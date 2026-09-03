@@ -91,6 +91,10 @@ const FOREIGN_AGENT: AgentRecord = {
   name: "oracle",
   harness: "claude_code",
   session_locator: null,
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:00Z",
 };
 /// Shared browsing/activation only — the *commit* is per consumer, which is the

@@ -74,7 +74,7 @@ impl HarnessKind {
 
     /// Whether this harness's reasoning effort is only meaningful **alongside a
     /// model** — i.e. whether an effort with no model selected is a coherent
-    /// profile.
+    /// model/effort selection.
     ///
     /// False for Claude and Codex: their effort flag is independent of the
     /// model flag, so "harness's own default model, at high effort" is a valid
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn effort_requires_model_is_antigravity_only() {
         // Claude and Codex emit `--effort` independently of `--model`, so
-        // "default model at high effort" is a valid profile for them.
+        // "default model at high effort" is a valid selection for them.
         assert!(HarnessKind::Antigravity.effort_requires_model());
         assert!(!HarnessKind::ClaudeCode.effort_requires_model());
         assert!(!HarnessKind::Codex.effort_requires_model());

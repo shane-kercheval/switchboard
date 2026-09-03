@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
-    AgentId, AgentProfile, AgentProfileSlot, AgentRecord, Attachment, CoreError, Directory,
-    HarnessKind, MessagePin, Project, ProjectEntry, ProjectId, ProjectSummary, SelectionAxis,
-    SendId, SessionLocator, normalize_selection,
+    AgentId, AgentRecord, AgentSelection, Attachment, CoreError, Directory, HarnessKind,
+    MessagePin, Project, ProjectEntry, ProjectId, ProjectSummary, SelectionAxis, SendId,
+    SessionLocator, normalize_agent_selection,
 };
 use switchboard_dispatcher::{
     CancelOutcome, CurrentTurnWait, DispatchContextFactory, Dispatcher, EventEmitter, OnBusy,
@@ -51,7 +51,7 @@ pub struct DirectoryInfo {
 /// used to insert last-wins. That silently shadowed: if two registries held the
 /// same id, whichever was read second won, and the agent dispatched into a
 /// project the user wasn't looking at with no signal anywhere. Re-inserting the
-/// *same* agent (a rename, a profile switch, a post-turn locator write) is
+/// *same* agent (a rename, a selection change, a post-turn locator write) is
 /// ordinary and stays a plain overwrite — only a change of owning project is a
 /// conflict.
 ///
@@ -118,7 +118,7 @@ fn validate_no_conflicting_claims(
 }
 
 /// The conflict a record would cause, if any: its `AgentId` is already mapped to
-/// a *different* project. Re-inserting the same agent (a rename, a profile
+/// a *different* project. Re-inserting the same agent (a rename, a selection
 /// switch, a post-turn locator write) is ordinary and returns `None`.
 fn conflicting_claim(
     cache: &HashMap<AgentId, AgentRecord>,
@@ -221,7 +221,7 @@ fn wait_between_project_and_generation_reads(_state: &AppState, _project: &Proje
 ///
 /// Deliberately **not** folded into [`lookup_agent`]: four of its callers
 /// (`rename_agent_impl`, `set_agent_session_locator_impl`,
-/// `set_agent_profiles_impl`, `set_active_agent_profile_impl`) already hold
+/// selection replacement and other registry mutations already hold
 /// `registry_write` when they call it, and `std::sync::Mutex` is not reentrant.
 pub(crate) fn capture_dispatch_snapshot(
     state: &AppState,
@@ -2367,40 +2367,18 @@ pub fn set_visible_project_impl(state: &AppState, project_id: Option<ProjectId>,
     lock(&state.visible_project).apply(project_id, seq);
 }
 
-#[cfg(test)]
 pub fn create_agent_impl(
     state: &AppState,
     name: &str,
     harness: HarnessKind,
-    model: Option<String>,
-    effort: Option<String>,
+    selection: AgentSelection,
 ) -> Result<AgentRecord, AppError> {
-    create_agent_with_profiles_impl(state, name, harness, model, effort, None)
-}
-
-pub fn create_agent_with_profiles_impl(
-    state: &AppState,
-    name: &str,
-    harness: HarnessKind,
-    model: Option<String>,
-    effort: Option<String>,
-    secondary: Option<AgentProfile>,
-) -> Result<AgentRecord, AppError> {
-    let model = normalize_selection(model);
-    let effort = normalize_selection(effort);
-    let secondary = secondary.map(|mut profile| {
-        profile.model = normalize_selection(profile.model);
-        profile.effort = normalize_selection(profile.effort);
-        profile
-    });
-    check_selection_supported(harness, model.as_deref(), effort.as_deref())?;
-    if let Some(secondary) = &secondary {
-        check_selection_supported(
-            harness,
-            secondary.model.as_deref(),
-            secondary.effort.as_deref(),
-        )?;
-    }
+    let selection = normalize_agent_selection(selection);
+    check_selection_supported(
+        harness,
+        selection.model.as_deref(),
+        selection.effort.as_deref(),
+    )?;
     // Same TOCTOU protection as create_project_impl — register_agent has
     // an internal read-check-then-append window that two concurrent IPC
     // calls could race through.
@@ -2410,7 +2388,7 @@ pub fn create_agent_with_profiles_impl(
         .get(&active)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(active))?;
-    let record = project.register_agent_with_profiles(name, harness, model, effort, secondary)?;
+    let record = project.register_agent(name, harness, selection)?;
     cache_agent(state, record.clone())?;
     Ok(record)
 }
@@ -2756,29 +2734,15 @@ pub fn set_agent_session_locator_impl(
     Ok(updated)
 }
 
-/// Atomically replace both execution profiles for an agent.
-pub fn set_agent_profiles_impl(
+/// Atomically replace the complete selection configuration for an agent.
+pub fn set_agent_selection_impl(
     state: &AppState,
     agent_id: AgentId,
-    primary: AgentProfile,
-    secondary: Option<AgentProfile>,
+    selection: AgentSelection,
 ) -> Result<AgentRecord, AppError> {
     let _write = lock(&state.registry_write);
     let (project, _) = lookup_agent(state, agent_id)?;
-    let updated = project.set_agent_profiles(agent_id, primary, secondary)?;
-    cache_agent(state, updated.clone())?;
-    Ok(updated)
-}
-
-/// Atomically switch the profile future sends capture.
-pub fn set_active_agent_profile_impl(
-    state: &AppState,
-    agent_id: AgentId,
-    active: AgentProfileSlot,
-) -> Result<AgentRecord, AppError> {
-    let _write = lock(&state.registry_write);
-    let (project, _) = lookup_agent(state, agent_id)?;
-    let updated = project.set_active_agent_profile(agent_id, active)?;
+    let updated = project.set_agent_selection(agent_id, selection)?;
     cache_agent(state, updated.clone())?;
     Ok(updated)
 }
@@ -2869,18 +2833,7 @@ pub fn attach_agent_impl(
     harness: HarnessKind,
     existing_session_id: &str,
     home_dir: &Path,
-    model: Option<String>,
-    effort: Option<String>,
 ) -> Result<AgentRecord, AppError> {
-    let model = normalize_selection(model);
-    let effort = normalize_selection(effort);
-    // Capability check first — before any session-file lookup or registry
-    // write. Load-bearing on this path (not just defense in depth): the
-    // per-harness `register_attached_*` methods structurally omit the axes they
-    // can't carry (Antigravity requires a model alongside an effort), so an
-    // unsupported axis from the IPC must be rejected here or it would be
-    // silently dropped rather than refused.
-    check_selection_supported(harness, model.as_deref(), effort.as_deref())?;
     let _write = lock(&state.registry_write);
     let active = lock(&state.active_project_id).ok_or(AppError::NoActiveProject)?;
     let project = lock(&state.projects)
@@ -2917,7 +2870,7 @@ pub fn attach_agent_impl(
                 });
             }
             check_claude_session_id_unique(state, &directory_path, &session_uuid)?;
-            project.register_attached_claude_agent(name, session_uuid, model, effort)?
+            project.register_attached_claude_agent(name, session_uuid)?
         }
         HarnessKind::Codex => {
             let (_path, session_partition_date) =
@@ -2934,8 +2887,6 @@ pub fn attach_agent_impl(
                 name,
                 existing_session_id.to_owned(),
                 session_partition_date,
-                model,
-                effort,
             )?;
             // Codex-only: force SessionMeta on subsequent dispatches until one
             // is genuinely observed. Claude/Antigravity emit SessionMeta
@@ -3160,7 +3111,7 @@ pub fn list_agents_impl(
     // **Validated, not cached.** This path holds no `registry_write`, so writing
     // these records back would race every guarded writer: the session-locator
     // sink writes a captured locator from the agent's own task mid-turn, and a
-    // rename or profile switch writes under the guard — either can land between
+    // rename or selection change writes under the guard — either can land between
     // the disk read above and the write, and the stale listing would overwrite
     // it. Dispatch would then use the old model or resume the wrong session.
     //
@@ -7207,8 +7158,13 @@ mod tests {
         register_test_directory(state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(state, "proj");
         set_active_project_impl(state, project.id).unwrap();
-        let agent =
-            create_agent_impl(state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
+        let agent = create_agent_impl(
+            state,
+            "assistant",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         (agent, project.id)
     }
 
@@ -7274,7 +7230,13 @@ mod tests {
         name: &str,
         text: &str,
     ) -> AgentId {
-        let agent = create_agent_impl(state, name, HarnessKind::ClaudeCode, None, None).unwrap();
+        let agent = create_agent_impl(
+            state,
+            name,
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         let session_uuid = Uuid::now_v7();
         set_agent_session_locator_impl(state, agent.id, SessionLocator::Uuid(session_uuid))
             .unwrap();
@@ -7412,7 +7374,8 @@ mod tests {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
         let (_other, _project_id) = project_with_agent(&state, &tmp);
-        let codex = create_agent_impl(&state, "cx", HarnessKind::Codex, None, None).unwrap();
+        let codex =
+            create_agent_impl(&state, "cx", HarnessKind::Codex, AgentSelection::default()).unwrap();
 
         let err = fork_agent_impl(&state, codex.id, home.path())
             .await
@@ -7905,7 +7868,7 @@ mod tests {
         let teardown = Arc::new(crate::state::MaintenanceBarrier::default());
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::new(Mutex::new(Vec::new())),
-            profiles: None,
+            selections: None,
             chrome: None,
             texts: vec!["parked".to_owned()],
             gate: Arc::new(tokio::sync::Notify::new()),
@@ -8701,8 +8664,13 @@ mod tests {
         // A different project, holding an agent with the SAME session id, busy.
         let other = create_project_in_only_dir(&state, "other-proj");
         set_active_project_impl(&state, other.id).unwrap();
-        let foreign =
-            create_agent_impl(&state, "foreign", HarnessKind::ClaudeCode, None, None).unwrap();
+        let foreign = create_agent_impl(
+            &state,
+            "foreign",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         set_agent_session_locator_impl(&state, foreign.id, SessionLocator::Uuid(parent_session))
             .unwrap();
         send_msg_with_home(&state, foreign.id, "long one", home.path())
@@ -8721,7 +8689,13 @@ mod tests {
     async fn a_non_fork_agent_is_never_gated_by_another_agents_turn() {
         let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["busy", "fine"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
-        let other = create_agent_impl(&state, "bob", HarnessKind::ClaudeCode, None, None).unwrap();
+        let other = create_agent_impl(
+            &state,
+            "bob",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         send_msg_with_home(&state, source_id, "long one", home.path())
             .await
@@ -9346,8 +9320,13 @@ mod tests {
         let (tmp, state, emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
         let home = TempDir::new().unwrap();
         let _ = project_with_agent(&state, &tmp);
-        let source =
-            create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
+        let source = create_agent_impl(
+            &state,
+            "reviewer-1",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         send_msg(&state, source.id, "work").await.unwrap();
         within(
             &emitter,
@@ -9537,8 +9516,13 @@ mod tests {
         let (tmp, state, emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
         let home = TempDir::new().unwrap();
         let _ = project_with_agent(&state, &tmp);
-        let source =
-            create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
+        let source = create_agent_impl(
+            &state,
+            "reviewer-1",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         // Put the source's turn in flight (AwaitCancellation parks until cancelled).
         send_msg(&state, source.id, "work").await.unwrap();
         within(
@@ -9576,8 +9560,13 @@ mod tests {
         let (tmp, state, emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
         let home = TempDir::new().unwrap();
         let _ = project_with_agent(&state, &tmp);
-        let source =
-            create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
+        let source = create_agent_impl(
+            &state,
+            "reviewer-1",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         send_msg(&state, source.id, "work").await.unwrap();
         within(
             &emitter,
@@ -9678,13 +9667,13 @@ mod tests {
     /// exactly one agent may dispatch through it per test. A second dispatching
     /// Claude agent would interleave into the same counter and silently draw
     /// another agent's scripted turn.
-    type RecordedProfile = (Option<String>, Option<String>);
+    type RecordedSelection = (Option<String>, Option<String>);
 
     struct GatedRecordingAdapter {
         prompts: Arc<Mutex<Vec<String>>>,
-        profiles: Option<Arc<Mutex<Vec<RecordedProfile>>>>,
-        /// Per-dispatch `chrome_integration`, for the mirror of the profile test:
-        /// profiles are captured when a send is *submitted*, this preference when
+        selections: Option<Arc<Mutex<Vec<RecordedSelection>>>>,
+        /// Per-dispatch `chrome_integration`, for the mirror of the selection test:
+        /// selections are captured when a send is *submitted*, this preference when
         /// the turn *runs*, and only a queued send can tell the two apart.
         chrome: Option<Arc<Mutex<Vec<bool>>>>,
         texts: Vec<String>,
@@ -9737,8 +9726,8 @@ mod tests {
                 .dispatches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             lock(&self.prompts).push(prompt.to_owned());
-            if let Some(profiles) = &self.profiles {
-                lock(profiles).push((agent.model.clone(), agent.effort.clone()));
+            if let Some(selections) = &self.selections {
+                lock(selections).push((agent.model.clone(), agent.effort.clone()));
             }
             if let Some(chrome) = &self.chrome {
                 lock(chrome).push(options.chrome_integration);
@@ -9853,7 +9842,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::clone(&prompts),
-            profiles: None,
+            selections: None,
             chrome: None,
             texts: texts.iter().map(|t| (*t).to_owned()).collect(),
             gate: Arc::clone(gate),
@@ -9878,7 +9867,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::clone(&prompts),
-            profiles: None,
+            selections: None,
             chrome: None,
             texts: texts.iter().map(|t| (*t).to_owned()).collect(),
             gate: Arc::clone(first.0),
@@ -9944,8 +9933,13 @@ mod tests {
         // (Panes are a frontend grouping, expanded to agent ids before the backend
         // sees them, so this is the scenario with panes factored out.)
         let f = forward_queue_fixture(&["PLANNER-LIVE", "PLANNER-SECOND"], 0);
-        let planner =
-            create_agent_impl(&f.state, "planner", HarnessKind::ClaudeCode, None, None).unwrap();
+        let planner = create_agent_impl(
+            &f.state,
+            "planner",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         let reviewer = seed_source(
             &f.state,
             f.home.path(),
@@ -10049,8 +10043,13 @@ mod tests {
         // not a reference to the source. So newer source output landing while the
         // send sits queued can never be substituted in at dispatch time.
         let f = forward_queue_fixture(&["PLANNER-LIVE", "PLANNER-SECOND"], 0);
-        let planner =
-            create_agent_impl(&f.state, "planner", HarnessKind::ClaudeCode, None, None).unwrap();
+        let planner = create_agent_impl(
+            &f.state,
+            "planner",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         let reviewer = seed_source(
             &f.state,
             f.home.path(),
@@ -10107,8 +10106,13 @@ mod tests {
         // *running* turn's text — forwarding does not wait for the source to drain to
         // idle.
         let f = forward_queue_fixture(&["TURN-ONE-TEXT", "TURN-TWO-TEXT"], 0);
-        let source =
-            create_agent_impl(&f.state, "reviewer", HarnessKind::ClaudeCode, None, None).unwrap();
+        let source = create_agent_impl(
+            &f.state,
+            "reviewer",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         send_msg(&f.state, source.id, "first").await.unwrap();
         within(
@@ -10152,8 +10156,13 @@ mod tests {
         // reachable in a forward body at all, so the sibling test's `!contains` is
         // discriminating rather than vacuous.
         let f = forward_queue_fixture(&["TURN-ONE-TEXT", "TURN-TWO-TEXT"], 1);
-        let source =
-            create_agent_impl(&f.state, "reviewer", HarnessKind::ClaudeCode, None, None).unwrap();
+        let source = create_agent_impl(
+            &f.state,
+            "reviewer",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         // Turn one completes on its own; turn two parks in flight.
         send_msg(&f.state, source.id, "first").await.unwrap();
@@ -10215,9 +10224,15 @@ mod tests {
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
 
-        let alice =
-            create_agent_impl(&state, "alice", HarnessKind::ClaudeCode, None, None).unwrap();
-        let bob = create_agent_impl(&state, "bob", HarnessKind::Codex, None, None).unwrap();
+        let alice = create_agent_impl(
+            &state,
+            "alice",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        let bob = create_agent_impl(&state, "bob", HarnessKind::Codex, AgentSelection::default())
+            .unwrap();
 
         // Both agents park mid-turn.
         send_msg(&state, alice.id, "alice work").await.unwrap();
@@ -10315,8 +10330,13 @@ mod tests {
 
         let proj = create_project_impl(&state, "alpha", tmp_a.path().to_str().unwrap()).unwrap();
         set_active_project_impl(&state, proj.id).unwrap();
-        let agent =
-            create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "assistant",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         let other = create_project_impl(&state, "beta", tmp_b.path().to_str().unwrap()).unwrap();
 
@@ -10374,8 +10394,7 @@ mod tests {
             &state,
             "assistant",
             switchboard_core::HarnessKind::ClaudeCode,
-            None,
-            None,
+            AgentSelection::default(),
         )
         .unwrap_err();
         assert!(matches!(err, AppError::NoActiveProject));
@@ -10391,8 +10410,7 @@ mod tests {
             &state,
             "assistant",
             switchboard_core::HarnessKind::ClaudeCode,
-            None,
-            None,
+            AgentSelection::default(),
         )
         .unwrap();
 
@@ -10901,8 +10919,7 @@ mod tests {
             &state,
             "a-agent",
             switchboard_core::HarnessKind::ClaudeCode,
-            None,
-            None,
+            AgentSelection::default(),
         )
         .unwrap();
         set_active_project_impl(&state, proj_b.id).unwrap();
@@ -10910,8 +10927,7 @@ mod tests {
             &state,
             "b-agent",
             switchboard_core::HarnessKind::ClaudeCode,
-            None,
-            None,
+            AgentSelection::default(),
         )
         .unwrap();
 
@@ -11018,11 +11034,22 @@ mod tests {
         register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
-        let claude_agent =
-            create_agent_impl(&state, "c1", HarnessKind::ClaudeCode, None, None).unwrap();
-        let codex_agent = create_agent_impl(&state, "x1", HarnessKind::Codex, None, None).unwrap();
-        let antigravity_agent =
-            create_agent_impl(&state, "a1", HarnessKind::Antigravity, None, None).unwrap();
+        let claude_agent = create_agent_impl(
+            &state,
+            "c1",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        let codex_agent =
+            create_agent_impl(&state, "x1", HarnessKind::Codex, AgentSelection::default()).unwrap();
+        let antigravity_agent = create_agent_impl(
+            &state,
+            "a1",
+            HarnessKind::Antigravity,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         // Three distinct agents → three independent actors. Each
         // `send_message_impl` returns immediately; await each agent's turn
@@ -11100,7 +11127,13 @@ mod tests {
         register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
-        let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode, None, None).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "a",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         lock(&state.needs_session_meta).insert(agent.id);
 
         send_msg(&state, agent.id, "hi").await.unwrap();
@@ -11143,7 +11176,13 @@ mod tests {
         register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
-        let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode, None, None).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "a",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         lock(&state.needs_session_meta).insert(agent.id);
 
         // Routing succeeds → the send is accepted; the dispatch failure is
@@ -11237,7 +11276,13 @@ mod tests {
         register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
-        let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode, None, None).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "a",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         // Default: off.
         send_msg(&state, agent.id, "one").await.unwrap();
@@ -11357,8 +11402,13 @@ mod tests {
         register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
-        let agent_default =
-            create_agent_impl(&state, "a", HarnessKind::ClaudeCode, None, None).unwrap();
+        let agent_default = create_agent_impl(
+            &state,
+            "a",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         send_msg(&state, agent_default.id, "hi").await.unwrap();
         within(
             &emitter,
@@ -11479,7 +11529,8 @@ mod tests {
         register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
-        let agent = create_agent_impl(&state, "a", HarnessKind::Codex, None, None).unwrap();
+        let agent =
+            create_agent_impl(&state, "a", HarnessKind::Codex, AgentSelection::default()).unwrap();
         // Simulate the Codex-attach state: the flag is set on a real attach,
         // but `create_agent_impl` doesn't trigger that path, so set it
         // directly to isolate the read-don't-drain behavior under test.
@@ -11533,8 +11584,7 @@ mod tests {
             &state,
             "assistant",
             switchboard_core::HarnessKind::ClaudeCode,
-            None,
-            None,
+            AgentSelection::default(),
         )
         .unwrap();
         set_active_project_impl(&state, proj_b.id).unwrap();
@@ -11542,8 +11592,7 @@ mod tests {
             &state,
             "assistant",
             switchboard_core::HarnessKind::ClaudeCode,
-            None,
-            None,
+            AgentSelection::default(),
         )
         .unwrap();
 
@@ -11703,8 +11752,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -11734,8 +11781,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         match err {
@@ -11760,8 +11805,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             "not-a-uuid",
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::InvalidUuid { .. }));
@@ -11780,8 +11823,6 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
         // The thread-id + discovered partition-date are written onto the record
@@ -11815,8 +11856,6 @@ mod tests {
             HarnessKind::Codex,
             thread_id,
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -11838,8 +11877,6 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         match err {
@@ -11870,8 +11907,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
 
@@ -11882,8 +11917,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         match err {
@@ -11911,8 +11944,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
         let err = attach_agent_impl(
@@ -11921,8 +11952,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::SessionAlreadyAttached { .. }));
@@ -11942,8 +11971,6 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
 
@@ -11954,8 +11981,6 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         // Discovery (existence check) runs before the sidecar collision scan
@@ -11977,7 +12002,13 @@ mod tests {
     #[tokio::test]
     async fn attach_rejects_duplicate_name_in_active_project() {
         let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
-        create_agent_impl(&state, "taken", HarnessKind::ClaudeCode, None, None).unwrap();
+        create_agent_impl(
+            &state,
+            "taken",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         let session_id = Uuid::now_v7();
         stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
 
@@ -11987,8 +12018,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         assert!(matches!(
@@ -12019,8 +12048,6 @@ mod tests {
             HarnessKind::Codex,
             &id_str,
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         match err {
@@ -12054,8 +12081,6 @@ mod tests {
             HarnessKind::Codex,
             &first_session.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
 
@@ -12069,8 +12094,6 @@ mod tests {
             HarnessKind::Codex,
             &second_session.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         assert!(matches!(
@@ -12110,8 +12133,6 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
         let err = attach_agent_impl(
@@ -12120,8 +12141,6 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::SessionAlreadyAttached { .. }));
@@ -12163,8 +12182,6 @@ mod tests {
                 HarnessKind::ClaudeCode,
                 &session_id.to_string(),
                 tmp_home.path(),
-                None,
-                None,
             )
             .unwrap();
         } // state_a dropped — project A's registry is persisted but no longer loaded in any AppState.
@@ -12191,8 +12208,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         match err {
@@ -12236,8 +12251,6 @@ mod tests {
                 HarnessKind::Codex,
                 &session_id.to_string(),
                 tmp_home.path(),
-                None,
-                None,
             )
             .unwrap();
         }
@@ -12261,8 +12274,6 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         match err {
@@ -12298,8 +12309,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &Uuid::now_v7().to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::NoActiveProject));
@@ -12317,8 +12326,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
 
@@ -12342,8 +12349,6 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
         std::fs::remove_file(path).unwrap();
@@ -12370,12 +12375,16 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
         // Codex agent (no dispatch yet) → not refresh-capable.
-        let codex = create_agent_impl(&state, "codex", HarnessKind::Codex, None, None).unwrap();
+        let codex = create_agent_impl(
+            &state,
+            "codex",
+            HarnessKind::Codex,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         let fps = project_session_fingerprints_impl(&state, proj.id, tmp_home.path()).unwrap();
 
@@ -12403,8 +12412,13 @@ mod tests {
     async fn project_session_fingerprints_claude_without_file_is_capable_but_unfingerprinted() {
         let (_tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha");
         // Claude agent, no session file on disk → refresh-capable but no fingerprint.
-        let claude =
-            create_agent_impl(&state, "claude", HarnessKind::ClaudeCode, None, None).unwrap();
+        let claude = create_agent_impl(
+            &state,
+            "claude",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         let fps = project_session_fingerprints_impl(&state, proj.id, tmp_home.path()).unwrap();
         let f = fps.iter().find(|f| f.agent_id == claude.id).unwrap();
@@ -12911,8 +12925,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
 
@@ -12997,8 +13009,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
 
@@ -13034,8 +13044,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
 
@@ -13072,8 +13080,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
 
@@ -13140,8 +13146,13 @@ mod tests {
         // End-to-end: a Codex thread-id with shell metacharacters is
         // single-quoted in the rendered resume command.
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
-        let agent =
-            create_agent_impl(&state, "codex_evil", HarnessKind::Codex, None, None).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "codex_evil",
+            HarnessKind::Codex,
+            AgentSelection::default(),
+        )
+        .unwrap();
         set_agent_session_locator_impl(
             &state,
             agent.id,
@@ -13164,8 +13175,13 @@ mod tests {
     async fn agent_session_info_for_never_dispatched_agent_is_empty() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         // Codex agent with no sidecar (never dispatched) → nothing to open/resume.
-        let record =
-            create_agent_impl(&state, "codex_one", HarnessKind::Codex, None, None).unwrap();
+        let record = create_agent_impl(
+            &state,
+            "codex_one",
+            HarnessKind::Codex,
+            AgentSelection::default(),
+        )
+        .unwrap();
         let info = agent_session_info_impl(&state, record.id, tmp_home.path()).unwrap();
         assert_eq!(info, AgentSessionInfo::default());
     }
@@ -13175,7 +13191,13 @@ mod tests {
         // The resume id is the Codex locator's thread-id on the record. Resume
         // is offered from it even when the local session file isn't present.
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
-        let agent = create_agent_impl(&state, "codex_two", HarnessKind::Codex, None, None).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "codex_two",
+            HarnessKind::Codex,
+            AgentSelection::default(),
+        )
+        .unwrap();
         set_agent_session_locator_impl(
             &state,
             agent.id,
@@ -13201,8 +13223,13 @@ mod tests {
     async fn load_transcript_for_codex_agent_without_sidecar_returns_meta_only_empty() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         // Create a Codex agent the normal way (no sidecar — no first dispatch).
-        let record =
-            create_agent_impl(&state, "codex_one", HarnessKind::Codex, None, None).unwrap();
+        let record = create_agent_impl(
+            &state,
+            "codex_one",
+            HarnessKind::Codex,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty());
@@ -13229,8 +13256,6 @@ mod tests {
             HarnessKind::Antigravity,
             &conversation_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -13262,8 +13287,6 @@ mod tests {
             HarnessKind::Antigravity,
             &conversation_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
 
@@ -13282,8 +13305,6 @@ mod tests {
             HarnessKind::Antigravity,
             &conversation_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         match err {
@@ -13311,8 +13332,6 @@ mod tests {
             HarnessKind::Antigravity,
             &conversation_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
         let err = attach_agent_impl(
@@ -13321,8 +13340,6 @@ mod tests {
             HarnessKind::Antigravity,
             &conversation_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         match err {
@@ -13340,8 +13357,13 @@ mod tests {
         // Antigravity agent never dispatched → no locator → empty turns, but
         // loader-derived registry meta still surfaces (mirrors the Codex arm)
         // so the sidebar populates the moment the agent is selected.
-        let record =
-            create_agent_impl(&state, "agy_one", HarnessKind::Antigravity, None, None).unwrap();
+        let record = create_agent_impl(
+            &state,
+            "agy_one",
+            HarnessKind::Antigravity,
+            AgentSelection::default(),
+        )
+        .unwrap();
         assert!(record.session_locator.is_none());
         let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty());
@@ -13351,8 +13373,13 @@ mod tests {
     #[tokio::test]
     async fn load_transcript_for_antigravity_agent_hydrates_prior_turns() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
-        let agent =
-            create_agent_impl(&state, "agy_hydrate", HarnessKind::Antigravity, None, None).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "agy_hydrate",
+            HarnessKind::Antigravity,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         // The server-assigned conversation UUID now lives on the record — the
         // same path the runtime-capture sink writes. Set it directly.
@@ -13447,8 +13474,13 @@ mod tests {
         // and deliberately clears nothing, so deleting the project is now the
         // operation that prunes the cache.
         let (_tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha");
-        let agent =
-            create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "assistant",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         // create_agent populated the cache → lookup resolves the owning
         // project without scanning any registry from disk.
@@ -13468,8 +13500,13 @@ mod tests {
     #[tokio::test]
     async fn open_with_corrupt_registry_errors_without_wedging_the_lock() {
         let (_tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha");
-        let agent =
-            create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "assistant",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         // Simulate a fresh process that hasn't loaded this project: drop the
         // in-memory maps (clearing project_locks releases the flock).
@@ -13670,7 +13707,13 @@ mod tests {
         // is untouched.
         let (tmp, state, _) = fresh_state_with_mock();
         let (a, project_id) = project_with_agent(&state, &tmp);
-        let b = create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
+        let b = create_agent_impl(
+            &state,
+            "second",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         let sidecar_a = meta_sidecar(&state, project_id, a.id);
         let sidecar_b = meta_sidecar(&state, project_id, b.id);
         write_dummy(&sidecar_a);
@@ -13739,7 +13782,13 @@ mod tests {
     async fn rename_agent_rejects_duplicate_name() {
         let (tmp, state, _) = fresh_state_with_mock();
         let (a, _pid) = project_with_agent(&state, &tmp);
-        create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
+        create_agent_impl(
+            &state,
+            "second",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         let err = rename_agent_impl(&state, a.id, "SECOND").unwrap_err();
         assert!(matches!(
             err,
@@ -13763,8 +13812,20 @@ mod tests {
     async fn reorder_agents_rewrites_registry_and_returns_new_order() {
         let (tmp, state, _) = fresh_state_with_mock();
         let (a, project_id) = project_with_agent(&state, &tmp);
-        let b = create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
-        let c = create_agent_impl(&state, "third", HarnessKind::ClaudeCode, None, None).unwrap();
+        let b = create_agent_impl(
+            &state,
+            "second",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        let c = create_agent_impl(
+            &state,
+            "third",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         let reordered = reorder_agents_impl(&state, project_id, &[c.id, a.id, b.id]).unwrap();
         assert_eq!(
@@ -13784,7 +13845,13 @@ mod tests {
     async fn reorder_agents_rejects_stale_id_list() {
         let (tmp, state, _) = fresh_state_with_mock();
         let (a, project_id) = project_with_agent(&state, &tmp);
-        let b = create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
+        let b = create_agent_impl(
+            &state,
+            "second",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         // Stale: the caller read the roster before `b` existed.
         let err = reorder_agents_impl(&state, project_id, &[a.id]).unwrap_err();
@@ -13818,8 +13885,12 @@ mod tests {
             &state,
             "a",
             HarnessKind::ClaudeCode,
-            Some("opus".to_owned()),
-            Some("high".to_owned()),
+            AgentSelection {
+                model: Some("opus".to_owned()),
+                effort: Some("high".to_owned()),
+                model_choices: vec!["opus".to_owned()],
+                effort_choices: vec!["high".to_owned()],
+            },
         )
         .unwrap();
         assert_eq!(agent.model.as_deref(), Some("opus"));
@@ -13844,8 +13915,12 @@ mod tests {
             &state,
             "a",
             HarnessKind::ClaudeCode,
-            Some("   ".to_owned()),
-            Some(String::new()),
+            AgentSelection {
+                model: Some("   ".to_owned()),
+                effort: Some(String::new()),
+                model_choices: vec![" ".to_owned()],
+                effort_choices: vec![String::new()],
+            },
         )
         .unwrap();
         assert_eq!(agent.model, None);
@@ -13866,8 +13941,12 @@ mod tests {
             &state,
             "a",
             HarnessKind::Antigravity,
-            None,
-            Some("high".to_owned()),
+            AgentSelection {
+                model: None,
+                effort: Some("high".to_owned()),
+                model_choices: Vec::new(),
+                effort_choices: vec!["high".to_owned()],
+            },
         )
         .unwrap_err();
         assert!(matches!(
@@ -13883,39 +13962,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_updates_refresh_the_registry_and_shared_cache() {
+    async fn selection_updates_refresh_the_registry_and_shared_cache() {
         let (tmp, state, _) = fresh_state_with_mock();
         let (agent, project_id) = project_with_agent(&state, &tmp);
-        let primary = AgentProfile {
+        let selection = AgentSelection {
             model: Some("opus".to_owned()),
             effort: Some("high".to_owned()),
+            model_choices: vec!["opus".to_owned(), "sonnet".to_owned()],
+            effort_choices: vec!["high".to_owned(), "medium".to_owned()],
         };
-        let secondary = AgentProfile {
-            model: Some("sonnet".to_owned()),
-            effort: Some("medium".to_owned()),
-        };
-
-        let updated =
-            set_agent_profiles_impl(&state, agent.id, primary.clone(), Some(secondary.clone()))
-                .unwrap();
-        assert_eq!(updated.active_profile(), primary);
-        let switched =
-            set_active_agent_profile_impl(&state, agent.id, AgentProfileSlot::Secondary).unwrap();
-        assert_eq!(switched.active_profile(), secondary);
+        let updated = set_agent_selection_impl(&state, agent.id, selection).unwrap();
+        assert_eq!(updated.model.as_deref(), Some("opus"));
+        assert_eq!(updated.effort.as_deref(), Some("high"));
 
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
-        assert_eq!(project.list_agents().unwrap()[0], switched);
-        assert_eq!(lock(&state.agents_by_id).get(&agent.id), Some(&switched));
+        assert_eq!(project.list_agents().unwrap()[0], updated);
+        assert_eq!(lock(&state.agents_by_id).get(&agent.id), Some(&updated));
     }
 
     #[tokio::test]
-    async fn queued_sends_capture_the_profile_active_when_each_was_submitted() {
+    async fn queued_sends_capture_the_selection_active_when_each_was_submitted() {
         let tmp = TempDir::new().unwrap();
         let gate = Arc::new(tokio::sync::Notify::new());
-        let profiles = Arc::new(Mutex::new(Vec::<RecordedProfile>::new()));
+        let selections = Arc::new(Mutex::new(Vec::<RecordedSelection>::new()));
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::new(Mutex::new(Vec::new())),
-            profiles: Some(Arc::clone(&profiles)),
+            selections: Some(Arc::clone(&selections)),
             chrome: None,
             texts: vec![String::new(); 3],
             gate: Arc::clone(&gate),
@@ -13933,15 +14005,13 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         let (agent, _) = project_with_agent(&state, &tmp);
-        let primary = AgentProfile {
+        let initial = AgentSelection {
             model: Some("opus".to_owned()),
             effort: Some("high".to_owned()),
+            model_choices: vec!["opus".to_owned(), "sonnet".to_owned()],
+            effort_choices: vec!["high".to_owned(), "medium".to_owned()],
         };
-        let secondary = AgentProfile {
-            model: Some("sonnet".to_owned()),
-            effort: Some("medium".to_owned()),
-        };
-        set_agent_profiles_impl(&state, agent.id, primary, Some(secondary)).unwrap();
+        set_agent_selection_impl(&state, agent.id, initial.clone()).unwrap();
 
         send_msg(&state, agent.id, "park").await.unwrap();
         within(
@@ -13950,11 +14020,18 @@ mod tests {
             emitter.wait_for_type("turn_start", 1),
         )
         .await;
-        send_msg(&state, agent.id, "queued-primary").await.unwrap();
-        set_active_agent_profile_impl(&state, agent.id, AgentProfileSlot::Secondary).unwrap();
-        send_msg(&state, agent.id, "queued-secondary")
-            .await
-            .unwrap();
+        send_msg(&state, agent.id, "queued-initial").await.unwrap();
+        set_agent_selection_impl(
+            &state,
+            agent.id,
+            AgentSelection {
+                model: Some("sonnet".to_owned()),
+                effort: Some("medium".to_owned()),
+                ..initial
+            },
+        )
+        .unwrap();
+        send_msg(&state, agent.id, "queued-updated").await.unwrap();
 
         gate.notify_one();
         within(
@@ -13964,7 +14041,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            *lock(&profiles),
+            *lock(&selections),
             vec![
                 (Some("opus".to_owned()), Some("high".to_owned())),
                 (Some("opus".to_owned()), Some("high".to_owned())),
@@ -13976,8 +14053,8 @@ mod tests {
     #[tokio::test]
     async fn a_queued_send_adopts_the_chrome_preference_in_force_when_it_runs() {
         // The deliberate mirror of
-        // `queued_sends_capture_the_profile_active_when_each_was_submitted`.
-        // A profile is frozen when the user hits send; the browser-tools
+        // `queued_sends_capture_the_selection_active_when_each_was_submitted`.
+        // A selection is frozen when the user hits send; the browser-tools
         // preference is sampled when the turn actually starts. Only a send that
         // is *already queued* when the toggle flips can tell those two apart —
         // sequential sends produce identical results either way, which is why
@@ -13988,7 +14065,7 @@ mod tests {
         let chrome = Arc::new(Mutex::new(Vec::<bool>::new()));
         let adapter: Arc<dyn HarnessAdapter> = Arc::new(GatedRecordingAdapter {
             prompts: Arc::new(Mutex::new(Vec::new())),
-            profiles: None,
+            selections: None,
             chrome: Some(Arc::clone(&chrome)),
             texts: vec![String::new(); 2],
             gate: Arc::clone(&gate),
@@ -14046,7 +14123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_stores_model_and_effort() {
+    async fn attach_is_unpinned() {
         let (tmp_workdir, tmp_home, state, project) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
@@ -14057,16 +14134,16 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            Some("sonnet".to_owned()),
-            Some("low".to_owned()),
         )
         .unwrap();
-        assert_eq!(record.model.as_deref(), Some("sonnet"));
-        assert_eq!(record.effort.as_deref(), Some("low"));
+        assert_eq!(record.model, None);
+        assert_eq!(record.effort, None);
+        assert!(record.model_choices.is_empty());
+        assert!(record.effort_choices.is_empty());
         let reloaded = lock(&state.projects).get(&project.id).cloned().unwrap();
         let stored = &reloaded.list_agents().unwrap()[0];
-        assert_eq!(stored.model.as_deref(), Some("sonnet"));
-        assert_eq!(stored.effort.as_deref(), Some("low"));
+        assert_eq!(stored.model, None);
+        assert_eq!(stored.effort, None);
     }
 
     #[tokio::test]
@@ -14957,7 +15034,13 @@ mod tests {
         // dispatch's DispatchContext reads the captured locator.
         let (tmp, state, _) = fresh_state_with_mock();
         let (_claude, project_id) = project_with_agent(&state, &tmp);
-        let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex, None, None).unwrap();
+        let codex = create_agent_impl(
+            &state,
+            "codex1",
+            HarnessKind::Codex,
+            AgentSelection::default(),
+        )
+        .unwrap();
         assert!(codex.session_locator.is_none());
 
         let locator = SessionLocator::Codex {
@@ -15009,7 +15092,13 @@ mod tests {
 
         let (tmp, state, _) = fresh_state_with_mock();
         let (_claude, project_id) = project_with_agent(&state, &tmp);
-        let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex, None, None).unwrap();
+        let codex = create_agent_impl(
+            &state,
+            "codex1",
+            HarnessKind::Codex,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
         let sink = crate::locator_sink::ProjectSessionLocatorSink::new(
@@ -15052,7 +15141,13 @@ mod tests {
 
         let (tmp, state, _) = fresh_state_with_mock();
         let (_claude, project_id) = project_with_agent(&state, &tmp);
-        let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex, None, None).unwrap();
+        let codex = create_agent_impl(
+            &state,
+            "codex1",
+            HarnessKind::Codex,
+            AgentSelection::default(),
+        )
+        .unwrap();
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
         let sink = crate::locator_sink::ProjectSessionLocatorSink::new(
             project,
@@ -15133,8 +15228,13 @@ mod tests {
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
         let (agent_a, _project_id) = project_with_agent(&state, &tmp);
-        let agent_b =
-            create_agent_impl(&state, "assistant-2", HarnessKind::ClaudeCode, None, None).unwrap();
+        let agent_b = create_agent_impl(
+            &state,
+            "assistant-2",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
         // One Send fanned out to both: same `send_id`, one call per recipient.
         let send_id = Uuid::now_v7();
@@ -15795,8 +15895,6 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
 
@@ -15810,8 +15908,6 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap_err();
         assert!(
@@ -15843,8 +15939,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .unwrap();
 
@@ -15857,8 +15951,6 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
-            None,
-            None,
         )
         .expect("same Claude id under a different directory is a distinct session");
     }
@@ -16013,7 +16105,12 @@ mod tests {
         // create_agent / create_project are synchronous; run them on blocking
         // tasks so they truly race the async delete.
         let agent_h = tokio::task::spawn_blocking(move || {
-            create_agent_impl(&agent_state, "racer", HarnessKind::ClaudeCode, None, None)
+            create_agent_impl(
+                &agent_state,
+                "racer",
+                HarnessKind::ClaudeCode,
+                AgentSelection::default(),
+            )
         });
         let project_h = tokio::task::spawn_blocking(move || {
             create_project_impl(&project_state, "racer-proj", &dir_path)
@@ -22264,10 +22361,20 @@ mod tests {
         let (_tmp, home, state, _project_id, emitter) =
             prompt_forward_state_with_adapters(claude, codex);
 
-        let topic_src =
-            create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
-        let feedback_src =
-            create_agent_impl(&state, "reviewer-2", HarnessKind::Codex, None, None).unwrap();
+        let topic_src = create_agent_impl(
+            &state,
+            "reviewer-1",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        let feedback_src = create_agent_impl(
+            &state,
+            "reviewer-2",
+            HarnessKind::Codex,
+            AgentSelection::default(),
+        )
+        .unwrap();
         // Both turns in flight: topic's parked on the signal, feedback's parked
         // until cancelled.
         send_msg(&state, topic_src.id, "work").await.unwrap();
@@ -22907,7 +23014,13 @@ mod tests {
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         for name in agent_names {
-            create_agent_impl(&state, name, HarnessKind::ClaudeCode, None, None).unwrap();
+            create_agent_impl(
+                &state,
+                name,
+                HarnessKind::ClaudeCode,
+                AgentSelection::default(),
+            )
+            .unwrap();
         }
         state.prompts.sync().await;
         (tmp, state, project.id)
@@ -23790,7 +23903,13 @@ mod tests {
         register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
-        create_agent_impl(&state, "alice", HarnessKind::ClaudeCode, None, None).unwrap();
+        create_agent_impl(
+            &state,
+            "alice",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         seed_workflow(
             &state,
             "mcp-review",
@@ -23873,7 +23992,13 @@ mod tests {
         register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
-        create_agent_impl(&state, "alice", HarnessKind::ClaudeCode, None, None).unwrap();
+        create_agent_impl(
+            &state,
+            "alice",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         seed_workflow(
             &state,
             "mcp-review",
@@ -24126,7 +24251,13 @@ mod tests {
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         for name in ["primary", "reviewer-1"] {
-            create_agent_impl(&state, name, HarnessKind::ClaudeCode, None, None).unwrap();
+            create_agent_impl(
+                &state,
+                name,
+                HarnessKind::ClaudeCode,
+                AgentSelection::default(),
+            )
+            .unwrap();
         }
         state.prompts.sync().await;
 
@@ -24265,8 +24396,20 @@ mod tests {
         register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
-        create_agent_impl(&state, "primary", HarnessKind::ClaudeCode, None, None).unwrap();
-        create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
+        create_agent_impl(
+            &state,
+            "primary",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        create_agent_impl(
+            &state,
+            "reviewer-1",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
         state.prompts.sync().await;
 
         let run_id = invoke_workflow_impl(

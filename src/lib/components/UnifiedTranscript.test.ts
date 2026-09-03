@@ -95,6 +95,10 @@ const CLAUDE_AGENT: AgentRecord = {
   name: "alice",
   harness: "claude_code",
   session_locator: { uuid: "00000000-0000-7000-8000-000000000001" },
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:00Z",
 };
 const CODEX_AGENT: AgentRecord = {
@@ -103,6 +107,10 @@ const CODEX_AGENT: AgentRecord = {
   name: "bob",
   harness: "codex",
   session_locator: null,
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:01Z",
 };
 
@@ -5183,6 +5191,10 @@ describe("pending-branch notice", () => {
     name: "alice-fork",
     harness: "claude_code",
     session_locator: { uuid: "00000000-0000-7000-8000-0000000000f1" },
+    model: null,
+    effort: null,
+    model_choices: [],
+    effort_choices: [],
     created_at: "2026-05-16T00:00:00Z",
     forked_from_session: PARENT_SESSION,
   };

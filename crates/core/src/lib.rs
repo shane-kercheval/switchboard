@@ -22,7 +22,7 @@ pub mod project;
 pub mod store;
 
 pub use agent::{
-    AgentId, AgentProfile, AgentProfileSlot, AgentProfiles, AgentRecord, SessionLocator,
+    AgentId, AgentRecord, AgentSelection, SessionLocator, normalize_agent_selection,
     normalize_selection,
 };
 pub use attachment::{

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/svelte";
-import type { AgentRecord, NormalizedEvent } from "$lib/types";
+import type { AgentRecord, AgentSelection, NormalizedEvent } from "$lib/types";
 // Static import so the component-tree transform happens at module collection,
 // not inside the first test's timeout (cold CI transforms have no vite cache).
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
@@ -17,27 +17,13 @@ vi.mock("@tauri-apps/api/event", () => ({
 // mocks are orthogonal.
 const renameAgentMock = vi.fn<(id: string, name: string) => Promise<void>>();
 const removeAgentMock = vi.fn<(id: string) => Promise<void>>();
-const setAgentProfilesMock =
-  vi.fn<
-    (
-      id: string,
-      primary: { model: string | null; effort: string | null },
-      secondary: unknown,
-    ) => Promise<void>
-  >();
-const setActiveAgentProfileMock =
-  vi.fn<(id: string, active: "primary" | "secondary") => Promise<void>>();
+const setAgentSelectionMock = vi.fn<(id: string, selection: AgentSelection) => Promise<void>>();
 const reorderAgentsMock = vi.fn<(projectId: string, orderedIds: string[]) => Promise<void>>();
 vi.mock("$lib/state/workspace.svelte", () => ({
   renameAgent: (id: string, name: string) => renameAgentMock(id, name),
   removeAgent: (id: string) => removeAgentMock(id),
-  setAgentProfiles: (
-    id: string,
-    primary: { model: string | null; effort: string | null },
-    secondary: unknown,
-  ) => setAgentProfilesMock(id, primary, secondary),
-  setActiveAgentProfile: (id: string, active: "primary" | "secondary") =>
-    setActiveAgentProfileMock(id, active),
+  setAgentSelection: (id: string, selection: AgentSelection) =>
+    setAgentSelectionMock(id, selection),
   reorderAgents: (projectId: string, orderedIds: string[]) =>
     reorderAgentsMock(projectId, orderedIds),
 }));
@@ -71,30 +57,6 @@ async function loadState() {
   return await import("$lib/state/index.svelte");
 }
 
-function pickerValue(testId: string): string {
-  const el = screen.getByTestId(testId);
-  return el instanceof HTMLSelectElement ? el.value : (el.getAttribute("data-value") ?? "");
-}
-
-async function choosePicker(testId: string, value: string): Promise<void> {
-  const el = screen.getByTestId(testId);
-  if (el instanceof HTMLSelectElement) {
-    await fireEvent.change(el, { target: { value } });
-  } else {
-    await fireEvent.click(
-      screen.getByTestId(`${testId}-option-${value === "" ? "no-override" : value}`),
-    );
-  }
-}
-
-function pickerHasOption(testId: string, value: string): boolean {
-  const el = screen.getByTestId(testId);
-  if (el instanceof HTMLSelectElement) {
-    return Array.from(el.options).some((option) => option.value === value);
-  }
-  return screen.queryByTestId(`${testId}-option-${value === "" ? "no-override" : value}`) !== null;
-}
-
 async function openAgentActions(index = 0): Promise<HTMLElement> {
   const triggers = await screen.findAllByTestId("agent-actions-trigger");
   const trigger = triggers.at(index);
@@ -114,6 +76,10 @@ const CLAUDE_AGENT: AgentRecord = {
   name: "alice",
   harness: "claude_code",
   session_locator: { uuid: "00000000-0000-7000-8000-000000000001" },
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:00Z",
 };
 const CODEX_AGENT: AgentRecord = {
@@ -122,6 +88,10 @@ const CODEX_AGENT: AgentRecord = {
   name: "bob",
   harness: "codex",
   session_locator: null,
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:01Z",
 };
 
@@ -131,6 +101,10 @@ const ANTIGRAVITY_AGENT: AgentRecord = {
   name: "ada",
   harness: "antigravity",
   session_locator: { uuid: "00000000-0000-7000-8000-000000000003" },
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:03Z",
 };
 
@@ -138,8 +112,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   renameAgentMock.mockResolvedValue(undefined);
   removeAgentMock.mockResolvedValue(undefined);
-  setAgentProfilesMock.mockResolvedValue(undefined);
-  setActiveAgentProfileMock.mockResolvedValue(undefined);
+  setAgentSelectionMock.mockResolvedValue(undefined);
   reorderAgentsMock.mockResolvedValue(undefined);
   agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
   openSessionFileMock.mockReset();
@@ -285,7 +258,7 @@ describe("Sidebar", () => {
     const menu = await openAgentActions();
     expect(await screen.findByTestId("agent-action-resume")).toBeInTheDocument();
     expect(screen.getByTestId("agent-action-open-session")).toBeInTheDocument();
-    expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-selection-settings")).toBeInTheDocument();
     expect(
       Array.from(menu.querySelectorAll('[role="menuitem"]')).map((item) =>
         item.textContent?.trim(),
@@ -837,9 +810,7 @@ describe("Sidebar", () => {
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
-      "Harness/session default",
-    );
+    expect(screen.queryByTestId("agent-selection")).toBeNull();
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
     expect(screen.getByTestId("agent-mcp-chip")).toHaveTextContent("1");
     expect(screen.getByTestId("agent-skills-chip")).toHaveTextContent("1");
@@ -853,11 +824,11 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
-    expect(screen.getByTestId("agent-profile-settings")).toHaveTextContent("Model settings");
+    await waitFor(() => expect(screen.getByTestId("agent-selection-settings")).toBeInTheDocument());
+    expect(screen.getByTestId("agent-selection-settings")).toHaveTextContent("Model settings");
   });
 
-  it("Antigravity exposes the profile action like every other harness", async () => {
+  it("Antigravity exposes the selection action like every other harness", async () => {
     // It had none while its model was harness-owned global config; `agy` 1.1.x
     // made both axes per-invocation, so the action is no longer withheld.
     const state = await loadState();
@@ -865,64 +836,87 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [ANTIGRAVITY_AGENT] } });
 
     await openAgentActions();
-    expect(screen.queryByTestId("agent-profile-settings")).not.toBeNull();
+    expect(screen.queryByTestId("agent-selection-settings")).not.toBeNull();
   });
 
-  it("model settings saves primary model and effort atomically", async () => {
+  it("model settings saves the complete independent selection atomically", async () => {
     const state = await loadState();
-    const agent = { ...CLAUDE_AGENT, model: "opus", effort: "high" };
+    const agent = {
+      ...CLAUDE_AGENT,
+      model: "opus",
+      effort: "high",
+      model_choices: ["opus"],
+      effort_choices: ["high"],
+    };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
+    await waitFor(() => expect(screen.getByTestId("agent-selection-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-selection-settings"));
 
-    await screen.findByTestId("change-profile-primary-model");
-    expect(pickerValue("change-profile-primary-model")).toBe("opus");
-    await choosePicker("change-profile-primary-model", "sonnet");
+    await screen.findByTestId("change-selection-model");
+    await fireEvent.click(screen.getByTestId("change-selection-model-choice-sonnet"));
+    await fireEvent.change(screen.getByTestId("change-selection-model-current"), {
+      target: { value: "sonnet" },
+    });
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
-      agent.id,
-      { model: "sonnet", effort: "high" },
-      null,
-    );
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
+      model: "sonnet",
+      effort: "high",
+      model_choices: ["opus", "sonnet"],
+      effort_choices: ["high"],
+    });
   });
 
-  it("Model settings preserves an agent's unpinned primary profile", async () => {
+  it("Model settings preserves an untouched unpinned agent", async () => {
     const state = await loadState();
     const agent = { ...CLAUDE_AGENT, model: null, effort: null };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
+    await waitFor(() => expect(screen.getByTestId("agent-selection-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-selection-settings"));
 
-    await screen.findByTestId("change-profile-primary-model");
-    // An attached agent arrives with no model/effort — "Attach existing" offers
-    // no pickers, so the profile is genuinely unset until someone edits it here.
-    // Opening the dialog must not silently pin a value: nothing is selected, and
-    // saving without touching a picker round-trips the nulls unchanged.
-    //
-    // There is deliberately no "Default" option to represent that state. It was
-    // removed as clutter on the common path; the backend rule it guarded — a
-    // null model with an explicit effort staying valid for Claude/Codex — is
-    // covered at `crates/core/src/project.rs`
-    // (`effort_without_a_model_stays_valid_where_the_harness_allows_it`).
-    expect(pickerHasOption("change-profile-primary-model", "")).toBe(false);
-    expect(pickerHasOption("change-profile-primary-effort", "")).toBe(false);
-    expect(pickerValue("change-profile-primary-model")).toBe("");
-    expect(pickerValue("change-profile-primary-effort")).toBe("");
-    await fireEvent.click(screen.getByTestId("change-profile-secondary-toggle"));
+    await screen.findByTestId("change-selection-model");
+    expect(screen.queryByTestId("change-selection-model-current")).toBeNull();
+    expect(screen.queryByTestId("change-selection-effort-current")).toBeNull();
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
-      agent.id,
-      { model: null, effort: null },
-      { model: "sonnet", effort: "medium" },
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
+      model: null,
+      effort: null,
+      model_choices: [],
+      effort_choices: [],
+    });
+  });
+
+  it("requires a compatible effort before saving a newly configured attached Antigravity agent", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...ANTIGRAVITY_AGENT,
+      model: null,
+      effort: null,
+      model_choices: [],
+      effort_choices: [],
+    };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-selection-settings"));
+    await fireEvent.click(screen.getByTestId("change-selection-model-choice-gemini-3.7-flash"));
+
+    expect(screen.getByTestId("change-selection-invalid")).toHaveTextContent(
+      "Choose a reasoning effort supported by the current model before saving.",
     );
+    expect(screen.getByTestId("change-save")).toBeDisabled();
+    expect(screen.getByTestId("change-cancel")).toBeEnabled();
+
+    await fireEvent.click(screen.getByTestId("change-selection-effort-choice-high"));
+    expect(screen.getByTestId("change-save")).toBeEnabled();
   });
 
   it("changing only effort leaves an unpinned model unset", async () => {
@@ -932,71 +926,71 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
-    await choosePicker("change-profile-primary-effort", "medium");
+    await waitFor(() => expect(screen.getByTestId("agent-selection-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-selection-settings"));
+    await fireEvent.click(screen.getByTestId("change-selection-effort-choice-medium"));
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
-      agent.id,
-      { model: null, effort: "medium" },
-      null,
-    );
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
+      model: null,
+      effort: "medium",
+      model_choices: [],
+      effort_choices: ["medium"],
+    });
   });
 
   it("Change model includes an unknown persisted value so Save preserves it", async () => {
     const state = await loadState();
-    const agent = { ...CLAUDE_AGENT, model: "future-opus" };
+    const agent = { ...CLAUDE_AGENT, model: "future-opus", model_choices: ["future-opus"] };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
+    await waitFor(() => expect(screen.getByTestId("agent-selection-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-selection-settings"));
 
-    await screen.findByTestId("change-profile-primary-model");
-    expect(pickerValue("change-profile-primary-model")).toBe("future-opus");
-    expect(pickerHasOption("change-profile-primary-model", "future-opus")).toBe(true);
-    // An off-catalog value has an unbounded, vendor-shaped label that a
-    // segmented pill would truncate — so the dialog drops to a native select
-    // where the current model stays fully readable.
-    expect(screen.getByTestId("change-profile-primary-model")).toBeInstanceOf(HTMLSelectElement);
+    expect(await screen.findByTestId("change-selection-model-choice-future-opus")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByTestId("change-selection-model-implicit")).toHaveTextContent("future-opus");
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
-      agent.id,
-      { model: "future-opus", effort: null },
-      null,
-    );
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
+      model: "future-opus",
+      effort: null,
+      model_choices: ["future-opus"],
+      effort_choices: [],
+    });
   });
 
   it("Change model uses the segmented toggle for an in-catalog model", async () => {
     const state = await loadState();
-    const agent = { ...CLAUDE_AGENT, model: "opus" };
+    const agent = { ...CLAUDE_AGENT, model: "opus", model_choices: ["opus"] };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
+    await waitFor(() => expect(screen.getByTestId("agent-selection-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-selection-settings"));
 
-    const picker = await screen.findByTestId("change-profile-primary-model");
-    // A curated short list stays a toggle, not a dropdown.
-    expect(picker).not.toBeInstanceOf(HTMLSelectElement);
-    expect(picker).toHaveAttribute("role", "radiogroup");
+    expect(await screen.findByTestId("change-selection-model-choice-opus")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
   });
 
   it("keeps the change dialog open and non-dismissible while saving", async () => {
     const state = await loadState();
-    const agent = { ...CLAUDE_AGENT, model: "opus" };
+    const agent = { ...CLAUDE_AGENT, model: "opus", model_choices: ["opus"] };
     await state.registerAgent(agent);
     const pending = deferred();
-    setAgentProfilesMock.mockReturnValueOnce(pending.promise);
+    setAgentSelectionMock.mockReturnValueOnce(pending.promise);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
-    await waitFor(() => expect(screen.getByTestId("agent-profile-settings")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("agent-profile-settings"));
+    await waitFor(() => expect(screen.getByTestId("agent-selection-settings")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-selection-settings"));
     await fireEvent.click(screen.getByTestId("change-save"));
 
     expect(screen.getByTestId("change-selection-panel")).toBeInTheDocument();
@@ -1006,108 +1000,249 @@ describe("Sidebar", () => {
     await waitFor(() => expect(screen.queryByTestId("change-selection-panel")).toBeNull());
   });
 
-  it("configures a secondary profile in the shared model settings dialog", async () => {
+  it("configures independent additional choices in the shared settings dialog", async () => {
     const state = await loadState();
-    const agent = { ...CLAUDE_AGENT, model: "opus", effort: "high" };
+    const agent = {
+      ...CLAUDE_AGENT,
+      model: "opus",
+      effort: "high",
+      model_choices: ["opus"],
+      effort_choices: ["high"],
+    };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
-    await fireEvent.click(await screen.findByTestId("agent-profile-settings"));
-    await fireEvent.click(screen.getByTestId("change-profile-secondary-toggle"));
-    expect(pickerValue("change-profile-secondary-model")).toBe("sonnet");
-    expect(pickerValue("change-profile-secondary-effort")).toBe("medium");
+    await fireEvent.click(await screen.findByTestId("agent-selection-settings"));
+    await fireEvent.click(screen.getByTestId("change-selection-model-choice-sonnet"));
+    await fireEvent.click(screen.getByTestId("change-selection-effort-choice-medium"));
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentProfilesMock).toHaveBeenCalledExactlyOnceWith(
-      agent.id,
-      { model: "opus", effort: "high" },
-      { model: "sonnet", effort: "medium" },
-    );
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
+      model: "opus",
+      effort: "high",
+      model_choices: ["opus", "sonnet"],
+      effort_choices: ["high", "medium"],
+    });
   });
 
-  it("quick-switches an agent to its secondary profile", async () => {
+  it("quick-switches model and effort independently when each has two choices", async () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...CLAUDE_AGENT,
       model: "opus",
       effort: "high",
-      profiles: {
-        active: "primary",
-        secondary: { model: "sonnet", effort: "medium" },
-      },
+      model_choices: ["opus", "sonnet"],
+      effort_choices: ["high", "medium"],
     };
     await state.registerAgent(agent);
-    const { rerender } = render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
-    const toggle = screen.getByTestId("agent-profile-switch");
-    expect(toggle).toHaveAccessibleName(/Using Primary: Opus · High.*Secondary: Sonnet · Medium/);
-    await fireEvent.click(toggle);
+    const modelChip = screen.getByTestId("agent-model-chip");
+    expect(modelChip).toHaveAccessibleName(/Current model: Opus.*Switch to Sonnet/);
+    await fireEvent.click(modelChip);
 
-    expect(setActiveAgentProfileMock).toHaveBeenCalledExactlyOnceWith(agent.id, "secondary");
-    await rerender({
-      agents: [{ ...agent, profiles: { ...agent.profiles!, active: "secondary" } }],
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
+      model: "sonnet",
+      effort: "high",
+      model_choices: ["opus", "sonnet"],
+      effort_choices: ["high", "medium"],
     });
-    expect(screen.getByTestId("agent-selected-model")).toHaveTextContent("sonnet");
-    expect(screen.getByTestId("agent-selected-effort")).toHaveTextContent("medium");
   });
 
-  it("shows two-line profile details above the switch and closes on pointer exit", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    try {
-      const state = await loadState();
-      const agent: AgentRecord = {
-        ...CLAUDE_AGENT,
-        model: "opus",
-        effort: "high",
-        profiles: {
-          active: "primary",
-          secondary: { model: "sonnet", effort: "medium" },
-        },
-      };
-      await state.registerAgent(agent);
-      render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+  it("opens a direct menu for three model choices", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...CLAUDE_AGENT,
+      model: "opus",
+      effort: "high",
+      model_choices: ["opus", "sonnet", "haiku"],
+      effort_choices: ["high"],
+    };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
-      const toggle = screen.getByTestId("agent-profile-switch");
-      await fireEvent.pointerEnter(toggle);
-      await vi.advanceTimersByTimeAsync(500);
-      const tooltip = await waitFor(() => screen.getByTestId("tooltip-content"));
-      expect(tooltip).toHaveAttribute("data-side", "top");
-      expect(within(tooltip).getByText("Primary: Opus · High")).toBeInTheDocument();
-      expect(within(tooltip).getByText("Switch to Secondary: Sonnet · Medium")).toBeInTheDocument();
-      expect(tooltip).toHaveClass("pointer-events-none");
+    await fireEvent.click(screen.getByTestId("agent-model-chip"));
+    expect(await screen.findByTestId("agent-model-option-opus")).toHaveTextContent(
+      "Opus (current)",
+    );
+    await fireEvent.click(await screen.findByTestId("agent-model-option-haiku"));
 
-      await fireEvent.pointerLeave(toggle);
-      await waitFor(() => expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument());
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
+      model: "haiku",
+      effort: "high",
+      model_choices: ["opus", "sonnet", "haiku"],
+      effort_choices: ["high"],
+    });
   });
 
-  it("quick-switches from an unpinned primary with no observed model", async () => {
+  it("opens a direct menu for three effort choices without changing the model", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...CLAUDE_AGENT,
+      model: "opus",
+      effort: "high",
+      model_choices: ["opus"],
+      effort_choices: ["high", "medium", "low"],
+    };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    await fireEvent.click(screen.getByTestId("agent-effort-chip"));
+    await fireEvent.click(await screen.findByTestId("agent-effort-option-low"));
+
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
+      model: "opus",
+      effort: "low",
+      model_choices: ["opus"],
+      effort_choices: ["high", "medium", "low"],
+    });
+  });
+
+  it("announces and atomically applies an Antigravity model switch that adjusts effort", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...ANTIGRAVITY_AGENT,
+      model: "gemini-3.7-flash",
+      effort: "medium",
+      model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+      effort_choices: ["medium", "high"],
+    };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    const modelChip = screen.getByTestId("agent-model-chip");
+    expect(modelChip).toHaveAccessibleName(/Switch to Gemini 3.1 Pro — effort becomes High/);
+    await fireEvent.click(modelChip);
+
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
+      model: "gemini-3.1-pro",
+      effort: "high",
+      model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+      effort_choices: ["medium", "high"],
+    });
+  });
+
+  it("preserves effort when switching to an unknown Antigravity model", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...ANTIGRAVITY_AGENT,
+      model: "gemini-3.7-flash",
+      effort: "medium",
+      model_choices: ["gemini-3.7-flash", "future-model"],
+      effort_choices: ["medium"],
+    };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    await fireEvent.click(screen.getByTestId("agent-model-chip"));
+
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
+      model: "future-model",
+      effort: "medium",
+      model_choices: ["gemini-3.7-flash", "future-model"],
+      effort_choices: ["medium"],
+    });
+  });
+
+  it("hides effort only for an explicitly known no-effort Antigravity model", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...ANTIGRAVITY_AGENT,
+      model: "claude-sonnet-4-6",
+      effort: null,
+      model_choices: ["claude-sonnet-4-6"],
+      effort_choices: ["high"],
+    };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    expect(screen.getByTestId("agent-model-chip")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-effort-chip")).toBeNull();
+  });
+
+  it("disables an Antigravity model target with no compatible configured effort", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...ANTIGRAVITY_AGENT,
+      model: "gemini-3.7-flash",
+      effort: "medium",
+      model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+      effort_choices: ["medium"],
+    };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    expect(screen.getByTestId("agent-model-chip")).toBeDisabled();
+    expect(screen.getByTestId("agent-model-chip")).toHaveAttribute(
+      "title",
+      "Add a compatible reasoning effort in Model settings before switching.",
+    );
+  });
+
+  it("blocks both quick controls while a complete selection write is pending", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...CLAUDE_AGENT,
+      model: "opus",
+      effort: "high",
+      model_choices: ["opus", "sonnet"],
+      effort_choices: ["high", "medium", "low"],
+    };
+    await state.registerAgent(agent);
+    const pending = deferred();
+    setAgentSelectionMock.mockReturnValueOnce(pending.promise);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    await fireEvent.click(screen.getByTestId("agent-model-chip"));
+    expect(screen.getByTestId("agent-effort-chip")).toBeDisabled();
+    await fireEvent.click(screen.getByTestId("agent-effort-chip"));
+    expect(setAgentSelectionMock).toHaveBeenCalledTimes(1);
+    pending.resolve(undefined);
+    await waitFor(() => expect(screen.getByTestId("agent-effort-chip")).toBeEnabled());
+  });
+
+  it("disables a two-choice effort target that the current Antigravity model rejects", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...ANTIGRAVITY_AGENT,
+      model: "gemini-3.1-pro",
+      effort: "high",
+      model_choices: ["gemini-3.1-pro"],
+      effort_choices: ["high", "medium"],
+    };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    expect(screen.getByTestId("agent-effort-chip")).toBeDisabled();
+    expect(screen.getByTestId("agent-effort-chip")).toHaveAttribute(
+      "title",
+      "Unavailable for the current model",
+    );
+  });
+
+  it("a sole choice can be adopted when the current value is null", async () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...CLAUDE_AGENT,
       model: null,
       effort: null,
-      profiles: {
-        active: "primary",
-        secondary: { model: "sonnet", effort: "medium" },
-      },
+      model_choices: ["sonnet"],
+      effort_choices: ["medium"],
     };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
-    expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
-      "Harness/session default",
-    );
-    const toggle = screen.getByTestId("agent-profile-switch");
-    expect(toggle).toHaveAccessibleName(
-      /Using Primary: Harness\/session default.*Secondary: Sonnet · Medium/,
-    );
-    await fireEvent.click(toggle);
+    const modelChip = screen.getByTestId("agent-model-chip");
+    expect(modelChip).toHaveAccessibleName(/Current model: Harness default.*Switch to Sonnet/);
+    await fireEvent.click(modelChip);
 
-    expect(setActiveAgentProfileMock).toHaveBeenCalledExactlyOnceWith(agent.id, "secondary");
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
+      model: "sonnet",
+      effort: null,
+      model_choices: ["sonnet"],
+      effort_choices: ["medium"],
+    });
   });
 
   it("keeps the quick switch usable and surfaces a persistence failure", async () => {
@@ -1116,20 +1251,18 @@ describe("Sidebar", () => {
       ...CLAUDE_AGENT,
       model: "opus",
       effort: "high",
-      profiles: {
-        active: "primary",
-        secondary: { model: "sonnet", effort: "medium" },
-      },
+      model_choices: ["opus", "sonnet"],
+      effort_choices: ["high", "medium"],
     };
     await state.registerAgent(agent);
-    setActiveAgentProfileMock.mockRejectedValueOnce(new Error("registry is read-only"));
+    setAgentSelectionMock.mockRejectedValueOnce(new Error("registry is read-only"));
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
-    const toggle = screen.getByTestId("agent-profile-switch");
+    const toggle = screen.getByTestId("agent-model-chip");
     await fireEvent.click(toggle);
 
     await waitFor(() =>
-      expect(screen.getByTestId("agent-profile-switch-error")).toHaveTextContent(
+      expect(screen.getByTestId("agent-selection-save-error")).toHaveTextContent(
         "registry is read-only",
       ),
     );
@@ -1138,7 +1271,7 @@ describe("Sidebar", () => {
 
   it("sidebar shows the SELECTED model even when the observed model differs (post-turn state)", async () => {
     const state = await loadState();
-    const agent = { ...CLAUDE_AGENT, model: "opus" };
+    const agent = { ...CLAUDE_AGENT, model: "opus", model_choices: ["opus"] };
     await state.registerAgent(agent);
     const runtime = state.runtimes[agent.id];
     if (runtime === undefined) throw new Error("unreachable");
@@ -1157,12 +1290,13 @@ describe("Sidebar", () => {
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
-    expect(screen.getByTestId("agent-selected-model")).toHaveTextContent("opus");
+    expect(screen.getByTestId("agent-model-chip")).toHaveTextContent("Opus");
+    expect(screen.getByTestId("agent-model-chip").tagName).toBe("SPAN");
     // The selection wins — the observed line is not shown when intent exists.
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
   });
 
-  it("sidebar shows harness default rather than the last observed model when unpinned", async () => {
+  it("sidebar does not turn an observed model into future-send intent when unpinned", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT); // no selected model
     const runtime = state.runtimes[CLAUDE_AGENT.id];
@@ -1181,20 +1315,24 @@ describe("Sidebar", () => {
     render(Sidebar, {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] },
     });
-    expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
-      "Harness/session default",
-    );
-    expect(screen.queryByTestId("agent-selected-model")).toBeNull();
+    expect(screen.queryByTestId("agent-selection")).toBeNull();
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
   });
 
   it("sidebar shows the selected effort", async () => {
     const state = await loadState();
-    const agent = { ...CLAUDE_AGENT, model: "opus", effort: "high" };
+    const agent = {
+      ...CLAUDE_AGENT,
+      model: "opus",
+      effort: "high",
+      model_choices: ["opus"],
+      effort_choices: ["high"],
+    };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
-    expect(screen.getByTestId("agent-selected-effort")).toHaveTextContent("high");
+    expect(screen.getByTestId("agent-effort-chip")).toHaveTextContent("High");
+    expect(screen.getByTestId("agent-effort-chip").tagName).toBe("SPAN");
   });
 
   it("gives the name the full row until hover: shared-prefix names stay distinguishable at rest", async () => {
@@ -1570,11 +1708,9 @@ describe("Sidebar agent-scoped event tolerance", () => {
         skills: meta.skills,
       },
     };
-    // Runtime metadata never replaces the active profile's future-send intent.
+    // Runtime metadata never becomes future-send intent.
     await waitFor(() => {
-      expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
-        "Harness/session default",
-      );
+      expect(screen.queryByTestId("agent-selection")).toBeNull();
       expect(screen.queryByTestId("agent-observed-model")).toBeNull();
     });
   });

@@ -6,9 +6,9 @@ import SettingsView from "./SettingsView.svelte";
 import { theme } from "$lib/theme.svelte";
 import { agentCopy } from "$lib/agentCopy.svelte";
 import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
-import { _testing as prefsTesting } from "$lib/preferences.svelte";
+import { _testing as prefsTesting, preferences } from "$lib/preferences.svelte";
 import { WORKFLOW_AUTHORING_GUIDE_URL } from "$lib/workflowAuthoring";
-import { DEFAULT_AGENT_PROFILES } from "$lib/agentSelection";
+import { DEFAULT_AGENT_SELECTIONS } from "$lib/agentSelection";
 import type { Preferences } from "$lib/types";
 
 // SettingsView embeds HarnessStatusList (probes install/auth on mount) and
@@ -102,42 +102,42 @@ describe("SettingsView", () => {
     );
   });
 
-  it("persists per-harness primary and optional secondary defaults", async () => {
+  it("persists independent quick choices and explicit defaults atomically", async () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
     await fireEvent.click(await screen.findByText("Codex", { selector: "summary" }));
-    await fireEvent.click(
-      screen.getByTestId("settings-profile-codex-primary-model-option-gpt-5.6-terra"),
-    );
+    await fireEvent.click(screen.getByTestId("settings-selection-codex-model-choice-gpt-5.6-luna"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             codex: {
-              primary: { model: "gpt-5.6-terra", effort: "high" },
-              secondary: { model: "gpt-5.6-terra", effort: "medium" },
+              model_choices: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+              effort_choices: ["high", "medium"],
+              default_model: "gpt-5.6-sol",
+              default_effort: "high",
             },
           }),
         }),
       }),
     );
 
-    await fireEvent.click(screen.getByTestId("settings-profile-codex-secondary-toggle"));
-    expect(screen.queryByTestId("settings-profile-codex-secondary-model")).toBeNull();
+    await fireEvent.change(screen.getByTestId("settings-selection-codex-model-current"), {
+      target: { value: "gpt-5.6-terra" },
+    });
     await waitFor(() =>
       expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             codex: {
-              primary: { model: "gpt-5.6-terra", effort: "high" },
-              secondary: null,
+              model_choices: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+              effort_choices: ["high", "medium"],
+              default_model: "gpt-5.6-terra",
+              default_effort: "high",
             },
           }),
         }),
       }),
     );
-
-    await fireEvent.click(screen.getByTestId("settings-profile-codex-secondary-toggle"));
-    expect(screen.getByTestId("settings-profile-codex-secondary-model")).toBeInTheDocument();
   });
 
   it("lists every harness in Agent Defaults", () => {
@@ -149,38 +149,49 @@ describe("SettingsView", () => {
     expect(labels).toEqual(["Claude", "Codex", "Antigravity"]);
   });
 
-  it("shows Pro high and Flash high as the Antigravity defaults", async () => {
+  it("shows the Antigravity model choices and implicit sole effort default", async () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
     await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
 
-    expect(screen.getByTestId("settings-profile-antigravity-primary-model")).toHaveAttribute(
-      "data-value",
-      "gemini-3.1-pro",
+    expect(
+      screen.getByTestId("settings-selection-antigravity-model-choice-gemini-3.1-pro"),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(
+      screen.getByTestId("settings-selection-antigravity-model-choice-gemini-3.7-flash"),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("settings-selection-antigravity-effort-implicit")).toHaveTextContent(
+      "Default: High",
     );
-    expect(screen.getByTestId("settings-profile-antigravity-primary-effort")).toHaveAttribute(
-      "data-value",
-      "high",
-    );
-    expect(screen.getByTestId("settings-profile-antigravity-secondary-model")).toHaveAttribute(
-      "data-value",
-      "gemini-3.7-flash",
-    );
-    expect(screen.getByTestId("settings-profile-antigravity-secondary-effort")).toHaveAttribute(
-      "data-value",
-      "high",
-    );
+    expect(screen.queryByTestId("settings-selection-antigravity-effort-current")).toBeNull();
   });
 
-  it("enables the secondary default for every harness", () => {
+  it("refuses an invalid Antigravity default before it can leak through another save", async () => {
+    preferences.agent_defaults.antigravity = {
+      ...DEFAULT_AGENT_SELECTIONS.antigravity,
+      effort_choices: ["high", "medium"],
+    };
     render(SettingsView, { props: { onClose: vi.fn() } });
+    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    const effortDefault = screen.getByTestId("settings-selection-antigravity-effort-current");
+    expect(within(effortDefault).getByRole("option", { name: "Medium" })).toBeDisabled();
+    await fireEvent.change(effortDefault, { target: { value: "medium" } });
+    expect(invokeMock.mock.calls.filter(([command]) => command === "set_preferences")).toHaveLength(
+      0,
+    );
 
-    for (const harness of ["claude_code", "codex", "antigravity"]) {
-      expect(screen.getByTestId(`settings-profile-${harness}-secondary-toggle`)).toHaveAttribute(
-        "aria-checked",
-        "true",
-      );
-      expect(screen.getByTestId(`settings-profile-${harness}-secondary`)).toBeInTheDocument();
-    }
+    await fireEvent.click(screen.getByTestId("show-builtins-toggle"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          agent_defaults: expect.objectContaining({
+            antigravity: {
+              ...DEFAULT_AGENT_SELECTIONS.antigravity,
+              effort_choices: ["high", "medium"],
+            },
+          }),
+        }),
+      }),
+    );
   });
 
   it("keeps backend preference controls unavailable until saved values are authoritative", async () => {
@@ -196,7 +207,7 @@ describe("SettingsView", () => {
 
     render(SettingsView, { props: { onClose: vi.fn() } });
     expect(screen.getByTestId("agent-defaults-loading")).toBeInTheDocument();
-    expect(screen.queryByTestId("settings-profile-claude_code-primary-model")).toBeNull();
+    expect(screen.queryByTestId("settings-selection-claude_code-model")).toBeNull();
     expect(screen.getByTestId("external-editor-command")).toBeDisabled();
     expect(screen.getByTestId("external-terminal-app")).toHaveAttribute("aria-disabled", "true");
     expect(screen.getByTestId("external-terminal-app-option-terminal")).toBeDisabled();
@@ -217,19 +228,20 @@ describe("SettingsView", () => {
       notify_on_completion: true,
       notify_while_focused: false,
       agent_defaults: {
-        ...structuredClone(DEFAULT_AGENT_PROFILES),
+        ...structuredClone(DEFAULT_AGENT_SELECTIONS),
         claude_code: {
-          primary: { model: "sonnet", effort: "low" },
-          secondary: null,
+          model_choices: ["sonnet"],
+          effort_choices: ["low"],
+          default_model: "sonnet",
+          default_effort: "low",
         },
       },
     });
 
     await waitFor(() =>
-      expect(screen.getByTestId("settings-profile-claude_code-primary-model")).toHaveAttribute(
-        "data-value",
-        "sonnet",
-      ),
+      expect(
+        screen.getByTestId("settings-selection-claude_code-model-choice-sonnet"),
+      ).toHaveAttribute("aria-pressed", "true"),
     );
     const editor = screen.getByTestId("external-editor-command") as HTMLInputElement;
     const terminal = screen.getByTestId("external-terminal-app");
@@ -252,15 +264,17 @@ describe("SettingsView", () => {
     );
 
     await fireEvent.click(
-      screen.getByTestId("settings-profile-claude_code-primary-effort-option-medium"),
+      screen.getByTestId("settings-selection-claude_code-effort-choice-medium"),
     );
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             claude_code: {
-              primary: { model: "sonnet", effort: "medium" },
-              secondary: null,
+              model_choices: ["sonnet"],
+              effort_choices: ["low", "medium"],
+              default_model: "sonnet",
+              default_effort: "low",
             },
           }),
         }),
@@ -447,7 +461,7 @@ describe("SettingsView", () => {
           auto_reading_mode: false,
           notify_on_completion: true,
           notify_while_focused: false,
-          agent_defaults: DEFAULT_AGENT_PROFILES,
+          agent_defaults: DEFAULT_AGENT_SELECTIONS,
         };
       return defaultInvoke(cmd, args);
     });

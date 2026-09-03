@@ -199,6 +199,10 @@ const BOB: AgentRecord = {
   name: "bob",
   harness: "codex",
   session_locator: null,
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:00Z",
 };
 const CAROL: AgentRecord = {
@@ -207,6 +211,10 @@ const CAROL: AgentRecord = {
   name: "carol",
   harness: "claude_code",
   session_locator: null,
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:01Z",
 };
 
@@ -256,6 +264,10 @@ describe("PromptComposer per-argument forwarding", () => {
       name: "oracle",
       harness: "claude_code" as const,
       session_locator: null,
+      model: null,
+      effort: null,
+      model_choices: [],
+      effort_choices: [],
       created_at: "2026-05-16T00:00:00Z",
     };
     setupForward(

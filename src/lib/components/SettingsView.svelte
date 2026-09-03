@@ -13,7 +13,7 @@
     SEGMENTED_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
   import HarnessStatusList from "$lib/components/HarnessStatusList.svelte";
-  import AgentProfileEditor from "$lib/components/AgentProfileEditor.svelte";
+  import AgentSelectionEditor from "$lib/components/AgentSelectionEditor.svelte";
   import Input from "$lib/components/ui/Input.svelte";
   import Switch from "$lib/components/ui/Switch.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
@@ -34,7 +34,8 @@
     openWorkflowsDir,
     notificationAvailability,
   } from "$lib/api";
-  import type { AgentProfile, HarnessKind, NotificationAvailability } from "$lib/types";
+  import type { AgentSelection, HarnessKind, NotificationAvailability } from "$lib/types";
+  import { selectionIsValid } from "$lib/agentSelection";
   import { HARNESS_LABEL, ALL_HARNESSES } from "$lib/harnessDisplay";
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
 
@@ -180,17 +181,28 @@
 
   async function updateAgentDefault(
     harness: HarnessKind,
-    slot: "primary" | "secondary",
-    profile: AgentProfile | null,
+    selection: AgentSelection,
   ): Promise<void> {
+    if (!selectionIsValid(selection, harness)) return;
     await loadPreferences();
     const agentDefaults = structuredClone($state.snapshot(preferences.agent_defaults));
-    if (slot === "primary" && profile !== null) {
-      agentDefaults[harness].primary = profile;
-    } else if (slot === "secondary") {
-      agentDefaults[harness].secondary = profile;
-    }
+    agentDefaults[harness] = {
+      model_choices: [...selection.model_choices],
+      effort_choices: [...selection.effort_choices],
+      default_model: selection.model,
+      default_effort: selection.effort,
+    };
     await updatePreferences({ agent_defaults: agentDefaults });
+  }
+
+  function defaultSelection(harness: HarnessKind): AgentSelection {
+    const defaults = preferences.agent_defaults[harness];
+    return {
+      model: defaults.default_model,
+      effort: defaults.default_effort,
+      model_choices: defaults.model_choices,
+      effort_choices: defaults.effort_choices,
+    };
   }
 </script>
 
@@ -255,8 +267,8 @@
       <div>
         <h2 class={sectionHeadingClass}>Agent Defaults</h2>
         <p class="text-muted mt-1 text-sm leading-relaxed">
-          Choose the initial model settings for new agents and projects. An optional secondary
-          configuration makes it easy to switch an agent between two setups.
+          Choose the model and reasoning-effort quick choices copied into new agents and projects.
+          Existing agents keep their own configuration.
         </p>
       </div>
 
@@ -273,17 +285,12 @@
                 {HARNESS_LABEL[harness]}
               </summary>
               <div class="border-border border-t p-3">
-                <AgentProfileEditor
+                <AgentSelectionEditor
                   {harness}
-                  bind:primary={
-                    () => preferences.agent_defaults[harness].primary,
-                    (value) => updateAgentDefault(harness, "primary", value)
-                  }
-                  bind:secondary={
-                    () => preferences.agent_defaults[harness].secondary,
-                    (value) => updateAgentDefault(harness, "secondary", value)
-                  }
-                  testidPrefix={`settings-profile-${harness}`}
+                  selection={defaultSelection(harness)}
+                  context="default"
+                  onChange={(selection) => updateAgentDefault(harness, selection)}
+                  testidPrefix={`settings-selection-${harness}`}
                 />
               </div>
             </details>

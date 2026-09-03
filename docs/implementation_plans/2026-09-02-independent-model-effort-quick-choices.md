@@ -235,9 +235,10 @@ mapping before merging the new fields. This targeted deletion must not remove un
 unknown harness entries, or unrelated top-level preferences. Its rationale belongs beside the merge:
 known retired schema is removed while future data remains lossless.
 
-Once a registry or preferences file is next written, obsolete profile keys disappear. Delete the
-old profile types, commands, errors, helpers, tests, and user-facing copy in the same feature rather
-than retaining two representations indefinitely.
+Newly appended registry rows use only the new shape, and obsolete profile keys disappear from all
+rows the next time the registry is rewritten by an agent mutation. The next preferences save removes
+its obsolete keys. Delete the old profile types, commands, errors, helpers, tests, and user-facing
+copy in the same feature rather than retaining two in-memory or API representations indefinitely.
 
 ---
 

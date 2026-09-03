@@ -186,10 +186,9 @@ impl TestFactory {
 
 impl DispatchContextFactory for TestFactory {
     fn selection_snapshot(&self) -> Option<SelectionSnapshot> {
-        let selected = self.agent.active_profile();
         Some(SelectionSnapshot {
-            model: selected.model.clone(),
-            effort: selected.effort.clone(),
+            model: self.agent.model.clone(),
+            effort: self.agent.effort.clone(),
         })
     }
 
@@ -417,7 +416,8 @@ fn agent_record() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
-        profiles: switchboard_core::AgentProfiles::default(),
+        model_choices: Vec::new(),
+        effort_choices: Vec::new(),
         forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),

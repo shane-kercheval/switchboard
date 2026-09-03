@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { flushSync, tick } from "svelte";
 import type {
   AgentRecord,
+  AgentSelection,
   MessagePin,
   NormalizedEvent,
   Prompt,
@@ -14,7 +15,7 @@ import type {
   Preferences,
 } from "$lib/types";
 import { ALL_HARNESSES } from "$lib/harnessDisplay";
-import { DEFAULT_AGENT_PROFILES } from "$lib/agentSelection";
+import { DEFAULT_AGENT_SELECTIONS } from "$lib/agentSelection";
 import { shortcut } from "$lib/platform";
 // Static import so App.svelte's (large) component-tree transform happens at
 // module collection, not inside the first test that calls `mountApp`. `vi.mock`
@@ -152,7 +153,7 @@ function freshBackend(): Backend {
     pins: new Map(),
     failPinLoadFor: new Set(),
     failPinSaveFor: new Set(),
-    agentDefaults: structuredClone(DEFAULT_AGENT_PROFILES),
+    agentDefaults: structuredClone(DEFAULT_AGENT_SELECTIONS),
     preferencesGate: null,
   };
 }
@@ -269,6 +270,12 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
           name: args?.name as string,
           harness: args?.harness as AgentRecord["harness"],
           session_locator: null,
+          ...((args?.selection as AgentSelection | undefined) ?? {
+            model: null,
+            effort: null,
+            model_choices: [],
+            effort_choices: [],
+          }),
           created_at: "2026-05-20T00:00:01Z",
         } satisfies AgentRecord);
       const pid = backend.activeProjectId ?? "";
@@ -435,6 +442,10 @@ function agent(over: Partial<AgentRecord> & { id: string; project_id: string }):
     name: "assistant",
     harness: "claude_code",
     session_locator: { uuid: "33333333-3333-7000-8000-333333333333" },
+    model: null,
+    effort: null,
+    model_choices: [],
+    effort_choices: [],
     created_at: "2026-05-20T00:00:01Z",
     ...over,
   };
@@ -697,8 +708,8 @@ describe("App", () => {
 
     // All harnesses are installed and every one is auto-seeded
     // (no longer on individual plans) → one agent each for Claude/Codex/
-    // Antigravity, in HARNESSES order. Its two default profiles use the stable
-    // harness name rather than naming only one of the configurations.
+    // Antigravity, in HARNESSES order. Multiple quick choices use the stable
+    // harness name rather than naming only one possible configuration.
     await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
     expect(createAgentCalls()).toEqual([
       { name: "claude", harness: "claude_code" },
@@ -709,7 +720,7 @@ describe("App", () => {
     await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(3));
     expect(screen.queryByTestId("confirm-create-agent")).not.toBeInTheDocument();
 
-    // Each seeded agent is born with its harness's default profiles.
+    // Each seeded agent is born with its harness's complete default selection.
     const seededArgs = invokeMock.mock.calls
       .filter(([c]) => c === "create_agent")
       .map(
@@ -717,44 +728,49 @@ describe("App", () => {
           a as {
             name: string;
             harness: string;
-            model?: string;
-            effort?: string;
-            secondaryModel?: string;
-            secondaryEffort?: string;
+            selection: unknown;
           },
       );
     expect(seededArgs).toEqual([
       {
         name: "claude",
         harness: "claude_code",
-        model: "opus",
-        effort: "high",
-        secondaryModel: "sonnet",
-        secondaryEffort: "medium",
+        selection: {
+          model: "opus",
+          effort: "high",
+          model_choices: ["opus", "sonnet"],
+          effort_choices: ["high", "medium"],
+        },
       },
       {
         name: "codex",
         harness: "codex",
-        model: "gpt-5.6-sol",
-        effort: "high",
-        secondaryModel: "gpt-5.6-terra",
-        secondaryEffort: "medium",
+        selection: {
+          model: "gpt-5.6-sol",
+          effort: "high",
+          model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
+          effort_choices: ["high", "medium"],
+        },
       },
       {
         name: "antigravity",
         harness: "antigravity",
-        model: "gemini-3.1-pro",
-        effort: "high",
-        secondaryModel: "gemini-3.7-flash",
-        secondaryEffort: "high",
+        selection: {
+          model: "gemini-3.1-pro",
+          effort: "high",
+          model_choices: ["gemini-3.1-pro", "gemini-3.7-flash"],
+          effort_choices: ["high"],
+        },
       },
     ]);
   });
 
-  it("new project: applies the saved primary and secondary defaults", async () => {
+  it("new project: applies the saved quick choices and defaults", async () => {
     backend.agentDefaults.claude_code = {
-      primary: { model: "sonnet", effort: "medium" },
-      secondary: { model: "haiku", effort: "low" },
+      model_choices: ["sonnet", "haiku"],
+      effort_choices: ["medium", "low"],
+      default_model: "sonnet",
+      default_effort: "medium",
     };
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
@@ -768,17 +784,21 @@ describe("App", () => {
     expect(claudeArgs).toEqual({
       name: "claude",
       harness: "claude_code",
-      model: "sonnet",
-      effort: "medium",
-      secondaryModel: "haiku",
-      secondaryEffort: "low",
+      selection: {
+        model: "sonnet",
+        effort: "medium",
+        model_choices: ["sonnet", "haiku"],
+        effort_choices: ["medium", "low"],
+      },
     });
   });
 
   it("new project waits for saved defaults before seeding agents", async () => {
     backend.agentDefaults.claude_code = {
-      primary: { model: "sonnet", effort: "medium" },
-      secondary: { model: "haiku", effort: "low" },
+      model_choices: ["sonnet", "haiku"],
+      effort_choices: ["medium", "low"],
+      default_model: "sonnet",
+      default_effort: "medium",
     };
     const preferencesGate = deferred<void>();
     backend.preferencesGate = preferencesGate.promise;
@@ -799,10 +819,12 @@ describe("App", () => {
     expect(claudeArgs).toEqual({
       name: "claude",
       harness: "claude_code",
-      model: "sonnet",
-      effort: "medium",
-      secondaryModel: "haiku",
-      secondaryEffort: "low",
+      selection: {
+        model: "sonnet",
+        effort: "medium",
+        model_choices: ["sonnet", "haiku"],
+        effort_choices: ["medium", "low"],
+      },
     });
   });
 
@@ -1436,10 +1458,12 @@ describe("App", () => {
     expect(createCalls[0]?.[1]).toEqual({
       name: "claude",
       harness: "claude_code",
-      model: "opus",
-      effort: "high",
-      secondaryModel: "sonnet",
-      secondaryEffort: "medium",
+      selection: {
+        model: "opus",
+        effort: "high",
+        model_choices: ["opus", "sonnet"],
+        effort_choices: ["high", "medium"],
+      },
     });
   });
 

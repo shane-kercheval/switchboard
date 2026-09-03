@@ -1,15 +1,19 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import type { AgentProfile, AgentRecord, HarnessAvailability, HarnessKind } from "$lib/types";
+  import type { AgentRecord, AgentSelection, HarnessAvailability, HarnessKind } from "$lib/types";
   import type { AgentFormSubmit } from "./CreateAgentForm.types";
   import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
   import { HARNESS_LABEL, ALL_HARNESSES } from "$lib/harnessDisplay";
-  import { defaultAgentName, defaultAgentNameForProfiles } from "$lib/agentSelection";
+  import {
+    defaultAgentName,
+    defaultAgentNameForSelection,
+    selectionIsValid,
+  } from "$lib/agentSelection";
   import { loadPreferences, preferenceLoadState, preferences } from "$lib/preferences.svelte";
   import { normalizeAgentName, validateAgentName } from "$lib/agentName";
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
-  import AgentProfileEditor from "$lib/components/AgentProfileEditor.svelte";
+  import AgentSelectionEditor from "$lib/components/AgentSelectionEditor.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { cn } from "$lib/utils";
   import {
@@ -52,7 +56,7 @@
   }: Props = $props();
   let name = $state<string>("");
   /// Set once the user edits the name field, which freezes it: until then the
-  /// name tracks the profile/harness selection (see the `$effect` below);
+  /// name tracks the model/effort and harness selection (see the `$effect` below);
   /// after, the user's value is theirs to keep.
   let nameTouched = $state<boolean>(false);
   let harness = $state<HarnessKind>("claude_code");
@@ -63,30 +67,28 @@
   /// existing on-disk session and pins nothing: the pickers aren't shown there
   /// and no model/effort flag is submitted, so the harness runs the resumed
   /// session as-is. The user manages model/effort from the agent's actions menu
-  /// afterward (the canonical place for an existing agent). The empty string is
-  /// the "unset" sentinel for a create-mode harness with no capability on an
-  /// axis — it maps to `undefined` on submit so the backend
-  /// stores `None`.
-  function defaultsFor(kind: HarnessKind): {
-    primary: AgentProfile;
-    secondary: AgentProfile | null;
-  } {
+  /// afterward (the canonical place for an existing agent).
+  function defaultsFor(kind: HarnessKind): AgentSelection {
     const defaults = preferences.agent_defaults[kind];
     return {
-      primary: { ...defaults.primary },
-      secondary: defaults.secondary === null ? null : { ...defaults.secondary },
+      model: defaults.default_model,
+      effort: defaults.default_effort,
+      model_choices: [...defaults.model_choices],
+      effort_choices: [...defaults.effort_choices],
     };
   }
-  let primary = $state<AgentProfile>({ model: null, effort: null });
-  let secondary = $state<AgentProfile | null>(null);
+  let agentSelection = $state<AgentSelection>({
+    model: null,
+    effort: null,
+    model_choices: [],
+    effort_choices: [],
+  });
   let defaultsInitialized = $state<boolean>(false);
 
   function initializeDefaults(): void {
     if (defaultsInitialized) return;
-    const defaults = defaultsFor(harness);
-    primary = defaults.primary;
-    secondary = defaults.secondary;
-    name = defaultAgentNameForProfiles(harness, primary, secondary);
+    agentSelection = defaultsFor(harness);
+    name = defaultAgentNameForSelection(harness, agentSelection);
     defaultsInitialized = true;
   }
 
@@ -99,8 +101,8 @@
   });
 
   /// Keep the name in lock-step with the current selection while the user
-  /// hasn't taken it over. A primary-only create tracks model/effort; enabling
-  /// Secondary switches to the harness name because either profile may run.
+  /// hasn't taken it over. Multiple choices use the stable harness name because
+  /// either axis may change after creation.
   /// Attach keeps the bare harness name because it inherits an existing session
   /// and pins nothing. Writing `name` here is safe — the effect never reads it,
   /// so there's no reactive loop.
@@ -108,7 +110,7 @@
     const auto =
       mode === "attach"
         ? defaultAgentName(harness, undefined, undefined)
-        : defaultAgentNameForProfiles(harness, primary, secondary);
+        : defaultAgentNameForSelection(harness, agentSelection);
     if (!nameTouched) name = auto;
   });
 
@@ -164,7 +166,12 @@
   );
 
   const canSubmit = $derived(
-    defaultsInitialized && !busy && nameValidation.ok && sessionIdValid && selectedSelectable,
+    defaultsInitialized &&
+      !busy &&
+      nameValidation.ok &&
+      sessionIdValid &&
+      selectedSelectable &&
+      (mode === "attach" || selectionIsValid(agentSelection, harness)),
   );
   const formDisabled = $derived(busy || !defaultsInitialized);
 
@@ -189,8 +196,7 @@
       mode: "create",
       name: trimmedName,
       harness,
-      primary: $state.snapshot(primary),
-      secondary: secondary === null ? null : $state.snapshot(secondary),
+      selection: $state.snapshot(agentSelection),
     });
   }
 
@@ -210,8 +216,7 @@
     // Reset the pickers to the new harness's default so a stale, out-of-list
     // value (e.g. a Codex model carried over to Antigravity) can't be submitted.
     const defaults = defaultsFor(kind);
-    primary = defaults.primary;
-    secondary = defaults.secondary;
+    agentSelection = defaults;
   }
 
   function selectMode(next: "create" | "attach"): void {
@@ -349,14 +354,13 @@
        actions menu afterward. -->
   {#if mode === "create"}
     {#if defaultsInitialized}
-      <AgentProfileEditor
+      <AgentSelectionEditor
         {harness}
-        bind:primary
-        bind:secondary
-        secondarySuggestion={preferences.agent_defaults[harness].secondary}
+        selection={agentSelection}
+        context="start"
+        onChange={(next) => (agentSelection = next)}
         disabled={formDisabled}
-        testidPrefix="create-profile"
-        legacyPrimaryTestids
+        testidPrefix="create-selection"
       />
     {:else}
       <p class="text-muted text-xs" data-testid="agent-defaults-loading">Loading defaults…</p>

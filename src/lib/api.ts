@@ -8,9 +8,8 @@ import type {
   ActivationCommandError,
   ActivationFailureKind,
   AgentId,
-  AgentProfile,
-  AgentProfileSlot,
   AgentRecord,
+  AgentSelection,
   ForwardSourceRef,
   Attachment,
   BranchComparison,
@@ -431,17 +430,12 @@ export async function setActiveProject(projectId: ProjectId): Promise<void> {
 export async function createAgent(
   name: string,
   harness: HarnessKind,
-  model?: string,
-  effort?: string,
-  secondary?: AgentProfile | null,
+  selection: AgentSelection,
 ): Promise<AgentRecord> {
   return await invoke<AgentRecord>("create_agent", {
     name,
     harness,
-    model,
-    effort,
-    secondaryModel: secondary?.model ?? undefined,
-    secondaryEffort: secondary?.effort ?? undefined,
+    selection,
   });
 }
 
@@ -467,34 +461,22 @@ export async function renameAgent(agentId: AgentId, newName: string): Promise<Ag
   return await invoke<AgentRecord>("rename_agent", { agentId, newName });
 }
 
-export async function setAgentProfiles(
+export async function setAgentSelection(
   agentId: AgentId,
-  primary: AgentProfile,
-  secondary: AgentProfile | null,
+  selection: AgentSelection,
 ): Promise<AgentRecord> {
-  return await invoke<AgentRecord>("set_agent_profiles", { agentId, primary, secondary });
-}
-
-export async function setActiveAgentProfile(
-  agentId: AgentId,
-  active: AgentProfileSlot,
-): Promise<AgentRecord> {
-  return await invoke<AgentRecord>("set_active_agent_profile", { agentId, active });
+  return await invoke<AgentRecord>("set_agent_selection", { agentId, selection });
 }
 
 export async function attachAgent(
   name: string,
   harness: HarnessKind,
   existingSessionId: string,
-  model?: string,
-  effort?: string,
 ): Promise<AgentRecord> {
   return await invoke<AgentRecord>("attach_agent", {
     name,
     harness,
     existingSessionId,
-    model,
-    effort,
   });
 }
 

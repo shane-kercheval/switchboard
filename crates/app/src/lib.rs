@@ -322,7 +322,7 @@ use crate::commands::{
     check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
     check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
     commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl,
-    create_agent_with_profiles_impl, create_project_impl, delete_project_impl, editor_open_argv,
+    create_agent_impl, create_project_impl, delete_project_impl, editor_open_argv,
     existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl, fork_agent_impl,
     forward_message_impl, forward_prompt_impl, get_preferences_impl, get_prompt_source_impl,
     harness_adapter_for, install_status_for_adapter, list_agents_impl, list_mcp_providers_impl,
@@ -336,13 +336,12 @@ use crate::commands::{
     rename_agent_impl, rename_project_impl, render_prompt_impl, reorder_agents_impl,
     resolve_saved_prompt_fresh_impl, resolve_saved_prompt_impl, resume_agent_in_terminal_impl,
     reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
-    send_message_impl, set_active_agent_profile_impl, set_active_project_impl,
-    set_agent_profiles_impl, set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
-    set_project_directory_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
-    sign_out_mcp_provider_impl, spawn_prompt_resolution_change_notifications,
-    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
-    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
-    workspace_status_impl,
+    send_message_impl, set_active_project_impl, set_agent_selection_impl, set_message_pin_impl,
+    set_preferences_impl, set_project_archived_impl, set_project_directory_impl,
+    set_visible_project_impl, sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
+    spawn_prompt_resolution_change_notifications, stage_attachment_impl, sync_prompts_and_notify,
+    terminal_open_argv, test_mcp_connection_impl, test_saved_mcp_provider_impl,
+    tracked_repos_inputs, tracked_roots, validate_external_url, workspace_status_impl,
 };
 use crate::error::AppError;
 use crate::preferences::Preferences;
@@ -1013,21 +1012,9 @@ async fn create_agent(
     state: State<'_, AppState>,
     name: String,
     harness: HarnessKind,
-    model: Option<String>,
-    effort: Option<String>,
-    secondary_model: Option<String>,
-    secondary_effort: Option<String>,
+    selection: switchboard_core::AgentSelection,
 ) -> Result<AgentRecord, String> {
-    let secondary = if secondary_model.is_some() || secondary_effort.is_some() {
-        Some(switchboard_core::AgentProfile {
-            model: secondary_model,
-            effort: secondary_effort,
-        })
-    } else {
-        None
-    };
-    create_agent_with_profiles_impl(state.inner(), &name, harness, model, effort, secondary)
-        .map_err(|e| e.to_string())
+    create_agent_impl(state.inner(), &name, harness, selection).map_err(|e| e.to_string())
 }
 
 /// Branch an agent's conversation into a new one. Registration only — the
@@ -1045,24 +1032,13 @@ async fn fork_agent(state: State<'_, AppState>, agent_id: String) -> Result<Agen
 }
 
 #[tauri::command]
-async fn set_agent_profiles(
+async fn set_agent_selection(
     state: State<'_, AppState>,
     agent_id: String,
-    primary: switchboard_core::AgentProfile,
-    secondary: Option<switchboard_core::AgentProfile>,
+    selection: switchboard_core::AgentSelection,
 ) -> Result<AgentRecord, String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
-    set_agent_profiles_impl(state.inner(), id, primary, secondary).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn set_active_agent_profile(
-    state: State<'_, AppState>,
-    agent_id: String,
-    active: switchboard_core::AgentProfileSlot,
-) -> Result<AgentRecord, String> {
-    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
-    set_active_agent_profile_impl(state.inner(), id, active).map_err(|e| e.to_string())
+    set_agent_selection_impl(state.inner(), id, selection).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1089,22 +1065,12 @@ async fn attach_agent(
     name: String,
     harness: HarnessKind,
     existing_session_id: String,
-    model: Option<String>,
-    effort: Option<String>,
 ) -> Result<AgentRecord, String> {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    attach_agent_impl(
-        state.inner(),
-        &name,
-        harness,
-        &existing_session_id,
-        &home,
-        model,
-        effort,
-    )
-    .map_err(|e| e.to_string())
+    attach_agent_impl(state.inner(), &name, harness, &existing_session_id, &home)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2377,8 +2343,7 @@ pub fn run() {
             fork_agent,
             remove_agent,
             rename_agent,
-            set_agent_profiles,
-            set_active_agent_profile,
+            set_agent_selection,
             reorder_agents,
             attach_agent,
             list_agents,

@@ -29,6 +29,10 @@ const BOB: AgentRecord = {
   name: "bob",
   harness: "codex",
   session_locator: null,
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:01Z",
 };
 

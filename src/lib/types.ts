@@ -518,16 +518,11 @@ export type SessionLocator =
   | { uuid: string }
   | { codex: { thread_id: string; partition_date: string } };
 
-export type AgentProfile = {
+export type AgentSelection = {
   model: string | null;
   effort: string | null;
-};
-
-export type AgentProfileSlot = "primary" | "secondary";
-
-export type AgentProfiles = {
-  secondary: AgentProfile | null;
-  active: AgentProfileSlot;
+  model_choices: string[];
+  effort_choices: string[];
 };
 
 // Mirror of `crates/core::AgentRecord`. `session_locator` is `null` for
@@ -544,9 +539,10 @@ export type AgentRecord = {
   // The user's selected model + reasoning effort (intent), shown in the sidebar.
   // `null`/absent when the user hasn't chosen one (the harness applies its own
   // default) or for a pre-feature agent.
-  model?: string | null;
-  effort?: string | null;
-  profiles?: AgentProfiles;
+  model: string | null;
+  effort: string | null;
+  model_choices: string[];
+  effort_choices: string[];
   // Set on an agent created by forking: the parent session this branch resumes
   // from until it has a session of its own. Stays set after the fork
   // materializes (it doubles as durable lineage), so it is NOT a reliable
@@ -790,7 +786,15 @@ export type Preferences = {
   auto_reading_mode: boolean;
   notify_on_completion: boolean;
   notify_while_focused: boolean;
-  agent_defaults: Record<HarnessKind, { primary: AgentProfile; secondary: AgentProfile | null }>;
+  agent_defaults: Record<
+    HarnessKind,
+    {
+      model_choices: string[];
+      effort_choices: string[];
+      default_model: string | null;
+      default_effort: string | null;
+    }
+  >;
 };
 
 // Mirror of Rust `NotificationAvailability` (`crates/app/src/notification.rs`).

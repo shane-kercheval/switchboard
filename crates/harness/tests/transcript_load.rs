@@ -225,7 +225,8 @@ async fn live_claude_transcript_load_round_trips() {
     let agent = AgentRecord {
         model: None,
         effort: None,
-        profiles: switchboard_core::AgentProfiles::default(),
+        model_choices: Vec::new(),
+        effort_choices: Vec::new(),
         forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
@@ -287,7 +288,8 @@ async fn live_claude_transcript_load_hydrates_tool_items() {
     let agent = AgentRecord {
         model: None,
         effort: None,
-        profiles: switchboard_core::AgentProfiles::default(),
+        model_choices: Vec::new(),
+        effort_choices: Vec::new(),
         forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
@@ -397,7 +399,8 @@ async fn live_claude_tool_results_bind_after_restart() {
     let agent = AgentRecord {
         model: None,
         effort: None,
-        profiles: switchboard_core::AgentProfiles::default(),
+        model_choices: Vec::new(),
+        effort_choices: Vec::new(),
         forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
@@ -488,7 +491,8 @@ async fn live_codex_transcript_load_via_captured_locator_round_trips() {
     let agent = AgentRecord {
         model: None,
         effort: None,
-        profiles: switchboard_core::AgentProfiles::default(),
+        model_choices: Vec::new(),
+        effort_choices: Vec::new(),
         forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
@@ -565,7 +569,8 @@ async fn live_codex_transcript_load_hydrates_tool_items() {
     let agent = AgentRecord {
         model: None,
         effort: None,
-        profiles: switchboard_core::AgentProfiles::default(),
+        model_choices: Vec::new(),
+        effort_choices: Vec::new(),
         forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
@@ -764,7 +769,8 @@ async fn live_antigravity_two_turns_hydrate_in_order() {
     let mut agent = AgentRecord {
         model: None,
         effort: None,
-        profiles: switchboard_core::AgentProfiles::default(),
+        model_choices: Vec::new(),
+        effort_choices: Vec::new(),
         forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),

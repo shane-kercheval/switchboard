@@ -869,7 +869,8 @@ mod tests {
                 session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
                 model: None,
                 effort: None,
-                profiles: switchboard_core::AgentProfiles::default(),
+                model_choices: Vec::new(),
+                effort_choices: Vec::new(),
                 forked_from_session: None,
                 created_at: Utc::now(),
             };

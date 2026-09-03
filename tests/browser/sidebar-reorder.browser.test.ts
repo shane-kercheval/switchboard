@@ -19,8 +19,7 @@ vi.mock("$lib/state/workspace.svelte", () => ({
   renameAgent: vi.fn(async () => undefined),
   reorderAgents: (projectId: string, orderedIds: string[]) =>
     reorderAgentsMock(projectId, orderedIds),
-  setAgentProfiles: vi.fn(async () => undefined),
-  setActiveAgentProfile: vi.fn(async () => undefined),
+  setAgentSelection: vi.fn(async () => undefined),
 }));
 
 import { render } from "vitest-browser-svelte";
@@ -36,6 +35,10 @@ const BOB: AgentRecord = {
   name: "bob",
   harness: "codex",
   session_locator: null,
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:01Z",
 };
 
@@ -45,6 +48,10 @@ const CAROL: AgentRecord = {
   name: "carol",
   harness: "antigravity",
   session_locator: null,
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:02Z",
 };
 

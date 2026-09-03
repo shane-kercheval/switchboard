@@ -25,15 +25,73 @@ use std::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::error::AppError;
-use switchboard_core::{AgentProfile, HarnessKind};
+use switchboard_core::{AgentSelection, HarnessKind, normalize_agent_selection};
 
-/// Primary and optional secondary configuration used when creating an agent of
-/// one harness. New agents always start on Primary.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(default)]
+/// Independent quick choices and starting defaults for one harness.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct AgentDefaults {
-    pub primary: AgentProfile,
-    pub secondary: Option<AgentProfile>,
+    pub model_choices: Vec<String>,
+    pub effort_choices: Vec<String>,
+    pub default_model: Option<String>,
+    pub default_effort: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AgentDefaultsWire {
+    model_choices: Vec<String>,
+    effort_choices: Vec<String>,
+    default_model: Option<String>,
+    default_effort: Option<String>,
+    primary: Option<LegacyPreferenceProfile>,
+    secondary: Option<LegacyPreferenceProfile>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LegacyPreferenceProfile {
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for AgentDefaults {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentDefaultsWire::deserialize(deserializer)?;
+        if wire.primary.is_some() || wire.secondary.is_some() {
+            let primary = wire.primary.unwrap_or_default();
+            let model_choices = legacy_default_choices(
+                primary.model.as_ref(),
+                wire.secondary
+                    .as_ref()
+                    .and_then(|profile| profile.model.as_ref()),
+            );
+            let effort_choices = legacy_default_choices(
+                primary.effort.as_ref(),
+                wire.secondary
+                    .as_ref()
+                    .and_then(|profile| profile.effort.as_ref()),
+            );
+            return Ok(Self {
+                default_model: primary.model.or_else(|| model_choices.first().cloned()),
+                default_effort: primary.effort.or_else(|| effort_choices.first().cloned()),
+                model_choices,
+                effort_choices,
+            });
+        }
+        Ok(Self {
+            model_choices: wire.model_choices,
+            effort_choices: wire.effort_choices,
+            default_model: wire.default_model,
+            default_effort: wire.default_effort,
+        })
+    }
+}
+
+fn legacy_default_choices(primary: Option<&String>, secondary: Option<&String>) -> Vec<String> {
+    primary.into_iter().chain(secondary).cloned().collect()
 }
 
 fn default_agent_defaults() -> BTreeMap<HarnessKind, AgentDefaults> {
@@ -41,40 +99,28 @@ fn default_agent_defaults() -> BTreeMap<HarnessKind, AgentDefaults> {
         (
             HarnessKind::ClaudeCode,
             AgentDefaults {
-                primary: AgentProfile {
-                    model: Some("opus".to_owned()),
-                    effort: Some("high".to_owned()),
-                },
-                secondary: Some(AgentProfile {
-                    model: Some("sonnet".to_owned()),
-                    effort: Some("medium".to_owned()),
-                }),
+                model_choices: vec!["opus".to_owned(), "sonnet".to_owned()],
+                effort_choices: vec!["high".to_owned(), "medium".to_owned()],
+                default_model: Some("opus".to_owned()),
+                default_effort: Some("high".to_owned()),
             },
         ),
         (
             HarnessKind::Codex,
             AgentDefaults {
-                primary: AgentProfile {
-                    model: Some("gpt-5.6-sol".to_owned()),
-                    effort: Some("high".to_owned()),
-                },
-                secondary: Some(AgentProfile {
-                    model: Some("gpt-5.6-terra".to_owned()),
-                    effort: Some("medium".to_owned()),
-                }),
+                model_choices: vec!["gpt-5.6-sol".to_owned(), "gpt-5.6-terra".to_owned()],
+                effort_choices: vec!["high".to_owned(), "medium".to_owned()],
+                default_model: Some("gpt-5.6-sol".to_owned()),
+                default_effort: Some("high".to_owned()),
             },
         ),
         (
             HarnessKind::Antigravity,
             AgentDefaults {
-                primary: AgentProfile {
-                    model: Some("gemini-3.1-pro".to_owned()),
-                    effort: Some("high".to_owned()),
-                },
-                secondary: Some(AgentProfile {
-                    model: Some("gemini-3.7-flash".to_owned()),
-                    effort: Some("high".to_owned()),
-                }),
+                model_choices: vec!["gemini-3.1-pro".to_owned(), "gemini-3.7-flash".to_owned()],
+                effort_choices: vec!["high".to_owned()],
+                default_model: Some("gemini-3.1-pro".to_owned()),
+                default_effort: Some("high".to_owned()),
             },
         ),
     ])
@@ -118,6 +164,20 @@ fn merge_yaml_value(existing: &mut serde_norway::Value, new: serde_norway::Value
             }
         }
         (existing, new) => *existing = new,
+    }
+}
+
+fn remove_legacy_agent_default_keys(value: &mut serde_norway::Value) {
+    let serde_norway::Value::Mapping(harnesses) = value else {
+        return;
+    };
+    for harness in ["claude_code", "codex", "antigravity"] {
+        let harness_key = serde_norway::Value::String(harness.to_owned());
+        let Some(serde_norway::Value::Mapping(defaults)) = harnesses.get_mut(&harness_key) else {
+            continue;
+        };
+        defaults.remove(serde_norway::Value::String("primary".to_owned()));
+        defaults.remove(serde_norway::Value::String("secondary".to_owned()));
     }
 }
 
@@ -211,7 +271,7 @@ pub struct Preferences {
     /// send today and a surprise for everyone else.
     pub auto_reading_mode: bool,
 
-    /// Per-harness profiles preselected by Add Agent and used when a new
+    /// Per-harness model/effort choices preselected by Add Agent and used when a new
     /// project auto-creates its roster.
     #[serde(
         default = "default_agent_defaults",
@@ -258,36 +318,51 @@ impl Preferences {
             }
         };
         let mut agent_defaults = default_agent_defaults();
-        for (harness, mut defaults) in self.agent_defaults {
-            let normalize = |value: Option<String>| {
-                value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
-            };
-            defaults.primary.model = normalize(defaults.primary.model);
-            defaults.primary.effort = normalize(defaults.primary.effort);
-            if let Some(secondary) = &mut defaults.secondary {
-                secondary.model = normalize(secondary.model.take());
-                secondary.effort = normalize(secondary.effort.take());
-            }
+        for (harness, defaults) in self.agent_defaults {
+            let built_in = &agent_defaults[&harness];
+            let mut selection = normalize_agent_selection(AgentSelection {
+                model: defaults.default_model,
+                effort: defaults.default_effort,
+                model_choices: defaults.model_choices,
+                effort_choices: defaults.effort_choices,
+            });
             if !harness.supports_model_selection() {
-                defaults.primary.model = None;
-                if let Some(secondary) = &mut defaults.secondary {
-                    secondary.model = None;
-                }
+                selection.model = None;
+                selection.model_choices.clear();
+            } else if selection.model_choices.is_empty() {
+                selection.model_choices.clone_from(&built_in.model_choices);
+                selection.model.clone_from(&built_in.default_model);
+            } else if selection
+                .model
+                .as_ref()
+                .is_none_or(|model| !selection.model_choices.contains(model))
+            {
+                selection.model = selection.model_choices.first().cloned();
             }
             if !harness.supports_effort_selection() {
-                defaults.primary.effort = None;
-                if let Some(secondary) = &mut defaults.secondary {
-                    secondary.effort = None;
-                }
-            }
-            if defaults
-                .secondary
+                selection.effort = None;
+                selection.effort_choices.clear();
+            } else if selection.effort_choices.is_empty() {
+                selection
+                    .effort_choices
+                    .clone_from(&built_in.effort_choices);
+                selection.effort.clone_from(&built_in.default_effort);
+            } else if selection
+                .effort
                 .as_ref()
-                .is_some_and(|p| p.model.is_none() && p.effort.is_none())
+                .is_none_or(|effort| !selection.effort_choices.contains(effort))
             {
-                defaults.secondary = None;
+                selection.effort = selection.effort_choices.first().cloned();
             }
-            agent_defaults.insert(harness, defaults);
+            agent_defaults.insert(
+                harness,
+                AgentDefaults {
+                    model_choices: selection.model_choices,
+                    effort_choices: selection.effort_choices,
+                    default_model: selection.model,
+                    default_effort: selection.effort,
+                },
+            );
         }
         Self {
             editor_command,
@@ -361,7 +436,12 @@ pub fn save(path: &Path, prefs: &Preferences) -> Result<(), AppError> {
         let defaults_key = serde_norway::Value::String("agent_defaults".to_owned());
         if let Some(new_defaults) = fields.remove(&defaults_key) {
             match root.get_mut(&defaults_key) {
-                Some(existing) => merge_yaml_value(existing, new_defaults),
+                Some(existing) => {
+                    // The recursive merge preserves unknown future data, so
+                    // known retired schema must be removed deliberately.
+                    remove_legacy_agent_default_keys(existing);
+                    merge_yaml_value(existing, new_defaults);
+                }
                 None => {
                     root.insert(defaults_key, new_defaults);
                 }
@@ -482,44 +562,39 @@ mod tests {
     }
 
     #[test]
-    fn every_harness_has_a_secondary_default() {
+    fn every_harness_has_non_empty_quick_choices_and_defaults() {
         let defaults = Preferences::default();
 
         assert!(
             defaults
                 .agent_defaults
                 .values()
-                .all(|value| value.secondary.is_some())
+                .all(|value| !value.model_choices.is_empty()
+                    && !value.effort_choices.is_empty()
+                    && value.default_model.is_some()
+                    && value.default_effort.is_some())
         );
         assert_eq!(
             defaults.agent_defaults[&HarnessKind::Antigravity],
             AgentDefaults {
-                primary: AgentProfile {
-                    model: Some("gemini-3.1-pro".to_owned()),
-                    effort: Some("high".to_owned()),
-                },
-                secondary: Some(AgentProfile {
-                    model: Some("gemini-3.7-flash".to_owned()),
-                    effort: Some("high".to_owned()),
-                }),
+                model_choices: vec!["gemini-3.1-pro".to_owned(), "gemini-3.7-flash".to_owned()],
+                effort_choices: vec!["high".to_owned()],
+                default_model: Some("gemini-3.1-pro".to_owned()),
+                default_effort: Some("high".to_owned()),
             }
         );
     }
 
     #[test]
-    fn agent_defaults_normalize_profiles_and_fill_missing_harnesses() {
+    fn agent_defaults_normalize_choices_and_fill_missing_harnesses() {
         let prefs = Preferences {
             agent_defaults: BTreeMap::from([(
                 HarnessKind::ClaudeCode,
                 AgentDefaults {
-                    primary: AgentProfile {
-                        model: Some("  sonnet  ".to_owned()),
-                        effort: Some(" medium ".to_owned()),
-                    },
-                    secondary: Some(AgentProfile {
-                        model: Some(" haiku ".to_owned()),
-                        effort: Some(" low ".to_owned()),
-                    }),
+                    model_choices: vec!["  sonnet  ".to_owned(), " haiku ".to_owned()],
+                    effort_choices: vec![" medium ".to_owned(), " low ".to_owned()],
+                    default_model: Some("  sonnet  ".to_owned()),
+                    default_effort: Some(" medium ".to_owned()),
                 },
             )]),
             ..Preferences::default()
@@ -529,14 +604,10 @@ mod tests {
         assert_eq!(
             prefs.agent_defaults[&HarnessKind::ClaudeCode],
             AgentDefaults {
-                primary: AgentProfile {
-                    model: Some("sonnet".to_owned()),
-                    effort: Some("medium".to_owned()),
-                },
-                secondary: Some(AgentProfile {
-                    model: Some("haiku".to_owned()),
-                    effort: Some("low".to_owned()),
-                }),
+                model_choices: vec!["sonnet".to_owned(), "haiku".to_owned()],
+                effort_choices: vec!["medium".to_owned(), "low".to_owned()],
+                default_model: Some("sonnet".to_owned()),
+                default_effort: Some("medium".to_owned()),
             }
         );
         assert_eq!(
@@ -559,8 +630,7 @@ mod tests {
         assert_eq!(prefs.terminal_app, "iTerm");
         assert_eq!(
             prefs.agent_defaults[&HarnessKind::ClaudeCode]
-                .primary
-                .model
+                .default_model
                 .as_deref(),
             Some("sonnet")
         );
@@ -568,7 +638,7 @@ mod tests {
             .agent_defaults
             .get_mut(&HarnessKind::ClaudeCode)
             .unwrap()
-            .secondary = None;
+            .model_choices = vec!["sonnet".to_owned()];
         prefs.editor_command = Some("zed".to_owned());
         save(&path, &prefs).unwrap();
 
@@ -591,18 +661,13 @@ mod tests {
             claude.get(serde_norway::Value::String("future_mode".to_owned())),
             Some(&serde_norway::Value::String("adaptive".to_owned()))
         );
-        let primary = claude
-            .get(serde_norway::Value::String("primary".to_owned()))
-            .and_then(serde_norway::Value::as_mapping)
-            .unwrap();
+        assert!(!claude.contains_key(serde_norway::Value::String("primary".to_owned())));
+        assert!(!claude.contains_key(serde_norway::Value::String("secondary".to_owned())));
         assert_eq!(
-            primary.get(serde_norway::Value::String("future_axis".to_owned())),
-            Some(&serde_norway::Value::String("preserved".to_owned()))
-        );
-        assert_eq!(
-            claude.get(serde_norway::Value::String("secondary".to_owned())),
-            Some(&serde_norway::Value::Null),
-            "an explicit current-version null must retain deletion semantics"
+            claude.get(serde_norway::Value::String("model_choices".to_owned())),
+            Some(&serde_norway::Value::Sequence(vec![
+                serde_norway::Value::String("sonnet".to_owned())
+            ]))
         );
     }
 

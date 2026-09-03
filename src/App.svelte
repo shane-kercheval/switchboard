@@ -1008,13 +1008,7 @@
   async function createOrAttachAndRegister(submission: AgentFormSubmit): Promise<AgentRecord> {
     const agent =
       submission.mode === "create"
-        ? await api.createAgent(
-            submission.name,
-            submission.harness,
-            submission.primary.model ?? undefined,
-            submission.primary.effort ?? undefined,
-            submission.secondary,
-          )
+        ? await api.createAgent(submission.name, submission.harness, submission.selection)
         : await api.attachAgent(submission.name, submission.harness, submission.existingSessionId);
     await registerAgent(agent);
     addAgentToProjectRoster(agent);

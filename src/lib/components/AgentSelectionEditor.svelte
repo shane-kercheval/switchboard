@@ -1,0 +1,228 @@
+<script lang="ts">
+  import type { AgentSelection, HarnessKind } from "$lib/types";
+  import {
+    EFFORT_OPTIONS,
+    MODEL_OPTIONS,
+    activatableEffortValues,
+    effortSupportFor,
+    resolveModelChange,
+    selectionIsValid,
+    type SelectionOption,
+  } from "$lib/agentSelection";
+  import { cn } from "$lib/utils";
+  import {
+    SEGMENTED_CONTAINER_CLASS,
+    SEGMENTED_ITEM_ACTIVE_CLASS,
+    SEGMENTED_ITEM_CLASS,
+    SEGMENTED_ITEM_INACTIVE_CLASS,
+  } from "$lib/components/ui/segmentedControl";
+
+  type Context = "default" | "start" | "current";
+  type Axis = "model" | "effort";
+  type Props = {
+    harness: HarnessKind;
+    selection: AgentSelection;
+    context: Context;
+    onChange: (selection: AgentSelection) => void;
+    disabled?: boolean;
+    testidPrefix?: string;
+  };
+
+  let {
+    harness,
+    selection,
+    context,
+    onChange,
+    disabled = false,
+    testidPrefix = "agent-selection",
+  }: Props = $props();
+  let interactionMessage = $state<string | null>(null);
+
+  const roleLabel = $derived(
+    context === "default" ? "Default" : context === "start" ? "Start with" : "Current",
+  );
+  const modelOptions = $derived(
+    optionsWithPersisted(MODEL_OPTIONS[harness], selection.model_choices),
+  );
+  const effortOptions = $derived(
+    optionsWithPersisted(EFFORT_OPTIONS[harness], selection.effort_choices),
+  );
+  const validEfforts = $derived(activatableEffortValues(selection, harness));
+  const pairValid = $derived(selectionIsValid(selection, harness));
+
+  function optionsWithPersisted(
+    curated: SelectionOption[],
+    persisted: readonly string[],
+  ): SelectionOption[] {
+    const options = [...curated];
+    for (const value of persisted) {
+      if (!options.some((option) => option.value === value)) options.push({ label: value, value });
+    }
+    return options;
+  }
+
+  function choices(axis: Axis): string[] {
+    return axis === "model" ? selection.model_choices : selection.effort_choices;
+  }
+
+  function current(axis: Axis): string | null {
+    return axis === "model" ? selection.model : selection.effort;
+  }
+
+  function withAxis(axis: Axis, values: string[], value: string | null): AgentSelection {
+    return axis === "model"
+      ? { ...selection, model_choices: values, model: value }
+      : { ...selection, effort_choices: values, effort: value };
+  }
+
+  function toggleChoice(axis: Axis, value: string): void {
+    if (disabled) return;
+    interactionMessage = null;
+    const selected = choices(axis).includes(value);
+    if (selected) {
+      if (current(axis) === value) {
+        interactionMessage = `Choose another ${roleLabel.toLowerCase()} before removing this value.`;
+        return;
+      }
+      if (choices(axis).length === 1) {
+        interactionMessage = "At least one quick choice is required once this axis is configured.";
+        return;
+      }
+      onChange(
+        withAxis(
+          axis,
+          choices(axis).filter((choice) => choice !== value),
+          current(axis),
+        ),
+      );
+      return;
+    }
+
+    const nextChoices = [...choices(axis), value];
+    if (current(axis) !== null) {
+      onChange(withAxis(axis, nextChoices, current(axis)));
+      return;
+    }
+    if (axis === "model") {
+      onChange({ ...selection, model_choices: nextChoices, model: value });
+      return;
+    }
+    const next = withAxis(axis, nextChoices, effortCompatible(value) ? value : null);
+    onChange(next);
+  }
+
+  function chooseCurrent(axis: Axis, value: string): void {
+    if (disabled) return;
+    interactionMessage = null;
+    if (axis === "effort") {
+      if (!validEfforts.has(value)) {
+        interactionMessage = "That reasoning effort is not available for the current model.";
+        return;
+      }
+      onChange({ ...selection, effort: value });
+      return;
+    }
+    const resolved = resolveModelChange(selection, harness, value);
+    if (!resolved.ok) {
+      interactionMessage = resolved.reason;
+      return;
+    }
+    onChange(resolved.selection);
+  }
+
+  function showSelector(axis: Axis): boolean {
+    const axisChoices = choices(axis);
+    return axisChoices.length > 1 || (context === "current" && axisChoices[0] !== current(axis));
+  }
+
+  function optionLabel(options: SelectionOption[], value: string): string {
+    return options.find((option) => option.value === value)?.label ?? value;
+  }
+
+  function effortCompatible(value: string): boolean {
+    const support = effortSupportFor(harness, selection.model);
+    return (
+      support.kind === "unknown" ||
+      (support.kind === "known" && support.options.some((option) => option.value === value))
+    );
+  }
+
+  function effortDisabled(value: string): boolean {
+    return !effortCompatible(value);
+  }
+</script>
+
+{#snippet axisEditor(axis: Axis, label: string, options: SelectionOption[])}
+  {@const axisChoices = choices(axis)}
+  {@const axisCurrent = current(axis)}
+  <fieldset class="space-y-2" {disabled} data-testid={`${testidPrefix}-${axis}`}>
+    <legend class="text-fg text-sm font-medium">{label}</legend>
+    <div class={cn(SEGMENTED_CONTAINER_CLASS, "flex flex-wrap")}>
+      {#each options as option (option.value)}
+        {@const selected = axisChoices.includes(option.value)}
+        {@const locked = selected && axisCurrent === option.value}
+        {@const incompatible = axis === "effort" && effortDisabled(option.value)}
+        <button
+          type="button"
+          aria-pressed={selected}
+          aria-disabled={locked || incompatible}
+          disabled={disabled || incompatible}
+          title={locked
+            ? `Choose another ${roleLabel.toLowerCase()} before removing this value.`
+            : incompatible
+              ? "Unavailable for the current model"
+              : undefined}
+          class={cn(
+            SEGMENTED_ITEM_CLASS,
+            selected ? SEGMENTED_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
+            (locked || incompatible) && "cursor-not-allowed opacity-60",
+          )}
+          data-testid={`${testidPrefix}-${axis}-choice-${option.value}`}
+          onclick={() => toggleChoice(axis, option.value)}
+        >
+          {option.label}
+        </button>
+      {/each}
+    </div>
+
+    {#if axisChoices.length === 1 && !showSelector(axis)}
+      <p class="text-muted text-xs" data-testid={`${testidPrefix}-${axis}-implicit`}>
+        {roleLabel}: {optionLabel(options, axisChoices[0] ?? "")}
+      </p>
+    {:else if axisChoices.length > 0}
+      <label class="block space-y-1">
+        <span class="text-muted text-xs">{roleLabel}</span>
+        <select
+          class="border-border bg-raised text-fg focus-visible:ring-focus h-7 w-full rounded-md border px-2 text-sm focus-visible:ring-1 focus-visible:outline-none disabled:opacity-50"
+          value={axisCurrent ?? ""}
+          {disabled}
+          aria-label={`${roleLabel} ${label.toLowerCase()}`}
+          data-testid={`${testidPrefix}-${axis}-current`}
+          onchange={(event) => chooseCurrent(axis, event.currentTarget.value)}
+        >
+          {#if axisCurrent === null}<option value="" disabled>Select a value</option>{/if}
+          {#each axisChoices as value (value)}
+            <option {value} disabled={axis === "effort" && effortDisabled(value)}>
+              {optionLabel(options, value)}
+            </option>
+          {/each}
+        </select>
+      </label>
+    {/if}
+  </fieldset>
+{/snippet}
+
+<div class="space-y-4" data-testid={testidPrefix}>
+  {@render axisEditor("model", "Model quick choices", modelOptions)}
+  {@render axisEditor("effort", "Reasoning effort quick choices", effortOptions)}
+  {#if interactionMessage}
+    <p class="text-muted text-xs" role="status" data-testid={`${testidPrefix}-interaction-message`}>
+      {interactionMessage}
+    </p>
+  {/if}
+  {#if !pairValid}
+    <p class="text-status-failed text-xs" role="alert" data-testid={`${testidPrefix}-invalid`}>
+      Choose a reasoning effort supported by the current model before saving.
+    </p>
+  {/if}
+</div>

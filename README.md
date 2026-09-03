@@ -28,7 +28,7 @@ Switchboard also has a **Git view** for reviewing repositories, complete branch 
 - **Search and navigate long conversations.** Search message text across agents, filter by role or pinned status, preview results, and jump back to a result when its agent is visible in a pane.
 - **Keep track of work across projects.** The project list shows which projects are still running, marks background work when it finishes, and lets you jump directly to newly completed work you haven't viewed.
 - **macOS notifications.** Switchboard notifies you when your agents finish and when a workflow run ends, while you're working in another app. Clicking the notification brings Switchboard forward. An optional setting extends this to your other projects while you're still in Switchboard, so a project finishing in the background reaches you while you're reading a different one.
-- **Switch between model configurations.** Give an agent a Primary model/effort setup and an optional Secondary setup, then switch between them from its sidebar card without reopening its settings.
+- **Switch models and reasoning efforts independently.** Choose the quick choices each agent keeps for both axes, then switch either one from its sidebar card without reopening settings.
 
 ## Install
 
@@ -80,7 +80,7 @@ Forwarding uses the agents' actual responses and clearly labels each source for 
 
 Fork creates a new Claude Code agent from an existing conversation. With one Claude agent selected, use the Fork half of the send button to send your message to `<name>-fork`, which inherits the conversation so far while leaving the original untouched. Use it to explore another approach from the same starting point.
 
-Model profiles let an agent keep a Primary model/effort setup and an optional Secondary setup you can switch to from its sidebar card. Per-agent-type defaults in Settings prefill Add Agent and are applied automatically when a new project creates its starting agents.
+Model and reasoning effort are independent quick-choice sets. An agent can keep one or more choices for either axis and switch each one independently from its sidebar card. Per-agent-type defaults in Settings prefill Add Agent and are applied automatically when a new project creates its starting agents.
 
 Panes make that routing easy to see. You can keep agents with related roles together and address the pane as a group, while every agent remains an independent session that can also be targeted directly.
 
@@ -140,7 +140,7 @@ Run it **before** using the new version: the first time it saves its settings (a
 Switchboard drives each agent through its own CLI, so it inherits that CLI's capabilities — and a few CLI-specific limitations are worth knowing up front:
 
 - **Every agent runs with its CLI's approval prompts turned off, so it will not ask you before reading or changing files.** Switchboard launches each agent CLI in its maximum-autonomy mode, and Codex additionally with its sandbox off, so an agent can read and change any file the operating system lets Switchboard reach. For Claude Code the whole filesystem also counts as a working directory, which Switchboard needs so attachments (kept outside your project folder) stay readable; that means Claude's `permissions.blockReadsOutsideWorkingDirectories` setting does not apply inside Switchboard. One known exception: a Bash sandbox you configured for Claude in its settings may still apply. Codex and Antigravity read outside the project by default; Switchboard has not found a setting in either that survives their no-prompt flags.
-- **Model profiles.** Every agent — Claude Code, Codex, and Antigravity — can have a Primary model/effort setup plus an optional Secondary setup for quick switching. Set per-agent-type defaults in Settings; Add Agent and new projects use them automatically. The transcript records the model each past turn actually ran on.
+- **Model and effort quick choices.** Every agent — Claude Code, Codex, and Antigravity — can keep independent sets of models and reasoning efforts for quick switching. Set each set and its default in Settings; Add Agent and new projects use them automatically. The transcript records the model each past turn actually ran on.
 - **Reasoning effort.** Every supported agent CLI lets Switchboard set the reasoning-effort level per agent (alongside the model). **Antigravity's effort options depend on the model you pick,** and some of its models have no effort setting at all — the picker only offers the levels that model accepts, and hides the control entirely for models that don't have one.
 - **Codex models depend on your plan.** When you sign in to Codex with a ChatGPT subscription, only the models your plan includes are available; choosing one your plan doesn't cover fails the turn with Codex's own error.
 - **Gemini is no longer supported.** Google withdrew Gemini CLI access for individual accounts, which left it impossible to test or use here, so support was removed. Use Antigravity — Google's replacement for individual plans — instead.

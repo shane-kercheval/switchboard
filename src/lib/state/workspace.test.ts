@@ -59,6 +59,10 @@ function agent(id: string, projectId: string): AgentRecord {
     name: `agent-${id.slice(-1)}`,
     harness: "claude_code",
     session_locator: null,
+    model: null,
+    effort: null,
+    model_choices: [],
+    effort_choices: [],
     created_at: "2026-05-16T00:00:00Z",
   };
 }
@@ -774,8 +778,8 @@ describe("project staleness refresh", () => {
   });
 });
 
-describe("agent model profiles", () => {
-  it("setAgentProfiles updates both profiles in one call and replaces the roster record", async () => {
+describe("agent selection", () => {
+  it("setAgentSelection replaces all four fields atomically and reconciles the roster", async () => {
     const ws = await loadWorkspaceState();
     const a = agent(AGENT_1, PROJECT_1);
     ws.agentsByProject[PROJECT_1] = [a, agent(AGENT_2, PROJECT_1)];
@@ -783,52 +787,31 @@ describe("agent model profiles", () => {
       ...a,
       model: "opus",
       effort: "high",
-      profiles: {
-        active: "primary",
-        secondary: { model: "sonnet", effort: "medium" },
-      },
+      model_choices: ["opus", "sonnet"],
+      effort_choices: ["high", "medium"],
     };
     invokeMock.mockImplementation(async (cmd) =>
-      cmd === "set_agent_profiles" ? updated : undefined,
+      cmd === "set_agent_selection" ? updated : undefined,
     );
 
-    await ws.setAgentProfiles(
-      AGENT_1,
-      { model: "opus", effort: "high" },
-      { model: "sonnet", effort: "medium" },
-    );
+    await ws.setAgentSelection(AGENT_1, {
+      model: "opus",
+      effort: "high",
+      model_choices: ["opus", "sonnet"],
+      effort_choices: ["high", "medium"],
+    });
 
-    expect(invokeMock).toHaveBeenCalledWith("set_agent_profiles", {
+    expect(invokeMock).toHaveBeenCalledWith("set_agent_selection", {
       agentId: AGENT_1,
-      primary: { model: "opus", effort: "high" },
-      secondary: { model: "sonnet", effort: "medium" },
+      selection: {
+        model: "opus",
+        effort: "high",
+        model_choices: ["opus", "sonnet"],
+        effort_choices: ["high", "medium"],
+      },
     });
     expect(ws.agentsByProject[PROJECT_1]?.find((r) => r.id === AGENT_1)).toEqual(updated);
-    expect(ws.agentsByProject[PROJECT_1]?.find((r) => r.id === AGENT_2)?.model).toBeUndefined();
-  });
-
-  it("setActiveAgentProfile persists the active slot and replaces the roster record", async () => {
-    const ws = await loadWorkspaceState();
-    const a: AgentRecord = {
-      ...agent(AGENT_1, PROJECT_1),
-      profiles: {
-        active: "primary",
-        secondary: { model: "sonnet", effort: "medium" },
-      },
-    };
-    ws.agentsByProject[PROJECT_1] = [a];
-    const switched: AgentRecord = { ...a, profiles: { ...a.profiles!, active: "secondary" } };
-    invokeMock.mockImplementation(async (cmd) =>
-      cmd === "set_active_agent_profile" ? switched : undefined,
-    );
-
-    await ws.setActiveAgentProfile(AGENT_1, "secondary");
-
-    expect(invokeMock).toHaveBeenCalledWith("set_active_agent_profile", {
-      agentId: AGENT_1,
-      active: "secondary",
-    });
-    expect(ws.agentsByProject[PROJECT_1]?.[0]).toEqual(switched);
+    expect(ws.agentsByProject[PROJECT_1]?.find((r) => r.id === AGENT_2)?.model).toBeNull();
   });
 });
 

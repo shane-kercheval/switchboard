@@ -215,7 +215,7 @@ struct WorkItem {
     attachments: Vec<Attachment>,
     /// Model/effort selected when the user submitted this send. Unlike the
     /// locator and other agent state, these values are intent attached to the
-    /// queued work and must not change if the agent switches profiles before
+    /// queued work and must not change if the agent switches selections before
     /// the backlog reaches it.
     selection: Option<SelectionSnapshot>,
     /// Set only for sends made via [`Dispatcher::send_message_awaiting_completion`].
@@ -238,7 +238,7 @@ struct WorkItem {
     emit_user_message: bool,
 }
 
-/// The profile-dependent part of an agent record captured for one send.
+/// The model/effort-dependent part of an agent record captured for one send.
 /// Ephemeral by design: it rides only in the in-memory queue; durable history
 /// records the harness-reported model/effort on the resulting turn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -878,7 +878,7 @@ pub trait DispatchContextFactory: Send + Sync {
     /// Model/effort intent captured when a send is submitted. This is called
     /// before the work item enters the actor queue, including when the actor
     /// already exists and ignores the newly supplied factory for context
-    /// construction. Factories with no profile semantics return `None`
+    /// construction. Factories with no selection semantics return `None`
     /// explicitly so adding a factory requires acknowledging this contract.
     fn selection_snapshot(&self) -> Option<SelectionSnapshot>;
 

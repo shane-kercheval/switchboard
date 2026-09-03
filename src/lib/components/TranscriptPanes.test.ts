@@ -64,6 +64,10 @@ const ALICE: AgentRecord = {
   name: "alice",
   harness: "claude_code",
   session_locator: { uuid: "00000000-0000-7000-8000-000000000001" },
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:00Z",
 };
 const BOB: AgentRecord = {
@@ -72,6 +76,10 @@ const BOB: AgentRecord = {
   name: "bob",
   harness: "codex",
   session_locator: null,
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:01Z",
 };
 const ROSTER = [ALICE, BOB];
@@ -84,6 +92,10 @@ function numberedAgent(index: number): AgentRecord {
     name: `agent-${index}`,
     harness: index % 2 === 0 ? "codex" : "claude_code",
     session_locator: null,
+    model: null,
+    effort: null,
+    model_choices: [],
+    effort_choices: [],
     created_at: `2026-05-16T00:00:${String(index).padStart(2, "0")}Z`,
   };
 }

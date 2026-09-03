@@ -217,10 +217,9 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
             .get(&self.agent_id)
             .cloned()
             .unwrap_or_else(|| self.fallback_agent.clone());
-        let selected = agent.active_profile();
         Some(SelectionSnapshot {
-            model: selected.model.clone(),
-            effort: selected.effort.clone(),
+            model: agent.model,
+            effort: agent.effort,
         })
     }
 

@@ -184,13 +184,16 @@ configured effort choices remain activatable and reactive harness validation rem
 Settings stores an independent default for each axis. Its default effort remains selected and
 editable when its default model has no effort axis; creation clears the new agent's current effort
 for that starting model while preserving the configured effort choices. For an effort-bearing
-Antigravity default model, the editor still refuses an incompatible default effort. The create-agent
-and existing-agent editors require a dispatch-ready current pair, including when an attached agent
-starts with empty sets. These editors need not require every selected model to have a compatible
-selected effort: a currently unusable quick model can remain selected and is disabled/explained in
-the sidebar until the user adds a compatible effort. Automatically modifying the effort quick-choice
-set when a model is selected is intentionally avoided because it would make the supposedly
-independent multi-select controls surprising.
+Antigravity default model, only a valid default pair is persisted. Settings keeps invalid intermediate
+repair steps in a per-harness editor draft so a pair made stale by manual edits or catalog drift can be
+repaired without writing more invalid state. The draft survives accordion collapse, never participates
+in another harness's save, and is discarded when Settings closes. The create-agent and existing-agent
+editors require a dispatch-ready current pair, including when an attached agent starts with empty sets.
+These editors need not require every selected model to have a compatible selected effort: a currently
+unusable quick model can remain selected and is disabled/explained in the sidebar until the user adds a
+compatible effort. Automatically modifying the effort quick-choice set when a model is selected is
+intentionally avoided because it would make the supposedly independent multi-select controls
+surprising.
 
 The resolution order is non-obvious and must survive in a concise comment/docstring beside the
 shared resolver, including the unknown-versus-explicit-no-effort distinction, why Settings is not an
@@ -531,7 +534,9 @@ independent quick choices.
    the existing optimistic preference path; never persist a transient missing default between two
    clicks. Antigravity may retain an independent effort default while its default model has no effort
    axis; explain that the effort is unused for that starting model rather than clearing the setting.
-   When an effort-bearing default model is selected, refuse an incompatible effort default locally.
+   When an effort-bearing default model is selected, hold invalid intermediate edits in an isolated
+   per-harness draft and persist the complete defaults only after the pair becomes valid. Closing
+   Settings discards an incomplete repair.
 3. In create mode, seed the editor from the selected harness's preferences. Label the chosen values
    `Start with`, not `Default`, because the submitted agent stores current selections. Preserve the
    existing rules that switching harness resets harness-specific configuration, while a temporary
@@ -553,7 +558,9 @@ independent quick choices.
   one and enabled at 2+; changing defaults without changing membership; preventing the last option's
   removal; atomic preference payloads; save failure copy; and every harness accordion.
 - Settings tests cover incompatible Antigravity defaults for effort-bearing models and independent
-  effort defaults for models with no effort axis.
+  effort defaults for models with no effort axis. Starting from an already-invalid persisted pair,
+  tests prove a multi-step repair survives accordion collapse, cannot leak through an unrelated save,
+  persists atomically once valid, and is discarded unfinished when Settings closes.
 - Create-form tests prove preferences prefill both choice sets and starting values, per-agent edits
   submit exactly, harness changes reset correctly, and create/attach draft behavior is preserved.
 - Attach tests prove the controls stay hidden and no default/selection fields are submitted.

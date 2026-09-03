@@ -48,7 +48,12 @@
   function resultFor(
     value: string,
   ): { ok: true; selection: AgentSelection } | { ok: false; reason: string } {
-    if (axis === "model") return resolveModelChange(selection, harness, value);
+    if (axis === "model") {
+      const result = resolveModelChange(selection, harness, value);
+      return result.ok
+        ? result
+        : { ok: false, reason: `${result.reason} Open Model settings to add one.` };
+    }
     if (effortSupport.kind === "known" && !activatableEfforts.has(value)) {
       return { ok: false, reason: "Unavailable for the current model" };
     }

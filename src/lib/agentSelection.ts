@@ -285,7 +285,7 @@ export function resolveModelChange(
   if (effort === undefined) {
     return {
       ok: false,
-      reason: "Add a compatible reasoning effort in Model settings before switching.",
+      reason: "No configured reasoning effort is compatible with that model.",
     };
   }
   return { ok: true, selection: { ...selection, model, effort } };

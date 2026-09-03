@@ -187,7 +187,7 @@ describe("resolveModelChange", () => {
       ),
     ).toEqual({
       ok: false,
-      reason: "Add a compatible reasoning effort in Model settings before switching.",
+      reason: "No configured reasoning effort is compatible with that model.",
     });
   });
 

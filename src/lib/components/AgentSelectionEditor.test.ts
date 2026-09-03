@@ -175,6 +175,51 @@ describe("AgentSelectionEditor", () => {
     expect(screen.getByTestId("agent-selection-effort-choice-medium")).toBeEnabled();
   });
 
+  it("asks for a model before assigning effort when no model is selected", () => {
+    render(AgentSelectionEditor, {
+      props: {
+        harness: "antigravity",
+        selection: {
+          model: null,
+          effort: null,
+          model_choices: [],
+          effort_choices: ["high"],
+        },
+        context: "current",
+        onChange: vi.fn(),
+      },
+    });
+
+    expect(screen.getByTestId("agent-selection-effort-unavailable")).toHaveTextContent(
+      "Choose a model before assigning the reasoning effort.",
+    );
+  });
+
+  it("explains an incompatible model choice within the current editor", async () => {
+    render(AgentSelectionEditor, {
+      props: {
+        harness: "antigravity",
+        selection: {
+          model: "gemini-3.7-flash",
+          effort: "medium",
+          model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+          effort_choices: ["medium"],
+        },
+        context: "current",
+        onChange: vi.fn(),
+      },
+    });
+
+    await fireEvent.change(screen.getByTestId("agent-selection-model-current"), {
+      target: { value: "gemini-3.1-pro" },
+    });
+    expect(
+      within(screen.getByTestId("agent-selection-model")).getByRole("status"),
+    ).toHaveTextContent(
+      "No configured reasoning effort is compatible with that model. Add a compatible reasoning effort quick choice, then try again.",
+    );
+  });
+
   it("keeps the independent effort default editable for a no-effort default model", async () => {
     const onChange = vi.fn();
     render(AgentSelectionEditor, {
@@ -221,7 +266,7 @@ describe("AgentSelectionEditor", () => {
     );
   });
 
-  it("clears interaction feedback when the edited context changes", async () => {
+  it("clears interaction feedback when the controlled selection changes externally", async () => {
     const onChange = vi.fn();
     const view = render(AgentSelectionEditor, {
       props: { harness: "claude_code", selection: BASE, context: "current", onChange },
@@ -230,11 +275,11 @@ describe("AgentSelectionEditor", () => {
     expect(within(screen.getByTestId("agent-selection-model")).getByRole("status")).toBeVisible();
 
     await view.rerender({
-      harness: "codex",
+      harness: "claude_code",
       selection: {
-        model: "gpt-5.6-sol",
+        model: "sonnet",
         effort: "high",
-        model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
+        model_choices: ["opus", "sonnet"],
         effort_choices: ["high", "medium"],
       },
       context: "current",

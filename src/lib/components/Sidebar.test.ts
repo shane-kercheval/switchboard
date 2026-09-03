@@ -1184,7 +1184,7 @@ describe("Sidebar", () => {
     expect(screen.getByTestId("agent-model-chip")).toBeDisabled();
     expect(screen.getByTestId("agent-model-chip")).toHaveAttribute(
       "title",
-      "Add a compatible reasoning effort in Model settings before switching.",
+      "No configured reasoning effort is compatible with that model. Open Model settings to add one.",
     );
   });
 

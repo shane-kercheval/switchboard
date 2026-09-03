@@ -57,6 +57,9 @@
   const modelSupported = $derived(SUPPORTS_MODEL_SELECTION[harness]);
   const effortSupported = $derived(SUPPORTS_EFFORT_SELECTION[harness]);
   const effortSupport = $derived(effortSupportFor(harness, selection.model));
+  const effortDefaultIsIndependent = $derived(
+    context === "default" && effortSupport.kind === "none",
+  );
   const validEfforts = $derived(activatableEffortValues(selection, harness));
   const pairValid = $derived(selectionIsValid(selection, harness));
   const interactionResetKey = $derived(
@@ -69,15 +72,13 @@
       selection.effort_choices,
     ]),
   );
-  let previousInteractionResetKey = $state<string | null>(null);
+
+  function clearInteractionMessage(_resetKey: string): void {
+    interactionMessage = null;
+  }
 
   $effect(() => {
-    if (previousInteractionResetKey === null) {
-      previousInteractionResetKey = interactionResetKey;
-    } else if (previousInteractionResetKey !== interactionResetKey) {
-      previousInteractionResetKey = interactionResetKey;
-      interactionMessage = null;
-    }
+    clearInteractionMessage(interactionResetKey);
   });
 
   function optionsWithPersisted(
@@ -146,11 +147,7 @@
     const next = withAxis(
       axis,
       nextChoices,
-      context === "default" && effortSupport.kind === "none"
-        ? value
-        : effortCompatible(value)
-          ? value
-          : null,
+      effortDefaultIsIndependent ? value : effortCompatible(value) ? value : null,
     );
     onChange(next);
   }
@@ -159,8 +156,7 @@
     if (disabled) return;
     interactionMessage = null;
     if (axis === "effort") {
-      const independentDefault = context === "default" && effortSupport.kind === "none";
-      if (!independentDefault && !validEfforts.has(value)) {
+      if (!effortDefaultIsIndependent && !validEfforts.has(value)) {
         interactionMessage = {
           axis,
           text: "That reasoning effort is not available for the current model.",
@@ -170,13 +166,18 @@
       onChange({ ...selection, effort: value });
       return;
     }
+    // Settings defaults are independent axes. Inspect the target model here so
+    // switching to a no-effort default preserves the separate effort default.
     if (context === "default" && effortSupportFor(harness, value).kind === "none") {
       onChange({ ...selection, model: value });
       return;
     }
     const resolved = resolveModelChange(selection, harness, value);
     if (!resolved.ok) {
-      interactionMessage = { axis, text: resolved.reason };
+      interactionMessage = {
+        axis,
+        text: `${resolved.reason} Add a compatible reasoning effort quick choice, then try again.`,
+      };
       return;
     }
     onChange(resolved.selection);
@@ -200,18 +201,24 @@
   }
 
   function effortDisabled(value: string): boolean {
-    if (context === "default" && effortSupport.kind === "none") return false;
+    if (effortDefaultIsIndependent) return false;
     return !effortCompatible(value);
   }
 
-  function assignmentUnavailable(axis: Axis): boolean {
-    return axis === "effort" && context !== "default" && effortSupport.kind === "none";
+  function assignmentUnavailableMessage(axis: Axis): string | null {
+    if (axis !== "effort" || effortDefaultIsIndependent || effortSupport.kind !== "none") {
+      return null;
+    }
+    return selection.model === null
+      ? "Choose a model before assigning the reasoning effort."
+      : "The current model does not use reasoning effort.";
   }
 </script>
 
 {#snippet axisEditor(axis: Axis, label: string, options: SelectionOption[])}
   {@const axisChoices = choices(axis)}
   {@const axisCurrent = current(axis)}
+  {@const unavailableMessage = assignmentUnavailableMessage(axis)}
   <fieldset class="space-y-2" {disabled} data-testid={`${testidPrefix}-${axis}`}>
     <legend class="text-fg text-sm font-medium">{label}</legend>
     <div class={cn(SEGMENTED_CONTAINER_CLASS, "flex flex-wrap")}>
@@ -239,9 +246,9 @@
       {/each}
     </div>
 
-    {#if assignmentUnavailable(axis)}
+    {#if unavailableMessage !== null}
       <p class="text-muted text-xs" data-testid={`${testidPrefix}-${axis}-unavailable`}>
-        The current model does not use reasoning effort.
+        {unavailableMessage}
       </p>
     {:else if axisChoices.length === 1 && !showSelector(axis)}
       <p class="text-muted text-xs" data-testid={`${testidPrefix}-${axis}-implicit`}>

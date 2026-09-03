@@ -194,6 +194,88 @@ describe("SettingsView", () => {
     );
   });
 
+  it("keeps an invalid Antigravity repair local until the default becomes valid", async () => {
+    const storedDefaults = {
+      model_choices: ["gemini-3.1-pro"],
+      effort_choices: ["medium"],
+      default_model: "gemini-3.1-pro",
+      default_effort: "medium",
+    };
+    preferences.agent_defaults.antigravity = structuredClone(storedDefaults);
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const antigravitySummary = screen.getByText("Antigravity", { selector: "summary" });
+    await fireEvent.click(antigravitySummary);
+
+    expect(screen.getByTestId("settings-selection-antigravity-invalid")).toBeInTheDocument();
+    await fireEvent.click(screen.getByTestId("settings-selection-antigravity-effort-choice-high"));
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("settings-selection-antigravity-effort-choice-high"),
+      ).toHaveAttribute("aria-pressed", "true"),
+    );
+    expect(invokeMock.mock.calls.filter(([command]) => command === "set_preferences")).toHaveLength(
+      0,
+    );
+
+    await fireEvent.click(antigravitySummary);
+    await fireEvent.click(antigravitySummary);
+    expect(screen.getByTestId("settings-selection-antigravity-effort-choice-high")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    await fireEvent.click(screen.getByTestId("show-builtins-toggle"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          agent_defaults: expect.objectContaining({ antigravity: storedDefaults }),
+        }),
+      }),
+    );
+
+    await fireEvent.change(screen.getByTestId("settings-selection-antigravity-effort-current"), {
+      target: { value: "high" },
+    });
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          agent_defaults: expect.objectContaining({
+            antigravity: {
+              ...storedDefaults,
+              effort_choices: ["medium", "high"],
+              default_effort: "high",
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("discards an incomplete default repair when Settings is closed", async () => {
+    preferences.agent_defaults.antigravity = {
+      model_choices: ["gemini-3.1-pro"],
+      effort_choices: ["medium"],
+      default_model: "gemini-3.1-pro",
+      default_effort: "medium",
+    };
+    const view = render(SettingsView, { props: { onClose: vi.fn() } });
+    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    await fireEvent.click(screen.getByTestId("settings-selection-antigravity-effort-choice-high"));
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("settings-selection-antigravity-effort-choice-high"),
+      ).toHaveAttribute("aria-pressed", "true"),
+    );
+
+    view.unmount();
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    expect(screen.getByTestId("settings-selection-antigravity-effort-choice-high")).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
   it("keeps the effort default independent when the default model has no effort axis", async () => {
     preferences.agent_defaults.antigravity = {
       model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],

@@ -54,6 +54,7 @@
   let workflowsDirError = $state<string | null>(null);
   let workflowPromptOpen = $state(false);
   let promptsSection = $state<HTMLElement | undefined>(undefined);
+  let agentDefaultDrafts = $state<Partial<Record<HarnessKind, AgentSelection>>>({});
   const workflowPrompt = $derived(workflowAuthoringPrompt(workflowsDir));
 
   const themeOptions: { mode: ThemeMode; label: string }[] = [
@@ -183,19 +184,27 @@
     harness: HarnessKind,
     selection: AgentSelection,
   ): Promise<void> {
-    if (!selectionIsValid(selection, harness)) {
-      console.error("[switchboard] selection editor emitted invalid agent defaults", { harness });
-      return;
-    }
+    const draft = copySelection(selection);
+    agentDefaultDrafts[harness] = draft;
+    if (!selectionIsValid(draft, harness)) return;
+
     await loadPreferences();
     const agentDefaults = structuredClone($state.snapshot(preferences.agent_defaults));
     agentDefaults[harness] = {
-      model_choices: [...selection.model_choices],
-      effort_choices: [...selection.effort_choices],
-      default_model: selection.model,
-      default_effort: selection.effort,
+      model_choices: [...draft.model_choices],
+      effort_choices: [...draft.effort_choices],
+      default_model: draft.model,
+      default_effort: draft.effort,
     };
     await updatePreferences({ agent_defaults: agentDefaults });
+  }
+
+  function copySelection(selection: AgentSelection): AgentSelection {
+    return {
+      ...selection,
+      model_choices: [...selection.model_choices],
+      effort_choices: [...selection.effort_choices],
+    };
   }
 
   function defaultSelection(harness: HarnessKind): AgentSelection {
@@ -206,6 +215,10 @@
       model_choices: defaults.model_choices,
       effort_choices: defaults.effort_choices,
     };
+  }
+
+  function editableDefaultSelection(harness: HarnessKind): AgentSelection {
+    return agentDefaultDrafts[harness] ?? defaultSelection(harness);
   }
 </script>
 
@@ -290,7 +303,7 @@
               <div class="border-border border-t p-3">
                 <AgentSelectionEditor
                   {harness}
-                  selection={defaultSelection(harness)}
+                  selection={editableDefaultSelection(harness)}
                   context="default"
                   onChange={(selection) => updateAgentDefault(harness, selection)}
                   testidPrefix={`settings-selection-${harness}`}

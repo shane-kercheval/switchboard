@@ -8,9 +8,9 @@
 //!
 //! What remains is the one thing a working directory is still *for*: canonical
 //! path identity, and the check that a path is a directory that exists. A
-//! project references a directory by `directory_id` through the store's catalog;
-//! this type is what the boundary canonicalizes through, so a path arriving from
-//! the frontend is identified the same way it was when it was catalogued.
+//! project records its directory as a canonical path on its index row; this
+//! type is what the boundary canonicalizes through, so a path arriving from the
+//! frontend is identified the same way the store recorded it.
 //!
 //! Deleted rather than deprecated: `init`, `has_switchboard`, the directory
 //! `config.yaml`, and the whole project lifecycle. Nothing writes
@@ -35,8 +35,8 @@ impl Directory {
     ///
     /// **This is the identity boundary.** Canonicalizing here is what makes two
     /// spellings of one directory — a symlink, a `/./`, a relative path — resolve
-    /// to the same catalog row, and therefore to the same `directory_id`. The
-    /// store's `add_directory` canonicalizes the same way for the same reason.
+    /// to the same recorded path. The store canonicalizes the same way for the
+    /// same reason when it records a project's directory.
     pub fn at(path: &Path) -> Result<Directory> {
         let canonical = std::fs::canonicalize(path).map_err(|e| CoreError::io(path, e))?;
         if !canonical.is_dir() {
@@ -72,7 +72,7 @@ mod tests {
     #[test]
     fn at_canonicalizes_symlinks() {
         // The identity boundary: a symlinked spelling must resolve to the same
-        // path the store catalogued, or one directory acquires two identities.
+        // path the store recorded, or one folder reads as two.
         let tmp = TempDir::new().unwrap();
         let real = tmp.path().join("real");
         std::fs::create_dir(&real).unwrap();

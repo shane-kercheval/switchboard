@@ -27,39 +27,6 @@ pub enum CoreError {
     #[error("project not found: {0}")]
     ProjectNotFound(uuid::Uuid),
 
-    /// A `directory_id` referenced by a project index entry has no catalog
-    /// entry. The catalog never deletes an entry a project still references, so
-    /// this is corruption (a hand-edited or truncated `directories.jsonl`), not
-    /// an ordinary "the user removed that directory" state — a removed working
-    /// *directory* keeps its catalog entry with a path that no longer resolves.
-    #[error("directory not found in the store catalog: {0}")]
-    DirectoryNotFound(uuid::Uuid),
-
-    /// A bind would add a second catalog row for an id that already has one.
-    ///
-    /// `bind_directory` exists only to restore a *lost* mapping; letting it run
-    /// on a live id would produce the ambiguous state
-    /// [`Self::AmbiguousDirectory`] describes, by the very command meant to
-    /// repair it. Re-pointing is the operation for an id that still resolves.
-    #[error("directory {0} already has a catalog entry — re-point it instead of binding")]
-    DuplicateDirectoryId(uuid::Uuid),
-
-    /// Two or more catalog entries claim the same `directory_id`, so the id
-    /// resolves to no single path.
-    ///
-    /// Deliberately distinct from [`Self::DirectoryNotFound`]: the repair is the
-    /// opposite one. A missing row means the id was never (or is no longer)
-    /// registered; an ambiguous one means it is registered twice, and pointing
-    /// the user at "register this directory" would mint a *third* identity that
-    /// no project references. `Store::repoint_directory` collapses the
-    /// duplicates, which is the only in-app exit from this state.
-    ///
-    /// Not reachable from ordinary use — ids are minted fresh and re-points
-    /// preserve them — so the realistic source is an external edit or a bulk
-    /// catalog write.
-    #[error("directory {0} has more than one catalog entry")]
-    AmbiguousDirectory(uuid::Uuid),
-
     /// The store root holds data but no `store.yaml`. Distinct from
     /// [`Self::MissingAppendOnlyFile`] ("a file that should exist doesn't"):
     /// here the schema marker is what's absent, so nothing establishes which
@@ -74,15 +41,33 @@ pub enum CoreError {
     #[error("store at {root} holds data but no version marker ({marker} is missing)")]
     StoreDataWithoutVersionMarker { root: PathBuf, marker: PathBuf },
 
-    /// A catalog write would leave two entries pointing at the same working
-    /// directory. One canonical path must map to exactly one `DirectoryId`:
-    /// per-directory scopes (project-name uniqueness, and the Claude
-    /// session-id collision scan, which is per-directory precisely because
-    /// Claude session ids are cwd-namespaced) are evaluated by id, so a split
-    /// identity silently narrows them to half the agents that share the
-    /// namespace.
-    #[error("working directory {path} is already registered as {existing}")]
-    DuplicateDirectoryPath { path: PathBuf, existing: uuid::Uuid },
+    /// The version-1 → 2 store migration found a row it cannot carry across:
+    /// a project whose directory id the retired catalog had no entry for (or
+    /// two), a project id listed twice, or two directory ids resolving to one
+    /// path. None of these states was ever produced by the app, so the files
+    /// were edited or partially restored, and guessing would bind a project to
+    /// the wrong folder silently. Nothing is written before every row resolves,
+    /// so the store is exactly as it was.
+    ///
+    /// The message leads with the repair that loses nothing: adding a
+    /// `"directory"` field to the row is exactly the shape the migration
+    /// already accepts (it is how an interrupted run resumes), so the row
+    /// migrates without consulting the catalog at all. Deleting the project's
+    /// directory under `projects/` would *not* unblock anything — the blocking
+    /// row is in the index — and would discard the project's state.
+    #[error(
+        "cannot migrate the project store: project {name:?} ({project}): {reason}. \
+         To keep the project, edit its line in {index} and add \
+         \"directory\": \"/path/to/its/folder\", then relaunch. To leave it out, \
+         remove that one line instead. Do not delete projects/{project}/ — that \
+         discards its conversation and agents without unblocking the migration."
+    )]
+    StoreMigrationBlocked {
+        project: uuid::Uuid,
+        name: String,
+        index: PathBuf,
+        reason: String,
+    },
 
     #[error("agent not found: {0}")]
     AgentNotFound(uuid::Uuid),

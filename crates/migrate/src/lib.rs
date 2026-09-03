@@ -11,7 +11,7 @@
 //! once) costs nothing.
 //!
 //! **Why Rust and not a shell script:** three files are *rewritten*, not
-//! copied — each project's `config.yaml` gains the `directory_id` recovery
+//! copied — each project's `config.yaml` gains the working-directory recovery
 //! record, the index rows gain the same, and every journal `Send`'s attachment
 //! paths move to the new location while `dispatched_path` preserves the
 //! original (send↔turn correlation reconstructs the exact dispatched text,
@@ -35,7 +35,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 use switchboard_core::{
-    AgentId, Attachment, DirectoryId, JournalRecord, ProjectConfig, ProjectEntry, ProjectId, Store,
+    AgentId, Attachment, JournalRecord, ProjectConfig, ProjectEntry, ProjectId, Store,
     append_jsonl, read_jsonl, read_yaml, write_yaml,
 };
 
@@ -51,8 +51,8 @@ const JOURNAL_FILE: &str = "journal.jsonl";
 const CONFIG_FILE: &str = "config.yaml";
 
 /// A legacy index row. Redeclared rather than imported: the current
-/// `ProjectEntry` *requires* `directory_id`, which legacy rows don't have —
-/// that absence is the thing being migrated.
+/// `ProjectEntry` *requires* a `directory`, which legacy rows don't have (the
+/// enclosing directory implied it) — that absence is the thing being migrated.
 #[derive(Debug, Deserialize)]
 struct LegacyProjectEntry {
     id: ProjectId,
@@ -89,7 +89,6 @@ pub struct MigrationReport {
 #[derive(Debug)]
 pub struct MigratedDirectory {
     pub directory: PathBuf,
-    pub directory_id: DirectoryId,
     /// `(id, name)` — the id is what validation compares against the written
     /// index, so a report that only carried names could not detect a wrong row.
     pub projects: Vec<(ProjectId, String, chrono::DateTime<chrono::Utc>)>,
@@ -116,7 +115,7 @@ pub enum MigrateError {
         "project {id} appears in two source directories ({first} and {second}) — likely a copied \
          checkout (cp -a, a restore) carrying the same .switchboard state. Migrating both would \
          make two index rows share one project directory, so the app would list one project \
-         twice under two owners. Remove {LEGACY_DIR}/ from whichever copy is not the real one, \
+         twice under two directories. Remove {LEGACY_DIR}/ from whichever copy is not the real one, \
          then re-run"
     )]
     DuplicateProjectId {
@@ -225,18 +224,15 @@ pub fn migrate(
     Ok(report)
 }
 
-/// Refuse anything that could make this run a merge: index rows, catalog rows,
-/// or any entry under `projects/`. Checking only the index would let a
-/// partially-written target (a catalog row or an orphan project directory from
-/// a crashed run) slip under "fresh" and leave residue behind a clean report.
+/// Refuse anything that could make this run a merge: index rows or any entry
+/// under `projects/`. Checking only the index would let a partially-written
+/// target (an orphan project directory from a crashed run) slip under "fresh"
+/// and leave residue behind a clean report.
 fn reject_non_empty_target(store: &Store, target_root: &Path) -> Result<(), MigrateError> {
     let projects_dir = target_root.join(LEGACY_PROJECTS_DIR);
     let has_project_dirs =
         std::fs::read_dir(&projects_dir).is_ok_and(|mut entries| entries.next().is_some());
-    if !store.list_projects()?.is_empty()
-        || !store.list_directories()?.is_empty()
-        || has_project_dirs
-    {
+    if !store.list_projects()?.is_empty() || has_project_dirs {
         return Err(MigrateError::TargetNotEmpty(target_root.to_path_buf()));
     }
     Ok(())
@@ -292,8 +288,8 @@ fn scan_sources(directories: &[PathBuf], report: &mut MigrationReport) -> Vec<So
 /// Machine restore into a second location, or a duplicated worktree all do —
 /// and then two catalogued directories legitimately list the same ids.
 /// Unrefused, both would copy into the same `projects/<id>/` (second overwrites
-/// first) while appending two index rows with different `directory_id`s: one
-/// project directory, two rows claiming different owners, the same project
+/// first) while appending two index rows with different directories: one
+/// project directory, two rows claiming different folders, the same project
 /// listed twice.
 fn reject_duplicate_project_ids(sources: &[SourceScan]) -> Result<(), MigrateError> {
     let mut seen: HashMap<ProjectId, &Path> = HashMap::new();
@@ -316,19 +312,14 @@ fn migrate_directory(
     source: &SourceScan,
     report: &mut MigrationReport,
 ) -> Result<(), MigrateError> {
-    // One catalog identity per directory, minted by the store itself so the
-    // canonicalization and duplicate-path rules are the app's own.
-    let directory_id = store.add_directory(&source.canonical)?.directory_id;
-
     let mut migrated = MigratedDirectory {
         directory: source.canonical.clone(),
-        directory_id,
         projects: Vec::new(),
         attachments_rewritten: 0,
         attachments_left: Vec::new(),
     };
     for entry in &source.entries {
-        copy_project(store, source, directory_id, entry, &mut migrated)?;
+        copy_project(store, source, entry, &mut migrated)?;
         migrated
             .projects
             .push((entry.id, entry.name.clone(), entry.created_at));
@@ -340,7 +331,6 @@ fn migrate_directory(
 fn copy_project(
     store: &Store,
     source: &SourceScan,
-    directory_id: DirectoryId,
     entry: &LegacyProjectEntry,
     migrated: &mut MigratedDirectory,
 ) -> Result<(), MigrateError> {
@@ -354,11 +344,11 @@ fn copy_project(
 
     copy_tree(&source_root, &target_project_root)?;
 
-    // config.yaml gains the directory_id recovery record. Read/modify/write
+    // config.yaml gains the working-directory recovery record. Read/modify/write
     // through the app's own type so the round-trip cannot drift.
     let config_path = target_project_root.join(CONFIG_FILE);
     let mut config: ProjectConfig = read_yaml(&config_path)?;
-    config.directory_id = Some(directory_id);
+    config.directory = Some(source.canonical.clone());
     write_yaml(&config_path, &config)?;
 
     // **Both spellings of the source root, because journals record the path the
@@ -379,7 +369,7 @@ fn copy_project(
             id: entry.id,
             name: entry.name.clone(),
             created_at: entry.created_at,
-            directory_id,
+            directory: source.canonical.clone(),
         },
     )?;
     Ok(())
@@ -503,14 +493,17 @@ fn rewrite_attachment(
 ///
 /// **Exact expected set, not counts.** The report carries every `(id, name)`
 /// per directory; the written index must match it row for row (id, name,
-/// `directory_id`, cardinality). A count can match while a duplicated or wrong
-/// row hides inside it.
+/// directory, cardinality). A count can match while a duplicated or wrong row
+/// hides inside it.
 fn validate(store: &Store, report: &MigrationReport) -> Result<(), MigrateError> {
-    let mut expected: HashMap<ProjectId, (&str, DirectoryId, chrono::DateTime<chrono::Utc>)> =
+    let mut expected: HashMap<ProjectId, (&str, &Path, chrono::DateTime<chrono::Utc>)> =
         HashMap::new();
     for migrated in &report.migrated {
         for (id, name, created_at) in &migrated.projects {
-            expected.insert(*id, (name.as_str(), migrated.directory_id, *created_at));
+            expected.insert(
+                *id,
+                (name.as_str(), migrated.directory.as_path(), *created_at),
+            );
         }
     }
 
@@ -526,33 +519,30 @@ fn validate(store: &Store, report: &MigrationReport) -> Result<(), MigrateError>
     // register cache enforces; a store that violates it fails on open there.
     let mut agent_ids: HashSet<AgentId> = HashSet::new();
     for entry in &indexed {
-        let Some(&(name, directory_id, created_at)) = expected.get(&entry.id) else {
+        let Some(&(name, directory, created_at)) = expected.get(&entry.id) else {
             return Err(MigrateError::Validation(format!(
                 "index lists project {} that the migration never wrote",
                 entry.id
             )));
         };
-        if entry.name != name
-            || entry.directory_id != directory_id
-            || entry.created_at != created_at
-        {
+        if entry.name != name || entry.directory != directory || entry.created_at != created_at {
             return Err(MigrateError::Validation(format!(
                 "index row for {} disagrees with what was migrated \
                  (name {:?} vs {:?}, directory {} vs {}, created {} vs {})",
                 entry.id,
                 entry.name,
                 name,
-                entry.directory_id,
-                directory_id,
+                entry.directory.display(),
+                directory.display(),
                 entry.created_at,
                 created_at
             )));
         }
         let project = store.open_project(entry.id)?;
         let config: ProjectConfig = read_yaml(&project.root.join(CONFIG_FILE))?;
-        if config.directory_id != Some(entry.directory_id) {
+        if config.directory.as_deref() != Some(entry.directory.as_path()) {
             return Err(MigrateError::Validation(format!(
-                "project {} config directory_id disagrees with its index row",
+                "project {} config directory disagrees with its index row",
                 entry.id
             )));
         }

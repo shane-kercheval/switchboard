@@ -321,12 +321,6 @@
   async function openActiveProjectInTerminal(): Promise<void> {
     if (activeProject === null) return;
     commandError = null;
-    // `directory` is null when the project's directory identity resolves to no
-    // single path — there is nothing to open, and the backend refuses to guess.
-    if (activeProject.directory === null) {
-      commandError = "This project's working directory could not be resolved.";
-      return;
-    }
     try {
       await api.openInTerminal(activeProject.directory);
     } catch (e) {
@@ -337,10 +331,6 @@
   async function revealActiveProjectInFinder(): Promise<void> {
     if (activeProject === null) return;
     commandError = null;
-    if (activeProject.directory === null) {
-      commandError = "This project's working directory could not be resolved.";
-      return;
-    }
     try {
       await api.revealInFinder(activeProject.directory);
     } catch (e) {
@@ -445,7 +435,7 @@
   }
 
   async function openActiveProjectInGit(): Promise<void> {
-    if (activeProject === null || activeProject.directory === null) return;
+    if (activeProject === null) return;
     settingsOpen = false;
     const result = await revealProjectBranch(activeProject.id, activeProject.directory);
     if (result.kind === "failed") {
@@ -508,11 +498,10 @@
     };
   });
 
-  // The displayed project's row when its working directory can't be used: the
-  // folder is gone, or the catalog can't say which folder it is. Either way no
-  // agent can run there, so the compose bar is gated (see ComposeBar) and this
-  // banner says why. It clears on its own once a registry refresh sees the
-  // folder again.
+  // The displayed project's row when its working directory is gone. No agent
+  // can run there, so the compose bar is gated (see ComposeBar) and this banner
+  // says why. It clears on its own once a registry refresh sees the folder
+  // again.
   const activeDirectoryProblem = $derived.by(() => {
     const projectId = selection.activeProjectId;
     if (projectId === null) return null;
@@ -520,13 +509,11 @@
     if (listing === undefined || projectIsAvailable(listing)) return null;
     return listing;
   });
-  const activeDirectoryProblemMessage = $derived.by(() => {
-    const listing = activeDirectoryProblem;
-    if (listing === null) return "";
-    return listing.directory_status === "resolved_path_unavailable" && listing.directory !== null
-      ? `This project's folder no longer exists at ${listing.directory}, so its agents can't run. If it was moved, put it back at that location; Switchboard checks again when you return to the window.`
-      : "Switchboard can't tell which folder this project belongs to, so it can't be used. Repairing its folder record isn't possible from Switchboard yet.";
-  });
+  const activeDirectoryProblemMessage = $derived(
+    activeDirectoryProblem === null
+      ? ""
+      : `This project's folder no longer exists at ${activeDirectoryProblem.directory}, so its agents can't run. If it was moved, put it back at that location; Switchboard checks again when you return to the window.`,
+  );
 
   // The displayed project's roster + hydrated conversation. `rosterLoaded`
   // distinguishes "roster still loading on first activation" (key absent) from
@@ -990,7 +977,7 @@
     }
   }
 
-  // "Add project" dialog. The form (`CreateProjectForm`) owns both modes' state
+  // "Add project" dialog. The form (`CreateProjectForm`) owns its own state
   // and commits; App only tracks open/close and a `busy` flag the form drives so
   // the modal stays non-dismissible while a commit (esp. new-project agent
   // seeding) is in flight. The form remounts fresh on each open (Dialog unmounts
@@ -1634,9 +1621,7 @@
         <Banner
           message={activeDirectoryProblemMessage}
           testid="banner-project-directory-unavailable"
-          actionLabel={activeDirectoryProblem.directory_status === "resolved_path_unavailable"
-            ? "Check again"
-            : undefined}
+          actionLabel="Check again"
           onAction={() => void refreshProjectRegistry()}
         />
       {/if}

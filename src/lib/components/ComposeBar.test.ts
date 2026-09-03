@@ -1148,8 +1148,7 @@ describe("ComposeBar", () => {
           name: "project",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/project",
-          directory_id: `dir:${"/work/project"}`,
-          directory_status: "resolved_available",
+          directory_available: true,
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -4348,8 +4347,7 @@ describe("ComposeBar prompt mode", () => {
           name: "here",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/here",
-          directory_id: `dir:${"/work/here"}`,
-          directory_status: "resolved_available",
+          directory_available: true,
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -4358,8 +4356,7 @@ describe("ComposeBar prompt mode", () => {
           name: "backend",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/backend",
-          directory_id: `dir:${"/work/backend"}`,
-          directory_status: "resolved_available",
+          directory_available: true,
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -4794,8 +4791,7 @@ describe("ComposeBar prompt mode", () => {
         name: "project",
         created_at: "2026-05-16T00:00:00Z",
         directory: "/work/project",
-        directory_id: `dir:${"/work/project"}`,
-        directory_status: "resolved_available",
+        directory_available: true,
         last_activity: "2026-05-16T00:00:00Z",
         archived: false,
       },
@@ -6432,8 +6428,7 @@ describe("ComposeBar — cross-agent forward", () => {
           name: "here",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/here",
-          directory_id: `dir:${"/work/here"}`,
-          directory_status: "resolved_available",
+          directory_available: true,
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -6442,8 +6437,7 @@ describe("ComposeBar — cross-agent forward", () => {
           name: "backend",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/backend",
-          directory_id: `dir:${"/work/backend"}`,
-          directory_status: "resolved_available",
+          directory_available: true,
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -8651,8 +8645,7 @@ describe("ComposeBar — unavailable project folder", () => {
     name: "project",
     created_at: "2026-05-16T00:00:00Z",
     directory: "/work/project",
-    directory_id: "dir:/work/project",
-    directory_status: "resolved_path_unavailable",
+    directory_available: false,
     last_activity: "2026-05-16T00:00:00Z",
     archived: false,
   };
@@ -8674,7 +8667,7 @@ describe("ComposeBar — unavailable project folder", () => {
     await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
     expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message")).toHaveLength(0);
 
-    ws.projects.list = [{ ...LISTING, directory_status: "resolved_available" }];
+    ws.projects.list = [{ ...LISTING, directory_available: true }];
     await tick();
     expect(send.disabled).toBe(false);
   });
@@ -8716,8 +8709,7 @@ describe("ComposeBar — unavailable project folder, fork shortcut", () => {
         name: "project",
         created_at: "2026-05-16T00:00:00Z",
         directory: "/work/project",
-        directory_id: "dir:/work/project",
-        directory_status: "resolved_path_unavailable",
+        directory_available: false,
         last_activity: "2026-05-16T00:00:00Z",
         archived: false,
       },
@@ -8740,7 +8732,7 @@ describe("ComposeBar — unavailable project folder, fork shortcut", () => {
     // composer offers the fork half once the folder is back.
     ws.projects.list = ws.projects.list.map((p) => ({
       ...p,
-      directory_status: "resolved_available" as const,
+      directory_available: true,
     }));
     await waitFor(() => expect(screen.queryByTestId("compose-fork-send")).not.toBeNull());
   });

@@ -44,7 +44,7 @@ This orchestration model has a useful side effect for prompt management. Because
 
 | Concept | Definition |
 |---|---|
-| **Working directory** | An on-disk directory (typically a git repo) where Switchboard does its work — the agent's spawn cwd. Recorded in the store's catalog under a stable `directory_id`; **Switchboard writes nothing into it.** Zero or more **projects** reference it. |
+| **Working directory** | An on-disk directory (typically a git repo) where Switchboard does its work — the agent's spawn cwd. Each project records its own as a canonical path on its index row; **Switchboard writes nothing into it.** Zero or more **projects** point at the same one. |
 | **Project** | A named, task-scoped grouping of agents + workflow runs + runtime state, hosted within a working directory. (Workflow *definitions* are **user-global** — one set shared across every project; projects own workflow *runs* — the in-flight invocations against their agents.) Each project has a UUID (`ProjectId`) and a user-supplied name (unique within its directory; can collide across directories). Multiple projects can coexist in the same working directory, allowing the user to run separate workstreams (backend / frontend / planning / etc.) on the same repo simultaneously. Project-specific state lives at `<store>/projects/<project-id>/` (see directory layout below). |
 | **Agent** | A Claude Code, Codex, or Antigravity session within a project, with a user-assigned name. Each agent has a persistent harness session under the hood, identified by a `session_locator` on its registry record (a UUID for Claude/Antigravity; a thread-id + partition-date for Codex). All three harnesses keep their locator wholly on the record — pre-generated at creation (Claude) or captured at runtime (Codex/Antigravity). Agents are bound to their project, not directly to the directory. |
 | **Primitive** | An atomic operation Switchboard provides for a workflow to compose: spawn agent, send message, auto-forward output, fan-in with template, pause for user input, iterate over a list. Six exist in v1; see §4. (Saving and invoking a reusable workflow is the composition layer over these primitives, not itself a primitive — see §5.) |
@@ -74,22 +74,18 @@ The shape (illustrative):
 ├── config.yaml                 # personal preferences + prompt providers (local_prompt_dirs, mcp_providers — §6)
 ├── prompts/                    # default local prompt store (built-ins are baked-in read-only — §6)
 ├── workflows/                  # user-global workflow definitions (YAML), shared across every project
-├── workspace.yaml              # app-managed **view-state only**: the working directories the user works
-│                               #   across (ordering) and which projects are archived.
+├── workspace.yaml              # app-managed **view-state only**: which projects are archived.
 │                               #   Nothing here is load-bearing — losing it costs arrangement, never a project.
 ├── locks/                      # cross-process harness session locks, one file per (harness, session, cwd).
 │                               #   Deliberately NOT dev-isolated: a dev build and the installed app must
 │                               #   contend on the same file or neither sees the other (see session_lock.rs)
 └── store/                      # the project store — the source of truth for what exists
     ├── store.yaml              # schema marker, checked fail-loud
-    ├── projects.jsonl          # global index: { id, name, created_at, directory_id } — one file for
-    │                           #   every project across every directory
-    ├── directories.jsonl       # the catalog: { directory_id, path }. Entries are never deleted while
-    │                           #   any project references them — deleting the mapping would strand
-    │                           #   every project under it with no cwd to dispatch into
+    ├── projects.jsonl          # global index: { id, name, created_at, directory } — one file for
+    │                           #   every project across every working directory
     └── projects/
         └── <project-id>/
-            ├── config.yaml     # per-project config, incl. a directory_id recovery copy (never read at runtime)
+            ├── config.yaml     # per-project config, incl. a working-directory recovery copy (never read at runtime)
             ├── instance.lock   # flock — one Switchboard process per project at a time
             ├── registry.jsonl  # agent registry (appended on register, rewritten on rename/remove)
             ├── journal.jsonl   # append-only user sends, outcomes, and durable turn links
@@ -104,7 +100,7 @@ The shape (illustrative):
             └── runs/           # workflow-run records
 ```
 
-**A project's working directory is resolved, not stored.** Each project row carries a `directory_id`; the catalog maps that id to a path. This indirection is what makes a moved directory a one-line repair (re-point the id) instead of a rewrite of every project that shares it, and it is why the wire type reports a structured directory status — resolved-and-available, resolved-but-path-unavailable, catalog-missing, catalog-ambiguous — rather than a boolean: the three failures have different causes and different repairs.
+**A project's working directory is a path on its own row.** An earlier layout kept a separate catalog of directory identities that projects referenced by id, on the theory that a moved folder should be a one-row repair. The index is one file rewritten whole and atomically, so that bought nothing, and the indirection created failure states (a dangling or duplicated identity) that ordinary use never produced but every reader had to handle. Now the row says where the project lives, the wire reports one flag — does that folder currently exist — and repairing a moved folder is `set_project_directory` on the project the user is looking at. The store migrates the old layout in place on first open.
 
 Everything under the config dir is local-machine runtime data. It is outside any repo, so there is nothing to `.gitignore`.
 
@@ -118,9 +114,9 @@ The store owns every project; a working directory is one of the store's own reco
 
 **A project whose directory is gone still lists, renames, archives, and deletes.** Only *dispatch* needs a working directory (it is the agent's spawn cwd), so everything else works on a project whose checkout was deleted — the row shows why it can't run and offers the repair, instead of vanishing. This is the concrete payoff of the move: under the old layout, deleting a worktree deleted its history.
 
-`workspace.yaml` is **view-state only**: the directory ordering and the set of archived project ids. Nothing in it is load-bearing — the store records what exists, so a lost or corrupt `workspace.yaml` costs the user their arrangement and never a project. That is precisely what makes best-effort loading safe. Archived-ness is per-install rather than travelling with the project, which is the accepted trade for its working when a directory is offline.
+`workspace.yaml` is **view-state only**: the set of archived project ids. Nothing in it is load-bearing — the store records what exists, so a lost or corrupt `workspace.yaml` costs the user their archived choices and never a project. That is precisely what makes best-effort loading safe. Archived-ness is per-install rather than travelling with the project, which is the accepted trade for its working when a directory is offline.
 
-Adding a directory records it in the catalog and the workspace list. **There is no "remove directory."** A catalog entry is referenced by every project in it and can never be deleted while any of them exists, so removal cannot mean "forget" without orphaning those projects. A view-state *hide* was built for this and carried for a milestone without ever being given an affordance; it was removed rather than left as reachable-looking dead code. Cleanup happens through the project archive/delete affordances, which is what the gesture would have decomposed into anyway. If directory-level decluttering is wanted later, it returns as `hidden` in `workspace.yaml` plus a row action — the plumbing is small; the missing piece was always the UI. Re-pointing a moved directory — one edit to the catalog, moving every project that shares the identity — is a planned affordance.
+There is no separate "add a directory" step: creating a project names the folder it works in, and the folder exists in Switchboard only as the paths its projects record. **There is no "remove directory"** for the same reason — cleanup happens through the project archive/delete affordances. Pointing a project whose folder moved at its new location (`set_project_directory`, one project at a time) exists as a backend command; the UI affordance for it is a planned follow-up.
 
 **Conversation source of truth — a split.** Switchboard stores no agent content **as transcript history** — the unified transcript's agent side always comes from the harness session files (one scoped exception below). But the harness session files do not hold *everything* either: they cannot faithfully represent the user's side of a multi-agent conversation — a fan-out replicates the user's prompt across every recipient's file, and an instantly-cancelled send is written to none. So the model is a split:
 

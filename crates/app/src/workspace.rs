@@ -1,47 +1,32 @@
-//! User-global workspace **view-state** — how the user has arranged the
-//! directories and projects the store holds.
+//! User-global workspace **view-state** — which projects the user has
+//! archived.
 //!
-//! Two things live here and nothing else: the ordered set of known directory
-//! paths, and which projects the user has archived. Both are presentation
-//! choices with no on-disk counterpart, which is why they are user-global
+//! That is the only thing that lives here. It is a presentation choice with no
+//! on-disk counterpart in the project itself, which is why it is user-global
 //! rather than stored beside the data.
 //!
 //! **Nothing here is load-bearing, and that is what makes best-effort loading
-//! safe.** The store's `projects.jsonl` and `directories.jsonl` are the record
-//! of what exists; a missing or corrupt `workspace.yaml` costs the user their
-//! ordering and their archived choices, never a project. This file used
-//! to also cache each directory's project list so an unavailable directory
-//! could still be listed — the store makes that redundant, because the index
-//! lives under the store root and is readable whether or not any working
-//! directory is. Removing the cache removes the one thing in here that *was*
-//! load-bearing, and with it the class of bug where a stale snapshot
-//! resurrected a deleted project.
+//! safe.** The store's `projects.jsonl` is the record of what exists; a missing
+//! or corrupt `workspace.yaml` costs the user their archived choices, never a
+//! project.
 //!
-//! `serde` ignores the removed `cached_projects` key, so an existing
-//! `workspace.yaml` loads unchanged.
+//! This file used to also carry the ordered list of working directories (and,
+//! before that, a cached copy of each directory's projects). Both are gone: the
+//! store records each project's directory on its own row, so the list had
+//! nothing left to say. `serde` ignores the retired `entries` and
+//! `cached_projects` keys, so an existing `workspace.yaml` loads unchanged.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use switchboard_core::{CoreError, ProjectId};
 
 use crate::error::AppError;
 
-/// One known working directory, as `workspace.yaml` persists it.
-///
-/// Path only. The projects that live in it come from the store index, keyed by
-/// `directory_id`, not from anything recorded here.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DirectoryEntry {
-    pub path: PathBuf,
-}
-
-/// The ordered set of known directories. Order is insertion order — the UI
-/// renders directories in the sequence the user added them.
+/// The archived set, as `workspace.yaml` persists it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Workspace {
-    entries: Vec<DirectoryEntry>,
     /// Projects the user has archived (hidden from the default view). This is
     /// **user-global view-state**, not on-disk project state: it lives here so
     /// archive works even when a project's directory is offline, and so it never
@@ -53,74 +38,9 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// Add a directory to the registry. Idempotent: a second add of an
-    /// already-known path is a no-op that preserves the existing entry's
-    /// position.
-    ///
-    /// Paths are compared as-given. Callers that want canonicalized identity
-    /// (matching `Directory::at`) should canonicalize before adding; we do not
-    /// canonicalize here because canonicalization requires the path to exist on
-    /// disk and the registry must be able to hold currently-unavailable
-    /// directories.
-    pub fn add(&mut self, path: PathBuf) {
-        if self.contains(&path) {
-            return;
-        }
-        self.entries.push(DirectoryEntry { path });
-    }
-
-    /// Retire every path a directory identity used to hold and register the one
-    /// it holds now, keeping the entry's position.
-    ///
-    /// **Plural, and chosen by what this registry knows.** A duplicated identity
-    /// holds more than one catalog path, and catalog order has no relationship
-    /// to the order the user arranged their directories in — the surplus row
-    /// typically arrives from outside (a partial restore, a bulk write) and is
-    /// not an entry here at all. Picking `old[0]` therefore updated nothing and
-    /// retired the legitimate row, leaving the repaired directory with **no
-    /// entry**: gone from the list and its position lost, while the
-    /// repair reported success. So: keep the earliest old path this registry
-    /// actually tracks, retire the rest, and fall back to appending when it
-    /// tracks none of them.
-    pub fn replace_paths(&mut self, old: &[PathBuf], new: PathBuf) {
-        let anchor = old
-            .iter()
-            .filter_map(|path| {
-                self.entries
-                    .iter()
-                    .position(|entry| entry.path == *path)
-                    .map(|index| (index, path))
-            })
-            .min_by_key(|(index, _)| *index);
-        if let Some((index, keep)) = anchor {
-            let keep = keep.clone();
-            self.entries
-                .retain(|entry| entry.path == keep || !old.contains(&entry.path));
-            let index = index.min(self.entries.len().saturating_sub(1));
-            if self.entries.iter().any(|entry| entry.path == new) {
-                // The destination is already tracked; retiring the anchor
-                // collapses onto it rather than creating a duplicate row.
-                self.entries.retain(|entry| entry.path != keep);
-            } else {
-                self.entries[index].path.clone_from(&new);
-            }
-        } else {
-            self.entries.retain(|entry| !old.contains(&entry.path));
-            self.add(new);
-        }
-    }
-
-    pub fn entries(&self) -> &[DirectoryEntry] {
-        &self.entries
-    }
-
-    pub fn contains(&self, path: &Path) -> bool {
-        self.entries.iter().any(|entry| entry.path == path)
-    }
-
     /// Set (or clear) a project's archived flag. Returns whether the set
     /// actually changed, so callers persist `workspace.yaml` only on a real
-    /// change (mirrors `refresh_cache`).
+    /// change.
     pub fn set_archived(&mut self, id: ProjectId, archived: bool) -> bool {
         if archived {
             self.archived.insert(id)
@@ -223,7 +143,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("workspace.yaml");
         let outcome = load(&path);
-        assert!(outcome.workspace.entries().is_empty());
+        assert_eq!(outcome.workspace, Workspace::default());
         assert!(outcome.persistable, "a fresh install must be persistable");
     }
 
@@ -233,29 +153,13 @@ mod tests {
         let path = dir.path().join("nested").join("workspace.yaml");
 
         let mut workspace = Workspace::default();
-        workspace.add(PathBuf::from("/a"));
-        workspace.add(PathBuf::from("/b"));
+        workspace.set_archived(Uuid::new_v4(), true);
+        workspace.set_archived(Uuid::new_v4(), true);
 
         save(&path, &workspace).unwrap();
         let outcome = load(&path);
         assert_eq!(outcome.workspace, workspace);
         assert!(outcome.persistable);
-    }
-
-    #[test]
-    fn add_is_idempotent_and_preserves_order() {
-        let mut workspace = Workspace::default();
-        workspace.add(PathBuf::from("/a"));
-        workspace.add(PathBuf::from("/b"));
-
-        workspace.add(PathBuf::from("/a"));
-
-        let paths: Vec<&Path> = workspace
-            .entries()
-            .iter()
-            .map(|e| e.path.as_path())
-            .collect();
-        assert_eq!(paths, vec![Path::new("/a"), Path::new("/b")]);
     }
 
     #[test]
@@ -303,34 +207,28 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_yaml_carrying_the_retired_hidden_key_still_loads() {
-        // Directory hiding was removed after shipping, so a real file can still
-        // carry the key. The struct does not deny unknown fields, so it is
+    fn a_workspace_yaml_carrying_retired_keys_still_loads_its_archived_set() {
+        // The directory list, its project cache, and directory hiding were all
+        // removed after shipping, so a real file can still carry every one of
+        // those keys. The struct does not deny unknown fields, so they are
         // ignored and dropped on the next write — a stale key must never cost
-        // the user their arrangement.
+        // the user their archived choices.
         let dir = tempdir().unwrap();
         let path = dir.path().join("workspace.yaml");
-        std::fs::write(&path, "entries:\n- path: /a\nhidden:\n- /a\narchived: []\n").unwrap();
-
-        let loaded = load(&path).workspace;
-        assert!(loaded.contains(Path::new("/a")));
-        assert_eq!(loaded.entries().len(), 1);
-    }
-
-    #[test]
-    fn a_workspace_yaml_holding_the_removed_project_cache_still_loads() {
-        // The cache key is gone from the struct; serde must ignore it rather
-        // than fail, or an existing install loses its directory list.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("workspace.yaml");
+        let archived = Uuid::new_v4();
         std::fs::write(
             &path,
-            "entries:\n- path: /a\n  cached_projects:\n  - id: 0192f0c0-0000-7000-8000-000000000000\n    name: alpha\n    created_at: 2026-01-01T00:00:00Z\n",
+            format!(
+                "entries:\n- path: /a\n  cached_projects:\n  - id: 0192f0c0-0000-7000-8000-000000000000\n    name: alpha\n    created_at: 2026-01-01T00:00:00Z\nhidden:\n- /a\narchived:\n- {archived}\n"
+            ),
         )
         .unwrap();
 
-        let workspace = load(&path).workspace;
-        assert!(workspace.contains(Path::new("/a")));
+        let loaded = load(&path).workspace;
+        assert!(loaded.is_archived(archived));
+        let mut expected = Workspace::default();
+        expected.set_archived(archived, true);
+        assert_eq!(loaded, expected);
     }
 
     #[test]
@@ -340,7 +238,7 @@ mod tests {
         std::fs::write(&path, "this: is: not: valid: yaml: [").unwrap();
 
         let outcome = load(&path);
-        assert!(outcome.workspace.entries().is_empty());
+        assert_eq!(outcome.workspace, Workspace::default());
         // Corrupt → unrecoverable, so a fresh save may replace it.
         assert!(outcome.persistable);
     }
@@ -355,7 +253,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
 
         let outcome = load(&path);
-        assert!(outcome.workspace.entries().is_empty());
+        assert_eq!(outcome.workspace, Workspace::default());
         assert!(
             !outcome.persistable,
             "an unreadable existing file must disable persistence so it is never clobbered"

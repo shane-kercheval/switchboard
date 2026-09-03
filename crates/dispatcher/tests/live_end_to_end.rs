@@ -2,7 +2,7 @@
 //! `agy`.
 //!
 //! Exercises the **full backend vertical slice** that a user actually
-//! triggers: `Store::add_directory` → `create_project` → `register_agent` →
+//! triggers: `Store::create_project` → `register_agent` →
 //! `Dispatcher::send_message` → real subprocess → events streamed back
 //! through the `EventEmitter`. Uses realistic on-disk paths so any
 //! path-encoding rule or cwd-semantic decision is exercised against the
@@ -226,11 +226,8 @@ fn assert_ordering_contract(kinds: &[String]) {
 fn temp_project(working_directory: &std::path::Path, name: &str) -> (TempDir, Project) {
     let store_root = TempDir::new().expect("store root");
     let store = Store::open(store_root.path()).expect("open store");
-    let directory = store
-        .add_directory(working_directory)
-        .expect("add_directory");
     let project = store
-        .create_project(directory.directory_id, name)
+        .create_project(working_directory, name)
         .expect("create_project");
     (store_root, project)
 }

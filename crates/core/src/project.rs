@@ -11,7 +11,7 @@ use crate::agent::{
 };
 use crate::error::{CoreError, Result};
 use crate::harness::{HarnessKind, SelectionAxis};
-use crate::ids::{DirectoryId, ProjectId};
+use crate::ids::ProjectId;
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
 use crate::paths::{
@@ -61,29 +61,24 @@ pub struct ProjectConfig {
     /// never read at runtime.**
     ///
     /// **`projects.jsonl` is authoritative; this copy is never read at
-    /// runtime.** Deliberately stated on its own rather than by analogy to
-    /// `name`, whose contract runs the other way. Nothing resolves a dispatch
-    /// cwd from here: [`load`] must not populate [`Project::directory`] from it,
-    /// because doing so would bypass the catalog — the only place that can
-    /// detect a duplicated or missing directory id — in favour of a copy with no
-    /// such checks.
+    /// runtime.** Nothing resolves a dispatch cwd from here: [`load`] must not
+    /// populate [`Project::directory`] from it, because the index is the one
+    /// record every reader agrees on, and a config that drifted from it would
+    /// send dispatch somewhere the project list does not show.
     ///
     /// It exists so the project tree is self-describing. Without it, losing
-    /// `projects.jsonl` and `directories.jsonl` together leaves every project's
-    /// data intact with no record of which directory any of it belongs to. With
-    /// it, a repair tool can rebuild the index and see which projects share a
-    /// directory identity. It does **not** recover the catalog's
-    /// `directory_id -> path` mapping, which still needs migration records or
-    /// the user re-pointing each id.
+    /// `projects.jsonl` leaves every project's data intact with no record of
+    /// which folder any of it belongs to; with it, a repair tool can rebuild
+    /// the index from the project directories alone.
     ///
     /// `None` means the project predates the user-global store (the legacy
     /// `<directory>/.switchboard/` layout, whose owning directory was implied by
     /// the path). Every project created in or migrated into the store carries
-    /// `Some`. **Any future writer that can change a project's owning directory
-    /// must update this alongside the index** — today the only writers are
-    /// creation and rename, and both stamp it from the index entry.
+    /// `Some`. **Any writer that can change a project's working directory must
+    /// update this alongside the index** — creation, rename, and
+    /// `Store::set_project_directory` all stamp it from the index entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub directory_id: Option<DirectoryId>,
+    pub directory: Option<PathBuf>,
 }
 
 /// The per-caller inputs to [`Project::register_agent_inner`].
@@ -829,9 +824,9 @@ pub(crate) fn load(directory: &Path, id: ProjectId, root: PathBuf) -> Result<Pro
 /// **A missing `registry.jsonl` is corruption, not an empty roster.**
 /// `create_on_disk` creates it with `create_new`, so every project that exists
 /// has one; `read_jsonl` would otherwise map its absence to `Ok(vec![])` and the
-/// session-id uniqueness scans — the whole reason this read is catalog-free —
-/// would silently pass over a project whose agents they could not see. Same
-/// posture the store already takes on `projects.jsonl` and `directories.jsonl`.
+/// session-id uniqueness scans — the whole reason this read needs no working
+/// directory — would silently pass over a project whose agents they could not
+/// see. Same posture the store already takes on `projects.jsonl`.
 ///
 /// Shared with [`Project::list_agents`] so both paths apply the same
 /// cross-field validation rather than one of them growing a laxer copy.
@@ -944,11 +939,8 @@ fn reject_fork_provenance_cycles(agents: &[AgentRecord]) -> Result<()> {
 /// legacy `Directory` layout, for rolling back the directory if that append
 /// fails.
 ///
-/// `directory_id` is `None` only for the legacy layout, where the owning
-/// directory was implied by the path; see [`ProjectConfig::directory_id`].
 pub(crate) fn create_on_disk(
     directory: &Path,
-    directory_id: Option<DirectoryId>,
     projects_dir: &Path,
     name: &str,
 ) -> Result<(ProjectSummary, Project)> {
@@ -961,7 +953,7 @@ pub(crate) fn create_on_disk(
         version: PROJECT_CONFIG_VERSION,
         name: name.to_owned(),
         created_at,
-        directory_id,
+        directory: Some(directory.to_owned()),
     };
     write_yaml(&root.join(CONFIG_FILE), &config)?;
 
@@ -1005,7 +997,7 @@ mod tests {
         let projects_dir = tmp.path().join("projects");
         create_dir_all(&projects_dir).unwrap();
         let (_summary, project) =
-            create_on_disk(tmp.path(), None, &projects_dir, "test-project").unwrap();
+            create_on_disk(tmp.path(), &projects_dir, "test-project").unwrap();
         (tmp, project)
     }
 

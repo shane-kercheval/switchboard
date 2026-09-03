@@ -46,8 +46,7 @@ function project(id: string, lastActivity: string): ProjectListing {
     name: `proj-${id.slice(-2)}`,
     created_at: "2026-05-16T00:00:00Z",
     directory: `/work/${id.slice(-2)}`,
-    directory_id: `dir:${`/work/${id.slice(-2)}`}`,
-    directory_status: "resolved_available",
+    directory_available: true,
     last_activity: lastActivity,
     archived: false,
   };
@@ -168,8 +167,8 @@ describe("workspace project activity", () => {
     ws.projects.list = [foreground, staleBackground];
     ws.recordProjectsActivityLocally([PROJECT_1], "2026-05-25T12:00:00.000Z");
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") {
-        return { directories: [], persistable: true };
+      if (cmd === "workspace_status") {
+        return { persistable: true };
       }
       if (cmd === "list_projects") {
         return [foreground, staleBackground];
@@ -193,8 +192,8 @@ describe("workspace project activity", () => {
     ws.projects.list = [foreground, background];
     ws.recordProjectsActivityLocally([PROJECT_1], "2026-05-25T12:00:00.000Z");
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") {
-        return { directories: [], persistable: true };
+      if (cmd === "workspace_status") {
+        return { persistable: true };
       }
       if (cmd === "list_projects") {
         return [foreground, fresherBackground];
@@ -227,8 +226,8 @@ describe("workspace project activity", () => {
     state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
     await tick();
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") {
-        return { directories: [], persistable: true };
+      if (cmd === "workspace_status") {
+        return { persistable: true };
       }
       if (cmd === "list_projects") {
         return [foreground, staleBackground];
@@ -1628,7 +1627,7 @@ describe("project idle predicate", () => {
     await tick();
 
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") return { directories: [], persistable: true };
+      if (cmd === "workspace_status") return { persistable: true };
       if (cmd === "list_projects") return [];
       return undefined;
     });
@@ -1687,8 +1686,8 @@ describe("project idle predicate", () => {
     observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
     await tick();
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") {
-        return { directories: [], persistable: true };
+      if (cmd === "workspace_status") {
+        return { persistable: true };
       }
       if (cmd === "list_projects") {
         return [];
@@ -1900,7 +1899,7 @@ describe("reading mode fallback", () => {
     reading.toggleReadingMode(PROJECT_1);
 
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") return { directories: [], persistable: true };
+      if (cmd === "workspace_status") return { persistable: true };
       if (cmd === "list_projects") return [];
       return undefined;
     });
@@ -1920,7 +1919,7 @@ describe("workspace registry reads", () => {
   } {
     const pending: { resolve: (rows: ProjectListing[]) => void; reject: (e: Error) => void }[] = [];
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === "list_workspace_directories") return { directories: [], persistable: true };
+      if (cmd === "workspace_status") return { persistable: true };
       if (cmd === "list_projects") {
         return new Promise((resolve, reject) => pending.push({ resolve, reject }));
       }

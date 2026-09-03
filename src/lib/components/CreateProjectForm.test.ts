@@ -18,10 +18,8 @@ vi.mock("$lib/api", () => ({
 }));
 
 const createProjectAndActivateMock = vi.fn<(name: string, dir: string) => Promise<void>>();
-const addDirectoryMock = vi.fn<(path: string) => Promise<void>>();
 vi.mock("$lib/state/workspace.svelte", () => ({
   createProjectAndActivate: (name: string, dir: string) => createProjectAndActivateMock(name, dir),
-  addDirectory: (path: string) => addDirectoryMock(path),
 }));
 
 import CreateProjectForm from "./CreateProjectForm.svelte";
@@ -46,8 +44,6 @@ beforeEach(() => {
   pickDirectoryMock.mockReset();
   createProjectAndActivateMock.mockReset();
   createProjectAndActivateMock.mockResolvedValue(undefined);
-  addDirectoryMock.mockReset();
-  addDirectoryMock.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -202,54 +198,6 @@ describe("CreateProjectForm — new project", () => {
       expect(screen.getByTestId("new-project-error")).toHaveTextContent("disk full"),
     );
     expect(onClose).not.toHaveBeenCalled();
-  });
-});
-
-describe("CreateProjectForm — add existing", () => {
-  async function switchToExisting(): Promise<void> {
-    await fireEvent.click(screen.getByTestId("project-dialog-mode-existing"));
-    await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
-  }
-
-  it("previews discovered projects and Add commits via addDirectory", async () => {
-    openMock.mockResolvedValue("/picked/b");
-    pickDirectoryMock.mockResolvedValue(info("/canonical/b", [summary("existing-proj")]));
-    const { onClose } = renderForm();
-    await switchToExisting();
-
-    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
-    await waitFor(() => expect(screen.getByTestId("add-existing-found")).toBeInTheDocument());
-    expect(screen.getByTestId("add-existing-found")).toHaveTextContent("existing-proj");
-    expect(screen.getByTestId("add-existing-add")).toBeEnabled();
-
-    await fireEvent.click(screen.getByTestId("add-existing-add"));
-    expect(addDirectoryMock).toHaveBeenCalledWith("/canonical/b");
-    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
-  });
-
-  it("shows the empty state and disables Add when the folder has no projects", async () => {
-    openMock.mockResolvedValue("/picked/empty");
-    pickDirectoryMock.mockResolvedValue(info("/picked/empty", []));
-    renderForm();
-    await switchToExisting();
-
-    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
-    await waitFor(() => expect(screen.getByTestId("add-existing-none")).toBeInTheDocument());
-    expect(screen.queryByTestId("add-existing-found")).not.toBeInTheDocument();
-    expect(screen.getByTestId("add-existing-add")).toBeDisabled();
-    expect(addDirectoryMock).not.toHaveBeenCalled();
-  });
-
-  it("surfaces a probe failure and disables Add", async () => {
-    openMock.mockResolvedValue("/picked/bad");
-    pickDirectoryMock.mockRejectedValue(new Error("incompatible .switchboard/ version"));
-    renderForm();
-    await switchToExisting();
-
-    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
-    await waitFor(() => expect(screen.getByTestId("add-existing-error")).toBeInTheDocument());
-    expect(screen.getByTestId("add-existing-add")).toBeDisabled();
-    expect(addDirectoryMock).not.toHaveBeenCalled();
   });
 });
 

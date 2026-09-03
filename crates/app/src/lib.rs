@@ -209,6 +209,27 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// Refuse to start, and say why where the user can read it.
+///
+/// A `setup` error becomes a panic in the builder's `expect`, which for an app
+/// launched from Finder is a process that exits before a window exists, with
+/// the reason in a crash log nobody opens. The store's refusals are written to
+/// be read — a blocked migration names the project and the file to repair — so
+/// they are shown in a blocking native dialog first. Exiting afterwards is
+/// abrupt but correct at this point: nothing has been created that a clean
+/// shutdown would need to unwind.
+fn abort_startup(app: &tauri::AppHandle, message: &str) -> ! {
+    use tauri_plugin_dialog::{DialogExt as _, MessageDialogKind};
+
+    eprintln!("{message}");
+    app.dialog()
+        .message(message)
+        .title("Switchboard can't start")
+        .kind(MessageDialogKind::Error)
+        .blocking_show();
+    std::process::exit(1)
+}
+
 #[cfg(target_os = "macos")]
 fn start_quit_confirmation(app: tauri::AppHandle) {
     use tauri_plugin_dialog::{DialogExt as _, MessageDialogButtons, MessageDialogKind};
@@ -295,7 +316,7 @@ fn handle_macos_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
 use crate::commands::{
     AUTOCREATE_PATH_WAIT, AgentSessionFingerprint, AgentSessionInfo, DirectoryInfo, ForwardArg,
     ForwardOutcome, HarnessInstallStatus, ProjectListing, RepoListing, StagedAttachment,
-    WorkspaceDirectories, add_mcp_provider_impl, add_tracked_repo_impl, agent_session_info_impl,
+    WorkspaceStatus, add_mcp_provider_impl, add_tracked_repo_impl, agent_session_info_impl,
     attach_agent_impl, branch_comparison_file_diff_impl, branch_comparison_impl, cancel_agent_impl,
     cancel_forward_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
     check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
@@ -304,9 +325,8 @@ use crate::commands::{
     create_agent_with_profiles_impl, create_project_impl, delete_project_impl, editor_open_argv,
     existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl, fork_agent_impl,
     forward_message_impl, forward_prompt_impl, get_preferences_impl, get_prompt_source_impl,
-    harness_adapter_for, init_directory_impl, install_status_for_adapter, list_agents_impl,
-    list_mcp_providers_impl, list_message_pins_impl, list_projects_impl, list_prompts_impl,
-    list_tracked_repos_from_inputs, list_workspace_directories_impl,
+    harness_adapter_for, install_status_for_adapter, list_agents_impl, list_mcp_providers_impl,
+    list_message_pins_impl, list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
     load_project_conversation_impl, load_transcript_impl, migrate_message_pin_impl,
     open_branch_comparison_file_difftool_impl, open_commit_file_difftool_impl, open_project_impl,
     open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
@@ -314,14 +334,15 @@ use crate::commands::{
     recheck_harness_installs_impl, remove_agent_impl, remove_mcp_provider_impl,
     remove_message_pins_impl, remove_queued_message_impl, remove_tracked_repo_impl,
     rename_agent_impl, rename_project_impl, render_prompt_impl, reorder_agents_impl,
-    repoint_project_directory_impl, resolve_saved_prompt_fresh_impl, resolve_saved_prompt_impl,
-    resume_agent_in_terminal_impl, reveal_in_finder_argv, search_project_files_in_root,
-    search_project_files_root_impl, send_message_impl, set_active_agent_profile_impl,
-    set_active_project_impl, set_agent_profiles_impl, set_message_pin_impl, set_preferences_impl,
-    set_project_archived_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
+    resolve_saved_prompt_fresh_impl, resolve_saved_prompt_impl, resume_agent_in_terminal_impl,
+    reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
+    send_message_impl, set_active_agent_profile_impl, set_active_project_impl,
+    set_agent_profiles_impl, set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
+    set_project_directory_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
     sign_out_mcp_provider_impl, spawn_prompt_resolution_change_notifications,
     stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
     test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
+    workspace_status_impl,
 };
 use crate::error::AppError;
 use crate::preferences::Preferences;
@@ -482,24 +503,17 @@ async fn pick_directory(state: State<'_, AppState>, path: String) -> Result<Dire
     pick_directory_impl(state.inner(), &path).map_err(|e| e.to_string())
 }
 
+/// Repair a project whose working directory moved or was recreated elsewhere.
+/// This project only; a sibling recording the same old folder is repaired on
+/// its own.
 #[tauri::command]
-async fn init_directory(state: State<'_, AppState>, path: String) -> Result<DirectoryInfo, String> {
-    init_directory_impl(state.inner(), &path)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Repair a project whose working directory moved, was deleted, or is claimed
-/// by two catalog rows. **Moves every project sharing that directory**, not just
-/// the one named — the UI must say so before the user confirms.
-#[tauri::command]
-async fn repoint_project_directory(
+async fn set_project_directory(
     state: State<'_, AppState>,
     project_id: String,
     new_path: String,
 ) -> Result<(), String> {
     let pid = parse_uuid(&project_id).map_err(|e| e.to_string())?;
-    repoint_project_directory_impl(state.inner(), pid, &new_path)
+    set_project_directory_impl(state.inner(), pid, &new_path)
         .await
         .map_err(|e| e.to_string())
 }
@@ -548,10 +562,8 @@ async fn migrate_message_pin(
 }
 
 #[tauri::command]
-async fn list_workspace_directories(
-    state: State<'_, AppState>,
-) -> Result<WorkspaceDirectories, String> {
-    Ok(list_workspace_directories_impl(state.inner()))
+async fn workspace_status(state: State<'_, AppState>) -> Result<WorkspaceStatus, String> {
+    Ok(workspace_status_impl(state.inner()))
 }
 
 /// List all prompts across configured providers (user-global; no project
@@ -1842,7 +1854,7 @@ fn debug_config_dir(override_dir: Option<std::ffi::OsString>) -> Option<std::pat
         .map(|dirs| dirs.config_dir().to_path_buf())
 }
 
-/// Path to the user-global `workspace.yaml` (the cross-directory project list).
+/// Path to the user-global `workspace.yaml` (archived-project view-state).
 fn workspace_config_path() -> Option<std::path::PathBuf> {
     config_dir().map(|dir| dir.join("workspace.yaml"))
 }
@@ -2183,14 +2195,31 @@ pub fn run() {
             // degrading: with no store the app would accept project creation
             // and silently lose it. Contrast the `Option<PathBuf>` persistence
             // paths below, which guard convenience state.
-            let store_root = store_root_path()
-                .ok_or("no config directory resolved — cannot locate the project store")?;
-            let store = switchboard_core::Store::open(&store_root)?;
+            let Some(store_root) = store_root_path() else {
+                abort_startup(
+                    app.handle(),
+                    "No configuration directory could be resolved, so Switchboard cannot locate its project store.",
+                );
+            };
+            let store = match switchboard_core::Store::open(&store_root) {
+                Ok(store) => store,
+                Err(e) => abort_startup(
+                    app.handle(),
+                    &format!(
+                        "Switchboard can't open its project store at {}.\n\n{e}",
+                        store_root.display()
+                    ),
+                ),
+            };
             // Also required, and aborts for the same reason: without a lock root
             // every turn would refuse (fail-closed), which is worse than not
             // starting and much harder to diagnose.
-            let lock_root = session_lock_root()
-                .ok_or("no config directory resolved — cannot locate the session lock root")?;
+            let Some(lock_root) = session_lock_root() else {
+                abort_startup(
+                    app.handle(),
+                    "No configuration directory could be resolved, so Switchboard cannot locate its session lock root.",
+                );
+            };
             let state = AppState::new(
                 Arc::clone(&claude_adapter),
                 Arc::clone(&codex_adapter),
@@ -2284,14 +2313,13 @@ pub fn run() {
             recheck_harness_installs,
             await_harness_path,
             pick_directory,
-            init_directory,
-            repoint_project_directory,
+            set_project_directory,
             list_projects,
             list_message_pins,
             set_message_pin,
             remove_message_pins,
             migrate_message_pin,
-            list_workspace_directories,
+            workspace_status,
             add_tracked_repo,
             remove_tracked_repo,
             list_tracked_repos,
@@ -2462,9 +2490,8 @@ mod asset_scope_tests {
         let tmp = TempDir::new().expect("temp store");
         let cwd = TempDir::new().expect("temp working directory");
         let probe = Store::open(tmp.path()).expect("open temp store");
-        let directory = probe.add_directory(cwd.path()).expect("bind a directory");
         let project = probe
-            .create_project(directory.directory_id, "probe")
+            .create_project(cwd.path(), "probe")
             .expect("create a project");
         // Through `Project::attachments_dir()` rather than a literal: renaming
         // the layout constant must reach this test, since that rename breaks

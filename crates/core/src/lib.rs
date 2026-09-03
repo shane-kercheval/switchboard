@@ -2,10 +2,10 @@
 //!
 //! The user-global store (`<config-dir>/store/`) is the single source of truth
 //! for what projects exist and what agents live in them. **Switchboard writes
-//! nothing into a working directory** — a directory is referenced by a stable
-//! `directory_id` the store's catalog maps to a path, so deleting or moving a
-//! checkout costs no project state. See `docs/system-design.md` §3 for the
-//! canonical spec.
+//! nothing into a working directory** — each project records its working
+//! directory as a path on its own index row, so deleting or moving a checkout
+//! costs no project state. See `docs/system-design.md` §3 for the canonical
+//! spec.
 
 pub mod agent;
 pub mod attachment;
@@ -32,12 +32,9 @@ pub use attachment::{
 pub use directory::Directory;
 pub use error::{CoreError, Result};
 pub use harness::{HarnessKind, SelectionAxis};
-pub use ids::{DirectoryId, ProjectId};
+pub use ids::ProjectId;
 pub use io::{append_jsonl, edit_yaml_mapping, read_jsonl, read_yaml, write_yaml};
 pub use journal::{JournalRecord, SendId};
 pub use pins::MessagePin;
 pub use project::{Project, ProjectConfig, ProjectSummary};
-pub use store::{
-    DirectoryEntry, DirectoryResolution, ProjectEntry, ResolvedProject, STORE_VERSION, Store,
-    StoreConfig,
-};
+pub use store::{ProjectEntry, STORE_VERSION, Store, StoreConfig};

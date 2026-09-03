@@ -60,8 +60,7 @@ function project(id: string): ProjectListing {
     name: `proj-${id.slice(-2)}`,
     created_at: "2026-05-16T00:00:00Z",
     directory: `/work/${id.slice(-2)}`,
-    directory_id: `dir:/work/${id.slice(-2)}`,
-    directory_status: "resolved_available",
+    directory_available: true,
     last_activity: "2026-05-16T00:00:00Z",
     archived: false,
   };
@@ -292,8 +291,7 @@ function projectIn(id: string, name: string, directory: string, archived = false
     name,
     created_at: "2026-05-16T00:00:00Z",
     directory,
-    directory_id: `dir:${directory}`,
-    directory_status: "resolved_available",
+    directory_available: true,
     last_activity: "2026-05-16T00:00:00Z",
     archived,
   };
@@ -703,7 +701,7 @@ describe("ProjectsSidebar — delete", () => {
   it("allows deleting an unavailable project (folder gone)", async () => {
     const unavailable: ProjectListing = {
       ...projectIn(A1, "alpha", "/work/a"),
-      directory_status: "resolved_path_unavailable",
+      directory_available: false,
     };
     await renderWith([unavailable]);
     await openProjectActions();
@@ -925,9 +923,7 @@ describe("ProjectsSidebar — archive + view toggle", () => {
   });
 
   it("on an unavailable row both Archive and Delete stay enabled", async () => {
-    await renderWith([
-      { ...projectIn(A1, "alpha", "/work/a"), directory_status: "resolved_path_unavailable" },
-    ]);
+    await renderWith([{ ...projectIn(A1, "alpha", "/work/a"), directory_available: false }]);
 
     await openProjectActions();
     expect(await screen.findByTestId("project-action-archive")).not.toHaveAttribute(

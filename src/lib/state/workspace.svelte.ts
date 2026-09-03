@@ -41,7 +41,6 @@ import type {
   ProjectListing,
   SendId,
   SessionFingerprint,
-  WorkspaceDirectoryInfo,
 } from "$lib/types";
 import { tick, untrack } from "svelte";
 import { SvelteSet } from "svelte/reactivity";
@@ -103,13 +102,10 @@ export type ProjectConversationState = {
 
 export type ActivationResult = "activated" | "superseded" | "failed";
 
-/// The registered directories + whether registry changes persist this session.
+/// Whether user-global view-state (archiving) persists this session.
 /// `persistable === false` means an existing `workspace.yaml` couldn't be read
 /// at startup — surfaced distinctly from a fresh install.
-export const workspace = $state<{ directories: WorkspaceDirectoryInfo[]; persistable: boolean }>({
-  directories: [],
-  persistable: true,
-});
+export const workspace = $state<{ persistable: boolean }>({ persistable: true });
 
 /// The flat cross-directory project list, sorted desc by `last_activity`.
 export const projects = $state<{ list: ProjectListing[] }>({ list: [] });
@@ -465,9 +461,9 @@ export function startProjectActivityObserver(
   });
 }
 
-/// Fetch the eager registry: the directory list (incl. empty directories + the
-/// persistability signal) and the flat project list. Called at startup and
-/// after any add/remove/create that changes the registry.
+/// Fetch the eager registry: the flat project list plus the persistability
+/// signal. Called at startup and after any create/delete that changes the
+/// registry.
 export function loadWorkspace(): Promise<void> {
   if (readInFlight !== null) {
     readRequested = true;
@@ -481,8 +477,8 @@ export function loadWorkspace(): Promise<void> {
       for (;;) {
         readRequested = false;
         const epoch = mutationEpoch;
-        const [dirs, projectList] = await Promise.all([
-          api.listWorkspaceDirectories(),
+        const [status, projectList] = await Promise.all([
+          api.workspaceStatus(),
           api.listProjects(),
         ]);
         // A test reset happened underneath: this worker belongs to a previous
@@ -501,8 +497,7 @@ export function loadWorkspace(): Promise<void> {
         // release of `readInFlight` must be one synchronous step, or a caller
         // could land after the decision to stop and resolve against a list
         // older than its own request with nothing scheduled to fix it.
-        workspace.directories = dirs.directories;
-        workspace.persistable = dirs.persistable;
+        workspace.persistable = status.persistable;
         projects.list = applyActivityOverrides(projectList);
         if (!readRequested) return;
       }
@@ -545,18 +540,8 @@ function markRegistryMutated(): void {
   mutationEpoch += 1;
 }
 
-/// Add a working directory to the workspace and refresh the registry.
-export async function addDirectory(path: string): Promise<void> {
-  await api.initDirectory(path);
-  await loadWorkspace();
-}
-
 /// Create a project in `directory`, refresh the registry, and activate it.
-/// Registers the folder first (idempotent `init_directory`): `create_project`
-/// requires its target directory to already be a loaded workspace directory, so
-/// a brand-new folder must be added before the project can be created in it.
 export async function createProjectAndActivate(name: string, directory: string): Promise<void> {
-  await api.initDirectory(directory);
   const summary = await api.createProject(name, directory);
   await loadWorkspace();
   // Activation must complete first: `create_agent` targets the backend's active
@@ -1420,7 +1405,6 @@ export const _testing = {
     readToken = null;
     readRequested = false;
     registryRefresh = null;
-    workspace.directories = [];
     workspace.persistable = true;
     projects.list = [];
     for (const key of Object.keys(projectDeletions.pending)) delete projectDeletions.pending[key];

@@ -1274,11 +1274,10 @@ describe("Sidebar", () => {
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
-    expect(screen.getByTestId("agent-effort-chip")).toBeDisabled();
-    expect(screen.getByTestId("agent-effort-chip")).toHaveAttribute(
-      "title",
-      "Unavailable for the current model",
-    );
+    const effortChip = screen.getByTestId("agent-effort-chip");
+    expect(effortChip).toBeDisabled();
+    expect(effortChip).not.toHaveAttribute("title");
+    expect(effortChip).toHaveAttribute("data-tooltip-trigger");
   });
 
   it("a sole choice can be adopted when the current value is null", async () => {

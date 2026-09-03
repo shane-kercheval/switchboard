@@ -1,19 +1,13 @@
-import type { AgentProfile, HarnessKind } from "$lib/types";
+import type { AgentSelection, HarnessKind } from "$lib/types";
 
-/// What the create-agent form emits on submit. `model`/`effort` are a
-/// **create-only** concern: present (a curated value) when the user picked one,
-/// absent when the harness lacks the capability on that axis. Absent ⇒ the
-/// backend receives `None` ⇒ no flag is sent (the harness uses its default).
-/// Attach carries neither — it brings in an existing session and pins nothing
-/// (the harness resumes the session as-is); model/effort are managed afterward
-/// from the agent's actions menu. This is enforced here so the rule can't be
-/// re-expressed by a caller, not just by the form's submit logic.
+/// What the create-agent form emits on submit. Create persists the complete
+/// independent selection configuration atomically. Attach carries none: it
+/// resumes the existing session without pinning model or effort.
 export type AgentFormSubmit =
   | {
       mode: "create";
       name: string;
       harness: HarnessKind;
-      primary: AgentProfile;
-      secondary: AgentProfile | null;
+      selection: AgentSelection;
     }
   | { mode: "attach"; name: string; harness: HarnessKind; existingSessionId: string };

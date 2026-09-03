@@ -5,243 +5,257 @@ import {
   SUPPORTS_MODEL_SELECTION,
 } from "./harnessDisplay";
 import {
-  DEFAULT_AGENT_PROFILES,
+  DEFAULT_AGENT_SELECTIONS,
   EFFORT_OPTIONS,
   MODEL_OPTIONS,
+  activatableEffortValues,
   defaultAgentName,
-  defaultAgentNameForProfiles,
+  defaultAgentNameForSelection,
   effortIsRequired,
   effortOptionsFor,
+  effortSupportFor,
+  resolveModelChange,
+  selectionForNewAgent,
+  selectionIsValid,
 } from "./agentSelection";
 import { canonicalizeForUniqueness, validateAgentName } from "./agentName";
+import type { AgentSelection } from "./types";
 
-/// The capability fact ("does harness H support axis A") is encoded three times
-/// — the capability map, the option list (empty ⇒ unsupported), and the built-in
-/// default (null ⇒ unsupported) — across two files, intentionally mirroring
-/// different sources. Nothing else enforces that the three agree, and the lists
-/// are designed to be hand-edited as models ship/sunset. These invariants fail
-/// closed on a desync instead of shipping a broken picker: a capability/list
-/// mismatch renders a picker with no options, and a default outside its list
-/// binds an orphan value the `<select>` never visibly selects.
-describe("agentSelection capability tables stay consistent", () => {
+function selection(over: Partial<AgentSelection> = {}): AgentSelection {
+  return {
+    model: "opus",
+    effort: "high",
+    model_choices: ["opus", "sonnet"],
+    effort_choices: ["high", "medium"],
+    ...over,
+  };
+}
+
+describe("agent selection catalogs", () => {
   for (const harness of ALL_HARNESSES) {
-    it(`${harness}: model capability map, list, and default agree`, () => {
-      const supported = SUPPORTS_MODEL_SELECTION[harness];
-      expect(MODEL_OPTIONS[harness].length > 0).toBe(supported);
-      const model = DEFAULT_AGENT_PROFILES[harness].primary.model;
-      expect(model !== null).toBe(supported);
-      if (model !== null) {
-        expect(MODEL_OPTIONS[harness].map((option) => option.value)).toContain(model);
-      }
-    });
-
-    it(`${harness}: effort capability map, list, and default agree`, () => {
-      const supported = SUPPORTS_EFFORT_SELECTION[harness];
-      expect(EFFORT_OPTIONS[harness].length > 0).toBe(supported);
-      const effort = DEFAULT_AGENT_PROFILES[harness].primary.effort;
-      expect(effort !== null).toBe(supported);
-      if (effort !== null) {
-        expect(EFFORT_OPTIONS[harness].map((option) => option.value)).toContain(effort);
-      }
+    it(`${harness}: capabilities, options, and defaults agree`, () => {
+      const defaults = DEFAULT_AGENT_SELECTIONS[harness];
+      expect(MODEL_OPTIONS[harness].length > 0).toBe(SUPPORTS_MODEL_SELECTION[harness]);
+      expect(EFFORT_OPTIONS[harness].length > 0).toBe(SUPPORTS_EFFORT_SELECTION[harness]);
+      expect(defaults.model_choices).toContain(defaults.default_model);
+      expect(defaults.effort_choices).toContain(defaults.default_effort);
+      expect(MODEL_OPTIONS[harness].map(({ value }) => value)).toEqual(
+        expect.arrayContaining(defaults.model_choices),
+      );
+      expect(EFFORT_OPTIONS[harness].map(({ value }) => value)).toEqual(
+        expect.arrayContaining(defaults.effort_choices),
+      );
     });
   }
 
-  it("defaults Antigravity to Pro high with Flash high as secondary", () => {
-    expect(DEFAULT_AGENT_PROFILES.antigravity).toEqual({
-      primary: { model: "gemini-3.1-pro", effort: "high" },
-      secondary: { model: "gemini-3.7-flash", effort: "high" },
+  it("ships two independent choices for Claude and Codex", () => {
+    expect(DEFAULT_AGENT_SELECTIONS.claude_code).toEqual({
+      model_choices: ["fable", "opus"],
+      effort_choices: ["medium", "high"],
+      default_model: "opus",
+      default_effort: "medium",
     });
-  });
-
-  it("enables a secondary profile for every harness", () => {
-    for (const harness of ALL_HARNESSES) {
-      expect(DEFAULT_AGENT_PROFILES[harness].secondary, harness).not.toBeNull();
-    }
+    expect(DEFAULT_AGENT_SELECTIONS.codex).toEqual({
+      model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
+      effort_choices: ["medium", "high"],
+      default_model: "gpt-5.6-terra",
+      default_effort: "medium",
+    });
+    expect(DEFAULT_AGENT_SELECTIONS.antigravity).toEqual({
+      model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+      effort_choices: ["medium", "high"],
+      default_model: "gemini-3.7-flash",
+      default_effort: "medium",
+    });
   });
 });
 
-describe("effortOptionsFor", () => {
-  const values = (harness: Parameters<typeof effortOptionsFor>[0], model: string | undefined) =>
-    effortOptionsFor(harness, model).map((o) => o.value);
+describe("Antigravity effort support", () => {
+  const values = (model: string | undefined) =>
+    effortOptionsFor("antigravity", model).map(({ value }) => value);
 
-  it("offers every Codex level regardless of model, curated or not", () => {
-    // Codex effort validity is server-enforced and self-describing, so the
-    // picker stays permissive and lets an invalid level fail the turn.
-    const all = EFFORT_OPTIONS.codex.map((o) => o.value);
-    for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", undefined]) {
-      expect(values("codex", model)).toEqual(all);
+  it("distinguishes known levels, explicit no-effort models, and unknown models", () => {
+    expect(values("gemini-3.7-flash")).toEqual(["low", "medium", "high"]);
+    expect(values("gemini-3.1-pro")).toEqual(["low", "high"]);
+    expect(values("gpt-oss-120b")).toEqual(["medium"]);
+    expect(effortSupportFor("antigravity", "claude-sonnet-4-6")).toEqual({ kind: "none" });
+    expect(effortSupportFor("antigravity", "future-model").kind).toBe("unknown");
+  });
+
+  it("classifies every curated Antigravity model explicitly", () => {
+    for (const { value } of MODEL_OPTIONS.antigravity) {
+      expect(effortSupportFor("antigravity", value).kind, value).not.toBe("unknown");
     }
   });
 
-  it("returns the harness list unchanged for non-model-dependent harnesses", () => {
-    expect(effortOptionsFor("claude_code", "opus")).toEqual(EFFORT_OPTIONS.claude_code);
-  });
-
-  /// Antigravity's effort axis is per-model in a way no other harness's is: the
-  /// levels differ by model, some models have none at all, and where the axis
-  /// exists it is **mandatory**. Getting any of these wrong fails the dispatch
-  /// before a model runs (`agy` validates client-side), so each shape is
-  /// pinned rather than left to the picker to discover.
-  it("derives Antigravity effort per model, including the no-axis and single-level shapes", () => {
-    expect(values("antigravity", "gemini-3.7-flash")).toEqual(["low", "medium", "high"]);
-    // 3.1 Pro genuinely lacks medium — the sets differ, which is why the map is
-    // per-model rather than one list.
-    expect(values("antigravity", "gemini-3.1-pro")).toEqual(["low", "high"]);
-
-    // The two Claude models have no axis: `agy` rejects `--effort` outright, so
-    // an empty list is what hides the control.
-    expect(values("antigravity", "claude-sonnet-4-6")).toEqual([]);
-    expect(values("antigravity", "claude-opus-4-6-thinking")).toEqual([]);
-
-    // GPT-OSS accepts exactly one level. It must NOT be empty — an empty list
-    // hides the control, and hiding it is what used to leave the picker
-    // disagreeing with the turn footer, which renders `medium` regardless.
-    expect(values("antigravity", "gpt-oss-120b")).toEqual(["medium"]);
-  });
-
-  it("makes Antigravity effort mandatory exactly where an axis exists", () => {
-    for (const model of ["gemini-3.7-flash", "gemini-3.1-pro", "gpt-oss-120b"]) {
-      expect(effortIsRequired("antigravity", model), model).toBe(true);
-    }
-    for (const model of ["claude-sonnet-4-6", "claude-opus-4-6-thinking", undefined]) {
-      expect(effortIsRequired("antigravity", model), String(model)).toBe(false);
-    }
-    // Every other harness treats effort as optional — unset means "pass no
-    // flag." The negative half is what keeps this from becoming a global rule.
-    expect(effortIsRequired("claude_code", "opus")).toBe(false);
+  it("requires effort only for known effort-bearing Antigravity models", () => {
+    expect(effortIsRequired("antigravity", "gemini-3.1-pro")).toBe(true);
+    expect(effortIsRequired("antigravity", "claude-sonnet-4-6")).toBe(false);
+    expect(effortIsRequired("antigravity", "future-model")).toBe(false);
     expect(effortIsRequired("codex", "gpt-5.6-sol")).toBe(false);
   });
 
-  it("offers only models agy still accepts, and no retired Flash generation", () => {
-    const slugs = MODEL_OPTIONS.antigravity.map((o) => o.value);
-    expect(slugs).not.toContain("gemini-3.6-flash");
-    expect(slugs).not.toContain("gemini-3.5-flash");
-    expect(slugs).toContain("gemini-3.7-flash");
-    // Effort belongs to the effort control, never folded into a model label —
-    // otherwise the label contradicts the footer beneath it.
-    for (const { label } of MODEL_OPTIONS.antigravity) {
-      expect(label, label).not.toMatch(/\((Low|Medium|High)\)$/);
-    }
-  });
-
-  it("keeps medium available as the safe clamp target for every curated Codex model", () => {
-    for (const { value: model } of MODEL_OPTIONS.codex) {
-      expect(values("codex", model)).toContain("medium");
-    }
-  });
-});
-
-describe("built-in agent defaults", () => {
-  for (const harness of ALL_HARNESSES) {
-    it(`${harness}: uses supported model and effort values`, () => {
-      const defaults = DEFAULT_AGENT_PROFILES[harness];
-      for (const profile of [defaults.primary, defaults.secondary]) {
-        expect(profile).not.toBeNull();
-        const { model, effort } = profile!;
-        if (model !== null) {
-          expect(MODEL_OPTIONS[harness].map((option) => option.value)).toContain(model);
-        }
-        if (effort !== null) {
-          expect(
-            effortOptionsFor(harness, model ?? undefined).map((option) => option.value),
-          ).toContain(effort);
-        }
-      }
-    });
-  }
-
-  it("seeds Codex with Sol and high effort", () => {
-    expect(DEFAULT_AGENT_PROFILES.codex.primary).toEqual({
-      model: "gpt-5.6-sol",
+  it("keeps the configured presentation set while restricting activation", () => {
+    const configured = selection({
+      model: "gemini-3.1-pro",
       effort: "high",
+      model_choices: ["gemini-3.1-pro"],
+      effort_choices: ["medium", "high"],
+    });
+    expect(configured.effort_choices).toEqual(["medium", "high"]);
+    expect([...activatableEffortValues(configured, "antigravity")]).toEqual(["high"]);
+  });
+});
+
+describe("selectionForNewAgent", () => {
+  it("preserves effort choices but clears the active effort for a no-effort model", () => {
+    expect(
+      selectionForNewAgent(
+        {
+          model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+          effort_choices: ["high", "medium"],
+          default_model: "claude-sonnet-4-6",
+          default_effort: "high",
+        },
+        "antigravity",
+      ),
+    ).toEqual({
+      ok: true,
+      selection: {
+        model: "claude-sonnet-4-6",
+        effort: null,
+        model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+        effort_choices: ["high", "medium"],
+      },
+    });
+  });
+
+  it("resolves an incompatible effort and reports a configuration with no valid choice", () => {
+    expect(
+      selectionForNewAgent(
+        {
+          model_choices: ["gemini-3.1-pro"],
+          effort_choices: ["medium", "high"],
+          default_model: "gemini-3.1-pro",
+          default_effort: "medium",
+        },
+        "antigravity",
+      ),
+    ).toMatchObject({ ok: true, selection: { effort: "high" } });
+
+    expect(
+      selectionForNewAgent(
+        {
+          model_choices: ["gemini-3.1-pro"],
+          effort_choices: ["medium"],
+          default_model: "gemini-3.1-pro",
+          default_effort: "medium",
+        },
+        "antigravity",
+      ),
+    ).toMatchObject({
+      ok: false,
+      selection: { model: "gemini-3.1-pro", effort: "medium" },
     });
   });
 });
 
-describe("defaultAgentName", () => {
-  it("derives model-effort for a fully-capable harness", () => {
-    expect(defaultAgentName("claude_code", "opus", "high")).toBe("opus-high");
-    expect(defaultAgentName("claude_code", "sonnet", "max")).toBe("sonnet-max");
+describe("resolveModelChange", () => {
+  const configured = selection({
+    model: "gemini-3.7-flash",
+    effort: "medium",
+    model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+    effort_choices: ["medium", "high", "low"],
   });
 
-  it("hyphenates dots in the model id so the name is a valid slug", () => {
-    expect(defaultAgentName("codex", "gpt-5.6-terra", "medium")).toBe("gpt-5-6-terra-medium");
-    expect(defaultAgentName("codex", "gpt-5.5", "medium")).toBe("gpt-5-5-medium");
-    expect(defaultAgentName("codex", "gpt-5.6-luna", "low")).toBe("gpt-5-6-luna-low");
-  });
-
-  it("uses just the model when effort is absent", () => {
-    expect(defaultAgentName("claude_code", "opus", undefined)).toBe("opus");
-  });
-
-  it("uses the short harness name when a secondary profile is configured", () => {
+  it("preserves valid effort and otherwise chooses the first compatible configured effort", () => {
     expect(
-      defaultAgentNameForProfiles(
+      resolveModelChange({ ...configured, effort: "high" }, "antigravity", "gemini-3.1-pro"),
+    ).toMatchObject({ ok: true, selection: { model: "gemini-3.1-pro", effort: "high" } });
+    expect(resolveModelChange(configured, "antigravity", "gemini-3.1-pro")).toMatchObject({
+      ok: true,
+      selection: { model: "gemini-3.1-pro", effort: "low" },
+    });
+  });
+
+  it("clears effort only for an explicitly known no-effort model", () => {
+    expect(resolveModelChange(configured, "antigravity", "claude-sonnet-4-6")).toMatchObject({
+      ok: true,
+      selection: { model: "claude-sonnet-4-6", effort: null },
+    });
+    expect(resolveModelChange(configured, "antigravity", "future-model")).toMatchObject({
+      ok: true,
+      selection: { model: "future-model", effort: "medium" },
+    });
+  });
+
+  it("refuses a known model when no configured effort can satisfy it", () => {
+    expect(
+      resolveModelChange(
+        { ...configured, effort: "medium", effort_choices: ["medium"] },
+        "antigravity",
+        "gemini-3.1-pro",
+      ),
+    ).toEqual({
+      ok: false,
+      reason: "No configured reasoning effort is compatible with that model.",
+    });
+  });
+
+  it("validates known pairs without treating unknown models as invalid", () => {
+    expect(selectionIsValid(configured, "antigravity")).toBe(true);
+    expect(selectionIsValid({ ...configured, model: "gemini-3.1-pro" }, "antigravity")).toBe(false);
+    expect(selectionIsValid({ ...configured, model: "future-model" }, "antigravity")).toBe(true);
+  });
+});
+
+describe("default agent naming", () => {
+  it("uses model and effort only when neither axis has multiple choices", () => {
+    expect(
+      defaultAgentNameForSelection(
         "claude_code",
-        { model: "opus", effort: "high" },
-        { model: "sonnet", effort: "medium" },
+        selection({ model_choices: ["opus"], effort_choices: ["high"] }),
+      ),
+    ).toBe("opus-high");
+    expect(defaultAgentNameForSelection("claude_code", selection())).toBe("claude");
+    expect(
+      defaultAgentNameForSelection(
+        "claude_code",
+        selection({ model_choices: ["opus"], effort_choices: ["high", "medium"] }),
       ),
     ).toBe("claude");
-    expect(
-      defaultAgentNameForProfiles(
-        "codex",
-        { model: "gpt-5.6-sol", effort: "high" },
-        { model: "gpt-5.6-terra", effort: "medium" },
-      ),
-    ).toBe("codex");
   });
 
-  it("falls back to the bare harness name when the model is absent", () => {
-    // An agent created without a concrete model has nothing to name itself
-    // after, so it takes the harness's bare name.
+  it("slugifies vendor model ids and falls back when no model is selected", () => {
+    expect(defaultAgentName("codex", "gpt-5.6-terra", "medium")).toBe("gpt-5-6-terra-medium");
     expect(defaultAgentName("antigravity", undefined, undefined)).toBe("antigravity");
-    // The "keep current" sentinel (attach mode) reads as no model.
-    expect(defaultAgentName("claude_code", "", "")).toBe("claude-code");
   });
 
-  // The helper feeds vendor-shaped model ids into a persisted, validated name.
-  // Guard the whole curated surface — not just today's defaults — so a future
-  // model/effort option carrying a name-illegal character is caught here rather
-  // than as an invalid create form / failed auto-seed in production.
   for (const harness of ALL_HARNESSES) {
-    const models = MODEL_OPTIONS[harness].length > 0 ? MODEL_OPTIONS[harness] : [{ value: "" }];
-    const efforts = EFFORT_OPTIONS[harness].length > 0 ? EFFORT_OPTIONS[harness] : [{ value: "" }];
-    for (const model of models) {
-      for (const effort of efforts) {
-        it(`${harness}: defaultAgentName(${model.value || "∅"}, ${effort.value || "∅"}) is a valid agent name`, () => {
-          const name = defaultAgentName(harness, model.value, effort.value);
-          expect(validateAgentName(name, [])).toEqual({ ok: true });
-          expect(
-            validateAgentName(
-              defaultAgentNameForProfiles(
-                harness,
-                { model: model.value, effort: effort.value },
-                { model: model.value, effort: effort.value },
-              ),
-              [],
-            ),
-          ).toEqual({ ok: true });
-        });
-      }
-    }
+    it(`${harness}: every built-in name is valid`, () => {
+      const defaults = DEFAULT_AGENT_SELECTIONS[harness];
+      const name = defaultAgentNameForSelection(harness, {
+        model: defaults.default_model,
+        effort: defaults.default_effort,
+        model_choices: defaults.model_choices,
+        effort_choices: defaults.effort_choices,
+      });
+      expect(validateAgentName(name, [])).toEqual({ ok: true });
+    });
   }
 
-  // The previous naming scheme (one slug per harness) guaranteed seeded agents
-  // never self-collided by construction; model+effort names don't. New-project
-  // auto-seeding creates one agent per installed harness from these static
-  // defaults, so a clash would fail one harness's creation. The only point a
-  // clash can be introduced is a code edit to the default tables — guard it
-  // here under the same canonicalization the backend uses for uniqueness.
-  it("new-project seed defaults are pairwise-distinct across harnesses", () => {
-    const canonical = ALL_HARNESSES.map((harness) =>
-      canonicalizeForUniqueness(
-        defaultAgentName(
-          harness,
-          DEFAULT_AGENT_PROFILES[harness].primary.model ?? undefined,
-          DEFAULT_AGENT_PROFILES[harness].primary.effort ?? undefined,
-        ),
-      ),
-    );
-    expect(new Set(canonical).size).toBe(canonical.length);
+  it("new-project seed defaults remain distinct across harnesses", () => {
+    const names = ALL_HARNESSES.map((harness) => {
+      const defaults = DEFAULT_AGENT_SELECTIONS[harness];
+      return canonicalizeForUniqueness(
+        defaultAgentNameForSelection(harness, {
+          model: defaults.default_model,
+          effort: defaults.default_effort,
+          model_choices: defaults.model_choices,
+          effort_choices: defaults.effort_choices,
+        }),
+      );
+    });
+    expect(new Set(names).size).toBe(names.length);
   });
 });

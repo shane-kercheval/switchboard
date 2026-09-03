@@ -31,8 +31,7 @@ import type {
   AgentId,
   ActivationFailure,
   AgentRecord,
-  AgentProfile,
-  AgentProfileSlot,
+  AgentSelection,
   AgentSessionFingerprint,
   ConversationItem,
   HarnessKind,
@@ -46,7 +45,7 @@ import { tick, untrack } from "svelte";
 import { SvelteSet } from "svelte/reactivity";
 import { harnessAvailability, settledHarnessAvailability } from "$lib/harnessAvailability.svelte";
 import { AUTO_SEED_ON_NEW_PROJECT } from "$lib/harnessDisplay";
-import { defaultAgentNameForProfiles } from "$lib/agentSelection";
+import { defaultAgentNameForSelection, selectionForNewAgent } from "$lib/agentSelection";
 import { loadPreferences, preferences } from "$lib/preferences.svelte";
 import {
   compareIsoTimestampsDescending,
@@ -601,14 +600,13 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
       // Every auto-created agent is born with a known, displayed model/effort
       // (`undefined` for a no-capability harness → backend stores `None`).
       const defaults = preferences.agent_defaults[harness];
-      const model = defaults.primary.model ?? undefined;
-      const effort = defaults.primary.effort ?? undefined;
+      const resolved = selectionForNewAgent(defaults, harness);
+      if (!resolved.ok) throw new Error(resolved.reason);
+      const agentSelection: AgentSelection = resolved.selection;
       const agent = await api.createAgent(
-        defaultAgentNameForProfiles(harness, defaults.primary, defaults.secondary),
+        defaultAgentNameForSelection(harness, agentSelection),
         harness,
-        model,
-        effort,
-        defaults.secondary,
+        agentSelection,
       );
       if (selection.activeProjectId !== projectId) break;
       await registerAgent(agent);
@@ -657,20 +655,11 @@ export async function renameAgent(agentId: AgentId, newName: string): Promise<vo
   replaceAgentRecord(agentId, updated);
 }
 
-export async function setAgentProfiles(
+export async function setAgentSelection(
   agentId: AgentId,
-  primary: AgentProfile,
-  secondary: AgentProfile | null,
+  agentSelection: AgentSelection,
 ): Promise<void> {
-  const updated = await api.setAgentProfiles(agentId, primary, secondary);
-  replaceAgentRecord(agentId, updated);
-}
-
-export async function setActiveAgentProfile(
-  agentId: AgentId,
-  active: AgentProfileSlot,
-): Promise<void> {
-  const updated = await api.setActiveAgentProfile(agentId, active);
+  const updated = await api.setAgentSelection(agentId, agentSelection);
   replaceAgentRecord(agentId, updated);
 }
 

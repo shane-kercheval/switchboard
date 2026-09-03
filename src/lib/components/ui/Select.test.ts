@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import Select from "./Select.svelte";
@@ -18,10 +18,14 @@ describe("Select", () => {
   });
 
   it("reflects a change to the selected value", async () => {
-    render(Select, { props: { options: OPTIONS, value: "opus", "data-testid": "sel" } });
+    const onchange = vi.fn();
+    render(Select, {
+      props: { options: OPTIONS, value: "opus", onchange, "data-testid": "sel" },
+    });
     const select = screen.getByTestId("sel") as HTMLSelectElement;
     await fireEvent.change(select, { target: { value: "sonnet" } });
     expect(select.value).toBe("sonnet");
+    expect(onchange).toHaveBeenCalledOnce();
   });
 
   it("honors disabled", () => {
@@ -29,5 +33,24 @@ describe("Select", () => {
       props: { options: OPTIONS, value: "opus", disabled: true, "data-testid": "sel" },
     });
     expect((screen.getByTestId("sel") as HTMLSelectElement).disabled).toBe(true);
+  });
+
+  it("supports a placeholder and disabled options", () => {
+    render(Select, {
+      props: {
+        options: [
+          { label: "Opus", value: "opus" },
+          { label: "Sonnet", value: "sonnet", disabled: true },
+        ],
+        value: "",
+        placeholder: "Select a value",
+        "data-testid": "sel",
+      },
+    });
+
+    const select = screen.getByTestId("sel") as HTMLSelectElement;
+    expect(select.options[0]).toHaveTextContent("Select a value");
+    expect(select.options[0]?.disabled).toBe(true);
+    expect(select.options[2]?.disabled).toBe(true);
   });
 });

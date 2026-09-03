@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent::{
-    AgentId, AgentProfile, AgentProfileSlot, AgentProfiles, AgentRecord, SessionLocator,
-    normalize_selection,
+    AgentId, AgentRecord, AgentSelection, SessionLocator, normalize_agent_selection,
 };
 use crate::error::{CoreError, Result};
 use crate::harness::{HarnessKind, SelectionAxis};
@@ -94,9 +93,7 @@ struct NewAgent<'a> {
     name: &'a str,
     harness: HarnessKind,
     session_locator: Option<SessionLocator>,
-    model: Option<String>,
-    effort: Option<String>,
-    profiles: AgentProfiles,
+    selection: AgentSelection,
     forked_from_session: Option<Uuid>,
 }
 
@@ -203,22 +200,7 @@ impl Project {
         &self,
         name: &str,
         harness: HarnessKind,
-        model: Option<String>,
-        effort: Option<String>,
-    ) -> Result<AgentRecord> {
-        self.register_agent_with_profiles(name, harness, model, effort, None)
-    }
-
-    /// Register a fresh agent with an optional secondary execution profile.
-    /// New agents always begin on Primary; switching is a separate explicit
-    /// action after registration.
-    pub fn register_agent_with_profiles(
-        &self,
-        name: &str,
-        harness: HarnessKind,
-        model: Option<String>,
-        effort: Option<String>,
-        secondary: Option<AgentProfile>,
+        selection: AgentSelection,
     ) -> Result<AgentRecord> {
         // Harness-asymmetry rule (which harnesses can pre-generate their
         // session locator at registration vs. learn it at runtime):
@@ -238,12 +220,7 @@ impl Project {
             name,
             harness,
             session_locator,
-            model,
-            effort,
-            profiles: AgentProfiles {
-                secondary,
-                active: AgentProfileSlot::Primary,
-            },
+            selection,
             forked_from_session: None,
         })
     }
@@ -307,16 +284,12 @@ impl Project {
 
         let name = derive_fork_name(&agents, &source.name);
         let harness = source.harness;
-        let model = source.model.clone();
-        let effort = source.effort.clone();
-        let profiles = source.profiles.clone();
+        let selection = source.selection();
         self.register_agent_inner(NewAgent {
             name: &name,
             harness,
             session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
-            model,
-            effort,
-            profiles,
+            selection,
             forked_from_session: Some(parent_session),
         })
     }
@@ -331,16 +304,12 @@ impl Project {
         &self,
         name: &str,
         session_id: Uuid,
-        model: Option<String>,
-        effort: Option<String>,
     ) -> Result<AgentRecord> {
         self.register_agent_inner(NewAgent {
             name,
             harness: HarnessKind::ClaudeCode,
             session_locator: Some(SessionLocator::Uuid(session_id)),
-            model,
-            effort,
-            profiles: AgentProfiles::default(),
+            selection: AgentSelection::default(),
             forked_from_session: None,
         })
     }
@@ -356,8 +325,6 @@ impl Project {
         name: &str,
         thread_id: String,
         partition_date: chrono::NaiveDate,
-        model: Option<String>,
-        effort: Option<String>,
     ) -> Result<AgentRecord> {
         self.register_agent_inner(NewAgent {
             name,
@@ -366,9 +333,7 @@ impl Project {
                 thread_id,
                 partition_date,
             }),
-            model,
-            effort,
-            profiles: AgentProfiles::default(),
+            selection: AgentSelection::default(),
             forked_from_session: None,
         })
     }
@@ -392,9 +357,7 @@ impl Project {
             name,
             harness: HarnessKind::Antigravity,
             session_locator: Some(SessionLocator::Uuid(conversation_id)),
-            model: None,
-            effort: None,
-            profiles: AgentProfiles::default(),
+            selection: AgentSelection::default(),
             forked_from_session: None,
         })
     }
@@ -426,9 +389,7 @@ impl Project {
             name,
             harness,
             session_locator,
-            model,
-            effort,
-            profiles,
+            selection,
             forked_from_session,
         } = spec;
         validate_name(name)?;
@@ -436,14 +397,14 @@ impl Project {
         // "unset," which is allowed on any harness — it must not trip the
         // capability error (e.g. a whitespace effort is "no effort,"
         // not an unsupported effort).
-        let model = normalize_selection(model);
-        let effort = normalize_selection(effort);
-        let mut profiles = profiles;
-        if let Some(secondary) = &mut profiles.secondary {
-            secondary.model = normalize_selection(secondary.model.take());
-            secondary.effort = normalize_selection(secondary.effort.take());
-        }
-        // These four capability gates are currently unreachable: every supported
+        let selection = normalize_agent_selection(selection);
+        let AgentSelection {
+            model,
+            effort,
+            model_choices,
+            effort_choices,
+        } = selection;
+        // These capability gates are currently unreachable: every supported
         // harness drives both axes, so neither `supports_*_selection` returns
         // false for any variant. They are retained deliberately, not left as dead
         // code — they are the forcing function that makes the next harness's
@@ -464,33 +425,31 @@ impl Project {
                 axis: SelectionAxis::Effort,
             });
         }
-        // See `set_agent_profiles` for why an effort with no model is refused
-        // here and why its mirror (a model that requires an effort) is not.
+        if !model_choices.is_empty() && !harness.supports_model_selection() {
+            return Err(CoreError::SelectionUnsupported {
+                harness,
+                axis: SelectionAxis::Model,
+            });
+        }
+        if !effort_choices.is_empty() && !harness.supports_effort_selection() {
+            return Err(CoreError::SelectionUnsupported {
+                harness,
+                axis: SelectionAxis::Effort,
+            });
+        }
+        // An effort with no model is incoherent only where the harness derives
+        // its levels from the model. Claude and Codex emit their effort flag
+        // independently, so "default model at high effort" remains valid.
+        // Configured effort choices are inert and may be prepared before a
+        // model is selected; only the current pair must be dispatchable.
+        //
+        // The mirror case — a model that requires an effort and has none — is
+        // deliberately not checked here. Enforcing it would duplicate the
+        // changing per-model catalog into core; the frontend prevents known
+        // invalid pairs and the harness reports unknown/catalog drift before
+        // dispatch.
         if harness.effort_requires_model() && effort.is_some() && model.is_none() {
             return Err(CoreError::EffortWithoutModel { harness });
-        }
-        if let Some(secondary) = &profiles.secondary {
-            if secondary.model.is_some() && !harness.supports_model_selection() {
-                return Err(CoreError::SelectionUnsupported {
-                    harness,
-                    axis: SelectionAxis::Model,
-                });
-            }
-            if secondary.effort.is_some() && !harness.supports_effort_selection() {
-                return Err(CoreError::SelectionUnsupported {
-                    harness,
-                    axis: SelectionAxis::Effort,
-                });
-            }
-            if harness.effort_requires_model()
-                && secondary.effort.is_some()
-                && secondary.model.is_none()
-            {
-                return Err(CoreError::EffortWithoutModel { harness });
-            }
-        }
-        if profiles.secondary.is_none() {
-            profiles.active = AgentProfileSlot::Primary;
         }
         // Fork provenance is only meaningful to a harness whose fork is the
         // deferred kind [`HarnessKind::supports_session_fork`] describes — the
@@ -513,7 +472,8 @@ impl Project {
             session_locator,
             model,
             effort,
-            profiles,
+            model_choices,
+            effort_choices,
             forked_from_session,
             created_at: Utc::now(),
         };
@@ -607,15 +567,13 @@ impl Project {
         Ok(updated)
     }
 
-    /// Atomically replace an agent's primary and optional secondary execution
-    /// profiles. One registry rewrite prevents a model/effort pair from being
-    /// left half-updated if persistence fails. Disabling the secondary profile
-    /// also returns the agent to Primary.
-    pub fn set_agent_profiles(
+    /// Atomically replace an agent's complete selection configuration. One
+    /// registry rewrite prevents Antigravity's model/effort pair from being
+    /// observed in an invalid intermediate state.
+    pub fn set_agent_selection(
         &self,
         agent_id: crate::agent::AgentId,
-        primary: AgentProfile,
-        secondary: Option<AgentProfile>,
+        selection: AgentSelection,
     ) -> Result<AgentRecord> {
         let mut agents = self.list_agents()?;
         let idx = agents
@@ -623,74 +581,33 @@ impl Project {
             .position(|a| a.id == agent_id)
             .ok_or(CoreError::AgentNotFound(agent_id))?;
         let harness = agents[idx].harness;
-        let normalize_profile = |mut profile: AgentProfile| -> AgentProfile {
-            profile.model = normalize_selection(profile.model);
-            profile.effort = normalize_selection(profile.effort);
-            profile
-        };
-        let primary = normalize_profile(primary);
-        let secondary = secondary.map(normalize_profile);
-        for profile in std::iter::once(&primary).chain(secondary.iter()) {
-            if profile.model.is_some() && !harness.supports_model_selection() {
-                return Err(CoreError::SelectionUnsupported {
-                    harness,
-                    axis: SelectionAxis::Model,
-                });
-            }
-            if profile.effort.is_some() && !harness.supports_effort_selection() {
-                return Err(CoreError::SelectionUnsupported {
-                    harness,
-                    axis: SelectionAxis::Effort,
-                });
-            }
-            // An effort with no model is incoherent **only where the harness
-            // derives its levels from the model** — see
-            // `HarnessKind::effort_requires_model`. Claude and Codex emit their
-            // effort flag independently, so "default model at high effort" is
-            // valid for them and must keep persisting; gating on the capability
-            // rather than applying this unconditionally is what preserves that.
-            //
-            // Where it does apply (Antigravity), refuse to store rather than
-            // silently drop the flag at dispatch, which would leave the record
-            // asserting a selection the turn never applied. The mirror case — a
-            // model that *requires* an effort and has none — is deliberately NOT
-            // checked here: that would mean duplicating the model catalog into
-            // core, and `agy` already rejects it pre-dispatch, quota-free, with
-            // a message naming the valid levels, surfaced verbatim.
-            if harness.effort_requires_model()
-                && profile.effort.is_some()
-                && profile.model.is_none()
-            {
-                return Err(CoreError::EffortWithoutModel { harness });
-            }
+        let selection = normalize_agent_selection(selection);
+        if selection.model.is_some() && !harness.supports_model_selection()
+            || !selection.model_choices.is_empty() && !harness.supports_model_selection()
+        {
+            return Err(CoreError::SelectionUnsupported {
+                harness,
+                axis: SelectionAxis::Model,
+            });
         }
-        agents[idx].model = primary.model;
-        agents[idx].effort = primary.effort;
-        agents[idx].profiles.secondary = secondary;
-        if agents[idx].profiles.secondary.is_none() {
-            agents[idx].profiles.active = AgentProfileSlot::Primary;
+        if selection.effort.is_some() && !harness.supports_effort_selection()
+            || !selection.effort_choices.is_empty() && !harness.supports_effort_selection()
+        {
+            return Err(CoreError::SelectionUnsupported {
+                harness,
+                axis: SelectionAxis::Effort,
+            });
         }
-        let updated = agents[idx].clone();
-        write_jsonl(&self.registry_path, &agents)?;
-        Ok(updated)
-    }
-
-    /// Select which configured profile future sends capture. Existing in-flight
-    /// and queued work is unaffected because each accepted send owns a snapshot.
-    pub fn set_active_agent_profile(
-        &self,
-        agent_id: crate::agent::AgentId,
-        active: AgentProfileSlot,
-    ) -> Result<AgentRecord> {
-        let mut agents = self.list_agents()?;
-        let idx = agents
-            .iter()
-            .position(|a| a.id == agent_id)
-            .ok_or(CoreError::AgentNotFound(agent_id))?;
-        if active == AgentProfileSlot::Secondary && agents[idx].profiles.secondary.is_none() {
-            return Err(CoreError::SecondaryProfileMissing(agent_id));
+        if harness.effort_requires_model()
+            && selection.effort.is_some()
+            && selection.model.is_none()
+        {
+            return Err(CoreError::EffortWithoutModel { harness });
         }
-        agents[idx].profiles.active = active;
+        agents[idx].model = selection.model;
+        agents[idx].effort = selection.effort;
+        agents[idx].model_choices = selection.model_choices;
+        agents[idx].effort_choices = selection.effort_choices;
         let updated = agents[idx].clone();
         write_jsonl(&self.registry_path, &agents)?;
         Ok(updated)
@@ -1001,11 +918,24 @@ mod tests {
         (tmp, project)
     }
 
+    fn selection(model: Option<&str>, effort: Option<&str>) -> AgentSelection {
+        normalize_agent_selection(AgentSelection {
+            model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
+            model_choices: Vec::new(),
+            effort_choices: Vec::new(),
+        })
+    }
+
     #[test]
     fn register_then_list_agent_roundtrips() {
         let (_tmp, project) = fresh_project();
         let record = project
-            .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "assistant",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         assert_eq!(record.name, "assistant");
         assert_eq!(record.project_id, project.id);
@@ -1023,10 +953,18 @@ mod tests {
         // agent and would treat this record as a branch waiting to materialize.
         let (_tmp, project) = fresh_project();
         let claude = project
-            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alice",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let mut codex = project
-            .register_agent("bob", HarnessKind::Codex, None, None)
+            .register_agent(
+                "bob",
+                HarnessKind::Codex,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         codex.forked_from_session = Some(uuid::Uuid::now_v7());
         crate::io::write_jsonl(&project.registry_path, &[claude, codex]).unwrap();
@@ -1048,10 +986,18 @@ mod tests {
         // provenance walk, whose session-keyed map keeps only one of the pair.
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alice",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let b = project
-            .register_agent("bob", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "bob",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
 
         let mut dup_id = b.clone();
@@ -1089,7 +1035,11 @@ mod tests {
         // whenever that project is also loaded.
         let (_tmp, project) = fresh_project();
         let mut agent = project
-            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alice",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         agent.project_id = uuid::Uuid::now_v7();
         crate::io::write_jsonl(&project.registry_path, &[agent]).unwrap();
@@ -1110,10 +1060,18 @@ mod tests {
         // its parent is mid-turn, so a loop deadlocks both.
         let (_tmp, project) = fresh_project();
         let mut a = project
-            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alice",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let mut b = project
-            .register_agent("bob", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "bob",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let a_session = a
             .session_locator
@@ -1144,7 +1102,11 @@ mod tests {
         // fork walks two edges and terminates.
         let (_tmp, project) = fresh_project();
         let parent = project
-            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alice",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let child = project.fork_agent(parent.id).unwrap();
         let grandchild = project.fork_agent(child.id).unwrap();
@@ -1158,7 +1120,11 @@ mod tests {
     fn fork_agent_branches_from_the_source_session() {
         let (_tmp, project) = fresh_project();
         let source = project
-            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alice",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let parent_session = source
             .session_locator
@@ -1187,14 +1153,18 @@ mod tests {
     }
 
     #[test]
-    fn fork_agent_inherits_model_and_effort() {
+    fn fork_agent_inherits_the_complete_selection() {
         let (_tmp, project) = fresh_project();
         let source = project
             .register_agent(
                 "alice",
                 HarnessKind::ClaudeCode,
-                Some("opus".to_owned()),
-                Some("high".to_owned()),
+                AgentSelection {
+                    model: Some("opus".to_owned()),
+                    effort: Some("high".to_owned()),
+                    model_choices: vec!["opus".to_owned(), "sonnet".to_owned()],
+                    effort_choices: vec!["high".to_owned(), "medium".to_owned()],
+                },
             )
             .unwrap();
 
@@ -1202,13 +1172,19 @@ mod tests {
 
         assert_eq!(fork.model.as_deref(), Some("opus"));
         assert_eq!(fork.effort.as_deref(), Some("high"));
+        assert_eq!(fork.model_choices, ["opus", "sonnet"]);
+        assert_eq!(fork.effort_choices, ["high", "medium"]);
     }
 
     #[test]
     fn fork_agent_disambiguates_repeated_forks() {
         let (_tmp, project) = fresh_project();
         let source = project
-            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alice",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
 
         assert_eq!(project.fork_agent(source.id).unwrap().name, "alice-fork");
@@ -1223,10 +1199,18 @@ mod tests {
         // than producing a registry the roster considers duplicated.
         let (_tmp, project) = fresh_project();
         let source = project
-            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alice",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         project
-            .register_agent("Alice_Fork", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "Alice_Fork",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
 
         assert_eq!(project.fork_agent(source.id).unwrap().name, "alice-fork-2");
@@ -1239,7 +1223,11 @@ mod tests {
         // gate rather than on a missing session — the distinction the two error
         // variants exist to preserve.
         let source = project
-            .register_agent("g", HarnessKind::Antigravity, None, None)
+            .register_agent(
+                "g",
+                HarnessKind::Antigravity,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
 
         let err = project.fork_agent(source.id).unwrap_err();
@@ -1261,7 +1249,11 @@ mod tests {
         // becomes a genuine "not yet — dispatch it once first."
         let (_tmp, project) = fresh_project();
         let source = project
-            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alice",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let stranded = AgentRecord {
             session_locator: None,
@@ -1294,9 +1286,7 @@ mod tests {
                 name: "c",
                 harness: HarnessKind::Codex,
                 session_locator: None,
-                model: None,
-                effort: None,
-                profiles: AgentProfiles::default(),
+                selection: AgentSelection::default(),
                 forked_from_session: Some(Uuid::now_v7()),
             })
             .unwrap_err();
@@ -1322,9 +1312,7 @@ mod tests {
                 name: "a-fork",
                 harness: HarnessKind::ClaudeCode,
                 session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
-                model: None,
-                effort: None,
-                profiles: AgentProfiles::default(),
+                selection: AgentSelection::default(),
                 forked_from_session: Some(parent),
             })
             .unwrap();
@@ -1351,7 +1339,11 @@ mod tests {
         // the original's — otherwise it would lose the middle fork's turns.
         let (_tmp, project) = fresh_project();
         let source = project
-            .register_agent("alice", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alice",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let fork = project.fork_agent(source.id).unwrap();
 
@@ -1370,7 +1362,11 @@ mod tests {
     fn register_codex_agent_leaves_session_id_none() {
         let (_tmp, project) = fresh_project();
         let record = project
-            .register_agent("c", HarnessKind::Codex, None, None)
+            .register_agent(
+                "c",
+                HarnessKind::Codex,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         assert!(record.session_locator.is_none());
     }
@@ -1382,7 +1378,11 @@ mod tests {
         // registry record. Mirrors Codex's pattern.
         let (_tmp, project) = fresh_project();
         let record = project
-            .register_agent("a", HarnessKind::Antigravity, None, None)
+            .register_agent(
+                "a",
+                HarnessKind::Antigravity,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         assert!(record.session_locator.is_none());
     }
@@ -1398,10 +1398,18 @@ mod tests {
     fn register_rejects_duplicate_verbatim() {
         let (_tmp, project) = fresh_project();
         project
-            .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "assistant",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let err = project
-            .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "assistant",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap_err();
         assert!(matches!(err, CoreError::DuplicateAgentName { .. }));
     }
@@ -1410,11 +1418,19 @@ mod tests {
     fn register_rejects_duplicate_under_hyphen_underscore_and_case() {
         let (_tmp, project) = fresh_project();
         project
-            .register_agent("agent-a", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "agent-a",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         for collision in ["agent_a", "Agent-A", "AGENT_A"] {
             let err = project
-                .register_agent(collision, HarnessKind::ClaudeCode, None, None)
+                .register_agent(
+                    collision,
+                    HarnessKind::ClaudeCode,
+                    crate::agent::AgentSelection::default(),
+                )
                 .unwrap_err();
             assert!(
                 matches!(err, CoreError::DuplicateAgentName { .. }),
@@ -1427,10 +1443,18 @@ mod tests {
     fn remove_agent_drops_target_and_keeps_others() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let b = project
-            .register_agent("beta", HarnessKind::Codex, None, None)
+            .register_agent(
+                "beta",
+                HarnessKind::Codex,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         assert!(project.remove_agent(a.id).unwrap());
         assert_eq!(project.list_agents().unwrap(), vec![b]);
@@ -1440,7 +1464,11 @@ mod tests {
     fn remove_agent_nonexistent_reports_not_removed() {
         let (_tmp, project) = fresh_project();
         project
-            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         assert!(!project.remove_agent(Uuid::now_v7()).unwrap());
         assert_eq!(project.list_agents().unwrap().len(), 1);
@@ -1452,11 +1480,19 @@ mod tests {
         // removal lets it be registered again.
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         project.remove_agent(a.id).unwrap();
         project
-            .register_agent("alpha", HarnessKind::Codex, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::Codex,
+                crate::agent::AgentSelection::default(),
+            )
             .expect("name freed by removal");
     }
 
@@ -1464,7 +1500,11 @@ mod tests {
     fn rename_agent_changes_name_and_persists() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let updated = project.rename_agent(a.id, "renamed").unwrap();
         assert_eq!(updated.name, "renamed");
@@ -1480,7 +1520,11 @@ mod tests {
         // of the agent's own name is allowed.
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("agent-a", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "agent-a",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let updated = project.rename_agent(a.id, "Agent_A").unwrap();
         assert_eq!(updated.name, "Agent_A");
@@ -1490,10 +1534,18 @@ mod tests {
     fn rename_agent_rejects_canonical_collision_with_another() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         project
-            .register_agent("beta", HarnessKind::Codex, None, None)
+            .register_agent(
+                "beta",
+                HarnessKind::Codex,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let err = project.rename_agent(a.id, "BETA").unwrap_err();
         assert!(matches!(err, CoreError::DuplicateAgentName { .. }));
@@ -1505,7 +1557,11 @@ mod tests {
     fn rename_agent_rejects_invalid_name() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let err = project.rename_agent(a.id, "bad name").unwrap_err();
         assert!(matches!(err, CoreError::InvalidName { .. }));
@@ -1523,13 +1579,25 @@ mod tests {
         let (_tmp, project) = fresh_project();
         // Three agents in a known order; Codex starts with no locator.
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let b = project
-            .register_agent("beta", HarnessKind::Codex, None, None)
+            .register_agent(
+                "beta",
+                HarnessKind::Codex,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let c = project
-            .register_agent("gamma", HarnessKind::Antigravity, None, None)
+            .register_agent(
+                "gamma",
+                HarnessKind::Antigravity,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         assert!(b.session_locator.is_none());
 
@@ -1557,13 +1625,25 @@ mod tests {
     fn reorder_agents_persists_the_new_order() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let b = project
-            .register_agent("beta", HarnessKind::Codex, None, None)
+            .register_agent(
+                "beta",
+                HarnessKind::Codex,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let c = project
-            .register_agent("gamma", HarnessKind::Antigravity, None, None)
+            .register_agent(
+                "gamma",
+                HarnessKind::Antigravity,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
 
         let reordered = project.reorder_agents(&[c.id, a.id, b.id]).unwrap();
@@ -1579,10 +1659,18 @@ mod tests {
     fn reorder_agents_identity_permutation_is_a_valid_noop() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let b = project
-            .register_agent("beta", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "beta",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let reordered = project.reorder_agents(&[a.id, b.id]).unwrap();
         assert_eq!(reordered, vec![a, b]);
@@ -1592,10 +1680,18 @@ mod tests {
     fn reorder_agents_rejects_wrong_length() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let b = project
-            .register_agent("beta", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "beta",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
 
         let err = project.reorder_agents(&[a.id]).unwrap_err();
@@ -1622,7 +1718,11 @@ mod tests {
     fn reorder_agents_rejects_unknown_id() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let err = project.reorder_agents(&[Uuid::now_v7()]).unwrap_err();
         assert!(matches!(err, CoreError::ReorderRosterMismatch { .. }));
@@ -1633,10 +1733,18 @@ mod tests {
     fn reorder_agents_rejects_duplicate_id() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "alpha",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let b = project
-            .register_agent("beta", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "beta",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         // Right length, but `b` appears twice and `a` never — a permutation
         // check by length alone would corrupt the registry here.
@@ -1658,7 +1766,11 @@ mod tests {
         // Fork-and-heal shape: a locator already present is replaced.
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("a", HarnessKind::Antigravity, None, None)
+            .register_agent(
+                "a",
+                HarnessKind::Antigravity,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let first = SessionLocator::Uuid(Uuid::new_v4());
         project.set_session_locator(a.id, first).unwrap();
@@ -1686,7 +1798,11 @@ mod tests {
         // resume) — and the registry left untouched.
         let (_tmp, project) = fresh_project();
         let claude = project
-            .register_agent("c", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "c",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let before = project.list_agents().unwrap();
         let err = project
@@ -1706,7 +1822,11 @@ mod tests {
 
         // The inverse: a Uuid locator on a Codex agent is likewise refused.
         let codex = project
-            .register_agent("x", HarnessKind::Codex, None, None)
+            .register_agent(
+                "x",
+                HarnessKind::Codex,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let err = project
             .set_session_locator(codex.id, SessionLocator::Uuid(Uuid::new_v4()))
@@ -1721,7 +1841,11 @@ mod tests {
     fn register_rejects_invalid_name() {
         let (_tmp, project) = fresh_project();
         let err = project
-            .register_agent("agent.1", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "agent.1",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap_err();
         assert!(matches!(err, CoreError::InvalidName { .. }));
     }
@@ -1731,7 +1855,7 @@ mod tests {
         let (_tmp, project) = fresh_project();
         let provided = Uuid::now_v7();
         let record = project
-            .register_attached_claude_agent("attached", provided, None, None)
+            .register_attached_claude_agent("attached", provided)
             .unwrap();
         assert_eq!(record.harness, HarnessKind::ClaudeCode);
         assert_eq!(record.session_locator, Some(SessionLocator::Uuid(provided)));
@@ -1747,8 +1871,7 @@ mod tests {
             .register_agent(
                 "assistant",
                 HarnessKind::ClaudeCode,
-                Some("opus".to_owned()),
-                Some("max".to_owned()),
+                selection(Some("opus"), Some("max")),
             )
             .unwrap();
         assert_eq!(record.model.as_deref(), Some("opus"));
@@ -1760,82 +1883,122 @@ mod tests {
     }
 
     #[test]
-    fn profiles_round_trip_and_switch_atomically() {
+    fn selection_round_trips_and_replaces_atomically() {
         let (_tmp, project) = fresh_project();
         let agent = project
-            .register_agent_with_profiles(
+            .register_agent(
                 "assistant",
                 HarnessKind::ClaudeCode,
-                Some("opus".to_owned()),
-                Some("high".to_owned()),
-                Some(AgentProfile {
-                    model: Some("sonnet".to_owned()),
-                    effort: Some("medium".to_owned()),
-                }),
+                AgentSelection {
+                    model: Some("opus".to_owned()),
+                    effort: Some("high".to_owned()),
+                    model_choices: vec!["opus".to_owned(), "sonnet".to_owned()],
+                    effort_choices: vec!["high".to_owned(), "medium".to_owned()],
+                },
             )
             .unwrap();
-        assert_eq!(agent.profiles.active, AgentProfileSlot::Primary);
-
-        let switched = project
-            .set_active_agent_profile(agent.id, AgentProfileSlot::Secondary)
-            .unwrap();
-        assert_eq!(switched.active_profile().model.as_deref(), Some("sonnet"));
-        assert_eq!(
-            project.list_agents().unwrap()[0].profiles.active,
-            AgentProfileSlot::Secondary
-        );
+        assert_eq!(agent.model_choices, ["opus", "sonnet"]);
 
         let updated = project
-            .set_agent_profiles(
+            .set_agent_selection(
                 agent.id,
-                AgentProfile {
-                    model: Some("haiku".to_owned()),
-                    effort: Some("low".to_owned()),
+                AgentSelection {
+                    model: Some("sonnet".to_owned()),
+                    effort: Some("medium".to_owned()),
+                    model_choices: vec!["opus".to_owned(), "sonnet".to_owned()],
+                    effort_choices: vec!["high".to_owned(), "medium".to_owned()],
                 },
-                None,
             )
             .unwrap();
-        assert_eq!(updated.model.as_deref(), Some("haiku"));
-        assert_eq!(updated.effort.as_deref(), Some("low"));
-        assert_eq!(updated.profiles, AgentProfiles::default());
+        assert_eq!(updated.model.as_deref(), Some("sonnet"));
+        assert_eq!(updated.effort.as_deref(), Some("medium"));
+        assert_eq!(project.list_agents().unwrap(), [updated]);
     }
 
     #[test]
-    fn switching_to_an_unconfigured_secondary_fails_without_mutating() {
+    fn legacy_unpinned_antigravity_choices_load_and_can_be_activated() {
         let (_tmp, project) = fresh_project();
-        let agent = project
-            .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
+        let agent_id = Uuid::now_v7();
+        let legacy = serde_json::json!({
+            "id": agent_id,
+            "project_id": project.id,
+            "name": "legacy",
+            "harness": "antigravity",
+            "session_locator": null,
+            "model": null,
+            "effort": null,
+            "profiles": {
+                "secondary": { "model": "gemini-3.1-pro", "effort": "high" },
+                "active": "primary"
+            },
+            "created_at": "2026-05-15T12:30:45Z"
+        });
+        std::fs::write(&project.registry_path, format!("{legacy}\n")).unwrap();
+
+        let loaded = project.list_agents().unwrap().remove(0);
+        assert_eq!(loaded.model, None);
+        assert_eq!(loaded.effort, None);
+        assert_eq!(loaded.model_choices, ["gemini-3.1-pro"]);
+        assert_eq!(loaded.effort_choices, ["high"]);
+
+        let updated = project
+            .set_agent_selection(
+                agent_id,
+                AgentSelection {
+                    model: Some("gemini-3.1-pro".to_owned()),
+                    effort: Some("high".to_owned()),
+                    model_choices: loaded.model_choices,
+                    effort_choices: loaded.effort_choices,
+                },
+            )
             .unwrap();
-        let before = project.list_agents().unwrap();
-
-        let error = project
-            .set_active_agent_profile(agent.id, AgentProfileSlot::Secondary)
-            .unwrap_err();
-
-        assert!(matches!(error, CoreError::SecondaryProfileMissing(id) if id == agent.id));
-        assert_eq!(project.list_agents().unwrap(), before);
+        assert_eq!(updated.model.as_deref(), Some("gemini-3.1-pro"));
+        assert_eq!(updated.effort.as_deref(), Some("high"));
+        assert!(
+            !std::fs::read_to_string(&project.registry_path)
+                .unwrap()
+                .contains("profiles")
+        );
     }
 
     #[test]
-    fn register_attached_claude_persists_model_and_effort() {
+    fn antigravity_choices_can_be_configured_before_a_current_model() {
         let (_tmp, project) = fresh_project();
         let record = project
-            .register_attached_claude_agent(
-                "attached",
-                Uuid::now_v7(),
-                Some("sonnet".to_owned()),
-                Some("low".to_owned()),
+            .register_agent(
+                "a",
+                HarnessKind::Antigravity,
+                AgentSelection {
+                    model: None,
+                    effort: None,
+                    model_choices: vec!["gemini-3.1-pro".to_owned()],
+                    effort_choices: vec!["high".to_owned()],
+                },
             )
             .unwrap();
-        assert_eq!(record.model.as_deref(), Some("sonnet"));
-        assert_eq!(record.effort.as_deref(), Some("low"));
+
+        assert_eq!(record.model, None);
+        assert_eq!(record.effort, None);
+        assert_eq!(project.list_agents().unwrap(), [record]);
+    }
+
+    #[test]
+    fn register_attached_claude_is_unpinned() {
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_attached_claude_agent("attached", Uuid::now_v7())
+            .unwrap();
+        assert_eq!(record.model, None);
+        assert_eq!(record.effort, None);
+        assert!(record.model_choices.is_empty());
+        assert!(record.effort_choices.is_empty());
         let listed = project.list_agents().unwrap();
         assert_eq!(listed, vec![record]);
     }
 
     #[test]
     fn register_attached_antigravity_carries_no_model_or_effort() {
-        // Antigravity supports neither axis; both are structurally None.
+        // Attach deliberately leaves both supported axes unpinned.
         let (_tmp, project) = fresh_project();
         let record = project
             .register_attached_antigravity_agent("attached", Uuid::new_v4())
@@ -1844,15 +2007,15 @@ mod tests {
         assert_eq!(record.effort, None);
     }
 
-    /// An effort with no model is refused at **both** persistence sites and for
-    /// **both** profile slots. Antigravity's valid levels are a property of the
+    /// An effort with no model is refused at both persistence sites.
+    /// Antigravity's valid levels are a property of the
     /// chosen model, so an effort alone is not dispatchable — and storing it
     /// would leave a record asserting a selection no turn can apply.
     #[test]
     fn effort_without_a_model_is_refused_at_registration() {
         let (_tmp, project) = fresh_project();
         let err = project
-            .register_agent("a", HarnessKind::Antigravity, None, Some("high".to_owned()))
+            .register_agent("a", HarnessKind::Antigravity, selection(None, Some("high")))
             .unwrap_err();
         assert!(
             matches!(
@@ -1870,40 +2033,25 @@ mod tests {
     }
 
     #[test]
-    fn effort_without_a_model_is_refused_when_setting_profiles() {
+    fn effort_without_a_model_is_refused_when_setting_selection() {
         let (_tmp, project) = fresh_project();
         let agent = project
-            .register_agent("a", HarnessKind::Antigravity, None, None)
+            .register_agent(
+                "a",
+                HarnessKind::Antigravity,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
 
-        // Primary slot.
         let err = project
-            .set_agent_profiles(
+            .set_agent_selection(
                 agent.id,
-                AgentProfile {
+                AgentSelection {
                     model: None,
                     effort: Some("high".to_owned()),
+                    model_choices: Vec::new(),
+                    effort_choices: vec!["high".to_owned()],
                 },
-                None,
-            )
-            .unwrap_err();
-        assert!(
-            matches!(err, CoreError::EffortWithoutModel { .. }),
-            "{err:?}"
-        );
-
-        // Secondary slot — the same rule, not just the primary one.
-        let err = project
-            .set_agent_profiles(
-                agent.id,
-                AgentProfile {
-                    model: Some("gemini-3.1-pro".to_owned()),
-                    effort: Some("high".to_owned()),
-                },
-                Some(AgentProfile {
-                    model: None,
-                    effort: Some("low".to_owned()),
-                }),
             )
             .unwrap_err();
         assert!(
@@ -1914,7 +2062,7 @@ mod tests {
 
     /// The regression this capability gate exists to prevent. Claude and Codex
     /// emit their effort flag independently of the model, so "harness's own
-    /// default model, at an explicit effort" is a valid, dispatchable profile —
+    /// default model, at an explicit effort" is a valid, dispatchable selection —
     /// and one the editor actively produces when a user sets an effort and then
     /// returns the model picker to "Default". An unconditional
     /// effort-requires-model rule rejected it on save.
@@ -1925,25 +2073,23 @@ mod tests {
 
             // At registration.
             let record = project
-                .register_agent("a", harness, None, Some("high".to_owned()))
+                .register_agent("a", harness, selection(None, Some("high")))
                 .unwrap_or_else(|e| panic!("{harness:?} registration: {e:?}"));
             assert_eq!(record.model, None);
             assert_eq!(record.effort.as_deref(), Some("high"));
 
-            // And when editing profiles afterwards, in both slots.
+            // And when editing the complete selection afterwards.
             project
-                .set_agent_profiles(
+                .set_agent_selection(
                     record.id,
-                    AgentProfile {
+                    AgentSelection {
                         model: None,
                         effort: Some("high".to_owned()),
+                        model_choices: Vec::new(),
+                        effort_choices: vec!["high".to_owned(), "low".to_owned()],
                     },
-                    Some(AgentProfile {
-                        model: None,
-                        effort: Some("low".to_owned()),
-                    }),
                 )
-                .unwrap_or_else(|e| panic!("{harness:?} set_agent_profiles: {e:?}"));
+                .unwrap_or_else(|e| panic!("{harness:?} set_agent_selection: {e:?}"));
         }
     }
 
@@ -1957,8 +2103,7 @@ mod tests {
             .register_agent(
                 "a",
                 HarnessKind::Antigravity,
-                Some("gemini-3.1-pro".to_owned()),
-                Some("high".to_owned()),
+                selection(Some("gemini-3.1-pro"), Some("high")),
             )
             .unwrap();
         assert_eq!(record.model.as_deref(), Some("gemini-3.1-pro"));
@@ -1976,8 +2121,7 @@ mod tests {
             .register_agent(
                 "a",
                 HarnessKind::Antigravity,
-                Some("gemini-3.1-pro".to_owned()),
-                None,
+                selection(Some("gemini-3.1-pro"), None),
             )
             .unwrap();
         assert_eq!(record.effort, None);
@@ -1993,21 +2137,21 @@ mod tests {
             .register_agent(
                 "a",
                 HarnessKind::ClaudeCode,
-                Some("  ".to_owned()),
-                Some(String::new()),
+                selection(Some("  "), Some("")),
             )
             .unwrap();
         assert_eq!(agent.model, None);
         assert_eq!(agent.effort, None);
 
         project
-            .set_agent_profiles(
+            .set_agent_selection(
                 agent.id,
-                AgentProfile {
+                AgentSelection {
                     model: Some("   ".to_owned()),
                     effort: Some(" ".to_owned()),
+                    model_choices: vec![" ".to_owned()],
+                    effort_choices: vec![" ".to_owned()],
                 },
-                None,
             )
             .unwrap();
         let reloaded = &project.list_agents().unwrap()[0];
@@ -2020,7 +2164,7 @@ mod tests {
         let (_tmp, project) = fresh_project();
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 16).unwrap();
         let record = project
-            .register_attached_codex_agent("attached", "thread-abc".to_owned(), date, None, None)
+            .register_attached_codex_agent("attached", "thread-abc".to_owned(), date)
             .unwrap();
         assert_eq!(record.harness, HarnessKind::Codex);
         assert_eq!(
@@ -2050,10 +2194,14 @@ mod tests {
     fn register_attached_enforces_name_uniqueness_across_create_and_attach() {
         let (_tmp, project) = fresh_project();
         project
-            .register_agent("agent-a", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "agent-a",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let err = project
-            .register_attached_claude_agent("agent_a", Uuid::now_v7(), None, None)
+            .register_attached_claude_agent("agent_a", Uuid::now_v7())
             .unwrap_err();
         assert!(matches!(err, CoreError::DuplicateAgentName { .. }));
     }
@@ -2062,7 +2210,7 @@ mod tests {
     fn register_attached_validates_name() {
         let (_tmp, project) = fresh_project();
         let err = project
-            .register_attached_claude_agent("bad.name", Uuid::now_v7(), None, None)
+            .register_attached_claude_agent("bad.name", Uuid::now_v7())
             .unwrap_err();
         assert!(matches!(err, CoreError::InvalidName { .. }));
     }
@@ -2092,7 +2240,11 @@ mod tests {
         let (_tmp, project) = fresh_project();
         // Append a valid record then a malformed line.
         project
-            .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "assistant",
+                HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         let mut f = std::fs::OpenOptions::new()
             .append(true)

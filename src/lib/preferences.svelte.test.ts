@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Preferences } from "$lib/types";
-import { DEFAULT_AGENT_PROFILES } from "$lib/agentSelection";
+import { DEFAULT_AGENT_SELECTIONS } from "$lib/agentSelection";
 
 // Each test controls the `get_preferences` / `set_preferences` responses.
 const invokeMock = vi.fn();
@@ -26,7 +26,7 @@ const PREFS = (editor: string | null, terminal: string): Preferences => ({
   auto_reading_mode: false,
   notify_on_completion: true,
   notify_while_focused: false,
-  agent_defaults: structuredClone(DEFAULT_AGENT_PROFILES),
+  agent_defaults: structuredClone(DEFAULT_AGENT_SELECTIONS),
 });
 
 beforeEach(() => {

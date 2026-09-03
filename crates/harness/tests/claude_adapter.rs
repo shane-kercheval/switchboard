@@ -26,7 +26,8 @@ fn fake_agent() -> AgentRecord {
     AgentRecord {
         model: None,
         effort: None,
-        profiles: switchboard_core::AgentProfiles::default(),
+        model_choices: Vec::new(),
+        effort_choices: Vec::new(),
         forked_from_session: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),

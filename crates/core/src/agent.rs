@@ -1,40 +1,41 @@
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use crate::harness::HarnessKind;
 
 pub type AgentId = Uuid;
 
-/// One model/reasoning-effort configuration. Both axes stay optional because
-/// neither is required: an agent may leave either (or both) unset and take the
-/// harness's own default. Antigravity is the one harness that constrains the
-/// pair — its valid effort levels are a property of the chosen model, so an
-/// effort without a model is rejected (`HarnessKind::effort_requires_model`).
+/// The complete model/reasoning-effort selection configuration for an agent.
+/// Current values are stored directly because dispatch snapshots them, while
+/// each choice list controls which values the UI can switch to quickly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct AgentProfile {
+pub struct AgentSelection {
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub model_choices: Vec<String>,
+    pub effort_choices: Vec<String>,
 }
 
-/// Which configured profile an agent will use for newly submitted sends.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentProfileSlot {
+enum LegacyAgentProfileSlot {
     #[default]
     Primary,
     Secondary,
 }
 
-/// Optional secondary configuration plus the currently active slot.
-///
-/// Kept as one additive field on [`AgentRecord`] so records written before
-/// profiles existed deserialize as primary-only without a migration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+struct LegacyAgentProfile {
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct AgentProfiles {
-    pub secondary: Option<AgentProfile>,
-    pub active: AgentProfileSlot,
+struct LegacyAgentProfiles {
+    secondary: Option<LegacyAgentProfile>,
+    active: LegacyAgentProfileSlot,
 }
 
 /// The identity Switchboard uses to find and resume a harness's conversation.
@@ -124,8 +125,8 @@ impl SessionLocator {
 ///
 /// Records are appended on registration. A small set of fields mutate after
 /// that, each through its own dedicated `Project` method (never a generic
-/// update API): `name` (rename), the primary/secondary profile configuration
-/// and active slot, `session_locator`
+/// update API): `name` (rename), the model/effort selection configuration,
+/// `session_locator`
 /// (runtime capture for Codex/Antigravity, including the Antigravity
 /// fork-and-heal case — see [`crate::project::Project::set_session_locator`]),
 /// and the records' physical order (user reordering — file order *is* the
@@ -144,7 +145,7 @@ impl SessionLocator {
 /// missing it entirely is treated as corruption and fails loud (see
 /// [`deserialize_required_locator`]), consistent with the Switchboard-owned
 /// JSONL invariant.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AgentRecord {
     pub id: AgentId,
     pub project_id: Uuid,
@@ -152,9 +153,8 @@ pub struct AgentRecord {
     pub harness: HarnessKind,
     #[serde(deserialize_with = "deserialize_required_locator")]
     pub session_locator: Option<SessionLocator>,
-    /// The primary profile's model. Sent when Primary is active; the secondary
-    /// profile supplies the value when Secondary is active. Omitted when
-    /// `None`, so the harness uses its default.
+    /// The model captured for a newly accepted send. Omitted when `None`, so
+    /// the harness uses its default.
     /// Free-text, not validated against an enum: no harness exposes a queryable
     /// model list and some values are plan-gated, so a bad value surfaces as a
     /// failed turn rather than a registration error. Only harnesses where
@@ -166,16 +166,17 @@ pub struct AgentRecord {
     /// (Deliberately unlike `session_locator`, which adds a custom deserializer
     /// precisely to *defeat* that permissive default and fail loud on absence.)
     pub model: Option<String>,
-    /// The primary profile's reasoning-effort level. Sent when Primary is
-    /// active and omitted when `None`. A closed per-harness enum at the UI boundary, but
+    /// The reasoning-effort level captured for a newly accepted send. Omitted
+    /// when `None`. A closed per-harness enum at the UI boundary, but
     /// stored as a `String` to keep this field harness-agnostic. Only harnesses
     /// where [`HarnessKind::supports_effort_selection`] holds ever carry a
     /// value. Same backward-compat rationale as `model`.
     pub effort: Option<String>,
-    /// Secondary model/effort configuration and the active slot. The primary
-    /// configuration remains in `model` / `effort` for wire compatibility.
-    #[serde(default)]
-    pub profiles: AgentProfiles,
+    /// Models exposed as quick choices. Always serialized, including when
+    /// empty, so their presence distinguishes this shape from pre-feature rows.
+    pub model_choices: Vec<String>,
+    /// Reasoning-effort levels exposed as quick choices.
+    pub effort_choices: Vec<String>,
     /// For a forked agent: the **parent session UUID** to `--resume` from when
     /// this agent's own session file does not exist yet. `None` for every agent
     /// that wasn't created by forking.
@@ -227,21 +228,110 @@ pub struct AgentRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Deserialize)]
+struct AgentRecordWire {
+    id: AgentId,
+    project_id: Uuid,
+    name: String,
+    harness: HarnessKind,
+    #[serde(deserialize_with = "deserialize_required_locator")]
+    session_locator: Option<SessionLocator>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    model_choices: Option<Vec<String>>,
+    #[serde(default)]
+    effort_choices: Option<Vec<String>>,
+    /// Presence of the old object is the legacy discriminator. The old writer
+    /// always emitted it, while the new writer never does; this lets the flat
+    /// `model`/`effort` keys keep their wire names for downgrade tolerance.
+    #[serde(default)]
+    profiles: Option<LegacyAgentProfiles>,
+    #[serde(default)]
+    forked_from_session: Option<Uuid>,
+    created_at: DateTime<Utc>,
+}
+
+impl<'de> Deserialize<'de> for AgentRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentRecordWire::deserialize(deserializer)?;
+        let selection = if let Some(profiles) = wire.profiles {
+            let primary = LegacyAgentProfile {
+                model: wire.model,
+                effort: wire.effort,
+            };
+            let current = if profiles.active == LegacyAgentProfileSlot::Secondary {
+                profiles.secondary.as_ref().unwrap_or(&primary)
+            } else {
+                &primary
+            };
+            AgentSelection {
+                model: current.model.clone(),
+                effort: current.effort.clone(),
+                model_choices: legacy_choices(
+                    primary.model.as_ref(),
+                    profiles
+                        .secondary
+                        .as_ref()
+                        .and_then(|profile| profile.model.as_ref()),
+                ),
+                effort_choices: legacy_choices(
+                    primary.effort.as_ref(),
+                    profiles
+                        .secondary
+                        .as_ref()
+                        .and_then(|profile| profile.effort.as_ref()),
+                ),
+            }
+        } else {
+            let model_choices = wire
+                .model_choices
+                .unwrap_or_else(|| wire.model.iter().cloned().collect());
+            let effort_choices = wire
+                .effort_choices
+                .unwrap_or_else(|| wire.effort.iter().cloned().collect());
+            AgentSelection {
+                model: wire.model,
+                effort: wire.effort,
+                model_choices,
+                effort_choices,
+            }
+        };
+        let selection = normalize_agent_selection(selection);
+        Ok(Self {
+            id: wire.id,
+            project_id: wire.project_id,
+            name: wire.name,
+            harness: wire.harness,
+            session_locator: wire.session_locator,
+            model: selection.model,
+            effort: selection.effort,
+            model_choices: selection.model_choices,
+            effort_choices: selection.effort_choices,
+            forked_from_session: wire.forked_from_session,
+            created_at: wire.created_at,
+        })
+    }
+}
+
+fn legacy_choices(primary: Option<&String>, secondary: Option<&String>) -> Vec<String> {
+    primary.into_iter().chain(secondary).cloned().collect()
+}
+
 impl AgentRecord {
     /// The configuration selected for a newly submitted send.
     #[must_use]
-    pub fn active_profile(&self) -> AgentProfile {
-        match self.profiles.active {
-            AgentProfileSlot::Primary => AgentProfile {
-                model: self.model.clone(),
-                effort: self.effort.clone(),
-            },
-            AgentProfileSlot::Secondary => {
-                self.profiles.secondary.clone().unwrap_or(AgentProfile {
-                    model: self.model.clone(),
-                    effort: self.effort.clone(),
-                })
-            }
+    pub fn selection(&self) -> AgentSelection {
+        AgentSelection {
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            model_choices: self.model_choices.clone(),
+            effort_choices: self.effort_choices.clone(),
         }
     }
 
@@ -288,21 +378,22 @@ impl AgentRecord {
                 axis: crate::harness::SelectionAxis::Effort,
             });
         }
-        if let Some(secondary) = &self.profiles.secondary {
-            if secondary.model.is_some() && !self.harness.supports_model_selection() {
-                return Err(CoreError::SelectionUnsupported {
-                    harness: self.harness,
-                    axis: crate::harness::SelectionAxis::Model,
-                });
-            }
-            if secondary.effort.is_some() && !self.harness.supports_effort_selection() {
-                return Err(CoreError::SelectionUnsupported {
-                    harness: self.harness,
-                    axis: crate::harness::SelectionAxis::Effort,
-                });
-            }
-        } else if self.profiles.active == AgentProfileSlot::Secondary {
-            return Err(CoreError::SecondaryProfileMissing(self.id));
+        if !self.model_choices.is_empty() && !self.harness.supports_model_selection() {
+            return Err(CoreError::SelectionUnsupported {
+                harness: self.harness,
+                axis: crate::harness::SelectionAxis::Model,
+            });
+        }
+        if !self.effort_choices.is_empty() && !self.harness.supports_effort_selection() {
+            return Err(CoreError::SelectionUnsupported {
+                harness: self.harness,
+                axis: crate::harness::SelectionAxis::Effort,
+            });
+        }
+        if self.harness.effort_requires_model() && self.effort.is_some() && self.model.is_none() {
+            return Err(CoreError::EffortWithoutModel {
+                harness: self.harness,
+            });
         }
         Ok(())
     }
@@ -340,6 +431,40 @@ pub fn normalize_selection(value: Option<String>) -> Option<String> {
     value.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
+/// Normalize a complete selection configuration while preserving choice order.
+/// Current values are appended when absent so every dispatch-ready value is
+/// also reachable through the quick-choice UI.
+#[must_use]
+pub fn normalize_agent_selection(mut selection: AgentSelection) -> AgentSelection {
+    selection.model = normalize_selection(selection.model);
+    selection.effort = normalize_selection(selection.effort);
+    selection.model_choices = normalize_choices(selection.model_choices);
+    selection.effort_choices = normalize_choices(selection.effort_choices);
+    include_current(&mut selection.model_choices, selection.model.as_ref());
+    include_current(&mut selection.effort_choices, selection.effort.as_ref());
+    selection
+}
+
+fn normalize_choices(values: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        if let Some(value) = normalize_selection(Some(value))
+            && !normalized.contains(&value)
+        {
+            normalized.push(value);
+        }
+    }
+    normalized
+}
+
+fn include_current(choices: &mut Vec<String>, current: Option<&String>) {
+    if let Some(current) = current
+        && !choices.contains(current)
+    {
+        choices.push(current.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,7 +478,8 @@ mod tests {
             session_locator: locator,
             model: None,
             effort: None,
-            profiles: AgentProfiles::default(),
+            model_choices: Vec::new(),
+            effort_choices: Vec::new(),
             forked_from_session: None,
             created_at: Utc::now(),
         }
@@ -372,6 +498,8 @@ mod tests {
         let mut record = record_with_locator(Some(SessionLocator::Uuid(Uuid::now_v7())));
         record.model = Some("sonnet".to_owned());
         record.effort = Some("high".to_owned());
+        record.model_choices = vec!["sonnet".to_owned()];
+        record.effort_choices = vec!["high".to_owned()];
         let json = serde_json::to_string(&record).unwrap();
         let parsed: AgentRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, record);
@@ -401,28 +529,56 @@ mod tests {
             serde_json::from_str(json).expect("missing model/effort must default to None");
         assert_eq!(parsed.model, None);
         assert_eq!(parsed.effort, None);
-        assert_eq!(parsed.profiles, AgentProfiles::default());
+        assert!(parsed.model_choices.is_empty());
+        assert!(parsed.effort_choices.is_empty());
         assert_eq!(parsed.session_locator, None);
     }
 
     #[test]
-    fn agent_record_roundtrips_with_secondary_profile() {
-        let mut record = record_with_locator(Some(SessionLocator::Uuid(Uuid::now_v7())));
-        record.model = Some("opus".to_owned());
-        record.effort = Some("high".to_owned());
-        record.profiles = AgentProfiles {
-            secondary: Some(AgentProfile {
-                model: Some("sonnet".to_owned()),
-                effort: Some("medium".to_owned()),
-            }),
-            active: AgentProfileSlot::Secondary,
-        };
+    fn pre_profile_flat_selection_becomes_a_single_quick_choice() {
+        let json = r#"{"id":"019e2c5f-aaaa-7000-8000-000000000001","project_id":"019e2c5f-bbbb-7000-8000-000000000002","name":"legacy","harness":"claude_code","session_locator":null,"model":"sonnet","effort":null,"created_at":"2026-05-15T12:30:45Z"}"#;
+        let parsed: AgentRecord = serde_json::from_str(json).unwrap();
 
-        let json = serde_json::to_string(&record).unwrap();
-        let parsed: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("sonnet"));
+        assert_eq!(parsed.model_choices, ["sonnet"]);
+        assert!(parsed.effort_choices.is_empty());
+    }
 
-        assert_eq!(parsed, record);
-        assert_eq!(parsed.active_profile().model.as_deref(), Some("sonnet"));
+    #[test]
+    fn legacy_secondary_profile_migrates_to_independent_choices() {
+        let json = r#"{"id":"019e2c5f-aaaa-7000-8000-000000000001","project_id":"019e2c5f-bbbb-7000-8000-000000000002","name":"legacy","harness":"claude_code","session_locator":null,"model":"opus","effort":"high","profiles":{"secondary":{"model":"sonnet","effort":"medium"},"active":"secondary"},"created_at":"2026-05-15T12:30:45Z"}"#;
+        let parsed: AgentRecord = serde_json::from_str(json).unwrap();
+
+        assert_eq!(parsed.model.as_deref(), Some("sonnet"));
+        assert_eq!(parsed.effort.as_deref(), Some("medium"));
+        assert_eq!(parsed.model_choices, ["opus", "sonnet"]);
+        assert_eq!(parsed.effort_choices, ["high", "medium"]);
+        let rewritten = serde_json::to_string(&parsed).unwrap();
+        assert!(!rewritten.contains("profiles"));
+        assert!(rewritten.contains("model_choices"));
+    }
+
+    #[test]
+    fn legacy_active_primary_can_have_no_current_effort_and_a_secondary_effort_choice() {
+        let json = r#"{"id":"019e2c5f-aaaa-7000-8000-000000000001","project_id":"019e2c5f-bbbb-7000-8000-000000000002","name":"legacy","harness":"claude_code","session_locator":null,"model":"opus","effort":null,"profiles":{"secondary":{"model":"sonnet","effort":"high"},"active":"primary"},"created_at":"2026-05-15T12:30:45Z"}"#;
+        let parsed: AgentRecord = serde_json::from_str(json).unwrap();
+
+        assert_eq!(parsed.model.as_deref(), Some("opus"));
+        assert_eq!(parsed.effort, None);
+        assert_eq!(parsed.model_choices, ["opus", "sonnet"]);
+        assert_eq!(parsed.effort_choices, ["high"]);
+    }
+
+    #[test]
+    fn legacy_unpinned_antigravity_primary_preserves_secondary_choices() {
+        let json = r#"{"id":"019e2c5f-aaaa-7000-8000-000000000001","project_id":"019e2c5f-bbbb-7000-8000-000000000002","name":"legacy","harness":"antigravity","session_locator":null,"model":null,"effort":null,"profiles":{"secondary":{"model":"gemini-3.1-pro","effort":"high"},"active":"primary"},"created_at":"2026-05-15T12:30:45Z"}"#;
+        let parsed: AgentRecord = serde_json::from_str(json).unwrap();
+
+        assert_eq!(parsed.model, None);
+        assert_eq!(parsed.effort, None);
+        assert_eq!(parsed.model_choices, ["gemini-3.1-pro"]);
+        assert_eq!(parsed.effort_choices, ["high"]);
+        parsed.validate().unwrap();
     }
 
     #[test]

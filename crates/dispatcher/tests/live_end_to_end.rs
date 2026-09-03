@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use switchboard_core::{
-    AgentRecord, Attachment, AttachmentKind, HarnessKind, Project, SendId, Store,
+    AgentRecord, AgentSelection, Attachment, AttachmentKind, HarnessKind, Project, SendId, Store,
 };
 use switchboard_dispatcher::{
     ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter,
@@ -243,7 +243,11 @@ async fn live_claude_full_stack_two_consecutive_turns_succeed() {
     let tmp = TempDir::new().expect("tempdir");
     let (_store_root, project) = temp_project(tmp.path(), "integration-test");
     let agent = project
-        .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
+        .register_agent(
+            "assistant",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
         .expect("register_agent");
     assert!(
         agent.session_locator.is_some(),
@@ -311,7 +315,11 @@ async fn live_claude_full_stack_emits_turn_start_then_content_then_turn_end() {
     let tmp = TempDir::new().expect("tempdir");
     let (_store_root, project) = temp_project(tmp.path(), "order-test");
     let agent = project
-        .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
+        .register_agent(
+            "assistant",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
         .expect("agent");
 
     let dispatcher = Arc::new(Dispatcher::new());
@@ -355,7 +363,11 @@ async fn live_claude_full_stack_paths_with_dot_components_resolve_correctly() {
     std::fs::create_dir_all(&working_dir).expect("create working dir");
     let (_store_root, project) = temp_project(&working_dir, "dot-path-test");
     let agent = project
-        .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
+        .register_agent(
+            "assistant",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
         .expect("agent");
 
     let dispatcher = Arc::new(Dispatcher::new());
@@ -410,7 +422,11 @@ async fn live_claude_full_stack_sees_files_in_cwd() {
 
     let (_store_root, project) = temp_project(tmp.path(), "cwd-test");
     let agent = project
-        .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
+        .register_agent(
+            "assistant",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
         .expect("agent");
 
     let dispatcher = Arc::new(Dispatcher::new());
@@ -456,7 +472,7 @@ async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
     let tmp = TempDir::new().expect("tempdir");
     let (_store_root, project) = temp_project(tmp.path(), "codex-order-test");
     let agent = project
-        .register_agent("assistant", HarnessKind::Codex, None, None)
+        .register_agent("assistant", HarnessKind::Codex, AgentSelection::default())
         .expect("agent");
     assert!(
         agent.session_locator.is_none(),
@@ -504,7 +520,11 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
     let tmp = TempDir::new().expect("tempdir");
     let (_store_root, project) = temp_project(tmp.path(), "antigravity-e2e");
     let agent = project
-        .register_agent("assistant", HarnessKind::Antigravity, None, None)
+        .register_agent(
+            "assistant",
+            HarnessKind::Antigravity,
+            AgentSelection::default(),
+        )
         .expect("agent");
     assert!(
         agent.session_locator.is_none(),
@@ -600,7 +620,7 @@ async fn live_cancel_case(harness: HarnessKind, adapter: Arc<dyn HarnessAdapter>
     let tmp = TempDir::new().expect("tempdir");
     let (_store_root, project) = temp_project(tmp.path(), "cancel-test");
     let agent = project
-        .register_agent("assistant", harness, None, None)
+        .register_agent("assistant", harness, AgentSelection::default())
         .expect("register_agent");
 
     let dispatcher = Arc::new(Dispatcher::new());
@@ -690,7 +710,7 @@ async fn live_codex_cancel_after_content_recovers_turn_identity() {
     let tmp = TempDir::new().expect("tempdir");
     let (_store_root, project) = temp_project(tmp.path(), "cancel-identity-test");
     let agent = project
-        .register_agent("assistant", HarnessKind::Codex, None, None)
+        .register_agent("assistant", HarnessKind::Codex, AgentSelection::default())
         .expect("register_agent");
 
     let dispatcher = Arc::new(Dispatcher::new());
@@ -844,7 +864,7 @@ async fn run_attachment_case_in(
 ) -> AttachmentRun {
     let (_store_root, project) = temp_project(cwd, "attachment-test");
     let agent = project
-        .register_agent("assistant", harness, None, None)
+        .register_agent("assistant", harness, AgentSelection::default())
         .expect("register_agent");
 
     // Mirror what `stage_attachment` does: place the file in the staging dir and

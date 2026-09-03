@@ -1491,7 +1491,11 @@ mod tests {
         let (_root, cwd, store) = store_with_dir();
         let project = store.create_project(cwd.path(), "alpha").unwrap();
         let agent = project
-            .register_agent("one", crate::harness::HarnessKind::ClaudeCode, None, None)
+            .register_agent(
+                "one",
+                crate::harness::HarnessKind::ClaudeCode,
+                crate::agent::AgentSelection::default(),
+            )
             .unwrap();
         drop(cwd);
 

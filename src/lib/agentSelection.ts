@@ -14,13 +14,7 @@
 /// (`SUPPORTS_MODEL_SELECTION` / `SUPPORTS_EFFORT_SELECTION`); a harness with no
 /// capability has an empty list here and no default.
 
-import type {
-  AgentProfile,
-  AgentProfileSlot,
-  AgentRecord,
-  HarnessKind,
-  Preferences,
-} from "./types";
+import type { AgentSelection, HarnessKind, Preferences } from "./types";
 import { HARNESS_DEFAULT_AGENT_NAME } from "./harnessDisplay";
 
 /// One picker option: `value` is the alias/id submitted to the backend,
@@ -159,13 +153,15 @@ export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
 /// client-side before dispatch, so a wrong entry fails loudly and quota-free
 /// with the CLI naming the valid set — unlike Claude, which silently degrades.
 ///
-/// A model absent from this map has **no effort axis**: `agy` rejects
-/// `--effort` for it outright. The sets genuinely differ per model — Flash
-/// takes all three levels, 3.1 Pro only low/high, GPT-OSS only medium — which
-/// is why this is a per-model map rather than one list.
-const ANTIGRAVITY_MODEL_EFFORTS: Record<string, readonly string[]> = {
+/// The sets genuinely differ per model — Flash takes all three levels, 3.1 Pro
+/// only low/high, GPT-OSS only medium — which is why this is a per-model map
+/// rather than one list. `null` explicitly means no effort axis; absence means
+/// an unknown/off-catalog model whose persisted effort must survive.
+const ANTIGRAVITY_MODEL_EFFORTS: Record<string, readonly string[] | null> = {
   "gemini-3.7-flash": ["low", "medium", "high"],
   "gemini-3.1-pro": ["low", "high"],
+  "claude-sonnet-4-6": null,
+  "claude-opus-4-6-thinking": null,
   // Single-valued, and that is the point: the control renders as one
   // already-selected option, which states what the turn will run at instead of
   // leaving the user to infer it from a label suffix. Kept in this map (rather
@@ -173,6 +169,23 @@ const ANTIGRAVITY_MODEL_EFFORTS: Record<string, readonly string[]> = {
   // describe the model the same way.
   "gpt-oss-120b": ["medium"],
 };
+
+export type EffortSupport =
+  | { kind: "known"; options: SelectionOption[] }
+  | { kind: "none" }
+  | { kind: "unknown"; options: SelectionOption[] };
+
+export function effortSupportFor(harness: HarnessKind, model: string | null): EffortSupport {
+  if (harness !== "antigravity") return { kind: "known", options: EFFORT_OPTIONS[harness] };
+  if (model === null || model === "") return { kind: "none" };
+  const levels = ANTIGRAVITY_MODEL_EFFORTS[model];
+  if (levels === undefined) return { kind: "unknown", options: EFFORT_OPTIONS.antigravity };
+  if (levels === null) return { kind: "none" };
+  return {
+    kind: "known",
+    options: EFFORT_OPTIONS.antigravity.filter((option) => levels.includes(option.value)),
+  };
+}
 
 /// The effort options valid for a given harness **and model**. Only Antigravity
 /// is model-dependent, because only there does a mismatch **fail the dispatch**:
@@ -186,20 +199,8 @@ export function effortOptionsFor(
   harness: HarnessKind,
   model: string | undefined,
 ): SelectionOption[] {
-  const base = EFFORT_OPTIONS[harness];
-  const unset = model == null || model === "";
-  if (harness === "antigravity") {
-    // An effort is meaningless without a model here: `agy` decides validity
-    // from the model, and several models have no axis at all. Returning an
-    // empty set is what hides the control (see `AgentProfileEditor`), so an
-    // unselected or no-axis model shows no effort picker rather than one whose
-    // every option would be rejected at dispatch.
-    if (unset) return [];
-    const levels = ANTIGRAVITY_MODEL_EFFORTS[model];
-    if (levels === undefined) return [];
-    return base.filter((option) => levels.includes(option.value));
-  }
-  return base;
+  const support = effortSupportFor(harness, model ?? null);
+  return support.kind === "none" ? [] : support.options;
 }
 
 /// Whether this harness/model pair **requires** an effort to dispatch.
@@ -209,66 +210,127 @@ export function effortOptionsFor(
 /// "Default" for those. Every other harness treats effort as optional — an
 /// unset effort means "pass no flag, let the harness choose".
 export function effortIsRequired(harness: HarnessKind, model: string | undefined): boolean {
-  return harness === "antigravity" && effortOptionsFor(harness, model).length > 0;
+  return harness === "antigravity" && effortSupportFor(harness, model ?? null).kind === "known";
 }
 
 /// Built-in fallback used until persisted preferences load. This same shape is
 /// also the reset value for a missing `agent_defaults` key; once loaded, Add
 /// Agent and new-project seeding read the user's preferences directly.
-export const DEFAULT_AGENT_PROFILES: Preferences["agent_defaults"] = {
+export const DEFAULT_AGENT_SELECTIONS: Preferences["agent_defaults"] = {
   claude_code: {
-    primary: { model: "opus", effort: "high" },
-    secondary: { model: "sonnet", effort: "medium" },
+    model_choices: ["fable", "opus"],
+    effort_choices: ["medium", "high"],
+    default_model: "opus",
+    default_effort: "medium",
   },
   codex: {
-    primary: { model: "gpt-5.6-sol", effort: "high" },
-    secondary: { model: "gpt-5.6-terra", effort: "medium" },
+    model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
+    effort_choices: ["medium", "high"],
+    default_model: "gpt-5.6-terra",
+    default_effort: "medium",
   },
   // Both carry explicit effort because `agy` rejects these effort-bearing
   // models when dispatched without one.
   antigravity: {
-    primary: { model: "gemini-3.1-pro", effort: "high" },
-    secondary: { model: "gemini-3.7-flash", effort: "high" },
+    model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+    effort_choices: ["medium", "high"],
+    default_model: "gemini-3.7-flash",
+    default_effort: "medium",
   },
 };
 
-/// Useful starting values when someone enables a secondary profile for the
-/// first time and their global defaults do not already define one.
-export const SUGGESTED_SECONDARY_PROFILE: Record<HarnessKind, AgentProfile> = {
-  claude_code: { model: "sonnet", effort: "medium" },
-  codex: { model: "gpt-5.6-terra", effort: "medium" },
-  antigravity: { model: "gemini-3.7-flash", effort: "high" },
-};
-
 /// A model-derived name stops describing an agent once it can switch between
-/// two profiles. Keep that case stable and harness-shaped instead. This map is
+/// multiple model or effort choices. Keep that case stable and harness-shaped instead. This map is
 /// intentionally explicit rather than slugging display labels: agent names are
 /// persisted identifiers, and a future label edit must not rename the default.
-const MULTI_PROFILE_AGENT_NAME: Record<HarnessKind, string> = {
+const MULTI_CHOICE_AGENT_NAME: Record<HarnessKind, string> = {
   claude_code: "claude",
   codex: "codex",
   antigravity: "antigravity",
 };
 
-export function primaryProfile(agent: AgentRecord): AgentProfile {
-  return { model: agent.model ?? null, effort: agent.effort ?? null };
+export function activatableEffortValues(
+  selection: AgentSelection,
+  harness: HarnessKind,
+): Set<string> {
+  const support = effortSupportFor(harness, selection.model);
+  if (support.kind === "none") return new Set();
+  if (support.kind === "unknown") return new Set(selection.effort_choices);
+  const valid = new Set(support.options.map((option) => option.value));
+  return new Set(selection.effort_choices.filter((effort) => valid.has(effort)));
 }
 
-export function secondaryProfile(agent: AgentRecord): AgentProfile | null {
-  return agent.profiles?.secondary ?? null;
+export type ModelChangeResolution =
+  | { ok: true; selection: AgentSelection }
+  | { ok: false; reason: string };
+
+export function resolveModelChange(
+  selection: AgentSelection,
+  harness: HarnessKind,
+  model: string,
+): ModelChangeResolution {
+  if (harness !== "antigravity") return { ok: true, selection: { ...selection, model } };
+  const support = effortSupportFor(harness, model);
+  if (support.kind === "none") {
+    return { ok: true, selection: { ...selection, model, effort: null } };
+  }
+  if (support.kind === "unknown") return { ok: true, selection: { ...selection, model } };
+  const valid = new Set(support.options.map((option) => option.value));
+  if (selection.effort !== null && valid.has(selection.effort)) {
+    return { ok: true, selection: { ...selection, model } };
+  }
+  const effort = EFFORT_OPTIONS.antigravity.find(
+    (option) => valid.has(option.value) && selection.effort_choices.includes(option.value),
+  )?.value;
+  if (effort === undefined) {
+    return {
+      ok: false,
+      reason: "No configured reasoning effort is compatible with that model.",
+    };
+  }
+  return { ok: true, selection: { ...selection, model, effort } };
 }
 
-export function activeProfileSlot(agent: AgentRecord): AgentProfileSlot {
-  return agent.profiles?.active ?? "primary";
+export function selectionIsValid(selection: AgentSelection, harness: HarnessKind): boolean {
+  if (harness !== "antigravity") return true;
+  const support = effortSupportFor(harness, selection.model);
+  if (support.kind !== "known") return true;
+  return (
+    selection.effort !== null && support.options.some((option) => option.value === selection.effort)
+  );
 }
 
-export function activeProfile(agent: AgentRecord): AgentProfile {
-  return activeProfileSlot(agent) === "secondary" && secondaryProfile(agent) !== null
-    ? secondaryProfile(agent)!
-    : primaryProfile(agent);
+export type NewAgentSelectionResolution =
+  | { ok: true; selection: AgentSelection }
+  | { ok: false; selection: AgentSelection; reason: string };
+
+/// Convert independent axis defaults into the pair a new agent can dispatch.
+/// A default effort remains meaningful in Settings even while the default
+/// model has no effort axis; only this creation boundary clears or resolves it.
+export function selectionForNewAgent(
+  defaults: Preferences["agent_defaults"][HarnessKind],
+  harness: HarnessKind,
+): NewAgentSelectionResolution {
+  const selection: AgentSelection = {
+    model: defaults.default_model,
+    effort: defaults.default_effort,
+    model_choices: [...defaults.model_choices],
+    effort_choices: [...defaults.effort_choices],
+  };
+  if (harness !== "antigravity") return { ok: true, selection };
+  if (selection.model === null) {
+    return { ok: true, selection: { ...selection, effort: null } };
+  }
+  const resolved = resolveModelChange(selection, harness, selection.model);
+  if (resolved.ok) return resolved;
+  return {
+    ok: false,
+    selection,
+    reason: "No configured reasoning effort is compatible with the starting model.",
+  };
 }
 
-/// The model-derived agent name for a primary-only create, with effort appended
+/// The model-derived agent name for a single-choice create, with effort appended
 /// where the harness has that axis (`opus-high`, `gpt-5-5-medium`, …).
 /// Harnesses with no concrete model to name after fall back to the bare harness
 /// name: an agent created without a concrete model (it
@@ -292,15 +354,14 @@ export function defaultAgentName(
   return slug === "" ? HARNESS_DEFAULT_AGENT_NAME[harness] : slug;
 }
 
-/// The profile-aware create name shared by the dialog and new-project seeding.
-/// A secondary-capable agent uses its short harness name because neither
-/// profile alone describes it.
-export function defaultAgentNameForProfiles(
+/// The quick-choice-aware create name shared by the dialog and new-project seeding.
+/// An agent with multiple choices uses its short harness name because no single
+/// model/effort pair describes it.
+export function defaultAgentNameForSelection(
   harness: HarnessKind,
-  primary: AgentProfile,
-  secondary: AgentProfile | null,
+  selection: AgentSelection,
 ): string {
-  return secondary === null
-    ? defaultAgentName(harness, primary.model ?? undefined, primary.effort ?? undefined)
-    : MULTI_PROFILE_AGENT_NAME[harness];
+  return selection.model_choices.length > 1 || selection.effort_choices.length > 1
+    ? MULTI_CHOICE_AGENT_NAME[harness]
+    : defaultAgentName(harness, selection.model ?? undefined, selection.effort ?? undefined);
 }

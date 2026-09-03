@@ -28,6 +28,10 @@ const ALICE: AgentRecord = {
   name: "alice",
   harness: "claude_code",
   session_locator: { uuid: "00000000-0000-7000-8000-000000000001" },
+  model: null,
+  effort: null,
+  model_choices: [],
+  effort_choices: [],
   created_at: "2026-05-16T00:00:00Z",
 };
 const BOB: AgentRecord = {

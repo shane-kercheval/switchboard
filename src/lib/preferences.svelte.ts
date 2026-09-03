@@ -13,7 +13,7 @@
 
 import * as api from "$lib/api";
 import type { Preferences } from "$lib/types";
-import { DEFAULT_AGENT_PROFILES } from "$lib/agentSelection";
+import { DEFAULT_AGENT_SELECTIONS } from "$lib/agentSelection";
 
 const DEFAULTS: Preferences = {
   editor_command: "code",
@@ -24,7 +24,7 @@ const DEFAULTS: Preferences = {
   auto_reading_mode: false,
   notify_on_completion: true,
   notify_while_focused: false,
-  agent_defaults: structuredClone(DEFAULT_AGENT_PROFILES),
+  agent_defaults: structuredClone(DEFAULT_AGENT_SELECTIONS),
 };
 
 export const preferences = $state<Preferences>({ ...DEFAULTS });
@@ -50,7 +50,7 @@ export const saveStatus = $state<{ error: string | null; keys: string[] }>({
 export const preferenceLoadState = $state<{ ready: boolean }>({ ready: false });
 let loadPromise: Promise<void> | null = null;
 /// Serialize whole-object writes so a slower earlier save cannot land after a
-/// newer one and restore stale defaults. This matters for profile editing,
+/// newer one and restore stale defaults. This matters for selection editing,
 /// where model and effort changes can be made in quick succession.
 let saveTail: Promise<void> = Promise.resolve();
 /// Fetch preferences once and share the same readiness barrier with every
@@ -62,7 +62,7 @@ export function loadPreferences(): Promise<void> {
     try {
       const fetched = await api.getPreferences();
       Object.assign(preferences, fetched, {
-        agent_defaults: structuredClone(fetched.agent_defaults ?? DEFAULT_AGENT_PROFILES),
+        agent_defaults: structuredClone(fetched.agent_defaults ?? DEFAULT_AGENT_SELECTIONS),
       });
     } catch (err) {
       console.warn("[switchboard] loadPreferences failed", err);

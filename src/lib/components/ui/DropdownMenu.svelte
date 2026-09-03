@@ -20,6 +20,7 @@
     triggerLabel?: string;
     triggerTestid?: string;
     triggerTabindex?: number;
+    triggerDisabled?: boolean;
     tooltipLabel?: string;
     tooltipSide?: "top" | "bottom" | "left" | "right";
     tooltipDisableHoverableContent?: boolean;
@@ -37,6 +38,7 @@
     triggerLabel,
     triggerTestid,
     triggerTabindex,
+    triggerDisabled = false,
     tooltipLabel,
     tooltipSide = "top",
     tooltipDisableHoverableContent = true,
@@ -69,6 +71,7 @@
           aria-label={triggerLabel}
           data-testid={triggerTestid}
           tabindex={triggerTabindex}
+          disabled={triggerDisabled}
         >
           {@render renderTrigger()}
         </Bits.Trigger>
@@ -80,6 +83,7 @@
       aria-label={triggerLabel}
       data-testid={triggerTestid}
       tabindex={triggerTabindex}
+      disabled={triggerDisabled}
     >
       {@render renderTrigger()}
     </Bits.Trigger>

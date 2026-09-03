@@ -4280,7 +4280,10 @@ describe("App", () => {
     await waitFor(() =>
       expect(lastVisibilityWrite(null)).toBeGreaterThan(lastVisibilityWrite("p-a")),
     );
-    expect(screen.getByTestId("reading-mode-toggle")).toHaveAttribute("aria-pressed", "true");
+    const toggle = screen.getByTestId("reading-mode-toggle");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(toggle).toHaveClass("bg-warning-soft", "hover:bg-control-hover");
+    expect(toggle.querySelector("svg")).toHaveClass("text-warning");
     expect(screen.queryByTestId("compose-box")).toBeNull();
   });
 

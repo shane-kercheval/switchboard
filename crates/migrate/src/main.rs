@@ -34,11 +34,12 @@ BEHAVIOR:
     Attachment paths inside the migrated journals point at the target location
     permanently; the store must stay at the path it was written to.
 
-    Run this BEFORE launching the new app: the app rewrites workspace.yaml into
-    a shape that drops the legacy project cache, and (once running) may create
-    an empty store at the default target. If you have already launched it, a
-    copy of the old workspace.yaml (or --workspace-yaml pointing at a backup)
-    is the supported way to supply the directory list.";
+    Run this BEFORE using the new app: the first time it saves its view-state
+    (archiving a project) it rewrites workspace.yaml without the directory list
+    this tool reads, and (once running) it may create an empty store at the
+    default target. If that has already happened, a copy of the old
+    workspace.yaml (or --workspace-yaml pointing at a backup) is the supported
+    way to supply the directory list.";
 
 fn main() -> ExitCode {
     let mut workspace_yaml: Option<PathBuf> = None;

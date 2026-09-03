@@ -133,7 +133,7 @@ cargo run -p switchboard-migrate
 
 It reads the directory list from your existing configuration, copies each directory's projects into the new location, and prints a report. **It never modifies or deletes your originals**, so if the result looks wrong you can delete the new store and run it again. Directories that are unavailable (a deleted worktree, an unplugged disk) are reported and skipped.
 
-Run it **before** launching the new version, which rewrites the configuration file the tool reads.
+Run it **before** using the new version: the first time it saves its settings (archiving a project) it rewrites the configuration file without the directory list the tool reads.
 
 ## Agent CLI support and limitations
 

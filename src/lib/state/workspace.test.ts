@@ -46,8 +46,7 @@ function project(id: string, lastActivity: string): ProjectListing {
     name: `proj-${id.slice(-2)}`,
     created_at: "2026-05-16T00:00:00Z",
     directory: `/work/${id.slice(-2)}`,
-    directory_id: `dir:${`/work/${id.slice(-2)}`}`,
-    directory_status: "resolved_available",
+    directory_available: true,
     last_activity: lastActivity,
     archived: false,
   };
@@ -168,8 +167,8 @@ describe("workspace project activity", () => {
     ws.projects.list = [foreground, staleBackground];
     ws.recordProjectsActivityLocally([PROJECT_1], "2026-05-25T12:00:00.000Z");
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") {
-        return { directories: [], persistable: true };
+      if (cmd === "workspace_status") {
+        return { persistable: true };
       }
       if (cmd === "list_projects") {
         return [foreground, staleBackground];
@@ -193,8 +192,8 @@ describe("workspace project activity", () => {
     ws.projects.list = [foreground, background];
     ws.recordProjectsActivityLocally([PROJECT_1], "2026-05-25T12:00:00.000Z");
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") {
-        return { directories: [], persistable: true };
+      if (cmd === "workspace_status") {
+        return { persistable: true };
       }
       if (cmd === "list_projects") {
         return [foreground, fresherBackground];
@@ -227,8 +226,8 @@ describe("workspace project activity", () => {
     state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
     await tick();
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") {
-        return { directories: [], persistable: true };
+      if (cmd === "workspace_status") {
+        return { persistable: true };
       }
       if (cmd === "list_projects") {
         return [foreground, staleBackground];
@@ -1628,7 +1627,7 @@ describe("project idle predicate", () => {
     await tick();
 
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") return { directories: [], persistable: true };
+      if (cmd === "workspace_status") return { persistable: true };
       if (cmd === "list_projects") return [];
       return undefined;
     });
@@ -1687,8 +1686,8 @@ describe("project idle predicate", () => {
     observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
     await tick();
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") {
-        return { directories: [], persistable: true };
+      if (cmd === "workspace_status") {
+        return { persistable: true };
       }
       if (cmd === "list_projects") {
         return [];
@@ -1900,12 +1899,184 @@ describe("reading mode fallback", () => {
     reading.toggleReadingMode(PROJECT_1);
 
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "list_workspace_directories") return { directories: [], persistable: true };
+      if (cmd === "workspace_status") return { persistable: true };
       if (cmd === "list_projects") return [];
       return undefined;
     });
     await ws.deleteProject(PROJECT_1);
 
     expect(reading.isReadingMode(PROJECT_1)).toBe(false);
+  });
+});
+
+describe("workspace registry reads", () => {
+  /// `list_projects` answers in order from a queue of deferred reads, so a test
+  /// can release each read when it chooses and count how many were issued.
+  function deferredListReads(): {
+    release: (rows: ProjectListing[]) => void;
+    fail: (message: string) => void;
+    reads: () => number;
+  } {
+    const pending: { resolve: (rows: ProjectListing[]) => void; reject: (e: Error) => void }[] = [];
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "workspace_status") return { persistable: true };
+      if (cmd === "list_projects") {
+        return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+      }
+      if (cmd === "rename_project") {
+        return {
+          ...project(args?.projectId as string, "2026-05-16T00:00:00Z"),
+          name: args?.newName as string,
+        };
+      }
+      return undefined;
+    });
+    const take = () => {
+      const next = pending.shift();
+      if (next === undefined) throw new Error("no list read in flight");
+      return next;
+    };
+    return {
+      release: (rows) => take().resolve(rows),
+      fail: (message) => take().reject(new Error(message)),
+      reads: () => pending.length,
+    };
+  }
+
+  it("re-reads when a rename outran the list read, and the newer name stays", async () => {
+    const ws = await loadWorkspaceState();
+    const before = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    ws.projects.list = [before];
+    const backend = deferredListReads();
+
+    const read = ws.loadWorkspace();
+    await ws.renameProject(PROJECT_1, "renamed");
+    expect(ws.projects.list[0]?.name).toBe("renamed");
+
+    backend.release([before]);
+    await vi.waitFor(() => expect(backend.reads()).toBe(1));
+    expect(ws.projects.list[0]?.name).toBe("renamed");
+    backend.release([{ ...before, name: "renamed" }]);
+    await read;
+
+    expect(ws.projects.list[0]?.name).toBe("renamed");
+  });
+
+  it("fails rather than pretending, when mutations keep outrunning the read", async () => {
+    const ws = await loadWorkspaceState();
+    const before = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    ws.projects.list = [before];
+    const backend = deferredListReads();
+
+    const read = ws.loadWorkspace();
+    for (let i = 0; i < 3; i += 1) {
+      await ws.renameProject(PROJECT_1, `renamed-${i}`);
+      backend.release([before]);
+      if (i < 2) await vi.waitFor(() => expect(backend.reads()).toBe(1));
+    }
+
+    await expect(read).rejects.toThrow("kept changing");
+    expect(ws.projects.list[0]?.name).toBe("renamed-2");
+  });
+
+  it("gives a caller that arrives mid-read one more read, then resolves everyone", async () => {
+    const ws = await loadWorkspaceState();
+    const backend = deferredListReads();
+    const first = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    const second = project(PROJECT_2, "2026-05-17T00:00:00Z");
+
+    const early = ws.loadWorkspace();
+    await vi.waitFor(() => expect(backend.reads()).toBe(1));
+    const late = ws.refreshProjectRegistry();
+    let lateSettled = false;
+    void late.then(() => (lateSettled = true));
+
+    backend.release([first]);
+    // The first snapshot is applied (it is current), then the late caller's
+    // read is issued — a peer read never invalidates a snapshot.
+    await vi.waitFor(() => expect(backend.reads()).toBe(1));
+    expect(ws.projects.list.map((p) => p.id)).toEqual([PROJECT_1]);
+    expect(lateSettled).toBe(false);
+
+    backend.release([first, second]);
+    await Promise.all([early, late]);
+    expect(ws.projects.list.map((p) => p.id).sort()).toEqual([PROJECT_1, PROJECT_2].sort());
+  });
+
+  it("picks up a caller that lands between a read resolving and its apply", async () => {
+    // The interleaving the loader's no-await section exists for: the second
+    // call is made synchronously after the first read's promise resolves, so
+    // it runs before the loader's continuation.
+    const ws = await loadWorkspaceState();
+    const backend = deferredListReads();
+    const rows = [project(PROJECT_1, "2026-05-16T00:00:00Z")];
+
+    const early = ws.loadWorkspace();
+    await vi.waitFor(() => expect(backend.reads()).toBe(1));
+    backend.release(rows);
+    const late = ws.loadWorkspace();
+    expect(late).toBe(early);
+
+    await vi.waitFor(() => expect(backend.reads()).toBe(1));
+    backend.release(rows);
+    await late;
+    expect(ws.projects.list.map((p) => p.id)).toEqual([PROJECT_1]);
+  });
+
+  it("rejects every waiter when the shared read fails", async () => {
+    const ws = await loadWorkspaceState();
+    const backend = deferredListReads();
+
+    const early = ws.loadWorkspace();
+    await vi.waitFor(() => expect(backend.reads()).toBe(1));
+    const late = ws.loadWorkspace();
+    backend.fail("registry unreadable");
+
+    await expect(early).rejects.toThrow("registry unreadable");
+    await expect(late).rejects.toThrow("registry unreadable");
+    // The slot is released: a fresh read runs afterwards, and the background
+    // refresh swallows a failure rather than rejecting.
+    const retry = ws.refreshProjectRegistry();
+    await vi.waitFor(() => expect(backend.reads()).toBe(1));
+    backend.fail("still unreadable");
+    await expect(retry).resolves.toBeUndefined();
+    const recovered = ws.loadWorkspace();
+    await vi.waitFor(() => expect(backend.reads()).toBe(1));
+    backend.release([project(PROJECT_1, "2026-05-16T00:00:00Z")]);
+    await recovered;
+    expect(ws.projects.list.map((p) => p.id)).toEqual([PROJECT_1]);
+  });
+
+  it("abandons a read that a test reset left in flight", async () => {
+    const ws = await loadWorkspaceState();
+    const backend = deferredListReads();
+
+    const stale = ws.loadWorkspace();
+    await vi.waitFor(() => expect(backend.reads()).toBe(1));
+    ws._testing.reset();
+    backend.release([project(PROJECT_1, "2026-05-16T00:00:00Z")]);
+    await stale;
+
+    expect(ws.projects.list).toEqual([]);
+  });
+
+  it("coalesces overlapping background refreshes into one call", async () => {
+    const ws = await loadWorkspaceState();
+    const backend = deferredListReads();
+
+    const first = ws.refreshProjectRegistry();
+    const second = ws.refreshProjectRegistry();
+    expect(second).toBe(first);
+    await vi.waitFor(() => expect(backend.reads()).toBe(1));
+    backend.release([project(PROJECT_1, "2026-05-16T00:00:00Z")]);
+    await first;
+    expect(ws.projects.list.map((p) => p.id)).toEqual([PROJECT_1]);
+
+    const third = ws.refreshProjectRegistry();
+    expect(third).not.toBe(first);
+    await vi.waitFor(() => expect(backend.reads()).toBe(1));
+    backend.release([]);
+    await third;
+    expect(ws.projects.list).toEqual([]);
   });
 });

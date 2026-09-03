@@ -62,7 +62,6 @@ const openDialogMock = vi.fn(async (_options: unknown): Promise<string | null> =
 // --- stateful fake backend ---
 type Backend = {
   persistable: boolean;
-  dirs: Map<string, { available: boolean }>;
   projects: ProjectListing[];
   rosters: Map<string, AgentRecord[]>;
   conversations: Map<string, ProjectConversation>;
@@ -81,6 +80,7 @@ type Backend = {
   // resolving — lets a test hold the probe "pending" to exercise the
   // auto-create race guard (await a fresh probe before reading installed()).
   installGate: Promise<void> | null;
+  listProjectsGate: Promise<void> | null;
   // When set, `notify` parks on this gate. Lets a test hold a completion
   // notification "in flight" and check that nothing restores the project's
   // visibility to the gate while it is.
@@ -101,6 +101,7 @@ type Backend = {
   sendMessageId: string;
   loadConvoCalls: string[];
   failOpenFor: Map<string, unknown>;
+  failRelocateFor: Map<string, { message: string; applied: boolean }>;
   failDeleteFor: Map<string, string>;
   failConvoFor: Set<string>;
   failPickFor: Set<string>;
@@ -121,7 +122,6 @@ let agentSeq = 0;
 function freshBackend(): Backend {
   return {
     persistable: true,
-    dirs: new Map(),
     projects: [],
     rosters: new Map(),
     conversations: new Map(),
@@ -131,6 +131,7 @@ function freshBackend(): Backend {
     createAgentFailFor: new Set(),
     pathSource: "login_shell",
     installGate: null,
+    listProjectsGate: null,
     notifyGate: null,
     awaitPathGate: null,
     createAgentGate: null,
@@ -140,6 +141,7 @@ function freshBackend(): Backend {
     sendMessageId: "77777777-7777-7000-8000-777777777777",
     loadConvoCalls: [],
     failOpenFor: new Map(),
+    failRelocateFor: new Map(),
     failDeleteFor: new Map(),
     failConvoFor: new Set(),
     failPickFor: new Set(),
@@ -172,19 +174,34 @@ function summaryFor(id: string): ProjectSummary {
 
 const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
   switch (cmd) {
-    case "list_workspace_directories":
-      return {
-        directories: [...backend.dirs].map(([path, d]) => ({ path, available: d.available })),
-        persistable: backend.persistable,
-      };
+    case "set_project_directory": {
+      // Mirrors the real command: the project's row moves, and the next list
+      // read reports the new folder as available.
+      const projectId = args?.projectId as string;
+      const newPath = args?.newPath as string;
+      const failure = backend.failRelocateFor.get(projectId);
+      const row = backend.projects.find((p) => p.id === projectId);
+      if (row === undefined) throw new Error(`relocate of unknown project ${projectId}`);
+      if (failure?.applied !== true) {
+        if (failure !== undefined) throw new Error(failure.message);
+      }
+      row.directory = newPath;
+      row.directory_available = true;
+      backend.failOpenFor.delete(projectId);
+      // The backend's uncertain commit: the write landed, but its durability
+      // could not be confirmed, so it errors *after* the row moved.
+      if (failure?.applied === true) throw new Error(failure.message);
+      return null;
+    }
+    case "workspace_status":
+      return { persistable: backend.persistable };
     case "list_projects":
-      // Only projects in registered directories surface (matches the
-      // real backend: the workspace registry gates which projects are listed).
-      return backend.projects.filter((p) => p.directory !== null && backend.dirs.has(p.directory));
+      if (backend.listProjectsGate !== null) await backend.listProjectsGate;
+      return backend.projects;
     case "pick_directory": {
-      // Read-only probe: discovers projects on disk for the chosen folder
-      // WITHOUT registering it (no mutation of `backend.dirs`). Mirrors the real
-      // `pick_directory_impl` the preview step calls before "Add" commits.
+      // Read-only probe: lists the projects the store holds for the chosen
+      // folder. Mirrors the real `pick_directory_impl` the new-project form
+      // calls for duplicate-name validation.
       const path = args?.path as string;
       if (backend.failPickFor.has(path)) throw new Error("incompatible .switchboard/ version");
       const found = backend.projects.filter((p) => p.directory === path);
@@ -193,11 +210,6 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
         has_switchboard: found.length > 0,
         projects: found.map((p) => ({ id: p.id, name: p.name, created_at: p.created_at })),
       };
-    }
-    case "init_directory": {
-      const path = args?.path as string;
-      backend.dirs.set(path, { available: true });
-      return { path, has_switchboard: true, projects: [] };
     }
     case "delete_project": {
       const projectId = args?.projectId as string;
@@ -220,8 +232,7 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
         name: args?.name as string,
         created_at: "2026-05-20T00:00:00Z",
         directory: args?.directory as string,
-        directory_id: `dir:${args?.directory as string}`,
-        directory_status: "resolved_available",
+        directory_available: true,
         last_activity: "2026-05-20T00:00:00Z",
         archived: false,
       };
@@ -412,10 +423,7 @@ function listing(
   return {
     name: "alpha",
     created_at: "2026-05-20T00:00:00Z",
-    // Fixtures group by directory path, so deriving the opaque id from it keeps
-    // siblings siblings without hard-coding a UUID per directory.
-    directory_id: `dir:${over.directory}`,
-    directory_status: "resolved_available",
+    directory_available: true,
     last_activity: "2026-05-20T00:00:00Z",
     archived: false,
     ...over,
@@ -444,14 +452,12 @@ function seedProject(opts: {
   name?: string;
 }): void {
   const dir = opts.directory ?? DIR_A;
-  backend.dirs.set(dir, { available: opts.available ?? true });
   backend.projects.push(
     listing({
       id: opts.projectId,
       directory: dir,
       name: opts.name ?? "alpha",
-      directory_status:
-        (opts.available ?? true) ? "resolved_available" : "resolved_path_unavailable",
+      directory_available: opts.available ?? true,
       last_activity: opts.lastActivity ?? "2026-05-20T00:00:00Z",
     }),
   );
@@ -677,122 +683,6 @@ describe("App", () => {
   });
 
   // --- adding projects ---
-
-  it("add existing: opens an explanatory dialog before picking a folder (no immediate OS picker)", async () => {
-    await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
-
-    await fireEvent.click(screen.getByTestId("welcome-add-project"));
-    await waitFor(() => expect(screen.getByTestId("project-dialog")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("project-dialog-mode-existing"));
-    // The dialog explains what to select first; the OS folder picker has not
-    // been opened yet (it opens on "Choose folder…").
-    await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
-    expect(openDialogMock).not.toHaveBeenCalled();
-    // Add is disabled until a folder with projects has been previewed.
-    expect(screen.getByTestId("add-existing-add")).toBeDisabled();
-  });
-
-  it("add existing: choosing a folder previews the projects but does NOT add them until Add is pressed", async () => {
-    backend.projects.push(listing({ id: "p-x", directory: DIR_A, name: "existing-proj" }));
-    backend.rosters.set("p-x", []);
-    openDialogMock.mockResolvedValueOnce(DIR_A);
-    await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
-
-    await fireEvent.click(screen.getByTestId("welcome-add-project"));
-    await waitFor(() => expect(screen.getByTestId("project-dialog")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("project-dialog-mode-existing"));
-    await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
-
-    // The preview names the project and enables Add — but the read-only probe
-    // ran, not a commit: the directory is unregistered and nothing is in the
-    // flat list yet.
-    await waitFor(() => expect(screen.getByTestId("add-existing-found")).toBeInTheDocument());
-    expect(screen.getByTestId("add-existing-found")).toHaveTextContent("existing-proj");
-    expect(screen.getByTestId("add-existing-add")).toBeEnabled();
-    expect(invokeMock.mock.calls.some(([c]) => c === "pick_directory")).toBe(true);
-    expect(invokeMock.mock.calls.some(([c]) => c === "init_directory")).toBe(false);
-    expect(screen.queryByTestId("project-row")).not.toBeInTheDocument();
-
-    // Pressing Add commits: init_directory registers the folder, the dialog
-    // closes, and the project surfaces in the flat list.
-    await fireEvent.click(screen.getByTestId("add-existing-add"));
-    await waitFor(() =>
-      expect(
-        invokeMock.mock.calls.some(([c, a]) => c === "init_directory" && a?.path === DIR_A),
-      ).toBe(true),
-    );
-    await waitFor(() => expect(screen.queryByTestId("project-dialog")).not.toBeInTheDocument());
-    expect(screen.getByTestId("project-row")).toBeInTheDocument();
-  });
-
-  it("add existing: a folder with no projects shows a 'none found' warning, leaves Add disabled, and adds nothing", async () => {
-    // DIR_A has no projects on disk.
-    openDialogMock.mockResolvedValueOnce(DIR_A);
-    await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
-
-    await fireEvent.click(screen.getByTestId("welcome-add-project"));
-    await waitFor(() => expect(screen.getByTestId("project-dialog")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("project-dialog-mode-existing"));
-    await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
-
-    await waitFor(() => expect(screen.getByTestId("add-existing-none")).toBeInTheDocument());
-    expect(screen.queryByTestId("add-existing-found")).not.toBeInTheDocument();
-    // Nothing to add → Add stays disabled and the empty folder is never
-    // registered (no accidental `.switchboard/` init).
-    expect(screen.getByTestId("add-existing-add")).toBeDisabled();
-    expect(invokeMock.mock.calls.some(([c]) => c === "init_directory")).toBe(false);
-  });
-
-  it("add existing: a failed probe surfaces the error, disables Add, and registers nothing", async () => {
-    // e.g. an incompatible `.switchboard/` version — the read-only probe rejects.
-    backend.failPickFor.add(DIR_A);
-    openDialogMock.mockResolvedValueOnce(DIR_A);
-    await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
-
-    await fireEvent.click(screen.getByTestId("welcome-add-project"));
-    await waitFor(() => expect(screen.getByTestId("project-dialog")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("project-dialog-mode-existing"));
-    await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
-
-    await waitFor(() => expect(screen.getByTestId("add-existing-error")).toBeInTheDocument());
-    expect(screen.queryByTestId("add-existing-found")).not.toBeInTheDocument();
-    expect(screen.getByTestId("add-existing-add")).toBeDisabled();
-    expect(invokeMock.mock.calls.some(([c]) => c === "init_directory")).toBe(false);
-  });
-
-  it("add existing: a probe failure on a re-pick clears the prior preview (Add can't strand on the old folder)", async () => {
-    // First pick (DIR_A) previews a project; second pick (DIR_B) fails the probe.
-    backend.projects.push(listing({ id: "p-x", directory: DIR_A, name: "existing-proj" }));
-    backend.rosters.set("p-x", []);
-    backend.failPickFor.add(DIR_B);
-    openDialogMock.mockResolvedValueOnce(DIR_A).mockResolvedValueOnce(DIR_B);
-    await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
-
-    await fireEvent.click(screen.getByTestId("welcome-add-project"));
-    await waitFor(() => expect(screen.getByTestId("project-dialog")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("project-dialog-mode-existing"));
-    await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
-
-    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
-    await waitFor(() => expect(screen.getByTestId("add-existing-found")).toBeInTheDocument());
-    expect(screen.getByTestId("add-existing-add")).toBeEnabled();
-
-    // Re-pick a folder whose probe fails → the stale preview is gone and Add is
-    // disabled, so it can't silently commit the first folder.
-    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
-    await waitFor(() => expect(screen.getByTestId("add-existing-error")).toBeInTheDocument());
-    expect(screen.queryByTestId("add-existing-found")).not.toBeInTheDocument();
-    expect(screen.getByTestId("add-existing-add")).toBeDisabled();
-    expect(invokeMock.mock.calls.some(([c]) => c === "init_directory")).toBe(false);
-  });
 
   it("new project: choosing a folder + name creates the project, activates it, and auto-seeds an agent per auto-seed harness", async () => {
     await mountApp();
@@ -1153,7 +1043,6 @@ describe("App", () => {
 
   it("surfaces the not-persistable state distinctly from a fresh install", async () => {
     backend.persistable = false;
-    backend.dirs.set(DIR_A, { available: true });
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("not-persistable-banner")).toBeInTheDocument());
     // The distinguishing signal is the banner above the welcome surface — not a
@@ -1841,7 +1730,7 @@ describe("App", () => {
     });
     const lockedRow = backend.projects.find((project) => project.id === "p-a");
     if (lockedRow === undefined) throw new Error("expected seeded project");
-    lockedRow.directory_status = "resolved_path_unavailable";
+    lockedRow.directory_available = false;
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
 
@@ -1874,7 +1763,7 @@ describe("App", () => {
     seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
     const row = backend.projects.find((project) => project.id === "p-a");
     if (row === undefined) throw new Error("expected seeded project");
-    row.directory_status = "resolved_path_unavailable";
+    row.directory_available = false;
     backend.failOpenFor.set("p-a", { type: "other", message: "directory disappeared" });
     await mountApp();
 
@@ -4573,5 +4462,261 @@ describe("App", () => {
         /Also notify me about other projects/,
       ),
     );
+  });
+
+  describe("unavailable project directory", () => {
+    const ASSISTANT = agent({ id: "ag-1", project_id: "p-a", name: "assistant" });
+
+    async function openAlpha(): Promise<void> {
+      await mountApp();
+      await fireEvent.click(await screen.findByText("alpha"));
+      await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    }
+
+    it("gates sending behind a banner that names the missing folder", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      await openAlpha();
+
+      const banner = await screen.findByTestId("banner-project-directory-unavailable");
+      expect(banner).toHaveTextContent(`no longer exists at ${DIR_A}`);
+      expect(banner).toHaveTextContent("Put it back at that location");
+      expect(screen.getByTestId("banner-project-directory-unavailable-action")).toHaveTextContent(
+        "Locate folder…",
+      );
+
+      await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "hi" } });
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
+      await fireEvent.keyDown(screen.getByTestId("compose-textarea"), {
+        key: "Enter",
+        metaKey: true,
+      });
+      expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message")).toHaveLength(0);
+    });
+
+    it("locates the folder from the banner, lifting the gate and keeping the draft", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      await openAlpha();
+      await screen.findByTestId("banner-project-directory-unavailable");
+      await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "hi" } });
+
+      openDialogMock.mockResolvedValueOnce(DIR_B);
+      await fireEvent.click(screen.getByTestId("banner-project-directory-unavailable-action"));
+
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith("set_project_directory", {
+          projectId: "p-a",
+          newPath: DIR_B,
+        }),
+      );
+      await waitFor(() =>
+        expect(
+          screen.queryByTestId("banner-project-directory-unavailable"),
+        ).not.toBeInTheDocument(),
+      );
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe("hi");
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+      expect(screen.queryByTestId("project-unavailable")).not.toBeInTheDocument();
+    });
+
+    it("locates the folder from the sidebar row menu through the same flow", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      await mountApp();
+      await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+
+      openDialogMock.mockResolvedValueOnce(DIR_B);
+      await fireEvent.click(screen.getByTestId("project-actions-trigger"));
+      await fireEvent.click(await screen.findByTestId("project-action-locate"));
+
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith("set_project_directory", {
+          projectId: "p-a",
+          newPath: DIR_B,
+        }),
+      );
+      await waitFor(() => expect(screen.queryByTestId("project-unavailable")).toBeNull());
+    });
+
+    it("leaves everything alone when the folder picker is cancelled", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      await openAlpha();
+      await screen.findByTestId("banner-project-directory-unavailable");
+
+      openDialogMock.mockResolvedValueOnce(null);
+      await fireEvent.click(screen.getByTestId("banner-project-directory-unavailable-action"));
+      await waitFor(() => expect(openDialogMock).toHaveBeenCalled());
+
+      expect(invokeMock.mock.calls.some(([cmd]) => cmd === "set_project_directory")).toBe(false);
+      expect(screen.getByTestId("banner-project-directory-unavailable")).toBeInTheDocument();
+    });
+
+    it("reports a refused move verbatim and keeps the repair offered", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      backend.failRelocateFor.set("p-a", {
+        message: "a project named alpha already lives there",
+        applied: false,
+      });
+      await openAlpha();
+      await screen.findByTestId("banner-project-directory-unavailable");
+
+      openDialogMock.mockResolvedValueOnce(DIR_B);
+      await fireEvent.click(screen.getByTestId("banner-project-directory-unavailable-action"));
+
+      const failure = await screen.findByTestId("banner-project-relocate-failed-p-a");
+      expect(failure).toHaveTextContent("a project named alpha already lives there");
+      expect(screen.getByTestId("banner-project-directory-unavailable")).toBeInTheDocument();
+
+      await fireEvent.click(screen.getByTestId("banner-project-relocate-failed-p-a-dismiss"));
+      expect(screen.queryByTestId("banner-project-relocate-failed-p-a")).not.toBeInTheDocument();
+    });
+
+    it("shows the moved folder even when the backend could not confirm the write", async () => {
+      // The uncertain commit: the index write landed but its durability was not
+      // confirmed, so the command errors after the row moved. The list must be
+      // re-read anyway, or the app keeps gating a folder the backend already uses.
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      backend.failRelocateFor.set("p-a", {
+        message: "index written but not yet synced",
+        applied: true,
+      });
+      await openAlpha();
+      await screen.findByTestId("banner-project-directory-unavailable");
+
+      openDialogMock.mockResolvedValueOnce(DIR_B);
+      await fireEvent.click(screen.getByTestId("banner-project-directory-unavailable-action"));
+
+      await screen.findByTestId("banner-project-relocate-failed-p-a");
+      await waitFor(() =>
+        expect(
+          screen.queryByTestId("banner-project-directory-unavailable"),
+        ).not.toBeInTheDocument(),
+      );
+      await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "hi" } });
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it("re-opens a project that could not open until its folder was located", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      backend.failOpenFor.set("p-a", { type: "other", message: "working directory unreadable" });
+      await mountApp();
+      await fireEvent.click(await screen.findByText("alpha"));
+      await waitFor(() => expect(screen.getByTestId("activation-error")).toBeInTheDocument());
+
+      openDialogMock.mockResolvedValueOnce(DIR_B);
+      await fireEvent.click(screen.getByTestId("banner-project-directory-unavailable-action"));
+
+      await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+      expect(screen.queryByTestId("activation-error")).not.toBeInTheDocument();
+    });
+
+    it("still opens the sidebar at launch when a focus refresh overlaps the startup read", async () => {
+      // The startup read decides, once per session, whether to force the
+      // sidebar open. A focus event on launch starts a second read; the two
+      // must not cancel each other into an empty list.
+      seedProject({ projectId: "p-a", name: "alpha", agents: [ASSISTANT] });
+      const { layout } = await import("$lib/layout.svelte");
+      layout.projectsSidebarOpen = false;
+      let release: () => void = () => {};
+      backend.listProjectsGate = new Promise<void>((r) => (release = r));
+
+      await mountApp();
+      window.dispatchEvent(new Event("focus"));
+      await tick();
+      release();
+
+      await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+      expect(layout.projectsSidebarOpen).toBe(true);
+    });
+
+    it("clears the banner and the gate once a refresh sees the folder again", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", available: false, agents: [ASSISTANT] });
+      await openAlpha();
+      await screen.findByTestId("banner-project-directory-unavailable");
+      await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "hi" } });
+
+      const row = backend.projects.find((project) => project.id === "p-a");
+      if (row === undefined) throw new Error("expected seeded project");
+      row.directory_available = true;
+      window.dispatchEvent(new Event("focus"));
+
+      await waitFor(() =>
+        expect(
+          screen.queryByTestId("banner-project-directory-unavailable"),
+        ).not.toBeInTheDocument(),
+      );
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe("hi");
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it("notices a folder that vanished while the app was in the background, on window focus", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", agents: [ASSISTANT] });
+      await openAlpha();
+      expect(screen.queryByTestId("banner-project-directory-unavailable")).not.toBeInTheDocument();
+
+      const row = backend.projects.find((project) => project.id === "p-a");
+      if (row === undefined) throw new Error("expected seeded project");
+      row.directory_available = false;
+      window.dispatchEvent(new Event("focus"));
+
+      await screen.findByTestId("banner-project-directory-unavailable");
+      expect(screen.getByTestId("project-unavailable")).toBeInTheDocument();
+    });
+
+    it("re-checks on visibility change too, and only when becoming visible", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", agents: [ASSISTANT] });
+      await openAlpha();
+      const listsBefore = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_projects").length;
+      const row = backend.projects.find((project) => project.id === "p-a");
+      if (row === undefined) throw new Error("expected seeded project");
+      row.directory_available = false;
+
+      const original = Object.getOwnPropertyDescriptor(document, "visibilityState");
+      try {
+        Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+        document.dispatchEvent(new Event("visibilitychange"));
+        await tick();
+        expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "list_projects").length).toBe(
+          listsBefore,
+        );
+
+        Object.defineProperty(document, "visibilityState", {
+          value: "visible",
+          configurable: true,
+        });
+        document.dispatchEvent(new Event("visibilitychange"));
+        await screen.findByTestId("banner-project-directory-unavailable");
+      } finally {
+        if (original === undefined) {
+          delete (document as { visibilityState?: unknown }).visibilityState;
+        } else {
+          Object.defineProperty(document, "visibilityState", original);
+        }
+      }
+    });
+
+    it("re-checks when a send fails before its turn starts, without waiting for focus", async () => {
+      seedProject({ projectId: "p-a", name: "alpha", agents: [ASSISTANT] });
+      await openAlpha();
+      await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "hi" } });
+      await fireEvent.click(screen.getByTestId("compose-send"));
+      await waitFor(() =>
+        expect(invokeMock.mock.calls.some(([cmd]) => cmd === "send_message")).toBe(true),
+      );
+
+      // The folder went away under the app; the backend's answer is the
+      // truthful spawn failure, which is the signal the list is stale.
+      const row = backend.projects.find((project) => project.id === "p-a");
+      if (row === undefined) throw new Error("expected seeded project");
+      row.directory_available = false;
+      fireTo(`agent:${ASSISTANT.id}`, {
+        type: "message_failed",
+        message_id: backend.sendMessageId,
+        send_id: null,
+        agent_id: ASSISTANT.id,
+        error: `working directory no longer exists: ${DIR_A}`,
+        at: "2026-05-20T00:00:06Z",
+      });
+
+      await screen.findByTestId("banner-project-directory-unavailable");
+    });
   });
 });

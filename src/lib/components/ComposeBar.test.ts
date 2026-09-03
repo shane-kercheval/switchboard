@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
-import type { AgentRecord, NormalizedEvent, Prompt } from "$lib/types";
+import type { AgentRecord, NormalizedEvent, ProjectListing, Prompt } from "$lib/types";
 // Static import so the component-tree transform happens at module collection,
 // not inside the first test's timeout (cold CI transforms have no vite cache).
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
@@ -1148,8 +1148,7 @@ describe("ComposeBar", () => {
           name: "project",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/project",
-          directory_id: `dir:${"/work/project"}`,
-          directory_status: "resolved_available",
+          directory_available: true,
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -4348,8 +4347,7 @@ describe("ComposeBar prompt mode", () => {
           name: "here",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/here",
-          directory_id: `dir:${"/work/here"}`,
-          directory_status: "resolved_available",
+          directory_available: true,
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -4358,8 +4356,7 @@ describe("ComposeBar prompt mode", () => {
           name: "backend",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/backend",
-          directory_id: `dir:${"/work/backend"}`,
-          directory_status: "resolved_available",
+          directory_available: true,
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -4794,8 +4791,7 @@ describe("ComposeBar prompt mode", () => {
         name: "project",
         created_at: "2026-05-16T00:00:00Z",
         directory: "/work/project",
-        directory_id: `dir:${"/work/project"}`,
-        directory_status: "resolved_available",
+        directory_available: true,
         last_activity: "2026-05-16T00:00:00Z",
         archived: false,
       },
@@ -6432,8 +6428,7 @@ describe("ComposeBar — cross-agent forward", () => {
           name: "here",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/here",
-          directory_id: `dir:${"/work/here"}`,
-          directory_status: "resolved_available",
+          directory_available: true,
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -6442,8 +6437,7 @@ describe("ComposeBar — cross-agent forward", () => {
           name: "backend",
           created_at: "2026-05-16T00:00:00Z",
           directory: "/work/backend",
-          directory_id: `dir:${"/work/backend"}`,
-          directory_status: "resolved_available",
+          directory_available: true,
           last_activity: "2026-05-16T00:00:00Z",
           archived: false,
         },
@@ -8642,5 +8636,104 @@ describe("ComposeBar — auto reading mode", () => {
     await waitFor(async () => expect(await isReading()).toBe(false));
     // The composer is back for the retry.
     expect(screen.getByTestId("workflow-composer")).toBeInTheDocument();
+  });
+});
+
+describe("ComposeBar — unavailable project folder", () => {
+  const LISTING: ProjectListing = {
+    id: PROJECT_ID,
+    name: "project",
+    created_at: "2026-05-16T00:00:00Z",
+    directory: "/work/project",
+    directory_available: false,
+    last_activity: "2026-05-16T00:00:00Z",
+    archived: false,
+  };
+
+  it("refuses to send while the folder is unavailable, and recovers when it is back", async () => {
+    const state = await loadState();
+    const ws = await loadWorkspace();
+    await state.registerAgent(AGENT_A);
+    ws.projects.list = [LISTING];
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "hi" } });
+
+    const send = screen.getByTestId("compose-send") as HTMLButtonElement;
+    expect(send.disabled).toBe(true);
+    // The keyboard path shares the gate — a disabled button alone would not
+    // stop ⌘↩.
+    await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message")).toHaveLength(0);
+
+    ws.projects.list = [{ ...LISTING, directory_available: true }];
+    await tick();
+    expect(send.disabled).toBe(false);
+  });
+
+  it("is not gated for a project the list does not know", async () => {
+    const state = await loadState();
+    const ws = await loadWorkspace();
+    await state.registerAgent(AGENT_A);
+    ws.projects.list = [{ ...LISTING, id: "00000000-0000-7000-8000-00000000aaaa" }];
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "hi" } });
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
+describe("ComposeBar — unavailable project folder, fork shortcut", () => {
+  it("refuses ⇧⌘↵ with a reason instead of creating a fork agent that cannot run", async () => {
+    const state = await loadState();
+    const ws = await loadWorkspace();
+    await state.registerAgent(AGENT_A);
+    state.applyAgentHydrate(AGENT_A.id, {
+      turns: [
+        {
+          role: "agent",
+          turn_id: "disk-a",
+          agent_id: AGENT_A.id,
+          items: [{ item_kind: "text", kind: "text", text: "earlier reply" }],
+          status: "complete",
+          started_at: "2026-05-15T00:00:00Z",
+          ended_at: "2026-05-15T00:00:01Z",
+          hydration_key: "key-a",
+        },
+      ],
+    });
+    ws.projects.list = [
+      {
+        id: PROJECT_ID,
+        name: "project",
+        created_at: "2026-05-16T00:00:00Z",
+        directory: "/work/project",
+        directory_available: false,
+        last_activity: "2026-05-16T00:00:00Z",
+        archived: false,
+      },
+    ];
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "branch" } });
+    expect(screen.queryByTestId("compose-fork-send")).toBeNull();
+
+    await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
+
+    expect(await screen.findByTestId("compose-send-error")).toHaveTextContent(
+      "folder is unavailable, so nothing can be sent",
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith("fork_agent", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
+
+    // Positive control, so the absence above cannot pass vacuously: the same
+    // composer offers the fork half once the folder is back.
+    ws.projects.list = ws.projects.list.map((p) => ({
+      ...p,
+      directory_available: true,
+    }));
+    await waitFor(() => expect(screen.queryByTestId("compose-fork-send")).not.toBeNull());
   });
 });

@@ -12,8 +12,8 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
     AgentId, AgentProfile, AgentProfileSlot, AgentRecord, Attachment, CoreError, Directory,
-    DirectoryId, DirectoryResolution, HarnessKind, MessagePin, Project, ProjectEntry, ProjectId,
-    ProjectSummary, SelectionAxis, SendId, SessionLocator, normalize_selection,
+    HarnessKind, MessagePin, Project, ProjectEntry, ProjectId, ProjectSummary, SelectionAxis,
+    SendId, SessionLocator, normalize_selection,
 };
 use switchboard_dispatcher::{
     CancelOutcome, CurrentTurnWait, DispatchContextFactory, Dispatcher, EventEmitter, OnBusy,
@@ -33,7 +33,7 @@ use crate::error::AppError;
 use crate::preferences::{self, Preferences};
 use crate::state::{AppState, lock, persist_git_registry, persist_workspace};
 
-/// Returned by `init_directory_impl` — gives the caller everything it needs
+/// Returned by `pick_directory_impl` — gives the caller everything it needs
 /// to render the directory header (path) and project list in one round trip.
 ///
 /// No `has_switchboard`: nothing is created in the working directory any more,
@@ -43,36 +43,6 @@ use crate::state::{AppState, lock, persist_git_registry, persist_workspace};
 pub struct DirectoryInfo {
     pub path: String,
     pub projects: Vec<ProjectSummary>,
-}
-
-/// Why a project's working directory is or isn't usable — the shape the flat
-/// project list reports per row.
-///
-/// **Four states, not a boolean.** The three failures have different causes and
-/// different repairs, and this is the only place a human sees any of them:
-/// [`Self::ResolvedPathUnavailable`] is the ordinary moved-or-deleted checkout
-/// and [`Self::CatalogAmbiguous`] is corruption, both fixed by re-pointing the
-/// directory; [`Self::CatalogMissing`] has no in-app repair. Flattening them
-/// here would discard the distinction at the boundary and make recovering it a
-/// second backend-and-wire change later.
-///
-/// `#[non_exhaustive]` because it crosses IPC — the frontend's reducer degrades
-/// on an unknown discriminant rather than breaking.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum DirectoryStatus {
-    /// Catalogued and the path exists — the project can be dispatched into.
-    ResolvedAvailable,
-    /// Catalogued, but the path is gone (moved, deleted, unmounted). Repair is
-    /// re-pointing the directory at where the checkout lives now.
-    ResolvedPathUnavailable,
-    /// The project's `directory_id` has no catalog row. Corruption — the
-    /// catalog never deletes a row a project references.
-    CatalogMissing,
-    /// More than one catalog row claims the `directory_id`, so it resolves to no
-    /// single path. Repair is a re-point, which collapses the duplicates.
-    CatalogAmbiguous,
 }
 
 /// Insert an agent record into the id cache, refusing a cross-project claim.
@@ -281,7 +251,7 @@ pub(crate) fn project_generation(state: &AppState, project_id: ProjectId) -> u64
 /// was already inside from finishing. A send resolves its `Project` — including
 /// the working directory it will dispatch into — and then awaits, with nothing
 /// bounding how long: `ensure_materializing_fork_may_dispatch` waits on a reply
-/// from an actor that may itself be mid-turn. Re-draining after the catalog
+/// from an actor that may itself be mid-turn. Re-draining after the index
 /// write does not help, because a send suspended past the drain still enqueues
 /// its stale factory. Comparing generations does, however long it waited.
 ///
@@ -454,53 +424,11 @@ impl Drop for MaintenanceGuard<'_> {
 /// dispatch flag, not routable state, and an agent may legitimately emit its
 /// metadata *during* the drain, so snapshotting and restoring it would resurrect
 /// a flag that was correctly cleared.
-/// What a lifecycle operation is claiming.
-///
-/// **`Directory` exists so the claim's membership is derived under the same
-/// lock that marks it.** Delete knows its one project up front; a re-point
-/// claims *every* project sharing a directory identity, and that set has to be
-/// read from the index — a read that must not happen before the marks exist.
-///
-/// It did, and the gap was real: `repoint_project_directory_impl` listed the
-/// siblings, and only afterwards called this function, which takes
-/// `registry_write` itself. A `create_project` landing in between took that lock
-/// first, found no marks (none were set yet), and committed a sibling into
-/// `state.projects` carrying the pre-repoint path. Never marked, never evicted,
-/// absent from `loaded_before`, so the restore filtered it out — and with no
-/// mark and no generation bump it passed every dispatch gate, dispatching into
-/// the retired directory until the app restarted. Re-deriving the set later
-/// (which the code did, with a comment claiming it closed this) could not help:
-/// the project was already loaded and stale by then.
-///
-/// Deriving here closes it, and closes it *structurally* — a caller cannot
-/// reintroduce the gap without reintroducing the parameter.
-enum MaintenanceScope {
-    /// Exactly these projects (delete: one known id).
-    Projects(HashSet<ProjectId>),
-    /// Every project the index currently attributes to this directory identity.
-    Directory(DirectoryId),
-}
-
 fn begin_maintenance<'a>(
     state: &'a AppState,
-    scope: &MaintenanceScope,
+    projects: &HashSet<ProjectId>,
 ) -> Result<MaintenanceGuard<'a>, AppError> {
     let _write = lock(&state.registry_write);
-    // Under the guard, before any mark: a `Directory` claim's membership is
-    // whatever the index says *now*, and once marked it cannot change —
-    // `create_project` refuses while any sibling is marked, and a concurrent
-    // delete's own `begin_maintenance` refuses the overlapping claim.
-    let projects: HashSet<ProjectId> = match scope {
-        MaintenanceScope::Projects(ids) => ids.clone(),
-        MaintenanceScope::Directory(directory_id) => state
-            .store
-            .list_projects()?
-            .into_iter()
-            .filter(|entry| entry.directory_id == *directory_id)
-            .map(|entry| entry.id)
-            .collect(),
-    };
-    let projects = &projects;
     {
         let mut marks = lock(&state.maintenance);
         if let Some(busy) = projects.iter().find(|id| marks.contains(id)) {
@@ -577,12 +505,12 @@ fn activate_project(state: &AppState, project: Project) -> Result<(), AppError> 
 
 /// Reload projects from the store. Called only by [`MaintenanceGuard`].
 ///
-/// **Takes no path, and cannot be given one.** The reload resolves each
-/// project's working directory through the catalog itself, so it depends on
-/// neither the caller's pre-operation assumption nor the path the caller
-/// happened to observe. That is what makes the re-point's uncertain-commit
-/// guarantee structural: a signature with no path parameter cannot reload from a
-/// stale one, where a comment asking future editors not to could.
+/// **Takes no path, and cannot be given one.** The reload reads each project's
+/// working directory from the index itself, so it depends on neither the
+/// caller's pre-operation assumption nor the path the caller happened to
+/// observe. That is what makes the repair's uncertain-commit guarantee
+/// structural: a signature with no path parameter cannot reload from a stale
+/// one, where a comment asking future editors not to could.
 ///
 /// **Deliberately ungated**: it opens projects that are still marked, because it
 /// *is* the operation the mark protects. It calls `Store::open_project` rather
@@ -639,21 +567,13 @@ pub struct ProjectListing {
     pub id: ProjectId,
     pub name: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// The working directory's stable identity — an opaque id, present whatever
-    /// `directory_status` says.
-    ///
-    /// **This is what lets the frontend group siblings.** `directory` is `None`
-    /// for both corrupt states by construction, so grouping on it would treat
-    /// every damaged project as sharing one directory — which it did, making two
-    /// unrelated broken projects collide on name in the rename form. It is also
-    /// the only way to preview a repair's blast radius (every project carrying
-    /// this id moves), which the repair command requires the UI to show.
-    pub directory_id: DirectoryId,
-    /// The resolved working directory, or `None` when the `directory_id` has no
-    /// single catalog row (`CatalogMissing` / `CatalogAmbiguous`) — there is no
-    /// path to report, and inventing one would be the guess the store refuses.
-    pub directory: Option<String>,
-    pub directory_status: DirectoryStatus,
+    /// The working directory the project records — the agent spawn cwd.
+    /// Present whether or not it currently exists on disk.
+    pub directory: String,
+    /// Whether `directory` exists right now. A project whose checkout was
+    /// deleted or moved still lists, renames, archives, and deletes; only
+    /// dispatch needs the folder, and the frontend gates that on this flag.
+    pub directory_available: bool,
     /// Recency-ordering key for the flat project list: the later of the
     /// project's journal mtime and `created_at` (see
     /// [`switchboard_core::Store::project_last_activity`]). The journal lives
@@ -668,13 +588,8 @@ pub struct ProjectListing {
 
 /// Read-only inspection: canonicalize the path and list whatever projects the
 /// store already holds for it. **Does not** create anything, write anything, or
-/// modify `AppState` — the frontend uses this to show the appropriate
-/// post-folder-picker CTA before committing.
-///
-/// Takes `state` now, because the answer lives in the store rather than in the
-/// directory. A directory that isn't catalogued yet lists no projects, which is
-/// the same answer the old `.switchboard`-presence check gave, arrived at
-/// without inspecting the user's folder.
+/// modify `AppState` — the frontend uses this to warn about a name collision
+/// before committing a new project.
 pub fn pick_directory_impl(state: &AppState, path: &str) -> Result<DirectoryInfo, AppError> {
     let directory = Directory::at(Path::new(path))?;
     let projects = projects_in_directory(state, &directory.path)?;
@@ -685,27 +600,15 @@ pub fn pick_directory_impl(state: &AppState, path: &str) -> Result<DirectoryInfo
 }
 
 /// Every project the store holds for a canonical working-directory path.
-///
-/// Empty for a path with no catalog row — a directory the user has never
-/// created a project in is indistinguishable from one they have never added,
-/// and both correctly list nothing.
 fn projects_in_directory(
     state: &AppState,
     canonical: &Path,
 ) -> Result<Vec<ProjectSummary>, AppError> {
-    let Some(entry) = state
-        .store
-        .list_directories()?
-        .into_iter()
-        .find(|entry| entry.path == canonical)
-    else {
-        return Ok(Vec::new());
-    };
     Ok(state
         .store
         .list_projects()?
         .into_iter()
-        .filter(|project| project.directory_id == entry.directory_id)
+        .filter(|project| project.directory == canonical)
         .map(|project| ProjectSummary {
             id: project.id,
             name: project.name,
@@ -714,139 +617,44 @@ fn projects_in_directory(
         .collect())
 }
 
-/// Additive + idempotent: registers the directory in the store's catalog and
-/// adds it to the workspace list. **Writes nothing into the directory itself.**
-/// The directory is keyed by its
-/// **canonical** path (`Directory::at` canonicalizes), so two spellings of the
-/// same directory collapse to one entry. Re-initializing an already-loaded
-/// directory just refreshes the handle and its cached project snapshot — it
-/// never clears other directories or any shared map. Adding a *new* directory
-/// leaves every already-loaded directory's projects, locks, and caches intact.
-///
-/// Also registers the canonical path in the user-global workspace registry
-/// (`workspace.yaml`) and refreshes that directory's cached project snapshot.
-pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<DirectoryInfo, AppError> {
-    // Serialize against concurrent registry writes (create_project,
-    // register_agent). init_directory appends a catalog row, which is a
-    // read-modify-write of a store file.
-    let _write = lock(&state.registry_write);
-    let directory = Directory::at(Path::new(path))?;
-    let canonical = directory.path.clone();
-    // Register in the store catalog. Idempotent by canonical path, so re-adding
-    // a directory the user already works in returns its existing id rather than
-    // minting a second one — which would split that directory's projects across
-    // two identities and make a later re-point fix only half of them.
-    state.store.add_directory(&canonical)?;
-    let projects = projects_in_directory(state, &canonical)?;
-    let info = DirectoryInfo {
-        path: canonical.to_string_lossy().into_owned(),
-        projects: projects.clone(),
-    };
-
-    // Insert (or refresh) the handle. Re-init of an already-loaded canonical
-    // path replaces only its own handle — every other loaded directory and all
-    // shared maps are untouched (the additive contract).
-
-    // Register in the user-global workspace (ordering + hidden view-state; no
-    // project cache — the store index is the record). The registry compares
-    // paths as-given, so only ever feed it canonical paths (decision:
-    // "Directory identity is canonicalized at the boundary").
-    lock(&state.workspace).add(canonical.clone());
-    persist_workspace(state);
-
-    // One-directional Git-view auto-sync: if this directory lives in a git repo,
-    // track that repo's canonical root in the Git view. Adding a subdirectory or
-    // a linked worktree resolves to the same root and dedups. A non-git
-    // directory simply doesn't resolve — skipped, no error. `git_registry` is
-    // acquired here under the held `registry_write`, per the documented order.
-    if let Some(root) = switchboard_git::resolve_repo_root(&canonical) {
-        let mut git_registry = lock(&state.git_registry);
-        let added = !git_registry.contains(&root);
-        git_registry.add(root);
-        drop(git_registry);
-        if added {
-            persist_git_registry(state);
-        }
-    }
-
-    Ok(info)
-}
-
 /// Point a project's working directory at a new location — the repair for a
-/// moved or deleted checkout, a duplicated directory identity, or a lost one.
+/// moved or recreated checkout. **This project only**: a sibling that recorded
+/// the same old folder is untouched, and repaired on its own.
 ///
-/// # Why this takes a project id
-///
-/// The operation is on the *directory identity*, but the id is not something the
-/// user has: they are looking at a project row that says its folder is gone.
-/// Naming the directory by path would also fail in exactly the states worth
-/// repairing — neither a duplicated identity nor a lost one has a single path.
-/// So the caller names the project and the backend resolves the identity behind
-/// it.
-///
-/// **Every project sharing that identity moves**, not just the one named. That
-/// is the correct semantics — one folder holds them all — but it means the UI
-/// must say so before the user commits, which is what `ProjectListing`'s
-/// `directory_id` is for.
-///
-/// # Three states, two catalog operations
-///
-/// A resolvable or duplicated id is **re-pointed** (which collapses duplicates
-/// to one row). An id with no row at all is **bound**, restoring the mapping it
-/// lost. Binding does not mint an identity: the id already exists and is already
-/// referenced by these projects. Both refuse a path another identity holds.
-///
-/// # Lifecycle, not a catalog write
+/// # Lifecycle, not just an index write
 ///
 /// `Project.directory` is snapshotted at open and *is* the dispatch cwd, and a
 /// running actor owns its own frozen copy inside a
-/// `ProjectDispatchContextFactory`. So the projects are marked under maintenance
+/// `ProjectDispatchContextFactory`. So the project is marked under maintenance
 /// and evicted **before** the drain, not after: draining first leaves a window
 /// where a send resolves the stale `Project` and spawns a fresh actor on the old
-/// path, which then survives the repair. The maintenance mark closes the other
-/// half of that window — a user opening a *different* project in the same
-/// directory mid-repair would otherwise load it against the stale path.
+/// path, which then survives the repair.
 ///
-/// Project locks are deliberately **not** released. `instance.lock` lives under
-/// the store root beside the project's other metadata, so it does not move with
-/// the working directory; dropping and re-acquiring it would only open a window
-/// for another process. [`activate_project`] reuses the held handle.
+/// The project lock is deliberately **not** released. `instance.lock` lives
+/// under the store root beside the project's other metadata, so it does not
+/// move with the working directory; dropping and re-acquiring it would only
+/// open a window for another process. The restore reuses the held handle.
 ///
 /// # Uncertain commit
 ///
-/// [`switchboard_core::Store::repoint_directory`] can return `Err` with the new
-/// catalog already on disk (`write_jsonl` fsyncs the parent *after* the rename).
-/// So the catalog is re-read on **both** outcomes and state rebuilt from what it
-/// says. The write error still propagates: a failed parent-sync means the rename
-/// is *visible* but not *durable*, and reporting success would hide that — the
-/// user's retry is what actually establishes durability, not a wasted round
-/// trip. If the re-read also fails, the projects stay unloaded and dispatch
-/// refuses rather than running against a path nothing has confirmed.
-pub async fn repoint_project_directory_impl(
+/// [`switchboard_core::Store::set_project_directory`] can return `Err` with the
+/// new index already on disk (`write_jsonl` fsyncs the parent *after* the
+/// rename). So the project is reloaded from the store on **both** outcomes and
+/// state rebuilt from what the index says. The write error still propagates: a
+/// failed parent-sync means the change is *visible* but not *durable*, and
+/// reporting success would hide that — the user's retry is what actually
+/// establishes durability. If the reload also fails, the project stays unloaded
+/// and dispatch refuses rather than running against a path nothing has
+/// confirmed.
+pub async fn set_project_directory_impl(
     state: &AppState,
     project_id: ProjectId,
     new_path: &str,
 ) -> Result<(), AppError> {
-    let indexed = state.store.list_projects()?;
-    let directory_id = indexed
-        .iter()
-        .find(|entry| entry.id == project_id)
-        .ok_or(CoreError::ProjectNotFound(project_id))?
-        .directory_id;
-    // Resolve **before** evicting or draining anything, so an unrepairable state
-    // cannot tear down every agent in the directory on its way to a
-    // predetermined error.
-    let existing_paths = state.store.directory_paths(directory_id)?;
-
-    // **Claim by identity, not by a set read beforehand.** The membership is
-    // derived inside `begin_maintenance`'s own lock — see `MaintenanceScope` for
-    // the race that a pre-read set left open, and why re-deriving it afterwards
-    // could not close it.
-    let guard = begin_maintenance(state, &MaintenanceScope::Directory(directory_id))?;
-    let affected: Vec<ProjectId> = guard.marked.iter().copied().collect();
+    let guard = begin_maintenance(state, &HashSet::from([project_id]))?;
     wait_at_maintenance_barrier(state).await;
     let agent_ids = guard.evicted_agents.clone();
-    crate::workflow_commands::cancel_runs_for_projects(state, &affected).await;
+    crate::workflow_commands::cancel_runs_for_projects(state, &[project_id]).await;
     for agent_id in agent_ids {
         state
             .dispatcher
@@ -856,68 +664,20 @@ pub async fn repoint_project_directory_impl(
 
     // Synchronous from here — no `.await` while `registry_write` is held.
     let _write = lock(&state.registry_write);
-    // No re-derivation: the claim's membership was fixed under the mark and
-    // cannot have changed (`create_project` refuses while a sibling is marked;
-    // a concurrent delete's own claim would have been refused as overlapping).
-    let target = Path::new(new_path);
-    let write_result = if existing_paths.is_empty() {
-        state.store.bind_directory(directory_id, target).map(|_| ())
-    } else {
-        state
-            .store
-            .repoint_directory(directory_id, target)
-            .map(|_| ())
-    };
-    let observed = state.store.directory_path(directory_id);
-
-    if observed.is_ok() {
-        // `observed` is only consulted as a gate; the restore resolves each
-        // project's directory through the catalog itself (see `reload_projects`).
-        retire_and_register_directory(state, &existing_paths, &observed);
-        guard.finish_restored(&affected);
-    } else {
-        // No confirmed path. Leave them unloaded — but discarded, not marked, so
-        // dispatch refuses with `ProjectNotLoaded` and a retry is not blocked by
-        // this process's own held locks.
-        guard.finish_discarded();
-    }
-
-    // **The write error wins, deliberately.** When the rename lands and only the
-    // parent fsync fails, `observed` shows the new path and the state above is
-    // rebuilt correctly — so returning `Ok` looks tempting and is wrong: the
-    // change is *visible* but not *durable*, and suppressing that would weaken
-    // the crash-consistency posture to spare the user one retry. The retry is
-    // not wasted, either — it re-runs the write and its fsync, which is what
-    // actually establishes durability. A typed "applied, durability
-    // unconfirmed" outcome would say this better than an error does, but that is
-    // a wire variant and UI copy, so it waits for the milestone that owns them.
-    write_result?;
-    observed?;
-    Ok(())
+    let write_result = state
+        .store
+        .set_project_directory(project_id, Path::new(new_path))
+        .map(|_| ());
+    // The restore reads the index itself, so it rebuilds from whichever side of
+    // the write actually landed — never from `new_path` as an assumption.
+    guard.finish_restored(&[project_id]);
+    write_result.map_err(AppError::from)
 }
 
-/// Retire the directory identity's old paths and register the one it now holds,
-/// in the workspace registry and the loaded-directory map.
-///
-/// The workspace half is one atomic operation (`Workspace::replace_paths`)
-/// rather than orchestration here: the ordering assumption that broke it —
-/// treating the first *catalog* path as the one whose position should survive —
-/// crept in at this call site, so the choice belongs inside the registry that
-/// knows its own order.
-fn retire_and_register_directory(
-    state: &AppState,
-    old: &[PathBuf],
-    new: &Result<PathBuf, CoreError>,
-) {
-    let Ok(new) = new else { return };
-    lock(&state.workspace).replace_paths(old, new.clone());
-    persist_workspace(state);
-}
-
-/// *The* directory-identity chokepoint. Every command that resolves a working
-/// directory to its canonical key — `init_directory_impl`, `create_project_impl`,
-/// `repoint_project_directory_impl` — funnels through here so a directory is
-/// identified the same way however it is reached.
+/// *The* directory-identity chokepoint for paths that may no longer exist.
+/// Every command that resolves a working directory to its canonical key without
+/// requiring it to be on disk funnels through here, so a directory is identified
+/// the same way however it is reached.
 ///
 /// Canonicalizes via `std::fs::canonicalize` when the path exists on disk
 /// (matching `Directory::at`, which is how loaded directories were keyed), and
@@ -931,134 +691,45 @@ fn canonicalize_boundary(path: &str) -> PathBuf {
 /// Flat cross-directory project list — **one read of the store index**.
 ///
 /// Every project in the store lists, whatever state its working directory is
-/// in. That is the shape change the store makes possible: the index and each
-/// project's journal live under the store root, so nothing here depends on a
-/// working directory being mounted, readable, or even present. The old
-/// implementation had to iterate the workspace registry, read each directory's
-/// own index, classify the read error, and fall back to a cached snapshot when
-/// it failed — all of which existed because the record of what projects existed
-/// lived inside the directories themselves. None of it is needed now, and the
-/// cache it maintained is gone along with the bug where a stale snapshot
-/// resurrected a deleted project.
+/// in: the index and each project's journal live under the store root, so
+/// nothing here depends on a working directory being mounted, readable, or even
+/// present. Ordering is the index's; the frontend sorts by activity.
 ///
-/// **A damaged catalog row degrades one row, never the call.** `directory: None`
-/// with a `CatalogMissing` / `CatalogAmbiguous` status is how a broken project
-/// surfaces: visible, nameable, and repairable, rather than hidden behind a
-/// failed aggregation.
-///
-/// Ordering follows the workspace registry's directory order, then the store
-/// index within each directory; projects whose directory is unresolvable sort
-/// last, since there is no directory to place them under. Hidden directories are
-/// omitted — that is what hiding means — but their projects are *not* deleted,
-/// so unhiding restores them.
-///
-/// Returns `Result` because reading the index or catalog can fail; unlike the
-/// old version, that failure means the store itself is unreadable, which is not
-/// something to paper over with a cached list.
+/// Returns `Result` because reading the index can fail, and that failure means
+/// the store itself is unreadable, which is not something to paper over with a
+/// cached list.
 pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppError> {
-    let resolved = state.store.list_projects_resolved()?;
-
-    // Directory order from the workspace registry (insertion order). A project
-    // whose directory resolves to a path the registry doesn't list still
-    // appears — the store, not the registry, is the record of what exists.
-    let order: Vec<PathBuf> = {
-        let workspace = lock(&state.workspace);
-        workspace
-            .entries()
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect()
-    };
-    let rank = |path: Option<&Path>| -> usize {
-        path.and_then(|p| order.iter().position(|known| known == p))
-            .unwrap_or(order.len())
-    };
-
-    let mut listings: Vec<ProjectListing> = resolved
-        .iter()
-        .map(|row| {
-            let entry = row.entry();
-            let (directory, directory_status) = match row.directory() {
-                DirectoryResolution::Resolved(path) => {
-                    let status = if path.is_dir() {
-                        DirectoryStatus::ResolvedAvailable
-                    } else {
-                        DirectoryStatus::ResolvedPathUnavailable
-                    };
-                    (Some(path.to_string_lossy().into_owned()), status)
-                }
-                DirectoryResolution::Missing => (None, DirectoryStatus::CatalogMissing),
-                DirectoryResolution::Ambiguous => (None, DirectoryStatus::CatalogAmbiguous),
-            };
-            ProjectListing {
-                id: entry.id,
-                directory_id: entry.directory_id,
-                name: entry.name.clone(),
-                created_at: entry.created_at,
-                directory,
-                directory_status,
-                last_activity: state
-                    .store
-                    .project_last_activity(entry.id, entry.created_at),
-                archived: lock(&state.workspace).is_archived(entry.id),
-            }
+    let entries = state.store.list_projects()?;
+    let workspace = lock(&state.workspace);
+    Ok(entries
+        .into_iter()
+        .map(|entry| ProjectListing {
+            id: entry.id,
+            name: entry.name,
+            created_at: entry.created_at,
+            directory_available: entry.directory.is_dir(),
+            directory: entry.directory.to_string_lossy().into_owned(),
+            last_activity: state
+                .store
+                .project_last_activity(entry.id, entry.created_at),
+            archived: workspace.is_archived(entry.id),
         })
-        .collect();
-
-    listings.sort_by_key(|listing| rank(listing.directory.as_ref().map(Path::new)));
-    Ok(listings)
+        .collect())
 }
 
-/// One directory row for the workspace switcher.
+/// Whether user-global view-state (`workspace.yaml`) persists this session.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct WorkspaceDirectoryInfo {
-    pub path: String,
-    /// Whether the directory currently exists on disk. An unavailable
-    /// directory (unmounted/moved) still appears, so the user can see it and
-    /// re-point it.
-    pub available: bool,
-}
-
-/// The switcher's view of the workspace registry: every registered directory
-/// plus whether registry changes persist this session.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct WorkspaceDirectories {
-    pub directories: Vec<WorkspaceDirectoryInfo>,
+pub struct WorkspaceStatus {
     /// `false` when an existing `workspace.yaml` couldn't be read at startup
     /// (`workspace_path` left `None`). The UI surfaces this distinctly from a
     /// fresh install so a transient read error doesn't masquerade as a clean
-    /// slate and lure the user into re-adding directories that silently fail to
-    /// save (see [`crate::workspace::LoadOutcome`]).
+    /// slate and lure the user into archiving projects whose flag then silently
+    /// fails to save (see [`crate::workspace::LoadOutcome`]).
     pub persistable: bool,
 }
 
-/// Every registered workspace directory for the switcher — including ones with
-/// no projects yet (which `list_projects` omits) — plus the persistability
-/// signal. Distinct from `list_projects` (the flat project list); the switcher
-/// needs directory rows independent of project rows to render empty directories
-/// and the add/remove-directory affordances.
-pub fn list_workspace_directories_impl(state: &AppState) -> WorkspaceDirectories {
-    let entry_paths: Vec<PathBuf> = lock(&state.workspace)
-        .entries()
-        .iter()
-        .map(|e| e.path.clone())
-        .collect();
-    // Built after the lock is dropped: `is_dir` is a syscall per entry, and the
-    // workspace mutex is on the project-list read path.
-    let directories = entry_paths
-        .into_iter()
-        .map(|path| WorkspaceDirectoryInfo {
-            // A path check, not a loaded-handle check: under the store a
-            // directory is nothing but a path in the catalog, so "does it
-            // exist" is the whole question. The old version reported a
-            // directory unavailable whenever its handle hadn't been opened,
-            // which conflated "not mounted" with "not visited yet".
-            available: path.is_dir(),
-            path: path.to_string_lossy().into_owned(),
-        })
-        .collect();
-    WorkspaceDirectories {
-        directories,
+pub fn workspace_status_impl(state: &AppState) -> WorkspaceStatus {
+    WorkspaceStatus {
         persistable: state.workspace_path.is_some(),
     }
 }
@@ -1104,7 +775,7 @@ pub fn add_tracked_repo_impl(state: &AppState, path: &str) -> Result<(), AppErro
         }
     })?;
     // Serialize the registry mutation + its persistence under `registry_write`,
-    // the same gate the auto-sync hook in `init_directory_impl` uses, so two
+    // the same gate the auto-sync hook in `create_project_impl` uses, so two
     // concurrent registry writes can't interleave a stale snapshot over a newer
     // one on disk.
     let _write = lock(&state.registry_write);
@@ -1484,31 +1155,25 @@ fn worktree_paths(repo: &switchboard_git::RepoView) -> Vec<PathBuf> {
 /// by canonicalized `PathBuf` so it matches `RepoView` worktree paths regardless
 /// of spelling.
 ///
-/// Reads the store index and catalog once. The Git-view read is polled, so it
+/// Reads the store index once. The Git-view read is polled, so it
 /// must be side-effect-free — which this now is by construction: there is no
 /// cache to refresh and no `workspace.yaml` write, where the previous
 /// snapshot-based version existed specifically to avoid triggering one. A
 /// brand-new project links immediately, since the index is written before
 /// `create_project` returns.
 ///
-/// A project whose directory doesn't resolve is skipped: this maps repo paths to
-/// projects, and a row with no path belongs to no repo.
 fn project_links_by_path(state: &AppState) -> HashMap<PathBuf, Vec<LinkedProject>> {
     let mut map: HashMap<PathBuf, Vec<LinkedProject>> = HashMap::new();
-    let Ok(rows) = state.store.list_projects_resolved() else {
+    let Ok(rows) = state.store.list_projects() else {
         return map;
     };
     for row in rows {
-        let Some(path) = row.directory().path() else {
-            continue;
-        };
-        map.entry(path.to_path_buf())
-            .or_default()
-            .push(LinkedProject {
-                id: row.entry().id,
-                name: row.entry().name.clone(),
-                directory: path.to_string_lossy().into_owned(),
-            });
+        let directory = row.directory.to_string_lossy().into_owned();
+        map.entry(row.directory).or_default().push(LinkedProject {
+            id: row.id,
+            name: row.name,
+            directory,
+        });
     }
     map
 }
@@ -2283,44 +1948,28 @@ pub fn create_project_impl(
     directory_path: &str,
 ) -> Result<ProjectSummary, AppError> {
     // Serialize the uniqueness check + JSONL append against concurrent
-    // `create_project` / `register_agent` / `init_directory` calls. Without
-    // this, two concurrent IPC calls could both pass the canonical-name
-    // uniqueness check (which reads disk) and then both append colliding
-    // records (which write disk).
+    // `create_project` / `register_agent` calls. Without this, two concurrent
+    // IPC calls could both pass the canonical-name uniqueness check (which
+    // reads disk) and then both append colliding records (which write disk).
     let _write = lock(&state.registry_write);
-    let canonical = canonicalize_boundary(directory_path);
-    // The catalog answers "is this a directory we can create in": the store owns
-    // directory identity, and a project's owner is the `directory_id` it records.
-    let directory_id = state
-        .store
-        .list_directories()?
-        .into_iter()
-        .find(|entry| entry.path == canonical)
-        .map(|entry| entry.directory_id)
-        .ok_or(AppError::NoDirectory)?;
-    // A project created into a directory mid-repair would be born on the stale
-    // path. The identity, not a project id, is what's under repair, so the check
-    // is against any of its projects.
-    //
-    // One `?` read, not a fallible lookup per marked id: the previous version
-    // swallowed an index-read error into `None` and let the create through — a
-    // gate that opens when it cannot read, which is the opposite of what the
-    // mark is for.
-    let owners: HashMap<ProjectId, DirectoryId> = state
-        .store
-        .list_projects()?
-        .into_iter()
-        .map(|entry| (entry.id, entry.directory_id))
-        .collect();
-    if let Some(busy) = lock(&state.maintenance)
-        .iter()
-        .find(|id| owners.get(id) == Some(&directory_id))
-    {
-        // Names the real reason. `NoDirectory` told the user the folder did not
-        // exist when the truth was that it was mid-repair.
-        return Err(AppError::ProjectUnderMaintenance(*busy));
+    // The folder must exist to create a project in it; `Directory::at` is the
+    // identity boundary, so two spellings of one folder record the same path.
+    let directory = Directory::at(Path::new(directory_path))?;
+    let project = state.store.create_project(&directory.path, name)?;
+    // One-directional Git-view auto-sync: if the folder lives in a git repo,
+    // track that repo's canonical root in the Git view. A subdirectory or a
+    // linked worktree resolves to the same root and dedups; a non-git folder
+    // simply doesn't resolve. `git_registry` is acquired under the held
+    // `registry_write`, per the documented lock order.
+    if let Some(root) = switchboard_git::resolve_repo_root(&directory.path) {
+        let mut git_registry = lock(&state.git_registry);
+        let added = !git_registry.contains(&root);
+        git_registry.add(root);
+        drop(git_registry);
+        if added {
+            persist_git_registry(state);
+        }
     }
-    let project = state.store.create_project(directory_id, name)?;
     let summary = ProjectSummary {
         id: project.id,
         name: project.config.name.clone(),
@@ -2344,11 +1993,11 @@ pub fn create_project_impl(
 /// drain (contrast delete).
 ///
 /// **Needs no working directory.** Both files live under the store root, so a
-/// project whose directory is missing, ambiguous, or merely unmounted renames
-/// exactly like any other — nothing is resolved from the catalog to perform the
-/// write, and `ProjectNotLoaded` is not reachable here. The frontend need no
-/// longer gate Rename on availability; being able to name a broken project is
-/// part of being able to see and repair it.
+/// project whose directory is missing or merely unmounted renames exactly like
+/// any other — nothing on disk outside the store is touched, and
+/// `ProjectNotLoaded` is not reachable here. The frontend need not gate Rename
+/// on availability; being able to name a stranded project is part of being
+/// able to see and repair it.
 ///
 /// Format + per-directory uniqueness are re-validated in core; the frontend
 /// pre-checks, but the backend stays authoritative.
@@ -2365,32 +2014,10 @@ pub fn rename_project_impl(
         entry.name.clone_into(&mut project.config.name);
     }
 
-    // No workspace refresh — the flat list reads the index, which this just
-    // rewrote. Resolve the row's directory the same way `list_projects_impl`
-    // does so a rename can't report a status the list disagrees with.
-    let (directory, directory_status) = match state.store.directory_path(entry.directory_id) {
-        Ok(path) if path.is_dir() => (
-            Some(path.to_string_lossy().into_owned()),
-            DirectoryStatus::ResolvedAvailable,
-        ),
-        Ok(path) => (
-            Some(path.to_string_lossy().into_owned()),
-            DirectoryStatus::ResolvedPathUnavailable,
-        ),
-        Err(CoreError::AmbiguousDirectory(_)) => (None, DirectoryStatus::CatalogAmbiguous),
-        Err(CoreError::DirectoryNotFound(_)) => (None, DirectoryStatus::CatalogMissing),
-        // Match only the two resolution failures. A blanket arm reported a
-        // missing catalog file, a permission error, and a corrupt line as "this
-        // one row is dangling" — pointing the user at a repair that cannot help,
-        // while `list_projects_impl` correctly fails the whole read on the same
-        // conditions.
-        Err(other) => return Err(other.into()),
-    };
     let archived = lock(&state.workspace).is_archived(entry.id);
     Ok(ProjectListing {
-        directory,
-        directory_id: entry.directory_id,
-        directory_status,
+        directory_available: entry.directory.is_dir(),
+        directory: entry.directory.to_string_lossy().into_owned(),
         last_activity: state
             .store
             .project_last_activity(entry.id, entry.created_at),
@@ -2539,8 +2166,8 @@ pub fn migrate_message_pin_impl(
 /// and refresh the workspace cache.
 ///
 /// **Error policy (engineer-approved).** "Already gone" is benign success:
-/// - the project isn't resolvable in any loaded directory (`ProjectNotLoaded`
-///   the catalog has no row for its `directory_id`) → nothing on disk we can reach;
+/// - the project isn't loaded (`ProjectNotLoaded`) → nothing in memory to
+///   drain, and the store delete is what removes it from disk;
 /// - the directory's index file vanished out-of-band (`MissingAppendOnlyFile`)
 ///   → the entry is effectively gone.
 ///
@@ -2560,8 +2187,7 @@ pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Res
     // a fresh actor for a project being deleted, and a racing open loads it back
     // in. Marking it under maintenance closes both; the mark is cleared on every
     // exit below.
-    let scope = MaintenanceScope::Projects(std::iter::once(project_id).collect());
-    let guard = begin_maintenance(state, &scope)?;
+    let guard = begin_maintenance(state, &HashSet::from([project_id]))?;
     let agent_ids = guard.evicted_agents.clone();
 
     // Cancel this project's workflow runs and let them settle to `cancelled`
@@ -2591,7 +2217,7 @@ pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Res
 
     // **An `Err` does not prove nothing was removed.** `write_jsonl` fsyncs the
     // parent *after* its rename, so the index row can already be gone when the
-    // call fails — the same contract `repoint_project_directory_impl` documents,
+    // call fails — the same contract `set_project_directory_impl` documents,
     // and the reason this used to be wrong: it assumed `Err` meant the project
     // was untouched, kept the lock and every agent live, and left the user
     // dispatching into a project that would vanish at restart.
@@ -3261,21 +2887,16 @@ pub fn attach_agent_impl(
         .get(&active)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(active))?;
-    // The active project's index row, for its `directory_id`. The row is also
-    // the **eligibility check on the target**: attaching mutates this project
-    // and the agent must be dispatchable afterwards, so a target whose own
-    // directory is missing or ambiguous is refused here with the error naming
-    // the repair. Deliberately scoped to the target — an *unrelated* project's
-    // damaged catalog row must not block this attach, which is why the
-    // collision scans below never consult the catalog at all.
+    // The active project's index row, for its working directory: the session
+    // file to attach lives under the harness's per-cwd tree, and the Claude
+    // collision scan is scoped to the projects sharing that folder.
     let entry = state
         .store
         .list_projects()?
         .into_iter()
         .find(|e| e.id == active)
         .ok_or(AppError::ProjectNotLoaded(active))?;
-    let directory_path = state.store.directory_path(entry.directory_id)?;
-    let directory_id = entry.directory_id;
+    let directory_path = entry.directory.clone();
 
     // Claude/Antigravity identify a session by a UUID, parsed per-arm
     // below. Codex's thread-id is an arbitrary string (not guaranteed a UUID),
@@ -3295,7 +2916,7 @@ pub fn attach_agent_impl(
                     expected_path: expected.to_string_lossy().into_owned(),
                 });
             }
-            check_claude_session_id_unique(state, directory_id, &session_uuid)?;
+            check_claude_session_id_unique(state, &directory_path, &session_uuid)?;
             project.register_attached_claude_agent(name, session_uuid, model, effort)?
         }
         HarnessKind::Codex => {
@@ -3410,12 +3031,10 @@ fn locator_uuid(agent: &AgentRecord) -> Option<Uuid> {
 /// Every project in the store, as index rows — the input every session-id
 /// collision scan works from.
 ///
-/// **Index only, never `list_projects_resolved`.** The scans need a registry
-/// and a display name; both come from the store root, so reading the catalog
-/// here would make a single damaged directory row fail every attach store-wide
-/// while adding nothing. Directory *identity* still scopes the Claude scan, but
-/// via `entry.directory_id`, which is on every index row whether or not it
-/// resolves to a path.
+/// **Index only, never an opened `Project`.** The scans need a registry and a
+/// display name; both come from the store root, so nothing here depends on a
+/// working directory being present. The Claude scan is scoped by the path each
+/// index row records, whether or not that folder currently exists.
 fn indexed_projects(state: &AppState) -> Result<Vec<ProjectEntry>, AppError> {
     state.store.list_projects().map_err(AppError::from)
 }
@@ -3442,18 +3061,18 @@ fn session_collision(entry: &ProjectEntry, agent: AgentRecord) -> AppError {
 /// are cwd-namespaced: the same id under a different cwd is a distinct session,
 /// so a widened scan would false-reject a legitimately-distinct one.
 ///
-/// Scoped by `directory_id`, not by path. Directory identity *is* the id — that
-/// is the catalog's premise — and an index row carries it whether or not it
-/// resolves, so a damaged catalog row can't silently narrow this scan.
+/// Scoped by the canonical path each index row records, whether or not that
+/// folder currently exists — a deleted checkout's projects still hold their
+/// sessions, and a re-created one must not collide with them.
 ///
 /// Held under `registry_write` so it's atomic with the subsequent register.
 fn check_claude_session_id_unique(
     state: &AppState,
-    directory_id: DirectoryId,
+    directory: &Path,
     candidate: &Uuid,
 ) -> Result<(), AppError> {
     for entry in indexed_projects(state)? {
-        if entry.directory_id != directory_id {
+        if entry.directory != directory {
             continue;
         }
         for agent in state.store.read_project_registry(&entry)? {
@@ -3574,10 +3193,8 @@ pub fn list_agents_impl(
 /// invite a caller to think the directory is authoritative for this read.
 /// `Store::list_project_agents` confirms the id is in the index — so a bogus id
 /// is still `ProjectNotFound`, the guarantee the old owner-validation gave —
-/// while dropping the cwd requirement. That last part is a **behavior change**:
-/// a project whose catalog row is damaged previously couldn't list its roster,
-/// because resolving the owner was part of the read. Browsing a roster genuinely
-/// needs no working directory, so it now succeeds.
+/// while dropping the cwd requirement. Browsing a roster genuinely needs no
+/// working directory, so a project whose folder is gone can still be browsed.
 ///
 /// Errors are the caller's to render per row (an unreadable registry is an
 /// unpickable entry, not a thrown hover), so they propagate rather than
@@ -7117,7 +6734,7 @@ fn open_project_from_store(state: &AppState, project_id: ProjectId) -> Result<Pr
     // Gated: this is the fallback ordinary reads take when a project isn't
     // loaded, which is exactly what a lifecycle operation makes true. Two of its
     // callers resolve harness session files through `project.directory`, so
-    // during a re-point they would read whichever side of the catalog write they
+    // during a repair they would read whichever side of the index write they
     // happened to catch. Gating all of them — including the two that only touch
     // the store-relative attachments dir — costs a retry on a transiently
     // refused read, and buys not having to re-derive which callers are safe
@@ -7202,54 +6819,79 @@ mod tests {
     use switchboard_harness::{ClaudeCodeAdapter, HarnessAdapter, MockHarnessAdapter};
     use tempfile::TempDir;
 
-    /// Test convenience: create a project in the sole loaded directory. Most
-    /// tests load exactly one directory, so this keeps their call sites terse
-    /// while the production API requires an explicit directory path.
-    /// Overwrite the store's directory catalog. Staging a damaged catalog is the
-    /// only way to reach the degradation paths; `Store` has no API that produces
-    /// one, by design.
-    fn write_catalog(state: &AppState, entries: &[switchboard_core::DirectoryEntry]) {
+    /// The working directories a test has registered per store, so
+    /// `create_project_in_only_dir` can keep the terse call shape most tests use.
+    /// Test scaffolding only: production has no notion of a registered
+    /// directory — a project simply records the folder it was created in.
+    static TEST_DIRECTORIES: std::sync::Mutex<Option<HashMap<PathBuf, Vec<PathBuf>>>> =
+        std::sync::Mutex::new(None);
+
+    /// Register `path` as a working directory for `state`'s store (canonicalized;
+    /// it must exist). Returns what the store currently holds for it.
+    fn register_test_directory(state: &AppState, path: &str) -> DirectoryInfo {
+        let directory = Directory::at(Path::new(path)).unwrap();
+        let mut registry = TEST_DIRECTORIES.lock().unwrap();
+        let dirs = registry
+            .get_or_insert_with(HashMap::new)
+            .entry(state.store.root().to_path_buf())
+            .or_default();
+        if !dirs.contains(&directory.path) {
+            dirs.push(directory.path.clone());
+        }
+        DirectoryInfo {
+            projects: projects_in_directory(state, &directory.path).unwrap(),
+            path: directory.path.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Rewrite the sole project's recorded directory to `path`, without
+    /// requiring the path to exist.
+    ///
+    /// `set_project_directory` canonicalizes, so it can't target a directory
+    /// that is already gone — but "recorded path no longer on disk" is exactly
+    /// the state several tests need. Writing the index directly is the only way
+    /// to stage it.
+    fn set_only_project_directory_unchecked(state: &AppState, path: &Path) {
+        let mut entries = state.store.list_projects().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "set_only_project_directory_unchecked expects one project"
+        );
+        entries[0].directory = path.to_path_buf();
         let mut lines = String::new();
-        for entry in entries {
+        for entry in &entries {
             lines.push_str(&serde_json::to_string(entry).unwrap());
             lines.push('\n');
         }
-        std::fs::write(state.store.root().join("directories.jsonl"), lines).unwrap();
+        std::fs::write(state.store.root().join("projects.jsonl"), lines).unwrap();
     }
 
-    /// Point the store's single catalog row at `path`, without requiring the
-    /// path to exist.
-    ///
-    /// `repoint_directory` canonicalizes, so it can't target a directory that is
-    /// already gone — but "catalogued path no longer on disk" is exactly the
-    /// state several tests need. Writing the catalog directly is the only way to
-    /// stage it.
-    fn repoint_only_directory(state: &AppState, path: &Path) {
-        let mut entries = state.store.list_directories().unwrap();
-        assert_eq!(entries.len(), 1, "repoint_only_directory expects one row");
-        entries[0].path = path.to_path_buf();
-        write_catalog(state, &entries);
-    }
-
-    /// A state with one catalogued directory and one project in it.
-    async fn state_with_project(name: &str) -> (AppState, TempDir, ProjectSummary) {
+    /// A state with one registered directory and one project in it.
+    fn state_with_project(name: &str) -> (AppState, TempDir, ProjectSummary) {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, name);
         (state, tmp, project)
     }
 
+    /// Test convenience: create a project in the sole registered directory. Most
+    /// tests register exactly one, so this keeps their call sites terse while the
+    /// production API requires an explicit directory path.
     fn create_project_in_only_dir(state: &AppState, name: &str) -> ProjectSummary {
         let path = {
-            let catalog = state.store.list_directories().unwrap();
+            let registry = TEST_DIRECTORIES.lock().unwrap();
+            let dirs = registry
+                .as_ref()
+                .and_then(|map| map.get(state.store.root()))
+                .cloned()
+                .unwrap_or_default();
             assert_eq!(
-                catalog.len(),
+                dirs.len(),
                 1,
-                "create_project_in_only_dir requires exactly one catalogued directory"
+                "create_project_in_only_dir requires exactly one registered directory"
             );
-            catalog[0].path.to_string_lossy().into_owned()
+            dirs[0].to_string_lossy().into_owned()
         };
         create_project_impl(state, name, &path).unwrap()
     }
@@ -7257,9 +6899,7 @@ mod tests {
     #[tokio::test]
     async fn search_project_files_honors_gitignore_and_includes_hidden_files() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
 
         std::fs::write(tmp.path().join(".gitignore"), "ignored.log\nignored-dir/\n").unwrap();
@@ -7303,9 +6943,7 @@ mod tests {
     #[tokio::test]
     async fn search_project_files_ranks_filename_matches_over_directory_matches() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
 
         // "crates" sorts alphabetically before "docs", so a naive
@@ -7347,9 +6985,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (tmp, state, _emitter) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
 
         std::fs::create_dir_all(tmp.path().join("locked")).unwrap();
@@ -7407,15 +7043,19 @@ mod tests {
             Arc::clone(&mock),
             emitter.clone() as Arc<dyn EventEmitter>,
         );
+        // A temp store root can be reused after an earlier test's is deleted;
+        // start every state with no registered directories so the "exactly
+        // one" helpers can't inherit a stale entry.
+        if let Some(map) = TEST_DIRECTORIES.lock().unwrap().as_mut() {
+            map.remove(state.store.root());
+        }
         (tmp, state, emitter)
     }
 
     #[tokio::test]
     async fn message_pins_persist_idempotently_without_message_content() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
 
         assert!(
@@ -7450,9 +7090,7 @@ mod tests {
     #[tokio::test]
     async fn message_pin_identity_migrates_atomically_and_preserves_timestamp() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
 
         let original = set_message_pin_impl(&state, project.id, "agent:send:one:alice", true)
@@ -7478,9 +7116,7 @@ mod tests {
     #[tokio::test]
     async fn message_pin_removal_deletes_all_identity_keys_atomically() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
         set_message_pin_impl(&state, project.id, "agent:send:one:alice", true).unwrap();
         set_message_pin_impl(
@@ -7567,10 +7203,8 @@ mod tests {
 
     /// Stand up a directory + project + Claude agent and return the agent and
     /// its project id. Shared setup for the cancellation/lifecycle tests.
-    async fn project_with_agent(state: &AppState, tmp: &TempDir) -> (AgentRecord, ProjectId) {
-        init_directory_impl(state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+    fn project_with_agent(state: &AppState, tmp: &TempDir) -> (AgentRecord, ProjectId) {
+        register_test_directory(state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(state, "proj");
         set_active_project_impl(state, project.id).unwrap();
         let agent =
@@ -7733,7 +7367,7 @@ mod tests {
     async fn fork_agent_branches_a_claude_agent_with_a_session() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_other, project_id) = project_with_agent(&state, &tmp).await;
+        let (_other, project_id) = project_with_agent(&state, &tmp);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let source = lock(&state.agents_by_id).get(&source_id).cloned().unwrap();
 
@@ -7761,7 +7395,7 @@ mod tests {
         // no file, and forking it would produce an unmaterializable branch.
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, _project_id) = project_with_agent(&state, &tmp);
 
         let err = fork_agent_impl(&state, agent.id, home.path())
             .await
@@ -7777,7 +7411,7 @@ mod tests {
     async fn fork_agent_rejects_a_non_claude_source() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_other, _project_id) = project_with_agent(&state, &tmp).await;
+        let (_other, _project_id) = project_with_agent(&state, &tmp);
         let codex = create_agent_impl(&state, "cx", HarnessKind::Codex, None, None).unwrap();
 
         let err = fork_agent_impl(&state, codex.id, home.path())
@@ -7799,7 +7433,7 @@ mod tests {
     async fn fork_agent_rejects_an_unknown_agent() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_other, _project_id) = project_with_agent(&state, &tmp).await;
+        let (_other, _project_id) = project_with_agent(&state, &tmp);
         let missing = Uuid::now_v7();
 
         let err = fork_agent_impl(&state, missing, home.path())
@@ -7816,7 +7450,7 @@ mod tests {
     /// test can hold an agent mid-turn and observe the fork gate. Mirrors
     /// `forward_queue_fixture`'s construction (the adapter is chosen at
     /// `AppState::new`, so it cannot be swapped in later).
-    async fn state_with_parked_claude(
+    fn state_with_parked_claude(
         texts: &[&str],
     ) -> (
         TempDir,
@@ -7835,9 +7469,7 @@ mod tests {
             Arc::new(RecordingEmitter::new()) as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         (tmp, TempDir::new().unwrap(), state, gate, project.id)
@@ -7863,7 +7495,7 @@ mod tests {
         // branch they didn't get to use plus an error. This check is why that
         // doesn't happen, so it needs its own test: nothing else fails if it's
         // deleted.
-        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let before = lock(&state.agents_by_id).len();
 
@@ -7890,7 +7522,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_resume_requires_switchboard_to_be_idle() {
-        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
 
         let argv = resume_agent_in_terminal_impl(&state, source_id, home.path())
@@ -7923,9 +7555,7 @@ mod tests {
         // agent outside it.
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let source_project = create_project_in_only_dir(&state, "source-proj");
         set_active_project_impl(&state, source_project.id).unwrap();
         let source_id = seed_source(&state, home.path(), source_project.id, "alice", "hello");
@@ -7961,7 +7591,7 @@ mod tests {
         // real answer (harness-behavior §3.5), so the dispatch is refused —
         // not queued, which would hand the branch the answer to the very turn
         // the user is branching away from.
-        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let fork = fork_agent_impl(&state, source_id, home.path())
             .await
@@ -7991,7 +7621,7 @@ mod tests {
         // inside the code path blocking it from answering — a deadlock that no
         // cancel can reach. The timeout is the assertion: without the guard this
         // hangs forever rather than failing.
-        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]);
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let mut agent = lock(&state.agents_by_id).get(&agent_id).cloned().unwrap();
         // Point the agent's fork provenance at its own session.
@@ -8087,9 +7717,7 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         let home = TempDir::new().unwrap();
@@ -8242,7 +7870,7 @@ mod tests {
         // refuses on the same policy as the command boundary. The dispatcher's
         // side of the wiring — that a refusal actually stops the turn — is
         // pinned in `switchboard-dispatcher`.
-        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let fork = fork_agent_impl(&state, source_id, home.path())
             .await
@@ -8266,7 +7894,7 @@ mod tests {
     /// As [`state_for_permit_release`], but the parked dispatch stays alive
     /// through a teardown grace after cancellation — the window where the harness
     /// is dying and the session lock must still be held.
-    async fn state_for_cancellation_teardown() -> (
+    fn state_for_cancellation_teardown() -> (
         TempDir,
         TempDir,
         AppState,
@@ -8296,9 +7924,7 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         (
@@ -8322,7 +7948,7 @@ mod tests {
     /// scheduling. Relying on the acquisition's own 155 ms retry to paper over
     /// that gap would be worse: the test would pass for a reason unrelated to
     /// what it claims to check.
-    async fn state_for_permit_release(
+    fn state_for_permit_release(
         texts: &[&str],
         fail_at: &[usize],
     ) -> (
@@ -8349,9 +7975,7 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         (
@@ -8406,7 +8030,7 @@ mod tests {
         // seam takes the already-read `Project`, so the one refactor that would
         // quietly weaken this test again — moving the pause back above the
         // project read — does not compile.
-        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let before = project_generation(&state, project_id);
 
@@ -8450,11 +8074,7 @@ mod tests {
         let maintenance_state = Arc::clone(&state);
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
         let maintenance = tokio::task::spawn_blocking(move || {
-            begin_maintenance(
-                &maintenance_state,
-                &MaintenanceScope::Projects(scope.clone()),
-            )
-            .is_ok()
+            begin_maintenance(&maintenance_state, &scope).is_ok()
         });
 
         // Release before asserting, always. A `spawn_blocking` task cannot be
@@ -8489,7 +8109,7 @@ mod tests {
         // it the right one. That property lives in
         // `a_lifecycle_operation_cannot_interleave_a_dispatch_capture`, which is
         // the test that can see it.
-        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let captured = project_generation(&state, project_id);
 
@@ -8523,7 +8143,7 @@ mod tests {
         // The locator is swapped after `build` to force the disagreement. A
         // mid-turn capture by the locator sink, or an attach, writes that cache
         // the same way.
-        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let factory = factory_for(&state, project_id, agent_id, home.path());
         let context = factory.build(SendId::now_v7());
@@ -8581,8 +8201,7 @@ mod tests {
         // `TERMINATE_GRACE`, SIGKILL) before its stream ends. The harness is alive
         // for that whole grace and may still be writing its session file, so the
         // lock has to outlive the cancel *request*, not end with it.
-        let (_tmp, home, state, emitter, teardown, project_id) =
-            state_for_cancellation_teardown().await;
+        let (_tmp, home, state, emitter, teardown, project_id) = state_for_cancellation_teardown();
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let key = own_session_key(&state, project_id, agent_id);
         send_msg_with_home(&state, agent_id, "go", home.path())
@@ -8625,7 +8244,7 @@ mod tests {
     #[tokio::test]
     async fn a_completed_turn_releases_its_session_lock() {
         let (_tmp, home, state, emitter, gate, project_id) =
-            state_for_permit_release(&["done"], &[]).await;
+            state_for_permit_release(&["done"], &[]);
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         send_msg_with_home(&state, agent_id, "go", home.path())
             .await
@@ -8645,7 +8264,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_turn_releases_its_session_lock() {
         let (_tmp, home, state, emitter, gate, project_id) =
-            state_for_permit_release(&["boom"], &[0]).await;
+            state_for_permit_release(&["boom"], &[0]);
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         send_msg_with_home(&state, agent_id, "go", home.path())
             .await
@@ -8665,7 +8284,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_turn_releases_its_session_lock() {
         let (_tmp, home, state, emitter, _gate, project_id) =
-            state_for_permit_release(&["parked"], &[]).await;
+            state_for_permit_release(&["parked"], &[]);
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         send_msg_with_home(&state, agent_id, "go", home.path())
             .await
@@ -8690,7 +8309,7 @@ mod tests {
     #[tokio::test]
     async fn a_drained_backlog_releases_the_session_lock() {
         let (_tmp, home, state, emitter, _gate, project_id) =
-            state_for_permit_release(&["parked"], &[]).await;
+            state_for_permit_release(&["parked"], &[]);
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         send_msg_with_home(&state, agent_id, "first", home.path())
             .await
@@ -8725,7 +8344,7 @@ mod tests {
         // that two processes derive the same key from the same inputs; the key
         // is a pure function of `(harness, locator, cwd)` and the tests in
         // `session_lock` pin what goes into it.
-        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let _other =
             held_by_another_instance(&state, own_session_key(&state, project_id, agent_id));
@@ -8744,7 +8363,7 @@ mod tests {
         // The contention above must be a wait, not a wedge: the same agent has
         // to become dispatchable the moment the other instance finishes. Without
         // this, a lock leaked anywhere would read as correct in the test above.
-        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let other = held_by_another_instance(&state, own_session_key(&state, project_id, agent_id));
         drop(other);
@@ -8761,7 +8380,7 @@ mod tests {
         // dispatching agent would lock a file nobody contends on and leave the
         // contended one open — `harness-behavior.md` §3.5's exact hazard, with
         // the lock in place and pointed at the wrong file.
-        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let fork = fork_agent_impl(&state, source_id, home.path())
             .await
@@ -8789,7 +8408,7 @@ mod tests {
         // still be writing it. Deriving the key from the fork's own
         // `forked_from_session` is what survives the deletion; a lookup of the
         // parent agent would not.
-        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let parent_key = own_session_key(&state, project_id, source_id);
         let fork = fork_agent_impl(&state, source_id, home.path())
@@ -8814,7 +8433,7 @@ mod tests {
         // agent's own key would leave the parent's held for the process's
         // lifetime, locking the parent out of every later turn with no way back
         // short of a restart.
-        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["done"]).await;
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["done"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let parent_key = own_session_key(&state, project_id, source_id);
         let fork = fork_agent_impl(&state, source_id, home.path())
@@ -8857,7 +8476,7 @@ mod tests {
         // reads the parent's again. Locking the parent forever would stop a
         // perfectly safe pair of turns — the parent's and the branch's — from
         // running at the same time, in both instances.
-        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let fork = fork_agent_impl(&state, source_id, home.path())
             .await
@@ -8894,7 +8513,7 @@ mod tests {
         // name a directory the project no longer uses, and a queued send resumes
         // past both the pre-enqueue check and the maintenance mark still carrying
         // it. Only a comparison at turn start catches that.
-        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]).await;
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         // **One factory, reused.** Rebuilding it between the two calls would
         // resample `generation_at_capture` from the bumped counter and the
@@ -8928,7 +8547,7 @@ mod tests {
         // session would be unlocked for the entire subprocess run — the exact
         // window the lock exists to cover, with every test above still passing.
         // So assert from outside a live turn.
-        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parked"]).await;
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parked"]);
         let agent_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let key = own_session_key(&state, project_id, agent_id);
         send_msg_with_home(&state, agent_id, "long one", home.path())
@@ -8952,7 +8571,7 @@ mod tests {
     async fn the_start_moment_check_allows_an_already_materialized_fork() {
         // Once the branch has its own session file the parent is irrelevant, so
         // the hook must cost nothing for every ordinary turn thereafter.
-        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let fork = fork_agent_impl(&state, source_id, home.path())
             .await
@@ -8993,7 +8612,7 @@ mod tests {
         // `fork_agent_impl`: a fork whose first turn failed still has no
         // session file, so the *next ordinary send* is the one that forks —
         // and it never calls the fork command.
-        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]).await;
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let fork = fork_agent_impl(&state, source_id, home.path())
             .await
@@ -9020,8 +8639,7 @@ mod tests {
     async fn sending_to_a_materialized_fork_ignores_its_parents_state() {
         // Once the fork has its own session file its dispatch no longer reads
         // the parent's session, so the gate is a no-op.
-        let (_tmp, home, state, gate, project_id) =
-            state_with_parked_claude(&["parent", "fork"]).await;
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent", "fork"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let fork = fork_agent_impl(&state, source_id, home.path())
             .await
@@ -9066,7 +8684,7 @@ mod tests {
         // ours is writing that session). Unscoped, the foreign busy agent is
         // found and the send is refused.
         let (_tmp, home, state, gate, project_id) =
-            state_with_parked_claude(&["foreign", "branch"]).await;
+            state_with_parked_claude(&["foreign", "branch"]);
 
         // The soon-to-be parent, in the fork's project. Fork from it, then
         // remove it so its session id survives only on the fork's provenance.
@@ -9101,8 +8719,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_non_fork_agent_is_never_gated_by_another_agents_turn() {
-        let (_tmp, home, state, gate, project_id) =
-            state_with_parked_claude(&["busy", "fine"]).await;
+        let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["busy", "fine"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let other = create_agent_impl(&state, "bob", HarnessKind::ClaudeCode, None, None).unwrap();
 
@@ -9178,7 +8795,7 @@ mod tests {
     async fn readonly_roster_reads_without_loading_and_errors_on_unknown_project() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, _first) = project_with_agent(&state, &tmp).await;
+        let (_recipient, _first) = project_with_agent(&state, &tmp);
         let (other_project, other_agent) =
             second_project_with_source(&state, home.path(), "other", "oracle", "ANSWER");
         // Simulate "never opened": drop every trace of the load.
@@ -9209,32 +8826,46 @@ mod tests {
         );
     }
 
-    /// A project whose catalog row is damaged can still have its roster browsed.
+    /// A project whose working directory is gone can still have its roster
+    /// browsed.
     ///
-    /// This is a **behavior change**, not a port: the old path resolved the
-    /// owning directory as part of the read, so a project with an unresolvable
-    /// directory couldn't list its agents at all. The registry lives under the
-    /// store root and browsing needs no working directory, so it now succeeds —
-    /// which is what lets the user see what is in a broken project before
-    /// deciding how to repair it.
+    /// The registry lives under the store root and browsing needs no working
+    /// directory, so the read succeeds — which is what lets the user see what is
+    /// in a stranded project before deciding how to repair it.
     #[tokio::test]
-    async fn readonly_roster_survives_an_unresolvable_working_directory() {
+    async fn readonly_roster_survives_a_missing_working_directory() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, _first) = project_with_agent(&state, &tmp).await;
+        let (_recipient, _first) = project_with_agent(&state, &tmp);
         let (other_project, other_agent) =
             second_project_with_source(&state, home.path(), "other", "oracle", "ANSWER");
         lock(&state.projects).remove(&other_project);
         lock(&state.agents_by_id).remove(&other_agent);
         lock(&state.project_locks).remove(&other_project);
 
-        // Break the catalog: every directory row gone, so no project resolves.
-        std::fs::write(state.store.root().join("directories.jsonl"), "").unwrap();
+        // Point the project at a folder that no longer exists.
+        let gone = TempDir::new().unwrap();
+        let gone_path = gone.path().canonicalize().unwrap();
+        drop(gone);
+        let mut entries = state.store.list_projects().unwrap();
+        entries
+            .iter_mut()
+            .find(|entry| entry.id == other_project)
+            .unwrap()
+            .directory = gone_path.clone();
+        let mut lines = String::new();
+        for entry in &entries {
+            lines.push_str(&serde_json::to_string(entry).unwrap());
+            lines.push('\n');
+        }
+        std::fs::write(state.store.root().join("projects.jsonl"), lines).unwrap();
 
-        assert!(
-            state.store.open_project(other_project).is_err(),
-            "the project genuinely cannot resolve a working directory"
+        assert_eq!(
+            state.store.open_project(other_project).unwrap().directory,
+            gone_path,
+            "the project records a working directory that is not on disk"
         );
+        assert!(!gone_path.exists());
         let roster = list_project_agents_readonly_impl(&state, other_project).unwrap();
         assert_eq!(
             roster.len(),
@@ -9251,7 +8882,7 @@ mod tests {
     async fn forward_qualifies_a_foreign_source_name_with_its_project() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, first_project) = project_with_agent(&state, &tmp).await;
+        let (_recipient, first_project) = project_with_agent(&state, &tmp);
         let local = seed_source(
             &state,
             home.path(),
@@ -9300,7 +8931,7 @@ mod tests {
     async fn forward_resolves_a_source_whose_project_was_never_opened() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, _first_project) = project_with_agent(&state, &tmp).await;
+        let (_recipient, _first_project) = project_with_agent(&state, &tmp);
         let (cold_project, cold) =
             second_project_with_source(&state, home.path(), "cold", "oracle", "COLD ANSWER");
         // Simulate "never opened this session": drop the loaded project and its
@@ -9338,7 +8969,7 @@ mod tests {
     async fn forward_refuses_a_source_whose_declared_project_does_not_own_it() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, first_project) = project_with_agent(&state, &tmp).await;
+        let (_recipient, first_project) = project_with_agent(&state, &tmp);
         let source = seed_source(&state, home.path(), first_project, "alpha", "ANSWER");
         let (other_project, _other) =
             second_project_with_source(&state, home.path(), "other", "beta", "BETA");
@@ -9372,7 +9003,7 @@ mod tests {
     async fn forward_reads_each_source_journal_from_its_own_project() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, first_project) = project_with_agent(&state, &tmp).await;
+        let (_recipient, first_project) = project_with_agent(&state, &tmp);
         let first = seed_source(&state, home.path(), first_project, "alpha", "ALPHA ANSWER");
         let (second_project, second) =
             second_project_with_source(&state, home.path(), "other", "beta", "STALE BETA");
@@ -9413,7 +9044,7 @@ mod tests {
     async fn workflow_forward_reads_each_source_journal_from_its_own_project() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, first_project) = project_with_agent(&state, &tmp).await;
+        let (_recipient, first_project) = project_with_agent(&state, &tmp);
         let first = seed_source(&state, home.path(), first_project, "alpha", "ALPHA ANSWER");
         let (second_project, second) =
             second_project_with_source(&state, home.path(), "other", "beta", "STALE BETA");
@@ -9450,7 +9081,7 @@ mod tests {
         use switchboard_core::JournalRecord;
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let (_recipient, project_id) = project_with_agent(&state, &tmp);
         // A completed turn sits on disk — the "stale" answer the old code grabbed.
         let source = seed_source(&state, home.path(), project_id, "scout", "STALE ANSWER");
         // The agent's most recent turn (per the journal) failed and wrote no
@@ -9516,7 +9147,7 @@ mod tests {
         use switchboard_core::JournalRecord;
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let (_recipient, project_id) = project_with_agent(&state, &tmp);
         let source = seed_source(&state, home.path(), project_id, "scout", "STALE ANSWER");
         // The agent's most recent turn was cancelled (distinct wording from failed).
         let send = Uuid::now_v7();
@@ -9572,7 +9203,7 @@ mod tests {
         use switchboard_core::JournalRecord;
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let (_recipient, project_id) = project_with_agent(&state, &tmp);
         let source = seed_source(&state, home.path(), project_id, "scout", "FRESH ANSWER");
         // An earlier turn failed, but a *later* turn completed (no Outcome). The
         // most-recent-turn logic must read this as completed, not poisoned.
@@ -9646,7 +9277,7 @@ mod tests {
         // composed after the field's typed lead (a forward captures completed output only).
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let (_recipient, project_id) = project_with_agent(&state, &tmp);
         let source = seed_source(&state, home.path(), project_id, "scout", "FRESH ANSWER");
 
         let mut forward_sources = std::collections::BTreeMap::new();
@@ -9686,7 +9317,7 @@ mod tests {
         // never read it).
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let (_recipient, project_id) = project_with_agent(&state, &tmp);
         let empty = seed_source(&state, home.path(), project_id, "reviewer-1", "");
 
         let mut forward_sources = std::collections::BTreeMap::new();
@@ -9714,7 +9345,7 @@ mod tests {
         // streaming agent), with an actionable message — not awaited.
         let (tmp, state, emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
         let home = TempDir::new().unwrap();
-        let _ = project_with_agent(&state, &tmp).await;
+        let _ = project_with_agent(&state, &tmp);
         let source =
             create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
         send_msg(&state, source.id, "work").await.unwrap();
@@ -9744,7 +9375,7 @@ mod tests {
     async fn forward_single_source_composes_the_body() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let (_recipient, project_id) = project_with_agent(&state, &tmp);
         let source = seed_source(
             &state,
             home.path(),
@@ -9774,7 +9405,7 @@ mod tests {
     async fn forward_prepends_typed_body_before_the_blocks() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let (_recipient, project_id) = project_with_agent(&state, &tmp);
         let source = seed_source(&state, home.path(), project_id, "reviewer-1", "the review");
 
         let outcome = forward_message_impl(
@@ -9798,7 +9429,7 @@ mod tests {
     async fn forward_multiple_sources_compose_in_declared_order() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let (_recipient, project_id) = project_with_agent(&state, &tmp);
         let s1 = seed_source(
             &state,
             home.path(),
@@ -9841,7 +9472,7 @@ mod tests {
         // contribution to a silently partial forward.)
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let (_recipient, project_id) = project_with_agent(&state, &tmp);
         let s1 = seed_source(&state, home.path(), project_id, "reviewer-1", "real output");
         let s2 = seed_source(&state, home.path(), project_id, "reviewer-2", "");
 
@@ -9878,7 +9509,7 @@ mod tests {
     async fn forward_all_empty_invalidates() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let (_recipient, project_id) = project_with_agent(&state, &tmp);
         let s1 = seed_source(&state, home.path(), project_id, "reviewer-1", "");
         let s2 = seed_source(&state, home.path(), project_id, "reviewer-2", "");
 
@@ -9905,7 +9536,7 @@ mod tests {
         use switchboard_harness::MockScenario;
         let (tmp, state, emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
         let home = TempDir::new().unwrap();
-        let _ = project_with_agent(&state, &tmp).await;
+        let _ = project_with_agent(&state, &tmp);
         let source =
             create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
         // Put the source's turn in flight (AwaitCancellation parks until cancelled).
@@ -9944,7 +9575,7 @@ mod tests {
         use switchboard_harness::MockScenario;
         let (tmp, state, emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
         let home = TempDir::new().unwrap();
-        let _ = project_with_agent(&state, &tmp).await;
+        let _ = project_with_agent(&state, &tmp);
         let source =
             create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
         send_msg(&state, source.id, "work").await.unwrap();
@@ -9997,9 +9628,7 @@ mod tests {
             Arc::clone(&mock),
             emitter.clone() as Arc<dyn EventEmitter>,
         );
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
 
@@ -10278,7 +9907,7 @@ mod tests {
     /// Stand up [`ForwardQueueFixture`]; `texts[i]` is the text the agent's
     /// `i`-th turn streams before completing, and the `park_at`-th turn stays in
     /// flight until [`ForwardQueueFixture::gate`] fires.
-    async fn forward_queue_fixture(texts: &[&str], park_at: usize) -> ForwardQueueFixture {
+    fn forward_queue_fixture(texts: &[&str], park_at: usize) -> ForwardQueueFixture {
         let gate = Arc::new(tokio::sync::Notify::new());
         let (claude, prompts) = gated_adapter(texts, &gate, park_at);
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
@@ -10290,9 +9919,7 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         ForwardQueueFixture {
@@ -10316,7 +9943,7 @@ mod tests {
         // not wait for, or pick up, the response reviewer is about to produce.
         // (Panes are a frontend grouping, expanded to agent ids before the backend
         // sees them, so this is the scenario with panes factored out.)
-        let f = forward_queue_fixture(&["PLANNER-LIVE", "PLANNER-SECOND"], 0).await;
+        let f = forward_queue_fixture(&["PLANNER-LIVE", "PLANNER-SECOND"], 0);
         let planner =
             create_agent_impl(&f.state, "planner", HarnessKind::ClaudeCode, None, None).unwrap();
         let reviewer = seed_source(
@@ -10421,7 +10048,7 @@ mod tests {
         // before dispatch, and the dispatcher's queued `WorkItem` holds that text —
         // not a reference to the source. So newer source output landing while the
         // send sits queued can never be substituted in at dispatch time.
-        let f = forward_queue_fixture(&["PLANNER-LIVE", "PLANNER-SECOND"], 0).await;
+        let f = forward_queue_fixture(&["PLANNER-LIVE", "PLANNER-SECOND"], 0);
         let planner =
             create_agent_impl(&f.state, "planner", HarnessKind::ClaudeCode, None, None).unwrap();
         let reviewer = seed_source(
@@ -10479,7 +10106,7 @@ mod tests {
         // when it registered. A source with work queued behind that turn resolves the
         // *running* turn's text — forwarding does not wait for the source to drain to
         // idle.
-        let f = forward_queue_fixture(&["TURN-ONE-TEXT", "TURN-TWO-TEXT"], 0).await;
+        let f = forward_queue_fixture(&["TURN-ONE-TEXT", "TURN-TWO-TEXT"], 0);
         let source =
             create_agent_impl(&f.state, "reviewer", HarnessKind::ClaudeCode, None, None).unwrap();
 
@@ -10524,7 +10151,7 @@ mod tests {
         // forward registered" — and this direction proves a later turn's text is
         // reachable in a forward body at all, so the sibling test's `!contains` is
         // discriminating rather than vacuous.
-        let f = forward_queue_fixture(&["TURN-ONE-TEXT", "TURN-TWO-TEXT"], 1).await;
+        let f = forward_queue_fixture(&["TURN-ONE-TEXT", "TURN-TWO-TEXT"], 1);
         let source =
             create_agent_impl(&f.state, "reviewer", HarnessKind::ClaudeCode, None, None).unwrap();
 
@@ -10584,9 +10211,7 @@ mod tests {
         );
         let tmp = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
 
@@ -10658,7 +10283,7 @@ mod tests {
     async fn forward_rejects_empty_sources() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
-        let _ = project_with_agent(&state, &tmp).await;
+        let _ = project_with_agent(&state, &tmp);
 
         let outcome = forward_message_impl(
             &state,
@@ -10673,50 +10298,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_directory_catalogs_the_path_and_writes_nothing_into_it() {
-        // The move's headline property: adding a working directory registers it
-        // in the store's catalog and leaves the user's folder untouched.
-        let (tmp, state, _) = fresh_state_with_mock();
-        let info = init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        assert!(info.projects.is_empty());
-        assert!(
-            !tmp.path().join(".switchboard").exists(),
-            "nothing is written into the working directory"
-        );
-
-        let canonical = tmp.path().canonicalize().unwrap();
-        let catalogued: Vec<_> = state
-            .store
-            .list_directories()
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.path == canonical)
-            .collect();
-        assert_eq!(catalogued.len(), 1, "exactly one catalog row for the path");
-
-        // Idempotent by canonical path: a second add must reuse the id, or the
-        // directory's projects would split across two identities.
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let after: Vec<_> = state
-            .store
-            .list_directories()
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.path == canonical)
-            .collect();
-        assert_eq!(after, catalogued, "re-adding must not mint a second id");
-    }
-
-    #[tokio::test]
-    async fn adding_a_second_directory_leaves_the_first_intact() {
-        // Additive is the new contract (replacing the old "rebind clears
-        // everything"): adding a second directory must not disturb the first
-        // directory's loaded projects, locks, register-cache, active project,
-        // or in-flight one-shots.
+    async fn creating_a_project_in_a_second_directory_leaves_the_first_intact() {
+        // Additive is the contract: a project in a second directory must not
+        // disturb the first directory's loaded projects, locks, register-cache,
+        // active project, or in-flight one-shots.
         let tmp_a = TempDir::new().unwrap();
         let tmp_b = TempDir::new().unwrap();
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
@@ -10728,48 +10313,23 @@ mod tests {
             emitter as Arc<dyn EventEmitter>,
         );
 
-        init_directory_impl(&state, tmp_a.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let proj = create_project_in_only_dir(&state, "alpha");
+        let proj = create_project_impl(&state, "alpha", tmp_a.path().to_str().unwrap()).unwrap();
         set_active_project_impl(&state, proj.id).unwrap();
         let agent =
             create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
 
-        // Add a second directory.
-        let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(info_b.projects.len(), 0);
+        let other = create_project_impl(&state, "beta", tmp_b.path().to_str().unwrap()).unwrap();
 
         // The first directory's state is fully intact.
-        assert_eq!(
-            state.store.list_directories().unwrap().len(),
-            2,
-            "both directories catalogued"
-        );
         assert!(lock(&state.projects).contains_key(&proj.id));
         assert!(lock(&state.project_locks).contains_key(&proj.id));
         assert!(lock(&state.agents_by_id).contains_key(&agent.id));
         assert_eq!(*lock(&state.active_project_id), Some(proj.id));
+        assert_eq!(list_projects_impl(&state).unwrap().len(), 2);
+        assert_ne!(proj.id, other.id);
 
         // Sending to the original agent still resolves and dispatches.
         send_msg(&state, agent.id, "still works").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn init_directory_is_idempotent() {
-        let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        // Second call must succeed and preserve any created projects.
-        create_project_in_only_dir(&state, "alpha");
-        let info = init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(info.projects.len(), 1);
-        assert_eq!(info.projects[0].name, "alpha");
     }
 
     #[test]
@@ -10784,9 +10344,7 @@ mod tests {
     #[tokio::test]
     async fn create_open_set_active_round_trip() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let summary = create_project_in_only_dir(&state, "alpha");
         // open_project on an already-loaded project is a no-op equivalent.
         let reopened = open_project_impl(&state, summary.id).unwrap();
@@ -10802,9 +10360,7 @@ mod tests {
     #[tokio::test]
     async fn set_active_project_rejects_unloaded() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let unknown = Uuid::now_v7();
         let err = set_active_project_impl(&state, unknown).unwrap_err();
         assert!(matches!(err, AppError::ProjectNotLoaded(_)));
@@ -10813,9 +10369,7 @@ mod tests {
     #[tokio::test]
     async fn create_agent_without_active_project_errors() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let err = create_agent_impl(
             &state,
             "assistant",
@@ -10830,9 +10384,7 @@ mod tests {
     #[tokio::test]
     async fn send_message_dispatches_and_emits_events() {
         let (tmp, state, emitter) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, project.id).unwrap();
         let agent = create_agent_impl(
@@ -10891,9 +10443,7 @@ mod tests {
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
         ));
-        let info = init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        let info = register_test_directory(&state, tmp.path().to_str().unwrap());
         let dir_path = info.path;
 
         let state_a = Arc::clone(&state);
@@ -10932,9 +10482,7 @@ mod tests {
     #[tokio::test]
     async fn send_message_unknown_agent_errors() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, project.id).unwrap();
         let err = send_msg(&state, Uuid::now_v7(), "hi").await.unwrap_err();
@@ -11345,9 +10893,7 @@ mod tests {
     #[tokio::test]
     async fn list_agents_defaults_to_active_project() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj_a = create_project_in_only_dir(&state, "alpha");
         let proj_b = create_project_in_only_dir(&state, "beta");
         set_active_project_impl(&state, proj_a.id).unwrap();
@@ -11469,9 +11015,7 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let claude_agent =
@@ -11553,9 +11097,7 @@ mod tests {
         // session_meta event must leave the flag intact, so a follow-up
         // dispatch still forces SessionMeta.
         let (tmp, state, emitter) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode, None, None).unwrap();
@@ -11598,9 +11140,7 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode, None, None).unwrap();
@@ -11694,9 +11234,7 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode, None, None).unwrap();
@@ -11816,9 +11354,7 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let agent_default =
@@ -11940,9 +11476,7 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let agent = create_agent_impl(&state, "a", HarnessKind::Codex, None, None).unwrap();
@@ -11989,9 +11523,7 @@ mod tests {
     #[tokio::test]
     async fn cross_project_concurrent_send_no_cross_talk() {
         let (tmp, state, emitter) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj_a = create_project_in_only_dir(&state, "alpha");
         let proj_b = create_project_in_only_dir(&state, "beta");
 
@@ -12055,27 +11587,14 @@ mod tests {
     #[tokio::test]
     async fn pick_directory_lists_the_projects_the_store_holds_for_that_path() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         create_project_in_only_dir(&state, "alpha");
 
         // Scoped to the picked path: a project in another directory must not
         // leak into the answer.
         let other = TempDir::new().unwrap();
-        init_directory_impl(&state, other.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let other_canonical = other.path().canonicalize().unwrap();
-        let other_id = state
-            .store
-            .list_directories()
-            .unwrap()
-            .into_iter()
-            .find(|entry| entry.path == other_canonical)
-            .unwrap()
-            .directory_id;
-        state.store.create_project(other_id, "beta").unwrap();
+        register_test_directory(&state, other.path().to_str().unwrap());
+        state.store.create_project(other.path(), "beta").unwrap();
 
         let info = pick_directory_impl(&state, tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(info.projects.len(), 1);
@@ -12153,7 +11672,7 @@ mod tests {
         }
     }
 
-    async fn fresh_state_with_active_project(
+    fn fresh_state_with_active_project(
         name: &str,
     ) -> (TempDir, TempDir, AppState, switchboard_core::ProjectSummary) {
         let tmp_workdir = TempDir::new().unwrap();
@@ -12166,9 +11685,7 @@ mod tests {
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
         );
-        init_directory_impl(&state, tmp_workdir.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp_workdir.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, name);
         set_active_project_impl(&state, proj.id).unwrap();
         (tmp_workdir, tmp_home, state, proj)
@@ -12176,7 +11693,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_claude_succeeds_when_session_file_exists() {
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
 
@@ -12209,7 +11726,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_claude_rejects_missing_session_file_with_expected_path() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         let err = attach_agent_impl(
             &state,
@@ -12236,7 +11753,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_rejects_invalid_uuid() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let err = attach_agent_impl(
             &state,
             "attached",
@@ -12252,7 +11769,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_codex_writes_locator_to_registry() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
         stage_codex_session_file(tmp_home.path(), date, &session_id.to_string());
@@ -12287,7 +11804,7 @@ mod tests {
         // Codex thread-ids are arbitrary strings, not guaranteed UUIDs (unlike
         // Claude/Antigravity). Attach must use the raw string, not reject
         // a valid session whose rollout filename ends in a non-UUID id.
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let thread_id = "thread-not-a-uuid";
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
         stage_codex_session_file(tmp_home.path(), date, thread_id);
@@ -12313,7 +11830,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_codex_rejects_missing_session_file() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         let err = attach_agent_impl(
             &state,
@@ -12342,7 +11859,7 @@ mod tests {
     async fn attach_claude_rejects_cross_project_session_id_collision() {
         // Two projects in the same directory. Attach session_id S in alpha;
         // attempt to attach the same S in beta → SessionAlreadyAttached.
-        let (tmp_workdir, tmp_home, state, alpha) = fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, tmp_home, state, alpha) = fresh_state_with_active_project("alpha");
         let beta = create_project_in_only_dir(&state, "beta");
         let session_id = Uuid::now_v7();
         stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
@@ -12384,7 +11901,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_claude_rejects_same_project_session_id_collision() {
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
 
@@ -12413,7 +11930,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_codex_rejects_cross_project_session_id_collision() {
-        let (tmp_workdir, tmp_home, state, _alpha) = fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, tmp_home, state, _alpha) = fresh_state_with_active_project("alpha");
         let beta = create_project_in_only_dir(&state, "beta");
         let session_id = Uuid::now_v7();
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
@@ -12459,7 +11976,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_rejects_duplicate_name_in_active_project() {
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         create_agent_impl(&state, "taken", HarnessKind::ClaudeCode, None, None).unwrap();
         let session_id = Uuid::now_v7();
         stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
@@ -12482,7 +11999,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_codex_surfaces_ambiguous_session_file() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         let id_str = session_id.to_string();
         stage_codex_session_file(
@@ -12526,7 +12043,7 @@ mod tests {
     /// ordering, and its orphan-sidecar invariant, are gone).
     #[tokio::test]
     async fn attach_codex_register_failure_leaves_registry_unchanged() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
 
         let first_session = Uuid::now_v7();
@@ -12582,7 +12099,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_codex_rejects_same_project_session_id_collision() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
         stage_codex_session_file(tmp_home.path(), date, &session_id.to_string());
@@ -12637,9 +12154,7 @@ mod tests {
                 Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,
             );
-            init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
-                .await
-                .unwrap();
+            register_test_directory(&state_a, tmp_workdir.path().to_str().unwrap());
             let proj_a = create_project_in_only_dir(&state_a, "alpha");
             set_active_project_impl(&state_a, proj_a.id).unwrap();
             attach_agent_impl(
@@ -12666,9 +12181,7 @@ mod tests {
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
         );
-        init_directory_impl(&state_b, tmp_workdir.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state_b, tmp_workdir.path().to_str().unwrap());
         let proj_b = create_project_in_only_dir(&state_b, "beta");
         set_active_project_impl(&state_b, proj_b.id).unwrap();
 
@@ -12714,9 +12227,7 @@ mod tests {
                 Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,
             );
-            init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
-                .await
-                .unwrap();
+            register_test_directory(&state_a, tmp_workdir.path().to_str().unwrap());
             let proj_a = create_project_in_only_dir(&state_a, "alpha");
             set_active_project_impl(&state_a, proj_a.id).unwrap();
             attach_agent_impl(
@@ -12740,9 +12251,7 @@ mod tests {
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
         );
-        init_directory_impl(&state_b, tmp_workdir.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state_b, tmp_workdir.path().to_str().unwrap());
         let proj_b = create_project_in_only_dir(&state_b, "beta");
         set_active_project_impl(&state_b, proj_b.id).unwrap();
 
@@ -12780,9 +12289,7 @@ mod tests {
                 Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,
             );
-            init_directory_impl(&state, tmp_workdir.path().to_str().unwrap())
-                .await
-                .unwrap();
+            register_test_directory(&state, tmp_workdir.path().to_str().unwrap());
             (tmp_workdir, tmp_home, state)
         };
         let err = attach_agent_impl(
@@ -12800,7 +12307,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_transcript_for_claude_agent_with_no_session_file_returns_empty() {
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         // Stage the file so attach succeeds but the file content is empty.
         stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
@@ -12825,7 +12332,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_transcript_for_stale_codex_locator_is_a_hydration_error() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
         let path = stage_codex_session_file(tmp_home.path(), date, &session_id.to_string());
@@ -12852,7 +12359,7 @@ mod tests {
 
     #[tokio::test]
     async fn project_session_fingerprints_marks_claude_capable_with_file_and_codex_incapable() {
-        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha");
 
         // Claude agent with a staged session file → refresh-capable, fingerprint present.
         let session_id = Uuid::now_v7();
@@ -12894,7 +12401,7 @@ mod tests {
 
     #[tokio::test]
     async fn project_session_fingerprints_claude_without_file_is_capable_but_unfingerprinted() {
-        let (_tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha");
         // Claude agent, no session file on disk → refresh-capable but no fingerprint.
         let claude =
             create_agent_impl(&state, "claude", HarnessKind::ClaudeCode, None, None).unwrap();
@@ -13365,7 +12872,7 @@ mod tests {
         // session file produces a turn with message id `msg_test31`, plus a
         // staged turnmeta sidecar record keyed on that id, surfaces the
         // persisted cost + overage on the hydrated turn after reopen.
-        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         let canonical_cwd = tmp_workdir.path().canonicalize().unwrap();
         let session_path = switchboard_harness::claude_session_file_path(
@@ -13439,7 +12946,7 @@ mod tests {
         // the frontend models only user/agent — so `load_transcript` must drop the
         // `role:"system"` turn rather than leak one the frontend would
         // mis-normalize as a content-less agent turn.
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         let canonical_cwd = tmp_workdir.path().canonicalize().unwrap();
         let session_path = switchboard_harness::claude_session_file_path(
@@ -13518,7 +13025,7 @@ mod tests {
         // surfaces the persisted rate-limit + its capture time through the
         // real load path (proves the sidecar-path resolution + overlay are
         // wired into load_agent_transcript, not just the pure helper).
-        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
         let record = attach_agent_impl(
@@ -13556,7 +13063,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_session_info_for_claude_with_file_offers_open_and_resume() {
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
         let record = attach_agent_impl(
@@ -13632,7 +13139,7 @@ mod tests {
     async fn agent_session_info_quotes_a_metacharacter_session_id() {
         // End-to-end: a Codex thread-id with shell metacharacters is
         // single-quoted in the rendered resume command.
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let agent =
             create_agent_impl(&state, "codex_evil", HarnessKind::Codex, None, None).unwrap();
         set_agent_session_locator_impl(
@@ -13655,7 +13162,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_session_info_for_never_dispatched_agent_is_empty() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         // Codex agent with no sidecar (never dispatched) → nothing to open/resume.
         let record =
             create_agent_impl(&state, "codex_one", HarnessKind::Codex, None, None).unwrap();
@@ -13667,7 +13174,7 @@ mod tests {
     async fn agent_session_info_for_codex_resolves_resume_id_from_record() {
         // The resume id is the Codex locator's thread-id on the record. Resume
         // is offered from it even when the local session file isn't present.
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let agent = create_agent_impl(&state, "codex_two", HarnessKind::Codex, None, None).unwrap();
         set_agent_session_locator_impl(
             &state,
@@ -13692,7 +13199,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_transcript_for_codex_agent_without_sidecar_returns_meta_only_empty() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         // Create a Codex agent the normal way (no sidecar — no first dispatch).
         let record =
             create_agent_impl(&state, "codex_one", HarnessKind::Codex, None, None).unwrap();
@@ -13705,14 +13212,14 @@ mod tests {
 
     #[tokio::test]
     async fn load_transcript_for_missing_agent_returns_agent_not_found() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let err = load_transcript_impl(&state, Uuid::now_v7(), tmp_home.path()).unwrap_err();
         assert!(matches!(err, AppError::AgentNotFound(_)));
     }
 
     #[tokio::test]
     async fn attach_antigravity_writes_locator_to_registry() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let conversation_id = Uuid::now_v7();
         stage_antigravity_conversation(tmp_home.path(), conversation_id, true);
 
@@ -13745,7 +13252,7 @@ mod tests {
         // brain dir without a transcript (encrypted-only / pruned) still
         // attaches, and hydration then degrades to empty turns + registry
         // meta, matching the loader's missing-transcript path.
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let conversation_id = Uuid::now_v7();
         stage_antigravity_conversation(tmp_home.path(), conversation_id, false);
 
@@ -13767,7 +13274,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_antigravity_rejects_missing_brain_dir() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let conversation_id = Uuid::now_v7();
         let err = attach_agent_impl(
             &state,
@@ -13794,7 +13301,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_antigravity_rejects_duplicate_conversation_uuid() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let conversation_id = Uuid::now_v7();
         stage_antigravity_conversation(tmp_home.path(), conversation_id, true);
 
@@ -13829,7 +13336,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_transcript_for_antigravity_agent_without_locator_returns_meta_only_empty() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         // Antigravity agent never dispatched → no locator → empty turns, but
         // loader-derived registry meta still surfaces (mirrors the Codex arm)
         // so the sidebar populates the moment the agent is selected.
@@ -13843,7 +13350,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_transcript_for_antigravity_agent_hydrates_prior_turns() {
-        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let agent =
             create_agent_impl(&state, "agy_hydrate", HarnessKind::Antigravity, None, None).unwrap();
 
@@ -13889,7 +13396,7 @@ mod tests {
 
     #[tokio::test]
     async fn project_lock_refuses_second_process_then_releases_on_remove() {
-        let (tmp_workdir, _home, state_a, proj) = fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, _home, state_a, proj) = fresh_state_with_active_project("alpha");
 
         // A second Switchboard "process" opens the same project from the same
         // store — refused while state_a holds the instance lock. (Independent
@@ -13903,9 +13410,7 @@ mod tests {
             Arc::clone(&mock),
             Arc::new(RecordingEmitter::new()) as Arc<dyn EventEmitter>,
         );
-        init_directory_impl(&state_b, tmp_workdir.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state_b, tmp_workdir.path().to_str().unwrap());
         let err = open_project_impl(&state_b, proj.id).unwrap_err();
         assert!(
             matches!(err, AppError::ProjectLocked(id) if id == proj.id),
@@ -13924,7 +13429,7 @@ mod tests {
 
     #[tokio::test]
     async fn intra_process_reopen_is_noop_and_does_not_relock() {
-        let (_tmp, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp, _home, state, proj) = fresh_state_with_active_project("alpha");
         // `create_project` already loaded + locked it; re-open is a no-op
         // returning the same project, with no second lock acquired.
         let again = open_project_impl(&state, proj.id).unwrap();
@@ -13941,7 +13446,7 @@ mod tests {
         // Re-pointed from `remove_directory`: hiding a directory is view-state
         // and deliberately clears nothing, so deleting the project is now the
         // operation that prunes the cache.
-        let (_tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha");
         let agent =
             create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
 
@@ -13962,7 +13467,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_with_corrupt_registry_errors_without_wedging_the_lock() {
-        let (_tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha");
         let agent =
             create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
 
@@ -13999,7 +13504,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_first_open_of_same_project_is_idempotent() {
-        let (_tmp, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp, _home, state, proj) = fresh_state_with_active_project("alpha");
         // Simulate not-yet-loaded so both threads race the first-open path.
         lock(&state.projects).clear();
         lock(&state.project_locks).clear();
@@ -14032,7 +13537,7 @@ mod tests {
         // loaded" by dropping the creation flock — the kernel can finalize a
         // flock release asynchronously, so a fresh-fd lock attempt microseconds
         // later can spuriously see WouldBlock under load.
-        let (_tmp, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let (_tmp, _home, state, proj) = fresh_state_with_active_project("alpha");
         let root = lock(&state.projects).get(&proj.id).unwrap().root.clone();
         // Take ownership of the creation lock handle so we control its release.
         let held = lock(&state.project_locks).remove(&proj.id).unwrap();
@@ -14055,7 +13560,7 @@ mod tests {
 
     #[tokio::test]
     async fn distinct_projects_lock_independently() {
-        let (_tmp, _home, state, alpha) = fresh_state_with_active_project("alpha").await;
+        let (_tmp, _home, state, alpha) = fresh_state_with_active_project("alpha");
         let beta = create_project_in_only_dir(&state, "beta");
         // Per-project lock, not per-directory: both are held simultaneously.
         assert_eq!(lock(&state.project_locks).len(), 2);
@@ -14073,7 +13578,7 @@ mod tests {
         // `turn_start` (the actor started the turn) rather than `agent_status`.
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, _project_id) = project_with_agent(&state, &tmp);
 
         send_msg(&state, agent.id, "long task").await.unwrap();
         // Wait until the actor has actually started the turn (the
@@ -14133,7 +13638,7 @@ mod tests {
     #[tokio::test]
     async fn remove_agent_drops_record_and_cache_entry() {
         let (tmp, state, _) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
         assert_eq!(project.list_agents().unwrap().len(), 1);
 
@@ -14146,7 +13651,7 @@ mod tests {
     #[tokio::test]
     async fn remove_agent_deletes_present_sidecar_and_tolerates_absent() {
         let (tmp, state, _) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
         // Only the meta sidecar exists; the codex/antigravity ones don't —
         // removal must delete the present one and not fail on the absent ones.
         let sidecar = meta_sidecar(&state, project_id, agent.id);
@@ -14164,7 +13669,7 @@ mod tests {
         // `.switchboard/.../sessions/<id>.*` paths — any harness-native file)
         // is untouched.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (a, project_id) = project_with_agent(&state, &tmp).await;
+        let (a, project_id) = project_with_agent(&state, &tmp);
         let b = create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
         let sidecar_a = meta_sidecar(&state, project_id, a.id);
         let sidecar_b = meta_sidecar(&state, project_id, b.id);
@@ -14188,7 +13693,7 @@ mod tests {
     async fn remove_agent_with_in_flight_turn_cancels_then_removes() {
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
         send_msg(&state, agent.id, "long task").await.unwrap();
         within(
             &emitter,
@@ -14216,7 +13721,7 @@ mod tests {
     #[tokio::test]
     async fn rename_agent_updates_record_and_cache() {
         let (tmp, state, _) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
 
         let updated = rename_agent_impl(&state, agent.id, "renamed").unwrap();
         assert_eq!(updated.name, "renamed");
@@ -14233,7 +13738,7 @@ mod tests {
     #[tokio::test]
     async fn rename_agent_rejects_duplicate_name() {
         let (tmp, state, _) = fresh_state_with_mock();
-        let (a, _pid) = project_with_agent(&state, &tmp).await;
+        let (a, _pid) = project_with_agent(&state, &tmp);
         create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
         let err = rename_agent_impl(&state, a.id, "SECOND").unwrap_err();
         assert!(matches!(
@@ -14257,7 +13762,7 @@ mod tests {
     #[tokio::test]
     async fn reorder_agents_rewrites_registry_and_returns_new_order() {
         let (tmp, state, _) = fresh_state_with_mock();
-        let (a, project_id) = project_with_agent(&state, &tmp).await;
+        let (a, project_id) = project_with_agent(&state, &tmp);
         let b = create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
         let c = create_agent_impl(&state, "third", HarnessKind::ClaudeCode, None, None).unwrap();
 
@@ -14278,7 +13783,7 @@ mod tests {
     #[tokio::test]
     async fn reorder_agents_rejects_stale_id_list() {
         let (tmp, state, _) = fresh_state_with_mock();
-        let (a, project_id) = project_with_agent(&state, &tmp).await;
+        let (a, project_id) = project_with_agent(&state, &tmp);
         let b = create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
 
         // Stale: the caller read the roster before `b` existed.
@@ -14305,9 +13810,7 @@ mod tests {
     #[tokio::test]
     async fn create_agent_stores_model_and_effort() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, project.id).unwrap();
 
@@ -14331,9 +13834,7 @@ mod tests {
     #[tokio::test]
     async fn create_agent_normalizes_blank_selections_to_none() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, project.id).unwrap();
 
@@ -14354,9 +13855,7 @@ mod tests {
     #[tokio::test]
     async fn create_agent_rejects_unsupported_selection_and_persists_nothing() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, project.id).unwrap();
 
@@ -14386,7 +13885,7 @@ mod tests {
     #[tokio::test]
     async fn profile_updates_refresh_the_registry_and_shared_cache() {
         let (tmp, state, _) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
         let primary = AgentProfile {
             model: Some("opus".to_owned()),
             effort: Some("high".to_owned()),
@@ -14433,7 +13932,7 @@ mod tests {
             adapter,
             emitter.clone() as Arc<dyn EventEmitter>,
         );
-        let (agent, _) = project_with_agent(&state, &tmp).await;
+        let (agent, _) = project_with_agent(&state, &tmp);
         let primary = AgentProfile {
             model: Some("opus".to_owned()),
             effort: Some("high".to_owned()),
@@ -14506,7 +14005,7 @@ mod tests {
             adapter,
             emitter.clone() as Arc<dyn EventEmitter>,
         );
-        let (agent, _) = project_with_agent(&state, &tmp).await;
+        let (agent, _) = project_with_agent(&state, &tmp);
 
         // Turn 1 dispatches with the preference off and parks mid-turn.
         send_msg(&state, agent.id, "park").await.unwrap();
@@ -14548,8 +14047,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_stores_model_and_effort() {
-        let (tmp_workdir, tmp_home, state, project) =
-            fresh_state_with_active_project("alpha").await;
+        let (tmp_workdir, tmp_home, state, project) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
 
@@ -14574,15 +14072,13 @@ mod tests {
     #[tokio::test]
     async fn rename_project_updates_state_cache_and_returns_listing() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
 
         let listing = rename_project_impl(&state, project.id, "renamed").unwrap();
         assert_eq!(listing.name, "renamed");
         assert_eq!(listing.id, project.id);
-        assert_eq!(listing.directory_status, DirectoryStatus::ResolvedAvailable);
+        assert!(listing.directory_available);
 
         // In-memory `Project` (canonical name) reflects the change.
         assert_eq!(
@@ -14598,9 +14094,7 @@ mod tests {
     #[tokio::test]
     async fn rename_project_rejects_duplicate_in_same_directory() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let a = create_project_in_only_dir(&state, "alpha");
         create_project_in_only_dir(&state, "beta");
 
@@ -14616,9 +14110,7 @@ mod tests {
     #[tokio::test]
     async fn rename_project_rejects_invalid_name() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let a = create_project_in_only_dir(&state, "alpha");
         let err = rename_project_impl(&state, a.id, "bad name").unwrap_err();
         assert!(matches!(err, AppError::Core(CoreError::InvalidName { .. })));
@@ -14642,9 +14134,7 @@ mod tests {
         // activated (not in `AppState.projects`); rename resolves the owning
         // directory from the index and still works.
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
         // Drop the loaded `Project` to simulate "available but not opened".
         lock(&state.projects).remove(&project.id);
@@ -14667,7 +14157,7 @@ mod tests {
     #[tokio::test]
     async fn delete_project_removes_project_agents_lock_and_clears_active() {
         let (tmp, state, _) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
 
         delete_project_impl(&state, project_id).await.unwrap();
 
@@ -14684,9 +14174,7 @@ mod tests {
     #[tokio::test]
     async fn delete_project_leaves_sibling_and_active_intact() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let a = create_project_in_only_dir(&state, "alpha");
         let b = create_project_in_only_dir(&state, "beta");
         set_active_project_impl(&state, b.id).unwrap();
@@ -14711,7 +14199,7 @@ mod tests {
         // scenario parks the turn until the shutdown cancel fires.
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
 
         send_msg(&state, agent.id, "long task").await.unwrap();
         within(
@@ -14746,9 +14234,7 @@ mod tests {
         // delete resolves the owning directory from the index and still removes
         // the on-disk state.
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
         // Simulate "available, not opened": drop the loaded handle + lock.
         lock(&state.projects).remove(&project.id);
@@ -14763,9 +14249,7 @@ mod tests {
         // No loaded directory owns the id (e.g. a stale row / already removed
         // out-of-band) → benign success, not an error (engineer-approved policy).
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let keep = create_project_in_only_dir(&state, "alpha");
 
         delete_project_impl(&state, Uuid::now_v7()).await.unwrap();
@@ -14778,9 +14262,7 @@ mod tests {
     #[tokio::test]
     async fn set_project_archived_flips_flag_in_listing() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
 
         let archived_of = |s: &AppState| list_projects_impl(s).unwrap()[0].archived;
@@ -14796,9 +14278,7 @@ mod tests {
     #[tokio::test]
     async fn set_project_archived_unknown_id_errors() {
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         create_project_in_only_dir(&state, "alpha");
 
         let err = set_project_archived_impl(&state, Uuid::now_v7(), true).unwrap_err();
@@ -14810,9 +14290,7 @@ mod tests {
         // Archive is global view-state — it must work even when the project's
         // directory is offline (the "clear a stale unavailable row" lever).
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
 
         set_project_archived_impl(&state, project.id, true).unwrap();
@@ -14824,7 +14302,7 @@ mod tests {
         // Archive is display-only: it must not cancel/drain an in-flight turn.
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
 
         send_msg(&state, agent.id, "long task").await.unwrap();
         within(
@@ -14863,9 +14341,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
 
         // Make the store root read-only so `write_jsonl` (index rewrite) can't
@@ -14884,95 +14360,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repointing_moves_every_project_in_the_directory_and_reloads_their_cwd() {
-        // The repair is on the directory identity, so the blast radius is every
-        // project sharing it — and the reload is what makes it real, because
-        // `Project.directory` is the dispatch cwd and is snapshotted at open.
+    async fn set_project_directory_moves_one_project_and_reloads_its_cwd() {
+        // The reload is what makes the repair real: `Project.directory` is the
+        // dispatch cwd and is snapshotted at open. A sibling that recorded the
+        // same old folder is its own project and stays where it was.
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let alpha = create_project_in_only_dir(&state, "alpha");
         let beta = create_project_in_only_dir(&state, "beta");
         let moved = TempDir::new().unwrap();
         let canonical = moved.path().canonicalize().unwrap();
 
-        repoint_project_directory_impl(&state, alpha.id, moved.path().to_str().unwrap())
+        set_project_directory_impl(&state, alpha.id, moved.path().to_str().unwrap())
             .await
             .unwrap();
 
-        for id in [alpha.id, beta.id] {
-            assert_eq!(
-                lock(&state.projects).get(&id).unwrap().directory,
-                canonical,
-                "every project sharing the identity moves, and is reloaded against the new path"
-            );
-        }
+        assert_eq!(
+            lock(&state.projects).get(&alpha.id).unwrap().directory,
+            canonical,
+            "the named project is reloaded against the new path"
+        );
+        assert_eq!(
+            lock(&state.projects).get(&beta.id).unwrap().directory,
+            tmp.path().canonicalize().unwrap(),
+            "a sibling recording the same old folder does not move"
+        );
         let listings = list_projects_impl(&state).unwrap();
-        assert!(listings.iter().all(|row| {
-            row.directory.as_deref() == Some(canonical.to_string_lossy().as_ref())
-                && row.directory_status == DirectoryStatus::ResolvedAvailable
-        }));
+        let alpha_row = listings.iter().find(|row| row.id == alpha.id).unwrap();
+        assert_eq!(alpha_row.directory, canonical.to_string_lossy());
+        assert!(alpha_row.directory_available);
     }
 
     #[tokio::test]
-    async fn a_bind_that_fails_leaves_every_project_in_the_identity_openable() {
-        // The most reachable wedge, and the one a user hits first: repairing a
-        // project whose catalog row was lost means choosing a folder, and the
-        // ordinary first-attempt mistake is choosing one another identity
-        // already holds. That failure used to leave every project in the
-        // identity evicted with its `instance.lock` still held — unopenable for
-        // the rest of the session, reported as false contention.
-        let (state, _cwd, project) = state_with_project("alpha").await;
-        let taken = TempDir::new().unwrap();
-        let other = state.store.add_directory(taken.path()).unwrap();
-        let kept: Vec<switchboard_core::DirectoryEntry> = state
-            .store
-            .list_directories()
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.directory_id == other.directory_id)
-            .collect();
-        write_catalog(&state, &kept);
+    async fn a_repair_that_fails_leaves_the_project_loaded_and_openable() {
+        // The ordinary first-attempt mistake is choosing a folder that does not
+        // exist (or no longer does). That failure must not leave the project
+        // evicted with its `instance.lock` still held — unopenable for the rest
+        // of the session, reported as false contention.
+        let (state, cwd, project) = state_with_project("alpha");
+        let gone = TempDir::new().unwrap();
+        let missing = gone.path().join("not-here");
 
-        let err =
-            repoint_project_directory_impl(&state, project.id, taken.path().to_str().unwrap())
-                .await
-                .unwrap_err();
+        let err = set_project_directory_impl(&state, project.id, missing.to_str().unwrap())
+            .await
+            .unwrap_err();
         assert!(
-            matches!(
-                err,
-                AppError::Core(CoreError::DuplicateDirectoryPath { .. })
-            ),
+            matches!(err, AppError::Core(CoreError::Io { .. })),
             "got: {err:?}"
         );
 
         assert!(
             lock(&state.maintenance).is_empty(),
-            "a failed repair must not leave the projects marked"
+            "a failed repair must not leave the project marked"
+        );
+        assert_eq!(
+            lock(&state.projects).get(&project.id).unwrap().directory,
+            cwd.path().canonicalize().unwrap(),
+            "the project is reloaded from the index, which the failure left as it was"
         );
         assert!(
-            !lock(&state.project_locks).contains_key(&project.id),
-            "nor holding their locks"
+            lock(&state.project_locks).contains_key(&project.id),
+            "the lock this process holds is reused, not re-acquired"
         );
-        // Openable again once the catalog is repaired by other means.
-        write_catalog(
-            &state,
-            &[switchboard_core::DirectoryEntry {
-                directory_id: other.directory_id,
-                path: taken.path().canonicalize().unwrap(),
-            }],
-        );
+        open_project_impl(&state, project.id).expect("openable after a failed repair");
+
         let moved = TempDir::new().unwrap();
-        repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
+        set_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
             .await
             .unwrap();
-        // Not auto-restored — the first failure left it unloaded, and only
-        // projects that were loaded when an operation began come back. The
-        // property that matters is that the user can open it, which the held
-        // lock used to make impossible.
-        open_project_impl(&state, project.id)
-            .expect("openable after a failed then successful repair");
         assert_eq!(
             lock(&state.projects).get(&project.id).unwrap().directory,
             moved.path().canonicalize().unwrap()
@@ -14986,12 +14441,11 @@ mod tests {
         // the session. Discarding is the recoverable state: unloaded, but a
         // retry is not blocked by this process's own handle.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
 
         {
-            let _guard =
-                begin_maintenance(&state, &MaintenanceScope::Projects(scope.clone())).unwrap();
+            let _guard = begin_maintenance(&state, &scope).unwrap();
             assert!(lock(&state.maintenance).contains(&project_id));
         } // dropped without finishing — the early-return shape
 
@@ -15005,11 +14459,11 @@ mod tests {
         // Two operations marking one project would each clear the other's marks
         // on the way out, reopening the window mid-operation.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
 
-        let _first = begin_maintenance(&state, &MaintenanceScope::Projects(scope.clone())).unwrap();
-        let second = begin_maintenance(&state, &MaintenanceScope::Projects(scope.clone()));
+        let _first = begin_maintenance(&state, &scope).unwrap();
+        let second = begin_maintenance(&state, &scope);
         assert!(
             matches!(second, Err(AppError::ProjectUnderMaintenance(_))),
             "an overlapping claim must be refused"
@@ -15024,11 +14478,11 @@ mod tests {
         // so re-draining cannot help: a suspended send still enqueues its stale
         // factory. Comparing generations does.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
         let captured = project_generation(&state, project_id);
 
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
-        begin_maintenance(&state, &MaintenanceScope::Projects(scope.clone()))
+        begin_maintenance(&state, &scope)
             .unwrap()
             .finish_restored(&[project_id]);
 
@@ -15047,7 +14501,7 @@ mod tests {
         // check and then waited would load the project against the directory it
         // is being moved away from.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
         lock(&state.projects).remove(&project_id);
         lock(&state.project_locks).remove(&project_id);
         lock(&state.maintenance).insert(project_id);
@@ -15061,23 +14515,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creating_into_a_directory_under_repair_is_refused_and_names_the_reason() {
-        let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let sibling = create_project_in_only_dir(&state, "alpha");
-        lock(&state.maintenance).insert(sibling.id);
-
-        let dir = tmp.path().to_str().unwrap();
-        let err = create_project_impl(&state, "beta", dir).unwrap_err();
-        assert!(
-            matches!(err, AppError::ProjectUnderMaintenance(_)),
-            "the user is told it is mid-repair, not that the folder is missing: {err:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn listing_agents_does_not_overwrite_a_newer_cached_record() {
         // The roster read loads from disk without `registry_write`, so writing
         // those records back races every guarded writer — the session-locator
@@ -15086,7 +14523,7 @@ mod tests {
         // the wrong session. Staged directly: the cache holds a newer record
         // than disk, and the listing must not clobber it.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
 
         let mut newer = agent.clone();
         newer.model = Some("captured-after-the-disk-read".to_owned());
@@ -15114,7 +14551,7 @@ mod tests {
         // is exactly what a lifecycle operation makes true. Two of its callers
         // resolve harness session files through the working directory.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
         lock(&state.projects).remove(&project_id);
         lock(&state.maintenance).insert(project_id);
 
@@ -15137,7 +14574,7 @@ mod tests {
         // deterministically by waiting for the eviction, and the send inside it
         // must be refused.
         let (tmp, state, _emitter) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
         let state = Arc::new(state);
 
         // Hold the post-eviction window open. Polling for it is not viable —
@@ -15155,7 +14592,7 @@ mod tests {
         let repoint_state = Arc::clone(&state);
         let target = moved.path().to_str().unwrap().to_owned();
         let repointer = tokio::spawn(async move {
-            repoint_project_directory_impl(&repoint_state, project_id, &target).await
+            set_project_directory_impl(&repoint_state, project_id, &target).await
         });
 
         // Let the repair reach the barrier. Under the old ordering the eviction
@@ -15197,7 +14634,7 @@ mod tests {
         // sibling mid-repair loads it against the stale working directory and
         // the repair leaves it there.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
         lock(&state.maintenance).insert(project_id);
 
         assert!(matches!(
@@ -15214,16 +14651,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repointing_evicts_agents_with_projects_so_a_cached_agent_never_outlives_its_project() {
+    async fn a_lifecycle_operation_evicts_agents_with_projects_so_a_cached_agent_never_outlives_its_project()
+     {
         // `lookup_agent` asserts a cached agent always has a loaded project.
         // Evicting only `state.projects` would falsify that silently, so both
         // maps go together and the maintenance mark makes the interval
         // unobservable.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
 
-        let guard = begin_maintenance(&state, &MaintenanceScope::Projects(scope.clone())).unwrap();
+        let guard = begin_maintenance(&state, &scope).unwrap();
         assert_eq!(guard.loaded_before, vec![project_id]);
         assert_eq!(guard.evicted_agents, vec![agent.id]);
         assert!(lock(&state.projects).is_empty());
@@ -15249,10 +14687,10 @@ mod tests {
         // project would fail to come back with `ProjectLocked`, creating the
         // wedge the local-handle pattern exists to prevent.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
         let scope: HashSet<ProjectId> = std::iter::once(project_id).collect();
 
-        let guard = begin_maintenance(&state, &MaintenanceScope::Projects(scope.clone())).unwrap();
+        let guard = begin_maintenance(&state, &scope).unwrap();
         guard.finish_restored(&[project_id]);
 
         assert!(
@@ -15267,7 +14705,7 @@ mod tests {
         // committed, so the retry reported `ProjectLocked` against this
         // process's own handle and the project became permanently unopenable.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
         lock(&state.projects).remove(&project_id);
         lock(&state.project_locks).remove(&project_id);
         // Stage the conflict: the cache claims this agent for another project.
@@ -15291,14 +14729,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repointing_drains_an_in_flight_turn_before_moving_the_directory() {
+    async fn a_repair_drains_an_in_flight_turn_before_moving_the_directory() {
         // The load-bearing half. A running actor owns a frozen `Project` inside
         // its dispatch-context factory, so evicting `state.projects` alone would
         // leave the live turn — and every turn the actor served afterwards —
         // running against the old path. Draining is what drops that factory.
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
         send_msg(&state, agent.id, "long task").await.unwrap();
         within(
             &emitter,
@@ -15308,7 +14746,7 @@ mod tests {
         .await;
 
         let moved = TempDir::new().unwrap();
-        repoint_project_directory_impl(&state, project_id, moved.path().to_str().unwrap())
+        set_project_directory_impl(&state, project_id, moved.path().to_str().unwrap())
             .await
             .unwrap();
 
@@ -15331,167 +14769,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repointing_keeps_the_workspace_entry_in_place_rather_than_re_adding_it() {
-        // The directory's identity didn't change, only its location — so its
-        // position in the user's ordering must survive. Remove-then-add would
-        // silently send it to the end of the list.
-        let (first, state, _) = fresh_state_with_mock();
-        let second = TempDir::new().unwrap();
-        init_directory_impl(&state, first.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let project = create_project_in_only_dir(&state, "alpha");
-        init_directory_impl(&state, second.path().to_str().unwrap())
-            .await
-            .unwrap();
-
-        let moved = TempDir::new().unwrap();
-        repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
-            .await
-            .unwrap();
-
-        let paths: Vec<PathBuf> = lock(&state.workspace)
-            .entries()
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect();
-        assert_eq!(
-            paths,
-            vec![
-                moved.path().canonicalize().unwrap(),
-                second.path().canonicalize().unwrap()
-            ],
-            "the moved directory keeps its position"
-        );
-    }
-
-    #[tokio::test]
-    async fn repointing_repairs_a_duplicated_directory_identity() {
-        // The only in-app exit from an ambiguous identity. Before the fix in
-        // core this returned Ok and changed nothing, leaving the user with a
-        // repair that reported success and did not work.
-        let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let project = create_project_in_only_dir(&state, "alpha");
-        let duplicate_row_path = TempDir::new().unwrap();
-        let mut entries = state.store.list_directories().unwrap();
-        entries.push(switchboard_core::DirectoryEntry {
-            directory_id: entries[0].directory_id,
-            path: duplicate_row_path.path().canonicalize().unwrap(),
-        });
-        write_catalog(&state, &entries);
-        assert_eq!(
-            list_projects_impl(&state).unwrap()[0].directory_status,
-            DirectoryStatus::CatalogAmbiguous
-        );
-
-        let moved = TempDir::new().unwrap();
-        repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
-            .await
-            .unwrap();
-
-        let row = &list_projects_impl(&state).unwrap()[0];
-        assert_eq!(row.directory_status, DirectoryStatus::ResolvedAvailable);
-        assert_eq!(
-            row.directory.as_deref(),
-            Some(
-                moved
-                    .path()
-                    .canonicalize()
-                    .unwrap()
-                    .to_string_lossy()
-                    .as_ref()
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn repointing_a_project_whose_catalog_row_was_lost_rebinds_its_identity() {
-        // The third repairable state, and the one that was refused for two
-        // rounds on a rationale that turned out to be wrong: binding restores a
-        // mapping the catalog lost, it does not mint an identity — the id
-        // already exists and these projects already reference it. Migration
-        // validation can only stop the *tool* from producing this state; a
-        // partial restore or a sync conflict can produce it at any time.
-        let (state, _cwd, project) = state_with_project("alpha").await;
-        write_catalog(&state, &[]);
-        assert_eq!(
-            list_projects_impl(&state).unwrap()[0].directory_status,
-            DirectoryStatus::CatalogMissing
-        );
-
-        let moved = TempDir::new().unwrap();
-        let canonical = moved.path().canonicalize().unwrap();
-        repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
-            .await
-            .unwrap();
-
-        let row = &list_projects_impl(&state).unwrap()[0];
-        assert_eq!(row.directory_status, DirectoryStatus::ResolvedAvailable);
-        assert_eq!(
-            row.directory.as_deref(),
-            Some(canonical.to_string_lossy().as_ref())
-        );
-        assert_eq!(
-            lock(&state.projects).get(&project.id).unwrap().directory,
-            canonical
-        );
-    }
-
-    #[tokio::test]
-    async fn binding_refuses_a_path_another_directory_identity_already_holds() {
-        // The repair must not become a way around one-id-per-path: stealing
-        // another identity's path would split that directory's projects.
-        let (state, _cwd, project) = state_with_project("alpha").await;
-        let taken = TempDir::new().unwrap();
-        let other = state.store.add_directory(taken.path()).unwrap();
-        // Drop only *our* row, leaving the other identity's in place.
-        let kept: Vec<switchboard_core::DirectoryEntry> = state
-            .store
-            .list_directories()
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.directory_id == other.directory_id)
-            .collect();
-        write_catalog(&state, &kept);
-
-        let err =
-            repoint_project_directory_impl(&state, project.id, taken.path().to_str().unwrap())
-                .await
-                .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                AppError::Core(CoreError::DuplicateDirectoryPath { .. })
-            ),
-            "got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_repoint_still_reloads_the_project_from_the_catalog() {
+    async fn a_failed_repair_still_reloads_the_project_from_the_index() {
         // A failure must not leave the projects evicted: they were dropped from
         // `state.projects` before the write, so an early return would strand
         // them unloaded even though nothing changed.
         //
         // **This does not prove the uncertain-commit half.** That case — an
-        // `Err` returned with the new catalog already on disk, when
+        // `Err` returned with the new index already on disk, when
         // `write_jsonl`'s parent fsync fails after its rename — cannot be staged
-        // portably, and the pre-call path is read from the same catalog the
-        // re-read consults, so no arrangement here tells a correct
+        // portably, and the pre-call path is read from the same index the
+        // reload consults, so no arrangement here tells a correct
         // implementation from one that trusts its own `Err`. That guarantee is
-        // structural instead: see the note at the re-read in
-        // `repoint_project_directory_impl`.
-        let (state, cwd, project) = state_with_project("alpha").await;
+        // structural instead: see the note at the reload in
+        // `set_project_directory_impl`.
+        let (state, cwd, project) = state_with_project("alpha");
         let elsewhere = TempDir::new().unwrap();
         let observed_path = elsewhere.path().canonicalize().unwrap();
-        repoint_only_directory(&state, &observed_path);
+        set_only_project_directory_unchecked(&state, &observed_path);
 
         let gone = TempDir::new().unwrap();
         let missing = gone.path().join("not-here");
-        let err = repoint_project_directory_impl(&state, project.id, missing.to_str().unwrap())
+        let err = set_project_directory_impl(&state, project.id, missing.to_str().unwrap())
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Core(_)), "got: {err:?}");
@@ -15499,7 +14797,7 @@ mod tests {
         assert_eq!(
             lock(&state.projects).get(&project.id).unwrap().directory,
             observed_path,
-            "the project is reloaded from the catalog after a failed re-point"
+            "the project is reloaded from the index after a failed repair"
         );
         assert_ne!(
             lock(&state.projects).get(&project.id).unwrap().directory,
@@ -15508,117 +14806,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_project_sharing_the_repaired_directory_moves_with_it() {
-        // The product property: one folder holds them all, so repairing it moves
-        // every project that references the identity — not just the named one.
-        // (This does **not** discriminate the pre-read race fixed alongside it:
-        // a sibling created before the command starts is in the index either
-        // way. It was written as a race test, survived falsification against the
-        // broken shape, and is kept under an honest name because the property is
-        // real and was otherwise untested.)
-        let (state, cwd, project) = state_with_project("alpha").await;
+    async fn a_sibling_at_the_same_folder_does_not_move_with_a_repaired_project() {
+        // The repair is on one project. A sibling that recorded the same old
+        // folder is a separate project with its own row; if that folder moved
+        // too, the user repairs it on its own.
+        let (state, cwd, project) = state_with_project("alpha");
         let sibling = create_project_in_only_dir(&state, "beta");
-        assert_eq!(
-            lock(&state.projects).get(&sibling.id).unwrap().directory,
-            cwd.path().canonicalize().unwrap()
-        );
 
         let moved = TempDir::new().unwrap();
-        repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
+        set_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
             .await
             .unwrap();
 
         assert_eq!(
             lock(&state.projects).get(&sibling.id).unwrap().directory,
-            moved.path().canonicalize().unwrap(),
-            "a sibling sharing the repaired directory must move with it, or it \
-             dispatches into the retired directory"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_directory_claim_derives_its_membership_when_it_marks() {
-        // The substantive half of the race fix: the claim's membership is read
-        // from the index *inside* `begin_maintenance`, so a caller cannot hand it
-        // a set read earlier. Pins that `Directory` sees what the index says at
-        // mark time — including a project the caller never knew about.
-        //
-        // **What this does not pin, and cannot from outside:** that the
-        // derivation happens under the same `registry_write` acquisition as the
-        // marking. That guarantee is mutual exclusion against
-        // `create_project_impl`, which takes the same lock before it commits —
-        // structural, unobservable without a third test seam, and stated at
-        // `MaintenanceScope` rather than asserted here.
-        let (state, _cwd, project) = state_with_project("alpha").await;
-        let directory_id = state
-            .store
-            .list_projects()
-            .unwrap()
-            .into_iter()
-            .find(|entry| entry.id == project.id)
-            .unwrap()
-            .directory_id;
-        let sibling = create_project_in_only_dir(&state, "beta");
-
-        let guard = begin_maintenance(&state, &MaintenanceScope::Directory(directory_id)).unwrap();
-        assert!(
-            guard.marked.contains(&project.id) && guard.marked.contains(&sibling.id),
-            "a directory claim must cover every project the index attributes to it, \
-             got {:?}",
-            guard.marked
-        );
-        guard.finish_discarded();
-    }
-
-    #[tokio::test]
-    async fn a_repoint_refuses_an_unreadable_catalog_without_tearing_anything_down() {
-        // The catalog is resolved before any eviction or drain, so a store we
-        // cannot read fails the command with the projects still loaded and their
-        // agents still running. Tearing down on the way to a guaranteed failure
-        // is pure destruction — the same reason the unrepairable states are
-        // rejected up front.
-        let (state, _cwd, project) = state_with_project("alpha").await;
-        let moved = TempDir::new().unwrap();
-        std::fs::remove_file(state.store.root().join("directories.jsonl")).unwrap();
-
-        let err =
-            repoint_project_directory_impl(&state, project.id, moved.path().to_str().unwrap())
-                .await
-                .unwrap_err();
-        assert!(
-            matches!(err, AppError::Core(CoreError::MissingAppendOnlyFile { .. })),
-            "got: {err:?}"
+            cwd.path().canonicalize().unwrap()
         );
         assert!(
-            lock(&state.projects).contains_key(&project.id),
-            "a refused repair must not unload the project"
+            lock(&state.projects).contains_key(&sibling.id),
+            "the sibling is neither evicted nor drained"
         );
-        assert!(
-            lock(&state.maintenance).is_empty(),
-            "nor leave it marked under maintenance"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_ambiguous_directory_identity_reaches_the_wire_as_its_own_status() {
-        // The four-state status exists because the repairs differ. An ambiguous
-        // identity is fixed by a re-point (which collapses the duplicate rows);
-        // a missing one has no in-app repair. Reporting both as "unavailable"
-        // would point the user at the wrong action — or at no action.
-        let (state, cwd, project) = state_with_project("alpha").await;
-        let elsewhere = TempDir::new().unwrap();
-        let mut entries = state.store.list_directories().unwrap();
-        entries.push(switchboard_core::DirectoryEntry {
-            directory_id: entries[0].directory_id,
-            path: elsewhere.path().canonicalize().unwrap(),
-        });
-        write_catalog(&state, &entries);
-
-        let listings = list_projects_impl(&state).unwrap();
-        let row = listings.iter().find(|l| l.id == project.id).unwrap();
-        assert_eq!(row.directory_status, DirectoryStatus::CatalogAmbiguous);
-        assert!(row.directory.is_none());
-        drop(cwd);
     }
 
     #[tokio::test]
@@ -15629,7 +14836,7 @@ mod tests {
         // today (ids are minted fresh, an agent lives in one registry); the
         // check lands before the move feature that can produce the state.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
 
         let mut impostor = agent.clone();
         impostor.project_id = Uuid::now_v7();
@@ -15662,7 +14869,7 @@ mod tests {
         // directories are the material a repair would rebuild from. Deleting
         // them would look like an ordinary delete while destroying that
         // material.
-        let (state, _cwd, project) = state_with_project("alpha").await;
+        let (state, _cwd, project) = state_with_project("alpha");
         let root = state.store.project_root(project.id);
         std::fs::remove_file(state.store.root().join("projects.jsonl")).unwrap();
 
@@ -15686,21 +14893,20 @@ mod tests {
         // that index — so the resurrection path is structurally gone. What still
         // needs proving is that the delete works at all with no reachable
         // working directory, since everything being removed lives in the store.
-        let (state, _cwd, project) = state_with_project("alpha").await;
+        let (state, _cwd, project) = state_with_project("alpha");
         let missing = TempDir::new().unwrap();
         let missing_path = missing.path().canonicalize().unwrap();
         drop(missing);
-        repoint_only_directory(&state, &missing_path);
+        set_only_project_directory_unchecked(&state, &missing_path);
         lock(&state.projects).remove(&project.id);
         lock(&state.project_locks).remove(&project.id);
 
         // Precondition: it lists, and reports its directory as unavailable.
         let before = list_projects_impl(&state).unwrap();
         let row = before.iter().find(|p| p.id == project.id).unwrap();
-        assert_eq!(
-            row.directory_status,
-            DirectoryStatus::ResolvedPathUnavailable,
-            "expected a catalogued directory whose path is gone"
+        assert!(
+            !row.directory_available,
+            "expected a recorded directory whose path is gone"
         );
 
         delete_project_impl(&state, project.id).await.unwrap();
@@ -15725,7 +14931,7 @@ mod tests {
         // lived inside that directory and couldn't be rewritten — so
         // reconnecting resurrected it. The index is in the store now, so the
         // delete is real, and reconnecting the directory brings back nothing.
-        let (state, tmp, project) = state_with_project("alpha").await;
+        let (state, tmp, project) = state_with_project("alpha");
 
         // Go offline: drop the loaded handle/lock/registry.
         lock(&state.projects).remove(&project.id);
@@ -15733,9 +14939,7 @@ mod tests {
 
         delete_project_impl(&state, project.id).await.unwrap();
 
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         assert!(
             list_projects_impl(&state)
                 .unwrap()
@@ -15752,7 +14956,7 @@ mod tests {
         // disk (registry.jsonl) and in the `agents_by_id` cache, so the next
         // dispatch's DispatchContext reads the captured locator.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_claude, project_id) = project_with_agent(&state, &tmp).await;
+        let (_claude, project_id) = project_with_agent(&state, &tmp);
         let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex, None, None).unwrap();
         assert!(codex.session_locator.is_none());
 
@@ -15804,7 +15008,7 @@ mod tests {
         use switchboard_dispatcher::SessionLocatorSink;
 
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_claude, project_id) = project_with_agent(&state, &tmp).await;
+        let (_claude, project_id) = project_with_agent(&state, &tmp);
         let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex, None, None).unwrap();
 
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
@@ -15847,7 +15051,7 @@ mod tests {
         use switchboard_dispatcher::SessionLocatorSink;
 
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_claude, project_id) = project_with_agent(&state, &tmp).await;
+        let (_claude, project_id) = project_with_agent(&state, &tmp);
         let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex, None, None).unwrap();
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
         let sink = crate::locator_sink::ProjectSessionLocatorSink::new(
@@ -15866,7 +15070,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_turn_on_idle_agent_is_a_no_op() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
-        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, _project_id) = project_with_agent(&state, &tmp);
         // Never dispatched → nothing to cancel.
         assert_eq!(
             cancel_turn_impl(&state, agent.id),
@@ -15881,7 +15085,7 @@ mod tests {
         // assert the impl drives a live turn to a cancelled terminal + idle.
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, _project_id) = project_with_agent(&state, &tmp);
 
         send_msg(&state, agent.id, "long task").await.unwrap();
         within(
@@ -15912,7 +15116,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_agent_on_idle_agent_is_a_no_op() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
-        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, _project_id) = project_with_agent(&state, &tmp);
         assert_eq!(
             cancel_agent_impl(&state, agent.id),
             CancelOutcome::NothingToCancel
@@ -15928,7 +15132,7 @@ mod tests {
         // terminal.
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent_a, _project_id) = project_with_agent(&state, &tmp).await;
+        let (agent_a, _project_id) = project_with_agent(&state, &tmp);
         let agent_b =
             create_agent_impl(&state, "assistant-2", HarnessKind::ClaudeCode, None, None).unwrap();
 
@@ -15986,7 +15190,7 @@ mod tests {
     async fn drain_helper_cancels_drains_then_releases_lock() {
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
 
         send_msg(&state, agent.id, "long task").await.unwrap();
         // Wait until the turn is actually live (started) before draining — the
@@ -16035,7 +15239,7 @@ mod tests {
         // record (the user's side) and no `outcome` record (content is in the
         // harness file) to the project's journal.jsonl.
         let (tmp, state, emitter) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
 
         send_msg(&state, agent.id, "journal me").await.unwrap();
         // The send record is written at turn-start, but await the terminal
@@ -16082,7 +15286,7 @@ mod tests {
     #[tokio::test]
     async fn stage_attachment_copies_into_project_dir_and_returns_absolute_path() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
 
         let source = tmp.path().join("diagram.png");
         std::fs::write(&source, b"PNG-BYTES").unwrap();
@@ -16105,7 +15309,7 @@ mod tests {
     #[tokio::test]
     async fn stage_attachment_is_collision_safe_for_same_filename() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
         let source = tmp.path().join("notes.txt");
 
         std::fs::write(&source, b"one").unwrap();
@@ -16138,7 +15342,7 @@ mod tests {
     #[tokio::test]
     async fn send_with_attachments_footers_adapter_prompt_and_journals_clean_text() {
         let (tmp, state, emitter) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
 
         let attachment = test_attachment(
             "image-1",
@@ -16198,7 +15402,7 @@ mod tests {
     async fn remove_queued_message_round_trips_attachments() {
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, _project_id) = project_with_agent(&state, &tmp);
 
         // First send parks in flight (AwaitCancellation); the second queues behind it.
         send_msg(&state, agent.id, "in flight").await.unwrap();
@@ -16257,7 +15461,7 @@ mod tests {
     #[tokio::test]
     async fn existing_attachment_paths_keeps_only_live_files_inside_the_project_dir() {
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
 
         let source = tmp.path().join("live.png");
         std::fs::write(&source, b"L").unwrap();
@@ -16297,7 +15501,7 @@ mod tests {
         // real file outside the attachments dir. It must be rejected, or the
         // command is a general filesystem-existence oracle.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
 
         // Ensure the attachments dir exists so it canonicalizes.
@@ -16326,7 +15530,7 @@ mod tests {
     #[tokio::test]
     async fn existing_attachment_paths_rejects_symlink_pointing_outside_the_dir() {
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
         std::fs::create_dir_all(project.attachments_dir()).unwrap();
 
@@ -16353,7 +15557,7 @@ mod tests {
         // pre-canonical staged path — so a survivor must come back byte-identical,
         // not canonicalized.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
 
         let source = tmp.path().join("live.png");
         std::fs::write(&source, b"L").unwrap();
@@ -16375,7 +15579,7 @@ mod tests {
         // A cleaned `.switchboard/` means no chip can exist — an empty list, not an
         // error.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
         let ghost = project
             .attachments_dir()
@@ -16447,7 +15651,7 @@ mod tests {
         // never dispatches.
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, _project_id) = project_with_agent(&state, &tmp);
 
         // First send starts the turn and parks it.
         send_msg(&state, agent.id, "blocker").await.unwrap();
@@ -16493,7 +15697,7 @@ mod tests {
         // No actor for the agent (never dispatched) → NotQueued maps to
         // QueuedMessageNotFound.
         let (tmp, state, _emitter) = fresh_state_with_mock();
-        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, _project_id) = project_with_agent(&state, &tmp);
         let unknown = Uuid::now_v7();
         let err = remove_queued_message_impl(&state, agent.id, unknown)
             .await
@@ -16504,136 +15708,69 @@ mod tests {
     // ---- multi-directory workspace ----
 
     #[tokio::test]
-    async fn two_spellings_of_same_directory_collapse_to_one() {
-        // Init the same directory under two spellings (a plain path and one
-        // with a redundant `/./` component). `Directory::at` canonicalizes, so
-        // both must collapse to a single `directories` entry, a single
-        // workspace entry, and its projects must list exactly once.
+    async fn two_spellings_of_same_directory_record_one_path() {
+        // Create projects under two spellings of one directory (a plain path
+        // and one with a redundant `/./` component). `Directory::at`
+        // canonicalizes, so both rows must record the same directory.
         let (tmp, state, _) = fresh_state_with_mock();
         let plain = tmp.path().to_str().unwrap().to_owned();
         let dotted = format!("{plain}/./");
+        let canonical = tmp.path().canonicalize().unwrap();
 
-        init_directory_impl(&state, &plain).await.unwrap();
-        let project = create_project_in_only_dir(&state, "alpha");
-        init_directory_impl(&state, &dotted).await.unwrap();
+        let alpha = create_project_impl(&state, "alpha", &plain).unwrap();
+        let beta = create_project_impl(&state, "beta", &dotted).unwrap();
 
-        assert_eq!(
-            state.store.list_directories().unwrap().len(),
-            1,
-            "two spellings must collapse to one catalogued directory"
-        );
-        assert_eq!(
-            lock(&state.workspace).entries().len(),
-            1,
-            "two spellings must collapse to one workspace entry"
-        );
         let listings = list_projects_impl(&state).unwrap();
-        assert_eq!(listings.len(), 1, "the project lists exactly once");
-        assert_eq!(listings[0].id, project.id);
-        assert_eq!(
-            listings[0].directory_status,
-            DirectoryStatus::ResolvedAvailable
-        );
+        assert_eq!(listings.len(), 2);
+        for id in [alpha.id, beta.id] {
+            let row = listings.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.directory, canonical.to_string_lossy());
+            assert!(row.directory_available);
+        }
+        // And the per-directory name rule sees them as one folder.
+        assert!(matches!(
+            create_project_impl(&state, "Alpha", &dotted).unwrap_err(),
+            AppError::Core(CoreError::DuplicateProjectName { .. })
+        ));
     }
 
     #[tokio::test]
     async fn list_projects_aggregates_across_two_directories() {
         let (tmp_a, state, _) = fresh_state_with_mock();
         let tmp_b = TempDir::new().unwrap();
+        let dir_a = tmp_a.path().canonicalize().unwrap();
+        let dir_b = tmp_b.path().canonicalize().unwrap();
 
-        init_directory_impl(&state, tmp_a.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let dir_a = state
-            .store
-            .list_directories()
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.path)
-            .next()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let alpha = create_project_impl(&state, "alpha", &dir_a).unwrap();
-
-        let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let dir_b = info_b.path.clone();
-        let beta = create_project_impl(&state, "beta", &dir_b).unwrap();
+        let alpha = create_project_impl(&state, "alpha", tmp_a.path().to_str().unwrap()).unwrap();
+        let beta = create_project_impl(&state, "beta", tmp_b.path().to_str().unwrap()).unwrap();
 
         let listings = list_projects_impl(&state).unwrap();
         assert_eq!(listings.len(), 2, "both directories' projects aggregate");
 
         let alpha_row = listings.iter().find(|l| l.id == alpha.id).unwrap();
         let beta_row = listings.iter().find(|l| l.id == beta.id).unwrap();
-        assert_eq!(alpha_row.directory.as_deref(), Some(dir_a.as_str()));
-        assert_eq!(beta_row.directory.as_deref(), Some(dir_b.as_str()));
-        assert_eq!(
-            alpha_row.directory_status,
-            DirectoryStatus::ResolvedAvailable
-        );
-        assert_eq!(
-            beta_row.directory_status,
-            DirectoryStatus::ResolvedAvailable
-        );
+        assert_eq!(alpha_row.directory, dir_a.to_string_lossy());
+        assert_eq!(beta_row.directory, dir_b.to_string_lossy());
+        assert!(alpha_row.directory_available);
+        assert!(beta_row.directory_available);
     }
 
     #[tokio::test]
-    async fn list_workspace_directories_includes_empty_directory_and_reports_persistable() {
-        let dir = TempDir::new().unwrap();
-        let ws_path = dir.path().join("workspace.yaml");
-        let tmp = TempDir::new().unwrap();
-        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new_for_test(
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            emitter as Arc<dyn EventEmitter>,
-        )
-        .with_workspace(ws_path);
-
-        // A directory with no projects must still appear in the switcher —
-        // unlike `list_projects`, which emits zero rows for it.
-        let info = init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        assert!(
-            list_projects_impl(&state).unwrap().is_empty(),
-            "no projects created yet"
-        );
-
-        let ws = list_workspace_directories_impl(&state);
-        assert!(ws.persistable, "a readable workspace.yaml is persistable");
-        assert_eq!(ws.directories.len(), 1);
-        assert_eq!(ws.directories[0].path, info.path);
-        assert!(
-            ws.directories[0].available,
-            "a freshly-initialized directory is loaded"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_workspace_directories_marks_unloaded_directory_unavailable_and_not_persistable() {
+    async fn workspace_status_reports_whether_view_state_persists() {
         // `fresh_state_with_mock` builds state with no `workspace_path`, the
         // not-persistable case (an unreadable existing workspace.yaml).
         let (_tmp, state, _) = fresh_state_with_mock();
-        // Register a directory in the workspace list whose path does not exist —
-        // as if it were unmounted at startup.
-        let phantom = PathBuf::from("/definitely/not/mounted");
-        lock(&state.workspace).add(phantom.clone());
-
-        let ws = list_workspace_directories_impl(&state);
         assert!(
-            !ws.persistable,
+            !workspace_status_impl(&state).persistable,
             "state with no workspace_path is not persistable"
         );
-        assert_eq!(ws.directories.len(), 1);
-        assert_eq!(ws.directories[0].path, phantom.to_string_lossy());
+
+        let dir = TempDir::new().unwrap();
+        let (_tmp, state, _) = fresh_state_with_mock();
+        let state = state.with_workspace(dir.path().join("workspace.yaml"));
         assert!(
-            !ws.directories[0].available,
-            "a registered-but-unloaded directory is unavailable"
+            workspace_status_impl(&state).persistable,
+            "a readable (or absent) workspace.yaml is persistable"
         );
     }
 
@@ -16649,9 +15786,7 @@ mod tests {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
         stage_codex_session_file(tmp_home.path(), date, &session_id.to_string());
 
-        let info_a = init_directory_impl(&state, tmp_a.path().to_str().unwrap())
-            .await
-            .unwrap();
+        let info_a = register_test_directory(&state, tmp_a.path().to_str().unwrap());
         let alpha = create_project_impl(&state, "alpha", &info_a.path).unwrap();
         set_active_project_impl(&state, alpha.id).unwrap();
         attach_agent_impl(
@@ -16666,9 +15801,7 @@ mod tests {
         .unwrap();
 
         // Second directory, attempt to attach the same Codex session id.
-        let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
-            .await
-            .unwrap();
+        let info_b = register_test_directory(&state, tmp_b.path().to_str().unwrap());
         let beta = create_project_impl(&state, "beta", &info_b.path).unwrap();
         set_active_project_impl(&state, beta.id).unwrap();
         let err = attach_agent_impl(
@@ -16701,9 +15834,7 @@ mod tests {
         stage_claude_session_file(tmp_home.path(), tmp_a.path(), &session_id);
         stage_claude_session_file(tmp_home.path(), tmp_b.path(), &session_id);
 
-        let info_a = init_directory_impl(&state, tmp_a.path().to_str().unwrap())
-            .await
-            .unwrap();
+        let info_a = register_test_directory(&state, tmp_a.path().to_str().unwrap());
         let alpha = create_project_impl(&state, "alpha", &info_a.path).unwrap();
         set_active_project_impl(&state, alpha.id).unwrap();
         attach_agent_impl(
@@ -16717,9 +15848,7 @@ mod tests {
         )
         .unwrap();
 
-        let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
-            .await
-            .unwrap();
+        let info_b = register_test_directory(&state, tmp_b.path().to_str().unwrap());
         let beta = create_project_impl(&state, "beta", &info_b.path).unwrap();
         set_active_project_impl(&state, beta.id).unwrap();
         attach_agent_impl(
@@ -16737,206 +15866,71 @@ mod tests {
     // ---- directory-identity helper, list resilience ----
 
     #[tokio::test]
-    async fn create_project_canonicalization_matches_init_directory_key() {
-        // The dedup invariant the flat cross-directory list depends on: the key
-        // `create_project_impl` resolves a directory by (`canonicalize_boundary`)
-        // must equal the key `init_directory_impl` stored for that directory
-        // (`Directory::at`'s canonical path). Feed `create_project` a noisy
-        // spelling of the same path and assert it still finds the loaded
-        // directory and creates the project there.
+    async fn create_project_records_the_canonical_directory() {
+        // The dedup invariant the per-directory rules depend on: whatever
+        // spelling the frontend hands over, the recorded directory is the
+        // canonical path (`Directory::at`), so two spellings are one folder.
         let (tmp, state, _) = fresh_state_with_mock();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let stored_key = state.store.list_directories().unwrap()[0].path.clone();
+        let canonical = tmp.path().canonicalize().unwrap();
 
         let noisy = format!("{}/./", tmp.path().to_str().unwrap());
         let summary = create_project_impl(&state, "alpha", &noisy).unwrap();
 
         let project = lock(&state.projects).get(&summary.id).cloned().unwrap();
+        assert_eq!(project.directory, canonical);
         assert_eq!(
-            project.directory, stored_key,
-            "create_project must resolve to the same canonical key init stored"
-        );
-        assert_eq!(
-            state.store.list_directories().unwrap().len(),
-            1,
-            "no second directory entry was created"
+            state.store.list_projects().unwrap()[0].directory,
+            canonical,
+            "the index row records the canonical path too"
         );
     }
 
     #[tokio::test]
-    async fn list_projects_with_no_changes_performs_no_write() {
-        // Persist-on-change: a second list with nothing changed must not rewrite
-        // workspace.yaml.
-        let dir = TempDir::new().unwrap();
-        let ws_path = dir.path().join("workspace.yaml");
-        let tmp = TempDir::new().unwrap();
-        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new_for_test(
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            emitter as Arc<dyn EventEmitter>,
-        )
-        .with_workspace(ws_path.clone());
-
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
-        create_project_in_only_dir(&state, "alpha");
-
-        // First list refreshes the cache (project added since last persist) and
-        // writes the file.
-        list_projects_impl(&state).unwrap();
-        let first_mtime = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
-
-        // Second list: nothing changed → no write, so mtime is unchanged.
-        list_projects_impl(&state).unwrap();
-        let second_mtime = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
-        assert_eq!(
-            first_mtime, second_mtime,
-            "an unchanged list must not rewrite workspace.yaml"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_projects_reports_a_vanished_directory_without_rewriting_workspace_yaml() {
-        // Two properties that used to belong to the cache path. First: a project
-        // whose directory is gone still lists — it just reports the directory as
-        // unavailable, with the path it *should* be at, which is what the
-        // re-point repair needs. Second: listing is a hot read and must not
-        // write `workspace.yaml`; that is now structural (there is no cache to
-        // refresh) rather than a persist-on-change optimization.
+    async fn list_projects_never_writes_workspace_yaml() {
+        // Listing is a hot read. `workspace.yaml` is written by view-state
+        // changes (archive) only; a list must not touch it.
         let dir = TempDir::new().unwrap();
         let ws_path = dir.path().join("workspace.yaml");
         let (tmp, state, _) = fresh_state_with_mock();
         let state = state.with_workspace(ws_path.clone());
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "alpha");
+        set_project_archived_impl(&state, project.id, true).unwrap();
+        let first_mtime = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
+
+        list_projects_impl(&state).unwrap();
+        list_projects_impl(&state).unwrap();
+        let second_mtime = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
+        assert_eq!(
+            first_mtime, second_mtime,
+            "listing must not rewrite workspace.yaml"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_projects_reports_a_vanished_directory_with_the_path_it_should_be_at() {
+        // A project whose directory is gone still lists — it just reports the
+        // directory as unavailable, with the path it *should* be at, which is
+        // what a repair needs.
+        let (tmp, state, _) = fresh_state_with_mock();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let proj = create_project_in_only_dir(&state, "alpha");
         list_projects_impl(&state).unwrap();
 
         let missing = TempDir::new().unwrap();
         let missing_path = missing.path().canonicalize().unwrap();
         drop(missing);
-        repoint_only_directory(&state, &missing_path);
-        let before = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
+        set_only_project_directory_unchecked(&state, &missing_path);
 
         let listings = list_projects_impl(&state).unwrap();
         assert_eq!(listings.len(), 1, "the project still lists");
         assert_eq!(listings[0].id, proj.id);
+        assert!(!listings[0].directory_available);
         assert_eq!(
-            listings[0].directory_status,
-            DirectoryStatus::ResolvedPathUnavailable
+            listings[0].directory,
+            missing_path.to_string_lossy(),
+            "the recorded path is reported so the user can repair it"
         );
-        assert_eq!(
-            listings[0].directory.as_deref(),
-            Some(missing_path.to_string_lossy().as_ref()),
-            "the catalogued path is reported so the user can re-point it"
-        );
-
-        let after = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
-        assert_eq!(before, after, "listing must not rewrite workspace.yaml");
-    }
-
-    #[tokio::test]
-    async fn list_projects_degrades_one_damaged_row_without_hiding_the_healthy_ones() {
-        // The old shape of this test was "a corrupt directory index must not
-        // fail the other directories' listings". Per-directory indexes are gone,
-        // so the equivalent hazard is a damaged *catalog row*: one project whose
-        // `directory_id` resolves to nothing must degrade to an unresolved row
-        // while every healthy project still lists. Whole-read failure here would
-        // hide every project behind one broken reference.
-        let (tmp_a, state, _) = fresh_state_with_mock();
-        let tmp_b = TempDir::new().unwrap();
-        let info_a = init_directory_impl(&state, tmp_a.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let alpha = create_project_impl(&state, "alpha", &info_a.path).unwrap();
-        let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let beta = create_project_impl(&state, "beta", &info_b.path).unwrap();
-
-        // Drop A's catalog row, leaving alpha's `directory_id` dangling.
-        let canonical_a = tmp_a.path().canonicalize().unwrap();
-        let kept: Vec<switchboard_core::DirectoryEntry> = state
-            .store
-            .list_directories()
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.path != canonical_a)
-            .collect();
-        write_catalog(&state, &kept);
-
-        let listings = list_projects_impl(&state).unwrap();
-        let beta_row = listings
-            .iter()
-            .find(|l| l.id == beta.id)
-            .expect("a healthy project still lists");
-        assert_eq!(
-            beta_row.directory_status,
-            DirectoryStatus::ResolvedAvailable
-        );
-
-        let alpha_row = listings
-            .iter()
-            .find(|l| l.id == alpha.id)
-            .expect("a project with a damaged catalog row still lists");
-        assert_eq!(
-            alpha_row.directory_status,
-            DirectoryStatus::CatalogMissing,
-            "the cause must reach the wire — its repair differs from a moved folder"
-        );
-        assert!(
-            alpha_row.directory.is_none(),
-            "there is no path to report, and guessing one is what the store refuses"
-        );
-    }
-
-    #[tokio::test]
-    async fn open_project_resolves_directly_and_cannot_be_blocked_by_another_project() {
-        // The failure this replaces: opening a project used to scan every loaded
-        // directory's index, so an unrelated directory with a damaged index
-        // could — depending on unordered map iteration — intermittently block
-        // opening a perfectly healthy project. The store resolves a project from
-        // its id in one lookup, so there is no scan to be caught by. Staged with
-        // an *unrelated* damaged catalog row, the closest remaining analogue.
-        let (tmp_a, state, _) = fresh_state_with_mock();
-        let tmp_b = TempDir::new().unwrap();
-        let info_a = init_directory_impl(&state, tmp_a.path().to_str().unwrap())
-            .await
-            .unwrap();
-        create_project_impl(&state, "alpha", &info_a.path).unwrap();
-        let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let beta = create_project_impl(&state, "beta", &info_b.path).unwrap();
-
-        // Evict B from the loaded set so the open must go to disk.
-        lock(&state.projects).remove(&beta.id);
-        lock(&state.project_locks).remove(&beta.id);
-
-        // Duplicate A's catalog row, making *A's* directory id ambiguous.
-        let canonical_a = tmp_a.path().canonicalize().unwrap();
-        let mut entries = state.store.list_directories().unwrap();
-        let row_a = entries
-            .iter()
-            .find(|entry| entry.path == canonical_a)
-            .unwrap()
-            .clone();
-        entries.push(switchboard_core::DirectoryEntry {
-            directory_id: row_a.directory_id,
-            path: tmp_b.path().canonicalize().unwrap(),
-        });
-        write_catalog(&state, &entries);
-
-        let reopened = open_project_impl(&state, beta.id)
-            .expect("a healthy project opens despite another project's damaged catalog row");
-        assert_eq!(reopened.id, beta.id);
     }
 
     // ---- remove_directory teardown-race tests ----
@@ -16955,7 +15949,7 @@ mod tests {
         // rewritten.
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
         let state = Arc::new(state);
 
         // First send starts + parks the turn.
@@ -16994,9 +15988,6 @@ mod tests {
         assert!(lock(&state.agents_by_id).is_empty());
         assert!(lock(&state.projects).is_empty());
         assert!(lock(&state.project_locks).is_empty());
-        // The *directory* stays catalogued and loaded — deleting a project has
-        // never removed its directory, and hiding no longer removes anything.
-        assert_eq!(state.store.list_directories().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -17006,11 +15997,11 @@ mod tests {
         // that became a view-state hide; the teardown race is unchanged and
         // delete is the operation that still performs it.
         let (tmp, state, _emitter) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
         let state = Arc::new(state);
 
-        let dir_path: String = state.store.list_directories().unwrap()[0]
-            .path
+        let dir_path: String = state.store.list_projects().unwrap()[0]
+            .directory
             .to_string_lossy()
             .into_owned();
 
@@ -17061,7 +16052,7 @@ mod tests {
         // down. The maintenance refusal is the arm that is new: before it, an
         // open landing mid-teardown could load the project back in.
         let (tmp, state, _emitter) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
         // Evict from the loaded set so the open takes the first-open path and
         // genuinely races the delete.
         let state = Arc::new(state);
@@ -21594,7 +20585,7 @@ mod tests {
         // empty transcript). Append journal records directly, then assert the
         // command surfaces the journal-sourced items.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (agent, project_id) = project_with_agent(&state, &tmp);
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
         let send_id = Uuid::now_v7();
         let turn_id = Uuid::now_v7();
@@ -21642,7 +20633,7 @@ mod tests {
     #[tokio::test]
     async fn load_project_conversation_missing_journal_has_no_user_items() {
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
 
         let home = tmp.path().to_path_buf();
         let conv = load_project_conversation_impl(&state, project_id, &home, &[])
@@ -21661,7 +20652,7 @@ mod tests {
         // reference must spare it from the load-time GC while the undeclared one
         // is still reclaimed — the whole reason the parameter exists.
         let (tmp, state, _) = fresh_state_with_mock();
-        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
 
         let source = tmp.path().join("drafted.png");
         std::fs::write(&source, b"D").unwrap();
@@ -21739,30 +20730,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_directory_auto_adds_repo_root_to_git_registry() {
+    async fn create_project_auto_adds_repo_root_to_git_registry() {
         let (_cfg, state) = state_with_registries();
         let repo = TempDir::new().unwrap();
         init_git_repo(repo.path());
 
-        init_directory_impl(&state, repo.path().to_str().unwrap())
-            .await
-            .unwrap();
+        create_project_impl(&state, "alpha", repo.path().to_str().unwrap()).unwrap();
 
         let canonical = repo.path().canonicalize().unwrap();
         assert!(
             lock(&state.git_registry).contains(&canonical),
-            "a git working directory auto-syncs its repo root into the git registry"
+            "a project in a git working directory auto-syncs its repo root into the git registry"
         );
     }
 
     #[tokio::test]
-    async fn init_directory_does_not_track_a_non_git_directory() {
+    async fn create_project_does_not_track_a_non_git_directory() {
         let (_cfg, state) = state_with_registries();
         let plain = TempDir::new().unwrap(); // no `git init`
 
-        init_directory_impl(&state, plain.path().to_str().unwrap())
-            .await
-            .unwrap();
+        create_project_impl(&state, "alpha", plain.path().to_str().unwrap()).unwrap();
 
         assert!(
             lock(&state.git_registry).roots().is_empty(),
@@ -21788,15 +20775,9 @@ mod tests {
             &["worktree", "add", wt_path.to_str().unwrap(), "feature"],
         );
 
-        init_directory_impl(&state, repo.path().to_str().unwrap())
-            .await
-            .unwrap();
-        init_directory_impl(&state, sub.to_str().unwrap())
-            .await
-            .unwrap();
-        init_directory_impl(&state, wt_path.to_str().unwrap())
-            .await
-            .unwrap();
+        create_project_impl(&state, "root", repo.path().to_str().unwrap()).unwrap();
+        create_project_impl(&state, "sub", sub.to_str().unwrap()).unwrap();
+        create_project_impl(&state, "wt", wt_path.to_str().unwrap()).unwrap();
 
         assert_eq!(
             lock(&state.git_registry).roots().len(),
@@ -22567,9 +21548,7 @@ mod tests {
         // A tracked repo hosting a Switchboard project at its main worktree.
         let repo = TempDir::new().unwrap();
         init_git_repo(repo.path());
-        init_directory_impl(&state, repo.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, repo.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "alpha");
         let canonical = repo.path().canonicalize().unwrap();
 
@@ -22633,9 +21612,7 @@ mod tests {
 
         // Track the repo, but create the project in a subfolder of it.
         add_tracked_repo_impl(&state, repo.path().to_str().unwrap()).unwrap();
-        init_directory_impl(&state, subdir.to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, subdir.to_str().unwrap());
         create_project_impl(&state, "sub", subdir.to_str().unwrap()).unwrap();
 
         let inputs = tracked_repos_inputs(&state);
@@ -22957,7 +21934,7 @@ mod tests {
     /// Stand up a prompts-enabled state with a directory + active project, ready
     /// for `seed_source` + `forward_prompt_impl`. Returns the state, a temp HOME
     /// for staging source transcripts, and the project id.
-    async fn prompt_forward_state() -> (TempDir, TempDir, AppState, ProjectId) {
+    fn prompt_forward_state() -> (TempDir, TempDir, AppState, ProjectId) {
         let (tmp, state) = state_with_prompts();
         let home = TempDir::new().unwrap();
         std::fs::write(
@@ -22966,9 +21943,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(tmp.path().join("prompts").join("notes.md"), NOTES_PROMPT).unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         (tmp, home, state, project.id)
@@ -22978,7 +21953,7 @@ mod tests {
     /// so a test can hold a source's turn deterministically in flight (the
     /// cross-argument invalidation race needs one source pending while another
     /// fails). Returns the recording emitter too, for `turn_start` waits.
-    async fn prompt_forward_state_with_adapters(
+    fn prompt_forward_state_with_adapters(
         claude: Arc<dyn HarnessAdapter>,
         codex: Arc<dyn HarnessAdapter>,
     ) -> (TempDir, TempDir, AppState, ProjectId, Arc<RecordingEmitter>) {
@@ -23002,9 +21977,7 @@ mod tests {
             Arc::new(switchboard_prompts::InMemorySecretStore::new()),
         );
         let state = state.with_prompts(service);
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         (tmp, home, state, project.id, emitter)
@@ -23012,7 +21985,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_prompt_fills_forwarded_arg_and_renders_with_typed_args() {
-        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let (_tmp, home, state, project_id) = prompt_forward_state();
         let source = seed_source(
             &state,
             home.path(),
@@ -23056,7 +22029,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_prompt_required_arg_all_empty_invalidates() {
-        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let (_tmp, home, state, project_id) = prompt_forward_state();
         let empty = seed_source(&state, home.path(), project_id, "reviewer-1", "");
 
         let outcome = forward_prompt_impl(
@@ -23092,7 +22065,7 @@ mod tests {
         // argument's requiredness to the prompt, not permission to silently
         // drop a selected source. (Inverts the old proceed-and-caption
         // behavior — same uniform any-empty policy as the message path.)
-        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let (_tmp, home, state, project_id) = prompt_forward_state();
         let empty = seed_source(&state, home.path(), project_id, "reviewer-1", "");
 
         let outcome = forward_prompt_impl(
@@ -23124,7 +22097,7 @@ mod tests {
     async fn forward_prompt_same_empty_agent_in_two_fields_named_once() {
         // The flat validator sees every field's sources; the same agent feeding
         // two arguments must not read "Alice, Alice have no forwardable text…".
-        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let (_tmp, home, state, project_id) = prompt_forward_state();
         let empty = seed_source(&state, home.path(), project_id, "reviewer-1", "");
 
         let outcome = forward_prompt_impl(
@@ -23170,7 +22143,7 @@ mod tests {
     async fn forward_prompt_appended_empty_source_invalidates() {
         // The appended text's sources are validated with the arguments' — the
         // any-empty policy is per-forward, not per-field.
-        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let (_tmp, home, state, project_id) = prompt_forward_state();
         let empty = seed_source(&state, home.path(), project_id, "reviewer-1", "");
 
         let outcome = forward_prompt_impl(
@@ -23199,7 +22172,7 @@ mod tests {
         // but the appended text forwards from a source. The backend renders the
         // prompt, composes the appended tail (typed lead + forwarded block), and
         // returns the combined body.
-        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let (_tmp, home, state, project_id) = prompt_forward_state();
         let source = seed_source(
             &state,
             home.path(),
@@ -23237,7 +22210,7 @@ mod tests {
         // The distinctive shape: ONE argument that is both typed *and*
         // forwarded — the typed lead text leads, then the forwarded block, in that
         // argument's single rendered value.
-        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let (_tmp, home, state, project_id) = prompt_forward_state();
         let source = seed_source(&state, home.path(), project_id, "reviewer-1", "LGTM");
 
         let outcome = forward_prompt_impl(
@@ -23289,7 +22262,7 @@ mod tests {
             MockScenario::AwaitCancellation,
         ));
         let (_tmp, home, state, _project_id, emitter) =
-            prompt_forward_state_with_adapters(claude, codex).await;
+            prompt_forward_state_with_adapters(claude, codex);
 
         let topic_src =
             create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
@@ -23930,9 +22903,7 @@ mod tests {
     async fn workflow_state(agent_names: &[&str]) -> (TempDir, AppState, ProjectId) {
         let (tmp, state) = state_with_prompts();
         let state = state.with_workflows_dir(tmp.path().join("workflows"));
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         for name in agent_names {
@@ -24816,9 +23787,7 @@ mod tests {
             Arc::new(switchboard_prompts::InMemorySecretStore::new()),
         )
         .with_workflows_dir(tmp.path().join("workflows"));
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         create_agent_impl(&state, "alice", HarnessKind::ClaudeCode, None, None).unwrap();
@@ -24901,9 +23870,7 @@ mod tests {
             ),
         )
         .unwrap();
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         create_agent_impl(&state, "alice", HarnessKind::ClaudeCode, None, None).unwrap();
@@ -25155,9 +24122,7 @@ mod tests {
             }),
         ));
         let state = state.with_notifier(gated as Arc<dyn crate::notification::Notifier>);
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         for name in ["primary", "reviewer-1"] {
@@ -25297,9 +24262,7 @@ mod tests {
         let state = state.with_prompts(service);
         let rec = Arc::new(RecordingNotifier::default());
         let state = state.with_notifier(Arc::clone(&rec) as Arc<dyn crate::notification::Notifier>);
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
-            .await
-            .unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
         let project = create_project_in_only_dir(&state, "proj");
         set_active_project_impl(&state, project.id).unwrap();
         create_agent_impl(&state, "primary", HarnessKind::ClaudeCode, None, None).unwrap();

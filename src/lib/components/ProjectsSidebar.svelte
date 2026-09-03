@@ -5,6 +5,7 @@
     Check,
     Code2,
     FolderOpen,
+    FolderSearch,
     GitBranch,
     MoreHorizontal,
     Terminal,
@@ -18,6 +19,7 @@
     projectIsIdle,
     projects,
     projectDeletions,
+    projectRelocations,
     deleteProject,
     renameProject,
     selection,
@@ -69,12 +71,17 @@
     onOpenSettings,
     onProjectSelect,
     onToggleSidebar,
+    onLocateFolder,
     settingsOpen = false,
   }: {
     onAddProject: () => void;
     onOpenSettings: () => void;
     onProjectSelect: () => void;
     onToggleSidebar: () => void;
+    /// Start the working-directory repair for `project`. App owns the flow (the
+    /// folder picker, the pending/error state) so the banner and this menu can't
+    /// drift; the row only asks for it.
+    onLocateFolder: (project: ProjectListing) => void;
     settingsOpen?: boolean;
   } = $props();
 
@@ -131,9 +138,7 @@
     const q = searchQuery.trim().toLowerCase();
     if (q === "") return projectsInView;
     return projectsInView.filter(
-      (p) =>
-        p.name.toLowerCase().includes(q) ||
-        (p.directory !== null && basename(p.directory).toLowerCase().includes(q)),
+      (p) => p.name.toLowerCase().includes(q) || basename(p.directory).toLowerCase().includes(q),
     );
   });
   const segmentClass = (selected: boolean): string =>
@@ -172,10 +177,7 @@
   const renameSiblings = $derived(
     editingProject === null
       ? []
-      : // Group by the directory's stable id, not its path: `directory` is null
-        // for both corrupt states, so `null === null` made every project with a
-        // broken directory reference a naming sibling of every other one.
-        projects.list.filter((p) => p.directory_id === editingProject.directory_id),
+      : projects.list.filter((p) => p.directory === editingProject.directory),
   );
   const renameValidation = $derived<NameValidation>(
     editingProjectId === null
@@ -187,14 +189,8 @@
   );
   const canSave = $derived(renameValidation.ok && !renaming);
 
-  /// A project's directory for display. `null` means its directory identity
-  /// resolves to no single path — corruption the user needs to see named, not a
-  /// blank where a path should be.
-  const UNRESOLVED_DIRECTORY = "working directory unresolved";
-  const directoryLabel = (project: ProjectListing): string =>
-    project.directory ?? UNRESOLVED_DIRECTORY;
-  const directoryBasename = (project: ProjectListing): string =>
-    project.directory === null ? UNRESOLVED_DIRECTORY : basename(project.directory);
+  const directoryLabel = (project: ProjectListing): string => project.directory;
+  const directoryBasename = (project: ProjectListing): string => basename(project.directory);
 
   function startEdit(project: ProjectListing): void {
     pendingDelete = null;
@@ -390,13 +386,6 @@
     archiveError = null;
     gitRevealError = null;
     openActionError = null;
-    if (project.directory === null) {
-      gitRevealError = {
-        projectId: project.id,
-        message: "This project's working directory could not be resolved.",
-      };
-      return;
-    }
     const result = await revealProjectBranch(project.id, project.directory);
     if (result.kind === "unresolved") {
       gitRevealError = {
@@ -412,27 +401,11 @@
   }
 
   /// Run an action that needs the project's working directory path.
-  ///
-  /// `directory` is null when the project's directory identity resolves to no
-  /// single path (missing or duplicated catalog row). There is nothing to open,
-  /// and guessing a path is exactly what the backend refuses to do, so this
-  /// reports the condition in the same slot an action failure would use rather
-  /// than passing an empty string down to the OS.
   function runProjectPathAction(
     project: ProjectListing,
     action: (directory: string) => Promise<void>,
   ): void {
-    if (project.directory === null) {
-      archiveError = null;
-      gitRevealError = null;
-      openActionError = {
-        projectId: project.id,
-        message: "This project's working directory could not be resolved.",
-      };
-      return;
-    }
-    const directory = project.directory;
-    runProjectOpenAction(project, () => action(directory));
+    runProjectOpenAction(project, () => action(project.directory));
   }
 
   function runProjectOpenAction(project: ProjectListing, action: () => Promise<void>): void {
@@ -499,7 +472,7 @@
       class="border-warning/30 bg-warning-soft text-warning border-b px-3 py-2 text-xs"
       data-testid="not-persistable-banner"
     >
-      Couldn't read your saved workspace — your project list won't be saved this session.
+      Couldn't read your saved workspace — archive choices won't be saved this session.
     </div>
   {/if}
 
@@ -847,6 +820,22 @@
                           Confirm delete
                         </DropdownMenuItem>
                       {:else}
+                        {#if !projectIsAvailable(project)}
+                          <DropdownMenuItem
+                            onSelect={() => onLocateFolder(project)}
+                            disabled={project.id in projectRelocations.pending}
+                            class="gap-2"
+                            data-testid="project-action-locate"
+                          >
+                            <FolderSearch
+                              size={14}
+                              strokeWidth={1.8}
+                              class="text-muted shrink-0"
+                              aria-hidden="true"
+                            />
+                            Locate folder…
+                          </DropdownMenuItem>
+                        {/if}
                         <DropdownMenuItem
                           onSelect={() => void showProjectInGit(project)}
                           class="gap-2"

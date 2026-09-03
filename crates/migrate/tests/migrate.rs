@@ -129,15 +129,16 @@ fn migrates_a_directory_end_to_end_and_the_app_code_reads_it_back() {
     let project = store.open_project(project_id).unwrap();
     assert_eq!(project.list_agents().unwrap().len(), 1);
 
-    // The directory identity was stamped everywhere it belongs.
-    let config: ProjectConfig = read_yaml(&project.root.join("config.yaml")).unwrap();
-    assert_eq!(config.directory_id, Some(indexed[0].directory_id));
-    let catalog = store.list_directories().unwrap();
-    assert_eq!(catalog.len(), 1);
+    // The working directory was stamped everywhere it belongs.
+    let canonical_legacy = legacy.path().canonicalize().unwrap();
     assert_eq!(
-        catalog[0].path,
-        legacy.path().canonicalize().unwrap(),
-        "the catalog maps the identity back to the working directory"
+        indexed[0].directory, canonical_legacy,
+        "the index row records the working directory the project came from"
+    );
+    let config: ProjectConfig = read_yaml(&project.root.join("config.yaml")).unwrap();
+    assert_eq!(
+        config.directory.as_deref(),
+        Some(canonical_legacy.as_path())
     );
 
     // Attachment: file copied, path rewritten, original preserved.
@@ -282,24 +283,22 @@ fn a_duplicated_project_id_across_directories_is_refused_before_any_write() {
     // Before any write: the refusal must not leave half a store behind.
     let store = Store::open(target.path()).unwrap();
     assert!(store.list_projects().unwrap().is_empty());
-    assert!(store.list_directories().unwrap().is_empty());
 }
 
 #[test]
 #[ignore = "migration-tool development test — run with: cargo test -p switchboard-migrate -- --ignored"]
 fn a_target_with_residue_but_an_empty_index_is_refused() {
-    // A crashed run can leave a catalog row or an orphan project directory with
-    // no index row. "Fresh" must mean fresh, not "no indexed projects" — the
-    // loose check would run over the residue and validate clean around it.
+    // A crashed run can leave an orphan project directory with no index row.
+    // "Fresh" must mean fresh, not "no indexed projects" — the loose check
+    // would run over the residue and validate clean around it.
     let (legacy, _, _) = legacy_directory("alpha");
     let target = TempDir::new().unwrap();
     {
         let store = Store::open(target.path()).unwrap();
-        let cwd = TempDir::new().unwrap();
-        store.add_directory(cwd.path()).unwrap();
+        std::fs::create_dir_all(store.project_root(uuid::Uuid::now_v7())).unwrap();
     }
     let err = switchboard_migrate::migrate(&[legacy.path().to_path_buf()], target.path())
-        .expect_err("a catalog row is residue; the target is not fresh");
+        .expect_err("an orphan project directory is residue; the target is not fresh");
     assert!(err.to_string().contains("not empty"), "got: {err}");
 }
 

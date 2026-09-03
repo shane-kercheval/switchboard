@@ -561,67 +561,34 @@ export type ProjectSummary = {
   created_at: string;
 };
 
-// Mirror of Rust `DirectoryStatus` — why a project's working directory is or
-// isn't usable. Four states rather than a boolean because the three failures
-// have different causes and different repairs:
-//   - `resolved_path_unavailable`: the ordinary moved/deleted/unmounted folder.
-//     Repairable by re-pointing the directory.
-//   - `catalog_ambiguous`: two catalog rows claim one directory identity.
-//     Corruption, also repaired by a re-point (which collapses them).
-//   - `catalog_missing`: no catalog row at all. Corruption, repaired by
-//     re-binding the identity to a user-chosen folder — the same affordance as
-//     the other two, a different operation underneath.
-// New variants land additively (the Rust enum is `#[non_exhaustive]`), so
-// consumers must degrade on an unknown value rather than assume exhaustiveness.
-export type DirectoryStatus =
-  | "resolved_available"
-  | "resolved_path_unavailable"
-  | "catalog_missing"
-  | "catalog_ambiguous";
-
 // Mirror of Rust `ProjectListing` (`crates/app/src/commands.rs`) — one row of
-// the flat cross-directory project list. `directory` is the owning directory's
-// path (label + spawn cwd), `null` when the directory identity resolves to no
-// single path; `last_activity` is the recency-ordering key (journal mtime or
-// `created_at`).
+// the flat cross-directory project list. `directory` is the project's working
+// directory (label + spawn cwd), recorded whether or not it currently exists;
+// `directory_available` says whether it does. `last_activity` is the
+// recency-ordering key (journal mtime or `created_at`).
 export type ProjectListing = {
   id: ProjectId;
   name: string;
   created_at: string;
-  // The working directory's stable identity — opaque, and present whatever
-  // `directory_status` says. Group siblings by this, never by `directory`:
-  // that is `null` for both corrupt states, so grouping on it treats every
-  // damaged project as sharing one directory.
-  directory_id: string;
-  directory: string | null;
-  directory_status: DirectoryStatus;
+  directory: string;
+  directory_available: boolean;
   last_activity: string;
   // User-global view-state (from `workspace.yaml`): the user archived this
   // project, hiding it from the default `Active` view. Not on-disk project state.
   archived: boolean;
 };
 
-// Whether a project can be dispatched into. The one question most callers ask —
-// kept as a helper so each doesn't re-derive it, and so an added
-// `DirectoryStatus` variant defaults to "not available" rather than silently
-// reading as usable.
-export function projectIsAvailable(listing: { directory_status: DirectoryStatus }): boolean {
-  return listing.directory_status === "resolved_available";
+// Whether a project can be dispatched into. The one question most callers ask,
+// kept as a helper so each doesn't re-derive it.
+export function projectIsAvailable(listing: { directory_available: boolean }): boolean {
+  return listing.directory_available;
 }
 
-// Mirror of Rust `WorkspaceDirectoryInfo` / `WorkspaceDirectories`. The
-// switcher renders directory rows independent of projects (so empty directories
-// appear), and `persistable === false` means an existing `workspace.yaml`
-// couldn't be read this session — surfaced distinctly from a fresh install so a
-// transient read error doesn't lure the user into re-adding directories that
-// then silently fail to save.
-export type WorkspaceDirectoryInfo = {
-  path: string;
-  available: boolean;
-};
-
-export type WorkspaceDirectories = {
-  directories: WorkspaceDirectoryInfo[];
+// Mirror of Rust `WorkspaceStatus`. `persistable === false` means an existing
+// `workspace.yaml` couldn't be read this session — surfaced distinctly from a
+// fresh install so a transient read error doesn't lure the user into archiving
+// projects whose flag then silently fails to save.
+export type WorkspaceStatus = {
   persistable: boolean;
 };
 

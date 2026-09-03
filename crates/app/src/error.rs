@@ -40,9 +40,6 @@ pub enum AppError {
     #[error("harness probe failed: {0}")]
     Probe(DispatchError),
 
-    #[error("no working directory has been initialised — call init_directory first")]
-    NoDirectory,
-
     /// Persisting the user-global workspace registry (`workspace.yaml`) failed.
     /// The registry is convenience state (the cross-directory project list and
     /// its cached snapshot), so callers treat this as best-effort and log

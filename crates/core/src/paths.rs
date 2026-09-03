@@ -13,10 +13,12 @@ pub(crate) const PROJECTS_DIR: &str = "projects";
 pub(crate) const JOURNAL_FILE: &str = "journal.jsonl";
 pub(crate) const PINS_FILE: &str = "pins.jsonl";
 pub(crate) const ATTACHMENTS_DIR: &str = "attachments";
-/// User-global store only (see `store.rs`): the working-directory catalog and
-/// the store's own schema marker. Deliberately *not* `config.yaml` — the store
+/// The version-1 directory catalog, read only by the store's in-place
+/// migration, and the name it is set aside under afterwards.
+pub(crate) const DIRECTORIES_CATALOG_V1: &str = "directories.jsonl";
+pub(crate) const DIRECTORIES_CATALOG_V1_BACKUP: &str = "directories.jsonl.v1.bak";
+/// The store's own schema marker. Deliberately *not* `config.yaml` — the store
 /// root and a project root are different scopes, and reusing the name would make
 /// a mis-joined path silently parse as the wrong thing.
-pub(crate) const DIRECTORIES_CATALOG: &str = "directories.jsonl";
 pub(crate) const STORE_CONFIG_FILE: &str = "store.yaml";
 pub(crate) const RUNS_DIR: &str = "runs";

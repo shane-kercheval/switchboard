@@ -27,19 +27,19 @@ fn multi_project_store_end_to_end_with_layout_assertion() {
     let store = Store::open(root.path()).unwrap();
     Store::open(root.path()).unwrap(); // Opening twice is idempotent.
 
-    let dir_one = store.add_directory(cwd_one.path()).unwrap().directory_id;
-    let dir_two = store.add_directory(cwd_two.path()).unwrap().directory_id;
-    assert_eq!(
-        store.add_directory(cwd_one.path()).unwrap().directory_id,
-        dir_one,
-        "re-adding a directory must not mint a second identity"
-    );
+    let dir_one = std::fs::canonicalize(cwd_one.path()).unwrap();
 
     // Two projects in one directory, plus one in another that reuses a name —
     // uniqueness is per directory, so two checkouts can each have an `api`.
-    let project_a = store.create_project(dir_one, "backend-feature").unwrap();
-    let project_b = store.create_project(dir_one, "frontend-feature").unwrap();
-    let project_c = store.create_project(dir_two, "backend-feature").unwrap();
+    let project_a = store
+        .create_project(cwd_one.path(), "backend-feature")
+        .unwrap();
+    let project_b = store
+        .create_project(cwd_one.path(), "frontend-feature")
+        .unwrap();
+    let project_c = store
+        .create_project(cwd_two.path(), "backend-feature")
+        .unwrap();
     assert_ne!(project_a.id, project_b.id);
     assert_ne!(project_a.id, project_c.id);
 
@@ -69,7 +69,7 @@ fn multi_project_store_end_to_end_with_layout_assertion() {
     assert_eq!(entries.len(), 3);
     let names: HashSet<_> = entries
         .iter()
-        .filter(|e| e.directory_id == dir_one)
+        .filter(|e| e.directory == dir_one)
         .map(|e| e.name.clone())
         .collect();
     assert_eq!(
@@ -82,7 +82,7 @@ fn multi_project_store_end_to_end_with_layout_assertion() {
     assert_eq!(
         reopened_a.directory,
         std::fs::canonicalize(cwd_one.path()).unwrap(),
-        "a reopened project must resolve its working directory through the catalog"
+        "a reopened project must carry the working directory its index row records"
     );
     let agents_a = reopened_a.list_agents().unwrap();
     let agents_b = reopened_b.list_agents().unwrap();
@@ -131,18 +131,17 @@ fn assert_layout(store_root: &Path, working_directory: &Path, project_ids: &[Pro
         "the store must write nothing into a working directory"
     );
 
-    for relative in [
-        "store.yaml",
-        "projects.jsonl",
-        "directories.jsonl",
-        "projects",
-    ] {
+    for relative in ["store.yaml", "projects.jsonl", "projects"] {
         assert!(
             store_root.join(relative).exists(),
             "missing {relative} under the store root"
         );
     }
     assert!(store_root.join("projects").is_dir());
+    assert!(
+        !store_root.join("directories.jsonl").exists(),
+        "a fresh store has no directory catalog; the path lives on each project row"
+    );
     // No store-wide `attachments/`: staging is per-project, inside
     // `projects/<id>/attachments/`, so project delete reclaims it with a plain
     // directory removal instead of an all-projects reference sweep.

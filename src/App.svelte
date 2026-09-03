@@ -84,6 +84,11 @@
     nextUnreadCompletedProjectId,
     projects,
     projectDeletions,
+    dismissProjectRelocationError,
+    installRegistryStalenessRefresh,
+    projectRelocations,
+    refreshProjectRegistry,
+    setProjectDirectory,
     retryProjectHydration,
     seedPathUnresolved,
     selection,
@@ -100,7 +105,8 @@
     type Command,
   } from "$lib/state/commandPalette.svelte";
   import type { AgentRecord, HarnessAvailability, HarnessKind, ProjectId } from "$lib/types";
-  import { projectIsAvailable } from "$lib/types";
+  import { projectIsAvailable, type ProjectListing } from "$lib/types";
+  import { pickDirectory } from "$lib/native";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { loadPreferences, preferences } from "$lib/preferences.svelte";
@@ -319,12 +325,6 @@
   async function openActiveProjectInTerminal(): Promise<void> {
     if (activeProject === null) return;
     commandError = null;
-    // `directory` is null when the project's directory identity resolves to no
-    // single path — there is nothing to open, and the backend refuses to guess.
-    if (activeProject.directory === null) {
-      commandError = "This project's working directory could not be resolved.";
-      return;
-    }
     try {
       await api.openInTerminal(activeProject.directory);
     } catch (e) {
@@ -335,10 +335,6 @@
   async function revealActiveProjectInFinder(): Promise<void> {
     if (activeProject === null) return;
     commandError = null;
-    if (activeProject.directory === null) {
-      commandError = "This project's working directory could not be resolved.";
-      return;
-    }
     try {
       await api.revealInFinder(activeProject.directory);
     } catch (e) {
@@ -443,7 +439,7 @@
   }
 
   async function openActiveProjectInGit(): Promise<void> {
-    if (activeProject === null || activeProject.directory === null) return;
+    if (activeProject === null) return;
     settingsOpen = false;
     const result = await revealProjectBranch(activeProject.id, activeProject.directory);
     if (result.kind === "failed") {
@@ -485,13 +481,52 @@
       });
 
     window.addEventListener("keydown", handleGlobalKeydown);
+    // Directory availability is only known at list time (see
+    // `refreshProjectRegistry`), so re-list whenever the user comes back, and
+    // whenever a send fails before its turn starts.
+    const uninstallStalenessRefresh = installRegistryStalenessRefresh();
+    const refreshOnReturn = (): void => void refreshProjectRegistry();
+    const refreshWhenVisible = (): void => {
+      if (document.visibilityState === "visible") refreshOnReturn();
+    };
+    window.addEventListener("focus", refreshOnReturn);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
     const removeDevSeed = installDevTranscriptSeed(() => activeAgents);
     return () => {
       stopProjectActivityObserver();
       window.removeEventListener("keydown", handleGlobalKeydown);
+      window.removeEventListener("focus", refreshOnReturn);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+      uninstallStalenessRefresh();
       removeDevSeed();
     };
   });
+
+  // The displayed project's row when its working directory is gone. No agent
+  // can run there, so the compose bar is gated (see ComposeBar) and this banner
+  // says why. It clears on its own once a registry refresh sees the folder
+  // again.
+  const activeDirectoryProblem = $derived.by(() => {
+    const projectId = selection.activeProjectId;
+    if (projectId === null) return null;
+    const listing = projects.list.find((candidate) => candidate.id === projectId);
+    if (listing === undefined || projectIsAvailable(listing)) return null;
+    return listing;
+  });
+  const activeDirectoryProblemMessage = $derived(
+    activeDirectoryProblem === null
+      ? ""
+      : `This project's folder no longer exists at ${activeDirectoryProblem.directory}, so its agents can't run. Put it back at that location, or locate where it moved to.`,
+  );
+
+  /// Point one project at a folder the user picks. Owned here so the banner and
+  /// the sidebar menu run the same flow; the sidebar asks for it by callback.
+  async function locateProjectFolder(project: ProjectListing): Promise<void> {
+    if (project.id in projectRelocations.pending) return;
+    const folder = await pickDirectory();
+    if (folder === null) return;
+    await setProjectDirectory(project.id, folder);
+  }
 
   // The displayed project's roster + hydrated conversation. `rosterLoaded`
   // distinguishes "roster still loading on first activation" (key absent) from
@@ -955,7 +990,7 @@
     }
   }
 
-  // "Add project" dialog. The form (`CreateProjectForm`) owns both modes' state
+  // "Add project" dialog. The form (`CreateProjectForm`) owns its own state
   // and commits; App only tracks open/close and a `busy` flag the form drives so
   // the modal stays non-dismissible while a commit (esp. new-project agent
   // seeding) is in flight. The form remounts fresh on each open (Dialog unmounts
@@ -1226,6 +1261,7 @@
           onOpenSettings={toggleSettings}
           onProjectSelect={() => (settingsOpen = false)}
           onToggleSidebar={() => (layout.projectsSidebarOpen = false)}
+          onLocateFolder={(project) => void locateProjectFolder(project)}
           {settingsOpen}
         />
       {/if}
@@ -1595,6 +1631,25 @@
           onDismiss={() => dismissPinMutationError(selection.activeProjectId!)}
         />
       {/if}
+      {#if activeDirectoryProblem !== null}
+        <Banner
+          message={activeDirectoryProblemMessage}
+          testid="banner-project-directory-unavailable"
+          actionLabel={activeDirectoryProblem.id in projectRelocations.pending
+            ? "Moving…"
+            : "Locate folder…"}
+          onAction={() => {
+            if (activeDirectoryProblem !== null) void locateProjectFolder(activeDirectoryProblem);
+          }}
+        />
+      {/if}
+      {#each Object.entries(projectRelocations.errors) as [projectId, error] (projectId)}
+        <Banner
+          message={`Couldn't move ${projects.list.find((project) => project.id === projectId)?.name ?? "the project"} to that folder: ${error}`}
+          testid={`banner-project-relocate-failed-${projectId}`}
+          onDismiss={() => dismissProjectRelocationError(projectId)}
+        />
+      {/each}
 
       <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
         {#if settingsOpen}

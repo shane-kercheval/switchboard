@@ -48,7 +48,7 @@ import type {
   WorkflowInputValue,
   WorkflowListing,
   WorkflowRunInfo,
-  WorkspaceDirectories,
+  WorkspaceStatus,
 } from "./types";
 
 export class ActivationFailureError extends Error {
@@ -130,10 +130,6 @@ export async function pickDirectory(path: string): Promise<DirectoryInfo> {
   return await invoke<DirectoryInfo>("pick_directory", { path });
 }
 
-export async function initDirectory(path: string): Promise<DirectoryInfo> {
-  return await invoke<DirectoryInfo>("init_directory", { path });
-}
-
 // The flat cross-directory project list. Each row carries its owning directory
 // and availability; ordering is left to the caller (the switcher sorts by
 // `last_activity`).
@@ -141,10 +137,9 @@ export async function listProjects(): Promise<ProjectListing[]> {
   return await invoke<ProjectListing[]>("list_projects");
 }
 
-// Every registered workspace directory (including empty ones) plus the
-// persistability signal — the switcher's directory rows.
-export async function listWorkspaceDirectories(): Promise<WorkspaceDirectories> {
-  return await invoke<WorkspaceDirectories>("list_workspace_directories");
+// Whether user-global view-state (`workspace.yaml`) persists this session.
+export async function workspaceStatus(): Promise<WorkspaceStatus> {
+  return await invoke<WorkspaceStatus>("workspace_status");
 }
 
 export async function createProject(name: string, directory: string): Promise<ProjectSummary> {
@@ -514,21 +509,11 @@ export async function reorderAgents(
   return await invoke<AgentRecord[]>("reorder_agents", { projectId, agentIds });
 }
 
-/// Repair a project whose working directory moved, was deleted, or ended up
-/// claimed by two catalog rows.
-///
-/// **Moves every project that shares that directory, not just this one.** The
-/// repair is on the directory identity — one folder holds them all — so the
-/// caller must tell the user that before confirming.
-///
-/// Rejects a project with no catalog row at all: there is no identity to
-/// re-point, and minting one would be inventing rather than repairing. That
-/// case belongs to the migration tool.
-export async function repointProjectDirectory(
-  projectId: ProjectId,
-  newPath: string,
-): Promise<void> {
-  await invoke<void>("repoint_project_directory", { projectId, newPath });
+/// Point a project at a new working directory — the repair for a folder that
+/// moved or was recreated elsewhere. This project only: a sibling that recorded
+/// the same old folder is repaired on its own.
+export async function setProjectDirectory(projectId: ProjectId, newPath: string): Promise<void> {
+  await invoke<void>("set_project_directory", { projectId, newPath });
 }
 
 /// List another project's agents **without loading or locking it** — the read

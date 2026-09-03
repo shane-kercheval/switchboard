@@ -113,13 +113,12 @@ pub struct MaintenanceBarrier {
 /// because `begin_maintenance` takes all three in that order — the write lock
 /// first (so a claim's membership is derived and marked atomically against
 /// `create_project`), then the marks, then the generations. `workspace`
-/// is at the head because it is the app-owned user-global registry that sits
-/// above any single directory's state; in practice it is taken either standalone
-/// (`list_projects`, the workspace switcher) or nested *under* `registry_write`
-/// in `init_directory` (which holds `registry_write` for its whole body) — never
-/// the inverse. `git_registry` (the Git-view tracked-repo list) follows the same
-/// shape: standalone for the Git-view read/add/remove commands, and nested under
-/// `registry_write` during `init_directory`'s auto-sync hook — so it sorts after
+/// is at the head because it is the app-owned user-global view-state that sits
+/// above any single project's state; in practice it is taken standalone
+/// (`list_projects`, archive) — never nested under `registry_write`, and never
+/// the inverse. `git_registry` (the Git-view tracked-repo list) is taken
+/// standalone for the Git-view read/add/remove commands, and nested under
+/// `registry_write` during `create_project`'s auto-sync hook — so it sorts after
 /// `registry_write` here. **No path may acquire `registry_write` while holding
 /// `git_registry`** (the inverse order is the deadlock this convention forbids).
 /// Violating the order can deadlock under concurrent access. Single-lock acquisitions (which most
@@ -265,11 +264,10 @@ pub struct AppState {
     /// live-reads the agent record from it at the next turn's start.
     pub agents_by_id: Arc<Mutex<HashMap<AgentId, AgentRecord>>>,
 
-    /// User-global workspace registry — the set of working directories the app
-    /// knows about plus a cached snapshot of each directory's projects (see
-    /// `crate::workspace`). Convenience state, not load-bearing: it backs the
-    /// flat cross-directory project list. Defaults to empty; production
-    /// hydrates it from `workspace.yaml` via [`AppState::with_workspace`].
+    /// User-global view-state: which projects the user has archived (see
+    /// `crate::workspace`). Convenience state, not load-bearing. Defaults to
+    /// empty; production hydrates it from `workspace.yaml` via
+    /// [`AppState::with_workspace`].
     pub workspace: Mutex<Workspace>,
 
     /// Resolved path of `workspace.yaml`, or `None` when no global location was
@@ -351,24 +349,24 @@ pub struct AppState {
     #[cfg(test)]
     pub capture_barrier: Mutex<Option<Arc<MaintenanceBarrier>>>,
 
-    /// Projects currently mid-lifecycle-operation — a re-point or a delete has
-    /// evicted their routable state and has not finished rebuilding it.
+    /// Projects currently mid-lifecycle-operation — a directory repair or a
+    /// delete has evicted their routable state and has not finished rebuilding
+    /// it.
     ///
     /// **A closed window, not a swept one.** These operations must evict before
     /// they drain (or a send lands in the gap and spawns a fresh actor on the
     /// old working directory), which leaves an interval where the project is
-    /// absent from every map but still exists. Without a gate, a user clicking a
-    /// *different* project in the same directory during that interval opens it
-    /// against the stale path, and a second drain would only catch that by
-    /// convergence argument. Refusing entry is the version that stays true when
-    /// the code around it changes.
+    /// absent from every map but still exists. Without a gate, a user clicking
+    /// the project during that interval opens it against the stale path, and a
+    /// second drain would only catch that by convergence argument. Refusing
+    /// entry is the version that stays true when the code around it changes.
     ///
     /// Read by `open_project_impl`, `create_project_impl`, and the dispatch
     /// resolution path; set and cleared under `registry_write`, which is what
     /// makes "evict and mark" atomic against those callers.
     pub maintenance: Mutex<HashSet<ProjectId>>,
 
-    /// The user-global project store — every project's index, catalog, and
+    /// The user-global project store — the project index and every project's
     /// metadata root.
     ///
     /// **Required, unlike the `Option<PathBuf>` paths above.** Those guard
@@ -734,7 +732,7 @@ mod tests {
         let path = dir.path().join("workspace.yaml");
 
         let state = mock_state();
-        lock(&state.workspace).add(path.clone());
+        lock(&state.workspace).set_archived(uuid::Uuid::new_v4(), true);
         persist_workspace(&state);
 
         assert!(!path.exists());
@@ -746,7 +744,7 @@ mod tests {
         let path = dir.path().join("workspace.yaml");
 
         let state = mock_state().with_workspace(path.clone());
-        lock(&state.workspace).add(PathBuf::from("/some/dir"));
+        lock(&state.workspace).set_archived(uuid::Uuid::new_v4(), true);
         persist_workspace(&state);
 
         let loaded = workspace::load(&path).workspace;

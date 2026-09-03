@@ -24,6 +24,14 @@ pub type EventStream = Pin<Box<dyn Stream<Item = AdapterEvent> + Send>>;
 pub enum DispatchError {
     #[error("harness binary not found")]
     BinaryNotFound,
+    /// The turn's working directory — the user's checkout, which is the
+    /// subprocess cwd — no longer exists. Distinguished from `BinaryNotFound`
+    /// because the OS reports both as `NotFound` at spawn: a deleted or moved
+    /// folder would otherwise read as a missing CLI. Switchboard's own state
+    /// lives outside the working directory, so the project survives; only
+    /// dispatch is impossible until the directory is re-pointed.
+    #[error("working directory no longer exists: {}", .0.display())]
+    WorkingDirectoryMissing(std::path::PathBuf),
     #[error("failed to spawn harness subprocess: {0}")]
     SpawnFailed(#[from] std::io::Error),
     /// Sidecar-or-equivalent pre-stream persistence read failed. Used by the

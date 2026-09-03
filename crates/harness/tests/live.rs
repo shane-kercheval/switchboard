@@ -746,17 +746,24 @@ async fn live_claude_session_file_effort_matches_the_dispatched_level() {
     // Every alias the gate echoes for, plus the one it withholds for. Covering
     // only a subset would leave an upstream change to an uncovered family
     // silently recreating the bug this gate exists to prevent.
-    for (model, expected) in [
-        ("opus", Some("low")),
-        ("sonnet", Some("low")),
-        ("fable", Some("low")),
-        ("haiku", None),
+    //
+    // Fable is sent `max`, the other recording families `low`: a boolean gate
+    // cannot see a model that records a *clamped* level for an upper effort
+    // (Opus 5 does exactly that with thinking disabled — §3.4/§6), so the
+    // family whose upper bound has only ever been hand-probed carries the
+    // upper-bound check here. Its output stays a single token, so the extra
+    // reasoning costs cents per run, not dollars.
+    for (model, sent, expected) in [
+        ("opus", "low", Some("low")),
+        ("sonnet", "low", Some("low")),
+        ("fable", "max", Some("max")),
+        ("haiku", "low", None),
     ] {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let adapter = ClaudeCodeAdapter::new();
         let mut agent = live_agent();
         agent.model = Some(model.to_owned());
-        agent.effort = Some("low".to_owned());
+        agent.effort = Some(sent.to_owned());
 
         let stream = adapter
             .dispatch(
@@ -787,7 +794,7 @@ async fn live_claude_session_file_effort_matches_the_dispatched_level() {
         assert_eq!(
             disk,
             vec![expected.map(str::to_owned)],
-            "--model {model} --effort low: unexpected on-disk effort"
+            "--model {model} --effort {sent}: unexpected on-disk effort"
         );
 
         // The live stamp must agree with what the file records — that agreement

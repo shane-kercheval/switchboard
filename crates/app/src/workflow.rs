@@ -1542,7 +1542,7 @@ mod tests {
             "got: {}",
             worker_bodies[0]
         );
-        assert!(worker_bodies[1].contains("Decision summary"));
+        assert!(worker_bodies[1].contains("net-effect assessment"));
         // Reviewers dispatched twice: the code review, then weighing in on the
         // worker's verdict (forwarded via `aggregated_responses(worker)`, so the
         // analyst output is delimited by the same START/END markers as any other

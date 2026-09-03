@@ -57,27 +57,20 @@ steps:
 
         {{ aggregated_responses(reviewers) }}
 
-        Weigh their responses and settle every finding. Then write your final response in two sections, in this order, for two different readers.
+        Weigh their responses and settle every finding — where a reviewer changed your mind, say so plainly and name what changed it; where you stand firm, keep the refuting evidence.
 
-        ## Decision summary — for the human
+        Then write ONE final response, addressed to the human who decides what happens next. They have read nothing else — not the reviews, not your analysis, not the responses — and this workflow does not send your reply back to the reviewers. Write for the human only, and do not reuse the per-finding template from your earlier analysis message.
 
-        Assume the human has read NOTHING else: not the reviews, not your analysis, not the reviewers' responses. This section is the only thing they will read, and it must stand alone.
-
-        Format: bullet points, grouped by issue. Depth is your judgment, calibrated per issue by one question — what does this change in the running system, and what does it ask of the reader? An issue that changes observable behavior or needs a decision gets enough bullets to cover what happens, why it matters, and what you're doing or asking. An obviously-correct fix nobody disputed gets one bullet naming it. Depth tracks substance, in both directions — never a template, never a fixed length.
-
-        - Open with the bottom line: what you will do, what you won't, and what you need from them — or that you need nothing.
-        - For every decision they must make: the question, your recommendation, and what happens if they defer.
-        - If your position changed during the debate, say so plainly and why. Report the cumulative outcome across rounds, not this round's delta.
-        - Write for someone who wasn't there: never refer to "finding #3" or "the hydration issue" as if they know the label — re-state what it is. No code identifiers unless they need them to act; describe the behavior instead.
-        - If you bold a lead sentence, it must be a complete plain-language statement of the point — the reader should understand the issue from that sentence alone. Never a slogan or theme label ("Depth tracks substance", "Proportionality") that names a topic without saying anything about it.
-
-        ## Full record — for the reviewers and for implementation
-
-        Precise enough that a reviewer can verify alignment and implementation can proceed without re-reading the debate:
-
-        - Every finding from every round with its final status (accept / reject / modify), the deciding argument in one or two sentences, and the exact change: files, functions, tests.
-        - Where you verified a disputed claim against the code, say what you checked and what you found.
-        - What changed from your original analysis across all rounds, and why.
+        - Open with the bottom line, one or two sentences: the overall disposition in aggregate ("implementing N, rejecting M, one decision needed from you"), naming individually only what the human must act on. The bullets that follow carry the specifics — the opening is what they'd get if they stopped reading there.
+        - Then one group per issue that matters: a bolded one-sentence claim stating the issue in plain language, followed by two to four sub-bullets — what it means for the system or the user, and what you are doing about it. A paragraph with a bolded first sentence is NOT a bullet group and is the failure mode here; if a sub-bullet runs past about two sentences, it is holding more than one fact and should be split. Two banned shapes, both of which gesture at content instead of being it: headline-fragment style ("Login flow: broken, not misconfigured") — write the sentence that explains it; and narrating your own disclosure ("one residual is named rather than buried", "with its dependency recorded") — just state the caveat.
+        - Report conclusions, not derivations. The human did not watch the debate and does not need it reconstructed: no "one reviewer proposed X, the other pointed out Y, so I chose Z." Say what the answer is. Mention that something was contested ONLY where the human needs it — a position you reversed, a call that is still genuinely uncertain, or a conclusion whose confidence rests on something you verified.
+        - A weightier issue earns MORE bullets, never longer ones. Depth is a count of facts, not prose density, and it tracks what the issue does to the system — not how much debate it generated or how much work it took.
+        - A decision the human must make gets full detail: the question, the tradeoff in functional terms, your recommendation and why, and what happens if they defer. This is the one place length is never the constraint.
+        - Within an issue, if the fix you're adopting adds machinery, new behavior, a new threshold, or a new failure path beyond the original change, say so in the bullet and name the cost. A fix that increases complexity is a tradeoff the human is accepting, not a free win.
+        - Minor uncontested items — cleanup, doc fixes, small test additions — get one full sentence each, or one shared sentence for the lot. This is a hard cap, not a target: no justification, no history, no explanation of why each one is right. If a "minor" item needs more than a sentence, it is not minor and belongs in its own group above.
+        - Name a file, function, or test only where the reader needs it to act or a later session would need it to implement, folded into the bullet as a clause rather than a separate section.
+        - Refer to nothing by finding number or debate-internal label; restate what each thing is.
+        - Close with a net-effect assessment in a few plain sentences: did the review change your assessment of the original change, is the change as a whole meaningfully larger or riskier than what was reviewed, and what is the single riskiest thing remaining after everything lands? This is a synthesis, not a summary — say only what is true in AGGREGATE and cannot be read off the bullets above. Do not restate a per-issue cost you already named; if the close repeats a phrase from an earlier bullet, it is re-listing rather than concluding. Never a bare severity label — every risk claim carries its reason in the same sentence.
   - label: Recommendation ready
     wait_for:
       agent: "{{ worker }}"

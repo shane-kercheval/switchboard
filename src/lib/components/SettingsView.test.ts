@@ -202,7 +202,7 @@ describe("SettingsView", () => {
       screen.getByTestId("settings-selection-antigravity-model-choice-gemini-3.1-pro"),
     ).toHaveAttribute("aria-pressed", "true");
     expect(
-      screen.getByTestId("settings-selection-antigravity-model-choice-gemini-3.7-flash"),
+      screen.getByTestId("settings-selection-antigravity-model-choice-gemini-3.8-flash"),
     ).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByTestId("settings-selection-antigravity-effort-current")).toHaveValue(
       "medium",
@@ -324,7 +324,7 @@ describe("SettingsView", () => {
 
   it("keeps the effort default independent when the default model has no effort axis", async () => {
     preferences.agent_defaults.antigravity = {
-      model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+      model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
       effort_choices: ["high", "medium"],
       default_model: "claude-sonnet-4-6",
       default_effort: "high",
@@ -341,7 +341,7 @@ describe("SettingsView", () => {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             antigravity: {
-              model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+              model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
               effort_choices: ["high", "medium"],
               default_model: "claude-sonnet-4-6",
               default_effort: "medium",

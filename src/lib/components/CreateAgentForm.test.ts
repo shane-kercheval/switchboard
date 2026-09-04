@@ -592,9 +592,9 @@ describe("CreateAgentForm", () => {
       name: "antigravity",
       harness: "antigravity",
       selection: {
-        model: "gemini-3.7-flash",
+        model: "gemini-3.8-flash",
         effort: "medium",
-        model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+        model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
@@ -628,7 +628,7 @@ describe("CreateAgentForm", () => {
 
   it("create + Antigravity: converts independent defaults into a dispatch-ready pair", async () => {
     preferences.agent_defaults.antigravity = {
-      model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+      model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
       effort_choices: ["high", "medium"],
       default_model: "claude-sonnet-4-6",
       default_effort: "high",
@@ -645,7 +645,7 @@ describe("CreateAgentForm", () => {
       selection: {
         model: "claude-sonnet-4-6",
         effort: null,
-        model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+        model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
         effort_choices: ["high", "medium"],
       },
     } satisfies AgentFormSubmit);
@@ -668,11 +668,11 @@ describe("CreateAgentForm", () => {
   it("create + Antigravity: switching to a narrower model clamps the effort", async () => {
     // `agy` fails the turn when the level isn't in the model's own set, so an
     // effort left over from the previous model has to be brought back into
-    // range at selection time rather than discovered at dispatch. 3.7 Flash
+    // range at selection time rather than discovered at dispatch. 3.8 Flash
     // takes low/medium/high; 3.1 Pro only low/high.
     const { onSubmit } = renderForm();
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
-    await choosePicker("model-select", "gemini-3.7-flash");
+    await choosePicker("model-select", "gemini-3.8-flash");
     await choosePicker("effort-select", "medium");
     expect(pickerValue("effort-select")).toBe("medium");
 
@@ -689,7 +689,7 @@ describe("CreateAgentForm", () => {
       selection: {
         model: "gemini-3.1-pro",
         effort: "high",
-        model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+        model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);

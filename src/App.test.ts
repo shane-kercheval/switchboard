@@ -756,9 +756,9 @@ describe("App", () => {
         name: "antigravity",
         harness: "antigravity",
         selection: {
-          model: "gemini-3.7-flash",
+          model: "gemini-3.8-flash",
           effort: "medium",
-          model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+          model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
           effort_choices: ["medium", "high"],
         },
       },
@@ -795,7 +795,7 @@ describe("App", () => {
 
   it("new project: clears active effort but preserves choices for a no-effort default model", async () => {
     backend.agentDefaults.antigravity = {
-      model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+      model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
       effort_choices: ["high", "medium"],
       default_model: "claude-sonnet-4-6",
       default_effort: "high",
@@ -813,7 +813,7 @@ describe("App", () => {
       selection: {
         model: "claude-sonnet-4-6",
         effort: null,
-        model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+        model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
         effort_choices: ["high", "medium"],
       },
     });

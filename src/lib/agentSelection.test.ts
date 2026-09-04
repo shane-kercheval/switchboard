@@ -62,9 +62,9 @@ describe("agent selection catalogs", () => {
       default_effort: "medium",
     });
     expect(DEFAULT_AGENT_SELECTIONS.antigravity).toEqual({
-      model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+      model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
       effort_choices: ["medium", "high"],
-      default_model: "gemini-3.7-flash",
+      default_model: "gemini-3.8-flash",
       default_effort: "medium",
     });
   });
@@ -75,7 +75,7 @@ describe("Antigravity effort support", () => {
     effortOptionsFor("antigravity", model).map(({ value }) => value);
 
   it("distinguishes known levels, explicit no-effort models, and unknown models", () => {
-    expect(values("gemini-3.7-flash")).toEqual(["low", "medium", "high"]);
+    expect(values("gemini-3.8-flash")).toEqual(["low", "medium", "high"]);
     expect(values("gemini-3.1-pro")).toEqual(["low", "high"]);
     expect(values("gpt-oss-120b")).toEqual(["medium"]);
     expect(effortSupportFor("antigravity", "claude-sonnet-4-6")).toEqual({ kind: "none" });
@@ -112,7 +112,7 @@ describe("selectionForNewAgent", () => {
     expect(
       selectionForNewAgent(
         {
-          model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+          model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
           effort_choices: ["high", "medium"],
           default_model: "claude-sonnet-4-6",
           default_effort: "high",
@@ -124,7 +124,7 @@ describe("selectionForNewAgent", () => {
       selection: {
         model: "claude-sonnet-4-6",
         effort: null,
-        model_choices: ["claude-sonnet-4-6", "gemini-3.7-flash"],
+        model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
         effort_choices: ["high", "medium"],
       },
     });
@@ -162,9 +162,9 @@ describe("selectionForNewAgent", () => {
 
 describe("resolveModelChange", () => {
   const configured = selection({
-    model: "gemini-3.7-flash",
+    model: "gemini-3.8-flash",
     effort: "medium",
-    model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+    model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
     effort_choices: ["medium", "high", "low"],
   });
 

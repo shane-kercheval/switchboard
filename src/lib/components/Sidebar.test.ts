@@ -915,7 +915,7 @@ describe("Sidebar", () => {
 
     await openAgentActions();
     await fireEvent.click(await screen.findByTestId("agent-selection-settings"));
-    await fireEvent.click(screen.getByTestId("change-selection-model-choice-gemini-3.7-flash"));
+    await fireEvent.click(screen.getByTestId("change-selection-model-choice-gemini-3.8-flash"));
 
     expect(screen.getByTestId("change-selection-invalid")).toHaveTextContent(
       "Choose a reasoning effort supported by the current model before saving.",
@@ -1117,9 +1117,9 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
-      model: "gemini-3.7-flash",
+      model: "gemini-3.8-flash",
       effort: "medium",
-      model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+      model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
       effort_choices: ["medium", "high"],
     };
     await state.registerAgent(agent);
@@ -1132,11 +1132,14 @@ describe("Sidebar", () => {
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
       model: "gemini-3.1-pro",
       effort: "high",
-      model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+      model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
       effort_choices: ["medium", "high"],
     });
   });
 
+  // `gemini-3.7-flash` is deliberately NOT updated to 3.8 here: it is a real
+  // model retired from the picker but still valid at dispatch, so this pins the
+  // promise that retiring an entry doesn't strand an agent already using it.
   it("preserves effort when switching to an unknown Antigravity model", async () => {
     const state = await loadState();
     const agent: AgentRecord = {
@@ -1179,9 +1182,9 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
-      model: "gemini-3.7-flash",
+      model: "gemini-3.8-flash",
       effort: "medium",
-      model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+      model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
       effort_choices: ["medium"],
     };
     await state.registerAgent(agent);

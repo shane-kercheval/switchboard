@@ -57,7 +57,7 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   /// what let this picker be a toggle instead of a dropdown.
   ///
   /// The Gemini-branded Antigravity models keep their `Gemini` prefix on
-  /// purpose; that is not an inconsistency. `3.7 Flash` and `3.1 Pro` are version numbers with no
+  /// purpose; that is not an inconsistency. `3.8 Flash` and `3.1 Pro` are version numbers with no
   /// product attached, while `Sonnet` and `Opus` are unambiguous on their own.
   ///
   /// The known cost of dropping `(Thinking)`: the turn footer shows agy's
@@ -77,17 +77,21 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   /// suffix would contradict the footer directly below it.
   ///
   /// Only the newest Flash generation is offered. agy's catalog also lists
-  /// 3.6 and 3.5 Flash; three near-identical generations is a picker that costs
+  /// 3.7 and 3.6 Flash; three near-identical generations is a picker that costs
   /// the user a decision without giving them one. Retiring an entry does not
   /// strand an agent already using it — the slug stays valid at dispatch, and
   /// the sidebar falls back to a dropdown for an off-catalog persisted value.
+  /// Nor is a *saved preference* migrated on a catalog roll: retiring an entry
+  /// changes what a new install is seeded with, never what a user already
+  /// configured. A persisted choice is re-appended to the picker so it stays
+  /// visible and removable rather than becoming stuck.
   ///
   /// Curated rather than fetched: `agy models` needs auth and network, and its
   /// `--output-format json` is advertised but rejected @ 1.1.19. A retired
   /// entry fails loudly and cheaply — `agy` rejects an unknown model
   /// pre-dispatch, quota-free, listing what is available.
   antigravity: [
-    { label: "Gemini 3.7 Flash", value: "gemini-3.7-flash" },
+    { label: "Gemini 3.8 Flash", value: "gemini-3.8-flash" },
     { label: "Gemini 3.1 Pro", value: "gemini-3.1-pro" },
     { label: "Sonnet 4.6", value: "claude-sonnet-4-6" },
     { label: "Opus 4.6", value: "claude-opus-4-6-thinking" },
@@ -110,7 +114,7 @@ export const MODEL_PRESENTATION: Record<HarnessKind, "segmented" | "dropdown"> =
   claude_code: "segmented",
   codex: "segmented",
   // Five entries after retiring the older Flash generations, longest label
-  // "Gemini 3.7 Flash" at 16 characters — comparable to Codex's segmented row.
+  // "Gemini 3.8 Flash" at 16 characters — comparable to Codex's segmented row.
   // Both this and the `(Thinking)` drop above were judged against the running
   // app: five pills carrying the suffixes were tried first and rejected.
   antigravity: "segmented",
@@ -158,7 +162,7 @@ export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
 /// rather than one list. `null` explicitly means no effort axis; absence means
 /// an unknown/off-catalog model whose persisted effort must survive.
 const ANTIGRAVITY_MODEL_EFFORTS: Record<string, readonly string[] | null> = {
-  "gemini-3.7-flash": ["low", "medium", "high"],
+  "gemini-3.8-flash": ["low", "medium", "high"],
   "gemini-3.1-pro": ["low", "high"],
   "claude-sonnet-4-6": null,
   "claude-opus-4-6-thinking": null,
@@ -232,9 +236,9 @@ export const DEFAULT_AGENT_SELECTIONS: Preferences["agent_defaults"] = {
   // Both carry explicit effort because `agy` rejects these effort-bearing
   // models when dispatched without one.
   antigravity: {
-    model_choices: ["gemini-3.7-flash", "gemini-3.1-pro"],
+    model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
     effort_choices: ["medium", "high"],
-    default_model: "gemini-3.7-flash",
+    default_model: "gemini-3.8-flash",
     default_effort: "medium",
   },
 };

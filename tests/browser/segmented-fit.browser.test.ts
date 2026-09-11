@@ -68,7 +68,7 @@ async function assertSingleRowNoClip(testid: string): Promise<void> {
   }
 }
 
-test("Codex's eight effort levels fit one row without clipping at the dialog width", async () => {
+test("Codex's six effort levels fit one row without clipping at the dialog width", async () => {
   render(SegmentedFitHost, {
     props: { width: DIALOG_INNER_WIDTH, options: EFFORT_OPTIONS.codex, value: "medium" },
   });

@@ -68,6 +68,32 @@ describe("agent selection catalogs", () => {
       default_effort: "medium",
     });
   });
+
+  it("offers only reasoning-bearing Codex effort levels", () => {
+    expect(EFFORT_OPTIONS.codex.map(({ value }) => value)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra",
+    ]);
+  });
+
+  it("offers Astra without changing the built-in Codex quick choices", () => {
+    expect(MODEL_OPTIONS.codex).toEqual([
+      { label: "GPT-6 Astra", value: "gpt-6-astra" },
+      { label: "GPT-5.6 Sol", value: "gpt-5.6-sol" },
+      { label: "GPT-5.6 Terra", value: "gpt-5.6-terra" },
+      { label: "GPT-5.6 Luna", value: "gpt-5.6-luna" },
+    ]);
+    expect(DEFAULT_AGENT_SELECTIONS.codex).toEqual({
+      model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
+      effort_choices: ["medium", "high"],
+      default_model: "gpt-5.6-terra",
+      default_effort: "medium",
+    });
+  });
 });
 
 describe("Antigravity effort support", () => {

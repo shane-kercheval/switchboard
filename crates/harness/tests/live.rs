@@ -2033,6 +2033,61 @@ async fn live_codex_model_and_effort_dispatch() {
 
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_astra_dispatches_and_hydrates() {
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = CodexAdapter::new();
+    let agent_id = Uuid::now_v7();
+    let mut agent = live_codex_agent();
+    agent.id = agent_id;
+    agent.model = Some("gpt-6-astra".to_owned());
+    agent.effort = Some("low".to_owned());
+
+    let events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Reply with the single word 'ack' and nothing else.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("Astra dispatch")
+        .collect()
+        .await;
+
+    let (model, effort) = turn_end_model_effort(&events).expect("Astra TurnEnd");
+    assert_eq!(model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(effort.as_deref(), Some("low"));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "Astra dispatch must complete; got {events:?}"
+    );
+
+    let (thread_id, date) = codex_capture(&events).expect("captured Astra locator");
+    let hydrated = load_codex_transcript(&home_dir(), cwd.path(), &thread_id, Some(date), agent_id)
+        .expect("hydrate Astra rollout");
+    let hydrated_model_effort: Vec<_> = hydrated
+        .turns
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::Agent { model, effort, .. } => Some((model.clone(), effort.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        hydrated_model_effort,
+        vec![(Some("gpt-6-astra".to_owned()), Some("low".to_owned()))]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_resume_reuses_session() {
     // Memorize-then-recall: definitive proof that resume restores prior
     // turn's context. Token-count growth would also signal "system prompts
@@ -3468,7 +3523,7 @@ async fn live_codex_model_and_effort_change_across_turns() {
 /// is implemented correctly and guards it against Codex CLI drift. Two turns so it
 /// also proves the key **varies per turn** (no stale-key carryover).
 #[tokio::test]
-#[ignore = "requires codex installed — run with: make test-live-codex"]
+#[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_hydration_key_matches_live_turn_end() {
     let cwd = tempfile::TempDir::new().unwrap();
     let adapter = CodexAdapter::new();
@@ -3823,13 +3878,15 @@ async fn live_codex_apply_patch_emits_edit_facet() {
     let cwd = tempfile::TempDir::new().unwrap();
     std::fs::write(cwd.path().join("alpha.txt"), "foo\n").unwrap();
     let adapter = CodexAdapter::new();
-    let agent = live_codex_agent();
+    let mut agent = live_codex_agent();
+    agent.model = Some("gpt-5.6-sol".to_owned());
+    agent.effort = Some("medium".to_owned());
 
     let events: Vec<AdapterEvent> = adapter
         .dispatch(
             &agent,
             cwd.path(),
-            "Edit the file alpha.txt in the current directory, changing the word foo to bar. \
+            "Use apply_patch to edit alpha.txt in the current directory, changing foo to bar. \
              Then run the shell command: ls. Then reply with the single word done.",
             Uuid::now_v7(),
             DispatchOptions::default(),

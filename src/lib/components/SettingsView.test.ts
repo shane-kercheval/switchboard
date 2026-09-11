@@ -105,13 +105,13 @@ describe("SettingsView", () => {
   it("persists independent quick choices and explicit defaults atomically", async () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
     await fireEvent.click(await screen.findByText("Codex", { selector: "summary" }));
-    await fireEvent.click(screen.getByTestId("settings-selection-codex-model-choice-gpt-5.6-luna"));
+    await fireEvent.click(screen.getByTestId("settings-selection-codex-model-choice-gpt-6-astra"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             codex: {
-              model_choices: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+              model_choices: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"],
               effort_choices: ["medium", "high"],
               default_model: "gpt-5.6-terra",
               default_effort: "medium",
@@ -129,7 +129,7 @@ describe("SettingsView", () => {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             codex: {
-              model_choices: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+              model_choices: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"],
               effort_choices: ["medium", "high"],
               default_model: "gpt-5.6-sol",
               default_effort: "medium",

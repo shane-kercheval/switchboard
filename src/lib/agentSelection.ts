@@ -31,6 +31,7 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
     { label: "Haiku", value: "haiku" },
   ],
   codex: [
+    { label: "GPT-6 Astra", value: "gpt-6-astra" },
     { label: "GPT-5.6 Sol", value: "gpt-5.6-sol" },
     { label: "GPT-5.6 Terra", value: "gpt-5.6-terra" },
     { label: "GPT-5.6 Luna", value: "gpt-5.6-luna" },
@@ -120,9 +121,9 @@ export const MODEL_PRESENTATION: Record<HarnessKind, "segmented" | "dropdown"> =
   antigravity: "segmented",
 };
 
-/// Per-harness effort options. Codex `none` is
-/// a *real* level (forces no extended reasoning), distinct from leaving effort
-/// unset. This is the **full** per-harness set; effort validity is additionally
+/// Per-harness effort options offered by Switchboard. Codex also accepts `none`
+/// and `minimal` on some older models, but neither is offered: both are unused in
+/// practice and GPT-6 Astra rejects them. Effort validity is additionally
 /// **per-model** for Antigravity (see `effortOptionsFor`), so a form scoped to a
 /// chosen model must derive its options through that helper rather than reading
 /// this map directly — several Antigravity models have no effort axis at all,
@@ -136,8 +137,6 @@ export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
     { label: "Max", value: "max" },
   ],
   codex: [
-    { label: "None", value: "none" },
-    { label: "Minimal", value: "minimal" },
     { label: "Low", value: "low" },
     { label: "Medium", value: "medium" },
     { label: "High", value: "high" },

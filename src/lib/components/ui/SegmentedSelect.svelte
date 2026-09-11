@@ -42,7 +42,7 @@
   // Always one row: one equal-width column per option. A set with more than
   // five options steps down to a smaller font + tighter padding so it still
   // fits on one line instead of wrapping to a second row, which reads as a
-  // broken pill. Codex's eight effort levels are the only set that trips it.
+  // broken pill. Codex's six effort levels are the only set that trips it.
   //
   // Deliberately count-only, *not* label-length aware. Antigravity's five model
   // pills briefly needed a length trigger too — "Gemini 3.7 Flash" clipped —

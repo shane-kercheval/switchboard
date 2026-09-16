@@ -373,7 +373,7 @@ Distinct from the `Compaction` system marker in `transcript.rs` (which is how we
 | Harness | Available? | Mechanism | Custom instructions | Verified how |
 |---|---|---|---|---|
 | **Claude** | ✅ | `-p "/compact"` on a `--resume`d session. Intercepted locally by the CLI; the model never sees it | ✅ `-p "/compact <instructions>"` | Live: real compaction, 20,528 → 3,111 tokens, session id preserved |
-| **Codex** | ✅ (wrong door) | `codex app-server` → `thread/compact/start { threadId }`. **`codex exec` cannot do it at all** | ❌ no instructions param | Live: drove app-server over stdio against an `exec`-created session; `tokenUsage.last` 16,879 → 5,709 (per-turn occupancy, not the cumulative `total` — §G23), `compacted` record written |
+| **Codex** | ✅ (wrong door) | `codex app-server` → `thread/compact/start { threadId }`. **`codex exec` cannot do it at all** | ❌ no instructions param | Live: drove app-server over stdio against an `exec`-created session; `tokenUsage.last` 16,879 → 5,709 (per-turn occupancy, not the cumulative `total` — G23), `compacted` record written |
 | **Antigravity** | ❌ | Binary contains the command ("Compact the conversation now (summarize history to free up the context window)"), an `ON-DEMAND COMPACTION` prompt that honors latest-message instructions, and `prehooks.manualCompactionRequested` — all behind the **Unleash feature flag `enable-compact-slash-command`**, off for this account | (would be ✅ if enabled) | Live: `agy -p "/compact"` produced **no** compaction boundary |
 
 #### The fake-success hazard (read before building anything here)

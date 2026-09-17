@@ -134,7 +134,7 @@ What they show, and what the parser design below depends on:
 | assistant envelope | **none** | one, `model:"<synthetic>"`, **with a `message.id`**, text = the error |
 | streaming deltas | **none** | **none** |
 | `result` | `subtype:"success"`, `is_error:false`, `result:""`, `num_turns:0`, `total_cost_usd` real (0.10–0.20 on a 1–2 turn session), `modelUsage` **one entry** with `contextWindow`, `result.model` **absent**, `result.usage` all zeros | `subtype:"success"`, `is_error:false`, `result:"Not enough messages to compact."`, `total_cost_usd:0`, `modelUsage` **empty** `{}`, `result.usage` all zeros |
-| after `result` | `system/init` re-emitted (carries `model`), then the recap `user` records | `system/init`, then the envelope, then `result` |
+| after the verdict, **before** `result` | `system/init` re-emitted (carries `model` — this ordering is what makes rule 4's window resolution possible), then `compact_boundary`, then the recap `user` records, then `result` | `system/init`, then the envelope, then `result` |
 
 Two consequences worth stating up front: `result` reports success in both cases (the verdict is the
 status pair, never `result`); and on failure the empty `modelUsage` falls through to the zero-valued
@@ -450,6 +450,15 @@ failed: Not enough messages to compact."), not the harness's recap. It has a suc
 where the marker has none. Per-turn cost/overage footer behavior applies to it as to any turn (an
 overage compaction shows its cost). It renders ungrouped — no user row above it.
 
+**The row renders its token counts whenever `usage` is present, whatever the status.** Not only on
+success. A compaction that succeeds and then exits non-zero terminates `Failed` while legitimately
+carrying post-compaction occupancy (the parser gates usage on the *verdict*, never on the terminal
+outcome — see the contract on `withhold_usage_on_failed_compaction`), and the sidebar reads any
+usage-bearing terminal turn as authoritative, so the bar moves. Without this rule the row would say
+"failed" with no numbers while the bar dropped, which reads as a contradiction; with it the row
+explains itself — "Compaction failed: harness exited with code 1 · 23.4k → 4.2k". A *refused*
+compaction carries no usage at all, so it shows a message and no counts, unchanged.
+
 **Context bar.** No change to `contextUtilization` should be needed once the compaction row is a
 completed agent turn carrying `usage`; verify rather than assume, and add the sidebar tests.
 
@@ -507,6 +516,10 @@ Small; compress accordingly.
 
 ## Known limitations to record (harness-behavior §3.9)
 
+- **A compaction that succeeds and then exits abnormally shows a failed row that still moves the
+  context bar.** Rare (clean compaction, dirty process exit), and deliberate: the conversation really
+  was compacted, so the post-compaction occupancy is the best measurement available and suppressing it
+  would leave the bar knowingly stale. The M3 rendering rule above is what keeps the pairing legible.
 - **Reopen shows the pre-compaction context bar until the next completed turn.** The context
   snapshot the sidecar persists is keyed on the final assistant `message.id`; a compaction has none,
   so its post-compaction occupancy is live-only. After a restart, the bar reads the last persisted

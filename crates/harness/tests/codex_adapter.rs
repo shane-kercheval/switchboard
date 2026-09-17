@@ -1524,3 +1524,40 @@ async fn deleted_working_directory_is_reported_as_such_not_as_a_missing_binary()
         Ok(_) => panic!("expected Err(WorkingDirectoryMissing), got Ok"),
     }
 }
+
+/// Codex's compaction is real but lives behind the experimental `codex
+/// app-server` `thread/compact/start` RPC — a transport this adapter, a one-shot
+/// `codex exec` subprocess, does not run. The trait default refuses.
+///
+/// Defense in depth: the app layer gates on
+/// `HarnessKind::supports_manual_compaction` first. This pins that bypassing
+/// that gate produces a typed refusal rather than something worse — notably not
+/// a `/compact` *prompt*, which Codex answers by claiming success while nothing
+/// compacts (harness-behavior §3.9).
+#[tokio::test]
+async fn compact_is_refused_as_an_unsupported_operation() {
+    let adapter = CodexAdapter::with_binary_path(FAKE_CODEX);
+    let result = adapter
+        .compact(
+            &codex_agent(),
+            Path::new("/tmp"),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await;
+
+    // `EventStream` is not `Debug`, so unwrap the error by hand.
+    let Err(err) = result else {
+        panic!("Codex must refuse a compaction rather than returning a stream");
+    };
+    assert!(
+        matches!(
+            err,
+            DispatchError::UnsupportedOperation {
+                harness: HarnessKind::Codex,
+                ..
+            }
+        ),
+        "expected UnsupportedOperation, got {err:?}"
+    );
+}

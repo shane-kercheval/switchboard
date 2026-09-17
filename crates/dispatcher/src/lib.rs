@@ -387,9 +387,24 @@ pub enum CurrentTurnWait {
     /// idle (or between queued turns, or never dispatched), so its latest
     /// completed output is settled on disk; or the turn the waiter bound to was a
     /// compaction, which produces no text and is therefore not a source of
-    /// forwardable output at all. A compaction satisfies this answer's contract
-    /// by definition, and the actor holds it until the compaction's stream has
-    /// drained so the session file is settled before the caller reads it.
+    /// forwardable output at all.
+    ///
+    /// For a compaction the actor holds this answer until that compaction's
+    /// stream has drained, which guarantees exactly one thing: **the compaction
+    /// itself has finished writing.** It is not a snapshot of the agent's history
+    /// at the moment of reading. The actor may begin queued work the instant this
+    /// is sent — it flushes these replies before advancing its backlog, but
+    /// nothing orders the caller's read against the *next* turn's writes — so a
+    /// reader delayed long enough can observe a later turn's output instead.
+    ///
+    /// That residual is accepted for v1, on the same terms as (and in addition
+    /// to) the binding race documented on
+    /// [`Dispatcher::wait_for_current_turn`]: the caller forwards a later answer
+    /// rather than the intended one, and no data is lost. The binding race is
+    /// about which turn the *request* attaches to; this one happens after
+    /// attaching, on the read. Closing it properly means ordering the read ahead
+    /// of the agent's next work — a lock taken at read time is not enough, since
+    /// the queued turn may already have taken it and finished.
     Idle,
     /// The agent had an in-flight turn, which reached this terminal outcome.
     /// `text` is the turn's captured `Text`-kind output for a `Completed`
@@ -444,13 +459,28 @@ pub struct RemovedQueuedMessage {
     pub attachments: Vec<Attachment>,
 }
 
-/// `remove_queued_message` found no such queued message — already
-/// dequeued/started, already removed, never existed, or the agent has no actor.
-/// Typed so the frontend doesn't fake-restore composer text for a message that
-/// is already running.
+/// Why [`Dispatcher::remove_queued_message`] returned nothing. Typed so the
+/// frontend doesn't fake-restore composer text for a message it cannot actually
+/// take back — and split into two arms because those are two different facts
+/// about the queue, and reporting the wrong one would tell a caller the item is
+/// gone when it is about to run.
+///
+/// Deliberately **not** `#[non_exhaustive]`: it crosses no IPC boundary, and the
+/// reason for splitting it is that a caller should be forced to look again when a
+/// third reason appears rather than absorbing it into a wildcard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("no queued message with that id")]
-pub struct NotQueued;
+pub enum RemoveQueuedMessageError {
+    /// No such queued message — already dequeued/started, already removed, never
+    /// existed, or the agent has no actor.
+    #[error("no queued message with that id")]
+    NotQueued,
+    /// The message is queued, is **still** queued, and will run: it is not a
+    /// send, so there is no composer text to hand back. Today that means a
+    /// compaction; see [`Dispatcher::compact_agent`] for why `cancel_send` is the
+    /// way to get rid of one.
+    #[error("that queued message cannot be removed")]
+    NotRemovable,
+}
 
 /// Commands sent to an agent's actor over its `mpsc` channel.
 enum Command {
@@ -462,10 +492,10 @@ enum Command {
         on_busy: OnBusy,
         reply: Option<oneshot::Sender<SendOutcome>>,
     },
-    /// Remove a queued message by id; reply with its payload or `NotQueued`.
+    /// Remove a queued message by id; reply with its payload or why not.
     Remove {
         message_id: MessageId,
-        reply: oneshot::Sender<Result<RemovedQueuedMessage, NotQueued>>,
+        reply: oneshot::Sender<Result<RemovedQueuedMessage, RemoveQueuedMessageError>>,
     },
     /// Await the agent's **current in-flight turn's** terminal (the per-agent
     /// forward-source wait). Replies [`CurrentTurnWait::Idle`] at once if no turn
@@ -1057,6 +1087,9 @@ impl Dispatcher {
     /// **Always enqueues**, so there is no `OnBusy` choice and no `Busy` outcome
     /// to branch on: a compaction has no deadline and nothing awaiting it, so
     /// refusing one for contention would only ask the user to try again later.
+    /// That is also why this goes straight to [`Self::enqueue`] rather than
+    /// through the `OnBusy`-shaped acceptance path — a caller with no choice
+    /// should not be handed an outcome whose refusing arm it cannot reach.
     /// It runs through the same actor as a send — same FIFO position, same
     /// cancellation, liveness, and terminal handling — but as
     /// [`TurnKind::Compaction`] it journals nothing, emits no user message, and
@@ -1070,11 +1103,11 @@ impl Dispatcher {
     /// adapter that cannot be driven to compact refuses at dispatch, which
     /// surfaces here as a `MessageFailed` rather than as a refusal the caller
     /// can act on.
-    pub async fn compact_agent(
+    pub fn compact_agent(
         &self,
         agent_id: AgentId,
         send_id: SendId,
-        factory: Arc<dyn DispatchContextFactory>,
+        factory: &Arc<dyn DispatchContextFactory>,
     ) -> MessageId {
         // Snapshotted like a send's: the compaction must run under the model the
         // user had selected when they asked for it, not whatever is selected by
@@ -1087,11 +1120,7 @@ impl Dispatcher {
             selection,
             completion: None,
         };
-        match self.accept(agent_id, item, factory, OnBusy::Enqueue).await {
-            SendOutcome::Accepted(message_id) => message_id,
-            // Structurally unreachable: `Busy` exists only on the `FailFast` arm.
-            SendOutcome::Busy => unreachable!("OnBusy::Enqueue never reports Busy"),
-        }
+        self.enqueue(agent_id, item, factory)
     }
 
     /// Like [`send_message`](Self::send_message), but hands back a one-shot
@@ -1189,46 +1218,18 @@ impl Dispatcher {
         factory: Arc<dyn DispatchContextFactory>,
         on_busy: OnBusy,
     ) -> SendOutcome {
-        let message_id = item.message_id;
-        // `None` ⇒ the agent is `Closing` (mid-teardown): reject rather than
-        // resurrect it with a fresh actor.
-        let Some(commands) = self.ensure_actor(agent_id, Arc::clone(&factory)) else {
-            return reject_send(
-                message_id,
-                agent_id,
-                on_busy,
-                factory.as_ref(),
-                "agent is shutting down",
-            );
-        };
         match on_busy {
-            OnBusy::Enqueue => {
-                // The message_id is the receipt; turn lifecycle flows over the
-                // event channel. A send error means the actor task is gone
-                // (e.g. panicked) while a stale handle lingered — never report a
-                // silently-dropped send as cleanly accepted; surface it as a
-                // MessageFailed so the optimistic bubble doesn't spin forever.
-                if commands
-                    .send(Command::Enqueue {
-                        item,
-                        on_busy,
-                        reply: None,
-                    })
-                    .is_err()
-                {
-                    emit_message_failed(
-                        factory.idle_emitter().as_ref(),
-                        &channel_name(agent_id),
-                        message_id,
-                        // Pre-`record_send`: the actor never received the item.
-                        None,
-                        agent_id,
-                        "agent worker is unavailable",
-                    );
-                }
-                SendOutcome::Accepted(message_id)
-            }
+            OnBusy::Enqueue => SendOutcome::Accepted(self.enqueue(agent_id, item, &factory)),
             OnBusy::FailFast => {
+                // `None` ⇒ the agent is `Closing` (mid-teardown): reject rather
+                // than resurrect it with a fresh actor. Fail-fast must not
+                // falsely report acceptance, so the rejection is just `Busy` —
+                // nothing was enqueued, and there is no optimistic UI bubble
+                // waiting on an event (this path has a caller awaiting a
+                // `SendOutcome` instead).
+                let Some(commands) = self.ensure_actor(agent_id, factory) else {
+                    return SendOutcome::Busy;
+                };
                 let (tx, rx) = oneshot::channel();
                 if commands
                     .send(Command::Enqueue {
@@ -1238,12 +1239,58 @@ impl Dispatcher {
                     })
                     .is_err()
                 {
-                    // Actor gone: fail-fast must not falsely report acceptance.
+                    // Actor gone between the map lookup and the send.
                     return SendOutcome::Busy;
                 }
                 rx.await.unwrap_or(SendOutcome::Busy)
             }
         }
+    }
+
+    /// The **always-accepts** admission path, shared by the compose-bar send and
+    /// by [`Self::compact_agent`]. Returns the receipt `message_id` directly
+    /// rather than a `SendOutcome`, because there is no outcome to branch on:
+    /// every way this can go wrong is reported to the frontend as a
+    /// `MessageFailed` on the agent's event channel, and the caller still holds a
+    /// real receipt for the row it already rendered.
+    ///
+    /// Two such failures exist, and both emit that event rather than being
+    /// swallowed: the agent is `Closing` (mid-teardown — rejected rather than
+    /// resurrected with a fresh actor, which would drive the same harness session
+    /// concurrently with the draining turn), or the actor task is gone while a
+    /// stale handle lingered. A silently-dropped item would leave its optimistic
+    /// bubble spinning forever.
+    fn enqueue(
+        &self,
+        agent_id: AgentId,
+        item: WorkItem,
+        factory: &Arc<dyn DispatchContextFactory>,
+    ) -> MessageId {
+        let message_id = item.message_id;
+        let failure = match self.ensure_actor(agent_id, Arc::clone(factory)) {
+            None => Some("agent is shutting down"),
+            Some(commands) => commands
+                .send(Command::Enqueue {
+                    item,
+                    on_busy: OnBusy::Enqueue,
+                    reply: None,
+                })
+                .is_err()
+                .then_some("agent worker is unavailable"),
+        };
+        if let Some(reason) = failure {
+            emit_message_failed(
+                factory.idle_emitter().as_ref(),
+                &channel_name(agent_id),
+                message_id,
+                // Pre-`record_send`: the actor never ran it, so there is no
+                // durable record for a reload to reconstruct.
+                None,
+                agent_id,
+                reason,
+            );
+        }
+        message_id
     }
 
     /// Request cancellation of `agent_id`'s in-flight turn, stamping `source`.
@@ -1296,18 +1343,20 @@ impl Dispatcher {
     /// so the UI can restore the composer text. **Race-safe** (the actor is the
     /// single authority): if the id is no longer enqueued — already
     /// dequeued/started, removed, or the agent has no actor — returns
-    /// `Err(NotQueued)`.
+    /// `Err(NotQueued)`. A queued item that is not a send — a compaction — is
+    /// reported `NotRemovable` instead, and is left in the queue: this call
+    /// exists to give the user's text back to the composer, and there is none.
     pub async fn remove_queued_message(
         &self,
         agent_id: AgentId,
         message_id: MessageId,
-    ) -> Result<RemovedQueuedMessage, NotQueued> {
+    ) -> Result<RemovedQueuedMessage, RemoveQueuedMessageError> {
         let commands = {
             let agents = lock(&self.agents);
             match agents.get(&agent_id) {
                 Some(AgentSlot::Active(tx)) => tx.clone(),
                 // No actor, or shutting down — nothing to remove.
-                _ => return Err(NotQueued),
+                _ => return Err(RemoveQueuedMessageError::NotQueued),
             }
         };
         let (tx, rx) = oneshot::channel();
@@ -1318,9 +1367,9 @@ impl Dispatcher {
             })
             .is_err()
         {
-            return Err(NotQueued);
+            return Err(RemoveQueuedMessageError::NotQueued);
         }
-        rx.await.unwrap_or(Err(NotQueued))
+        rx.await.unwrap_or(Err(RemoveQueuedMessageError::NotQueued))
     }
 
     /// Await `agent_id`'s **current in-flight turn** reaching a terminal state —
@@ -2616,7 +2665,7 @@ fn synthesize_terminal(
 ///
 /// **Sends only.** This entry point exists to hand the user's text back to the
 /// composer, and a queued compaction has no text to hand back — so it is
-/// reported `NotQueued` and, decisively, is checked **before** anything is
+/// reported `NotRemovable` and, decisively, is checked **before** anything is
 /// removed: answering "not queued" while having silently dropped the work would
 /// leave the caller unable to restore what it just destroyed. Cancelling a
 /// queued compaction is `cancel_send`'s job, which resolves it with the
@@ -2625,13 +2674,13 @@ fn remove_from_backlog(
     backlog: &mut VecDeque<WorkItem>,
     agent_id: AgentId,
     message_id: MessageId,
-) -> Result<RemovedQueuedMessage, NotQueued> {
+) -> Result<RemovedQueuedMessage, RemoveQueuedMessageError> {
     let pos = backlog
         .iter()
         .position(|m| m.message_id == message_id)
-        .ok_or(NotQueued)?;
+        .ok_or(RemoveQueuedMessageError::NotQueued)?;
     if backlog[pos].payload.kind() != TurnKind::Send {
-        return Err(NotQueued);
+        return Err(RemoveQueuedMessageError::NotRemovable);
     }
     let mut item = backlog
         .remove(pos)
@@ -2681,34 +2730,6 @@ fn emit_event(
             error = %e,
             "failed to serialize event — skipping emit (should be unreachable)"
         ),
-    }
-}
-
-/// Reject a send for an agent that is shutting down (or otherwise can't accept
-/// it). On the `Enqueue` path the receipt `message_id` is still returned, but a
-/// `MessageFailed` is emitted so the optimistic UI bubble fails rather than
-/// spinning; on `FailFast` the caller is told `Busy` (never falsely `Accepted`).
-fn reject_send(
-    message_id: MessageId,
-    agent_id: AgentId,
-    on_busy: OnBusy,
-    factory: &dyn DispatchContextFactory,
-    reason: &str,
-) -> SendOutcome {
-    match on_busy {
-        OnBusy::Enqueue => {
-            emit_message_failed(
-                factory.idle_emitter().as_ref(),
-                &channel_name(agent_id),
-                message_id,
-                // Rejected before the actor ran it — no durable record.
-                None,
-                agent_id,
-                reason,
-            );
-            SendOutcome::Accepted(message_id)
-        }
-        OnBusy::FailFast => SendOutcome::Busy,
     }
 }
 

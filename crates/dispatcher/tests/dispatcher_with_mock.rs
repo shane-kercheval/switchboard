@@ -23,8 +23,9 @@ use switchboard_core::{AgentId, AgentRecord, Attachment, HarnessKind, SendId, Se
 use switchboard_dispatcher::{
     AwaitableSendOutcome, CancelOutcome, CompletionResult, ConversationJournal, CurrentTurnWait,
     DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter, JournalError, MetadataCache,
-    NoopJournal, NoopMetadataCache, NoopSessionLocatorSink, NotQueued, OnBusy, RecordingEmitter,
-    SelectionSnapshot, SendOutcome, SessionLocatorError, SessionLocatorSink, TurnKind, TurnPermit,
+    NoopJournal, NoopMetadataCache, NoopSessionLocatorSink, OnBusy, RecordingEmitter,
+    RemoveQueuedMessageError, SelectionSnapshot, SendOutcome, SessionLocatorError,
+    SessionLocatorSink, TurnKind, TurnPermit,
 };
 use switchboard_harness::{
     CancelSource, ContextWindowSource, DispatchOptions, FailureKind, HarnessAdapter, MessageId,
@@ -3124,7 +3125,7 @@ async fn remove_queued_message_prevents_dispatch_and_returns_payload() {
     // Removing it again (now unknown) → NotQueued.
     assert!(matches!(
         dispatcher.remove_queued_message(agent.id, queued_id).await,
-        Err(NotQueued)
+        Err(RemoveQueuedMessageError::NotQueued)
     ));
 
     // Let the blocker finish; only the blocker's turn ever started.
@@ -3151,7 +3152,7 @@ async fn remove_queued_message_for_unknown_agent_is_not_queued() {
         dispatcher
             .remove_queued_message(agent.id, Uuid::now_v7())
             .await,
-        Err(NotQueued)
+        Err(RemoveQueuedMessageError::NotQueued)
     ));
 }
 
@@ -5266,19 +5267,23 @@ async fn wait_for_current_turn_resolves_when_registered_after_the_terminal() {
 // it never resolves a current-turn waiter with a conversational terminal).
 // ---------------------------------------------------------------------------
 
-/// Stand up a dispatcher + agent whose actor runs `scenarios` in order, with a
-/// journal the test can inspect. Mirrors the per-test boilerplate above; the
-/// compaction suite needs the journal on every case, since "nothing was written"
-/// is most of what it asserts.
-fn compaction_fixture(
-    scenarios: impl IntoIterator<Item = MockScenario>,
-) -> (
+/// What [`compaction_fixture`] hands a test: the dispatcher under test, its
+/// recording emitter and journal, the agent, and the factory its actor is built
+/// from (already a trait object, since both `send_message` and `compact_agent`
+/// take one).
+type CompactionFixture = (
     Arc<Dispatcher>,
     Arc<RecordingEmitter>,
     Arc<RecordingJournal>,
     AgentRecord,
-    Arc<TestFactory>,
-) {
+    Arc<dyn DispatchContextFactory>,
+);
+
+/// Stand up a dispatcher + agent whose actor runs `scenarios` in order, with a
+/// journal the test can inspect. Mirrors the per-test boilerplate above; the
+/// compaction suite needs the journal on every case, since "nothing was written"
+/// is most of what it asserts.
+fn compaction_fixture(scenarios: impl IntoIterator<Item = MockScenario>) -> CompactionFixture {
     let dispatcher = Arc::new(Dispatcher::new());
     let emitter = Arc::new(RecordingEmitter::new());
     let journal = Arc::new(RecordingJournal::default());
@@ -5288,7 +5293,7 @@ fn compaction_fixture(
         agent.clone(),
         Arc::clone(&emitter),
         Arc::clone(&journal) as Arc<dyn ConversationJournal>,
-    );
+    ) as Arc<dyn DispatchContextFactory>;
     (dispatcher, emitter, journal, agent, factory)
 }
 
@@ -5344,7 +5349,7 @@ async fn compaction_on_an_idle_agent_runs_at_once_and_parks_idle() {
         compaction_fixture([MockScenario::CompactsSuccessfully]);
     let send_id = SendId::now_v7();
 
-    let message_id = dispatcher.compact_agent(agent.id, send_id, factory).await;
+    let message_id = dispatcher.compact_agent(agent.id, send_id, &factory);
     within(
         &emitter,
         "agent_idle",
@@ -5401,7 +5406,7 @@ async fn compaction_queues_behind_the_running_turn_and_an_earlier_queued_send() 
                 "first",
                 vec![],
                 SendId::now_v7(),
-                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                Arc::clone(&factory),
                 OnBusy::Enqueue,
             )
             .await,
@@ -5420,14 +5425,12 @@ async fn compaction_queues_behind_the_running_turn_and_an_earlier_queued_send() 
                 "second",
                 vec![],
                 SendId::now_v7(),
-                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                Arc::clone(&factory),
                 OnBusy::Enqueue,
             )
             .await,
     );
-    let compaction = dispatcher
-        .compact_agent(agent.id, SendId::now_v7(), factory)
-        .await;
+    let compaction = dispatcher.compact_agent(agent.id, SendId::now_v7(), &factory);
 
     assert_eq!(
         started_message_ids(&emitter),
@@ -5459,9 +5462,7 @@ async fn compaction_queues_behind_the_running_turn_and_an_earlier_queued_send() 
 async fn a_completed_compaction_journals_nothing() {
     let (dispatcher, emitter, journal, agent, factory) =
         compaction_fixture([MockScenario::CompactsSuccessfully]);
-    dispatcher
-        .compact_agent(agent.id, SendId::now_v7(), factory)
-        .await;
+    dispatcher.compact_agent(agent.id, SendId::now_v7(), &factory);
     within(
         &emitter,
         "agent_idle",
@@ -5477,9 +5478,7 @@ async fn a_failed_compaction_journals_nothing() {
     // marker, and a compaction takes the same terminal path to get there.
     let (dispatcher, emitter, journal, agent, factory) =
         compaction_fixture([MockScenario::CompactionFails]);
-    dispatcher
-        .compact_agent(agent.id, SendId::now_v7(), factory)
-        .await;
+    dispatcher.compact_agent(agent.id, SendId::now_v7(), &factory);
     within(
         &emitter,
         "agent_idle",
@@ -5507,7 +5506,7 @@ async fn a_cancelled_compaction_journals_nothing() {
     let (dispatcher, emitter, journal, agent, factory) =
         compaction_fixture([MockScenario::CompactionAwaitsCancellation]);
     let send_id = SendId::now_v7();
-    dispatcher.compact_agent(agent.id, send_id, factory).await;
+    dispatcher.compact_agent(agent.id, send_id, &factory);
     within(
         &emitter,
         "turn_start",
@@ -5548,7 +5547,7 @@ async fn cancel_send_drops_a_queued_compaction_with_message_cancelled() {
             "first",
             vec![],
             running_send_id,
-            Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+            Arc::clone(&factory),
             OnBusy::Enqueue,
         )
         .await;
@@ -5560,13 +5559,7 @@ async fn cancel_send_drops_a_queued_compaction_with_message_cancelled() {
     .await;
 
     let compaction_send_id = SendId::now_v7();
-    let compaction = dispatcher
-        .compact_agent(
-            agent.id,
-            compaction_send_id,
-            Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
-        )
-        .await;
+    let compaction = dispatcher.compact_agent(agent.id, compaction_send_id, &factory);
     dispatcher.cancel_send(compaction_send_id, &[agent.id], CancelSource::User);
     within(
         &emitter,
@@ -5605,9 +5598,7 @@ async fn cancel_send_drops_a_queued_compaction_with_message_cancelled() {
 async fn cancel_agent_drains_a_running_compaction_like_a_send() {
     let (dispatcher, emitter, journal, agent, factory) =
         compaction_fixture([MockScenario::CompactionAwaitsCancellation]);
-    dispatcher
-        .compact_agent(agent.id, SendId::now_v7(), factory)
-        .await;
+    dispatcher.compact_agent(agent.id, SendId::now_v7(), &factory);
     within(
         &emitter,
         "turn_start",
@@ -5638,9 +5629,10 @@ async fn cancel_agent_drains_a_running_compaction_like_a_send() {
 #[tokio::test]
 async fn a_queued_compaction_is_not_removable_as_a_queued_message() {
     // `remove_queued_message` exists to hand the user's text back to the
-    // composer. A compaction has none, so it answers `NotQueued` — and, the part
-    // that matters, leaves the work queued rather than dropping something the
-    // caller could not restore.
+    // composer. A compaction has none, so it answers `NotRemovable` — and, the
+    // part that matters, leaves the work queued rather than dropping something
+    // the caller could not restore. Reporting `NotQueued` here would be a lie
+    // about an item that is still going to run.
     let (dispatcher, emitter, _journal, agent, factory) = compaction_fixture([
         MockScenario::AwaitCancellation,
         MockScenario::CompactsSuccessfully,
@@ -5652,7 +5644,7 @@ async fn a_queued_compaction_is_not_removable_as_a_queued_message() {
             "first",
             vec![],
             SendId::now_v7(),
-            Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+            Arc::clone(&factory),
             OnBusy::Enqueue,
         )
         .await;
@@ -5663,15 +5655,13 @@ async fn a_queued_compaction_is_not_removable_as_a_queued_message() {
     )
     .await;
 
-    let compaction = dispatcher
-        .compact_agent(agent.id, SendId::now_v7(), factory)
-        .await;
+    let compaction = dispatcher.compact_agent(agent.id, SendId::now_v7(), &factory);
     assert_eq!(
         dispatcher
             .remove_queued_message(agent.id, compaction)
             .await
             .unwrap_err(),
-        NotQueued
+        RemoveQueuedMessageError::NotRemovable
     );
 
     assert_eq!(
@@ -5700,13 +5690,7 @@ async fn an_unsupported_compaction_fails_the_message_without_starting_a_turn() {
     let (dispatcher, emitter, journal, agent, factory) =
         compaction_fixture([MockScenario::Streaming]);
 
-    dispatcher
-        .compact_agent(
-            agent.id,
-            SendId::now_v7(),
-            Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
-        )
-        .await;
+    dispatcher.compact_agent(agent.id, SendId::now_v7(), &factory);
     within(
         &emitter,
         "message_failed",
@@ -5748,22 +5732,50 @@ async fn an_unsupported_compaction_fails_the_message_without_starting_a_turn() {
     .await;
 }
 
-/// Register a current-turn wait on `agent_id` and return the pending future.
+/// Register a current-turn wait against `agent_id`'s running turn, proving the
+/// actor **serviced and deliberately withheld** it, and return the still-pending
+/// future.
 ///
-/// Polling once is what makes the compaction waiter tests deterministic rather
-/// than racy: `wait_for_current_turn` sends its command to the actor
-/// *synchronously*, before its first await, so one poll guarantees the command
-/// is on the actor's FIFO — and the `Pending` it must return is itself the
-/// assertion that the wait has not already resolved.
+/// Three steps, each load-bearing:
+///
+/// 1. Poll the wait once. `wait_for_current_turn` sends its command to the actor
+///    *synchronously*, before its first await, so one poll puts the command on
+///    the actor's FIFO. The `Pending` it returns proves only that no reply has
+///    arrived yet — not that the actor has seen it.
+/// 2. Round-trip `running_turn_kind`, whose `PeekCurrentTurn` lands on that same
+///    FIFO *behind* the wait. Its reply cannot come back until the wait was
+///    processed first, and the `expected` kind it carries is a second assertion:
+///    the wait bound to the turn the test means it to.
+/// 3. Poll again. Now `Pending` means the actor saw the wait and chose to hold
+///    it, which is the actual contract — without this step a regression that
+///    answered the wait immediately would still look identical to one that had
+///    not yet reached it.
+///
+/// **Call this before releasing whatever ends the turn.** Step 2's ordering
+/// proof only establishes *mid-turn* registration while the stream has no event
+/// ready: `drain_turn`'s `select!` is `biased` toward the stream, so a terminal
+/// made ready first would be processed ahead of a command already in the
+/// mailbox, and this helper would then be proving mid-*drain* registration
+/// instead.
 async fn register_current_turn_wait<'a>(
     dispatcher: &'a Arc<Dispatcher>,
     agent_id: AgentId,
+    expected: TurnKind,
     label: &str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CurrentTurnWait> + Send + 'a>> {
     let mut fut = Box::pin(dispatcher.wait_for_current_turn(agent_id));
     assert!(
         futures::poll!(fut.as_mut()).is_pending(),
-        "{label}: the wait resolved before the compaction's stream drained"
+        "{label}: the wait resolved before it could even be registered"
+    );
+    assert_eq!(
+        dispatcher.running_turn_kind(agent_id).await,
+        Some(expected),
+        "{label}: the wait did not register against a running {expected:?} turn"
+    );
+    assert!(
+        futures::poll!(fut.as_mut()).is_pending(),
+        "{label}: the actor answered the wait instead of holding it until drain"
     );
     fut
 }
@@ -5777,9 +5789,7 @@ async fn compaction_waiters_resolve_idle_at_drain(fail: bool) {
             end_stream: Arc::clone(&end_stream),
             fail,
         }]);
-    dispatcher
-        .compact_agent(agent.id, SendId::now_v7(), factory)
-        .await;
+    dispatcher.compact_agent(agent.id, SendId::now_v7(), &factory);
     within(
         &emitter,
         "turn_start",
@@ -5787,8 +5797,17 @@ async fn compaction_waiters_resolve_idle_at_drain(fail: bool) {
     )
     .await;
 
-    // Window 1: mid-compaction — the producer is parked before its terminal.
-    let mut mid = register_current_turn_wait(&dispatcher, agent.id, "mid-compaction").await;
+    // Window 1: mid-compaction. The producer is parked before its terminal, so
+    // the stream has nothing ready and the helper's ordering proof establishes a
+    // genuinely *mid-turn* registration. Registering before the release below is
+    // what makes that true — see the helper's contract.
+    let mut mid = register_current_turn_wait(
+        &dispatcher,
+        agent.id,
+        TurnKind::Compaction,
+        "mid-compaction",
+    )
+    .await;
 
     start_terminal.notify_one();
     within(&emitter, "turn_end", emitter.wait_for_type("turn_end", 1)).await;
@@ -5801,17 +5820,12 @@ async fn compaction_waiters_resolve_idle_at_drain(fail: bool) {
         futures::poll!(mid.as_mut()).is_pending(),
         "a compaction waiter must not resolve at the terminal event"
     );
-    let mut late = register_current_turn_wait(&dispatcher, agent.id, "post-terminal").await;
-    // Ordering, not decoration: `PeekCurrentTurn` lands on the same FIFO mailbox
-    // *behind* the wait just registered, so its reply proves the actor has
-    // already processed that wait — and the kind it carries proves the actor is
-    // still inside the drain, which is the window being tested.
-    assert_eq!(
-        dispatcher.running_turn_kind(agent.id).await,
-        Some(TurnKind::Compaction),
-        "a compaction reports running until its stream drains, not until its terminal"
-    );
-    assert!(futures::poll!(late.as_mut()).is_pending());
+    // A wait arriving in this window gets the same treatment. The helper's
+    // `Some(Compaction)` assertion doubles here as the proof that a compaction
+    // reports running until its stream drains rather than until its terminal.
+    let late =
+        register_current_turn_wait(&dispatcher, agent.id, TurnKind::Compaction, "post-terminal")
+            .await;
 
     end_stream.notify_one();
     assert_eq!(current_turn_within(mid).await, CurrentTurnWait::Idle);
@@ -5841,7 +5855,7 @@ async fn a_cancelled_compactions_waiter_resolves_idle_not_cancelled() {
     let (dispatcher, emitter, _journal, agent, factory) =
         compaction_fixture([MockScenario::CompactionAwaitsCancellation]);
     let send_id = SendId::now_v7();
-    dispatcher.compact_agent(agent.id, send_id, factory).await;
+    dispatcher.compact_agent(agent.id, send_id, &factory);
     within(
         &emitter,
         "turn_start",
@@ -5849,7 +5863,13 @@ async fn a_cancelled_compactions_waiter_resolves_idle_not_cancelled() {
     )
     .await;
 
-    let waiter = register_current_turn_wait(&dispatcher, agent.id, "mid-compaction").await;
+    let waiter = register_current_turn_wait(
+        &dispatcher,
+        agent.id,
+        TurnKind::Compaction,
+        "mid-compaction",
+    )
+    .await;
     dispatcher.cancel_send(send_id, &[agent.id], CancelSource::User);
     assert_eq!(current_turn_within(waiter).await, CurrentTurnWait::Idle);
 }
@@ -5870,13 +5890,7 @@ async fn a_send_queued_behind_a_compaction_is_unaffected_by_its_waiter() {
         MockScenario::Streaming,
     ]);
 
-    let compaction = dispatcher
-        .compact_agent(
-            agent.id,
-            SendId::now_v7(),
-            Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
-        )
-        .await;
+    let compaction = dispatcher.compact_agent(agent.id, SendId::now_v7(), &factory);
     within(
         &emitter,
         "turn_start (compaction)",
@@ -5884,7 +5898,13 @@ async fn a_send_queued_behind_a_compaction_is_unaffected_by_its_waiter() {
     )
     .await;
 
-    let waiter = register_current_turn_wait(&dispatcher, agent.id, "mid-compaction").await;
+    let waiter = register_current_turn_wait(
+        &dispatcher,
+        agent.id,
+        TurnKind::Compaction,
+        "mid-compaction",
+    )
+    .await;
     let queued = accepted(
         dispatcher
             .send_message(

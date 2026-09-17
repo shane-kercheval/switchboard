@@ -462,6 +462,37 @@ compaction carries no usage at all, so it shows a message and no counts, unchang
 **Context bar.** No change to `contextUtilization` should be needed once the compaction row is a
 completed agent turn carrying `usage`; verify rather than assume, and add the sidebar tests.
 
+**Compaction-aware copy, in one pass.** Milestone 3 is the first milestone in which a user can start
+a compaction, so it is the first in which any message about a busy agent can be about one — and
+several of those messages currently assume the agent is mid-*answer*. `AppError::ForkSourceBusy`
+reads "{name} is working — a branch taken now would not include its current answer; wait for it to
+finish, or cancel it first", whose middle clause is wrong for a compaction, which has no answer. The
+refusal itself is correct for both: a send's answer is not on disk yet, and a compaction is rewriting
+the session file, so either way the fork copies something unfinished.
+
+Do **not** make the message kind-aware. `ForkSourceBusy` is raised from four sites —
+`ensure_fork_source_free` and the send-path gate in `commands.rs`, the dispatch preflight in
+`dispatch_context.rs`, and the workflow fork gate in `workflow_commands.rs` — and only the first has
+the turn kind in hand. The other three reach their answer through `busy_fork_source`, which returns
+an `Option<AgentRecord>` from the bool `is_safe_to_fork_from`, so threading the kind means widening
+that predicate and three call sites for a wording change. Generic wording covers both operations.
+
+Check any candidate against three constraints, in this order — the terse rewrites that lose one of
+them lose it silently:
+
+1. **True for a send and a compaction.** Avoid "its current answer" (a compaction has none) and also
+   avoid implying that cancelling *completes* anything — a cancelled turn leaves the conversation
+   just as unfinished, only no longer moving.
+2. **Gives the reason.** A bare "is busy, try later" teaches nothing about why branching is refused
+   when queueing is not.
+3. **Keeps the cancel affordance.** The current message offers "or cancel it first"; a rewrite that
+   drops it leaves the user only the option of waiting.
+
+Candidate: "{name} is busy — its conversation must stop changing before you can branch. Wait for it
+to finish, or cancel it first." Settle the final string against the real UI. Sweep the sibling
+busy-agent messages in the same pass; `resolve_source_completed_only`'s workflow refusal was made
+kind-aware in milestone 2 and is the reference for the precision wanted.
+
 ### Definition of Done
 
 - App tests (free functions): `compact_agent_impl` refuses a Codex and an Antigravity agent, an
@@ -485,7 +516,8 @@ completed agent turn carrying `usage`; verify rather than assume, and add the si
   reply yields one failed row; the ordering scenario **running send → queued send → queued
   compaction** asserts the sidebar bar shows the compaction's occupancy after it completes, and again
   after a hydrate; a failed compaction leaves the bar unchanged.
-- Copy reviewed against `docs/ui-conventions.md`.
+- Copy reviewed against `docs/ui-conventions.md`, including the busy-agent sweep above (a fork
+  refused because its parent is compacting must not promise an answer that is not coming).
 - `make check` green, including the browser suite.
 
 ## Milestone 4 — Documentation

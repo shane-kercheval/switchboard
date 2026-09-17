@@ -17,7 +17,7 @@ use switchboard_core::{
 };
 use switchboard_dispatcher::{
     CancelOutcome, CurrentTurnWait, DispatchContextFactory, Dispatcher, EventEmitter, OnBusy,
-    RemovedQueuedMessage, SendOutcome, TurnKind,
+    RemoveQueuedMessageError, RemovedQueuedMessage, SendOutcome, TurnKind,
 };
 use switchboard_harness::{
     CancelSource, ForwardedBlock, HarnessAdapter, MessageId, TurnOutcome,
@@ -3540,6 +3540,13 @@ pub async fn send_message_impl(
 /// Remove a not-yet-dispatched queued message by id, returning its payload so
 /// the compose bar can restore the text. Race-safe: `NotQueued` (already
 /// dequeued/started or never existed) maps to [`AppError::QueuedMessageNotFound`].
+///
+/// Both of the dispatcher's refusals collapse onto that one error *today*,
+/// because no surface offers removal for a compaction row — so a user has no way
+/// to tell them apart, and inventing a second message would describe a state they
+/// cannot reach. They are listed by name rather than caught by a wildcard so a
+/// *new* refusal reason has to be classified deliberately instead of silently
+/// inheriting "not found".
 pub async fn remove_queued_message_impl(
     state: &AppState,
     agent_id: AgentId,
@@ -3549,7 +3556,11 @@ pub async fn remove_queued_message_impl(
         .dispatcher
         .remove_queued_message(agent_id, message_id)
         .await
-        .map_err(|_| AppError::QueuedMessageNotFound(message_id))
+        .map_err(|e| match e {
+            RemoveQueuedMessageError::NotQueued | RemoveQueuedMessageError::NotRemovable => {
+                AppError::QueuedMessageNotFound(message_id)
+            }
+        })
 }
 
 /// Cancel an agent's in-flight turn (user-initiated stop). Idempotent: a

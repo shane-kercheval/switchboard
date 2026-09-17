@@ -2133,3 +2133,102 @@ describe("workflow user_message events", () => {
     expect(fanout.user.text).toBe("review");
   });
 });
+
+describe("compaction turns", () => {
+  const COMPACT_TURN = "00000000-0000-7000-8000-00000000c004";
+  const COMPACT_SEND = "00000000-0000-7000-8000-00000000c001";
+
+  /// `reduce`, but supplying the pending entry's `send_id` and kind the way the
+  /// event boundary does.
+  function reduceCompaction(turns: Turn[], input: ReducerInput): Turn[] {
+    return transcriptReducer(
+      turns,
+      input,
+      AGENT_A,
+      RECEIVED_AT,
+      COMPACT_SEND,
+      undefined,
+      "compaction",
+    );
+  }
+
+  it("survives a hydrate that has no counterpart on disk", () => {
+    // Decision 7 depends on this. A compaction writes no agent turn to the
+    // session file — only the harness's own recap marker — so every refresh
+    // re-reads a disk view that does not contain this row. If the merge dropped
+    // residents with no disk counterpart, the row the user just watched run
+    // would vanish the moment the recap arrived beside it.
+    const resident = reduceCompaction([], {
+      type: "turn_start",
+      turn_id: COMPACT_TURN,
+      message_id: "m-1",
+      started_at: "2026-05-15T00:00:05Z",
+    } as ReducerInput);
+    expect(resident).toHaveLength(1);
+
+    const merged = reduce(resident, {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [
+        {
+          role: "agent",
+          turn_id: "disk-unrelated",
+          agent_id: AGENT_A,
+          started_at: "2026-05-14T00:00:02Z",
+          status: "complete",
+          items: [{ item_kind: "text", kind: "text", text: "an earlier answer" }],
+        },
+      ],
+    });
+
+    const kept = merged.find((t) => t.turn_id === COMPACT_TURN);
+    expect(kept?.role === "agent" && kept.kind).toBe("compaction");
+  });
+
+  it("keeps its usage on a failed terminal", () => {
+    // A compaction that succeeded and then exited non-zero terminates `failed`
+    // while legitimately carrying post-compaction occupancy — and the sidebar
+    // bar moves on that same usage. Dropping it here would leave the row saying
+    // "failed" with no numbers while the bar dropped.
+    const started = reduceCompaction([], {
+      type: "turn_start",
+      turn_id: COMPACT_TURN,
+      message_id: "m-1",
+      started_at: "2026-05-15T00:00:05Z",
+    } as ReducerInput);
+    const ended = reduce(started, {
+      type: "turn_end",
+      turn_id: COMPACT_TURN,
+      outcome: { status: "failed", kind: "harness_error", message: "exited with code 1" },
+      ended_at: "2026-05-15T00:00:06Z",
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        context_input_tokens: 120000,
+        context_tokens_after_turn: 18000,
+        context_window: 200000,
+      },
+    } as ReducerInput);
+
+    const turn = ended.find((t) => t.turn_id === COMPACT_TURN);
+    expect(turn?.role === "agent" && turn.status).toBe("failed");
+    expect(turn?.role === "agent" && turn.usage?.context_tokens_after_turn).toBe(18000);
+    expect(turn?.role === "agent" && turn.kind).toBe("compaction");
+  });
+
+  it("renders no row for a cancelled queued compaction, where a send renders one", () => {
+    const cancelled = {
+      type: "message_cancelled",
+      message_id: "m-1",
+      send_id: COMPACT_SEND,
+      agent_id: AGENT_A,
+      at: RECEIVED_AT,
+    } as ReducerInput;
+    expect(reduceCompaction([], cancelled)).toEqual([]);
+    // The same event for a *send* does render its cancelled row — the contrast
+    // is the behavior, not an accident of this input.
+    expect(
+      transcriptReducer([], cancelled, AGENT_A, RECEIVED_AT, COMPACT_SEND, undefined, undefined),
+    ).toHaveLength(1);
+  });
+});

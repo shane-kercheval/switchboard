@@ -113,6 +113,17 @@ export type Turn =
       /// AdapterFailure → suggest "report bug"; AuthFailure → "run claude auth login").
       error?: string;
       error_kind?: FailureKind;
+      /// What this turn *is*, when it is not an ordinary response. `"compaction"`
+      /// marks a manual context compaction: a real turn that ran on the agent, in
+      /// execution order, but that has no prompt above it and no answer inside it
+      /// — so it renders as its own compact row rather than as an empty response.
+      ///
+      /// Absent on every ordinary turn, and never set on a hydrated one: a
+      /// compaction leaves no agent turn on disk (only the harness's own recap
+      /// marker), so a turn read from a session file is always a response.
+      /// `status` is untouched by this — a compaction is streaming, complete,
+      /// failed, or cancelled exactly like any other turn.
+      kind?: "compaction";
     };
 
 /// One ordered entry in an agent turn's content stream. Discriminated by
@@ -181,6 +192,17 @@ export type PendingSend = {
   /// (already running → cancel the live turn). Such an entry is no longer "live"
   /// work (excluded from the composer's stop affordance).
   cancel_requested?: boolean;
+  /// Set to `"compaction"` for a queued manual compaction. A compaction lives in
+  /// this list for the same reason a send does — it is work the backend has
+  /// accepted but not started, and its `turn_start` must consume *its own* entry.
+  /// Keeping it out of the list would let it consume a concurrent send's slot in
+  /// the pre-receipt race and mis-attribute that send's reply.
+  ///
+  /// Travels with `queued_at`: a compaction has no user turn to take a timestamp
+  /// from, so the queued row needs its own to sit in the right place in the
+  /// timeline. Both are absent for a send.
+  kind?: "compaction";
+  queued_at?: string;
 };
 
 /// Per-agent operational state.

@@ -60,6 +60,12 @@ export function transcriptReducer(
   // re-read once that turn carries an early `hydration_key`. See
   // `resolveTurnCollision`'s `protectedTurnId`.
   inFlightTurnId?: TurnId,
+  // What the pending entry this event belongs to was, when it was not an
+  // ordinary send. Supplied by the caller alongside `sendId` from the same
+  // lookup, for the three events that consume an entry (`turn_start`,
+  // `message_failed`, `message_cancelled`) — a compaction renders as its own row,
+  // or as no row at all, where a send renders a response.
+  pendingKind?: "compaction",
 ): Turn[] {
   switch (input.type) {
     case "turn_start": {
@@ -80,6 +86,10 @@ export function transcriptReducer(
           started_at: input.started_at,
           status: "streaming",
           items: [],
+          // Decision 7: the compaction enters the transcript when it *starts*, in
+          // execution order — never at click time, which would place it ahead of
+          // any send already queued in front of it.
+          kind: pendingKind,
         },
       ];
     }
@@ -144,6 +154,11 @@ export function transcriptReducer(
       // under its prompt. `sendId` comes from the event's backend-authoritative
       // send identity. Idempotent on the derived `turn_id`.
       if (sendId === undefined) return turns;
+      // Decision 8: a queued compaction cancelled before it started disappears
+      // without a row. Nothing ran, and there is no user message for a
+      // "cancelled" row to sit under — unlike a cancelled queued send, whose row
+      // renders beneath the prompt the user did type.
+      if (pendingKind === "compaction") return turns;
       const turn_id = `cancelled-${input.message_id}`;
       if (findTurn(turns, turn_id) !== undefined) return turns;
       return [
@@ -184,6 +199,7 @@ export function transcriptReducer(
         receivedAt,
         input.error,
         sendId,
+        pendingKind,
       );
     }
 
@@ -595,7 +611,7 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         // else the front — see `pickPendingIndex`).
         pending_sends: removePending(
           runtime.pending_sends,
-          pickPendingIndex(runtime.pending_sends, input.message_id),
+          pickPendingIndex(runtime.pending_sends, input.message_id, input.send_id),
         ),
       };
 
@@ -604,7 +620,11 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // adapter failed to launch pre-`TurnStart`). Prune its pending entry (by
       // message_id, else front) and surface the error. A truly stray event
       // (no pending sends) is ignored.
-      const idx = pickPendingIndex(runtime.pending_sends, input.message_id);
+      const idx = pickPendingIndex(
+        runtime.pending_sends,
+        input.message_id,
+        input.send_id ?? undefined,
+      );
       if (idx < 0) return runtime;
       const pending_sends = removePending(runtime.pending_sends, idx);
       const last_error: { message: string; kind: FailureKind } = {
@@ -790,11 +810,32 @@ function findTurn(turns: Turn[], turnId: TurnId): Turn | undefined {
 /// `message_failed` beats the `send_message` IPC receipt, so the entry has no
 /// `message_id` yet — the backend runs turns in dispatch order, so the front is
 /// the next to start). `-1` when there are no pending sends (a stray event).
-function pickPendingIndex(pending: PendingSend[] | undefined, messageId: MessageId): number {
+/// The pending entry an event consumes: its receipt if known, else its send
+/// identity, else — only when the event carries no send identity at all — the
+/// receipt-less front entry.
+///
+/// **Identity before position.** Every pending entry carries a frontend-minted
+/// `send_id`, and `turn_start` always carries one, so that pair is an exact
+/// match and the positional guess never has to run for it. The guess is not
+/// merely imprecise: an event belonging to a send the frontend never originated
+/// (a workflow dispatch) would otherwise consume whatever sits at the front,
+/// inheriting that entry's `send_id` *and* its kind — rendering an ordinary
+/// answer through the compaction row and hiding its content. Only
+/// `message_failed` still needs the guess, because its `send_id` is null for a
+/// send that never reached the journal.
+function pickPendingIndex(
+  pending: PendingSend[] | undefined,
+  messageId: MessageId,
+  sendId?: SendId,
+): number {
   if (pending === undefined || pending.length === 0) return -1;
   const byMsg = pending.findIndex((p) => p.message_id === messageId);
   if (byMsg >= 0) return byMsg;
-  // No receipt match. Fall back to the front *only* if it hasn't recorded its
+  if (sendId !== undefined) {
+    // Exact: an event naming a send must consume that send's entry or nothing.
+    return pending.findIndex((p) => p.send_id === sendId);
+  }
+  // No identity at all. Fall back to the front *only* if it hasn't recorded its
   // receipt yet — the race where the event beat `recordSendAccepted`. If the
   // front already has a (different) receipt, this event doesn't correlate to
   // any pending send: it's stray/stale, so don't consume anything.
@@ -859,6 +900,9 @@ function appendFailedTurnImpl(
   startedAt: string,
   error: string,
   sendId?: SendId,
+  // Carried so a compaction that failed before starting renders as a failed
+  // *compaction* row rather than as an empty response with no prompt above it.
+  kind?: "compaction",
 ): Turn[] {
   if (findTurn(turns, turnId) !== undefined) return turns;
   return [
@@ -873,6 +917,7 @@ function appendFailedTurnImpl(
       items: [],
       error,
       error_kind: "adapter_failure",
+      kind,
     },
   ];
 }

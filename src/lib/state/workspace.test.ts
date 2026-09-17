@@ -2063,3 +2063,87 @@ describe("workspace registry reads", () => {
     expect(ws.projects.list).toEqual([]);
   });
 });
+
+describe("project read serialization", () => {
+  /// Give queued reads enough turns to drain.
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 40; i += 1) {
+      await tick();
+      await new Promise((r) => setTimeout(r, 1));
+    }
+  }
+
+  it("runs overlapping project reads one at a time", async () => {
+    // Every read rebuilds and *replaces* the project's whole overlay, so two
+    // running at once do not merge — the later-finishing one wins outright, and
+    // an older read landing last reverts the view. Three branches, not two,
+    // because serializing only the second against the first still lets the third
+    // run concurrently with it.
+    const ws = await loadWorkspaceState();
+    const forks = ["f1", "f2", "f3"].map((suffix, idx) => ({
+      ...agent(`00000000-0000-7000-8000-0000000000${suffix}`, PROJECT_1),
+      name: `branch-${idx}`,
+      forked_from_session: "00000000-0000-7000-8000-0000000000aa",
+    }));
+
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") {
+        return { items: [], agents: [] } satisfies ProjectConversation;
+      }
+      return undefined;
+    });
+    const state = await loadAgentState();
+    ws.agentsByProject[PROJECT_1] = forks;
+    for (const f of forks) await state.registerAgent(f);
+    await ws.hydrateProject(PROJECT_1);
+    expect(ws.conversations[PROJECT_1]?.status).toBe("complete");
+    ws.installForkHistoryRefresh();
+
+    // From here every read is gated, so overlap is observable.
+    const order: string[] = [];
+    const gates: (() => void)[] = [];
+    let seq = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") {
+        seq += 1;
+        const id = `load-${seq}`;
+        order.push(`start:${id}`);
+        await new Promise<void>((resolve) => gates.push(resolve));
+        order.push(`end:${id}`);
+        return { items: [], agents: [] } satisfies ProjectConversation;
+      }
+      return undefined;
+    });
+
+    // All three branches' first turns complete together — the case the
+    // fork-history loader's own comment describes.
+    let turn = 0;
+    for (const f of forks) {
+      turn += 1;
+      fireTo(`agent:${f.id}`, {
+        type: "turn_end",
+        turn_id: `turn-${turn}`,
+        outcome: { status: "completed" },
+        ended_at: "2026-05-16T00:00:05Z",
+      });
+    }
+    await settle();
+
+    expect(order).toEqual(["start:load-1"]);
+    gates[0]?.();
+    await settle();
+    expect(order).toEqual(["start:load-1", "end:load-1", "start:load-2"]);
+    gates[1]?.();
+    await settle();
+    expect(order).toEqual([
+      "start:load-1",
+      "end:load-1",
+      "start:load-2",
+      "end:load-2",
+      "start:load-3",
+    ]);
+    gates[2]?.();
+    await settle();
+    expect(order.filter((e) => e.startsWith("start:"))).toHaveLength(3);
+  });
+});

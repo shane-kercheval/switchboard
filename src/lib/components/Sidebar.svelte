@@ -6,6 +6,7 @@
     EyeOff,
     FileText,
     GripVertical,
+    History,
     MoreHorizontal,
     Pencil,
     Plug,
@@ -18,7 +19,14 @@
   } from "@lucide/svelte";
   import { flip } from "svelte/animate";
   import type { AgentSelection, AgentRecord, AgentId, ProjectId } from "$lib/types";
-  import { retryAgentHydration, runtimes, stopAgent, transcripts } from "$lib/state/index.svelte";
+  import {
+    dispatchCompaction,
+    retryAgentHydration,
+    runtimes,
+    stopAgent,
+    transcripts,
+  } from "$lib/state/index.svelte";
+  import { supportsManualCompaction } from "$lib/harnessCapabilities";
   import {
     removeAgent,
     renameAgent,
@@ -611,6 +619,13 @@
     }
   }
 
+  /// Start a manual compaction for `agentId`. The `send_id` is minted here, the
+  /// same way the compose bar mints one per send, so the queued row has
+  /// something to cancel with before any `turn_start` carries the id back.
+  async function startCompaction(agentId: AgentId): Promise<void> {
+    await dispatchCompaction(agentId, crypto.randomUUID());
+  }
+
   /// Context utilization — `context_tokens_after_turn / context_window` from
   /// the most recent completed agent turn. Forward-looking signal ("how full
   /// will the next turn's context be").
@@ -1163,6 +1178,25 @@
                       >
                         <Square size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
                         Stop agent
+                      </DropdownMenuItem>
+                    {/if}
+                    {#if supportsManualCompaction(agent.harness)}
+                      <!-- Never disabled while busy: a compaction queues behind
+                           the running turn like any other work, so greying it out
+                           would refuse something the backend accepts. -->
+                      <DropdownMenuItem
+                        onSelect={() => void startCompaction(agent.id)}
+                        class="gap-2"
+                        tooltip="Summarize the conversation so far and continue from the summary. Runs as a turn; queues if the agent is busy."
+                        data-testid="agent-action-compact"
+                      >
+                        <History
+                          size={14}
+                          strokeWidth={1.8}
+                          class="text-muted shrink-0"
+                          aria-hidden="true"
+                        />
+                        Compact context
                       </DropdownMenuItem>
                     {/if}
                     {#if sessionInfo?.resume_command}

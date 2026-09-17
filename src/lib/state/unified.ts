@@ -29,6 +29,7 @@ import type {
   Attachment,
   ConversationItem,
   OutcomeStatus,
+  SendId,
   SystemMarker,
   TurnId,
 } from "$lib/types";
@@ -139,6 +140,25 @@ export type UnifiedRow =
       agent_id: AgentId;
       status: OutcomeStatus;
       reason?: string | null;
+    }
+  | {
+      // A compaction the backend has accepted but not started. It has no turn
+      // yet and no user message above it, so it is its own row rather than an
+      // affordance hung under a prompt the way a queued *send* is.
+      //
+      // `send_id` is deliberately absent, like a system marker's: it must never
+      // join a fan-out group, and it anchors to its own `queued_at` so it sits
+      // where the user asked for it — behind anything already queued, ahead of
+      // anything queued after.
+      kind: "queued_compaction";
+      at: string;
+      rank: 4;
+      key: string;
+      send_id?: undefined;
+      agent_id: AgentId;
+      /// What `cancel_send` cancels. Named for what it does here rather than
+      /// reusing `send_id`, which grouping keys on.
+      cancel_send_id: SendId;
     };
 
 /// A render unit for the transcript: either a standalone row, or a fan-out
@@ -162,7 +182,23 @@ export type RenderBlock =
 export const INITIAL_WINDOW = 20;
 export const REVEAL_BATCH = 20;
 
-const KIND_RANK = { user: 0, agent: 1, system_marker: 2, outcome: 3 } as const;
+/// One accepted-but-unstarted compaction, as the caller reads it off an agent's
+/// pending-send list.
+export type QueuedCompaction = {
+  agent_id: AgentId;
+  send_id: SendId;
+  queued_at: string;
+};
+
+const KIND_RANK = {
+  user: 0,
+  agent: 1,
+  system_marker: 2,
+  outcome: 3,
+  // Last at an identical timestamp: a queued compaction has not run, so anything
+  // that did belongs above it.
+  queued_compaction: 4,
+} as const;
 
 /// Merge the active project's per-agent turns (live + hydrated agent content
 /// and this-session user turns) with its journal overlay (historical user
@@ -188,8 +224,23 @@ export function buildUnifiedRows(
   turns: Turn[],
   overlay: ConversationItem[],
   knownAgentIds?: ReadonlySet<AgentId>,
+  /// Compactions accepted but not yet started, drawn from the agents'
+  /// `pending_sends`. A third source beside turns and the overlay because a
+  /// queued compaction exists in neither: it has no turn until `turn_start`, and
+  /// nothing about it is ever journaled.
+  queuedCompactions: QueuedCompaction[] = [],
 ): UnifiedRow[] {
   const rows: UnifiedRow[] = [];
+  for (const queued of queuedCompactions) {
+    rows.push({
+      kind: "queued_compaction",
+      at: queued.queued_at,
+      rank: KIND_RANK.queued_compaction,
+      key: `qc:${queued.send_id}`,
+      agent_id: queued.agent_id,
+      cancel_send_id: queued.send_id,
+    });
+  }
 
   // Live user turns of one fan-out share a `send_id` (one per recipient), so
   // collapse them into a single user row whose `agent_ids` is the recipient set
@@ -321,7 +372,11 @@ export function buildUnifiedRows(
     } else if (row.kind === "user") {
       const agent_ids = row.agent_ids.filter((id) => knownAgentIds.has(id));
       if (agent_ids.length > 0) visibleRows.push({ ...row, agent_ids });
-    } else if (row.kind === "outcome" || row.kind === "system_marker") {
+    } else if (
+      row.kind === "outcome" ||
+      row.kind === "system_marker" ||
+      row.kind === "queued_compaction"
+    ) {
       if (knownAgentIds.has(row.agent_id)) visibleRows.push(row);
     } else if (knownAgentIds.has(row.turn.agent_id)) {
       visibleRows.push(row);

@@ -694,3 +694,47 @@ describe("groupRenderBlocks", () => {
     ]);
   });
 });
+
+describe("queued compactions", () => {
+  const COMPACT_SEND = "00000000-0000-7000-8000-00000000c001";
+
+  it("interleaves chronologically instead of pinning to either end", () => {
+    // A compaction has no user message to anchor to, so `queued_at` is the only
+    // thing that can place it — and placement is the whole point: it must sit
+    // behind work already queued and ahead of work queued after, matching the
+    // order the backend will actually run them in.
+    const rows = buildUnifiedRows(
+      [
+        userTurn(TURN_1, AGENT_A, "2026-05-15T00:00:00Z", "first", SEND_1),
+        agentTurn("t-1", AGENT_A, "2026-05-15T00:00:01Z", SEND_1),
+      ],
+      [],
+      undefined,
+      [{ agent_id: AGENT_A, send_id: COMPACT_SEND, queued_at: "2026-05-15T00:00:02Z" }],
+    );
+
+    expect(rows.map((r) => r.kind)).toEqual(["user", "agent", "queued_compaction"]);
+    const queued = rows.at(-1);
+    expect(queued?.kind === "queued_compaction" && queued.cancel_send_id).toBe(COMPACT_SEND);
+    // Never grouped into a fan-out: a compaction belongs to no send.
+    expect(queued?.send_id).toBeUndefined();
+  });
+
+  it("sorts before a turn that started after it was queued", () => {
+    const rows = buildUnifiedRows(
+      [agentTurn("t-late", AGENT_A, "2026-05-15T00:00:09Z")],
+      [],
+      undefined,
+      [{ agent_id: AGENT_A, send_id: COMPACT_SEND, queued_at: "2026-05-15T00:00:02Z" }],
+    );
+    expect(rows.map((r) => r.kind)).toEqual(["queued_compaction", "agent"]);
+  });
+
+  it("is filtered out with its agent when that agent is removed", () => {
+    // Same rule every other row follows — a removed agent leaves no orphan.
+    const rows = buildUnifiedRows([], [], new Set([AGENT_B]), [
+      { agent_id: AGENT_A, send_id: COMPACT_SEND, queued_at: "2026-05-15T00:00:02Z" },
+    ]);
+    expect(rows).toEqual([]);
+  });
+});

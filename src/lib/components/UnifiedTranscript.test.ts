@@ -5316,3 +5316,299 @@ describe("pending-branch notice", () => {
     expect(screen.getByText(/no messages yet/i)).toBeInTheDocument();
   });
 });
+
+describe("compaction rows", () => {
+  const COMPACT_SEND = "00000000-0000-7000-8000-00000000c001";
+  const COMPACT_PENDING = "00000000-0000-7000-8000-00000000c002";
+  const COMPACT_MESSAGE = "00000000-0000-7000-8000-00000000c003";
+  const COMPACT_TURN = "00000000-0000-7000-8000-00000000c004";
+
+  /// Register the agent and queue a compaction against it, with the IPC resolved
+  /// so the receipt is recorded.
+  async function queueCompaction(): Promise<Awaited<ReturnType<typeof loadState>>> {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    invokeMock.mockResolvedValue(COMPACT_MESSAGE);
+    await state.dispatchCompaction(
+      CLAUDE_AGENT.id,
+      COMPACT_SEND,
+      COMPACT_PENDING,
+      "2026-05-16T00:00:05Z",
+    );
+    return state;
+  }
+
+  it("renders a queued compaction as its own row, with a cancel that fires cancel_send", async () => {
+    // A queued *send* hangs its affordance under the prompt the user typed. A
+    // compaction has no prompt, so it stands alone — and cancelling it is the
+    // only way to get rid of it before it starts.
+    await queueCompaction();
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const queued = await screen.findByTestId("compaction-queued");
+    expect(queued).toHaveTextContent(/compaction queued/i);
+
+    invokeMock.mockClear();
+    await fireEvent.click(within(queued).getByTestId("compaction-queued-cancel"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "cancel_send",
+        expect.objectContaining({ sendId: COMPACT_SEND }),
+      ),
+    );
+  });
+
+  it("replaces the queued row with a running one, then the compacted result", async () => {
+    // The realistic sequence. `turn_start` is what puts the row in execution
+    // order; the counts are what tell the user the action did something.
+    await queueCompaction();
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await screen.findByTestId("compaction-queued");
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: COMPACT_TURN,
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      started_at: "2026-05-16T00:00:06Z",
+    } as NormalizedEvent);
+    await tick();
+
+    expect(screen.queryByTestId("compaction-queued")).toBeNull();
+    expect(await screen.findByTestId("compaction-turn")).toHaveTextContent(/compacting context/i);
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_end",
+      turn_id: COMPACT_TURN,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:07Z",
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        context_input_tokens: 120_000,
+        context_tokens_after_turn: 18_000,
+        context_window: 200_000,
+      },
+    } as NormalizedEvent);
+    await tick();
+
+    const row = screen.getByTestId("compaction-turn");
+    expect(row).toHaveTextContent(/context compacted/i);
+    expect(within(row).getByTestId("compaction-turn-counts")).toHaveTextContent(
+      "120k → 18k tokens",
+    );
+  });
+
+  it("shows the harness's own reason when a compaction is refused", async () => {
+    // The whole point of reading the harness's verdict rather than its exit
+    // code: "Not enough messages to compact" is actionable, "it failed" is not.
+    await queueCompaction();
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await screen.findByTestId("compaction-queued");
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: COMPACT_TURN,
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      started_at: "2026-05-16T00:00:06Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_end",
+      turn_id: COMPACT_TURN,
+      outcome: {
+        status: "failed",
+        kind: "harness_error",
+        message: "Not enough messages to compact.",
+      },
+      ended_at: "2026-05-16T00:00:07Z",
+    } as NormalizedEvent);
+    await tick();
+
+    const row = await screen.findByTestId("compaction-turn");
+    expect(row).toHaveTextContent(/not enough messages to compact/i);
+    // A refused compaction withholds usage entirely, so there is nothing to show.
+    expect(within(row).queryByTestId("compaction-turn-counts")).toBeNull();
+  });
+
+  it("still shows counts on a compaction that worked and then exited badly", async () => {
+    // The row must not say "failed" with no numbers while the sidebar bar drops
+    // on the very usage it is hiding — that reads as a contradiction.
+    await queueCompaction();
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await screen.findByTestId("compaction-queued");
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: COMPACT_TURN,
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      started_at: "2026-05-16T00:00:06Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_end",
+      turn_id: COMPACT_TURN,
+      outcome: { status: "failed", kind: "harness_error", message: "exited with code 1" },
+      ended_at: "2026-05-16T00:00:07Z",
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        context_input_tokens: 120_000,
+        context_tokens_after_turn: 18_000,
+        context_window: 200_000,
+      },
+    } as NormalizedEvent);
+    await tick();
+
+    const row = await screen.findByTestId("compaction-turn");
+    expect(row).toHaveTextContent(/exited with code 1/i);
+    expect(within(row).getByTestId("compaction-turn-counts")).toHaveTextContent(
+      "120k → 18k tokens",
+    );
+  });
+
+  it("leaves nothing behind when a queued compaction is cancelled", async () => {
+    // Decision 8: nothing ran, and there is no prompt for a cancelled row to sit
+    // under. A cancelled queued *send* does render one — the difference is
+    // deliberate.
+    await queueCompaction();
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await screen.findByTestId("compaction-queued");
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "message_cancelled",
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      agent_id: CLAUDE_AGENT.id,
+      at: "2026-05-16T00:00:07Z",
+    } as NormalizedEvent);
+    await tick();
+
+    expect(screen.queryByTestId("compaction-queued")).toBeNull();
+    expect(screen.queryByTestId("compaction-turn")).toBeNull();
+    expect(screen.queryAllByTestId("turn")).toHaveLength(0);
+  });
+
+  it("offers a send-scoped cancel while it is running", async () => {
+    // Decision 1: a compaction is cancellable on its own terms. Without this the
+    // only way to stop one is "Stop agent", which also discards everything else
+    // queued for that agent.
+    await queueCompaction();
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await screen.findByTestId("compaction-queued");
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: COMPACT_TURN,
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      started_at: "2026-05-16T00:00:06Z",
+    } as NormalizedEvent);
+    await tick();
+
+    invokeMock.mockClear();
+    await fireEvent.click(screen.getByTestId("turn-live-control"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "cancel_send",
+        expect.objectContaining({ sendId: COMPACT_SEND }),
+      ),
+    );
+  });
+
+  it("shows the cost and model of a compaction that spent real money", async () => {
+    // A compaction bills like any other turn. The accepted limitation is that
+    // cost is lost after a restart, not that it never appears.
+    await queueCompaction();
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await screen.findByTestId("compaction-queued");
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: COMPACT_TURN,
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      started_at: "2026-05-16T00:00:06Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_end",
+      turn_id: COMPACT_TURN,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:07Z",
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        context_input_tokens: 120_000,
+        context_tokens_after_turn: 18_000,
+        context_window: 200_000,
+        total_cost_usd: 0.42,
+      },
+      spend: { real_spend: true, is_overage: true, overage_resets_at: null },
+      model: "claude-sonnet-4-6",
+    } as NormalizedEvent);
+    await tick();
+
+    expect(await screen.findByTestId("message-cost")).toHaveTextContent("0.4200");
+    expect(screen.getByTestId("message-overage")).toBeInTheDocument();
+    expect(screen.getByTestId("message-model")).toHaveTextContent("claude-sonnet-4-6");
+  });
+
+  it("renders an IPC refusal as a compaction row, not a bare failed response", async () => {
+    // The likeliest first interaction: the menu is offered on a brand-new agent,
+    // and the backend correctly refuses with "send it a message first". That
+    // refusal must not look like the CLI crashed.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    invokeMock.mockRejectedValue(new Error("alice has no conversation to compact yet"));
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    await state.dispatchCompaction(
+      CLAUDE_AGENT.id,
+      COMPACT_SEND,
+      COMPACT_PENDING,
+      "2026-05-16T00:00:05Z",
+    );
+    await tick();
+
+    const row = await screen.findByTestId("compaction-turn");
+    expect(row).toHaveTextContent(/no conversation to compact/i);
+    expect(screen.queryByTestId("compaction-queued")).toBeNull();
+  });
+
+  it("renders one failed row when the whole sequence beats the IPC reply", async () => {
+    // The pre-receipt race: `message_failed` can land before `compact_agent`
+    // resolves, so the entry it prunes has no `message_id` yet. One row, not two,
+    // and not a stranded queued row.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    let resolveIpc: (id: string) => void = () => {};
+    invokeMock.mockImplementation(
+      async () => await new Promise<string>((res) => (resolveIpc = res)),
+    );
+    const inFlight = state.dispatchCompaction(
+      CLAUDE_AGENT.id,
+      COMPACT_SEND,
+      COMPACT_PENDING,
+      "2026-05-16T00:00:05Z",
+    );
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await screen.findByTestId("compaction-queued");
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "message_failed",
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      agent_id: CLAUDE_AGENT.id,
+      error: "the harness declined to compact this conversation",
+      at: "2026-05-16T00:00:06Z",
+    } as NormalizedEvent);
+    resolveIpc(COMPACT_MESSAGE);
+    await inFlight;
+    await tick();
+
+    expect(screen.queryByTestId("compaction-queued")).toBeNull();
+    const rows = screen.getAllByTestId("compaction-turn");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveTextContent(/declined to compact/i);
+  });
+});

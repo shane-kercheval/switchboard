@@ -396,10 +396,15 @@ export async function migrateMessagePin(
 export async function loadProjectConversation(
   projectId: ProjectId,
   draftAttachments: string[] = [],
+  // Only the project's first load of this app session may reclaim staged
+  // attachments; a later read would delete the staged copy of an attachment a
+  // queued send still references. See the backend's `reclaim` doc.
+  reclaim = false,
 ): Promise<ProjectConversation> {
   return await invoke<ProjectConversation>("load_project_conversation", {
     projectId,
     draftAttachments,
+    reclaim,
   });
 }
 
@@ -572,6 +577,15 @@ export async function existingAttachmentPaths(
 // recipient cancels its in-flight turn iff it belongs to `sendId` and drops any
 // still-queued item of the send, never touching a later, unrelated turn. The
 // per-turn cancelled terminals flow back over the agent event channels.
+// Ask an agent to compact its own conversation: summarize the history so far and
+// continue from the summary. Returns the receipt `MessageId`; the turn's
+// lifecycle arrives on the agent's event channel like a send's, and `sendId` is
+// what cancels it while it is still queued. Claude-only — the backend refuses
+// every other harness, and the menu never offers it for them.
+export async function compactAgent(agentId: AgentId, sendId: SendId): Promise<MessageId> {
+  return await invoke<MessageId>("compact_agent", { agentId, sendId });
+}
+
 export async function cancelSend(sendId: SendId, recipients: AgentId[]): Promise<void> {
   await invoke("cancel_send", { sendId, recipients });
 }

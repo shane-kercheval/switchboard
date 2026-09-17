@@ -205,8 +205,26 @@ const sessionFingerprintBaseline = new Map<ProjectId, AgentSessionFingerprint[]>
 /// a redundant concurrent re-read. Defense-in-depth — the sole caller is
 /// `seq`-guarded and the keyed merge already makes a concurrent re-read
 /// dup-safe — but it keeps the function safe for any future caller.
+/// Projects whose staged attachments have already been reclaimed once in this
+/// app session. Non-reactive bookkeeping, like the guards around it.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const attachmentsReclaimed = new Set<ProjectId>();
+
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const refreshInFlight = new Set<ProjectId>();
+
+/// Projects whose refresh was requested *while one was already running*, and so
+/// must run again once it finishes.
+///
+/// Coalescing-by-dropping is right for the project-switch caller — that one
+/// retries on the next switch, which happens constantly. It is wrong for a
+/// completed compaction: the thing being fetched is the recap marker the harness
+/// just wrote, the request that would be dropped is the only one that will ever
+/// be made for it, and the in-flight read it lost to may have started before the
+/// harness finished writing. Dropping it leaves the compaction row with no recap
+/// beside it until the user switches projects.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const refreshRequestedAgain = new Set<ProjectId>();
 
 /// Every `send_id` of a *this-session* send, taken from the **user** turns in
 /// the per-agent slices. Used to keep the overlay to not-live-this-session
@@ -1033,7 +1051,22 @@ export async function hydrateProject(
     // reference. An unsent draft's chips live in localStorage, which the backend
     // can't see, so declare their paths or the load deletes the files behind
     // chips the composer is still showing.
-    const convo = await api.loadProjectConversation(projectId, draftAttachmentPaths(projectId));
+    //
+    // **Only the first load of this project reclaims.** The journal records a
+    // send at turn-start and the composer clears its chips at send, so a *queued*
+    // send's attachment is referenced by neither — a reclaiming read that runs
+    // while any agent holds a backlog deletes the staged copy that message will
+    // reference when it finally runs. Before the first load there is no backlog,
+    // which is the only reason that one read is safe. Tracked here rather than
+    // derived from `isRefresh` because a retry is also a non-refresh load and can
+    // happen at any point in the project's life.
+    const reclaim = !attachmentsReclaimed.has(projectId);
+    attachmentsReclaimed.add(projectId);
+    const convo = await api.loadProjectConversation(
+      projectId,
+      draftAttachmentPaths(projectId),
+      reclaim,
+    );
 
     // Sends represented live in the slices this session own their rendering
     // there; drop the journal's copy of them from the overlay to avoid a doubled
@@ -1164,7 +1197,11 @@ export async function hydrateProject(
 async function maybeRefreshProject(projectId: ProjectId): Promise<void> {
   const baseline = sessionFingerprintBaseline.get(projectId);
   if (baseline === undefined) return; // not yet hydrated → nothing to refresh
-  if (refreshInFlight.has(projectId)) return; // a refresh is already running
+  if (refreshInFlight.has(projectId)) {
+    // Run again when the current one finishes — see `refreshRequestedAgain`.
+    refreshRequestedAgain.add(projectId);
+    return;
+  }
   refreshInFlight.add(projectId);
   try {
     let current: AgentSessionFingerprint[];
@@ -1190,10 +1227,22 @@ async function maybeRefreshProject(projectId: ProjectId): Promise<void> {
     }
     // Unchanged → do NOT re-read (the parse path stays uncalled).
     if (!anyStale) return;
-    hydrationStarted.delete(projectId);
-    await hydrateProject(projectId, refreshCapable);
+    // Behind any fork-history read already queued, and ahead of the next one —
+    // otherwise an older read finishing last would replace the overlay this one
+    // is about to build.
+    await chainProjectLoad(projectId, async () => {
+      hydrationStarted.delete(projectId);
+      return await hydrateProject(projectId, refreshCapable);
+    });
   } finally {
     refreshInFlight.delete(projectId);
+    // Exactly one follow-up, not a loop: the flag is cleared before the re-run,
+    // so requests arriving during *that* run queue one more and no further. A
+    // steady stream of requests therefore costs one extra read, never an
+    // unbounded chain.
+    if (refreshRequestedAgain.delete(projectId)) {
+      await maybeRefreshProject(projectId);
+    }
   }
 }
 
@@ -1317,11 +1366,45 @@ const forkHistoryLoaded = new Set<AgentId>();
 /// in exactly the case it was widened to cover.
 const forkHistoryPending = new SvelteSet<AgentId>();
 
-/// Per-project in-flight fork-history read, so concurrent branch terminals
-/// serialize rather than firing overlapping project reads. Bookkeeping only —
-/// never read during render.
+/// Tail of each project's chain of pending reads. Bookkeeping only — never read
+/// during render.
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
-const forkHistoryLoadInFlight = new Map<ProjectId, Promise<HydrateOutcome>>();
+const projectLoadChain = new Map<ProjectId, Promise<unknown>>();
+
+/// Run `load` after every project read already queued, and make it the one the
+/// *next* caller waits behind.
+///
+/// **Every read of a project rebuilds and replaces its whole overlay**, filtered
+/// only on the per-agent slices — so two concurrent reads do not merge, the
+/// later-finishing one simply wins. An older read landing last reverts the view:
+/// a fork-history read in flight across a compaction erases the recap marker
+/// that compaction just fetched, until something loads the project again.
+///
+/// The publish is **synchronous, before awaiting the predecessor** — that is the
+/// whole mechanism. Read-then-await-then-publish (what each caller used to do on
+/// its own) serializes only against the *first* read: two callers arriving during
+/// one load both await it, then both start together. Publishing first means the
+/// second sees the first's promise and chains behind it instead.
+///
+/// The chain is bounded in practice, not by construction: fork-history reads are
+/// one-shot per branch and the staleness refresh coalesces to one follow-up, so
+/// nothing here generates an unbounded queue. A future caller that fires per
+/// event would need its own coalescing.
+async function chainProjectLoad<T>(projectId: ProjectId, load: () => Promise<T>): Promise<T> {
+  const prior = projectLoadChain.get(projectId);
+  const next = (async () => {
+    if (prior !== undefined) await prior.catch(() => undefined);
+    return await load();
+  })();
+  projectLoadChain.set(projectId, next);
+  try {
+    return await next;
+  } finally {
+    // Only if still the tail — a later caller has already taken ownership
+    // otherwise, and deleting would let the one after it skip the queue.
+    if (projectLoadChain.get(projectId) === next) projectLoadChain.delete(projectId);
+  }
+}
 
 /// Whether `agentId` is a fork still waiting for its inherited history — read by
 /// the transcript to decide whether to explain the branch's empty backlog.
@@ -1405,20 +1488,10 @@ async function loadForkInheritedHistory(agentId: AgentId): Promise<void> {
   // then runs its own read: sequential rather than concurrent, one extra read,
   // nothing lost. (Its `agentTurnFilter` names a different agent, so the
   // winner's read cannot cover it.)
-  const inFlight = forkHistoryLoadInFlight.get(projectId);
-  if (inFlight !== undefined) await inFlight.catch(() => undefined);
-
-  hydrationStarted.delete(projectId);
-  const load = hydrateProject(projectId, new Set([agentId]));
-  forkHistoryLoadInFlight.set(projectId, load);
-  let outcome: HydrateOutcome;
-  try {
-    outcome = await load;
-  } finally {
-    if (forkHistoryLoadInFlight.get(projectId) === load) {
-      forkHistoryLoadInFlight.delete(projectId);
-    }
-  }
+  const outcome = await chainProjectLoad(projectId, async () => {
+    hydrationStarted.delete(projectId);
+    return await hydrateProject(projectId, new Set([agentId]));
+  });
   // Only an `applied` read actually produced inherited history. Anything else
   // leaves the one-shot unset so the next completed turn retries. Reading
   // `conversations[projectId].status` here instead would report success for a
@@ -1433,9 +1506,20 @@ async function loadForkInheritedHistory(agentId: AgentId): Promise<void> {
 /// Wire the terminal hook that drives [`loadForkInheritedHistory`]. Called once
 /// at app start; the hook is a no-op for every non-fork agent.
 export function installForkHistoryRefresh(): void {
-  setTurnTerminalHook((agentId, outcome) => {
+  setTurnTerminalHook((agentId, outcome, kind) => {
     if (outcome !== "completed") return;
     void loadForkInheritedHistory(agentId);
+    if (kind === "compaction") {
+      // The recap the harness wrote lives in its own session file, and the
+      // compaction turn itself carries no content — so without this re-read the
+      // marker explaining what was summarized only appears after a project
+      // switch. `maybeRefreshProject` stays private: this is its second caller,
+      // not a reason to export it.
+      const agent = Object.values(agentsByProject)
+        .flat()
+        .find((candidate) => candidate.id === agentId);
+      if (agent !== undefined) void maybeRefreshProject(agent.project_id);
+    }
   });
 }
 
@@ -1445,6 +1529,9 @@ export const _testing = {
   reset(): void {
     forkHistoryLoaded.clear();
     forkHistoryPending.clear();
+    refreshRequestedAgain.clear();
+    attachmentsReclaimed.clear();
+    projectLoadChain.clear();
     setTurnTerminalHook(undefined);
     setDispatchFailedHook(undefined);
     loaderGeneration += 1;

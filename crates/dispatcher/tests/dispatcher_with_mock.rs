@@ -1117,7 +1117,7 @@ async fn a_start_moment_refusal_stops_the_turn_before_anything_durable() {
         Arc::clone(&journal) as Arc<dyn ConversationJournal>,
     );
     Arc::get_mut(&mut factory).unwrap().refuse_at_start = Some(
-        "alice is working — a branch taken now would not include its current answer".to_owned(),
+        "alice is busy — its conversation must stop changing before you can branch".to_owned(),
     );
 
     let _ = dispatcher

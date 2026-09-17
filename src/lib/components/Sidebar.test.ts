@@ -31,6 +31,7 @@ vi.mock("$lib/state/workspace.svelte", () => ({
 const agentSessionInfoMock = vi.fn();
 const openSessionFileMock = vi.fn();
 const resumeAgentInTerminalMock = vi.fn<(id: string) => Promise<void>>();
+const compactAgentMock = vi.fn<(agentId: string, sendId: string) => Promise<string>>();
 vi.mock("$lib/api", () => ({
   agentSessionInfo: (id: string) => agentSessionInfoMock(id),
   openSessionFile: async (id: string) => {
@@ -38,6 +39,10 @@ vi.mock("$lib/api", () => ({
   },
   resumeAgentInTerminal: (id: string) => resumeAgentInTerminalMock(id),
   cancelAgent: vi.fn(),
+  cancelSend: vi.fn(),
+  cancelTurn: vi.fn(),
+  compactAgent: (agentId: string, sendId: string) => compactAgentMock(agentId, sendId),
+  loadTranscript: vi.fn(),
 }));
 
 const copyTextMock = vi.fn<(t: string) => Promise<void>>();
@@ -126,6 +131,8 @@ beforeEach(() => {
   resumeAgentInTerminalMock.mockResolvedValue(undefined);
   copyTextMock.mockReset();
   copyTextMock.mockResolvedValue(undefined);
+  compactAgentMock.mockReset();
+  compactAgentMock.mockResolvedValue("00000000-0000-7000-8000-00000000c003");
 });
 
 beforeEach(async () => {
@@ -272,12 +279,13 @@ describe("Sidebar", () => {
     ).toEqual([
       "Rename",
       "Collapse",
+      "Compact context",
       "Resume in terminal",
       "Open session file",
       "Model settings…",
       "Delete agent",
     ]);
-    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(6);
+    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(7);
   });
 
   it("shows only currently available menu actions", async () => {
@@ -2070,6 +2078,16 @@ describe("Sidebar pane visibility + assignment", () => {
 });
 
 describe("Sidebar — agent reordering", () => {
+  // A completed or cancelled drag arms a capture-phase `click` listener on
+  // `window` to swallow the synthesized click, and removes it on a `setTimeout(0)`
+  // macrotask. A test that ends right after `pointerUp` never lets that macrotask
+  // run, so the listener outlives the test and eats the first click of the next
+  // one — which manifests as an unrelated menu that mysteriously won't open.
+  // Draining one macrotask here lets the guard disarm itself.
+  afterEach(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
   const THREE_AGENTS = [CLAUDE_AGENT, CODEX_AGENT, ANTIGRAVITY_AGENT];
 
   function grip(index: number): HTMLElement {
@@ -2187,5 +2205,171 @@ describe("Sidebar — agent reordering", () => {
     await fireEvent.keyDown(window, { key: "Escape" });
     await fireEvent.pointerUp(handle, { pointerId: 1 });
     expect(reorderAgentsMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("compact context action", () => {
+  it("is offered for a Claude agent", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const menu = await openAgentActions();
+    expect(within(menu).getByTestId("agent-action-compact")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["codex", CODEX_AGENT],
+    ["antigravity", ANTIGRAVITY_AGENT],
+  ])("is withheld from a %s agent", async (_harness, agent) => {
+    // The capability gate, on the surface a user actually touches. Offering it
+    // here would produce a refusal at best — and the reason the refusal has to
+    // be real is that a `/compact` *prompt* to these harnesses returns a
+    // model-authored claim of success while nothing compacted.
+    const state = await loadState();
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    const menu = await openAgentActions();
+    expect(within(menu).queryByTestId("agent-action-compact")).toBeNull();
+    // The menu did render — an empty one would pass the assertion above for the
+    // wrong reason.
+    expect(within(menu).getByTestId("agent-action-rename")).toBeInTheDocument();
+  });
+
+  it("dispatches a compaction and registers its pending entry", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-action-compact"));
+
+    await waitFor(() => expect(compactAgentMock).toHaveBeenCalledTimes(1));
+    const [agentId, sendId] = compactAgentMock.mock.calls[0]!;
+    expect(agentId).toBe(CLAUDE_AGENT.id);
+    // The send id is minted here so the queued row has something to cancel with
+    // before any `turn_start` carries it back.
+    expect(sendId).toMatch(/^[0-9a-f-]{36}$/);
+    await waitFor(() => {
+      const pending = state.runtimes[CLAUDE_AGENT.id]?.pending_sends ?? [];
+      expect(pending).toHaveLength(1);
+      expect(pending[0]?.kind).toBe("compaction");
+      expect(pending[0]?.send_id).toBe(sendId);
+      expect(pending[0]?.queued_at).toBeDefined();
+    });
+  });
+
+  it("is still offered while the agent is busy, because a compaction queues", async () => {
+    // Decision 1. Greying it out would refuse something the backend accepts, and
+    // would push the user into watching the agent to catch it idle.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.dispatchUserTurn(
+      CLAUDE_AGENT.id,
+      "00000000-0000-7000-8000-000000000001",
+      "go",
+      [],
+      "00000000-0000-7000-8000-0000000000d1",
+      "2026-05-16T00:00:00Z",
+    );
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const menu = await openAgentActions();
+    const item = within(menu).getByTestId("agent-action-compact");
+    expect(item).toBeInTheDocument();
+    expect(item).not.toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("moves the context bar to the compaction's post-compaction occupancy", async () => {
+    // The user-visible payoff of the whole feature: the bar has to drop. It
+    // reads the latest terminal turn carrying usage, and a compaction is exactly
+    // that — no sidebar change was needed, which this pins.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          context_input_tokens: 120_000,
+          context_tokens_after_turn: 120_000,
+          context_window: 200_000,
+        },
+      },
+      {
+        role: "agent",
+        turn_id: "turn-compaction",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:02Z",
+        ended_at: "2026-05-16T00:00:03Z",
+        status: "complete",
+        kind: "compaction",
+        items: [],
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          context_input_tokens: 120_000,
+          context_tokens_after_turn: 20_000,
+          context_window: 200_000,
+        },
+      },
+    ];
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent(
+      "context after last turn: 10%",
+    );
+  });
+
+  it("leaves the bar unchanged after a compaction that carried no usage", async () => {
+    // A *refused* compaction withholds usage entirely, so the previous turn's
+    // number is still the truth. Blanking the bar would tell the user their
+    // context is unknown when nothing about it changed.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          context_input_tokens: 120_000,
+          context_tokens_after_turn: 120_000,
+          context_window: 200_000,
+        },
+      },
+      {
+        role: "agent",
+        turn_id: "turn-compaction",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:02Z",
+        ended_at: "2026-05-16T00:00:03Z",
+        status: "failed",
+        kind: "compaction",
+        items: [],
+        error: "Not enough messages to compact.",
+      },
+    ];
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent(
+      "context after last turn: 60%",
+    );
   });
 });

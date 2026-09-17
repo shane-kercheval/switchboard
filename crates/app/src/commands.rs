@@ -2514,6 +2514,25 @@ async fn ensure_materializing_fork_may_dispatch(
     }
 }
 
+/// Whether `agent` is a **fork still awaiting materialization**: it carries fork
+/// provenance but has no session file of its own, so the next dispatch is the one
+/// that will copy its parent's session. Returns that parent's session id, which
+/// the fork gate needs and a bare `bool` would throw away.
+///
+/// Shared so the two questions asked about this state stay the same question:
+/// [`busy_fork_source`] asks whether the copy is safe to take right now, and
+/// [`compact_agent_impl`] asks whether a compaction would *be* that copy.
+pub(crate) fn unmaterialized_fork_parent(
+    agent: &AgentRecord,
+    directory: &Path,
+    home_dir: &Path,
+) -> Option<Uuid> {
+    let parent_session = agent.forked_from_session?;
+    resolve_session_file(agent, directory, home_dir)
+        .is_none()
+        .then_some(parent_session)
+}
+
 /// The shared policy: **the parent this dispatch would fork, if that parent is
 /// mid-turn right now** — `None` when the dispatch is safe (not a fork, already
 /// materialized, parent gone, or parent idle).
@@ -2537,10 +2556,7 @@ pub(crate) async fn busy_fork_source(
     directory: &Path,
     home_dir: &Path,
 ) -> Option<AgentRecord> {
-    let parent_session = agent.forked_from_session?;
-    if resolve_session_file(agent, directory, home_dir).is_some() {
-        return None;
-    }
+    let parent_session = unmaterialized_fork_parent(agent, directory, home_dir)?;
     // Self-referential provenance is corrupt data, not a policy question: the
     // adapter would be handed `--resume X --session-id X --fork-session`. The
     // caller turns this into a visible refusal; see the deadlock note below for
@@ -3535,6 +3551,78 @@ pub async fn send_message_impl(
         // here yet. Map defensively so a future caller can't silently misread.
         SendOutcome::Busy => Err(AppError::AgentBusy),
     }
+}
+
+/// Ask an agent to compact its own conversation — summarize the history so far
+/// and continue from the summary. Returns the receipt `MessageId`; the turn's
+/// lifecycle flows over the per-agent event channel exactly as a send's does, and
+/// the correlated `TurnStart` carries this id.
+///
+/// Shaped like [`send_message_impl`] — same dispatch snapshot, same factory, same
+/// generation check — because a compaction *is* a turn. What differs is the three
+/// gates in front of it, each refusing before anything is created or dispatched:
+///
+/// 1. **The harness capability**, which is the authority. A `/compact` *prompt*
+///    is not a substitute for the harnesses that lack it: they answer it with a
+///    model-authored claim of success while nothing is compacted (harness-behavior
+///    §3.9), so the refusal has to be real.
+/// 2. **A fork still awaiting materialization**, checked *before* the
+///    no-session gate below, which it would otherwise trip with a less useful
+///    message. A compaction must not be the dispatch that performs a fork.
+/// 3. **No session at all**, which is what keeps the adapter on its `--resume`
+///    branch: there is no conversation to summarize.
+///
+/// Deliberately **not** gated on the agent being idle. A compaction queues behind
+/// in-flight and queued work like any other turn (decision 1), so busy is not a
+/// refusal here.
+pub async fn compact_agent_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    send_id: SendId,
+    home_dir: &Path,
+) -> Result<MessageId, AppError> {
+    let (project, agent, generation) = capture_dispatch_snapshot(state, agent_id)?;
+    let project_id = project.id;
+    if !agent.harness.supports_manual_compaction() {
+        return Err(AppError::CompactionUnsupported {
+            harness: agent.harness,
+        });
+    }
+    if unmaterialized_fork_parent(&agent, &project.directory, home_dir).is_some() {
+        return Err(AppError::CompactionForkNotMaterialized {
+            name: agent.name.clone(),
+        });
+    }
+    if resolve_session_file(&agent, &project.directory, home_dir).is_none() {
+        return Err(AppError::CompactionSourceHasNoSession {
+            name: agent.name.clone(),
+        });
+    }
+    let adapter = adapter_for(state, &agent)?;
+    let factory: Arc<dyn DispatchContextFactory> = Arc::new(ProjectDispatchContextFactory::new(
+        project,
+        agent,
+        adapter,
+        crate::dispatch_context::DispatchDeps {
+            base_emitter: Arc::clone(&state.emitter),
+            needs_session_meta: Arc::clone(&state.needs_session_meta),
+            agents_by_id: Arc::clone(&state.agents_by_id),
+            registry_write: Arc::clone(&state.registry_write),
+            dispatcher: Arc::downgrade(&state.dispatcher),
+            home_dir: home_dir.to_path_buf(),
+            lock_root: state.lock_root.clone(),
+            project_generation: Arc::clone(&state.project_generation),
+            generation_at_capture: generation,
+            preferences: Arc::clone(&state.preferences),
+        },
+    ));
+    // Same last-moment check as a send: refuse if the project moved under us
+    // while the awaits above were pending.
+    reject_if_generation_changed(state, project_id, generation)?;
+    // `send_id` is minted by the frontend so it can cancel the compaction while
+    // it is still queued, before any `TurnStart` carries the id back. Unlike a
+    // send's it groups nothing — a compaction is never a fan-out.
+    Ok(state.dispatcher.compact_agent(agent_id, send_id, &factory))
 }
 
 /// Remove a not-yet-dispatched queued message by id, returning its payload so
@@ -6337,11 +6425,25 @@ fn gc_unreferenced_attachments(attachments_dir: &Path, referenced: &HashSet<Path
 /// backend cannot see, so the caller must declare its live references or the GC
 /// below would reclaim them — leaving the restored draft's chips dangling at
 /// deleted paths. Pass an empty slice when there is no draft.
+///
+/// `reclaim` asks for the staged-attachment GC. **Only a project's first load of
+/// the app session may pass `true`.** The GC's reference set is the journal plus
+/// the caller's draft, and a *queued* send is in neither: the journal records a
+/// send at turn-start, and the composer clears its chips the moment the user
+/// sends. So a reclaiming load that runs while any agent holds a backlog deletes
+/// the staged copy of an attachment that message is still going to reference,
+/// and the agent is later handed a path to nothing. Before the first load there
+/// is no backlog to destroy, which is what makes that one boundary safe; every
+/// later read — a staleness refresh, a fork-history read, a retry — must pass
+/// `false` and let orphans wait. Reclaiming is opportunistic by design (a pure
+/// function of on-disk state, re-run on the next load), so deferring costs only
+/// disk.
 pub async fn load_project_conversation_impl(
     state: &AppState,
     project_id: ProjectId,
     home_dir: &Path,
     draft_attachments: &[PathBuf],
+    reclaim: bool,
 ) -> Result<ProjectConversation, AppError> {
     // Resolve the project and collect each agent's *owned* inputs while holding
     // the lock, then release it before doing any read+parse. `load_agent_transcript`
@@ -6353,14 +6455,17 @@ pub async fn load_project_conversation_impl(
     };
     let journal = switchboard_core::journal::read_records(&project.journal_path())?;
 
-    // Reclaim disk on load: delete any staged file referenced by neither a `Send`
-    // record nor the caller's live draft — orphans from a staged-but-unsent drop
-    // the user has since abandoned, or files whose conversation was removed.
+    // Reclaim disk on first load: delete any staged file referenced by neither a
+    // `Send` record nor the caller's live draft — orphans from a staged-but-unsent
+    // drop the user has since abandoned, or files whose conversation was removed.
     // Pure function of (on-disk state, declared draft refs), so it's crash-safe
-    // (just re-runs next load) and needs no completion signal.
-    let mut referenced = collect_referenced_attachment_paths(&journal);
-    referenced.extend(draft_attachments.iter().cloned());
-    gc_unreferenced_attachments(&project.attachments_dir(), &referenced);
+    // (just re-runs next load) and needs no completion signal. See `reclaim` on
+    // this function for why a later load must never do this.
+    if reclaim {
+        let mut referenced = collect_referenced_attachment_paths(&journal);
+        referenced.extend(draft_attachments.iter().cloned());
+        gc_unreferenced_attachments(&project.attachments_dir(), &referenced);
+    }
 
     let agents = project.list_agents()?;
 
@@ -7873,7 +7978,16 @@ mod tests {
         let refusal = preflight_for(&state, project_id, fork.id, home.path())
             .await
             .expect_err("a turn that would fork a busy parent must be refused at its start");
-        assert!(refusal.contains("is working"), "got: {refusal}");
+        // Compared against the error's own text rather than a phrase from it, so
+        // a copy change moves both together instead of failing here.
+        assert_eq!(
+            refusal,
+            AppError::ForkSourceBusy {
+                name: "alice".to_owned()
+            }
+            .to_string(),
+            "the start-moment refusal must be the busy-parent one, not some other failure"
+        );
 
         gate.notify_waiters();
     }
@@ -7900,6 +8014,7 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: Some(Arc::clone(&teardown)),
+            compaction: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
@@ -9720,7 +9835,19 @@ mod tests {
         /// held. Without it a test cannot distinguish "released at turn end" from
         /// "released the instant cancel was requested."
         teardown: Option<Arc<crate::state::MaintenanceBarrier>>,
+        /// Scripts `compact`. `None` — the default for every fixture that is not
+        /// about compaction — makes the adapter refuse, which is what a harness
+        /// Switchboard cannot drive does.
+        compaction: Option<CompactionScript>,
         dispatches: std::sync::atomic::AtomicUsize,
+    }
+
+    /// How [`GatedRecordingAdapter`] should answer a compaction: park on `gate`
+    /// before the terminal (so a forward can register a current-turn wait against
+    /// a live compaction), then terminate `Failed` if `fails`, else `Completed`.
+    struct CompactionScript {
+        gate: Arc<tokio::sync::Notify>,
+        fails: bool,
     }
 
     #[async_trait]
@@ -9830,6 +9957,355 @@ mod tests {
                 tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
             ))
         }
+
+        async fn compact(
+            &self,
+            agent: &AgentRecord,
+            _cwd: &Path,
+            turn_id: switchboard_harness::TurnId,
+            options: switchboard_harness::DispatchOptions,
+        ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError> {
+            // Unscripted means unsupported — the trait default, reproduced here
+            // because overriding the method replaces it.
+            let Some(script) = &self.compaction else {
+                return Err(switchboard_harness::DispatchError::UnsupportedOperation {
+                    harness: agent.harness,
+                    operation: "manual context compaction",
+                });
+            };
+            let cancel_token = options.cancel_token.clone();
+            let gate = Arc::clone(&script.gate);
+            let fails = script.fails;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                // A compaction streams no answer, so the only pre-terminal event
+                // is a heartbeat — matching what the Claude adapter emits.
+                let _ = tx.send(switchboard_harness::AdapterEvent::Liveness { turn_id });
+                let cancelled = tokio::select! {
+                    () = gate.notified() => false,
+                    () = cancel_token.cancelled() => true,
+                };
+                if cancelled {
+                    // End with no terminal; the dispatcher synthesizes Cancelled.
+                    return;
+                }
+                let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
+                    turn_id,
+                    outcome: if fails {
+                        TurnOutcome::Failed {
+                            kind: switchboard_harness::FailureKind::HarnessError,
+                            message: "the harness declined to compact this conversation".to_owned(),
+                        }
+                    } else {
+                        TurnOutcome::Completed
+                    },
+                    ended_at: chrono::Utc::now(),
+                    usage: None,
+                    context_window_source: None,
+                    stable_message_id: None,
+                    first_message_id: None,
+                    spend: None,
+                    model: None,
+                    effort: None,
+                });
+            });
+            Ok(Box::pin(
+                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            ))
+        }
+    }
+
+    /// A [`GatedRecordingAdapter`] whose `compact` parks on `compaction_gate`
+    /// before terminating, so a test can hold a compaction live while a forward
+    /// resolves against it. Sends are ungated (nothing parks) — the compaction is
+    /// the only thing these fixtures hold.
+    fn compaction_adapter(
+        texts: &[&str],
+        compaction_gate: &Arc<tokio::sync::Notify>,
+        fails: bool,
+    ) -> Arc<dyn HarnessAdapter> {
+        Arc::new(GatedRecordingAdapter {
+            prompts: Arc::new(Mutex::new(Vec::new())),
+            selections: None,
+            chrome: None,
+            texts: texts.iter().map(|t| (*t).to_owned()).collect(),
+            gate: Arc::new(tokio::sync::Notify::new()),
+            // No send parks: `usize::MAX` is never a dispatch index.
+            park_at: usize::MAX,
+            extra_parks: Vec::new(),
+            fail_at: Vec::new(),
+            teardown: None,
+            compaction: Some(CompactionScript {
+                gate: Arc::clone(compaction_gate),
+                fails,
+            }),
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Manual context compaction — the app-layer gates, and what a forward sees
+    // while one is running.
+    // -----------------------------------------------------------------------
+
+    /// A loaded project whose Claude adapter parks its compactions on `gate`.
+    fn compaction_fixture(
+        texts: &[&str],
+        gate: &Arc<tokio::sync::Notify>,
+        fails: bool,
+    ) -> (TempDir, TempDir, AppState, Arc<RecordingEmitter>, ProjectId) {
+        let emitter = Arc::new(RecordingEmitter::new());
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state = AppState::new_for_test(
+            compaction_adapter(texts, gate, fails),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        (tmp, TempDir::new().unwrap(), state, emitter, project.id)
+    }
+
+    #[tokio::test]
+    async fn compaction_is_refused_for_every_harness_that_cannot_be_driven() {
+        // The capability predicate is the authority, and this is the gate that
+        // stands between a Codex or Antigravity agent and a `/compact` *prompt*
+        // — which those harnesses answer with a model-authored claim of success
+        // while nothing is compacted. A silent no-op would be the worst outcome
+        // available, so the refusal must be typed and loud.
+        let (_tmp, home, state, _gate, _project) =
+            compaction_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
+        for harness in [HarnessKind::Codex, HarnessKind::Antigravity] {
+            let agent = create_agent_impl(
+                &state,
+                &format!("agent-{harness}"),
+                harness,
+                AgentSelection::default(),
+            )
+            .unwrap();
+            let err = compact_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
+                .await
+                .expect_err("a harness Switchboard cannot compact must be refused");
+            assert!(
+                matches!(err, AppError::CompactionUnsupported { harness: h } if h == harness),
+                "got: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_is_refused_for_an_agent_with_no_session_yet() {
+        // Nothing has been said, so there is nothing to summarize — and refusing
+        // here is what keeps the adapter on its `--resume` branch instead of
+        // minting a session as a side effect of a maintenance action.
+        let (_tmp, home, state, _gate, _project) =
+            compaction_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
+        let agent = create_agent_impl(
+            &state,
+            "fresh",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+
+        let err = compact_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
+            .await
+            .expect_err("an agent with no session has nothing to compact");
+        assert!(
+            matches!(err, AppError::CompactionSourceHasNoSession { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_is_refused_for_a_fork_still_awaiting_materialization() {
+        // The branch's session is created by its first *send*. If a compaction
+        // were allowed to be that dispatch it would materialize the branch as a
+        // side effect — and the fork is a turn that needs a prompt, which a
+        // compaction does not have. The distinct error is what tells the user the
+        // specific thing to do (send a message), where the no-session error above
+        // would only say the agent is empty.
+        let (_tmp, home, state, _gate, _project) =
+            compaction_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
+        let mut agent = create_agent_impl(
+            &state,
+            "branch",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        // Fork provenance with no session file of its own — the residue of a
+        // fork whose first send failed to launch.
+        agent.forked_from_session = Some(Uuid::now_v7());
+        lock(&state.agents_by_id).insert(agent.id, agent.clone());
+
+        let err = compact_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
+            .await
+            .expect_err("a compaction must not be the dispatch that forks");
+        assert!(
+            matches!(err, AppError::CompactionForkNotMaterialized { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_is_accepted_for_a_claude_agent_with_a_session() {
+        // The happy path returns the dispatcher's receipt, and the turn runs on
+        // the agent's event channel like any other.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (_tmp, home, state, emitter, project_id) = compaction_fixture(&[], &gate, false);
+        let agent = seed_source(&state, home.path(), project_id, "alice", "ANSWER");
+
+        let message_id = compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
+            .await
+            .expect("a Claude agent with a session can be compacted");
+
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        let start = emitter
+            .snapshot()
+            .into_iter()
+            .find(|(_, v)| v["type"] == "turn_start")
+            .expect("turn_start");
+        assert_eq!(
+            start.1["message_id"].as_str().unwrap(),
+            message_id.to_string(),
+            "the receipt must correlate to the turn the frontend will render"
+        );
+        gate.notify_one();
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compaction_does_not_refuse_a_busy_agent() {
+        // Decision 1: a compaction queues like any other work rather than being
+        // gated on idleness. Accepting while a send is in flight is the whole
+        // behavior — a refusal here would push the user into watching the agent.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (_tmp, home, state, emitter, project_id) = compaction_fixture(&["LIVE"], &gate, false);
+        let agent = seed_source(&state, home.path(), project_id, "alice", "ANSWER");
+
+        send_msg_with_home(&state, agent, "a long task", home.path())
+            .await
+            .unwrap();
+        within(
+            &emitter,
+            "turn_start (send)",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
+            .await
+            .expect("a busy agent queues the compaction rather than refusing it");
+    }
+
+    /// Forward from `source` and return the composed body, asserting it resolved.
+    async fn forward_from(
+        state: &AppState,
+        source: AgentId,
+        home: &Path,
+        project: ProjectId,
+    ) -> String {
+        let outcome = forward_message_impl(
+            state,
+            String::new(),
+            vec![src(state, source)],
+            Uuid::now_v7(),
+            home,
+            project,
+        )
+        .await
+        .unwrap();
+        resolved(&outcome).to_owned()
+    }
+
+    #[tokio::test]
+    async fn forwarding_from_a_compacting_agent_delivers_its_previous_answer() {
+        // Decision 9: a compaction is invisible to forwarding. The forward waits
+        // for the compaction's process to be gone — so the session file is
+        // settled — and then reads the agent's latest *real* answer, because a
+        // compaction produces none. The failure this guards against is the
+        // forward resolving as an empty source and invalidating itself, which
+        // would turn a routine maintenance action into a broken workflow.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (_tmp, home, state, emitter, project_id) = compaction_fixture(&[], &gate, false);
+        let agent = seed_source(&state, home.path(), project_id, "alice", "REAL ANSWER");
+
+        compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
+            .await
+            .unwrap();
+        within(
+            &emitter,
+            "compaction in flight",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        // Drive the forward to its hold *before* releasing the compaction: a
+        // future is inert until polled, so a merely-constructed forward would
+        // register nothing and this would prove only that no forward exists.
+        let mut forward = Box::pin(forward_from(&state, agent, home.path(), project_id));
+        assert!(
+            futures::poll!(forward.as_mut()).is_pending(),
+            "the forward must hold while the compaction is live"
+        );
+        await_wait_registered(&state, agent).await;
+
+        gate.notify_one();
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), forward)
+            .await
+            .expect("the forward resolves once the compaction drains");
+        assert!(
+            body.contains("REAL ANSWER"),
+            "a compaction has no output of its own, so the forward takes the last real answer; got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_after_a_failed_compaction_delivers_the_same_answer() {
+        // A failed compaction leaves the conversation exactly as it was, so it
+        // must not change what a forward sees — and in particular must not
+        // invalidate it. Same assertion as the success case on purpose: the
+        // verdict is not supposed to matter here.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (_tmp, home, state, emitter, project_id) = compaction_fixture(&[], &gate, true);
+        let agent = seed_source(&state, home.path(), project_id, "alice", "REAL ANSWER");
+
+        compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
+            .await
+            .unwrap();
+        within(
+            &emitter,
+            "compaction in flight",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        gate.notify_one();
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+
+        let body = forward_from(&state, agent, home.path(), project_id).await;
+        assert!(
+            body.contains("REAL ANSWER"),
+            "a failed compaction changes nothing a forward can see; got: {body}"
+        );
     }
 
     /// Barrier proving `agent_id`'s actor has **processed** the
@@ -9874,6 +10350,7 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: None,
+            compaction: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         (adapter, prompts)
@@ -9899,6 +10376,7 @@ mod tests {
             extra_parks: vec![(second.1, Arc::clone(second.0))],
             fail_at: fail_at.to_vec(),
             teardown: None,
+            compaction: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         (adapter, prompts)
@@ -14019,6 +14497,7 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: None,
+            compaction: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         let emitter = Arc::new(RecordingEmitter::new());
@@ -14097,6 +14576,7 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: None,
+            compaction: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         let emitter = Arc::new(RecordingEmitter::new());
@@ -20728,7 +21208,7 @@ mod tests {
         .unwrap();
 
         let home = tmp.path().to_path_buf();
-        let conv = load_project_conversation_impl(&state, project_id, &home, &[])
+        let conv = load_project_conversation_impl(&state, project_id, &home, &[], true)
             .await
             .unwrap();
 
@@ -20757,7 +21237,7 @@ mod tests {
         let (_agent, project_id) = project_with_agent(&state, &tmp);
 
         let home = tmp.path().to_path_buf();
-        let conv = load_project_conversation_impl(&state, project_id, &home, &[])
+        let conv = load_project_conversation_impl(&state, project_id, &home, &[], true)
             .await
             .unwrap();
 
@@ -20787,9 +21267,15 @@ mod tests {
             .unwrap();
 
         let home = tmp.path().to_path_buf();
-        load_project_conversation_impl(&state, project_id, &home, &[PathBuf::from(&drafted.path)])
-            .await
-            .unwrap();
+        load_project_conversation_impl(
+            &state,
+            project_id,
+            &home,
+            &[PathBuf::from(&drafted.path)],
+            true,
+        )
+        .await
+        .unwrap();
 
         assert!(
             Path::new(&drafted.path).exists(),
@@ -20798,6 +21284,44 @@ mod tests {
         assert!(
             !Path::new(&abandoned.path).exists(),
             "a staged file referenced by neither the journal nor the draft is still reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_reclaiming_load_spares_a_queued_sends_staged_attachment() {
+        // The attachment a *queued* send references is invisible to the GC's
+        // reference set: the journal records a send only at turn-start, and the
+        // composer clears its chips the moment the user sends. So any read that
+        // reclaims while an agent holds a backlog deletes the staged copy that
+        // message will reference when it finally runs, and the agent is handed a
+        // path to nothing. Only a project's first load — before any backlog can
+        // exist — may reclaim.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
+
+        let source = tmp.path().join("queued.png");
+        std::fs::write(&source, b"Q").unwrap();
+        let queued = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+
+        let home = tmp.path().to_path_buf();
+        load_project_conversation_impl(&state, project_id, &home, &[], false)
+            .await
+            .unwrap();
+        assert!(
+            Path::new(&queued.path).exists(),
+            "a refresh, retry, or fork-history read must not reclaim — it cannot see a backlog"
+        );
+
+        // The same call with reclaim on is what proves the flag is the thing
+        // doing the work, rather than the file surviving for some other reason.
+        load_project_conversation_impl(&state, project_id, &home, &[], true)
+            .await
+            .unwrap();
+        assert!(
+            !Path::new(&queued.path).exists(),
+            "a first load still reclaims genuine orphans"
         );
     }
 

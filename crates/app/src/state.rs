@@ -84,7 +84,29 @@ impl VisibleProject {
     }
 }
 
-/// Two-way handshake for the post-eviction pause point.
+/// A point in production code a test can hold open — see [`AppState::test_seams`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TestSeam {
+    /// The post-eviction, pre-drain window inside a lifecycle operation. Closes
+    /// too fast to observe by polling; without a pause the ordering could only be
+    /// argued.
+    Maintenance,
+    /// Inside `capture_dispatch_snapshot`, **between its two reads, while it
+    /// holds `registry_write`**. The property — project, agent, roster, and
+    /// generation from one instant — is enforced by holding one lock, which a
+    /// test cannot observe from outside; every version that tried was
+    /// indistinguishable from the broken form. The wait is a blocking one because
+    /// the capture is synchronous and holds a `std` mutex.
+    Capture,
+    /// Inside the attachment-reclaim worker, before it scans. Holds the worker
+    /// open so a test can prove a second caller — a reloaded page — waits for
+    /// the worker to stop rather than being released on "already claimed", and
+    /// that dropping the first caller starts no second worker.
+    Reclaim,
+}
+
+/// Two-way handshake for a [`TestSeam`].
 ///
 /// **`entered` is not decoration.** A one-way barrier can be deleted from the
 /// operation and the test still passes, having silently stopped testing the
@@ -231,19 +253,28 @@ pub struct AppState {
     /// `agents_by_id` entries — a stale `agent_id` from a deleted project's
     /// attach must not leak forward.
     pub needs_session_meta: Arc<Mutex<HashSet<AgentId>>>,
-    /// Projects whose staged attachments this **process** has already reclaimed.
+    /// One attachment-reclaim pass per project per **process**, keyed to the
+    /// completion signal of the worker that runs it.
     ///
     /// Reclaiming is only safe before any of a project's agents can hold queued
     /// work, because a queued send's attachment is referenced by neither the
     /// journal (which records a send at turn-start) nor the compose draft
-    /// (cleared at send). The frontend enforces that by calling
-    /// `reclaim_project_attachments` before it lists the project's agents — but
-    /// a webview reload restarts the frontend while this process keeps its
-    /// dispatcher backlog, so a reloaded frontend would run that call again
-    /// against a project that now *does* have queued work. This set is what makes
-    /// the second call a no-op: eligibility belongs to the process's lifetime,
-    /// which is what actually bounds the backlog, not to the page's.
-    pub attachments_reclaimed: Mutex<HashSet<ProjectId>>,
+    /// (cleared at send). The frontend enforces that by awaiting
+    /// `reclaim_project_attachments` before it lists the project's agents — but a
+    /// webview reload restarts the frontend while this process keeps its
+    /// dispatcher backlog, so a reloaded frontend runs that call again against a
+    /// project that now *may* have queued work.
+    ///
+    /// Two properties, and the value type is what carries the second: the pass
+    /// runs **once** per process (the key's presence), and every caller —
+    /// including one arriving mid-pass from a reloaded page — returns only when
+    /// the worker has **actually stopped** (the receiver). A bare "already
+    /// claimed" flag gets the first and not the second: the reloaded frontend
+    /// would be released to register agents while the original worker was still
+    /// scanning, which is the deletion this exists to prevent. The worker is a
+    /// detached task owned by the runtime, not by its first caller, so a caller
+    /// that vanishes neither restarts the pass nor releases another caller early.
+    pub attachment_reclaims: Mutex<HashMap<ProjectId, tokio::sync::watch::Receiver<bool>>>,
 
     /// Per-project inter-process lock handles. One entry per loaded
     /// project, holding an advisory exclusive lock (std `File::try_lock`,
@@ -342,25 +373,14 @@ pub struct AppState {
     /// test can look. Without a way to hold it open, the ordering could only be
     /// argued, and this milestone has already shipped one test that looked like
     /// coverage and wasn't. A barrier is the smaller price.
-    #[cfg(test)]
-    pub maintenance_barrier: Mutex<Option<Arc<MaintenanceBarrier>>>,
-
-    /// Two-way handshake inside `capture_dispatch_snapshot`, taken **while it
-    /// holds `registry_write`**.
     ///
-    /// **The second such seam, added deliberately rather than by momentum.** The
-    /// property it exists for — that a dispatch's project, agent, roster, and
-    /// lifecycle generation come from one instant — is enforced by holding a
-    /// single lock, and a test cannot observe "one lock" from outside. Every
-    /// version that tried timed out to be indistinguishable from the broken form:
-    /// `maintenance_barrier` pauses *after* `begin_maintenance` has returned and
-    /// released its guard, so it cannot stage the interleaving at all. Pausing
-    /// mid-capture is the only way a test can prove maintenance is excluded.
-    ///
-    /// A third seam should prompt generalizing this into one mechanism rather
-    /// than a third field.
+    /// The seams a test can hold open, keyed by [`TestSeam`]. Each is a two-way
+    /// handshake at a point the production code passes through; unset seams are
+    /// no-ops. One map rather than one field per seam, because the third seam is
+    /// where the pattern stops being a coincidence — see [`TestSeam`] for what
+    /// each pause proves and why it sits where it does.
     #[cfg(test)]
-    pub capture_barrier: Mutex<Option<Arc<MaintenanceBarrier>>>,
+    pub test_seams: Mutex<HashMap<TestSeam, Arc<MaintenanceBarrier>>>,
 
     /// Projects currently mid-lifecycle-operation — a directory repair or a
     /// delete has evicted their routable state and has not finished rebuilding
@@ -491,9 +511,7 @@ impl AppState {
             project_generation: Arc::new(Mutex::new(HashMap::new())),
             lock_root,
             #[cfg(test)]
-            maintenance_barrier: Mutex::new(None),
-            #[cfg(test)]
-            capture_barrier: Mutex::new(None),
+            test_seams: Mutex::new(HashMap::new()),
             #[cfg(test)]
             store_tmp: None,
             #[cfg(test)]
@@ -508,7 +526,7 @@ impl AppState {
             antigravity_adapter,
             emitter,
             needs_session_meta: Arc::new(Mutex::new(HashSet::new())),
-            attachments_reclaimed: Mutex::new(HashSet::new()),
+            attachment_reclaims: Mutex::new(HashMap::new()),
             project_locks: Mutex::new(HashMap::new()),
             agents_by_id: Arc::new(Mutex::new(HashMap::new())),
             workspace: Mutex::new(Workspace::default()),

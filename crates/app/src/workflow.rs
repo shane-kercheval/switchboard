@@ -293,6 +293,17 @@ impl WorkflowRun {
                 .send_workflow_message_awaiting_completion(
                     agent_id,
                     &body,
+                    // **Empty is load-bearing, not a TODO.** Attachment cleanup
+                    // (`reclaim_project_attachments_impl`) runs at project open and
+                    // deletes staged files no journaled send or compose draft
+                    // refers to. A *queued* send is on neither list, so cleanup is
+                    // only safe because the composer — which can only target agents
+                    // of an already-open project — is the sole way a file gets
+                    // staged. Giving workflows attachments breaks that: a workflow
+                    // could queue an attachment-bearing send at a moment cleanup
+                    // still considers safe, and the file is deleted before it is
+                    // sent. Read that function's safety section before changing
+                    // this.
                     Vec::new(),
                     send_id,
                     factory,

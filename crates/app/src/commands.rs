@@ -135,11 +135,20 @@ fn conflicting_claim(
     })
 }
 
-/// Hold the post-eviction, pre-drain window open when a test asks. No-op in
-/// release builds (the field does not exist) and when unset.
+/// The barrier a test installed at `seam`, if any. `None` in release builds
+/// (the map does not exist) and when unset.
 #[cfg(test)]
-async fn wait_at_maintenance_barrier(state: &AppState) {
-    let barrier = lock(&state.maintenance_barrier).clone();
+fn test_seam(
+    state: &AppState,
+    seam: crate::state::TestSeam,
+) -> Option<Arc<crate::state::MaintenanceBarrier>> {
+    lock(&state.test_seams).get(&seam).cloned()
+}
+
+/// Hold a seam open when a test asks. Takes the barrier by value so a detached
+/// task can carry one it cloned out before spawning.
+#[cfg(test)]
+async fn wait_at_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>) {
     if let Some(barrier) = barrier {
         // Signal arrival *before* waiting, so a test can block on reaching this
         // point rather than guessing at it — and so deleting this call makes the
@@ -155,12 +164,34 @@ async fn wait_at_maintenance_barrier(state: &AppState) {
     }
 }
 
+/// [`wait_at_seam`] for a seam that sits **inside blocking work**, where there is
+/// no async context to await in. Blocking here is correct rather than a
+/// compromise: the caller is already on the blocking pool, which is what that
+/// pool is for, and the capture seam uses the same form for the same reason.
+#[cfg(test)]
+fn wait_at_blocking_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>) {
+    if let Some(barrier) = barrier {
+        // `notify_one` on both sides — see `wait_at_seam`.
+        barrier.entered.notify_one();
+        futures::executor::block_on(barrier.release.notified());
+    }
+}
+
+#[cfg(not(test))]
+fn wait_at_blocking_seam(_barrier: Option<()>) {}
+
+/// Hold the post-eviction, pre-drain window open when a test asks.
+#[cfg(test)]
+async fn wait_at_maintenance_barrier(state: &AppState) {
+    wait_at_seam(test_seam(state, crate::state::TestSeam::Maintenance)).await;
+}
+
 #[cfg(not(test))]
 #[expect(clippy::unused_async, reason = "matches the cfg(test) signature")]
 async fn wait_at_maintenance_barrier(_state: &AppState) {}
 
 /// Hold [`capture_dispatch_snapshot`] open **between its two reads**, inside the
-/// `registry_write` guard, when a test asks. See [`AppState::capture_barrier`].
+/// `registry_write` guard, when a test asks. See [`crate::state::TestSeam::Capture`].
 ///
 /// **Taking the already-read `Project` is what fixes the call site, and it is
 /// load-bearing rather than decorative.**
@@ -180,9 +211,9 @@ async fn wait_at_maintenance_barrier(_state: &AppState) {}
 /// thing beats a comment asking for the right one.
 #[cfg(test)]
 fn wait_between_project_and_generation_reads(state: &AppState, _project: &Project) {
-    let barrier = lock(&state.capture_barrier).clone();
+    let barrier = test_seam(state, crate::state::TestSeam::Capture);
     if let Some(barrier) = barrier {
-        // `notify_one` on both sides — see `wait_at_maintenance_barrier`.
+        // `notify_one` on both sides — see `wait_at_seam`.
         barrier.entered.notify_one();
         // Blocking, not `await`: the capture is synchronous and holds a `std`
         // mutex, which must never be held across an await point. The test drives
@@ -6462,36 +6493,87 @@ pub async fn reclaim_project_attachments_impl(
     project_id: ProjectId,
     draft_attachments: &[PathBuf],
 ) -> Result<(), AppError> {
-    // Claim the one pass for this project up front: a second caller (a reloaded
-    // frontend) must find it taken even if this one goes on to fail, because by
-    // then the dispatcher may hold queued work the reference set cannot see.
-    if !lock(&state.attachments_reclaimed).insert(project_id) {
-        return Ok(());
-    }
     let project = match lock(&state.projects).get(&project_id).cloned() {
         Some(loaded) => loaded,
         None => open_project_from_store(state, project_id)?,
     };
-    // Reading the journal and walking the attachments directory are blocking I/O,
-    // and this runs on the project-open path — same reason `load_agent_transcript`
-    // is spawned rather than awaited inline.
-    let drafts: Vec<PathBuf> = draft_attachments.to_vec();
-    let project_attachments_label = project.attachments_dir().to_string_lossy().into_owned();
-    tokio::task::spawn_blocking(move || {
-        let journal = switchboard_core::journal::read_records(&project.journal_path())?;
-        let mut referenced = collect_referenced_attachment_paths(&journal);
-        referenced.extend(drafts);
-        gc_unreferenced_attachments(&project.attachments_dir(), &referenced);
-        Ok::<(), AppError>(())
-    })
-    .await
-    .map_err(|join_err| AppError::AttachmentStage {
-        source_path: project_attachments_label,
-        source: std::io::Error::other(join_err.to_string()),
-    })?
+    let mut done = {
+        let mut passes = lock(&state.attachment_reclaims);
+        // A pass exists — running or finished. Either way, wait on *its*
+        // completion; never start another.
+        if let Some(done) = passes.get(&project_id) {
+            done.clone()
+        } else {
+            let (finished, done) = tokio::sync::watch::channel(false);
+            passes.insert(project_id, done.clone());
+            let drafts: Vec<PathBuf> = draft_attachments.to_vec();
+            #[cfg(test)]
+            let seam = test_seam(state, crate::state::TestSeam::Reclaim);
+            #[cfg(not(test))]
+            let seam: Option<()> = None;
+            // Detached on purpose: owned by the runtime, not by this caller. A
+            // caller that goes away (a page reload mid-pass) must neither cancel
+            // the pass nor let a later caller start a second one.
+            tokio::spawn(async move {
+                // Reading the journal and walking the attachments directory are
+                // blocking I/O on the project-open path — same reason
+                // `load_agent_transcript` is spawned rather than awaited.
+                if let Err(join_err) = tokio::task::spawn_blocking(move || {
+                    // **Inside** the blocking work, not before it. A seam in the
+                    // async wrapper would leave the deleting phase unobserved: a
+                    // regression that stopped awaiting this handle would signal
+                    // completion early, and the scan would still finish before any
+                    // assertion could notice. Parked here, that regression
+                    // releases a waiter while this closure is demonstrably still
+                    // running.
+                    wait_at_blocking_seam(seam);
+                    reclaim_pass(&project, &drafts);
+                })
+                .await
+                {
+                    tracing::warn!(
+                        %project_id,
+                        error = %join_err,
+                        "attachment reclaim worker did not finish — skipping this pass"
+                    );
+                }
+                // Signal on every exit. If this task itself dies the sender drops,
+                // which waiters below also read as "stopped".
+                let _ = finished.send(true);
+            });
+            done
+        }
+    };
+    // `Err` ⇒ the sender was dropped without a signal: the worker is gone, which
+    // is the same fact from a waiter's point of view.
+    let _ = done.wait_for(|finished| *finished).await;
+    Ok(())
 }
 
-/// `draft_attachments` are staged files the caller's *unsent* compose draft still
+/// One reclaim pass over a project's attachments directory. **Best effort**: an
+/// unreadable or corrupt journal skips the pass entirely and logs — it must never
+/// proceed with an empty reference set, which would delete every staged file. A
+/// skipped pass costs only disk (the next process start retries), whereas
+/// failing here used to abort project activation over housekeeping the user
+/// cannot act on. History loading stays fail-loud, so the underlying problem is
+/// still shown; it just no longer locks the user out of their agents.
+fn reclaim_pass(project: &Project, drafts: &[PathBuf]) {
+    let journal = match switchboard_core::journal::read_records(&project.journal_path()) {
+        Ok(journal) => journal,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project.id,
+                error = %e,
+                "journal unreadable — skipping attachment reclaim rather than deleting on a guess"
+            );
+            return;
+        }
+    };
+    let mut referenced = collect_referenced_attachment_paths(&journal);
+    referenced.extend(drafts.iter().cloned());
+    gc_unreferenced_attachments(&project.attachments_dir(), &referenced);
+}
+
 /// **Read-only.** This used to reclaim orphaned staged attachments, taking the
 /// caller's draft references so they were spared; both moved to
 /// [`reclaim_project_attachments_impl`], the only operation that can recognize
@@ -8183,7 +8265,7 @@ mod tests {
         let before = project_generation(&state, project_id);
 
         let barrier = Arc::new(crate::state::MaintenanceBarrier::default());
-        *lock(&state.capture_barrier) = Some(Arc::clone(&barrier));
+        lock(&state.test_seams).insert(crate::state::TestSeam::Capture, Arc::clone(&barrier));
         let entered = barrier.entered.notified();
         tokio::pin!(entered);
         entered.as_mut().enable();
@@ -15207,7 +15289,7 @@ mod tests {
         // Hold the post-eviction window open. Polling for it is not viable —
         // the drain finishes before a test can look.
         let barrier = Arc::new(crate::state::MaintenanceBarrier::default());
-        *lock(&state.maintenance_barrier) = Some(Arc::clone(&barrier));
+        lock(&state.test_seams).insert(crate::state::TestSeam::Maintenance, Arc::clone(&barrier));
         // Subscribe before spawning. The seam now uses `notify_one`, which
         // stores a permit and makes the ordering irrelevant — but subscribing
         // first is still the honest shape, and this line predates that change.
@@ -21365,8 +21447,9 @@ mod tests {
 
         let first = tmp.path().join("orphan.png");
         std::fs::write(&first, b"O").unwrap();
-        let orphan =
-            futures::executor::block_on(stage_attachment_impl(&state, project_id, &first)).unwrap();
+        let orphan = stage_attachment_impl(&state, project_id, &first)
+            .await
+            .unwrap();
 
         reclaim_project_attachments_impl(&state, project_id, &[])
             .await
@@ -21390,6 +21473,118 @@ mod tests {
             Path::new(&queued.path).exists(),
             "a second reclaim in one process lifetime must be a no-op — the backlog it \
              cannot see may already exist"
+        );
+    }
+
+    /// Frees a seam's parked worker however the test exits. See its one use.
+    struct ReleaseOnDrop(Arc<crate::state::MaintenanceBarrier>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_reclaim_caller_waits_for_the_running_worker_even_if_the_first_is_dropped() {
+        // The reload case in full. The first caller's page reloads mid-pass, so
+        // the caller vanishes; the second caller (the reloaded page) must not be
+        // released until the worker has actually stopped — otherwise it registers
+        // agents and accepts an attachment-bearing send that the still-running
+        // worker deletes. And dropping the first caller must not start a *second*
+        // worker, which could finish first and release the second caller early.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
+        let state = Arc::new(state);
+
+        let source = tmp.path().join("orphan.png");
+        std::fs::write(&source, b"O").unwrap();
+        let orphan = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+
+        let barrier = Arc::new(crate::state::MaintenanceBarrier::default());
+        lock(&state.test_seams).insert(crate::state::TestSeam::Reclaim, Arc::clone(&barrier));
+        // Release on drop. The worker is parked on a *blocking* thread, so a
+        // panicking assertion below that skipped the release would strand it and
+        // hang the runtime's shutdown — turning a clear assertion failure into a
+        // hung suite, which is the worst way to learn this test broke.
+        let _release = ReleaseOnDrop(Arc::clone(&barrier));
+        let entered = barrier.entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+
+        let first_state = Arc::clone(&state);
+        let first = tokio::spawn(async move {
+            reclaim_project_attachments_impl(&first_state, project_id, &[]).await
+        });
+        tokio::time::timeout(WAIT, entered)
+            .await
+            .expect("the worker reaches its seam");
+        // The initiating caller goes away while its worker is held open.
+        first.abort();
+        let _ = first.await;
+
+        let second_state = Arc::clone(&state);
+        let mut second = Box::pin(async move {
+            reclaim_project_attachments_impl(&second_state, project_id, &[]).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), second.as_mut())
+                .await
+                .is_err(),
+            "a caller arriving mid-pass must wait for the worker, not be released on the claim"
+        );
+        // Exactly one worker: a second would have signalled `entered` again.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                barrier.entered.notified()
+            )
+            .await
+            .is_err(),
+            "dropping the first caller must not start a second worker"
+        );
+        assert!(
+            Path::new(&orphan.path).exists(),
+            "precondition: the held worker has not scanned yet"
+        );
+
+        barrier.release.notify_one();
+        tokio::time::timeout(WAIT, second)
+            .await
+            .expect("the second caller completes once the worker stops")
+            .unwrap();
+        assert!(
+            !Path::new(&orphan.path).exists(),
+            "the one worker finished its pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_journal_skips_reclaiming_without_failing_the_open() {
+        // Housekeeping must not lock the user out. A journal line that will not
+        // parse used to abort project activation here; now the pass is skipped —
+        // and skipped means *nothing is deleted*, never "proceed with an empty
+        // reference set", which would reclaim every staged file.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        std::fs::create_dir_all(project.journal_path().parent().unwrap()).unwrap();
+        std::fs::write(project.journal_path(), "{ this is not json\n").unwrap();
+
+        let source = tmp.path().join("would-be-orphan.png");
+        std::fs::write(&source, b"O").unwrap();
+        let staged = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+
+        reclaim_project_attachments_impl(&state, project_id, &[])
+            .await
+            .expect("a corrupt journal is a reason to skip, not to fail the open");
+        assert!(
+            Path::new(&staged.path).exists(),
+            "a skipped pass deletes nothing"
         );
     }
 

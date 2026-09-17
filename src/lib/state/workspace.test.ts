@@ -2149,10 +2149,18 @@ describe("project read serialization", () => {
 
   it("queues a compaction refresh behind a branch read and keeps both results", async () => {
     // The collision the chain was built for, which the three-branch case does not
-    // reach: a compaction's refresh enters through the freshness check and can
-    // request a *second* run via the follow-up flag. If an older branch read
-    // landed last it would replace the overlay and erase the recap marker the
-    // refresh had just fetched.
+    // reach: a compaction's refresh enters through the freshness check and, if a
+    // second compaction lands while it runs, requests one follow-up. Every read
+    // replaces the whole overlay, so an older branch read landing last would
+    // erase the recap a refresh had just fetched — and a dropped follow-up would
+    // never fetch the second one.
+    //
+    // A previous version of this test passed without triggering a single
+    // refresh. Three things now make it real: compactions are registered so
+    // their turns carry the compaction kind the hook keys on; the initial
+    // hydration stores a freshness baseline so a refresh can be admitted; and
+    // each mocked read snapshots the disk *when it starts*, so a read that began
+    // before a recap was written cannot return it.
     const ws = await loadWorkspaceState();
     const state = await loadAgentState();
     const fork = {
@@ -2160,55 +2168,105 @@ describe("project read serialization", () => {
       name: "branch",
       forked_from_session: "00000000-0000-7000-8000-0000000000aa",
     };
+    // A second branch whose first turn completes while the first read is still
+    // running, so three reads contend at once. That is what makes this test
+    // discriminate on serialization itself: a chain that only waits on the
+    // *first* read still lets the second and third run together.
+    const fork2 = {
+      ...agent("00000000-0000-7000-8000-0000000000f8", PROJECT_1),
+      name: "branch-2",
+      forked_from_session: "00000000-0000-7000-8000-0000000000ab",
+    };
     const compactor = agent(AGENT_2, PROJECT_1);
-    const recap: ConversationItem = {
+    const recap = (id: string, summary: string): ConversationItem => ({
       kind: "system_marker",
-      id: "marker-1",
+      id,
       agent_id: compactor.id,
       at: "2026-05-16T00:00:09Z",
-      marker: { marker_kind: "compaction", summary: "summarised" },
-    };
+      marker: { marker_kind: "compaction", summary },
+    });
+    const recapA = recap("marker-a", "first summary");
+    const recapB = recap("marker-b", "second summary");
 
-    let recapOnDisk = false;
+    // Every fingerprint fetch reports a new modification, so any refresh that
+    // asks is admitted; `hydrateProject` stores the latest as the next baseline.
+    let stamp = 0;
+    const fingerprints = (): AgentSessionFingerprint[] => {
+      stamp += 1;
+      return [
+        {
+          agent_id: compactor.id,
+          refresh_capable: true,
+          fingerprint: { source_path: "/s", modified_at: `t${stamp}`, byte_len: stamp },
+        },
+      ];
+    };
+    let onDisk: ConversationItem[] = [];
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "project_session_fingerprints") return fingerprints();
       if (cmd === "load_project_conversation") {
-        return { items: recapOnDisk ? [recap] : [], agents: [] } satisfies ProjectConversation;
+        return { items: onDisk, agents: [] } satisfies ProjectConversation;
       }
+      if (cmd === "compact_agent") return "00000000-0000-7000-8000-00000000c003";
       return undefined;
     });
-    ws.agentsByProject[PROJECT_1] = [fork, compactor];
+    ws.agentsByProject[PROJECT_1] = [fork, fork2, compactor];
     await state.registerAgent(fork);
+    await state.registerAgent(fork2);
     await state.registerAgent(compactor);
     await ws.hydrateProject(PROJECT_1);
+    expect(ws.conversations[PROJECT_1]?.status).toBe("complete");
     ws.installForkHistoryRefresh();
 
-    // Every later read is gated so the test controls completion order.
+    // From here every read is gated and snapshots the disk at start.
     const order: string[] = [];
     const gates: (() => void)[] = [];
     let seq = 0;
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "project_session_fingerprints") {
-        // Always stale, so the refresh always admits.
-        return [
-          {
-            agent_id: compactor.id,
-            refresh_capable: true,
-            fingerprint: { source_path: "/s", modified_at: `t${seq}`, byte_len: seq },
-          },
-        ] as unknown as AgentSessionFingerprint[];
-      }
+      if (cmd === "project_session_fingerprints") return fingerprints();
       if (cmd === "load_project_conversation") {
         seq += 1;
         const id = `load-${seq}`;
+        const snapshot = [...onDisk];
         order.push(`start:${id}`);
         await new Promise<void>((resolve) => gates.push(resolve));
         order.push(`end:${id}`);
-        return { items: recapOnDisk ? [recap] : [], agents: [] } satisfies ProjectConversation;
+        return { items: snapshot, agents: [] } satisfies ProjectConversation;
       }
+      if (cmd === "compact_agent") return `00000000-0000-7000-8000-00000000c00${seq}`;
       return undefined;
     });
 
-    // The branch's first turn completes, starting a read...
+    let compaction = 0;
+    /// Report a compaction finishing. `recapsOnCompletion` is what the harness has
+    /// written to its session file by the time the terminal is emitted — always
+    /// set *before* the event, because that is the real order: the CLI writes its
+    /// recap, then reports the turn done.
+    async function completeCompaction(recapsOnCompletion: ConversationItem[]): Promise<void> {
+      onDisk = recapsOnCompletion;
+      compaction += 1;
+      const sendId = `00000000-0000-7000-8000-00000000d00${compaction}`;
+      const pendingId = `00000000-0000-7000-8000-00000000e00${compaction}`;
+      await state.dispatchCompaction(compactor.id, sendId, pendingId, "2026-05-16T00:00:05Z");
+      const messageId = state.runtimes[compactor.id]?.pending_sends?.at(-1)?.message_id;
+      expect(messageId).toBeDefined();
+      fireTo(`agent:${compactor.id}`, {
+        type: "turn_start",
+        turn_id: `turn-compact-${compaction}`,
+        message_id: messageId,
+        send_id: sendId,
+        started_at: "2026-05-16T00:00:06Z",
+      });
+      fireTo(`agent:${compactor.id}`, {
+        type: "turn_end",
+        turn_id: `turn-compact-${compaction}`,
+        outcome: { status: "completed" },
+        ended_at: "2026-05-16T00:00:07Z",
+      });
+      await settle();
+    }
+
+    // The branch's first turn completes, starting a read that sees no recap.
     fireTo(`agent:${fork.id}`, {
       type: "turn_end",
       turn_id: "turn-fork",
@@ -2218,47 +2276,76 @@ describe("project read serialization", () => {
     await settle();
     expect(order).toEqual(["start:load-1"]);
 
-    // ...and two compactions finish while it is still running. The harness has
-    // written its recap by now.
-    recapOnDisk = true;
-    for (const n of [1, 2]) {
-      fireTo(`agent:${compactor.id}`, {
-        type: "turn_start",
-        turn_id: `turn-compact-${n}`,
-        message_id: `msg-compact-${n}`,
-        send_id: `send-compact-${n}`,
-        started_at: "2026-05-16T00:00:06Z",
-      });
-      fireTo(`agent:${compactor.id}`, {
-        type: "turn_end",
-        turn_id: `turn-compact-${n}`,
-        outcome: { status: "completed" },
-        ended_at: "2026-05-16T00:00:07Z",
-      });
-    }
-    await settle();
-    // Still exactly one read running — the refreshes are queued, not concurrent.
-    expect(order.filter((e) => e.startsWith("start:"))).toHaveLength(1);
+    // The second branch completes too, queueing a second read, and a compaction
+    // finishes: its refresh is admitted and queues third. Three reads now contend,
+    // which is what makes the ordering assertion below discriminate — a chain that
+    // only waited on the *first* read would let these two start together.
+    fireTo(`agent:${fork2.id}`, {
+      type: "turn_end",
+      turn_id: "turn-fork-2",
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:05Z",
+    });
+    await completeCompaction([recapA]);
+    expect(order).toEqual(["start:load-1"]);
 
-    // Drain everything the chain queued.
-    for (let i = 0; i < 6; i += 1) {
+    // Drain both branch reads. The refresh starts third and snapshots recap A —
+    // recap B does not exist yet, on disk or anywhere.
+    for (const i of [0, 1]) {
       gates[i]?.();
       await settle();
     }
+    expect(order).toEqual([
+      "start:load-1",
+      "end:load-1",
+      "start:load-2",
+      "end:load-2",
+      "start:load-3",
+    ]);
 
-    const starts = order.filter((e) => e.startsWith("start:"));
-    const ends = order.filter((e) => e.startsWith("end:"));
-    expect(starts.length).toBe(ends.length);
-    // Strictly alternating start/end proves nothing overlapped.
-    expect(order).toEqual(starts.flatMap((s, i) => [s, ends[i]!]));
-    // The last read wins the overlay, and it is one that saw the recap.
-    expect(ws.conversations[PROJECT_1]?.items).toEqual([recap]);
+    // A second compaction finishes while the refresh is still running. Its recap
+    // is on disk before its terminal event — the real order — but *after* the
+    // refresh took its snapshot, so no read that has already started can see it.
+    // The follow-up this schedules is the only thing that can.
+    await completeCompaction([recapA, recapB]);
+    expect(order.filter((e) => e.startsWith("start:"))).toHaveLength(3);
+
+    gates[2]?.();
+    await settle();
+    gates[3]?.();
+    await settle();
+
+    // Two assertions for two distinct regressions, **content first on purpose**.
+    // Dropping the follow-up breaks both (there is one fewer read *and* recap B
+    // never reaches the user), so if the ordering assertion ran first it would
+    // fail first and hide which guarantee actually went. Asserting content first
+    // means a dropped follow-up fails here, and a serialization regression — which
+    // leaves content intact, since whichever read finishes last still sees both
+    // recaps — fails only below. Each failure then names its own cause.
+    expect(ws.conversations[PROJECT_1]?.items).toEqual([recapA, recapB]);
+    expect(order).toEqual([
+      "start:load-1",
+      "end:load-1",
+      "start:load-2",
+      "end:load-2",
+      "start:load-3",
+      "end:load-3",
+      "start:load-4",
+      "end:load-4",
+    ]);
   });
 
   it("does not reclaim attachments from a refresh", async () => {
+    // Refreshes run long after agents are registered and can hold queued work,
+    // so they must never reclaim. This drives a genuine compaction refresh and
+    // asserts it happened — an assertion on the reclaim count alone would pass
+    // if no refresh ever ran.
     const ws = await loadWorkspaceState();
     const state = await loadAgentState();
+    const compactor = agent(AGENT_1, PROJECT_1);
     let reclaims = 0;
+    let loads = 0;
+    let stamp = 0;
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
       switch (cmd) {
         case "open_project":
@@ -2267,27 +2354,58 @@ describe("project read serialization", () => {
           reclaims += 1;
           return undefined;
         case "list_agents":
-          return [agent(AGENT_1, PROJECT_1)];
+          return [compactor];
         case "project_session_fingerprints":
-          return [] satisfies AgentSessionFingerprint[];
+          stamp += 1;
+          return [
+            {
+              agent_id: compactor.id,
+              refresh_capable: true,
+              fingerprint: { source_path: "/s", modified_at: `t${stamp}`, byte_len: stamp },
+            },
+          ] satisfies AgentSessionFingerprint[];
         case "load_project_conversation":
+          loads += 1;
           return { items: [], agents: [] } satisfies ProjectConversation;
+        case "compact_agent":
+          return "00000000-0000-7000-8000-00000000c003";
         default:
           return undefined;
       }
     });
     await ws.activateProject(PROJECT_1);
-    await state.registerAgent(agent(AGENT_1, PROJECT_1));
+    for (let i = 0; i < 20; i += 1) {
+      await tick();
+      await new Promise((r) => setTimeout(r, 1));
+    }
     ws.installForkHistoryRefresh();
     expect(reclaims).toBe(1);
+    const loadsBefore = loads;
 
-    fireTo(`agent:${AGENT_1}`, {
+    const sendId = "00000000-0000-7000-8000-00000000d001";
+    await state.dispatchCompaction(
+      compactor.id,
+      sendId,
+      "00000000-0000-7000-8000-00000000e001",
+      "2026-05-16T00:00:05Z",
+    );
+    const messageId = state.runtimes[compactor.id]?.pending_sends?.at(-1)?.message_id;
+    fireTo(`agent:${compactor.id}`, {
+      type: "turn_start",
+      turn_id: "turn-compact",
+      message_id: messageId,
+      send_id: sendId,
+      started_at: "2026-05-16T00:00:06Z",
+    });
+    fireTo(`agent:${compactor.id}`, {
       type: "turn_end",
-      turn_id: "turn-1",
+      turn_id: "turn-compact",
       outcome: { status: "completed" },
-      ended_at: "2026-05-16T00:00:05Z",
+      ended_at: "2026-05-16T00:00:07Z",
     });
     await settle();
+
+    expect(loads).toBeGreaterThan(loadsBefore);
     expect(reclaims).toBe(1);
   });
 });

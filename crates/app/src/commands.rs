@@ -17,7 +17,7 @@ use switchboard_core::{
 };
 use switchboard_dispatcher::{
     CancelOutcome, CurrentTurnWait, DispatchContextFactory, Dispatcher, EventEmitter, OnBusy,
-    RemovedQueuedMessage, SendOutcome,
+    RemovedQueuedMessage, SendOutcome, TurnKind,
 };
 use switchboard_harness::{
     CancelSource, ForwardedBlock, HarnessAdapter, MessageId, TurnOutcome,
@@ -2451,7 +2451,7 @@ pub async fn fork_agent_impl(
 /// queued: waiting would hand the branch the answer to the very turn the user is
 /// branching away from.
 ///
-/// **A look, not a lock — but no longer only a look.** `is_turn_running` is a
+/// **A look, not a lock — but no longer only a look.** `running_turn_kind` is a
 /// non-blocking peek at the agent's actor (the dispatcher has no status flag by
 /// design — one turn in flight is structural), so on its own it leaves two
 /// windows: a parent turn starting between this reply and claude reading the
@@ -2470,7 +2470,12 @@ pub async fn fork_agent_impl(
 /// coupling that reasoning feared is real and is the accepted cost — see
 /// `crate::session_lock`.
 async fn ensure_fork_source_free(state: &AppState, source: &AgentRecord) -> Result<(), AppError> {
-    if state.dispatcher.is_turn_running(source.id).await {
+    if state
+        .dispatcher
+        .running_turn_kind(source.id)
+        .await
+        .is_some()
+    {
         return Err(AppError::ForkSourceBusy {
             name: source.name.clone(),
         });
@@ -2565,7 +2570,7 @@ pub(crate) async fn busy_fork_source(
     let parent = lock(agents_by_id)
         .values()
         .find(|candidate| {
-            // Never match the agent itself. `is_turn_running` asks the target's
+            // Never match the agent itself. `running_turn_kind` asks the target's
             // own actor and awaits its reply, so an agent whose provenance names
             // its own session would ask a question only it can answer, from
             // inside the code path that is stopping it from answering —
@@ -2584,7 +2589,7 @@ pub(crate) async fn busy_fork_source(
         })
         .cloned();
     let parent = parent?;
-    // Stricter than `is_turn_running`: a parent mid-teardown can still be writing
+    // Stricter than `running_turn_kind`: a parent mid-teardown can still be writing
     // its session file, and that reads as "not running".
     if dispatcher.is_safe_to_fork_from(parent.id).await {
         None
@@ -3944,11 +3949,19 @@ async fn resolve_source_completed_only(
         name: qualified_source_name(&agent.name, &project, recipient_project),
         ..agent
     };
-    if state.dispatcher.is_turn_running(agent_id).await {
+    // Name what the agent is actually doing: a compaction never produces a reply,
+    // so "still responding" would send the user looking for output that isn't
+    // coming.
+    let busy_with = match state.dispatcher.running_turn_kind(agent_id).await {
+        None => None,
+        Some(TurnKind::Send) => Some("is still responding"),
+        Some(TurnKind::Compaction) => Some("is compacting its context"),
+    };
+    if let Some(busy_with) = busy_with {
         return Err(AppError::Workflow(
             switchboard_workflow::WorkflowError::Invocation {
                 message: format!(
-                    "agent {:?} is still responding — wait for it to finish, then run the workflow",
+                    "agent {:?} {busy_with} — wait for it to finish, then run the workflow",
                     agent.name
                 ),
             },
@@ -7443,7 +7456,7 @@ mod tests {
     /// race the actor.
     async fn await_turn_running(state: &AppState, agent_id: AgentId) {
         for _ in 0..200 {
-            if state.dispatcher.is_turn_running(agent_id).await {
+            if state.dispatcher.running_turn_kind(agent_id).await.is_some() {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -7578,7 +7591,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_referential_provenance_is_refused_rather_than_asking_itself() {
-        // Corrupt data, not a policy question. `is_turn_running` asks the target
+        // Corrupt data, not a policy question. `running_turn_kind` asks the target
         // agent's own actor and awaits its reply, so an agent whose provenance
         // names its own session would ask a question only it can answer from
         // inside the code path blocking it from answering — a deadlock that no
@@ -9820,7 +9833,7 @@ mod tests {
     /// idle arm as `Idle`. So a test must not release a parked turn until the wait
     /// is registered.
     ///
-    /// `is_turn_running` sends `PeekCurrentTurn` on the same FIFO mailbox, behind
+    /// `running_turn_kind` sends `PeekCurrentTurn` on the same FIFO mailbox, behind
     /// the wait. Awaiting its reply therefore proves the wait was serviced first,
     /// and a `true` reply proves it registered against a *live* turn rather than
     /// being answered from the post-terminal stash. Call this after `poll!` and
@@ -9828,7 +9841,7 @@ mod tests {
     /// stream cannot yield a terminal, so the biased arm cannot preempt the command.
     async fn await_wait_registered(state: &AppState, agent_id: AgentId) {
         assert!(
-            state.dispatcher.is_turn_running(agent_id).await,
+            state.dispatcher.running_turn_kind(agent_id).await.is_some(),
             "the forward's wait must register while the source's turn is still live"
         );
     }

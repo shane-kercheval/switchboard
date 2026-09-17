@@ -37,6 +37,15 @@
 //! `MessageFailed`. `AgentIdle` fires only when the actor parks with an empty
 //! backlog (genuine idle) — never between chained queued turns.
 //!
+//! **Two kinds of work, one actor.** Besides sends, an agent can be asked to
+//! **compact its own conversation** ([`Dispatcher::compact_agent`]). A compaction
+//! rides the same backlog, the same `select!` drain, and the same cancellation
+//! and terminal machinery as a send — that reuse is the point, since none of
+//! that behavior differs. What differs is that a compaction is not
+//! *conversational*: it carries no prompt, writes **nothing** to the journal, and
+//! has no text to forward. [`TurnKind`] is the single discriminator every one of
+//! those divergences branches on.
+//!
 //! **Opt-in per-send completion signal.** A caller that needs to *await* a
 //! specific send's outcome (the workflow runtime, the cross-agent forward
 //! resolver) uses [`Dispatcher::send_message_awaiting_completion`], which hands
@@ -208,11 +217,7 @@ impl Drop for PathReadinessGuard {
 struct WorkItem {
     message_id: MessageId,
     send_id: SendId,
-    /// The **clean** prompt (no attachment footer). The agent-facing footer is
-    /// rendered from `attachments` at dispatch time, so the queued item stays
-    /// the user's literal text.
-    prompt: String,
-    attachments: Vec<Attachment>,
+    payload: WorkPayload,
     /// Model/effort selected when the user submitted this send. Unlike the
     /// locator and other agent state, these values are intent attached to the
     /// queued work and must not change if the agent switches selections before
@@ -229,13 +234,58 @@ struct WorkItem {
     /// discarding the item (see [`resolve_dropped_completion`]) — never a silent
     /// drop that would leave the awaiter on a `RecvError`.
     completion: Option<oneshot::Sender<CompletionResult>>,
-    /// Emit a live [`NormalizedEvent::UserMessage`] for this send once it is
-    /// durable (after `record_send` succeeds, before `TurnStart`). Set for
-    /// backend-originated sends (a workflow `send`) that have no frontend
-    /// optimistic user turn; `false` for the compose-bar path, which renders its
-    /// user turn optimistically. Emitting at the journal boundary keeps the live
-    /// user message identical to the reloaded journal view by construction.
-    emit_user_message: bool,
+}
+
+/// What a work item asks the agent to do.
+///
+/// An enum rather than a nullable `prompt` beside a flag: the actor must treat a
+/// compaction differently at several points in a turn's lifecycle, and every one
+/// of them should be a match the compiler checks rather than a condition someone
+/// can forget to write.
+#[derive(Debug)]
+enum WorkPayload {
+    /// A user-initiated send — the ordinary conversational turn.
+    Send {
+        /// The **clean** prompt (no attachment footer). The agent-facing footer
+        /// is rendered from `attachments` at dispatch time, so the queued item
+        /// stays the user's literal text.
+        prompt: String,
+        attachments: Vec<Attachment>,
+        /// Emit a live [`NormalizedEvent::UserMessage`] for this send once it is
+        /// durable (after `record_send` succeeds, before `TurnStart`). Set for
+        /// backend-originated sends (a workflow `send`) that have no frontend
+        /// optimistic user turn; `false` for the compose-bar path, which renders
+        /// its user turn optimistically. Emitting at the journal boundary keeps
+        /// the live user message identical to the reloaded journal view by
+        /// construction.
+        emit_user_message: bool,
+    },
+    /// Ask the harness to compact the agent's **own existing conversation**.
+    /// Carries no prompt and no attachments — it is not something the user said,
+    /// and nothing about it is journaled.
+    Compact,
+}
+
+impl WorkPayload {
+    fn kind(&self) -> TurnKind {
+        match self {
+            Self::Send { .. } => TurnKind::Send,
+            Self::Compact => TurnKind::Compaction,
+        }
+    }
+}
+
+/// What a turn is doing — the classification an observer can read without the
+/// work item's payload.
+///
+/// A compaction is a real turn through the actor: it queues, streams, cancels,
+/// and terminates exactly like a send. It is simply **not conversational** — no
+/// prompt, nothing journaled, no forwardable text — so every place that must
+/// tell the two apart branches on this rather than on the presence of a prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnKind {
+    Send,
+    Compaction,
 }
 
 /// The model/effort-dependent part of an agent record captured for one send.
@@ -333,9 +383,13 @@ pub enum AwaitableSendOutcome {
 /// `Idle` source (no live turn to capture; its file is already settled).
 #[derive(Debug, Clone, PartialEq)]
 pub enum CurrentTurnWait {
-    /// The agent had no in-flight turn — it was idle (or between queued turns,
-    /// or never dispatched). The caller reads the source's latest completed
-    /// output from disk (settled, since nothing is running).
+    /// **There is no conversational turn to capture — read disk.** The agent was
+    /// idle (or between queued turns, or never dispatched), so its latest
+    /// completed output is settled on disk; or the turn the waiter bound to was a
+    /// compaction, which produces no text and is therefore not a source of
+    /// forwardable output at all. A compaction satisfies this answer's contract
+    /// by definition, and the actor holds it until the compaction's stream has
+    /// drained so the session file is settled before the caller reads it.
     Idle,
     /// The agent had an in-flight turn, which reached this terminal outcome.
     /// `text` is the turn's captured `Text`-kind output for a `Completed`
@@ -422,11 +476,17 @@ enum Command {
     WaitForCurrentTurn {
         reply: oneshot::Sender<CurrentTurnWait>,
     },
-    /// **Non-blocking** peek: reply `true` iff a turn is *actively running* right
-    /// now (not idle, not already past its terminal). Unlike `WaitForCurrentTurn`
-    /// it never holds the reply — used by completed-only forwarding to reject a
-    /// still-streaming source without waiting on it.
-    PeekCurrentTurn { reply: oneshot::Sender<bool> },
+    /// **Non-blocking** peek: reply `Some(kind)` iff a turn is *actively running*
+    /// right now, `None` when the agent is free. Unlike `WaitForCurrentTurn` it
+    /// never holds the reply — used by completed-only forwarding to reject a
+    /// still-streaming source without waiting on it, and by the fork gate.
+    ///
+    /// The kind rides along because "busy" alone cannot be explained to a user:
+    /// a compacting agent is not "still responding," and a caller that says so is
+    /// describing a turn that will never produce a reply.
+    PeekCurrentTurn {
+        reply: oneshot::Sender<Option<TurnKind>>,
+    },
     /// Reply `true` while this actor owns running or queued work. External
     /// session handoff uses this to avoid starting a second process against a
     /// harness session Switchboard is still driving.
@@ -975,15 +1035,63 @@ impl Dispatcher {
         let item = WorkItem {
             message_id: Uuid::now_v7(),
             send_id,
-            prompt: prompt.to_owned(),
-            attachments,
+            payload: WorkPayload::Send {
+                prompt: prompt.to_owned(),
+                attachments,
+                // Compose-bar sends render their user turn optimistically on the
+                // frontend; no backend-emitted user message.
+                emit_user_message: false,
+            },
             selection,
             completion: None,
-            // Compose-bar sends render their user turn optimistically on the
-            // frontend; no backend-emitted user message.
-            emit_user_message: false,
         };
         self.accept(agent_id, item, factory, on_busy).await
+    }
+
+    /// Accept a **manual context compaction** for `agent_id`: ask the harness to
+    /// summarize its own conversation so far and continue from the summary.
+    /// Spawns the agent's actor on first use and returns the receipt
+    /// `MessageId`; the `turn_id` arrives later on the correlated `TurnStart`,
+    /// exactly as for a send.
+    ///
+    /// **Always enqueues**, so there is no `OnBusy` choice and no `Busy` outcome
+    /// to branch on: a compaction has no deadline and nothing awaiting it, so
+    /// refusing one for contention would only ask the user to try again later.
+    /// It runs through the same actor as a send — same FIFO position, same
+    /// cancellation, liveness, and terminal handling — but as
+    /// [`TurnKind::Compaction`] it journals nothing, emits no user message, and
+    /// produces no forwardable text. There is deliberately no awaitable variant.
+    ///
+    /// The caller supplies `send_id` so it can cancel the compaction through
+    /// [`Self::cancel_send`] while it is still queued, before any `TurnStart`
+    /// has carried that id back.
+    ///
+    /// Callers must gate on `HarnessKind::supports_manual_compaction` first — an
+    /// adapter that cannot be driven to compact refuses at dispatch, which
+    /// surfaces here as a `MessageFailed` rather than as a refusal the caller
+    /// can act on.
+    pub async fn compact_agent(
+        &self,
+        agent_id: AgentId,
+        send_id: SendId,
+        factory: Arc<dyn DispatchContextFactory>,
+    ) -> MessageId {
+        // Snapshotted like a send's: the compaction must run under the model the
+        // user had selected when they asked for it, not whatever is selected by
+        // the time the backlog reaches it.
+        let selection = factory.selection_snapshot();
+        let item = WorkItem {
+            message_id: Uuid::now_v7(),
+            send_id,
+            payload: WorkPayload::Compact,
+            selection,
+            completion: None,
+        };
+        match self.accept(agent_id, item, factory, OnBusy::Enqueue).await {
+            SendOutcome::Accepted(message_id) => message_id,
+            // Structurally unreachable: `Busy` exists only on the `FailFast` arm.
+            SendOutcome::Busy => unreachable!("OnBusy::Enqueue never reports Busy"),
+        }
     }
 
     /// Like [`send_message`](Self::send_message), but hands back a one-shot
@@ -1051,11 +1159,13 @@ impl Dispatcher {
         let item = WorkItem {
             message_id: Uuid::now_v7(),
             send_id,
-            prompt: prompt.to_owned(),
-            attachments,
+            payload: WorkPayload::Send {
+                prompt: prompt.to_owned(),
+                attachments,
+                emit_user_message,
+            },
             selection,
             completion: Some(completion_tx),
-            emit_user_message,
         };
         match self.accept(agent_id, item, factory, OnBusy::FailFast).await {
             SendOutcome::Accepted(message_id) => AwaitableSendOutcome::Accepted {
@@ -1252,15 +1362,10 @@ impl Dispatcher {
         rx.await.unwrap_or(CurrentTurnWait::Idle)
     }
 
-    /// Whether `agent_id` has a turn **actively running** right now. Non-blocking:
-    /// the actor answers immediately (never holds the reply for a running turn),
-    /// so completed-only forwarding can reject a still-streaming source without
-    /// waiting on it. `false` for an idle/never-dispatched/shutting-down agent.
-    /// See [`fork_safety_from_slot`] for the slot-state half of this decision.
-    ///
     /// Whether an agent is safe to *fork from* right now — a stricter question
-    /// than [`Self::is_turn_running`], which reports a shutting-down agent as
-    /// not running.
+    /// than [`Self::running_turn_kind`], which reports a shutting-down agent as
+    /// not running. See [`fork_safety_from_slot`] for the slot-state half of this
+    /// decision.
     ///
     /// That answer is right for completed-only forwarding (nothing more will
     /// arrive) and wrong here: a slot flips to `Closing` before cancellation and
@@ -1285,18 +1390,29 @@ impl Dispatcher {
             return true;
         }
         match rx.await {
-            Ok(running) => !running,
+            Ok(running) => running.is_none(),
             // The actor dropped the reply — it is tearing down. Unsafe.
             Err(_) => false,
         }
     }
 
-    pub async fn is_turn_running(&self, agent_id: AgentId) -> bool {
+    /// What `agent_id` is running right now, or `None` if it is free —
+    /// non-blocking: the actor answers immediately (it never holds the reply for
+    /// a running turn), so completed-only forwarding can reject a still-busy
+    /// source without waiting on it. `None` for an idle / never-dispatched /
+    /// shutting-down agent.
+    ///
+    /// Reports the *kind* rather than a bare "busy" so a caller can say what the
+    /// agent is doing: a [`TurnKind::Compaction`] is never going to produce a
+    /// reply, so telling the user to "wait for it to finish responding" would be
+    /// wrong. See [`Self::is_safe_to_fork_from`] for the stricter question that
+    /// also accounts for a shutting-down agent.
+    pub async fn running_turn_kind(&self, agent_id: AgentId) -> Option<TurnKind> {
         let commands = {
             let agents = lock(&self.agents);
             match agents.get(&agent_id) {
                 Some(AgentSlot::Active(tx)) => tx.clone(),
-                _ => return false,
+                _ => return None,
             }
         };
         let (tx, rx) = oneshot::channel();
@@ -1304,13 +1420,13 @@ impl Dispatcher {
             .send(Command::PeekCurrentTurn { reply: tx })
             .is_err()
         {
-            return false;
+            return None;
         }
-        rx.await.unwrap_or(false)
+        rx.await.unwrap_or(None)
     }
 
     /// Whether Switchboard still owns any running or queued work for this
-    /// agent. Unlike [`Self::is_turn_running`], this stays true through
+    /// agent. Unlike [`Self::running_turn_kind`], this stays true through
     /// post-terminal enrichment and a queued backlog, which are both unsafe
     /// moments to hand the same harness session to an external terminal.
     pub async fn has_pending_work(&self, agent_id: AgentId) -> bool {
@@ -1554,7 +1670,7 @@ fn apply_idle_command(
         }
         // No turn live ⇒ not running.
         Command::PeekCurrentTurn { reply } => {
-            let _ = reply.send(false);
+            let _ = reply.send(None);
             IdleAfter::Continue
         }
         Command::PeekWorkPending { reply } => {
@@ -1630,6 +1746,7 @@ async fn run_turn(
     // fires it at the turn's terminal. Partial move — the remaining `item`
     // fields stay accessible.
     let mut completion = item.completion;
+    let kind = item.payload.kind();
     let turn_id: TurnId = Uuid::now_v7();
     let started_at = Utc::now();
 
@@ -1708,84 +1825,109 @@ async fn run_turn(
         }
     };
 
-    // Fail-closed: journal the send before spawning. On failure, no turn starts,
-    // no outcome marker (the journal is what's broken — a marker would orphan),
-    // and we surface MessageFailed. Advance the backlog regardless.
-    if let Err(e) = journal.record_send(
-        turn_id,
-        agent_id,
-        &item.prompt,
-        &item.attachments,
-        started_at,
-    ) {
-        emit_message_failed(
-            emitter.as_ref(),
-            channel,
-            item.message_id,
-            // The journal write itself failed — there is no durable send for reload
-            // to reconstruct, so the frontend must not invent a row.
-            None,
-            agent_id,
-            &e.to_string(),
-        );
-        // An awaited send must not hang because its turn never started.
-        fire_completion(
-            &mut completion,
-            TurnOutcome::Failed {
-                kind: FailureKind::AdapterFailure,
-                message: e.to_string(),
-            },
-            String::new(),
-        );
-        return TurnAfter::Continue;
-    }
-
-    // The send is now durable (journaled above). For a backend-originated send (a
-    // workflow `send`, which has no frontend optimistic user turn), surface its
-    // message as a live user message before the turn starts — so the live view
-    // matches the reloaded journal view. Emitting *past* `record_send` means a
-    // journal-write failure (handled above) shows no live user message either.
-    if item.emit_user_message {
-        emit_user_message(
-            emitter.as_ref(),
-            channel,
-            item.send_id,
-            &item.prompt,
-            started_at,
-            agent_id,
-        );
-    }
-
     let token = CancellationToken::new();
     options.cancel_token = token.clone();
-    // Clean prompt is journaled (above) and queued; the agent-facing footer of
-    // `label: <absolute path>` lines is appended only here, at the dispatch
-    // boundary, so adapters stay attachment-unaware. Empty attachments → the
-    // prompt is returned unchanged.
-    let dispatch_prompt = render_prompt_with_attachments(&item.prompt, &item.attachments);
-    let stream = match adapter
-        .dispatch(&agent, &cwd, &dispatch_prompt, turn_id, options)
-        .await
-    {
+
+    // The one place a send and a compaction diverge before the stream exists:
+    // what gets written down, what the user is shown, and which adapter
+    // operation runs. A compaction reaches none of the first two — the journal
+    // is the **user's** side of the conversation (system-design §3) and a
+    // compaction is not something the user said, so there is no send to make
+    // durable and no user message to render.
+    let launched = match &item.payload {
+        WorkPayload::Send {
+            prompt,
+            attachments,
+            emit_user_message: announce_user_message,
+        } => {
+            // Fail-closed: journal the send before spawning. On failure, no turn
+            // starts, no outcome marker (the journal is what's broken — a marker
+            // would orphan), and we surface MessageFailed. Advance the backlog
+            // regardless.
+            if let Err(e) = journal.record_send(turn_id, agent_id, prompt, attachments, started_at)
+            {
+                emit_message_failed(
+                    emitter.as_ref(),
+                    channel,
+                    item.message_id,
+                    // The journal write itself failed — there is no durable send for reload
+                    // to reconstruct, so the frontend must not invent a row.
+                    None,
+                    agent_id,
+                    &e.to_string(),
+                );
+                // An awaited send must not hang because its turn never started.
+                fire_completion(
+                    &mut completion,
+                    TurnOutcome::Failed {
+                        kind: FailureKind::AdapterFailure,
+                        message: e.to_string(),
+                    },
+                    String::new(),
+                );
+                return TurnAfter::Continue;
+            }
+
+            // The send is now durable (journaled above). For a backend-originated send (a
+            // workflow `send`, which has no frontend optimistic user turn), surface its
+            // message as a live user message before the turn starts — so the live view
+            // matches the reloaded journal view. Emitting *past* `record_send` means a
+            // journal-write failure (handled above) shows no live user message either.
+            if *announce_user_message {
+                emit_user_message(
+                    emitter.as_ref(),
+                    channel,
+                    item.send_id,
+                    prompt,
+                    started_at,
+                    agent_id,
+                );
+            }
+
+            // Clean prompt is journaled (above) and queued; the agent-facing footer of
+            // `label: <absolute path>` lines is appended only here, at the dispatch
+            // boundary, so adapters stay attachment-unaware. Empty attachments → the
+            // prompt is returned unchanged.
+            let dispatch_prompt = render_prompt_with_attachments(prompt, attachments);
+            adapter
+                .dispatch(&agent, &cwd, &dispatch_prompt, turn_id, options)
+                .await
+        }
+        // A distinct adapter operation, not `dispatch` with a magic prompt: the
+        // harnesses that cannot be mechanically driven to compact answer a
+        // `/compact` *prompt* with a model-authored claim of success while
+        // nothing is compacted, so the refusal has to live in the type of the
+        // call. `options` rides through unchanged — the cancel token is what
+        // makes a compaction cancellable like any other turn.
+        WorkPayload::Compact => adapter.compact(&agent, &cwd, turn_id, options).await,
+    };
+
+    let stream = match launched {
         Ok(stream) => stream,
         Err(e) => {
-            // Send is journaled but the turn never started: record a Failed
-            // marker against the minted turn_id (intentional — restart shows a
-            // failed turn, not an orphan user message) and surface MessageFailed.
             let message = e.to_string();
             let outcome = TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 message: message.clone(),
             };
-            journal.record_outcome(turn_id, agent_id, &outcome, started_at, Utc::now());
+            // A send is journaled by now but its turn never started: record a
+            // Failed marker against the minted turn_id (intentional — restart
+            // shows a failed turn, not an orphan user message) and carry the
+            // send_id so live attaches the marker identically to reload. A
+            // compaction journaled nothing and stays that way: no marker, and no
+            // send_id, so the frontend invents no transcript row for it.
+            let durable_send_id = match kind {
+                TurnKind::Send => {
+                    journal.record_outcome(turn_id, agent_id, &outcome, started_at, Utc::now());
+                    Some(item.send_id)
+                }
+                TurnKind::Compaction => None,
+            };
             emit_message_failed(
                 emitter.as_ref(),
                 channel,
                 item.message_id,
-                // Post-`record_send`: the send is durable (and a `Failed` outcome
-                // was just recorded), so reload reconstructs user message + marker
-                // — carry the send_id so live attaches the marker identically.
-                Some(item.send_id),
+                durable_send_id,
                 agent_id,
                 &message,
             );
@@ -1810,6 +1952,7 @@ async fn run_turn(
         agent_id,
         channel,
         turn_id,
+        kind,
         item.send_id,
         started_at,
         &emitter,
@@ -1835,6 +1978,7 @@ async fn drain_turn(
     agent_id: AgentId,
     channel: &str,
     turn_id: TurnId,
+    kind: TurnKind,
     running_send_id: SendId,
     started_at: DateTime<Utc>,
     emitter: &Arc<dyn EventEmitter>,
@@ -1854,6 +1998,23 @@ async fn drain_turn(
         completion,
         current_turn: Vec::new(),
     };
+    // `Some` only while this turn is part of the user's conversation. A
+    // compaction journals **nothing** — no send, no outcome marker, no send↔turn
+    // link — because the journal is the user's side of the conversation
+    // (system-design §3) and a compaction is not part of it: there is no message
+    // for reload to reconstruct, and an outcome marker would render as a failed
+    // *turn* the user never sent. Every journal write below reaches the journal
+    // through this binding, so for a compaction there is simply nowhere to write.
+    //
+    // Belt-and-braces for the two link sites: a compaction's parser emits no
+    // `TurnIdentity` and no `first_message_id`, so they cannot fire today — but a
+    // parser change must not be able to journal a link for a compaction.
+    let conversation_journal: Option<&dyn ConversationJournal> =
+        (kind == TurnKind::Send).then(|| &**journal);
+    // Current-turn waiters bound to a *compaction*, held here rather than in
+    // `awaiters` — they are answered at stream drain, not at the terminal. See
+    // where they are drained, below the loop.
+    let mut compaction_waiters: Vec<oneshot::Sender<CurrentTurnWait>> = Vec::new();
     let mut terminal_seen = false;
     // The terminal outcome + captured text, stashed once observed so a
     // `WaitForCurrentTurn` arriving *after* the terminal but before the stream
@@ -1979,7 +2140,7 @@ async fn drain_turn(
                                 turn_id,
                                 agent_id,
                                 started_at,
-                                journal.as_ref(),
+                                conversation_journal,
                                 &mut awaiters,
                                 &outcome,
                                 "",
@@ -2008,6 +2169,7 @@ async fn drain_turn(
                 // The event still flows to the frontend below (no `continue`).
                 if let AdapterEvent::TurnIdentity { message_id, .. } = &event
                     && recorded_link_key.is_none()
+                    && let Some(journal) = conversation_journal
                 {
                     // Explicit statement (not a conjunct in the chain above),
                     // matching the terminal site's spelling of this same
@@ -2036,7 +2198,13 @@ async fn drain_turn(
                     if token.is_cancelled() {
                         continue;
                     }
-                    if matches!(outcome, TurnOutcome::Completed) && !visible_output_seen {
+                    // A compaction produces no content by design (it streams no
+                    // answer), so this diagnostic would fire on every successful
+                    // one — it is a send-shaped expectation.
+                    if kind == TurnKind::Send
+                        && matches!(outcome, TurnOutcome::Completed)
+                        && !visible_output_seen
+                    {
                         tracing::warn!(
                             agent_id = %agent_id,
                             %turn_id,
@@ -2044,7 +2212,9 @@ async fn drain_turn(
                         );
                     }
                     terminal_seen = true;
-                    if !matches!(outcome, TurnOutcome::Completed) {
+                    if !matches!(outcome, TurnOutcome::Completed)
+                        && let Some(journal) = conversation_journal
+                    {
                         journal.record_outcome(turn_id, agent_id, outcome, started_at, *ended_at);
                     }
                     // Terminal fallback for the durable send↔turn key-join: a
@@ -2072,7 +2242,9 @@ async fn drain_turn(
                     // first. Writing the second link converts a loud anomaly
                     // into a silent arbitrary pick; do not "simplify" this into
                     // writing both.
-                    if let Some(key) = first_message_id {
+                    if let Some(key) = first_message_id
+                        && let Some(journal) = conversation_journal
+                    {
                         match &recorded_link_key {
                             None => {
                                 if journal.record_link(turn_id, agent_id, key, *ended_at) {
@@ -2227,12 +2399,16 @@ async fn drain_turn(
                     Some(Command::Remove { message_id, reply }) => {
                         let _ = reply.send(remove_from_backlog(backlog, agent_id, message_id));
                     }
-                    Some(Command::WaitForCurrentTurn { reply }) => {
+                    Some(Command::WaitForCurrentTurn { reply }) => match kind {
+                        // Registered mid-compaction *or* arriving after its
+                        // terminal — either way it is held and answered `Idle` at
+                        // stream drain (see below the loop), never here.
+                        TurnKind::Compaction => compaction_waiters.push(reply),
                         // Mid-turn: register to fire at this turn's terminal. If
                         // the terminal already passed (we're draining post-terminal
                         // enrichment), answer immediately with the stashed outcome
                         // + text — registering would strand the caller.
-                        match &terminal {
+                        TurnKind::Send => match &terminal {
                             Some((outcome, text)) => {
                                 let _ = reply.send(CurrentTurnWait::Terminal {
                                     outcome: outcome.clone(),
@@ -2240,11 +2416,22 @@ async fn drain_turn(
                                 });
                             }
                             None => awaiters.current_turn.push(reply),
-                        }
-                    }
-                    // Mid-turn peek: running iff the terminal hasn't passed yet.
+                        },
+                    },
                     Some(Command::PeekCurrentTurn { reply }) => {
-                        let _ = reply.send(terminal.is_none());
+                        // A send stops being "running" at its terminal: its output
+                        // is final there, and a completed-only forward may read
+                        // past it while the actor drains post-terminal enrichment.
+                        // A compaction reports running for the whole drain
+                        // instead — what it changed lives in the session file, and
+                        // that file is settled only once the adapter has reaped
+                        // the process, which is the end of the stream rather than
+                        // the terminal. Same boundary its waiters resolve at.
+                        let running = match kind {
+                            TurnKind::Send => terminal.is_none(),
+                            TurnKind::Compaction => true,
+                        };
+                        let _ = reply.send(running.then_some(kind));
                     }
                     // The actor still owns this turn while it drains
                     // post-terminal enrichment, and may also hold a backlog.
@@ -2304,7 +2491,7 @@ async fn drain_turn(
             turn_id,
             agent_id,
             started_at,
-            journal.as_ref(),
+            conversation_journal,
             &mut awaiters,
             &TurnOutcome::Cancelled { source },
             "",
@@ -2332,7 +2519,7 @@ async fn drain_turn(
             turn_id,
             agent_id,
             started_at,
-            journal.as_ref(),
+            conversation_journal,
             &mut awaiters,
             &TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
@@ -2340,6 +2527,18 @@ async fn drain_turn(
             },
             "",
         );
+    }
+
+    // A compaction's current-turn waiters are answered here, at stream drain, and
+    // only here — never at the terminal event. `Idle` is the right answer because
+    // a compaction produces no text: resolving it as `Terminal { Completed, text:
+    // "" }` would make the forward path invalidate the forward as an empty
+    // source. Drain rather than terminal because `Idle` sends the caller to the
+    // session file, and an adapter ends its stream only once it has reaped the
+    // process — so this is the first moment that file is settled. Holds for every
+    // outcome alike: completed, failed, and cancelled.
+    for reply in compaction_waiters {
+        let _ = reply.send(CurrentTurnWait::Idle);
     }
 
     match shutdown_reply {
@@ -2370,6 +2569,10 @@ fn fire_completion(
 /// construction. A synthesized terminal carries no harness usage/cost/model/effort
 /// and no `hydration_key` (there is no harness turn id behind it).
 ///
+/// `journal` is `None` for work that is not part of the user's conversation (a
+/// compaction): the terminal is still emitted and the awaiters still fire, only
+/// the durable outcome marker is skipped.
+///
 /// This is **only** for terminals the dispatcher invents (cancel, force-fail,
 /// stream-truncation). A real adapter `TurnEnd` is forwarded verbatim through
 /// `into_normalized` and fires its awaiters inline — it must not be re-emitted
@@ -2382,7 +2585,7 @@ fn synthesize_terminal(
     turn_id: TurnId,
     agent_id: AgentId,
     started_at: DateTime<Utc>,
-    journal: &dyn ConversationJournal,
+    journal: Option<&dyn ConversationJournal>,
     awaiters: &mut TurnAwaiters,
     outcome: &TurnOutcome,
     text: &str,
@@ -2403,11 +2606,21 @@ fn synthesize_terminal(
         },
         agent_id,
     );
-    journal.record_outcome(turn_id, agent_id, outcome, started_at, ended_at);
+    if let Some(journal) = journal {
+        journal.record_outcome(turn_id, agent_id, outcome, started_at, ended_at);
+    }
     awaiters.fire(outcome, text);
 }
 
 /// Remove a queued message by id from an agent's backlog, returning its payload.
+///
+/// **Sends only.** This entry point exists to hand the user's text back to the
+/// composer, and a queued compaction has no text to hand back — so it is
+/// reported `NotQueued` and, decisively, is checked **before** anything is
+/// removed: answering "not queued" while having silently dropped the work would
+/// leave the caller unable to restore what it just destroyed. Cancelling a
+/// queued compaction is `cancel_send`'s job, which resolves it with the
+/// `MessageCancelled` signal the frontend already handles.
 fn remove_from_backlog(
     backlog: &mut VecDeque<WorkItem>,
     agent_id: AgentId,
@@ -2417,6 +2630,9 @@ fn remove_from_backlog(
         .iter()
         .position(|m| m.message_id == message_id)
         .ok_or(NotQueued)?;
+    if backlog[pos].payload.kind() != TurnKind::Send {
+        return Err(NotQueued);
+    }
     let mut item = backlog
         .remove(pos)
         .expect("position from iter is in bounds");
@@ -2429,11 +2645,19 @@ fn remove_from_backlog(
             source: CancelSource::User,
         },
     );
+    let WorkPayload::Send {
+        prompt,
+        attachments,
+        ..
+    } = item.payload
+    else {
+        unreachable!("non-send payloads were rejected above")
+    };
     Ok(RemovedQueuedMessage {
         agent_id,
         send_id: item.send_id,
-        prompt: item.prompt,
-        attachments: item.attachments,
+        prompt,
+        attachments,
     })
 }
 

@@ -448,15 +448,32 @@ export function buildUnifiedRows(
   //   - A row pending on every recipient is lifted to the floors of all its
   //     agents, then raises them to its anchor.
   //   - A fan-out some recipients have started is NOT lifted — its row sits at
-  //     the earliest start, where a reload also puts it — but on each recipient
-  //     still waiting it occupies its submit position: items queued ahead of it
-  //     there are untouched, items queued behind it are raised to its anchor.
-  //     Seeding the floor with it directly would lift the earlier items too and
-  //     display them below a send that recipient will run after them.
+  //     the earliest recipient start, where a reload also puts it — but on each
+  //     recipient still waiting it occupies its submit position: fully pending
+  //     items queued ahead of it there are untouched, fully pending items
+  //     queued behind it are raised to its anchor. Seeding the floor with it
+  //     directly would lift the earlier items too and display them below a
+  //     send that recipient will run after them.
   //
   // Without any of this, a send that just started would move to its turn-start
   // stamp and land *below* a sibling still waiting at its earlier submit stamp
   // — the queue would render inverted until the sibling started too.
+  //
+  // **The boundary of the guarantee.** A row is one send on every recipient's
+  // timeline and can sit in one place, so it is placed for the recipient that
+  // ran it first — the policy reload follows too, since the backend groups the
+  // journal's per-recipient records at the earliest. So a waiting recipient's
+  // queue order is preserved only against fully pending work queued behind the
+  // fan-out there. It is not preserved against work queued ahead of it that
+  // another agent's activity lifts past it, nor against a later fan-out that
+  // started elsewhere first — and it is not restored when the recipient catches
+  // up: if B runs E and then F while F sits at A's earlier start, F stays above
+  // E, live and after reopen. What holds throughout is a true chronology of
+  // *start times*; per-recipient execution order for a grouped send is shown
+  // by the fan-out block's columns, not by the row's position. The test "a
+  // fan-out placed at its first recipient's start stays there after the other
+  // recipient runs older work" pins the shape, so a change that lifts partial
+  // rows fails deliberately rather than quietly.
   //
   // Within one anchor: kind rank (user < agent < system_marker < outcome <
   // pending), then own `at`; `Array.prototype.sort` is stable so ties hold
@@ -489,6 +506,19 @@ export function buildUnifiedRows(
         return [row.agent_id];
     }
   };
+  // The recipients a row is still waiting on: every recipient of a fully
+  // pending send, the one agent of a queued compaction, the waiting subset of a
+  // partially started fan-out, and none for anything that has run.
+  const pendingRecipientsOf = (row: UnifiedRow): readonly AgentId[] => {
+    switch (row.kind) {
+      case "user":
+        return row.pending_agent_ids;
+      case "queued_compaction":
+        return [row.agent_id];
+      default:
+        return [];
+    }
+  };
   const raise = (floor: Map<AgentId, string>, id: AgentId, to: string): void => {
     const prior = floor.get(id);
     if (prior === undefined || isIsoTimestampBefore(prior, to)) floor.set(id, to);
@@ -504,22 +534,17 @@ export function buildUnifiedRows(
     .filter((row) => isPending(row) || (row.kind === "user" && row.pending_agent_ids.length > 0))
     .sort((a, b) => compareIsoTimestampsAscending(queuedAtOf(a), queuedAtOf(b)));
   for (const row of queued) {
+    const waiting = pendingRecipientsOf(row);
     if (isPending(row)) {
-      const agents =
-        row.kind === "user"
-          ? row.agent_ids
-          : row.kind === "queued_compaction"
-            ? [row.agent_id]
-            : [];
       let anchor = anchorOf(row);
-      for (const id of agents) {
+      for (const id of waiting) {
         const f = floor.get(id);
         if (f !== undefined && isIsoTimestampBefore(anchor, f)) anchor = f;
       }
       effectiveAnchor.set(row, anchor);
-      for (const id of agents) raise(floor, id, anchor);
-    } else if (row.kind === "user") {
-      for (const id of row.pending_agent_ids) raise(floor, id, anchorOf(row));
+      for (const id of waiting) raise(floor, id, anchor);
+    } else {
+      for (const id of waiting) raise(floor, id, anchorOf(row));
     }
   }
   const rankOf = (row: UnifiedRow): number => (isPending(row) ? KIND_RANK.pending : row.rank);

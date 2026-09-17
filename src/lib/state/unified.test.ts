@@ -13,6 +13,7 @@ import type { Turn } from "./types";
 
 const AGENT_A = "00000000-0000-7000-8000-000000000aaa";
 const AGENT_B = "00000000-0000-7000-8000-000000000bbb";
+const AGENT_C = "00000000-0000-7000-8000-000000000ccc";
 const TURN_1 = "00000000-0000-7000-8000-000000000001";
 const SEND_1 = "00000000-0000-7000-8000-0000000000d1";
 
@@ -950,5 +951,55 @@ describe("buildUnifiedRows: pending sends", () => {
       [],
     );
     expect(rows.map(label)).toEqual(["u:f", "a:send-f", "u:b", "a:send-b", "u:g"]);
+  });
+
+  it("a fan-out placed at its first recipient's start stays there after the other recipient runs older work", () => {
+    // The documented boundary, not a defect. E was queued on B and C at :00; F
+    // to A and B at :01. A starts F at :31; C runs an older job X at :40, which
+    // lifts E (still fully pending) behind X. B's queue is E then F, but F sits
+    // at A's start and is never lifted — so the display reads F, X, E.
+    const during = buildUnifiedRows(
+      [
+        userTurn("u-eb", AGENT_B, at("00"), "e", "send-e", true),
+        userTurn("u-ec", AGENT_C, at("00"), "e", "send-e", true),
+        userTurn("u-fa", AGENT_A, at("31"), "f", "send-f"),
+        userTurn("u-fb", AGENT_B, at("01"), "f", "send-f", true),
+        agentTurn("a-fa", AGENT_A, at("31"), "send-f"),
+        userTurn("u-x", AGENT_C, at("40"), "x", "send-x"),
+        agentTurn("a-x", AGENT_C, at("40"), "send-x"),
+      ],
+      [],
+    );
+    expect(during.map(label)).toEqual(["u:f", "a:send-f", "u:x", "a:send-x", "u:e"]);
+
+    // B then runs E at :50 and F at :60 (C ran E at :55). F keeps A's :31, so
+    // the order is unchanged — and a reload, which groups the journal's
+    // per-recipient records at the earliest, shows the same. Chronology of
+    // start times holds; B's execution order is what the fan-out columns show.
+    const after = buildUnifiedRows(
+      [
+        userTurn("u-eb", AGENT_B, at("50"), "e", "send-e"),
+        userTurn("u-ec", AGENT_C, at("55"), "e", "send-e"),
+        agentTurn("a-eb", AGENT_B, at("50"), "send-e"),
+        agentTurn("a-ec", AGENT_C, at("55"), "send-e"),
+        userTurn("u-fa", AGENT_A, at("31"), "f", "send-f"),
+        userTurn("u-fb", AGENT_B, at("60"), "f", "send-f"),
+        agentTurn("a-fa", AGENT_A, at("31"), "send-f"),
+        agentTurn("a-fb", AGENT_B, at("60"), "send-f"),
+        userTurn("u-x", AGENT_C, at("40"), "x", "send-x"),
+        agentTurn("a-x", AGENT_C, at("40"), "send-x"),
+      ],
+      [],
+    );
+    expect(after.map(label)).toEqual([
+      "u:f",
+      "a:send-f",
+      "a:send-f",
+      "u:x",
+      "a:send-x",
+      "u:e",
+      "a:send-e",
+      "a:send-e",
+    ]);
   });
 });

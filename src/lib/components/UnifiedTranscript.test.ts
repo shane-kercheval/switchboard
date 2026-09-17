@@ -5551,6 +5551,12 @@ describe("compaction rows", () => {
     expect(await screen.findByTestId("message-cost")).toHaveTextContent("0.4200");
     expect(screen.getByTestId("message-overage")).toBeInTheDocument();
     expect(screen.getByTestId("message-model")).toHaveTextContent("claude-sonnet-4-6");
+    // The model and timestamp are revealed on hover/focus of the row's `group`.
+    // jsdom cannot compute that style, so assert the hook is wired — without the
+    // class those details render into the DOM and can never be shown.
+    expect(screen.getByTestId("compaction-turn").closest("[data-testid='turn']")).toHaveClass(
+      "group",
+    );
   });
 
   it("renders an IPC refusal as a compaction row, not a bare failed response", async () => {

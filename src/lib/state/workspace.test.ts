@@ -2146,4 +2146,256 @@ describe("project read serialization", () => {
     await settle();
     expect(order.filter((e) => e.startsWith("start:"))).toHaveLength(3);
   });
+
+  it("queues a compaction refresh behind a branch read and keeps both results", async () => {
+    // The collision the chain was built for, which the three-branch case does not
+    // reach: a compaction's refresh enters through the freshness check and can
+    // request a *second* run via the follow-up flag. If an older branch read
+    // landed last it would replace the overlay and erase the recap marker the
+    // refresh had just fetched.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const fork = {
+      ...agent("00000000-0000-7000-8000-0000000000f9", PROJECT_1),
+      name: "branch",
+      forked_from_session: "00000000-0000-7000-8000-0000000000aa",
+    };
+    const compactor = agent(AGENT_2, PROJECT_1);
+    const recap: ConversationItem = {
+      kind: "system_marker",
+      id: "marker-1",
+      agent_id: compactor.id,
+      at: "2026-05-16T00:00:09Z",
+      marker: { marker_kind: "compaction", summary: "summarised" },
+    };
+
+    let recapOnDisk = false;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") {
+        return { items: recapOnDisk ? [recap] : [], agents: [] } satisfies ProjectConversation;
+      }
+      return undefined;
+    });
+    ws.agentsByProject[PROJECT_1] = [fork, compactor];
+    await state.registerAgent(fork);
+    await state.registerAgent(compactor);
+    await ws.hydrateProject(PROJECT_1);
+    ws.installForkHistoryRefresh();
+
+    // Every later read is gated so the test controls completion order.
+    const order: string[] = [];
+    const gates: (() => void)[] = [];
+    let seq = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "project_session_fingerprints") {
+        // Always stale, so the refresh always admits.
+        return [
+          {
+            agent_id: compactor.id,
+            refresh_capable: true,
+            fingerprint: { source_path: "/s", modified_at: `t${seq}`, byte_len: seq },
+          },
+        ] as unknown as AgentSessionFingerprint[];
+      }
+      if (cmd === "load_project_conversation") {
+        seq += 1;
+        const id = `load-${seq}`;
+        order.push(`start:${id}`);
+        await new Promise<void>((resolve) => gates.push(resolve));
+        order.push(`end:${id}`);
+        return { items: recapOnDisk ? [recap] : [], agents: [] } satisfies ProjectConversation;
+      }
+      return undefined;
+    });
+
+    // The branch's first turn completes, starting a read...
+    fireTo(`agent:${fork.id}`, {
+      type: "turn_end",
+      turn_id: "turn-fork",
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:05Z",
+    });
+    await settle();
+    expect(order).toEqual(["start:load-1"]);
+
+    // ...and two compactions finish while it is still running. The harness has
+    // written its recap by now.
+    recapOnDisk = true;
+    for (const n of [1, 2]) {
+      fireTo(`agent:${compactor.id}`, {
+        type: "turn_start",
+        turn_id: `turn-compact-${n}`,
+        message_id: `msg-compact-${n}`,
+        send_id: `send-compact-${n}`,
+        started_at: "2026-05-16T00:00:06Z",
+      });
+      fireTo(`agent:${compactor.id}`, {
+        type: "turn_end",
+        turn_id: `turn-compact-${n}`,
+        outcome: { status: "completed" },
+        ended_at: "2026-05-16T00:00:07Z",
+      });
+    }
+    await settle();
+    // Still exactly one read running — the refreshes are queued, not concurrent.
+    expect(order.filter((e) => e.startsWith("start:"))).toHaveLength(1);
+
+    // Drain everything the chain queued.
+    for (let i = 0; i < 6; i += 1) {
+      gates[i]?.();
+      await settle();
+    }
+
+    const starts = order.filter((e) => e.startsWith("start:"));
+    const ends = order.filter((e) => e.startsWith("end:"));
+    expect(starts.length).toBe(ends.length);
+    // Strictly alternating start/end proves nothing overlapped.
+    expect(order).toEqual(starts.flatMap((s, i) => [s, ends[i]!]));
+    // The last read wins the overlay, and it is one that saw the recap.
+    expect(ws.conversations[PROJECT_1]?.items).toEqual([recap]);
+  });
+
+  it("does not reclaim attachments from a refresh", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    let reclaims = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      switch (cmd) {
+        case "open_project":
+          return { id: PROJECT_1, name: "p", created_at: "2026-05-16T00:00:00Z" };
+        case "reclaim_project_attachments":
+          reclaims += 1;
+          return undefined;
+        case "list_agents":
+          return [agent(AGENT_1, PROJECT_1)];
+        case "project_session_fingerprints":
+          return [] satisfies AgentSessionFingerprint[];
+        case "load_project_conversation":
+          return { items: [], agents: [] } satisfies ProjectConversation;
+        default:
+          return undefined;
+      }
+    });
+    await ws.activateProject(PROJECT_1);
+    await state.registerAgent(agent(AGENT_1, PROJECT_1));
+    ws.installForkHistoryRefresh();
+    expect(reclaims).toBe(1);
+
+    fireTo(`agent:${AGENT_1}`, {
+      type: "turn_end",
+      turn_id: "turn-1",
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:05Z",
+    });
+    await settle();
+    expect(reclaims).toBe(1);
+  });
+});
+
+describe("attachment reclaim boundary", () => {
+  it("finishes reclaiming before any of the project's agents are registered", async () => {
+    // Reclaiming is only safe while no agent can receive a send, because a queued
+    // send's attachment is referenced by neither the journal nor the compose
+    // draft. Registering the agents is what makes them targetable, so the reclaim
+    // must *complete* first — holding its promise unresolved is what proves the
+    // ordering is enforced by an await rather than merely by statement order.
+    const ws = await loadWorkspaceState();
+    const seen: string[] = [];
+    let releaseReclaim: () => void = () => {};
+    const reclaimHeld = new Promise<void>((resolve) => (releaseReclaim = resolve));
+
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      seen.push(cmd);
+      switch (cmd) {
+        case "open_project":
+          return { id: PROJECT_1, name: "p", created_at: "2026-05-16T00:00:00Z" };
+        case "reclaim_project_attachments":
+          await reclaimHeld;
+          return undefined;
+        case "list_agents":
+          return [agent(AGENT_1, PROJECT_1)];
+        case "load_project_conversation":
+          return { items: [], agents: [] } satisfies ProjectConversation;
+        default:
+          return undefined;
+      }
+    });
+
+    const activation = ws.activateProject(PROJECT_1);
+    for (let i = 0; i < 20; i += 1) {
+      await tick();
+      await new Promise((r) => setTimeout(r, 1));
+    }
+
+    expect(seen).toContain("reclaim_project_attachments");
+    expect(seen).not.toContain("list_agents");
+
+    releaseReclaim();
+    await activation;
+    expect(seen.indexOf("reclaim_project_attachments")).toBeLessThan(seen.indexOf("list_agents"));
+  });
+
+  it("declares the unsent draft's attachments so opening never deletes them", async () => {
+    // The whole reason the parameter exists: the draft lives in this process's
+    // localStorage, so an undeclared path is reclaimed and the restored chip
+    // dangles at a deleted file.
+    const compose = await import("./composeStore");
+    compose._testing.reset();
+    compose.setAttachments(PROJECT_1, [
+      { path: "/staged/a.png", label: "a.png", original_name: "a.png", kind: "image" },
+    ]);
+
+    const ws = await loadWorkspaceState();
+    let declared: unknown;
+    invokeMock.mockImplementation(async (cmd: string, args?): Promise<unknown> => {
+      switch (cmd) {
+        case "open_project":
+          return { id: PROJECT_1, name: "p", created_at: "2026-05-16T00:00:00Z" };
+        case "reclaim_project_attachments":
+          declared = args?.draftAttachments;
+          return undefined;
+        case "list_agents":
+          return [];
+        case "load_project_conversation":
+          return { items: [], agents: [] } satisfies ProjectConversation;
+        default:
+          return undefined;
+      }
+    });
+
+    await ws.activateProject(PROJECT_1);
+    expect(declared).toEqual(["/staged/a.png"]);
+  });
+
+  it("never reclaims again on a refresh or a retry", async () => {
+    // Both run long after agents are registered and can hold queued work, so
+    // neither may reclaim. The backend refuses a second pass per process too;
+    // this pins the frontend half.
+    const ws = await loadWorkspaceState();
+    let reclaims = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      switch (cmd) {
+        case "open_project":
+          return { id: PROJECT_1, name: "p", created_at: "2026-05-16T00:00:00Z" };
+        case "reclaim_project_attachments":
+          reclaims += 1;
+          return undefined;
+        case "list_agents":
+          return [];
+        case "project_session_fingerprints":
+          return [] satisfies AgentSessionFingerprint[];
+        case "load_project_conversation":
+          return { items: [], agents: [] } satisfies ProjectConversation;
+        default:
+          return undefined;
+      }
+    });
+
+    await ws.activateProject(PROJECT_1);
+    expect(reclaims).toBe(1);
+
+    await ws.retryProjectHydration(PROJECT_1);
+    await ws.activateProject(PROJECT_1);
+    expect(reclaims).toBe(1);
+  });
 });

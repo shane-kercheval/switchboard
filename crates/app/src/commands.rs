@@ -6420,30 +6420,88 @@ fn gc_unreferenced_attachments(attachments_dir: &Path, referenced: &HashSet<Path
     }
 }
 
-/// `draft_attachments` are staged files the caller's *unsent* compose draft still
-/// points at. A draft lives in the frontend's machine-local storage, which the
-/// backend cannot see, so the caller must declare its live references or the GC
-/// below would reclaim them — leaving the restored draft's chips dangling at
-/// deleted paths. Pass an empty slice when there is no draft.
+/// Reclaim a project's orphaned staged attachments: delete every file in its
+/// attachments directory that neither a journal `Send` record nor
+/// `draft_attachments` refers to. Orphans come from a staged-but-unsent drop the
+/// user abandoned, or from a conversation that was removed.
 ///
-/// `reclaim` asks for the staged-attachment GC. **Only a project's first load of
-/// the app session may pass `true`.** The GC's reference set is the journal plus
-/// the caller's draft, and a *queued* send is in neither: the journal records a
-/// send at turn-start, and the composer clears its chips the moment the user
-/// sends. So a reclaiming load that runs while any agent holds a backlog deletes
-/// the staged copy of an attachment that message is still going to reference,
-/// and the agent is later handed a path to nothing. Before the first load there
-/// is no backlog to destroy, which is what makes that one boundary safe; every
-/// later read — a staleness refresh, a fork-history read, a retry — must pass
-/// `false` and let orphans wait. Reclaiming is opportunistic by design (a pure
-/// function of on-disk state, re-run on the next load), so deferring costs only
-/// disk.
+/// `draft_attachments` are staged files the caller's *unsent* compose draft still
+/// points at. A draft lives in the frontend's machine-local storage, which this
+/// process cannot see, so the caller **must** declare its live references or a
+/// restored draft's chips are left dangling at deleted paths.
+///
+/// # When this is safe, and why it is a separate operation
+///
+/// The reference set above is blind to a **queued** send: the journal records a
+/// send at turn-start, and the composer clears its chips the instant the user
+/// sends. So between those two moments an attachment belongs to a real message
+/// and is referenced by nothing on disk — reclaiming then deletes the staged copy
+/// the message is about to use, and the agent is handed a path to nothing.
+///
+/// The only moment with no such window is before any of the project's agents can
+/// receive a send. Two things establish it together, and **both** are load-bearing:
+///
+/// 1. The frontend calls this after `open_project` and **before** it lists and
+///    registers the project's agents, so no agent exists for a send to target.
+///    That ordering lives in `ensureProjectLoaded`; this process cannot check it.
+/// 2. This function refuses to run twice for the same project in one **process**
+///    lifetime. A webview reload restarts the frontend — and therefore step 1 —
+///    while the dispatcher keeps its backlog, so the reloaded frontend's call
+///    would otherwise reclaim attachments belonging to work still queued here.
+///
+/// Both rest on a further assumption worth tripping over rather than
+/// rediscovering: backend-originated sends (workflow steps) carry no staged
+/// attachments, so nothing can enqueue an attachment-bearing send without the
+/// frontend. If that changes, or if a send path stops requiring an opened
+/// project, this boundary has to be rebuilt.
+///
+/// Reclaiming is opportunistic — a pure function of on-disk state, re-run on the
+/// next process start — so a skipped pass costs only disk.
+pub async fn reclaim_project_attachments_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    draft_attachments: &[PathBuf],
+) -> Result<(), AppError> {
+    // Claim the one pass for this project up front: a second caller (a reloaded
+    // frontend) must find it taken even if this one goes on to fail, because by
+    // then the dispatcher may hold queued work the reference set cannot see.
+    if !lock(&state.attachments_reclaimed).insert(project_id) {
+        return Ok(());
+    }
+    let project = match lock(&state.projects).get(&project_id).cloned() {
+        Some(loaded) => loaded,
+        None => open_project_from_store(state, project_id)?,
+    };
+    // Reading the journal and walking the attachments directory are blocking I/O,
+    // and this runs on the project-open path — same reason `load_agent_transcript`
+    // is spawned rather than awaited inline.
+    let drafts: Vec<PathBuf> = draft_attachments.to_vec();
+    let project_attachments_label = project.attachments_dir().to_string_lossy().into_owned();
+    tokio::task::spawn_blocking(move || {
+        let journal = switchboard_core::journal::read_records(&project.journal_path())?;
+        let mut referenced = collect_referenced_attachment_paths(&journal);
+        referenced.extend(drafts);
+        gc_unreferenced_attachments(&project.attachments_dir(), &referenced);
+        Ok::<(), AppError>(())
+    })
+    .await
+    .map_err(|join_err| AppError::AttachmentStage {
+        source_path: project_attachments_label,
+        source: std::io::Error::other(join_err.to_string()),
+    })?
+}
+
+/// `draft_attachments` are staged files the caller's *unsent* compose draft still
+/// **Read-only.** This used to reclaim orphaned staged attachments, taking the
+/// caller's draft references so they were spared; both moved to
+/// [`reclaim_project_attachments_impl`], the only operation that can recognize
+/// the one moment reclaiming is safe. A loader that reclaims deletes a queued
+/// send's attachment every time the conversation is re-read, so this stays
+/// read-only.
 pub async fn load_project_conversation_impl(
     state: &AppState,
     project_id: ProjectId,
     home_dir: &Path,
-    draft_attachments: &[PathBuf],
-    reclaim: bool,
 ) -> Result<ProjectConversation, AppError> {
     // Resolve the project and collect each agent's *owned* inputs while holding
     // the lock, then release it before doing any read+parse. `load_agent_transcript`
@@ -6454,18 +6512,6 @@ pub async fn load_project_conversation_impl(
         None => open_project_from_store(state, project_id)?,
     };
     let journal = switchboard_core::journal::read_records(&project.journal_path())?;
-
-    // Reclaim disk on first load: delete any staged file referenced by neither a
-    // `Send` record nor the caller's live draft — orphans from a staged-but-unsent
-    // drop the user has since abandoned, or files whose conversation was removed.
-    // Pure function of (on-disk state, declared draft refs), so it's crash-safe
-    // (just re-runs next load) and needs no completion signal. See `reclaim` on
-    // this function for why a later load must never do this.
-    if reclaim {
-        let mut referenced = collect_referenced_attachment_paths(&journal);
-        referenced.extend(draft_attachments.iter().cloned());
-        gc_unreferenced_attachments(&project.attachments_dir(), &referenced);
-    }
 
     let agents = project.list_agents()?;
 
@@ -21208,7 +21254,7 @@ mod tests {
         .unwrap();
 
         let home = tmp.path().to_path_buf();
-        let conv = load_project_conversation_impl(&state, project_id, &home, &[], true)
+        let conv = load_project_conversation_impl(&state, project_id, &home)
             .await
             .unwrap();
 
@@ -21237,7 +21283,7 @@ mod tests {
         let (_agent, project_id) = project_with_agent(&state, &tmp);
 
         let home = tmp.path().to_path_buf();
-        let conv = load_project_conversation_impl(&state, project_id, &home, &[], true)
+        let conv = load_project_conversation_impl(&state, project_id, &home)
             .await
             .unwrap();
 
@@ -21266,20 +21312,13 @@ mod tests {
             .await
             .unwrap();
 
-        let home = tmp.path().to_path_buf();
-        load_project_conversation_impl(
-            &state,
-            project_id,
-            &home,
-            &[PathBuf::from(&drafted.path)],
-            true,
-        )
-        .await
-        .unwrap();
+        reclaim_project_attachments_impl(&state, project_id, &[PathBuf::from(&drafted.path)])
+            .await
+            .unwrap();
 
         assert!(
             Path::new(&drafted.path).exists(),
-            "a staged file the caller declared as a live draft reference survives the load GC"
+            "a staged file the caller declared as a live draft reference survives the reclaim"
         );
         assert!(
             !Path::new(&abandoned.path).exists(),
@@ -21288,14 +21327,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_non_reclaiming_load_spares_a_queued_sends_staged_attachment() {
-        // The attachment a *queued* send references is invisible to the GC's
-        // reference set: the journal records a send only at turn-start, and the
-        // composer clears its chips the moment the user sends. So any read that
-        // reclaims while an agent holds a backlog deletes the staged copy that
-        // message will reference when it finally runs, and the agent is handed a
-        // path to nothing. Only a project's first load — before any backlog can
-        // exist — may reclaim.
+    async fn loading_a_conversation_never_reclaims_attachments() {
+        // The loader runs on every refresh, fork-history read, and retry. The
+        // GC's reference set cannot see a *queued* send — the journal records a
+        // send at turn-start and the composer clears its chips at send — so a
+        // loader that reclaimed would delete the staged copy a queued message is
+        // about to use, every time the conversation was re-read.
         let (tmp, state, _) = fresh_state_with_mock();
         let (_agent, project_id) = project_with_agent(&state, &tmp);
 
@@ -21306,22 +21343,53 @@ mod tests {
             .unwrap();
 
         let home = tmp.path().to_path_buf();
-        load_project_conversation_impl(&state, project_id, &home, &[], false)
+        load_project_conversation_impl(&state, project_id, &home)
+            .await
+            .unwrap();
+
+        assert!(
+            Path::new(&queued.path).exists(),
+            "reading a conversation must never delete a staged attachment"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaiming_runs_once_per_process_so_a_reloaded_frontend_cannot_repeat_it() {
+        // The frontend calls this before it registers a project's agents, so the
+        // first pass runs when no send can be queued. A webview reload restarts
+        // the frontend — and that ordering — while this process keeps its
+        // dispatcher backlog, so the reloaded frontend's call arrives at a moment
+        // when queued work *can* exist and must reclaim nothing.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
+
+        let first = tmp.path().join("orphan.png");
+        std::fs::write(&first, b"O").unwrap();
+        let orphan =
+            futures::executor::block_on(stage_attachment_impl(&state, project_id, &first)).unwrap();
+
+        reclaim_project_attachments_impl(&state, project_id, &[])
+            .await
+            .unwrap();
+        assert!(
+            !Path::new(&orphan.path).exists(),
+            "the one pass per process still reclaims genuine orphans"
+        );
+
+        // Stand in for the attachment of a send queued after that first pass.
+        let second = tmp.path().join("queued-after-reload.png");
+        std::fs::write(&second, b"Q").unwrap();
+        let queued = stage_attachment_impl(&state, project_id, &second)
+            .await
+            .unwrap();
+
+        reclaim_project_attachments_impl(&state, project_id, &[])
             .await
             .unwrap();
         assert!(
             Path::new(&queued.path).exists(),
-            "a refresh, retry, or fork-history read must not reclaim — it cannot see a backlog"
-        );
-
-        // The same call with reclaim on is what proves the flag is the thing
-        // doing the work, rather than the file surviving for some other reason.
-        load_project_conversation_impl(&state, project_id, &home, &[], true)
-            .await
-            .unwrap();
-        assert!(
-            !Path::new(&queued.path).exists(),
-            "a first load still reclaims genuine orphans"
+            "a second reclaim in one process lifetime must be a no-op — the backlog it \
+             cannot see may already exist"
         );
     }
 

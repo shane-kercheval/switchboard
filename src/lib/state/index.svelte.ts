@@ -535,7 +535,6 @@ export async function dispatchCompaction(
   agentId: AgentId,
   sendId: SendId,
   // Both generated, not reactive state.
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity
   pendingTurnId: TurnId = crypto.randomUUID(),
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   queuedAt: string = new Date().toISOString(),

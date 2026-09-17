@@ -205,11 +205,6 @@ const sessionFingerprintBaseline = new Map<ProjectId, AgentSessionFingerprint[]>
 /// a redundant concurrent re-read. Defense-in-depth — the sole caller is
 /// `seq`-guarded and the keyed merge already makes a concurrent re-read
 /// dup-safe — but it keeps the function safe for any future caller.
-/// Projects whose staged attachments have already been reclaimed once in this
-/// app session. Non-reactive bookkeeping, like the guards around it.
-// eslint-disable-next-line svelte/prefer-svelte-reactivity
-const attachmentsReclaimed = new Set<ProjectId>();
-
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const refreshInFlight = new Set<ProjectId>();
 
@@ -975,6 +970,13 @@ function ensureProjectLoaded(projectId: ProjectId): Promise<void> {
   if (existing !== undefined) return existing;
   const load = (async () => {
     await api.openProject(projectId);
+    // **Before the roster, and awaited.** Reclaiming orphaned staged attachments
+    // is only safe while no agent of this project can hold queued work, because a
+    // queued send's attachment is referenced by neither the journal (written at
+    // turn-start) nor the compose draft (cleared at send). Registering the agents
+    // is what makes them targetable, so this is the last moment that holds — and
+    // it has to be awaited, not fired off, or the registration below races it.
+    await api.reclaimProjectAttachments(projectId, draftAttachmentPaths(projectId));
     const agents = await api.listAgents(projectId);
     agentsByProject[projectId] = agents;
     await Promise.all(agents.map((a) => registerAgent(a)));
@@ -1047,26 +1049,7 @@ export async function hydrateProject(
     });
   }
   try {
-    // Loading garbage-collects every staged attachment the journal doesn't
-    // reference. An unsent draft's chips live in localStorage, which the backend
-    // can't see, so declare their paths or the load deletes the files behind
-    // chips the composer is still showing.
-    //
-    // **Only the first load of this project reclaims.** The journal records a
-    // send at turn-start and the composer clears its chips at send, so a *queued*
-    // send's attachment is referenced by neither — a reclaiming read that runs
-    // while any agent holds a backlog deletes the staged copy that message will
-    // reference when it finally runs. Before the first load there is no backlog,
-    // which is the only reason that one read is safe. Tracked here rather than
-    // derived from `isRefresh` because a retry is also a non-refresh load and can
-    // happen at any point in the project's life.
-    const reclaim = !attachmentsReclaimed.has(projectId);
-    attachmentsReclaimed.add(projectId);
-    const convo = await api.loadProjectConversation(
-      projectId,
-      draftAttachmentPaths(projectId),
-      reclaim,
-    );
+    const convo = await api.loadProjectConversation(projectId);
 
     // Sends represented live in the slices this session own their rendering
     // there; drop the journal's copy of them from the overlay to avoid a doubled
@@ -1259,8 +1242,15 @@ export async function retryProjectHydration(projectId: ProjectId): Promise<void>
   // (which is last-write-wins and would be fine). `hydrateProject` sets status
   // `"loading"` synchronously before its await, so a racing retry sees it here.
   if (conversations[projectId]?.status === "loading") return;
-  hydrationStarted.delete(projectId);
-  await hydrateProject(projectId);
+  // Chained like the two background readers, so "every read after the project's
+  // first is queued behind the others" holds by construction rather than by each
+  // caller remembering. The guard above catches a read that is already *running*;
+  // it cannot see one merely queued, and two overlapping reads race to replace
+  // the whole overlay.
+  await chainProjectLoad(projectId, async () => {
+    hydrationStarted.delete(projectId);
+    return await hydrateProject(projectId);
+  });
 }
 
 /// Append a freshly created/attached agent to its owning project's roster so
@@ -1530,7 +1520,6 @@ export const _testing = {
     forkHistoryLoaded.clear();
     forkHistoryPending.clear();
     refreshRequestedAgain.clear();
-    attachmentsReclaimed.clear();
     projectLoadChain.clear();
     setTurnTerminalHook(undefined);
     setDispatchFailedHook(undefined);

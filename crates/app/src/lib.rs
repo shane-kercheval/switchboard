@@ -331,13 +331,13 @@ use crate::commands::{
     migrate_message_pin_impl, open_branch_comparison_file_difftool_impl,
     open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
     parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
-    read_tracked_repo_from_inputs, recheck_harness_installs_impl, remove_agent_impl,
-    remove_mcp_provider_impl, remove_message_pins_impl, remove_queued_message_impl,
-    remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
-    reorder_agents_impl, resolve_saved_prompt_fresh_impl, resolve_saved_prompt_impl,
-    resume_agent_in_terminal_impl, reveal_in_finder_argv, search_project_files_in_root,
-    search_project_files_root_impl, send_message_impl, set_active_project_impl,
-    set_agent_selection_impl, set_message_pin_impl, set_preferences_impl,
+    read_tracked_repo_from_inputs, recheck_harness_installs_impl, reclaim_project_attachments_impl,
+    remove_agent_impl, remove_mcp_provider_impl, remove_message_pins_impl,
+    remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl, rename_project_impl,
+    render_prompt_impl, reorder_agents_impl, resolve_saved_prompt_fresh_impl,
+    resolve_saved_prompt_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
+    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
+    set_active_project_impl, set_agent_selection_impl, set_message_pin_impl, set_preferences_impl,
     set_project_archived_impl, set_project_directory_impl, set_visible_project_impl,
     sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
     spawn_prompt_resolution_change_notifications, stage_attachment_impl, sync_prompts_and_notify,
@@ -1718,25 +1718,37 @@ async fn open_branch_comparison_file_difftool(
     .map_err(|e| e.to_string())
 }
 
+/// Reclaim a project's orphaned staged attachments. **Call once per project
+/// open, after `open_project` and before `list_agents`** — see
+/// `reclaim_project_attachments_impl` for why that ordering is what makes
+/// deleting safe, and why a later call (or one from a reloaded webview) must not
+/// and does not reclaim again.
+#[tauri::command]
+async fn reclaim_project_attachments(
+    state: State<'_, AppState>,
+    project_id: String,
+    draft_attachments: Vec<String>,
+) -> Result<(), String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    let drafts: Vec<std::path::PathBuf> = draft_attachments
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    reclaim_project_attachments_impl(state.inner(), id, &drafts)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn load_project_conversation(
     state: State<'_, AppState>,
     project_id: String,
-    draft_attachments: Vec<String>,
-    // The frontend owns the "first load of this app session" fact, so it decides
-    // — see `reclaim` on `load_project_conversation_impl` for why any later read
-    // reclaiming would delete a queued send's staged attachment.
-    reclaim: bool,
 ) -> Result<ProjectConversation, String> {
     let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    let drafts: Vec<std::path::PathBuf> = draft_attachments
-        .into_iter()
-        .map(std::path::PathBuf::from)
-        .collect();
-    load_project_conversation_impl(state.inner(), id, &home, &drafts, reclaim)
+    load_project_conversation_impl(state.inner(), id, &home)
         .await
         .map_err(|e| e.to_string())
 }
@@ -2393,6 +2405,7 @@ pub fn run() {
             reveal_in_finder,
             load_transcript,
             load_project_conversation,
+            reclaim_project_attachments,
             project_session_fingerprints,
         ])
         .build(tauri::generate_context!())

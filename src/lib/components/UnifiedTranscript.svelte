@@ -2013,7 +2013,10 @@
      response. It keeps the agent header so attribution matches every other row
      in a multi-agent transcript, and renders ungrouped — there is no prompt. -->
 {#snippet compactionTurnRow(turn: AgentTurn)}
-  <div class="space-y-1.5" data-testid="turn" data-role="agent">
+  <!-- `group` is what `messageMeta` reveals its details on — without it the
+       model and timestamp render but can never be shown, by hover or by
+       keyboard focus. -->
+  <div class="group space-y-1.5" data-testid="turn" data-role="agent">
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
       {#if agentById[turn.agent_id]?.harness}

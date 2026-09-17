@@ -231,6 +231,19 @@ pub struct AppState {
     /// `agents_by_id` entries — a stale `agent_id` from a deleted project's
     /// attach must not leak forward.
     pub needs_session_meta: Arc<Mutex<HashSet<AgentId>>>,
+    /// Projects whose staged attachments this **process** has already reclaimed.
+    ///
+    /// Reclaiming is only safe before any of a project's agents can hold queued
+    /// work, because a queued send's attachment is referenced by neither the
+    /// journal (which records a send at turn-start) nor the compose draft
+    /// (cleared at send). The frontend enforces that by calling
+    /// `reclaim_project_attachments` before it lists the project's agents — but
+    /// a webview reload restarts the frontend while this process keeps its
+    /// dispatcher backlog, so a reloaded frontend would run that call again
+    /// against a project that now *does* have queued work. This set is what makes
+    /// the second call a no-op: eligibility belongs to the process's lifetime,
+    /// which is what actually bounds the backlog, not to the page's.
+    pub attachments_reclaimed: Mutex<HashSet<ProjectId>>,
 
     /// Per-project inter-process lock handles. One entry per loaded
     /// project, holding an advisory exclusive lock (std `File::try_lock`,
@@ -495,6 +508,7 @@ impl AppState {
             antigravity_adapter,
             emitter,
             needs_session_meta: Arc::new(Mutex::new(HashSet::new())),
+            attachments_reclaimed: Mutex::new(HashSet::new()),
             project_locks: Mutex::new(HashMap::new()),
             agents_by_id: Arc::new(Mutex::new(HashMap::new())),
             workspace: Mutex::new(Workspace::default()),

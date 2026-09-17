@@ -61,6 +61,24 @@ export type Turn =
       /// hydrated or journal-sourced row — history has by definition run, and a
       /// prompt whose response could not be matched must keep its own time
       /// rather than be mistaken for queued work.
+      ///
+      /// **Every path by which a send leaves the queue must clear this** — by
+      /// settling the row (`reducers.ts::settleUserRows`, reached from
+      /// `turn_start`, `message_cancelled`, and the pre-start failure helper
+      /// behind `message_failed` and `failSendStart`) or by dropping the row.
+      /// A path that forgets leaves the prompt pinned to the tail of its
+      /// agent's history until the project is reopened. The backend's
+      /// `remove_queued_message` (pull a queued send back) has no frontend
+      /// caller today; wiring one makes it such a path.
+      ///
+      /// Known display trade: a recipient that settles **without** a
+      /// `turn_start` — a backend admission refusal, a journal-write failure,
+      /// or the `send_message` IPC itself rejecting — is stamped at the moment
+      /// the frontend learned of it, and a reload may place that send
+      /// differently (an unjournaled failure has no record to reconstruct; a
+      /// journaled one is stamped at the attempt, not the receipt). It
+      /// self-corrects on reopen; carrying a separate "resolved" stamp to
+      /// close it is more state than the case deserves.
       pending?: true;
     }
   | {

@@ -840,9 +840,12 @@ describe("buildUnifiedRows: pending sends", () => {
       [recap],
     );
     expect(rows.map((r) => r.kind)).toEqual(["system_marker", "user", "agent"]);
-    const user = rows.find((r) => r.kind === "user");
-    expect(user).toMatchObject({ at: at("10"), agent_ids: [AGENT_A, AGENT_B] });
-    expect(user?.kind === "user" ? user.pending : "not a user row").toBeUndefined();
+    expect(rows.find((r) => r.kind === "user")).toMatchObject({
+      at: at("10"),
+      queued_at: at("00"),
+      agent_ids: [AGENT_A, AGENT_B],
+      pending_agent_ids: [AGENT_B],
+    });
   });
 
   it("marks a fan-out pending only while no recipient has started", () => {
@@ -853,6 +856,99 @@ describe("buildUnifiedRows: pending sends", () => {
       ],
       [],
     );
-    expect(rows[0]).toMatchObject({ kind: "user", pending: true, at: at("00") });
+    expect(rows[0]).toMatchObject({
+      kind: "user",
+      at: at("00"),
+      queued_at: at("00"),
+      pending_agent_ids: [AGENT_A, AGENT_B],
+    });
+  });
+
+  it("lifts a pending fan-out when one recipient runs work queued ahead of it", () => {
+    // B is mid-turn (T). X was queued on A at :00, fan-out F to A and B at :01,
+    // S to B at :02. X starts on A at :31: F lifts behind X, and S — queued
+    // behind F on B — must lift behind F, not stay at :02 above it. Same for a
+    // compaction queued on B behind F.
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-t", AGENT_B, at("00"), "t", "send-t"),
+        agentTurn("a-t", AGENT_B, at("00"), "send-t"),
+        userTurn("u-x", AGENT_A, at("31"), "x", "send-x"),
+        agentTurn("a-x", AGENT_A, at("31"), "send-x"),
+        userTurn("u-fa", AGENT_A, at("01"), "f", "send-f", true),
+        userTurn("u-fb", AGENT_B, at("01"), "f", "send-f", true),
+        userTurn("u-s", AGENT_B, at("02"), "s", "send-s", true),
+      ],
+      [],
+      undefined,
+      [{ agent_id: AGENT_B, send_id: "compact", queued_at: at("03") }],
+    );
+    expect(rows.map(label)).toEqual([
+      "u:t",
+      "a:send-t",
+      "u:x",
+      "a:send-x",
+      "u:f",
+      "u:s",
+      "queued_compaction",
+    ]);
+  });
+
+  it("keeps a pending row queued ahead of a lifted fan-out above it", () => {
+    // P1 was queued on B before F, P2 after. F lifts behind X on A; P1 stays
+    // where B's queue has it (before F), P2 follows F.
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-t", AGENT_B, at("00"), "t", "send-t"),
+        agentTurn("a-t", AGENT_B, at("00"), "send-t"),
+        userTurn("u-x", AGENT_A, at("31"), "x", "send-x"),
+        agentTurn("a-x", AGENT_A, at("31"), "send-x"),
+        userTurn("u-p1", AGENT_B, at("00.500"), "p1", "send-p1", true),
+        userTurn("u-fa", AGENT_A, at("01"), "f", "send-f", true),
+        userTurn("u-fb", AGENT_B, at("01"), "f", "send-f", true),
+        userTurn("u-p2", AGENT_B, at("02"), "p2", "send-p2", true),
+      ],
+      [],
+    );
+    expect(rows.map(label)).toEqual(["u:t", "a:send-t", "u:p1", "u:x", "a:send-x", "u:f", "u:p2"]);
+  });
+
+  it("a fan-out started on one recipient holds its queue position on the other", () => {
+    // B's queue is E, F, G. A (idle) starts F at once at :31; B is still on T.
+    // F's row anchors at A's start. E, queued on B ahead of F, must stay above
+    // it; G, queued behind F, must follow it. Counting F as started work on B
+    // would drag E below F — a send B runs after E.
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-t", AGENT_B, at("00"), "t", "send-t"),
+        agentTurn("a-t", AGENT_B, at("00"), "send-t"),
+        userTurn("u-e", AGENT_B, at("05"), "e", "send-e", true),
+        userTurn("u-fa", AGENT_A, at("31"), "f", "send-f"),
+        userTurn("u-fb", AGENT_B, at("06"), "f", "send-f", true),
+        agentTurn("a-fa", AGENT_A, at("31"), "send-f"),
+        userTurn("u-g", AGENT_B, at("07"), "g", "send-g", true),
+      ],
+      [],
+    );
+    expect(rows.map(label)).toEqual(["u:t", "a:send-t", "u:e", "u:f", "a:send-f", "u:g"]);
+  });
+
+  it("a fan-out started on one recipient still lifts later work on the other past B's own runs", () => {
+    // Same shape, but B also finished an exchange at :40 after F started on A.
+    // G is behind F on B *and* behind B's :40 run, so it lands after both;
+    // F's row itself is not moved by B's later run — it sits where A started
+    // it, as a reload would show.
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-fa", AGENT_A, at("31"), "f", "send-f"),
+        userTurn("u-fb", AGENT_B, at("06"), "f", "send-f", true),
+        agentTurn("a-fa", AGENT_A, at("31"), "send-f"),
+        userTurn("u-b", AGENT_B, at("40"), "b", "send-b"),
+        agentTurn("a-b", AGENT_B, at("40"), "send-b"),
+        userTurn("u-g", AGENT_B, at("07"), "g", "send-g", true),
+      ],
+      [],
+    );
+    expect(rows.map(label)).toEqual(["u:f", "a:send-f", "u:b", "a:send-b", "u:g"]);
   });
 });

@@ -116,6 +116,10 @@ export type UnifiedRow =
       // queued columns and cancel-send affordance immediately; a historical
       // fan-out only groups once its responses can be correlated.
       live: boolean;
+      // Set when no recipient has started this send yet (every live user turn
+      // in the group still carries its `pending` flag). Sorted as pending work:
+      // after everything its agents have already run, in submit order.
+      pending?: true;
     }
   | { kind: "agent"; at: string; rank: 1; key: string; send_id?: string; turn: AgentTurn }
   | {
@@ -195,9 +199,9 @@ const KIND_RANK = {
   agent: 1,
   system_marker: 2,
   outcome: 3,
-  // Last at an identical timestamp: a queued compaction has not run, so anything
-  // that did belongs above it.
-  queued_compaction: 4,
+  // Work that has not run yet — a queued compaction, or a send no recipient has
+  // started. Last at an identical anchor: anything that did run belongs above it.
+  pending: 4,
 } as const;
 
 /// Merge the active project's per-agent turns (live + hydrated agent content
@@ -235,7 +239,7 @@ export function buildUnifiedRows(
     rows.push({
       kind: "queued_compaction",
       at: queued.queued_at,
-      rank: KIND_RANK.queued_compaction,
+      rank: KIND_RANK.pending,
       key: `qc:${queued.send_id}`,
       agent_id: queued.agent_id,
       cancel_send_id: queued.send_id,
@@ -256,7 +260,14 @@ export function buildUnifiedRows(
     agent_ids: AgentId[];
     text: string;
     attachments: Attachment[];
+    // Earliest submit stamp across recipients — the anchor only while no
+    // recipient has started.
     at: string;
+    // Earliest turn-start across the recipients that HAVE started. A started
+    // recipient's stamp is the instant the journal records the send at, so the
+    // group anchors there, live and after reload alike; a recipient still
+    // waiting must not drag the exchange back to its submit time.
+    started_at?: string;
   };
   const groups = new Map<string, UserGroup>();
   const groupOrder: string[] = [];
@@ -264,6 +275,7 @@ export function buildUnifiedRows(
     if (turn.role === "user") {
       const groupKey = turn.send_id ?? turn.turn_id;
       const g = groups.get(groupKey);
+      const started = turn.pending === undefined ? turn.started_at : undefined;
       if (g === undefined) {
         groups.set(groupKey, {
           send_id: turn.send_id,
@@ -273,11 +285,18 @@ export function buildUnifiedRows(
           // list), so the first turn's attachments stand for the group.
           attachments: turn.attachments ?? [],
           at: turn.started_at,
+          started_at: started,
         });
         groupOrder.push(groupKey);
       } else {
         if (!g.agent_ids.includes(turn.agent_id)) g.agent_ids.push(turn.agent_id);
         if (isIsoTimestampBefore(turn.started_at, g.at)) g.at = turn.started_at;
+        if (
+          started !== undefined &&
+          (g.started_at === undefined || isIsoTimestampBefore(started, g.started_at))
+        ) {
+          g.started_at = started;
+        }
       }
     } else {
       rows.push({
@@ -295,7 +314,7 @@ export function buildUnifiedRows(
     if (g === undefined) continue;
     rows.push({
       kind: "user",
-      at: g.at,
+      at: g.started_at ?? g.at,
       rank: KIND_RANK.user,
       key: `u:${groupKey}`,
       send_id: g.send_id,
@@ -303,6 +322,7 @@ export function buildUnifiedRows(
       text: g.text,
       attachments: g.attachments,
       live: true,
+      ...(g.started_at === undefined ? { pending: true as const } : {}),
     });
   }
 
@@ -385,16 +405,27 @@ export function buildUnifiedRows(
 
   // Order by **send**, not raw timestamp: each row is anchored to the time of
   // its send's user message (`sendAnchor`), so a send's response renders
-  // directly under its prompt even when it ran much later. This matters for a
-  // *queued* single-recipient send — live, all three user messages are stamped
-  // near submit time (t1<t2<t3) while a queued send's response only starts after
-  // the earlier turn finishes, so its own timestamp is *later than the next
-  // prompt*. A raw-timestamp sort would float that response below the later
-  // prompt (detached from its own); anchoring keeps it adjacent. Rows whose
-  // send has no user message (pre-journal history with no recoverable send_id)
-  // fall back to their own `at`. Within one anchor: kind rank (user < agent <
-  // system_marker < outcome), then own `at`; `Array.prototype.sort` is stable so
-  // ties hold insertion order.
+  // directly under its prompt even when it ran much later. A started send's
+  // prompt is stamped at turn-start (the reducer re-stamps it when the turn
+  // begins, matching the journal), so the exchange sits at the moment it ran,
+  // after anything that happened while it waited. Rows whose send has no user
+  // message (pre-journal history with no recoverable send_id) fall back to their
+  // own `at`.
+  //
+  // **Pending work — a queued compaction, or a send no recipient has started —
+  // renders after everything its agent has already run, in submit order.** Its
+  // own stamp says only when it was queued; nothing says when it will run, and
+  // it cannot run before the work ahead of it. So its anchor is lifted to the
+  // latest anchor among the agent's started rows (never lowered — a queue with
+  // no started work on that agent keeps chronological order against other
+  // agents), and it ranks last at that anchor. Without the lift, a send that
+  // just started would move to its turn-start stamp and land *below* a sibling
+  // still waiting at its earlier submit stamp — the queue would render inverted
+  // until the sibling started too.
+  //
+  // Within one anchor: kind rank (user < agent < system_marker < outcome <
+  // pending), then own `at`; `Array.prototype.sort` is stable so ties hold
+  // insertion order.
   const sendAnchor = new Map<string, string>();
   for (const row of visibleRows) {
     if (row.kind === "user" && row.send_id !== undefined) {
@@ -406,10 +437,44 @@ export function buildUnifiedRows(
   }
   const anchorOf = (row: UnifiedRow): string =>
     (row.send_id !== undefined ? sendAnchor.get(row.send_id) : undefined) ?? row.at;
+  const isPending = (row: UnifiedRow): boolean =>
+    row.kind === "queued_compaction" || (row.kind === "user" && row.pending === true);
+  const agentsOf = (row: UnifiedRow): readonly AgentId[] => {
+    switch (row.kind) {
+      case "user":
+        return row.agent_ids;
+      case "agent":
+        return [row.turn.agent_id];
+      default:
+        return [row.agent_id];
+    }
+  };
+  const latestRun = new Map<AgentId, string>();
+  for (const row of visibleRows) {
+    if (isPending(row)) continue;
+    const anchor = anchorOf(row);
+    for (const id of agentsOf(row)) {
+      const prior = latestRun.get(id);
+      if (prior === undefined || isIsoTimestampBefore(prior, anchor)) latestRun.set(id, anchor);
+    }
+  }
+  const effectiveAnchor = new Map<UnifiedRow, string>();
+  for (const row of visibleRows) {
+    let anchor = anchorOf(row);
+    if (isPending(row)) {
+      for (const id of agentsOf(row)) {
+        const run = latestRun.get(id);
+        if (run !== undefined && isIsoTimestampBefore(anchor, run)) anchor = run;
+      }
+    }
+    effectiveAnchor.set(row, anchor);
+  }
+  const rankOf = (row: UnifiedRow): number => (isPending(row) ? KIND_RANK.pending : row.rank);
   visibleRows.sort((a, b) => {
-    const t = compareIsoTimestampsAscending(anchorOf(a), anchorOf(b));
+    const t = compareIsoTimestampsAscending(effectiveAnchor.get(a)!, effectiveAnchor.get(b)!);
     if (t !== 0) return t;
-    if (a.rank !== b.rank) return a.rank - b.rank;
+    const r = rankOf(a) - rankOf(b);
+    if (r !== 0) return r;
     return compareIsoTimestampsAscending(a.at, b.at);
   });
   return visibleRows;

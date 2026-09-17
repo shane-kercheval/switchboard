@@ -54,6 +54,14 @@ export type Turn =
       /// shared across a fan-out's per-recipient turns. Absent/empty for a plain
       /// send (optional like the other additive turn fields here).
       attachments?: Attachment[];
+      /// Set while the send is still waiting to run: from the optimistic append
+      /// until its turn starts, fails to start, or is cancelled. The unified
+      /// view renders a pending prompt after everything its agent has already
+      /// run, in queue order, whatever the submit time says. Never set on a
+      /// hydrated or journal-sourced row — history has by definition run, and a
+      /// prompt whose response could not be matched must keep its own time
+      /// rather than be mistaken for queued work.
+      pending?: true;
     }
   | {
       role: "agent";

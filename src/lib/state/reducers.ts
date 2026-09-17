@@ -76,7 +76,7 @@ export function transcriptReducer(
       const existing = findTurn(turns, input.turn_id);
       if (existing !== undefined && existing.role === "agent") return turns;
       return [
-        ...turns,
+        ...settleUserRows(turns, sendId, input.started_at),
         {
           role: "agent",
           turn_id: input.turn_id,
@@ -112,6 +112,7 @@ export function transcriptReducer(
           send_id: input.send_id,
           started_at: input.at,
           text: input.text,
+          pending: true,
         },
       ];
     }
@@ -162,7 +163,7 @@ export function transcriptReducer(
       const turn_id = `cancelled-${input.message_id}`;
       if (findTurn(turns, turn_id) !== undefined) return turns;
       return [
-        ...turns,
+        ...settleUserRows(turns, sendId, receivedAt),
         {
           role: "agent",
           turn_id,
@@ -883,8 +884,28 @@ function appendUserTurnImpl(
       started_at: startedAt,
       text,
       attachments,
+      pending: true,
     },
   ];
+}
+
+/// Settle the user rows of `sendId` on this agent slice: the send is no longer
+/// waiting to run — its turn started, or it failed or was cancelled before it
+/// could. Either way the pending flag comes off and the row is re-stamped to
+/// `at`, the moment the send resolved. For a start that is the turn's
+/// `started_at`, the same instant the journal records the send at, so the live
+/// row lands where a reload will put it: anything that happened while the send
+/// waited — a compaction recap it queued behind, say — sorts above the exchange
+/// instead of below it. For a pre-start failure or cancel it is the receipt
+/// time, which keeps the row beside the terminal agent row rendered under it.
+function settleUserRows(turns: Turn[], sendId: SendId | undefined, at: string): Turn[] {
+  if (sendId === undefined) return turns;
+  return turns.map((t) => {
+    if (t.role !== "user" || t.send_id !== sendId) return t;
+    if (t.pending === undefined && t.started_at === at) return t;
+    const { pending: _pending, ...settled } = t;
+    return { ...settled, started_at: at };
+  });
 }
 
 /// Append a synthetic `failed` agent turn for a send that failed *before* any
@@ -906,7 +927,7 @@ function appendFailedTurnImpl(
 ): Turn[] {
   if (findTurn(turns, turnId) !== undefined) return turns;
   return [
-    ...turns,
+    ...settleUserRows(turns, sendId, startedAt),
     {
       role: "agent",
       turn_id: turnId,

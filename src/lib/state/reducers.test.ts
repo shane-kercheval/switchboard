@@ -81,6 +81,82 @@ describe("transcriptReducer", () => {
       turns = reduce(turns, turnStart(TURN_1));
       expect(turns).toHaveLength(1);
     });
+
+    it("settles the send's live user row at the turn's start time", () => {
+      // The row is stamped at submit and born pending; the journal stamps the
+      // same send at turn-start. A queued send's two stamps differ by the whole
+      // wait. The sibling send is untouched: still pending, still at submit.
+      const submitted = _internal.appendUserTurn(
+        [],
+        AGENT_A,
+        "u1",
+        "queued",
+        [],
+        "2026-05-16T00:00:00Z",
+        MESSAGE_1,
+      );
+      const other = _internal.appendUserTurn(
+        submitted,
+        AGENT_A,
+        "u2",
+        "someone else's",
+        [],
+        "2026-05-16T00:00:01Z",
+        MESSAGE_2,
+      );
+      // `sendId` is the caller-supplied lookup from the pending FIFO, not a field
+      // the helper forwards — pass it explicitly or the re-stamp has no key.
+      const turns = transcriptReducer(
+        other,
+        turnStart(TURN_1, MESSAGE_1, "2026-05-16T00:00:30Z"),
+        AGENT_A,
+        RECEIVED_AT,
+        MESSAGE_1,
+      );
+      expect(
+        turns.map((t) => [t.turn_id, t.started_at, t.role === "user" ? t.pending : undefined]),
+      ).toEqual([
+        ["u1", "2026-05-16T00:00:30Z", undefined],
+        ["u2", "2026-05-16T00:00:01Z", true],
+        [TURN_1, "2026-05-16T00:00:30Z", undefined],
+      ]);
+    });
+
+    it("orders a recap that landed while the send was queued above the exchange", () => {
+      // Submit at :00 while a compaction runs; its recap marker is stamped on
+      // disk at :30 when it finishes; the queued send then starts at :31. After
+      // the settle, prompt and response share the turn-start stamp, so both
+      // sort after a marker written while the send waited; a submit-time stamp
+      // would have put the marker below both.
+      const submitted = _internal.appendUserTurn(
+        [],
+        AGENT_A,
+        "u1",
+        "queued",
+        [],
+        "2026-05-16T00:00:00Z",
+        MESSAGE_1,
+      );
+      const turns = transcriptReducer(
+        submitted,
+        turnStart(TURN_1, MESSAGE_1, "2026-05-16T00:00:31Z"),
+        AGENT_A,
+        RECEIVED_AT,
+        MESSAGE_1,
+      );
+      const recap: ConversationItem = {
+        kind: "system_marker",
+        id: "marker",
+        agent_id: AGENT_A,
+        marker: { marker_kind: "compaction", summary: "recap" },
+        at: "2026-05-16T00:00:30Z",
+      };
+      expect(buildUnifiedRows(turns, [recap]).map((r) => r.kind)).toEqual([
+        "system_marker",
+        "user",
+        "agent",
+      ]);
+    });
   });
 
   describe("content_chunk → items", () => {
@@ -372,6 +448,37 @@ describe("transcriptReducer", () => {
       expect(t.send_id).toBe("send-1");
     });
 
+    it("settles the pending prompt beside its cancelled row", () => {
+      const queued = _internal.appendUserTurn(
+        [],
+        AGENT_A,
+        "u1",
+        "never ran",
+        [],
+        "2026-05-15T23:59:00Z",
+        "send-1",
+      );
+      const turns = transcriptReducer(
+        queued,
+        {
+          type: "message_cancelled",
+          message_id: MESSAGE_1,
+          send_id: "send-1",
+          agent_id: AGENT_A,
+          at: RECEIVED_AT,
+        },
+        AGENT_A,
+        RECEIVED_AT,
+        "send-1",
+      );
+      expect(
+        turns.map((t) => [t.role, t.started_at, t.role === "user" ? t.pending : t.status]),
+      ).toEqual([
+        ["user", RECEIVED_AT, undefined],
+        ["agent", RECEIVED_AT, "cancelled"],
+      ]);
+    });
+
     it("is a no-op when no send_id resolves (stray event)", () => {
       const turns = transcriptReducer(
         [],
@@ -413,6 +520,38 @@ describe("transcriptReducer", () => {
       expect(t.error).toBe("adapter failed to launch");
       expect(t.error_kind).toBe("adapter_failure");
       expect(t.send_id).toBe("send-1");
+    });
+
+    it("settles the pending prompt beside its failed row", () => {
+      const queued = _internal.appendUserTurn(
+        [],
+        AGENT_A,
+        "u1",
+        "never ran",
+        [],
+        "2026-05-15T23:59:00Z",
+        "send-1",
+      );
+      const turns = transcriptReducer(
+        queued,
+        {
+          type: "message_failed",
+          message_id: MESSAGE_1,
+          send_id: MESSAGE_1,
+          agent_id: AGENT_A,
+          error: "adapter failed to launch",
+          at: RECEIVED_AT,
+        },
+        AGENT_A,
+        RECEIVED_AT,
+        "send-1",
+      );
+      expect(
+        turns.map((t) => [t.role, t.started_at, t.role === "user" ? t.pending : t.status]),
+      ).toEqual([
+        ["user", RECEIVED_AT, undefined],
+        ["agent", RECEIVED_AT, "failed"],
+      ]);
     });
 
     it("is a no-op when no send_id resolves (post-start failure renders on the live turn)", () => {
@@ -1975,6 +2114,9 @@ describe("_internal.appendUserTurn", () => {
       started_at: "2026-05-16T00:00:00Z",
       text: "hi there",
       attachments: [],
+      // Born pending: the reducer clears it when the send starts, fails, or is
+      // cancelled.
+      pending: true,
     });
   });
 

@@ -29,6 +29,7 @@ import type {
   Attachment,
   ConversationItem,
   OutcomeStatus,
+  SendId,
   SystemMarker,
   TurnId,
 } from "$lib/types";
@@ -115,6 +116,17 @@ export type UnifiedRow =
       // queued columns and cancel-send affordance immediately; a historical
       // fan-out only groups once its responses can be correlated.
       live: boolean;
+      // Recipients whose turn has not started (their live user turn still
+      // carries `pending`). Empty for history and for a send every recipient
+      // has started. A send pending on *every* recipient is sorted as pending
+      // work; one pending on *some* holds a queue position on each of those
+      // recipients at `queued_at` while its row sits at the earliest start.
+      pending_agent_ids: AgentId[];
+      // The send's queue position: the earliest submit stamp among recipients
+      // still waiting (equal to `at` when none are). Ordering among pending
+      // work on one agent is by this, never by `at`, which for a partially
+      // started fan-out is a start time.
+      queued_at: string;
     }
   | { kind: "agent"; at: string; rank: 1; key: string; send_id?: string; turn: AgentTurn }
   | {
@@ -139,6 +151,25 @@ export type UnifiedRow =
       agent_id: AgentId;
       status: OutcomeStatus;
       reason?: string | null;
+    }
+  | {
+      // A compaction the backend has accepted but not started. It has no turn
+      // yet and no user message above it, so it is its own row rather than an
+      // affordance hung under a prompt the way a queued *send* is.
+      //
+      // `send_id` is deliberately absent, like a system marker's: it must never
+      // join a fan-out group, and it anchors to its own `queued_at` so it sits
+      // where the user asked for it — behind anything already queued, ahead of
+      // anything queued after.
+      kind: "queued_compaction";
+      at: string;
+      rank: 4;
+      key: string;
+      send_id?: undefined;
+      agent_id: AgentId;
+      /// What `cancel_send` cancels. Named for what it does here rather than
+      /// reusing `send_id`, which grouping keys on.
+      cancel_send_id: SendId;
     };
 
 /// A render unit for the transcript: either a standalone row, or a fan-out
@@ -162,7 +193,23 @@ export type RenderBlock =
 export const INITIAL_WINDOW = 20;
 export const REVEAL_BATCH = 20;
 
-const KIND_RANK = { user: 0, agent: 1, system_marker: 2, outcome: 3 } as const;
+/// One accepted-but-unstarted compaction, as the caller reads it off an agent's
+/// pending-send list.
+export type QueuedCompaction = {
+  agent_id: AgentId;
+  send_id: SendId;
+  queued_at: string;
+};
+
+const KIND_RANK = {
+  user: 0,
+  agent: 1,
+  system_marker: 2,
+  outcome: 3,
+  // Work that has not run yet — a queued compaction, or a send no recipient has
+  // started. Last at an identical anchor: anything that did run belongs above it.
+  pending: 4,
+} as const;
 
 /// Merge the active project's per-agent turns (live + hydrated agent content
 /// and this-session user turns) with its journal overlay (historical user
@@ -188,8 +235,23 @@ export function buildUnifiedRows(
   turns: Turn[],
   overlay: ConversationItem[],
   knownAgentIds?: ReadonlySet<AgentId>,
+  /// Compactions accepted but not yet started, drawn from the agents'
+  /// `pending_sends`. A third source beside turns and the overlay because a
+  /// queued compaction exists in neither: it has no turn until `turn_start`, and
+  /// nothing about it is ever journaled.
+  queuedCompactions: QueuedCompaction[] = [],
 ): UnifiedRow[] {
   const rows: UnifiedRow[] = [];
+  for (const queued of queuedCompactions) {
+    rows.push({
+      kind: "queued_compaction",
+      at: queued.queued_at,
+      rank: KIND_RANK.pending,
+      key: `qc:${queued.send_id}`,
+      agent_id: queued.agent_id,
+      cancel_send_id: queued.send_id,
+    });
+  }
 
   // Live user turns of one fan-out share a `send_id` (one per recipient), so
   // collapse them into a single user row whose `agent_ids` is the recipient set
@@ -205,7 +267,17 @@ export function buildUnifiedRows(
     agent_ids: AgentId[];
     text: string;
     attachments: Attachment[];
+    // Earliest stamp across recipients — the anchor only while no recipient
+    // has started.
     at: string;
+    // Earliest turn-start across the recipients that HAVE started. A started
+    // recipient's stamp is the instant the journal records the send at, so the
+    // group anchors there, live and after reload alike; a recipient still
+    // waiting must not drag the exchange back to its submit time.
+    started_at?: string;
+    // Recipients still waiting, and the earliest of their submit stamps.
+    pending_agent_ids: AgentId[];
+    queued_at?: string;
   };
   const groups = new Map<string, UserGroup>();
   const groupOrder: string[] = [];
@@ -213,6 +285,7 @@ export function buildUnifiedRows(
     if (turn.role === "user") {
       const groupKey = turn.send_id ?? turn.turn_id;
       const g = groups.get(groupKey);
+      const started = turn.pending === undefined ? turn.started_at : undefined;
       if (g === undefined) {
         groups.set(groupKey, {
           send_id: turn.send_id,
@@ -222,11 +295,26 @@ export function buildUnifiedRows(
           // list), so the first turn's attachments stand for the group.
           attachments: turn.attachments ?? [],
           at: turn.started_at,
+          started_at: started,
+          pending_agent_ids: started === undefined ? [turn.agent_id] : [],
+          queued_at: started === undefined ? turn.started_at : undefined,
         });
         groupOrder.push(groupKey);
       } else {
         if (!g.agent_ids.includes(turn.agent_id)) g.agent_ids.push(turn.agent_id);
         if (isIsoTimestampBefore(turn.started_at, g.at)) g.at = turn.started_at;
+        if (
+          started !== undefined &&
+          (g.started_at === undefined || isIsoTimestampBefore(started, g.started_at))
+        ) {
+          g.started_at = started;
+        }
+        if (started === undefined) {
+          if (!g.pending_agent_ids.includes(turn.agent_id)) g.pending_agent_ids.push(turn.agent_id);
+          if (g.queued_at === undefined || isIsoTimestampBefore(turn.started_at, g.queued_at)) {
+            g.queued_at = turn.started_at;
+          }
+        }
       }
     } else {
       rows.push({
@@ -244,7 +332,7 @@ export function buildUnifiedRows(
     if (g === undefined) continue;
     rows.push({
       kind: "user",
-      at: g.at,
+      at: g.started_at ?? g.at,
       rank: KIND_RANK.user,
       key: `u:${groupKey}`,
       send_id: g.send_id,
@@ -252,6 +340,8 @@ export function buildUnifiedRows(
       text: g.text,
       attachments: g.attachments,
       live: true,
+      pending_agent_ids: g.pending_agent_ids,
+      queued_at: g.queued_at ?? g.started_at ?? g.at,
     });
   }
 
@@ -277,6 +367,8 @@ export function buildUnifiedRows(
         text: item.text,
         attachments: item.attachments ?? [],
         live: false,
+        pending_agent_ids: [],
+        queued_at: item.at,
       });
     } else if (item.kind === "outcome") {
       rows.push({
@@ -320,8 +412,13 @@ export function buildUnifiedRows(
       visibleRows.push(row);
     } else if (row.kind === "user") {
       const agent_ids = row.agent_ids.filter((id) => knownAgentIds.has(id));
-      if (agent_ids.length > 0) visibleRows.push({ ...row, agent_ids });
-    } else if (row.kind === "outcome" || row.kind === "system_marker") {
+      const pending_agent_ids = row.pending_agent_ids.filter((id) => knownAgentIds.has(id));
+      if (agent_ids.length > 0) visibleRows.push({ ...row, agent_ids, pending_agent_ids });
+    } else if (
+      row.kind === "outcome" ||
+      row.kind === "system_marker" ||
+      row.kind === "queued_compaction"
+    ) {
       if (knownAgentIds.has(row.agent_id)) visibleRows.push(row);
     } else if (knownAgentIds.has(row.turn.agent_id)) {
       visibleRows.push(row);
@@ -330,16 +427,57 @@ export function buildUnifiedRows(
 
   // Order by **send**, not raw timestamp: each row is anchored to the time of
   // its send's user message (`sendAnchor`), so a send's response renders
-  // directly under its prompt even when it ran much later. This matters for a
-  // *queued* single-recipient send — live, all three user messages are stamped
-  // near submit time (t1<t2<t3) while a queued send's response only starts after
-  // the earlier turn finishes, so its own timestamp is *later than the next
-  // prompt*. A raw-timestamp sort would float that response below the later
-  // prompt (detached from its own); anchoring keeps it adjacent. Rows whose
-  // send has no user message (pre-journal history with no recoverable send_id)
-  // fall back to their own `at`. Within one anchor: kind rank (user < agent <
-  // system_marker < outcome), then own `at`; `Array.prototype.sort` is stable so
-  // ties hold insertion order.
+  // directly under its prompt even when it ran much later. A started send's
+  // prompt is stamped at turn-start (the reducer re-stamps it when the turn
+  // begins, matching the journal), so the exchange sits at the moment it ran,
+  // after anything that happened while it waited. Rows whose send has no user
+  // message (pre-journal history with no recoverable send_id) fall back to their
+  // own `at`.
+  //
+  // **Work that has not run on an agent renders after everything that agent
+  // has already run, in queue order.** The queue is per agent: everything that
+  // started, then the pending items by submit stamp. A pending item's own stamp
+  // says only when it was queued; it cannot run before what is ahead of it. So
+  // each pending row's anchor is lifted (never lowered — a queue with nothing
+  // started on that agent keeps chronological order against other agents) to a
+  // per-agent floor, and it ranks last at that anchor.
+  //
+  // The floor seeds from the agent's started work and then advances through
+  // the pending items in submit order, so a lifted item constrains the items
+  // queued behind it on any agent it shares. Two shapes feed it:
+  //   - A row pending on every recipient is lifted to the floors of all its
+  //     agents, then raises them to its anchor.
+  //   - A fan-out some recipients have started is NOT lifted — its row sits at
+  //     the earliest recipient start, where a reload also puts it — but on each
+  //     recipient still waiting it occupies its submit position: fully pending
+  //     items queued ahead of it there are untouched, fully pending items
+  //     queued behind it are raised to its anchor. Seeding the floor with it
+  //     directly would lift the earlier items too and display them below a
+  //     send that recipient will run after them.
+  //
+  // Without any of this, a send that just started would move to its turn-start
+  // stamp and land *below* a sibling still waiting at its earlier submit stamp
+  // — the queue would render inverted until the sibling started too.
+  //
+  // **The boundary of the guarantee.** A row is one send on every recipient's
+  // timeline and can sit in one place, so it is placed for the recipient that
+  // ran it first — the policy reload follows too, since the backend groups the
+  // journal's per-recipient records at the earliest. So a waiting recipient's
+  // queue order is preserved only against fully pending work queued behind the
+  // fan-out there. It is not preserved against work queued ahead of it that
+  // another agent's activity lifts past it, nor against a later fan-out that
+  // started elsewhere first — and it is not restored when the recipient catches
+  // up: if B runs E and then F while F sits at A's earlier start, F stays above
+  // E, live and after reopen. What holds throughout is a true chronology of
+  // *start times*; per-recipient execution order for a grouped send is shown
+  // by the fan-out block's columns, not by the row's position. The test "a
+  // fan-out placed at its first recipient's start stays there after the other
+  // recipient runs older work" pins the shape, so a change that lifts partial
+  // rows fails deliberately rather than quietly.
+  //
+  // Within one anchor: kind rank (user < agent < system_marker < outcome <
+  // pending), then own `at`; `Array.prototype.sort` is stable so ties hold
+  // insertion order.
   const sendAnchor = new Map<string, string>();
   for (const row of visibleRows) {
     if (row.kind === "user" && row.send_id !== undefined) {
@@ -351,10 +489,70 @@ export function buildUnifiedRows(
   }
   const anchorOf = (row: UnifiedRow): string =>
     (row.send_id !== undefined ? sendAnchor.get(row.send_id) : undefined) ?? row.at;
+  const isPending = (row: UnifiedRow): boolean =>
+    row.kind === "queued_compaction" ||
+    (row.kind === "user" && row.pending_agent_ids.length === row.agent_ids.length);
+  // Where a row counts as started work: a user row only on the recipients that
+  // have started it (a waiting recipient takes it into the queue pass instead).
+  const startedAgentsOf = (row: UnifiedRow): readonly AgentId[] => {
+    switch (row.kind) {
+      case "user":
+        return row.agent_ids.filter((id) => !row.pending_agent_ids.includes(id));
+      case "agent":
+        return [row.turn.agent_id];
+      case "queued_compaction":
+        return [];
+      default:
+        return [row.agent_id];
+    }
+  };
+  // The recipients a row is still waiting on: every recipient of a fully
+  // pending send, the one agent of a queued compaction, the waiting subset of a
+  // partially started fan-out, and none for anything that has run.
+  const pendingRecipientsOf = (row: UnifiedRow): readonly AgentId[] => {
+    switch (row.kind) {
+      case "user":
+        return row.pending_agent_ids;
+      case "queued_compaction":
+        return [row.agent_id];
+      default:
+        return [];
+    }
+  };
+  const raise = (floor: Map<AgentId, string>, id: AgentId, to: string): void => {
+    const prior = floor.get(id);
+    if (prior === undefined || isIsoTimestampBefore(prior, to)) floor.set(id, to);
+  };
+  const floor = new Map<AgentId, string>();
+  for (const row of visibleRows) {
+    for (const id of startedAgentsOf(row)) raise(floor, id, anchorOf(row));
+  }
+  const effectiveAnchor = new Map<UnifiedRow, string>();
+  for (const row of visibleRows) effectiveAnchor.set(row, anchorOf(row));
+  const queuedAtOf = (row: UnifiedRow): string => (row.kind === "user" ? row.queued_at : row.at);
+  const queued = visibleRows
+    .filter((row) => isPending(row) || (row.kind === "user" && row.pending_agent_ids.length > 0))
+    .sort((a, b) => compareIsoTimestampsAscending(queuedAtOf(a), queuedAtOf(b)));
+  for (const row of queued) {
+    const waiting = pendingRecipientsOf(row);
+    if (isPending(row)) {
+      let anchor = anchorOf(row);
+      for (const id of waiting) {
+        const f = floor.get(id);
+        if (f !== undefined && isIsoTimestampBefore(anchor, f)) anchor = f;
+      }
+      effectiveAnchor.set(row, anchor);
+      for (const id of waiting) raise(floor, id, anchor);
+    } else {
+      for (const id of waiting) raise(floor, id, anchorOf(row));
+    }
+  }
+  const rankOf = (row: UnifiedRow): number => (isPending(row) ? KIND_RANK.pending : row.rank);
   visibleRows.sort((a, b) => {
-    const t = compareIsoTimestampsAscending(anchorOf(a), anchorOf(b));
+    const t = compareIsoTimestampsAscending(effectiveAnchor.get(a)!, effectiveAnchor.get(b)!);
     if (t !== 0) return t;
-    if (a.rank !== b.rank) return a.rank - b.rank;
+    const r = rankOf(a) - rankOf(b);
+    if (r !== 0) return r;
     return compareIsoTimestampsAscending(a.at, b.at);
   });
   return visibleRows;

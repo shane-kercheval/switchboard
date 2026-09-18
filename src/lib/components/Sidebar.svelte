@@ -6,6 +6,7 @@
     EyeOff,
     FileText,
     GripVertical,
+    History,
     MoreHorizontal,
     Pencil,
     Plug,
@@ -18,7 +19,14 @@
   } from "@lucide/svelte";
   import { flip } from "svelte/animate";
   import type { AgentSelection, AgentRecord, AgentId, ProjectId } from "$lib/types";
-  import { retryAgentHydration, runtimes, stopAgent, transcripts } from "$lib/state/index.svelte";
+  import {
+    dispatchCompaction,
+    retryAgentHydration,
+    runtimes,
+    stopAgent,
+    transcripts,
+  } from "$lib/state/index.svelte";
+  import { supportsManualCompaction } from "$lib/harnessCapabilities";
   import {
     removeAgent,
     renameAgent,
@@ -134,6 +142,14 @@
   let hydrationDetailsName = $state("");
   let hydrationDetailsError = $state("");
   let removeConfirmAgentId = $state<AgentId | null>(null);
+  /// The agent whose context-bar compact button is armed — one click arms, a
+  /// second runs it. Same two-step as delete, and for the same reason: the
+  /// button sits inline with no menu around it, so a stray click would spend a
+  /// turn's worth of tokens with nothing to undo it.
+  let compactConfirmAgentId = $state<AgentId | null>(null);
+  /// Holds the armed button's confirm tooltip open. One boolean, because only
+  /// one agent is ever armed, and it is bound only by the armed branch.
+  let compactConfirmTooltipOpen = $state(false);
   let removingAgentId = $state<AgentId | null>(null);
   let removeError = $state<{ agentId: AgentId; message: string } | null>(null);
 
@@ -300,6 +316,8 @@
     }
     if (removeConfirmAgentId !== null && !ids.has(removeConfirmAgentId))
       removeConfirmAgentId = null;
+    if (compactConfirmAgentId !== null && !ids.has(compactConfirmAgentId))
+      compactConfirmAgentId = null;
     if (resumeAgentId !== null && !ids.has(resumeAgentId)) {
       resumeAgentId = null;
       resumeOpen = false;
@@ -611,6 +629,32 @@
     }
   }
 
+  /// Start a manual compaction for `agentId`. The `send_id` is minted here, the
+  /// same way the compose bar mints one per send, so the queued row has
+  /// something to cancel with before any `turn_start` carries the id back.
+  /// A tooltip trigger's own handler for `name`, so a trigger that needs its
+  /// own handler can run both. Spreading the trigger props and then declaring
+  /// the same handler on the element silently REPLACES the tooltip's — for
+  /// `onpointerleave` that means it never closes, and hovering the next
+  /// trigger stacks a second one behind it.
+  function triggerHandler(
+    props: Record<string, unknown>,
+    name: string,
+  ): ((event: Event) => void) | undefined {
+    const handler = props[name];
+    return typeof handler === "function" ? (handler as (event: Event) => void) : undefined;
+  }
+
+  function disarmCompaction(): void {
+    compactConfirmAgentId = null;
+    compactConfirmTooltipOpen = false;
+  }
+
+  async function startCompaction(agentId: AgentId): Promise<void> {
+    disarmCompaction();
+    await dispatchCompaction(agentId, crypto.randomUUID());
+  }
+
   /// Context utilization — `context_tokens_after_turn / context_window` from
   /// the most recent completed agent turn. Forward-looking signal ("how full
   /// will the next turn's context be").
@@ -870,6 +914,18 @@
     });
   }
 </script>
+
+<!-- One description for one action, rendered by both affordances that trigger
+     it: the agent-menu item and the context-bar button. Second line muted — a
+     mechanical footnote to the first, not a second instruction. The armed
+     button says only "Confirm compaction?"; at that point the user has already
+     read this and is being asked one question. -->
+{#snippet compactTooltipContent()}
+  <div class="max-w-xs space-y-1 text-[13px]">
+    <p class="font-medium">Compact the conversation</p>
+    <p class="text-primary-fg/70">Runs as a turn; queues if the agent is busy.</p>
+  </div>
+{/snippet}
 
 <svelte:window onkeydown={onWindowKeydown} />
 
@@ -1163,6 +1219,25 @@
                       >
                         <Square size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
                         Stop agent
+                      </DropdownMenuItem>
+                    {/if}
+                    {#if supportsManualCompaction(agent.harness)}
+                      <!-- Never disabled while busy: a compaction queues behind
+                           the running turn like any other work, so greying it out
+                           would refuse something the backend accepts. -->
+                      <DropdownMenuItem
+                        onSelect={() => void startCompaction(agent.id)}
+                        class="gap-2"
+                        tooltipContent={compactTooltipContent}
+                        data-testid="agent-action-compact"
+                      >
+                        <History
+                          size={14}
+                          strokeWidth={1.8}
+                          class="text-muted shrink-0"
+                          aria-hidden="true"
+                        />
+                        Compact context
                       </DropdownMenuItem>
                     {/if}
                     {#if sessionInfo?.resume_command}
@@ -1528,16 +1603,84 @@
                  pre-first-turn) hides identically to a permanent one; that's the
                  intended behavior, not a case to distinguish. -->
             {#if util !== undefined}
-              <div class="mt-1.5" data-testid="agent-context-bar">
-                <div class="text-muted mb-0.5 text-[11px]">
-                  context after last turn: {(util * 100).toFixed(0)}%
+              <div class="mt-1.5 flex items-end gap-1.5" data-testid="agent-context-bar">
+                <div class="min-w-0 flex-1">
+                  <div class="text-muted mb-0.5 text-[11px]">
+                    context after last turn: {(util * 100).toFixed(0)}%
+                  </div>
+                  <div class="bg-active h-1 w-full overflow-hidden rounded">
+                    <div
+                      class="bg-fg h-full"
+                      style:width="{Math.min(util * 100, 100).toFixed(1)}%"
+                    ></div>
+                  </div>
                 </div>
-                <div class="bg-active h-1 w-full overflow-hidden rounded">
-                  <div
-                    class="bg-fg h-full"
-                    style:width="{Math.min(util * 100, 100).toFixed(1)}%"
-                  ></div>
-                </div>
+                {#if supportsManualCompaction(agent.harness)}
+                  {@const armed = compactConfirmAgentId === agent.id}
+                  {#snippet compactButton(props: Record<string, unknown>, armed: boolean)}
+                    {@const closeOnLeave = triggerHandler(props, "onpointerleave")}
+                    {@const closeOnBlur = triggerHandler(props, "onblur")}
+                    <button
+                      {...props}
+                      type="button"
+                      class={armed
+                        ? "text-accent hover:bg-active -mb-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded"
+                        : "text-muted hover:text-fg hover:bg-active -mb-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded"}
+                      aria-label={armed ? "Compact now" : "Compact context"}
+                      data-armed={armed ? "true" : "false"}
+                      data-testid="agent-compact-button"
+                      onclick={() => {
+                        if (armed) {
+                          void startCompaction(agent.id);
+                        } else {
+                          compactConfirmAgentId = agent.id;
+                          compactConfirmTooltipOpen = true;
+                        }
+                      }}
+                      onpointerleave={(event) => {
+                        closeOnLeave?.(event);
+                        disarmCompaction();
+                      }}
+                      onblur={(event) => {
+                        closeOnBlur?.(event);
+                        disarmCompaction();
+                      }}
+                    >
+                      {#if armed}
+                        <Check size={13} strokeWidth={2.2} aria-hidden="true" />
+                      {:else}
+                        <History size={13} strokeWidth={1.8} aria-hidden="true" />
+                      {/if}
+                    </button>
+                  {/snippet}
+                  <!-- Two instances, not one with a swapped label. The primitive
+                       closes a tooltip when its trigger is clicked and latches it
+                       shut until a fresh pointer-enter — right for an ordinary
+                       button, wrong here, where the click is exactly what needs
+                       explaining and the pointer never leaves. Arming mounts a
+                       second, unsuppressed tooltip already open. Disarms on
+                       pointer leave rather than on a timer or an outside click:
+                       the button is the only thing that armed it, so leaving it
+                       is the clearest "I didn't mean that". -->
+                  {#if armed}
+                    <Tooltip
+                      label="Confirm compaction?"
+                      side="top"
+                      bind:open={compactConfirmTooltipOpen}
+                    >
+                      {#snippet trigger(props)}
+                        {@render compactButton(props, true)}
+                      {/snippet}
+                    </Tooltip>
+                  {:else}
+                    <Tooltip side="top" reopen="fresh-hover">
+                      {#snippet trigger(props)}
+                        {@render compactButton(props, false)}
+                      {/snippet}
+                      {@render compactTooltipContent()}
+                    </Tooltip>
+                  {/if}
+                {/if}
               </div>
             {/if}
           {/if}

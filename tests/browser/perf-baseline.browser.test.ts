@@ -170,6 +170,7 @@ test.runIf(PERF)("streaming pipeline per-chunk stage costs (baseline)", () => {
       if (row.kind === "user") n += row.text.length;
       else if (row.kind === "outcome") n += 0;
       else if (row.kind === "system_marker") n += 0;
+      else if (row.kind === "queued_compaction") n += 0;
       else {
         n += row.turn.items.length;
         for (const item of row.turn.items) {

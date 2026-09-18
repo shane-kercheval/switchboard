@@ -133,6 +133,80 @@ pub struct ParserState {
     /// subagent work included) and its `modelUsage` holds whole-dispatch
     /// per-model aggregates. Failure results bypass this stash and fail fast.
     pending_completed_terminal: Option<PendingCompletedTerminal>,
+    /// Which operation's stream this state is reading. Compaction-only rules are
+    /// gated on this; an ordinary send's handling of every affected record is
+    /// unchanged, pinned by the `outside_compaction_mode_*` tests.
+    mode: StreamMode,
+    /// The compaction verdict from `system/status`, recorded only in
+    /// [`StreamMode::Compaction`]. `None` means no verdict was seen — which at
+    /// `result` time is itself a failure signal, not a success (see
+    /// [`parse_result`]).
+    compaction_verdict: Option<CompactionVerdict>,
+    /// The model named by the `system/init` Claude re-emits as the session
+    /// re-initializes during a compaction. Kept because it is the **only exact
+    /// model identifier a compaction's stream carries**: there is no assistant
+    /// envelope to name a model, and `result.model` was absent in both captured
+    /// compactions, so without this the window lookup would fall through to the
+    /// sole-entry guess that [`select_context_window`] exists to avoid. Set in
+    /// compaction mode only, so an ordinary send's window resolution is
+    /// untouched.
+    ///
+    /// The ordering this depends on is verified, not assumed: on both the
+    /// success and the failure path `init` arrives *before* `result`
+    /// (harness-behavior.md §3.9).
+    init_model: Option<String>,
+    /// Before/after context occupancy from `compact_boundary.compact_metadata`,
+    /// recorded in compaction mode whenever the boundary arrives — **not** keyed
+    /// to the verdict having been seen first.
+    ///
+    /// Deliberately independent: nesting it inside the `Succeeded` verdict made
+    /// the observed record order (verdict, then boundary) load-bearing for the
+    /// feature's central visible output. Claude emits both from one routine and
+    /// that order is an observed fact, not a documented contract — so a
+    /// reordering upstream would have left the compaction completing with no
+    /// numbers and the context bar clean-hiding, silently. [`parse_result`]
+    /// joins the two instead: occupancy is read only when the verdict says
+    /// success, which keeps "a boundary alone never invents a success" intact
+    /// without the ordering dependency.
+    compaction_occupancy: Option<CompactionOccupancy>,
+}
+
+/// Which operation a [`ParserState`] is reading the stream of. Claude emits the
+/// same record vocabulary for both, but a compaction assigns different meaning
+/// to three of them — `system/status` carries the verdict, the `<synthetic>`
+/// assistant envelope is a diagnostic rather than an answer, and `result` is not
+/// the verdict at all.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamMode {
+    #[default]
+    Send,
+    Compaction,
+}
+
+/// What Claude's `system/status` record said about a requested compaction.
+/// **The verdict, and the only one** — `result` reports `subtype:"success"`,
+/// `is_error:false` and exit 0 for a compaction that did nothing at all, so
+/// classifying off `result` would report every refusal as a completed turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompactionVerdict {
+    Succeeded,
+    Failed {
+        /// Claude's `compact_error`, when it carried one. `None` — including for
+        /// a present-but-blank field — so [`parse_result`] can fall back to the
+        /// `result` record's own text rather than to a generic string. Choosing
+        /// the wording here instead would destroy the better diagnostic before
+        /// anything could reach for it.
+        message: Option<String>,
+    },
+}
+
+/// The before/after context occupancy a successful compaction reports. These are
+/// the turn's *only* occupancy source: a compaction makes no assistant call, so
+/// the usual final-parent-call derivation has nothing to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactionOccupancy {
+    pre_tokens: u64,
+    post_tokens: u64,
 }
 
 /// The stashed payload of a successful `result`, pending emission at EOF.
@@ -192,13 +266,18 @@ impl ParserState {
         })
     }
 
-    /// Construct a state for a dispatch launched with `effort` (the value
-    /// passed to `--effort`, or `None` when the agent leaves it unset).
-    pub(crate) fn with_dispatched_effort(effort: Option<String>) -> Self {
+    /// Construct a state for a stream of `mode`, launched with `effort` (the
+    /// value passed to `--effort`, or `None` when the agent leaves it unset).
+    pub(crate) fn for_stream(mode: StreamMode, effort: Option<String>) -> Self {
         Self {
+            mode,
             dispatched_effort: effort,
             ..Self::default()
         }
+    }
+
+    fn compacting(&self) -> bool {
+        self.mode == StreamMode::Compaction
     }
 
     /// The effort to stamp on this turn's terminal, or `None` to render nothing.
@@ -330,7 +409,7 @@ pub fn parse_line(
     match value.get("type").and_then(Value::as_str) {
         Some("stream_event") => parse_stream_event(&value, turn_id, state),
         Some("result") => parse_result(&value, turn_id, state),
-        Some("system") => parse_system_event(&value, turn_id, agent_id),
+        Some("system") => parse_system_event(&value, turn_id, agent_id, state),
         Some("assistant") => parse_assistant_envelope(&value, turn_id, state),
         Some("user") => parse_user_envelope(&value, turn_id),
         Some("rate_limit_event") => parse_rate_limit_event(&value, agent_id, state),
@@ -342,6 +421,14 @@ fn parse_stream_event(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> 
     let Some(event) = obj.get("event") else {
         return ParseOutcome::Skip;
     };
+
+    // Drift protection, cheap: neither captured compaction emits a single delta,
+    // and a compaction has no answer to stream. Should a future CLI start
+    // streaming the summarizer's output, it degrades to a heartbeat rather than
+    // printing the summary into the transcript as if the agent had said it.
+    if state.compacting() {
+        return ParseOutcome::Event(AdapterEvent::Liveness { turn_id });
+    }
 
     match event.get("type").and_then(Value::as_str) {
         Some("content_block_start") => {
@@ -451,15 +538,41 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
     // legitimate, not noise).
     let auth_failure = state.pending_auth_failure.take();
 
+    // A compaction's occupancy comes from `compact_boundary`, not from a final
+    // assistant call (it makes none). `None` outside compaction mode and on a
+    // failed compaction, where the whole usage record is withheld below.
+    // The join: occupancy is recorded independently of the verdict, and is used
+    // only when the verdict says the compaction actually happened.
+    let compaction_occupancy = match &state.compaction_verdict {
+        Some(CompactionVerdict::Succeeded) => state.compaction_occupancy,
+        _ => None,
+    };
+    let (context_input_tokens, context_tokens_after_turn) = if state.compacting() {
+        (
+            compaction_occupancy.map(|o| o.pre_tokens),
+            compaction_occupancy.map(|o| o.post_tokens),
+        )
+    } else {
+        (
+            state.last_assistant_context_input_tokens,
+            state.last_assistant_context_tokens_after_turn,
+        )
+    };
     let context_window = select_context_window(
         obj,
         state.last_assistant_model.as_deref(),
-        state.last_assistant_context_tokens_after_turn,
+        // In compaction mode this is the only exact key available; it is `None`
+        // for a send, leaving that path's resolution chain untouched.
+        state.init_model.as_deref(),
+        // Feeds the impossible-window rejection. Passing the compaction's own
+        // post-compaction occupancy keeps that check live on this path rather
+        // than letting it silently go dead for want of an assistant call.
+        context_tokens_after_turn,
     );
     let usage = extract_usage_from_result(
         obj,
-        state.last_assistant_context_input_tokens,
-        state.last_assistant_context_tokens_after_turn,
+        context_input_tokens,
+        context_tokens_after_turn,
         context_window
             .as_ref()
             .map(|selected| selected.context_window),
@@ -491,11 +604,19 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
     // and stopping the read early is correct for a failed dispatch. Message
     // ids are read (not taken) so a failure terminal still carries the turn's
     // identity keys.
+    //
+    // **The auth check runs first, deliberately.** An auth-failed compaction
+    // never reaches Claude's command handler, so it has no verdict at all — and
+    // the no-verdict arm below would otherwise swallow it, replacing an
+    // actionable `AuthFailure` (which drives the frontend's "run `claude auth
+    // login`" copy) with a generic harness error.
     let failure = if let Some(auth_message) = auth_failure {
         Some(TurnOutcome::Failed {
             kind: FailureKind::AuthFailure,
             message: auth_message,
         })
+    } else if let Some(compaction_failure) = compaction_failure(state, result_diagnostic(obj)) {
+        Some(compaction_failure)
     } else if is_error || has_api_error {
         let message = obj
             .get("result")
@@ -514,7 +635,7 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
             turn_id,
             outcome,
             ended_at: Utc::now(),
-            usage,
+            usage: withhold_usage_on_failed_compaction(state, usage),
             context_window_source,
             spend,
             model: state.last_assistant_model.clone(),
@@ -536,6 +657,106 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
         spend,
     });
     ParseOutcome::Event(AdapterEvent::Liveness { turn_id })
+}
+
+/// The `result` record's own human-readable text, when it carries one. The
+/// second-choice diagnostic for a failed compaction, behind `compact_error`.
+fn result_diagnostic(result: &Value) -> Option<&str> {
+    result
+        .get("result")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+/// The terminal a compaction's verdict demands at `result`, or `None` when this
+/// stream is not a compaction or the compaction succeeded (in which case the
+/// caller folds the result like any other successful turn, so the adapter's
+/// exit-status gate still applies).
+///
+/// **Fail-closed on a missing verdict, by construction.** `result` reports
+/// success for a compaction that did nothing, so "no verdict seen" cannot be
+/// read as "it worked." The observed cause is `DISABLE_COMPACT` in the user's
+/// environment, but the arm is deliberately written against the *absence* of
+/// evidence rather than that one cause, so any future shape in which the command
+/// does not run surfaces as a failure rather than a silent no-op.
+///
+/// It is a named `HarnessError` rather than a truncation `AdapterFailure`
+/// because `FailureKind` drives the frontend's recovery copy: "adapter failure"
+/// tells the user to file a bug, which is the wrong instruction for something
+/// Claude declined to do.
+///
+/// **Classification is fail-closed; the *message* is best-available.** Those are
+/// separate concerns and the precedence exists so the second never weakens the
+/// first: Claude's own `compact_error`, then `diagnostic` (the `result` text),
+/// then authored wording only when the harness said nothing at all. Without the
+/// middle step every cause outside the two captured shapes — an API error, a
+/// quota exhaustion, an environment that disabled the command — collapsed to a
+/// bare "compaction did not run", which tells the user nothing about whether a
+/// retry could work.
+///
+/// Note this runs **ahead of** the generic `is_error` / `api_error_status`
+/// handling, so an API error that kills a compaction before its verdict reads
+/// "compaction did not run: API Error …" — the same `HarnessError` kind the
+/// generic path would give, plus the fact that nothing was compacted.
+fn compaction_failure(state: &ParserState, diagnostic: Option<&str>) -> Option<TurnOutcome> {
+    if !state.compacting() {
+        return None;
+    }
+    let message = match &state.compaction_verdict {
+        Some(CompactionVerdict::Succeeded) => return None,
+        Some(CompactionVerdict::Failed { message }) => message
+            .clone()
+            .or_else(|| diagnostic.map(str::to_owned))
+            .unwrap_or_else(|| "the harness declined to compact this conversation".to_owned()),
+        None => match diagnostic {
+            Some(diagnostic) => format!("compaction did not run: {diagnostic}"),
+            None => "compaction did not run".to_owned(),
+        },
+    };
+    Some(TurnOutcome::Failed {
+        kind: FailureKind::HarnessError,
+        message,
+    })
+}
+
+/// Drop the usage record entirely when a compaction failed.
+///
+/// A refused compaction's `result` carries an **empty** `modelUsage`, so the
+/// extractor falls back to `result.usage` — whose zero-valued token fields are
+/// schema-present and therefore yield a legitimate `Some` with no
+/// `context_window`. The sidebar treats the newest usage-bearing turn as
+/// authoritative and clean-hides on a missing window, so emitting that record
+/// would **blank the context bar after a compaction that changed nothing** —
+/// precisely when the previous turn's number is still exactly right. Withholding
+/// it leaves the bar reading the last real turn, which is the truth.
+///
+/// Only the failed path is withheld: a *successful* compaction's numbers come
+/// from `compact_metadata` and are the whole point of the row.
+///
+/// **The contract, stated once because three states meet here.** A *refusal*
+/// (no verdict, or a failed one) withholds usage — nothing was compacted, so the
+/// previous turn's number is still the truth. A *successful* compaction keeps
+/// it. A successful compaction whose process then exits abnormally **also keeps
+/// it** — that terminal is `Failed`, but the compaction demonstrably happened
+/// and its post-compaction occupancy is the best measurement available, so
+/// suppressing it would knowingly leave the context bar stale. The gate is
+/// therefore the *verdict*, never the terminal outcome. Do not "simplify" this
+/// to "failed turns carry no usage"; that would re-break the dirty-exit case,
+/// which `a_folded_success_still_fails_on_a_dirty_exit` pins.
+fn withhold_usage_on_failed_compaction(
+    state: &ParserState,
+    usage: Option<TurnUsage>,
+) -> Option<TurnUsage> {
+    if state.compacting()
+        && !matches!(
+            &state.compaction_verdict,
+            Some(CompactionVerdict::Succeeded)
+        )
+    {
+        return None;
+    }
+    usage
 }
 
 /// Pull `TurnUsage` from a `result` event.
@@ -701,17 +922,22 @@ struct SelectedContextWindow {
 
 /// Select a model-bound `contextWindow` from `result.modelUsage`.
 ///
-/// The final parent assistant model is authoritative. The result-level model
-/// is used only when no assistant model was observed, and a sole-entry fallback
-/// is allowed only when neither identifier exists. Claude may qualify the
-/// corresponding usage-map key with `[1m]`; that exact transport suffix is the
+/// The final parent assistant model is authoritative. `init_model` — the model a
+/// compaction's re-initialized session announces, and the only exact identifier
+/// that path has — is next; the result-level model follows; and a sole-entry
+/// fallback is allowed only when **none** of the three exists. Claude may qualify
+/// the corresponding usage-map key with `[1m]`; that exact transport suffix is the
 /// only non-exact lookup allowed. Other mismatches do not fall through because
 /// guessing would risk binding an auxiliary model's window to the parent turn.
 /// A numerically impossible window is also rejected before it can reach
 /// persistence or the UI.
+///
+/// `init_model` is `None` for an ordinary send, so this ordering change is inert
+/// on that path: a send always has a final assistant model, which still wins.
 fn select_context_window(
     result: &Value,
     final_assistant_model: Option<&str>,
+    init_model: Option<&str>,
     context_tokens_after_turn: Option<u64>,
 ) -> Option<SelectedContextWindow> {
     let model_usage = result.get("modelUsage").and_then(Value::as_object)?;
@@ -720,6 +946,8 @@ fn select_context_window(
     }
 
     let (model, sole_entry_fallback) = if let Some(model) = final_assistant_model {
+        (model, false)
+    } else if let Some(model) = init_model {
         (model, false)
     } else if let Some(model) = result.get("model").and_then(Value::as_str) {
         (model, false)
@@ -758,8 +986,24 @@ fn select_context_window(
 /// evidence the process is alive; `Liveness` renders nothing, so
 /// misclassifying a future content-bearing subtype degrades to exactly the
 /// old silent skip, never worse.
-fn parse_system_event(obj: &Value, turn_id: TurnId, agent_id: AgentId) -> ParseOutcome {
-    if obj.get("subtype").and_then(Value::as_str) != Some("init") {
+fn parse_system_event(
+    obj: &Value,
+    turn_id: TurnId,
+    agent_id: AgentId,
+    state: &mut ParserState,
+) -> ParseOutcome {
+    let subtype = obj.get("subtype").and_then(Value::as_str);
+    // Compaction-only: two of the subtypes that are pure liveness for a send
+    // carry this turn's entire meaning. Outside compaction mode they stay
+    // `Liveness` exactly as before.
+    if state.compacting() {
+        match subtype {
+            Some("status") => record_compaction_verdict(obj, state),
+            Some("compact_boundary") => record_compaction_occupancy(obj, state),
+            _ => {}
+        }
+    }
+    if subtype != Some("init") {
         return ParseOutcome::Event(AdapterEvent::Liveness { turn_id });
     }
 
@@ -768,6 +1012,12 @@ fn parse_system_event(obj: &Value, turn_id: TurnId, agent_id: AgentId) -> ParseO
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    // Stash the re-initialized session's model as the compaction's exact window
+    // key (see `ParserState::init_model`). Kept-first: the whole point is the
+    // model this dispatch ran under, and only one `init` is expected.
+    if state.compacting() && state.init_model.is_none() && !model.is_empty() {
+        state.init_model = Some(model.clone());
+    }
     let harness_version = obj
         .get("claude_code_version")
         .and_then(Value::as_str)
@@ -812,6 +1062,59 @@ fn parse_system_event(obj: &Value, turn_id: TurnId, agent_id: AgentId) -> ParseO
     })
 }
 
+/// Record the compaction verdict from a `system/status` record.
+///
+/// Claude emits two status records: an in-progress `status:"compacting"` with no
+/// `compact_result`, then the verdict with `status:null` and `compact_result`
+/// set. Keying on `compact_result` being a **string** is what distinguishes
+/// them — treating the in-progress record as a verdict would classify every
+/// compaction by whichever field happened to be absent.
+fn record_compaction_verdict(obj: &Value, state: &mut ParserState) {
+    let Some(result) = obj.get("compact_result").and_then(Value::as_str) else {
+        return;
+    };
+    state.compaction_verdict = Some(match result {
+        "success" => CompactionVerdict::Succeeded,
+        // Any non-success value is a failure, including one we have never seen:
+        // an unrecognized verdict must not fall through to "it worked."
+        //
+        // A blank `compact_error` is treated as absent, not as an empty message:
+        // an empty string here would win the precedence at `result` and mask the
+        // result record's own diagnostic.
+        _ => CompactionVerdict::Failed {
+            message: obj
+                .get("compact_error")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(str::to_owned),
+        },
+    });
+}
+
+/// Record before/after occupancy from a `system/compact_boundary`'s
+/// `compact_metadata`, whenever it arrives.
+///
+/// Deliberately **not** conditioned on a verdict having been seen — see
+/// [`ParserState::compaction_occupancy`]. Recording a boundary cannot make a
+/// turn succeed: [`parse_result`] reads this only when the verdict says success,
+/// so a boundary with no verdict still terminates as a failure with no usage.
+fn record_compaction_occupancy(obj: &Value, state: &mut ParserState) {
+    let Some(metadata) = obj.get("compact_metadata") else {
+        return;
+    };
+    let (Some(pre_tokens), Some(post_tokens)) = (
+        metadata.get("pre_tokens").and_then(Value::as_u64),
+        metadata.get("post_tokens").and_then(Value::as_u64),
+    ) else {
+        return;
+    };
+    state.compaction_occupancy = Some(CompactionOccupancy {
+        pre_tokens,
+        post_tokens,
+    });
+}
+
 fn parse_mcp_server_status(v: &Value) -> Option<McpServerStatus> {
     Some(McpServerStatus {
         name: v.get("name").and_then(Value::as_str)?.to_owned(),
@@ -836,7 +1139,14 @@ fn parse_mcp_server_status(v: &Value) -> Option<McpServerStatus> {
 /// from `HarnessError` to `AuthFailure`.
 fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseOutcome {
     let mut events = Vec::new();
-    track_assistant_context_usage(obj, state);
+    // A compaction's only assistant envelope is the harness-authored
+    // `<synthetic>` diagnostic on the refusal path, carrying a zero-valued
+    // `usage`. Tracking it would set occupancy to `Some(0)` — and if a window
+    // resolved beside it, the sidebar would render a confident 0% for a
+    // conversation that was never compacted.
+    if !state.compacting() {
+        track_assistant_context_usage(obj, state);
+    }
 
     // Track this message's Anthropic id as the turn's durable join key (keep
     // last → the final assistant message's id). Same envelope, same "keep last"
@@ -845,10 +1155,20 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
     // message by construction.
     // Announce the turn's dedup identity the first time we see an assistant
     // message id, so a live turn carries its `hydration_key` while streaming.
+    //
+    // **Never in compaction mode**, and this is the load-bearing half of the
+    // gating: the id on that envelope is minted for a synthetic refusal message
+    // that exists in no session file. Letting it through would make it the
+    // turn's `stable_message_id` (the cost/context sidecar join key) and
+    // `first_message_id` (the live↔disk `hydration_key`) — two durable keys
+    // pointing at a message nothing can ever join against. Both stay `None` on
+    // every compaction terminal, which is what decision 6 and 7's "live-only"
+    // properties rest on.
     let message_id = obj
         .get("message")
         .and_then(|m| m.get("id"))
-        .and_then(Value::as_str);
+        .and_then(Value::as_str)
+        .filter(|_| !state.compacting());
     if let Some(id) = message_id {
         state.last_assistant_message_id = Some(id.to_owned());
     }
@@ -896,8 +1216,14 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
     // The identity event leads; tool_use blocks follow. A first assistant
     // envelope with no content array still emits the identity (it's decoupled
     // from content) rather than being dropped by an early `Skip`.
-    if let Some(content) = content {
-        if is_synthetic && envelope_error.is_none() {
+    //
+    // A compaction contributes no content of any kind: the auth stash and the
+    // model keep-last above are the entire reason its envelope is parsed at all.
+    if let Some(content) = content.filter(|_| !state.compacting()) {
+        // The compaction verdict already carries the refusal text, and the
+        // frontend renders it on the failed compaction row — emitting the
+        // envelope's copy as content would print the same sentence twice.
+        if is_synthetic && envelope_error.is_none() && !state.compacting() {
             append_synthetic_text_events(content, turn_id, state, &mut events);
         }
         for block in content {
@@ -1182,7 +1508,7 @@ mod tests {
 
     /// Drive a turn to its folded terminal on `model`, returning the stamped effort.
     fn terminal_effort_for(model: &str, dispatched: Option<&str>) -> Option<String> {
-        let mut state = ParserState::with_dispatched_effort(dispatched.map(str::to_owned));
+        let mut state = ParserState::for_stream(StreamMode::Send, dispatched.map(str::to_owned));
         let turn = tid();
         let assistant = format!(
             r#"{{"type":"assistant","message":{{"id":"m1","model":"{model}","content":[{{"type":"text","text":"ok"}}]}}}}"#
@@ -1263,7 +1589,7 @@ mod tests {
     fn terminal_withholds_effort_when_no_model_ran() {
         // An auth/argument failure dies before any assistant record, so there is
         // no resolved model — and no honest effort to report either.
-        let mut state = ParserState::with_dispatched_effort(Some("high".to_owned()));
+        let mut state = ParserState::for_stream(StreamMode::Send, Some("high".to_owned()));
         let turn = tid();
         match parse_line(
             r#"{"type":"result","is_error":true,"result":"boom"}"#,
@@ -1638,7 +1964,7 @@ mod tests {
             }
         });
         assert_eq!(
-            select_context_window(&result, Some("claude-sonnet-5"), Some(600_000)),
+            select_context_window(&result, Some("claude-sonnet-5"), None, Some(600_000)),
             Some(SelectedContextWindow {
                 model: "claude-sonnet-5".to_owned(),
                 context_window: 1_000_000,
@@ -1661,7 +1987,7 @@ mod tests {
             }
         });
         assert_eq!(
-            select_context_window(&result, Some("claude-opus-4-8"), Some(600_000)),
+            select_context_window(&result, Some("claude-opus-4-8"), None, Some(600_000)),
             Some(SelectedContextWindow {
                 model: "claude-opus-4-8".to_owned(),
                 context_window: 1_000_000,
@@ -1678,7 +2004,7 @@ mod tests {
             }
         });
         assert_eq!(
-            select_context_window(&result, Some("claude-opus-4-8"), Some(100_000)),
+            select_context_window(&result, Some("claude-opus-4-8"), None, Some(100_000)),
             Some(SelectedContextWindow {
                 model: "claude-opus-4-8".to_owned(),
                 context_window: 200_000,
@@ -1697,7 +2023,7 @@ mod tests {
             }
         });
         assert_eq!(
-            select_context_window(&result, Some("claude-opus-4-8"), Some(100_000)),
+            select_context_window(&result, Some("claude-opus-4-8"), None, Some(100_000)),
             None
         );
     }
@@ -1710,7 +2036,10 @@ mod tests {
                 "primary": {"inputTokens": 5000, "contextWindow": 200_000}
             }
         });
-        assert_eq!(select_context_window(&result, None, Some(10_000)), None);
+        assert_eq!(
+            select_context_window(&result, None, None, Some(10_000)),
+            None
+        );
     }
 
     #[test]
@@ -1721,7 +2050,7 @@ mod tests {
             }
         });
         assert_eq!(
-            select_context_window(&result, None, Some(600_000)),
+            select_context_window(&result, None, None, Some(600_000)),
             Some(SelectedContextWindow {
                 model: "claude-sonnet-5".to_owned(),
                 context_window: 1_000_000,
@@ -1740,7 +2069,7 @@ mod tests {
             }
         });
         assert_eq!(
-            select_context_window(&qualified, None, Some(600_000)),
+            select_context_window(&qualified, None, None, Some(600_000)),
             Some(SelectedContextWindow {
                 model: "claude-opus-4-8".to_owned(),
                 context_window: 1_000_000,
@@ -1756,7 +2085,7 @@ mod tests {
             }
         });
         assert_eq!(
-            select_context_window(&unrelated, None, Some(100_000)),
+            select_context_window(&unrelated, None, None, Some(100_000)),
             Some(SelectedContextWindow {
                 model: "claude-opus-4-8[beta]".to_owned(),
                 context_window: 200_000,
@@ -1773,7 +2102,7 @@ mod tests {
             }
         });
         assert_eq!(
-            select_context_window(&result, Some("missing-assistant-model"), Some(10)),
+            select_context_window(&result, Some("missing-assistant-model"), None, Some(10)),
             None
         );
     }
@@ -1786,7 +2115,7 @@ mod tests {
             }
         });
         assert_eq!(
-            select_context_window(&result, Some("claude-sonnet-5"), Some(596_970)),
+            select_context_window(&result, Some("claude-sonnet-5"), None, Some(596_970)),
             None
         );
     }
@@ -1794,13 +2123,13 @@ mod tests {
     #[test]
     fn select_context_window_empty_modelusage_returns_none() {
         let result = json!({"modelUsage": {}});
-        assert_eq!(select_context_window(&result, None, None), None);
+        assert_eq!(select_context_window(&result, None, None, None), None);
     }
 
     #[test]
     fn select_context_window_missing_modelusage_returns_none() {
         let result = json!({"result": "ok"});
-        assert_eq!(select_context_window(&result, None, None), None);
+        assert_eq!(select_context_window(&result, None, None, None), None);
     }
 
     #[test]
@@ -2700,5 +3029,505 @@ mod tests {
                 ..
             })
         ));
+    }
+}
+
+/// Compaction-mode parsing, driven from the two real captures in
+/// `tests/fixtures/claude/` (Claude 2.1.270, Switchboard's exact argv).
+///
+/// The property under test throughout: **the verdict is the `system/status`
+/// pair, never `result`** — both captures carry `result.subtype:"success"`,
+/// `is_error:false` and exit 0, so a parser that classified off `result` would
+/// report the refusal as a completed turn.
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use crate::events::ContextWindowSource;
+
+    const SUCCESS: &str = include_str!("../tests/fixtures/claude/compaction-success.jsonl");
+    const TOO_SMALL: &str = include_str!("../tests/fixtures/claude/compaction-too-small.jsonl");
+
+    fn tid() -> TurnId {
+        uuid::Uuid::nil()
+    }
+
+    fn aid() -> AgentId {
+        AgentId::from(uuid::Uuid::nil())
+    }
+
+    /// Replay a stream in `mode`, emitting the folded terminal at EOF with
+    /// `exit_outcome` — the adapter's exit-status gate, which the caller owns.
+    fn replay_with(
+        mode: StreamMode,
+        fixture: &str,
+        exit_outcome: TurnOutcome,
+    ) -> Vec<AdapterEvent> {
+        let mut state = ParserState::for_stream(mode, None);
+        let (turn_id, agent_id) = (tid(), aid());
+        let mut events: Vec<AdapterEvent> = Vec::new();
+        for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
+            match parse_line(line, turn_id, agent_id, &mut state) {
+                ParseOutcome::Event(ev) => events.push(ev),
+                ParseOutcome::Events(evs) => events.extend(evs),
+                ParseOutcome::Skip => {}
+                ParseOutcome::Error(e) => panic!("unexpected parse error: {e}"),
+            }
+        }
+        if let Some(end) = state.take_final_turn_end(turn_id, exit_outcome) {
+            events.push(end);
+        }
+        events
+    }
+
+    fn compact(fixture: &str) -> Vec<AdapterEvent> {
+        replay_with(StreamMode::Compaction, fixture, TurnOutcome::Completed)
+    }
+
+    fn terminals(events: &[AdapterEvent]) -> Vec<&AdapterEvent> {
+        events
+            .iter()
+            .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+            .collect()
+    }
+
+    fn sole_terminal(events: &[AdapterEvent]) -> &AdapterEvent {
+        let found = terminals(events);
+        assert_eq!(found.len(), 1, "exactly one terminal per turn");
+        found[0]
+    }
+
+    #[test]
+    fn success_folds_and_completes_with_occupancy_from_compact_metadata() {
+        let events = compact(SUCCESS);
+        let AdapterEvent::TurnEnd {
+            outcome,
+            usage,
+            context_window_source,
+            model,
+            stable_message_id,
+            first_message_id,
+            ..
+        } = sole_terminal(&events)
+        else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(*outcome, TurnOutcome::Completed);
+        let usage = usage
+            .as_ref()
+            .expect("a successful compaction reports usage");
+        // Straight from `compact_boundary.compact_metadata` — the turn makes no
+        // assistant call, so this is the only occupancy source that exists.
+        assert_eq!(usage.context_input_tokens, Some(23_423));
+        assert_eq!(usage.context_tokens_after_turn, Some(4_172));
+        // Resolved from the post-compaction `system/init` model, exactly.
+        assert_eq!(usage.context_window, Some(1_000_000));
+        assert!(matches!(
+            context_window_source,
+            Some(ContextWindowSource::StreamOnly { model }) if model == "claude-fable-5-1"
+        ));
+        // Billing telemetry still comes from `result` as usual.
+        assert_eq!(usage.total_cost_usd, Some(0.099_425));
+        // A compaction names no model: there is no assistant envelope to carry
+        // one, and the `system/init` model is deliberately not substituted (it
+        // announces the session's model, not evidence of what summarized).
+        assert_eq!(*model, None);
+        // No durable identity: a compaction produces no assistant message, so
+        // neither the hydration key nor the cost-join key may be invented.
+        assert_eq!(*stable_message_id, None);
+        assert_eq!(*first_message_id, None);
+    }
+
+    #[test]
+    fn a_folded_success_still_fails_on_a_dirty_exit() {
+        // The exit-status gate is the adapter's, and it applies to a compaction
+        // exactly as to a send: a folded success is not proof the process
+        // finished cleanly.
+        let dirty = TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message: "harness exited with code 1".to_owned(),
+        };
+        let events = replay_with(StreamMode::Compaction, SUCCESS, dirty.clone());
+        let AdapterEvent::TurnEnd { outcome, usage, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(*outcome, dirty);
+        // Partial work is still billed, so the folded telemetry rides the
+        // failure terminal — same rule as a send's dirty exit.
+        assert!(usage.is_some());
+    }
+
+    #[test]
+    fn a_refusal_fails_fast_with_the_harness_message_and_no_usage() {
+        let events = compact(TOO_SMALL);
+        let AdapterEvent::TurnEnd {
+            outcome,
+            usage,
+            stable_message_id,
+            first_message_id,
+            ..
+        } = sole_terminal(&events)
+        else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(
+            *outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message: "Not enough messages to compact.".to_owned(),
+            },
+            "the CLI's own message, classified from the verdict — not from `result`, \
+             which reports success"
+        );
+        // The refusal's `result` carries an empty `modelUsage`, so the extractor
+        // falls back to a schema-present all-zero `usage` with no window.
+        // Emitting it would blank the context bar after a no-op compaction.
+        assert_eq!(*usage, None);
+        // The `<synthetic>` refusal envelope carries a `message.id`; it must
+        // never become a hydration or cost-join key.
+        assert_eq!(*stable_message_id, None);
+        assert_eq!(*first_message_id, None);
+    }
+
+    #[test]
+    fn a_refusal_emits_no_content_and_no_identity() {
+        let events = compact(TOO_SMALL);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AdapterEvent::ContentChunk { .. })),
+            "the verdict already carries the refusal text — emitting the envelope's \
+             copy too would render the same sentence twice"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AdapterEvent::TurnIdentity { .. })),
+            "a synthetic message id must never be announced as the turn's dedup key"
+        );
+    }
+
+    #[test]
+    fn a_successful_compaction_emits_no_content() {
+        let events = compact(SUCCESS);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AdapterEvent::ContentChunk { .. })),
+            "the recap is harness-owned and hydrates from the session file; the live \
+             turn contributes no transcript content"
+        );
+    }
+
+    #[test]
+    fn session_meta_and_rate_limit_still_flow_through() {
+        let events = compact(SUCCESS);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AdapterEvent::SessionMeta { .. })),
+            "the post-compaction `system/init` still refreshes the agent's registry"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AdapterEvent::RateLimitEvent { .. })),
+            "rate-limit telemetry is agent-scoped and unaffected by the mode"
+        );
+    }
+
+    #[test]
+    fn a_result_with_no_verdict_fails_closed_rather_than_reporting_success() {
+        // `DISABLE_COMPACT=1` (and any future shape in which the command does
+        // not run) produces a `result` with no preceding verdict. Written
+        // against the absence of evidence, not that one cause.
+        let stream = r#"{"type":"system","subtype":"init","model":"claude-sonnet-5"}
+{"type":"result","subtype":"success","is_error":false,"result":"","modelUsage":{}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd { outcome, usage, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(
+            *outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message: "compaction did not run".to_owned(),
+            },
+            "a named harness error, not an AdapterFailure — `FailureKind` drives the \
+             frontend's recovery copy, and \"file a bug\" is wrong for something \
+             Claude declined"
+        );
+        assert_eq!(*usage, None);
+    }
+
+    #[test]
+    fn an_unrecognized_verdict_is_treated_as_a_failure() {
+        let stream = r#"{"type":"system","subtype":"status","status":null,"compact_result":"something_new"}
+{"type":"result","subtype":"success","is_error":false,"result":"","modelUsage":{}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd { outcome, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert!(
+            matches!(outcome, TurnOutcome::Failed { .. }),
+            "an unknown verdict must not fall through to success, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn an_auth_failed_compaction_stays_an_auth_failure() {
+        // An auth failure never reaches Claude's command handler, so it carries
+        // no verdict — and must not be swallowed by the no-verdict arm, which
+        // would replace an actionable "run `claude auth login`" with a generic
+        // harness error.
+        let stream = r#"{"type":"assistant","error":"authentication_failed","message":{"id":"msg_auth","model":"<synthetic>","content":[{"type":"text","text":"Not logged in · Please run /login"}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"","modelUsage":{}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd {
+            outcome,
+            first_message_id,
+            ..
+        } = sole_terminal(&events)
+        else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(
+            *outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::AuthFailure,
+                message: CLAUDE_AUTH_MESSAGE.to_owned(),
+            }
+        );
+        assert_eq!(
+            *first_message_id, None,
+            "even on the auth path a compaction mints no hydration key"
+        );
+    }
+
+    #[test]
+    fn the_init_model_resolves_the_window_across_a_multi_entry_model_usage() {
+        // The sole-entry fallback cannot help here; only the init model can.
+        let stream = r#"{"type":"system","subtype":"status","status":null,"compact_result":"success"}
+{"type":"system","subtype":"init","model":"claude-sonnet-5"}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":900,"post_tokens":100}}
+{"type":"result","subtype":"success","is_error":false,"result":"","modelUsage":{"claude-sonnet-5":{"inputTokens":10,"outputTokens":5,"contextWindow":200000},"claude-haiku-4-5-20251001":{"inputTokens":1,"outputTokens":1,"contextWindow":111111}}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd { usage, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(
+            usage.as_ref().and_then(|u| u.context_window),
+            Some(200_000),
+            "the parent model's window, not the auxiliary model's"
+        );
+    }
+
+    #[test]
+    fn an_init_model_absent_from_model_usage_resolves_no_window_but_keeps_usage() {
+        // Fail closed: never bind a window we cannot name. The row's numbers
+        // come from `compact_metadata`, so the turn is still fully reportable —
+        // the bar clean-hides until the next turn rather than showing a
+        // pre-compaction percentage that is now wrong.
+        let stream = r#"{"type":"system","subtype":"status","status":null,"compact_result":"success"}
+{"type":"system","subtype":"init","model":"claude-model-that-did-not-bill"}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":900,"post_tokens":100}}
+{"type":"result","subtype":"success","is_error":false,"result":"","modelUsage":{"claude-sonnet-5":{"inputTokens":10,"outputTokens":5,"contextWindow":200000}}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd {
+            outcome,
+            usage,
+            context_window_source,
+            ..
+        } = sole_terminal(&events)
+        else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(*outcome, TurnOutcome::Completed);
+        let usage = usage.as_ref().expect("usage survives an unresolved window");
+        assert_eq!(usage.context_window, None);
+        assert_eq!(usage.context_tokens_after_turn, Some(100));
+        assert_eq!(*context_window_source, None);
+    }
+
+    #[test]
+    fn a_window_smaller_than_the_post_compaction_occupancy_is_rejected() {
+        // The impossible-window check is fed the compaction's own occupancy, so
+        // it stays live on a path that has no assistant call to derive one from.
+        let stream = r#"{"type":"system","subtype":"status","status":null,"compact_result":"success"}
+{"type":"system","subtype":"init","model":"claude-sonnet-5"}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":900000,"post_tokens":500000}}
+{"type":"result","subtype":"success","is_error":false,"result":"","modelUsage":{"claude-sonnet-5":{"inputTokens":10,"outputTokens":5,"contextWindow":200000}}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd { usage, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(usage.as_ref().and_then(|u| u.context_window), None);
+    }
+
+    #[test]
+    fn a_success_without_a_boundary_completes_with_no_occupancy() {
+        // Defensive: the boundary is the only occupancy source, so losing it
+        // must cost the numbers, not the turn.
+        let stream = r#"{"type":"system","subtype":"status","status":null,"compact_result":"success"}
+{"type":"system","subtype":"init","model":"claude-sonnet-5"}
+{"type":"result","subtype":"success","is_error":false,"result":"","modelUsage":{"claude-sonnet-5":{"inputTokens":10,"outputTokens":5,"contextWindow":200000}}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd { outcome, usage, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(*outcome, TurnOutcome::Completed);
+        let usage = usage.as_ref().expect("billing telemetry still present");
+        assert_eq!(usage.context_input_tokens, None);
+        assert_eq!(usage.context_tokens_after_turn, None);
+    }
+
+    #[test]
+    fn a_boundary_arriving_before_the_verdict_still_reports_the_occupancy() {
+        // The observed order is verdict-then-boundary, but Claude emits both
+        // from one routine and that order is not a documented contract. If it
+        // ever flips, the compaction must still report its numbers — the
+        // alternative is a success that silently renders no counts and hides the
+        // context bar, which no offline test would otherwise catch.
+        let stream = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":23423,"post_tokens":4172}}
+{"type":"system","subtype":"status","status":null,"compact_result":"success"}
+{"type":"system","subtype":"init","model":"claude-sonnet-5"}
+{"type":"result","subtype":"success","is_error":false,"result":"","modelUsage":{"claude-sonnet-5":{"inputTokens":10,"outputTokens":5,"contextWindow":200000}}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd { outcome, usage, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(*outcome, TurnOutcome::Completed);
+        let usage = usage.as_ref().expect("occupancy survives the reordering");
+        assert_eq!(usage.context_input_tokens, Some(23_423));
+        assert_eq!(usage.context_tokens_after_turn, Some(4_172));
+    }
+
+    #[test]
+    fn a_boundary_without_a_verdict_never_invents_a_success() {
+        // The safety property the decoupling above must not weaken: recording a
+        // boundary independently of the verdict cannot make a turn succeed. Only
+        // the verdict decides the terminal.
+        let stream = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":23423,"post_tokens":4172}}
+{"type":"system","subtype":"init","model":"claude-sonnet-5"}
+{"type":"result","subtype":"success","is_error":false,"result":"","modelUsage":{"claude-sonnet-5":{"inputTokens":10,"outputTokens":5,"contextWindow":200000}}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd { outcome, usage, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert!(
+            matches!(outcome, TurnOutcome::Failed { .. }),
+            "a boundary alone is not a verdict, got {outcome:?}"
+        );
+        assert_eq!(*usage, None, "and it carries no usage");
+    }
+
+    #[test]
+    fn a_missing_verdict_carries_the_results_own_diagnostic() {
+        // Classification stays fail-closed; the message is best-available.
+        // Without this, every cause outside the two captured shapes collapsed to
+        // a bare "compaction did not run" and told the user nothing about
+        // whether a retry could work.
+        let stream = r#"{"type":"system","subtype":"init","model":"claude-sonnet-5"}
+{"type":"result","subtype":"success","is_error":false,"result":"Compaction is disabled in this environment.","modelUsage":{}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd { outcome, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(
+            *outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message: "compaction did not run: Compaction is disabled in this environment."
+                    .to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_api_error_before_the_verdict_keeps_its_text() {
+        // This arm runs AHEAD of the generic `is_error` / `api_error_status`
+        // handling, so an API error that kills a compaction reads as "did not
+        // run" plus the CLI's text — the same `HarnessError` kind the generic
+        // path would give, plus the fact that nothing was compacted. Asserted so
+        // a later reordering of the arms cannot silently drop the API text.
+        let stream = r#"{"type":"system","subtype":"init","model":"claude-sonnet-5"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"result":"API Error: 500 overloaded","modelUsage":{}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd { outcome, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        let TurnOutcome::Failed { kind, message } = outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert_eq!(*kind, FailureKind::HarnessError);
+        assert!(
+            message.contains("API Error: 500 overloaded"),
+            "the API error text must survive, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_verdict_without_compact_error_falls_back_to_the_result_text() {
+        // A blank `compact_error` is treated as absent, not as an empty message —
+        // otherwise it would win the precedence and mask the better diagnostic.
+        let stream = r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"   "}
+{"type":"system","subtype":"init","model":"claude-sonnet-5"}
+{"type":"result","subtype":"success","is_error":false,"result":"Quota exhausted.","modelUsage":{}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd { outcome, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(
+            *outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message: "Quota exhausted.".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_failure_with_no_diagnostic_anywhere_falls_back_to_authored_copy() {
+        let stream = r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed"}
+{"type":"result","subtype":"success","is_error":false,"result":"","modelUsage":{}}"#;
+        let events = compact(stream);
+        let AdapterEvent::TurnEnd { outcome, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        let TurnOutcome::Failed { message, .. } = outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert!(
+            !message.trim().is_empty(),
+            "a failure must always say something"
+        );
+    }
+
+    #[test]
+    fn outside_compaction_mode_the_same_status_records_stay_liveness() {
+        // Pins the existing send-path behavior: the compaction rules are gated
+        // on the mode, not on the record shape.
+        let events = replay_with(StreamMode::Send, TOO_SMALL, TurnOutcome::Completed);
+        let AdapterEvent::TurnEnd { outcome, usage, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(
+            *outcome,
+            TurnOutcome::Completed,
+            "a send reads this stream as an ordinary completed turn — the verdict is \
+             meaningless to it"
+        );
+        assert!(usage.is_some(), "a send keeps `result`'s zero-valued usage");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AdapterEvent::ContentChunk { .. })),
+            "a send surfaces synthetic text as content, as it does for `/plugin`"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AdapterEvent::TurnIdentity { .. })),
+            "a send still announces its dedup identity"
+        );
     }
 }

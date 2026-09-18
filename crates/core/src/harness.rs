@@ -157,6 +157,42 @@ impl HarnessKind {
             Self::Codex | Self::Antigravity => false,
         }
     }
+
+    /// Whether Switchboard can ask this harness to **compact an existing
+    /// conversation on demand** — summarize the history so far and continue
+    /// from the summary, the headless equivalent of the interactive `/compact`.
+    ///
+    /// True only for Claude, whose CLI marks `/compact` `supportsNonInteractive`
+    /// and intercepts it locally on the ordinary `-p` dispatch path: no new
+    /// transport, and the model never sees the command as a prompt.
+    ///
+    /// **Codex can compact, but only through a transport we do not run.** Its
+    /// compaction exists solely as the experimental `codex app-server`
+    /// `thread/compact/start` RPC; `codex exec` — the one-shot subprocess the
+    /// Codex adapter drives — cannot do it at all. That is the same reasoning
+    /// [`Self::supports_session_fork`] gives for `thread/fork`, and the cost is
+    /// the transport, not the call. **Antigravity** ships the command in its
+    /// binary but behind the remote Unleash flag `enable-compact-slash-command`,
+    /// which is off; because the gate is a *remote* flag it can open without a
+    /// version bump, so re-probe rather than trusting this arm forever.
+    ///
+    /// **This predicate is the guard against a silent lie, not a mere feature
+    /// gate.** Sending `/compact` as an ordinary *prompt* to Codex or
+    /// Antigravity is answered by the model claiming the context was compacted
+    /// while nothing is compacted — verified against both on-disk transcripts,
+    /// not the printed reply. So "just send `/compact` everywhere" is correct
+    /// for exactly one harness and fabricated success on the other two; a
+    /// compact action must be per-harness and mechanism-verified. Per
+    /// `harness-behavior.md` §3.9.
+    ///
+    /// Same authority + exhaustiveness role as the four siblings above.
+    #[must_use]
+    pub fn supports_manual_compaction(self) -> bool {
+        match self {
+            Self::ClaudeCode => true,
+            Self::Codex | Self::Antigravity => false,
+        }
+    }
 }
 
 /// The two independent per-agent selection axes. A closed, complete set — model
@@ -281,6 +317,17 @@ mod tests {
         assert!(HarnessKind::ClaudeCode.supports_session_fork());
         assert!(!HarnessKind::Codex.supports_session_fork());
         assert!(!HarnessKind::Antigravity.supports_session_fork());
+    }
+
+    #[test]
+    fn supports_manual_compaction_is_claude_only() {
+        // Codex's compaction is real but lives behind the app-server transport
+        // the adapter doesn't run; Antigravity's is remote-flag-gated off. On
+        // both, a `/compact` *prompt* is answered with a fabricated success —
+        // this gate is what keeps the action off those agents.
+        assert!(HarnessKind::ClaudeCode.supports_manual_compaction());
+        assert!(!HarnessKind::Codex.supports_manual_compaction());
+        assert!(!HarnessKind::Antigravity.supports_manual_compaction());
     }
 
     #[test]

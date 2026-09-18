@@ -31,6 +31,7 @@ vi.mock("$lib/state/workspace.svelte", () => ({
 const agentSessionInfoMock = vi.fn();
 const openSessionFileMock = vi.fn();
 const resumeAgentInTerminalMock = vi.fn<(id: string) => Promise<void>>();
+const compactAgentMock = vi.fn<(agentId: string, sendId: string) => Promise<string>>();
 vi.mock("$lib/api", () => ({
   agentSessionInfo: (id: string) => agentSessionInfoMock(id),
   openSessionFile: async (id: string) => {
@@ -38,6 +39,10 @@ vi.mock("$lib/api", () => ({
   },
   resumeAgentInTerminal: (id: string) => resumeAgentInTerminalMock(id),
   cancelAgent: vi.fn(),
+  cancelSend: vi.fn(),
+  cancelTurn: vi.fn(),
+  compactAgent: (agentId: string, sendId: string) => compactAgentMock(agentId, sendId),
+  loadTranscript: vi.fn(),
 }));
 
 const copyTextMock = vi.fn<(t: string) => Promise<void>>();
@@ -126,6 +131,8 @@ beforeEach(() => {
   resumeAgentInTerminalMock.mockResolvedValue(undefined);
   copyTextMock.mockReset();
   copyTextMock.mockResolvedValue(undefined);
+  compactAgentMock.mockReset();
+  compactAgentMock.mockResolvedValue("00000000-0000-7000-8000-00000000c003");
 });
 
 beforeEach(async () => {
@@ -272,12 +279,13 @@ describe("Sidebar", () => {
     ).toEqual([
       "Rename",
       "Collapse",
+      "Compact context",
       "Resume in terminal",
       "Open session file",
       "Model settings…",
       "Delete agent",
     ]);
-    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(6);
+    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(7);
   });
 
   it("shows only currently available menu actions", async () => {
@@ -2070,6 +2078,16 @@ describe("Sidebar pane visibility + assignment", () => {
 });
 
 describe("Sidebar — agent reordering", () => {
+  // A completed or cancelled drag arms a capture-phase `click` listener on
+  // `window` to swallow the synthesized click, and removes it on a `setTimeout(0)`
+  // macrotask. A test that ends right after `pointerUp` never lets that macrotask
+  // run, so the listener outlives the test and eats the first click of the next
+  // one — which manifests as an unrelated menu that mysteriously won't open.
+  // Draining one macrotask here lets the guard disarm itself.
+  afterEach(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
   const THREE_AGENTS = [CLAUDE_AGENT, CODEX_AGENT, ANTIGRAVITY_AGENT];
 
   function grip(index: number): HTMLElement {
@@ -2187,5 +2205,381 @@ describe("Sidebar — agent reordering", () => {
     await fireEvent.keyDown(window, { key: "Escape" });
     await fireEvent.pointerUp(handle, { pointerId: 1 });
     expect(reorderAgentsMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("compact context action", () => {
+  it("is offered for a Claude agent", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const menu = await openAgentActions();
+    expect(within(menu).getByTestId("agent-action-compact")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["codex", CODEX_AGENT],
+    ["antigravity", ANTIGRAVITY_AGENT],
+  ])("is withheld from a %s agent", async (_harness, agent) => {
+    // The capability gate, on the surface a user actually touches. Offering it
+    // here would produce a refusal at best — and the reason the refusal has to
+    // be real is that a `/compact` *prompt* to these harnesses returns a
+    // model-authored claim of success while nothing compacted.
+    const state = await loadState();
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    const menu = await openAgentActions();
+    expect(within(menu).queryByTestId("agent-action-compact")).toBeNull();
+    // The menu did render — an empty one would pass the assertion above for the
+    // wrong reason.
+    expect(within(menu).getByTestId("agent-action-rename")).toBeInTheDocument();
+  });
+
+  it("dispatches a compaction and registers its pending entry", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-action-compact"));
+
+    await waitFor(() => expect(compactAgentMock).toHaveBeenCalledTimes(1));
+    const [agentId, sendId] = compactAgentMock.mock.calls[0]!;
+    expect(agentId).toBe(CLAUDE_AGENT.id);
+    // The send id is minted here so the queued row has something to cancel with
+    // before any `turn_start` carries it back.
+    expect(sendId).toMatch(/^[0-9a-f-]{36}$/);
+    await waitFor(() => {
+      const pending = state.runtimes[CLAUDE_AGENT.id]?.pending_sends ?? [];
+      expect(pending).toHaveLength(1);
+      expect(pending[0]?.kind).toBe("compaction");
+      expect(pending[0]?.send_id).toBe(sendId);
+      expect(pending[0]?.queued_at).toBeDefined();
+    });
+  });
+
+  it("is still offered while the agent is busy, because a compaction queues", async () => {
+    // Decision 1. Greying it out would refuse something the backend accepts, and
+    // would push the user into watching the agent to catch it idle.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.dispatchUserTurn(
+      CLAUDE_AGENT.id,
+      "00000000-0000-7000-8000-000000000001",
+      "go",
+      [],
+      "00000000-0000-7000-8000-0000000000d1",
+      "2026-05-16T00:00:00Z",
+    );
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const menu = await openAgentActions();
+    const item = within(menu).getByTestId("agent-action-compact");
+    expect(item).toBeInTheDocument();
+    expect(item).not.toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("moves the context bar to the compaction's post-compaction occupancy", async () => {
+    // The user-visible payoff of the whole feature: the bar has to drop. It
+    // reads the latest terminal turn carrying usage, and a compaction is exactly
+    // that — no sidebar change was needed, which this pins.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          context_input_tokens: 120_000,
+          context_tokens_after_turn: 120_000,
+          context_window: 200_000,
+        },
+      },
+      {
+        role: "agent",
+        turn_id: "turn-compaction",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:02Z",
+        ended_at: "2026-05-16T00:00:03Z",
+        status: "complete",
+        kind: "compaction",
+        items: [],
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          context_input_tokens: 120_000,
+          context_tokens_after_turn: 20_000,
+          context_window: 200_000,
+        },
+      },
+    ];
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent(
+      "context after last turn: 10%",
+    );
+  });
+
+  it("leaves the bar unchanged after a compaction that carried no usage", async () => {
+    // A *refused* compaction withholds usage entirely, so the previous turn's
+    // number is still the truth. Blanking the bar would tell the user their
+    // context is unknown when nothing about it changed.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          context_input_tokens: 120_000,
+          context_tokens_after_turn: 120_000,
+          context_window: 200_000,
+        },
+      },
+      {
+        role: "agent",
+        turn_id: "turn-compaction",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:02Z",
+        ended_at: "2026-05-16T00:00:03Z",
+        status: "failed",
+        kind: "compaction",
+        items: [],
+        error: "Not enough messages to compact.",
+      },
+    ];
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent(
+      "context after last turn: 60%",
+    );
+  });
+});
+
+describe("compact button on the context bar", () => {
+  /// The button lives inside the context bar, which only renders once a turn
+  /// has reported occupancy — so every test here needs one.
+  function seedContextBar(state: Awaited<ReturnType<typeof loadState>>, agent: AgentRecord): void {
+    state.transcripts[agent.id] = [
+      {
+        role: "agent",
+        turn_id: `turn-1-${agent.id}`,
+        agent_id: agent.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          context_input_tokens: 120_000,
+          context_tokens_after_turn: 120_000,
+          context_window: 200_000,
+        },
+      },
+    ];
+  }
+
+  it("is offered for a Claude agent, beside the bar it acts on", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const bar = await screen.findByTestId("agent-context-bar");
+    expect(within(bar).getByTestId("agent-compact-button")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["codex", CODEX_AGENT],
+    ["antigravity", ANTIGRAVITY_AGENT],
+  ])("is withheld from a %s agent", async (_harness, agent) => {
+    // The same capability gate the menu item carries. Both harnesses report
+    // context, so the bar renders and only the button must be absent — which is
+    // what makes this a real gate test rather than an absent-bar test.
+    const state = await loadState();
+    await state.registerAgent(agent);
+    seedContextBar(state, agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    const bar = await screen.findByTestId("agent-context-bar");
+    expect(within(bar).queryByTestId("agent-compact-button")).toBeNull();
+  });
+
+  it("does not render for a Claude agent whose context is unknown", async () => {
+    // No bar, no button: the affordance is anchored to the measurement, and a
+    // fresh agent pre-first-turn has none.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    await screen.findAllByTestId("agent-actions-trigger");
+    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+    expect(screen.queryByTestId("agent-compact-button")).toBeNull();
+  });
+
+  it("arms on the first click without dispatching", async () => {
+    // The safety property the whole two-step exists for: a compaction spends a
+    // turn's tokens and cannot be undone, so one stray click must cost nothing.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const button = await screen.findByTestId("agent-compact-button");
+    expect(button).toHaveAttribute("data-armed", "false");
+    await fireEvent.click(button);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-compact-button")).toHaveAttribute("data-armed", "true"),
+    );
+    expect(compactAgentMock).not.toHaveBeenCalled();
+    // The label moves with the state, so a screen-reader user is told what the
+    // next click does rather than being handed the same button twice.
+    expect(screen.getByTestId("agent-compact-button")).toHaveAccessibleName("Compact now");
+  });
+
+  it("dispatches on the second click and returns to rest", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const button = await screen.findByTestId("agent-compact-button");
+    await fireEvent.click(button);
+    await fireEvent.click(await screen.findByTestId("agent-compact-button"));
+
+    await waitFor(() => expect(compactAgentMock).toHaveBeenCalledTimes(1));
+    const [agentId, sendId] = compactAgentMock.mock.calls[0]!;
+    expect(agentId).toBe(CLAUDE_AGENT.id);
+    expect(sendId).toMatch(/^[0-9a-f-]{36}$/);
+    await waitFor(() => {
+      const pending = state.runtimes[CLAUDE_AGENT.id]?.pending_sends ?? [];
+      expect(pending).toHaveLength(1);
+      expect(pending[0]?.kind).toBe("compaction");
+      expect(pending[0]?.send_id).toBe(sendId);
+    });
+    // Disarmed after firing, so the next click starts the two-step over rather
+    // than queueing a second compaction on one more click.
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-compact-button")).toHaveAttribute("data-armed", "false"),
+    );
+  });
+
+  it("disarms when the pointer leaves, so a later click re-arms instead of firing", async () => {
+    // Walking away is the undo. Without it the button stays armed indefinitely
+    // and a click minutes later — on what looks like an ordinary icon — spends
+    // a turn.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const button = await screen.findByTestId("agent-compact-button");
+    await fireEvent.click(button);
+    await fireEvent.pointerLeave(screen.getByTestId("agent-compact-button"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-compact-button")).toHaveAttribute("data-armed", "false"),
+    );
+    await fireEvent.click(screen.getByTestId("agent-compact-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-compact-button")).toHaveAttribute("data-armed", "true"),
+    );
+    expect(compactAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("disarms on blur, so a keyboard user who tabs away doesn't leave it armed", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const button = await screen.findByTestId("agent-compact-button");
+    await fireEvent.click(button);
+    await fireEvent.blur(screen.getByTestId("agent-compact-button"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-compact-button")).toHaveAttribute("data-armed", "false"),
+    );
+    expect(compactAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("arms one agent at a time", async () => {
+    // Two Claude agents: arming one must not arm the other, or a confirm click
+    // aimed at the first would fire the second.
+    const state = await loadState();
+    const second: AgentRecord = {
+      ...CLAUDE_AGENT,
+      id: "00000000-0000-7000-8000-00000000ca02",
+      name: "claude-two",
+    };
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(second);
+    seedContextBar(state, CLAUDE_AGENT);
+    seedContextBar(state, second);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, second] } });
+
+    const buttons = await screen.findAllByTestId("agent-compact-button");
+    expect(buttons).toHaveLength(2);
+    await fireEvent.click(buttons[0]!);
+
+    await waitFor(() => {
+      const [first, other] = screen.getAllByTestId("agent-compact-button");
+      expect(first).toHaveAttribute("data-armed", "true");
+      expect(other).toHaveAttribute("data-armed", "false");
+    });
+
+    // Clicking the other one arms it — it does not inherit the first's confirm.
+    await fireEvent.click(screen.getAllByTestId("agent-compact-button")[1]!);
+    await waitFor(() =>
+      expect(screen.getAllByTestId("agent-compact-button")[1]!).toHaveAttribute(
+        "data-armed",
+        "true",
+      ),
+    );
+    expect(compactAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("queues like the menu action while the agent is busy", async () => {
+    // Decision 1 on this surface too: never disabled mid-turn, because the
+    // backend accepts it and queues it.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    state.dispatchUserTurn(
+      CLAUDE_AGENT.id,
+      "00000000-0000-7000-8000-000000000001",
+      "go",
+      [],
+      "00000000-0000-7000-8000-0000000000d1",
+      "2026-05-16T00:00:00Z",
+    );
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const button = await screen.findByTestId("agent-compact-button");
+    expect(button).not.toBeDisabled();
+    await fireEvent.click(button);
+    await fireEvent.click(await screen.findByTestId("agent-compact-button"));
+
+    await waitFor(() => expect(compactAgentMock).toHaveBeenCalledTimes(1));
   });
 });

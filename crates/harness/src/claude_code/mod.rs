@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome};
-use crate::parser::{self, ParseOutcome, ParserState};
+use crate::parser::{self, ParseOutcome, ParserState, StreamMode};
 
 /// Adapter for Claude Code (`claude -p`). Spawns a `claude` subprocess,
 /// feeds the prompt as a positional argument, and maps the stream-json output
@@ -158,57 +158,149 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         let binary = crate::subprocess::resolve_binary(&self.claude_binary_path)?;
         let args = build_args(&BuildArgsInput {
             agent,
-            prompt,
+            invocation: Invocation::Prompt(prompt),
             cwd,
             chrome: options.chrome_integration,
             home_override: None,
             grants: &self.working_directory_grants,
         });
 
-        let mut command = tokio::process::Command::new(&binary);
-        command
-            .args(&args)
-            .current_dir(cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Null stdin: we never write to it, and an open stdin can stall a
-            // harness on an interactive read or a pipe-full deadlock.
-            .stdin(Stdio::null())
-            // Belt-and-suspenders teardown: `kill_on_drop` fires only when
-            // `child` is dropped, which happens if the producer task itself is
-            // dropped/aborted. Intentional cancellation flows through
-            // `options.cancel_token` (watched in `run_producer`), which kills
-            // the whole process group; `kill_on_drop` just covers the
-            // producer-task-teardown edge.
-            .kill_on_drop(true);
-        crate::subprocess::apply_path_env(&mut command);
-        // Own process group so `killpg` (in the cancel path) tears down the
-        // entire subprocess tree, not just the spawned PID.
-        #[cfg(unix)]
-        command.process_group(0);
-        let mut child = command
-            .spawn()
-            .map_err(|e| crate::subprocess::map_spawn_error(e, cwd))?;
-
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let agent_id = agent.id;
-
-        tokio::spawn(run_producer(
-            child,
-            stdout,
-            stderr,
-            tx,
+        spawn_stream(
+            &binary,
+            &args,
+            cwd,
+            agent,
             turn_id,
-            agent_id,
-            agent.effort.clone(),
+            StreamMode::Send,
             options.cancel_token,
-        ));
-
-        Ok(Box::pin(UnboundedReceiverStream::new(rx)))
+        )
     }
+
+    /// Compact this agent's conversation. Shares every dispatch flag with a
+    /// send — resume, model, effort, chrome, `--add-dir`,
+    /// `--include-partial-messages` — because the summarization call is real,
+    /// billed work that must run under the model the user chose for this agent.
+    ///
+    /// `options.is_first_dispatch_after_attach` is ignored, for the same reason
+    /// `dispatch` ignores it: Claude re-emits `SessionMeta` from `system/init`
+    /// on every invocation, including this one.
+    ///
+    /// Fails closed when the agent has no resolvable session file. A compaction
+    /// is never a session's first dispatch, so an absent file means either a
+    /// never-dispatched agent or a fork whose materializing turn has not run —
+    /// and letting the CLI proceed would mint a fresh session whose entire
+    /// contents are one failed compaction, or silently branch a fork as the side
+    /// effect of a maintenance action. The app layer refuses earlier with better
+    /// copy; this is the boundary that makes the guarantee structural.
+    async fn compact(
+        &self,
+        agent: &AgentRecord,
+        cwd: &Path,
+        turn_id: TurnId,
+        options: crate::DispatchOptions,
+    ) -> Result<EventStream, DispatchError> {
+        let Some(SessionLocator::Uuid(session_id)) = &agent.session_locator else {
+            return Err(DispatchError::InvalidAgentState(format!(
+                "Claude agent {} has no session locator — there is no conversation to compact",
+                agent.id
+            )));
+        };
+        if !session_file_exists(cwd, session_id) {
+            return Err(DispatchError::InvalidAgentState(format!(
+                "Claude agent {} has no session file yet — there is no conversation to compact",
+                agent.id
+            )));
+        }
+        let binary = crate::subprocess::resolve_binary(&self.claude_binary_path)?;
+        let args = build_args(&BuildArgsInput {
+            agent,
+            invocation: Invocation::Compact,
+            cwd,
+            chrome: options.chrome_integration,
+            home_override: None,
+            grants: &self.working_directory_grants,
+        });
+        spawn_stream(
+            &binary,
+            &args,
+            cwd,
+            agent,
+            turn_id,
+            StreamMode::Compaction,
+            options.cancel_token,
+        )
+    }
+}
+
+/// Spawn `claude` with `args` and return the parsed event stream. Shared by
+/// `dispatch` and `compact`: the process handling (process group, null stdin,
+/// kill-on-drop, the producer task) is identical for both, and only the
+/// argument list and the parser's [`StreamMode`] differ.
+fn spawn_stream(
+    binary: &Path,
+    args: &[String],
+    cwd: &Path,
+    agent: &AgentRecord,
+    turn_id: TurnId,
+    mode: StreamMode,
+    cancel_token: CancellationToken,
+) -> Result<EventStream, DispatchError> {
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Null stdin: we never write to it, and an open stdin can stall a
+        // harness on an interactive read or a pipe-full deadlock.
+        .stdin(Stdio::null())
+        // Belt-and-suspenders teardown: `kill_on_drop` fires only when
+        // `child` is dropped, which happens if the producer task itself is
+        // dropped/aborted. Intentional cancellation flows through
+        // `cancel_token` (watched in `run_producer`), which kills
+        // the whole process group; `kill_on_drop` just covers the
+        // producer-task-teardown edge.
+        .kill_on_drop(true);
+    crate::subprocess::apply_path_env(&mut command);
+    // Own process group so `killpg` (in the cancel path) tears down the
+    // entire subprocess tree, not just the spawned PID.
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|e| crate::subprocess::map_spawn_error(e, cwd))?;
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    tokio::spawn(run_producer(
+        child,
+        stdout,
+        stderr,
+        tx,
+        turn_id,
+        agent.id,
+        agent.effort.clone(),
+        mode,
+        cancel_token,
+    ));
+
+    Ok(Box::pin(UnboundedReceiverStream::new(rx)))
+}
+
+/// What a `claude -p` invocation asks the CLI to do. The two forms share every
+/// flag and differ only in the positional — which is exactly the property the
+/// `compaction_argv_matches_send_argv_except_the_positional` test pins, so the
+/// two cannot drift as flags are added.
+#[derive(Clone, Copy)]
+enum Invocation<'a> {
+    /// An ordinary turn carrying the user's message.
+    Prompt(&'a str),
+    /// Compact the agent's existing conversation. See
+    /// [`ClaudeCodeAdapter::compact`].
+    Compact,
 }
 
 /// Everything one `claude -p` invocation is built from. A struct rather than
@@ -217,7 +309,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 #[derive(Clone, Copy)]
 struct BuildArgsInput<'a> {
     agent: &'a AgentRecord,
-    prompt: &'a str,
+    invocation: Invocation<'a>,
     cwd: &'a Path,
     /// Enables the Claude in Chrome browser tools for this turn.
     chrome: bool,
@@ -230,7 +322,7 @@ struct BuildArgsInput<'a> {
 fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
     let BuildArgsInput {
         agent,
-        prompt,
+        invocation,
         cwd,
         chrome,
         home_override,
@@ -253,16 +345,35 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
         // subprocess — claude computes its own session-storage path from
         // its actual cwd, so any divergence here means we look in the
         // wrong place and pass `--session-id` when we should `--resume`.
-        let exists = match home_override {
-            Some(home) => session_exists_in(home, cwd, session_id),
-            None => session_file_exists(cwd, session_id),
-        };
-        match (exists, agent.forked_from_session) {
-            // The agent's own session exists: an ordinary resume. A forked
-            // agent takes this branch for every turn after its first, so the
-            // fork flags appear exactly once in its lifetime even though the
-            // provenance field is never cleared.
-            (true, _) => {
+        //
+        // Only the prompt arms consult the file — a compaction resumes its own
+        // session whatever the answer — so short-circuit rather than stat a path
+        // whose result the `Compact` arm discards.
+        let exists = matches!(invocation, Invocation::Prompt(_))
+            && match home_override {
+                Some(home) => session_exists_in(home, cwd, session_id),
+                None => session_file_exists(cwd, session_id),
+            };
+        match (invocation, exists, agent.forked_from_session) {
+            // An ordinary resume, reached two ways.
+            //
+            // A send takes it once the agent's own session file exists. A forked
+            // agent lands here for every turn after its first, so the fork flags
+            // appear exactly once in its lifetime even though the provenance
+            // field is never cleared.
+            //
+            // A compaction takes it **unconditionally**, whatever the file says.
+            // It is never a session's first dispatch — there would be nothing to
+            // compact — and it must never materialize a fork as the side effect
+            // of a maintenance action: Claude's fork is a turn that needs a
+            // prompt, and a compaction has none. `compact` refuses before
+            // spawning when the file is absent, which is where the actionable
+            // error comes from; this pattern is what makes "a compaction can
+            // neither mint nor fork a session" true by construction rather than
+            // by call order. If the file vanishes in between, claude reports an
+            // unresumable session and the turn fails cleanly — which is the
+            // right failure, unlike silently branching or minting one.
+            (Invocation::Compact, _, _) | (Invocation::Prompt(_), true, _) => {
                 args.push("--resume".to_owned());
                 args.push(session_id.to_string());
             }
@@ -281,7 +392,7 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
             // treats the file as present-or-absent — a *truncated* file (killed
             // mid-copy) reads as present. See harness-behavior.md §3.5 for
             // whether that state is reachable.
-            (false, Some(parent_session)) => {
+            (Invocation::Prompt(_), false, Some(parent_session)) => {
                 args.push("--resume".to_owned());
                 args.push(parent_session.to_string());
                 args.push("--session-id".to_owned());
@@ -289,7 +400,7 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
                 args.push("--fork-session".to_owned());
             }
             // First turn of an ordinary agent: create the session under our id.
-            (false, None) => {
+            (Invocation::Prompt(_), false, None) => {
                 args.push("--session-id".to_owned());
                 args.push(session_id.to_string());
             }
@@ -327,9 +438,25 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
     // Any flag added later must be pushed BEFORE this `--`, or it lands as a
     // positional alongside the prompt.
     args.push("--".to_owned());
-    args.push(claude_transport_prompt(prompt));
+    args.push(match invocation {
+        Invocation::Prompt(prompt) => claude_transport_prompt(prompt),
+        // Bare and UNESCAPED, deliberately: `claude_transport_prompt`'s leading
+        // space exists to stop the CLI intercepting a user's slash-leading
+        // *message* as a command, and that rule is load-bearing — it is also
+        // what keeps a user-typed `/compact` from reaching Codex and Antigravity,
+        // where the model answers with a fabricated "compacted" and nothing
+        // compacts (harness-behavior §3.9). So a compaction does not carve an
+        // exception out of the escape; it is a separate operation whose
+        // positional never passes through it.
+        Invocation::Compact => COMPACT_COMMAND.to_owned(),
+    });
     args
 }
+
+/// The exact positional a compaction sends. Claude also accepts
+/// `/compact <instructions>`; custom instructions are deliberately out of scope,
+/// so this is the whole argument.
+const COMPACT_COMMAND: &str = "/compact";
 
 /// The exact text handed to `claude -p` for a given dispatch prompt.
 ///
@@ -496,6 +623,7 @@ async fn run_producer(
     turn_id: TurnId,
     agent_id: AgentId,
     dispatched_effort: Option<String>,
+    mode: StreamMode,
     cancel_token: CancellationToken,
 ) {
     // Drain stderr concurrently; prevents pipe-full deadlock if the subprocess
@@ -519,7 +647,7 @@ async fn run_producer(
     // cancel outcome; a binary token can't carry the source). So the cancel
     // path must skip the truncation synthesis below.
     let mut cancelled = false;
-    let mut parser_state = ParserState::with_dispatched_effort(dispatched_effort.clone());
+    let mut parser_state = ParserState::for_stream(mode, dispatched_effort.clone());
 
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
@@ -754,7 +882,7 @@ mod tests {
     fn input<'a>(agent: &'a AgentRecord, cwd: &'a Path, home: &'a Path) -> BuildArgsInput<'a> {
         BuildArgsInput {
             agent,
-            prompt: "hi",
+            invocation: Invocation::Prompt("hi"),
             cwd,
             chrome: false,
             home_override: Some(home),
@@ -877,6 +1005,137 @@ mod tests {
             .join(encode_cwd(&canonical));
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
+    }
+
+    #[test]
+    fn compaction_argv_matches_send_argv_except_the_positional() {
+        // The property that keeps the two from drifting: a compaction runs with
+        // the agent's *entire* dispatch configuration — resume, model, effort,
+        // chrome, --add-dir, --include-partial-messages — because the
+        // summarization call is real, billed work the user chose that model for.
+        // Any flag a future change adds to a send lands on a compaction too, or
+        // this fails.
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        materialize_session(home.path(), project.path(), session_id);
+        let agent = AgentRecord {
+            model: Some("claude-opus-5".to_owned()),
+            effort: Some("high".to_owned()),
+            ..agent_with_session(session_id)
+        };
+
+        let send = build_args(&BuildArgsInput {
+            chrome: true,
+            ..input(&agent, project.path(), home.path())
+        });
+        let compaction = build_args(&BuildArgsInput {
+            invocation: Invocation::Compact,
+            chrome: true,
+            ..input(&agent, project.path(), home.path())
+        });
+
+        assert_eq!(
+            send.len(),
+            compaction.len(),
+            "same argv shape: {send:?} vs {compaction:?}"
+        );
+        assert_eq!(
+            send[..send.len() - 1],
+            compaction[..compaction.len() - 1],
+            "every flag identical; only the positional may differ"
+        );
+        assert_eq!(
+            compaction.last().map(String::as_str),
+            Some("/compact"),
+            "bare and UNESCAPED — the transport space-prefix is never on this path"
+        );
+        assert_eq!(compaction[compaction.len() - 2], "--");
+    }
+
+    #[test]
+    fn compaction_always_resumes_its_own_session_never_forks() {
+        // A compaction must not materialize a fork as the side effect of a
+        // maintenance action: Claude's fork is a turn that needs a prompt. An
+        // unmaterialized fork is the exact record shape that would otherwise
+        // take the fork branch, so pin it here rather than trusting call order.
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let parent_session = Uuid::now_v7();
+        let agent = AgentRecord {
+            forked_from_session: Some(parent_session),
+            ..agent_with_session(session_id)
+        };
+
+        let args = build_args(&BuildArgsInput {
+            invocation: Invocation::Compact,
+            ..input(&agent, project.path(), home.path())
+        });
+
+        assert!(!args.contains(&"--fork-session".to_owned()));
+        assert!(
+            !args.contains(&"--session-id".to_owned()),
+            "a compaction can neither mint nor branch a session"
+        );
+        assert!(!args.contains(&parent_session.to_string()));
+        let resume = flag_at(&args, "--resume");
+        assert_eq!(args[resume + 1], session_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn compact_refuses_an_agent_with_no_session_file() {
+        // Fail closed rather than let the CLI mint a fresh session whose entire
+        // contents are one failed compaction.
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::now_v7());
+        let adapter = ClaudeCodeAdapter::with_binary_path("claude");
+
+        let err = adapter
+            .compact(
+                &agent,
+                project.path(),
+                Uuid::now_v7(),
+                crate::DispatchOptions::default(),
+            )
+            .await;
+
+        // `EventStream` is not `Debug`, so unwrap the error by hand.
+        let Err(err) = err else {
+            panic!("no session file — nothing to compact");
+        };
+        assert!(
+            matches!(err, DispatchError::InvalidAgentState(_)),
+            "expected InvalidAgentState, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_refuses_an_agent_with_no_session_locator() {
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = AgentRecord {
+            session_locator: None,
+            ..agent_with_session(Uuid::now_v7())
+        };
+        let adapter = ClaudeCodeAdapter::with_binary_path("claude");
+
+        let err = adapter
+            .compact(
+                &agent,
+                project.path(),
+                Uuid::now_v7(),
+                crate::DispatchOptions::default(),
+            )
+            .await;
+
+        // `EventStream` is not `Debug`, so unwrap the error by hand.
+        let Err(err) = err else {
+            panic!("no locator — nothing to compact");
+        };
+        assert!(
+            matches!(err, DispatchError::InvalidAgentState(_)),
+            "expected InvalidAgentState, got {err:?}"
+        );
     }
 
     /// Index of `flag` in `args`, asserting it appears exactly once.
@@ -1121,7 +1380,7 @@ mod tests {
         let agent = agent_with_session(Uuid::now_v7());
         for prompt in ["- the left border is cut off", "--help"] {
             let args = build_args(&BuildArgsInput {
-                prompt,
+                invocation: Invocation::Prompt(prompt),
                 ..input(&agent, project.path(), home.path())
             });
             assert_eq!(args.last(), Some(&prompt.to_owned()));
@@ -1148,7 +1407,7 @@ mod tests {
             ),
         ] {
             let args = build_args(&BuildArgsInput {
-                prompt,
+                invocation: Invocation::Prompt(prompt),
                 ..input(&agent, project.path(), home.path())
             });
             assert_eq!(args.last().map(String::as_str), Some(transported));
@@ -1164,7 +1423,7 @@ mod tests {
 
         for prompt in ["plain message", " /plugin"] {
             let args = build_args(&BuildArgsInput {
-                prompt,
+                invocation: Invocation::Prompt(prompt),
                 ..input(&agent, project.path(), home.path())
             });
             assert_eq!(args.last().map(String::as_str), Some(prompt));

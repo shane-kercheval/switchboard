@@ -600,7 +600,9 @@ describe("failSendStart", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
-      send_id: MESSAGE_1,
+      // The backend echoes the send id the frontend minted, so this always
+      // matches the pending entry — correlation is by identity, not position.
+      send_id: "s1",
       started_at: "2026-05-16T00:00:00Z",
     });
     expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
@@ -658,9 +660,9 @@ describe("message_failed event → transcript", () => {
   it("renders the row in the pre-receipt race (message_failed beats recordSendAccepted)", async () => {
     // The send is dispatched but its `send_message` IPC receipt hasn't landed,
     // so the pending entry has no message_id yet. A backend message_failed must
-    // still surface — pendingEntryFor's front-fallback resolves it (mirroring
-    // the runtime reducer's pickPendingIndex), so the transcript and runtime
-    // stay on the same entry.
+    // still surface — `pendingEntryFor` resolves it by `send_id` (mirroring the
+    // runtime reducer's `pickPendingIndex`), so the transcript and runtime stay
+    // on the same entry.
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
     state.dispatchUserTurn(AGENT_A, "user-1", "hello", [], "send-1", "2026-05-16T00:00:00Z");
@@ -668,7 +670,7 @@ describe("message_failed event → transcript", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "message_failed",
       message_id: MESSAGE_1,
-      send_id: MESSAGE_1,
+      send_id: "send-1",
       agent_id: AGENT_A,
       error: "adapter failed to launch",
       at: "2026-05-16T00:00:01Z",
@@ -962,7 +964,7 @@ describe("cancelSend pre-accept race", () => {
       type: "turn_start",
       turn_id: TURN_1,
       message_id: MESSAGE_1,
-      send_id: MESSAGE_1,
+      send_id: "send-1",
       started_at: "2026-05-16T00:00:00Z",
     });
     expect(invokeMock).toHaveBeenCalledWith(
@@ -1638,5 +1640,268 @@ describe("send-completion notifications", () => {
 
     expect(notified()).toHaveLength(0);
     void state;
+  });
+});
+
+describe("manual context compaction", () => {
+  const COMPACT_SEND = "00000000-0000-7000-8000-00000000c001";
+  const COMPACT_PENDING = "00000000-0000-7000-8000-00000000c002";
+  const COMPACT_MESSAGE = "00000000-0000-7000-8000-00000000c003";
+  const COMPACT_TURN = "00000000-0000-7000-8000-00000000c004";
+
+  it("registers its pending entry before the IPC, and only an idle agent starts", async () => {
+    // Registering *before* the call is what makes the pre-receipt race safe:
+    // `turn_start` can arrive before `compact_agent` resolves, and it must find
+    // an entry to consume. The assertion is on the state observed while the IPC
+    // is still unresolved.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    let resolveIpc: (id: string) => void = () => {};
+    invokeMock.mockImplementation(
+      async () => await new Promise<string>((res) => (resolveIpc = res)),
+    );
+
+    const inFlight = state.dispatchCompaction(
+      AGENT_A,
+      COMPACT_SEND,
+      COMPACT_PENDING,
+      "2026-05-15T00:00:05Z",
+    );
+
+    expect(state.runtimes[AGENT_A]?.pending_sends).toEqual([
+      {
+        send_id: COMPACT_SEND,
+        user_turn_id: COMPACT_PENDING,
+        kind: "compaction",
+        queued_at: "2026-05-15T00:00:05Z",
+      },
+    ]);
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
+    // No user turn — a compaction is not something the user said.
+    expect(state.transcripts[AGENT_A]).toEqual([]);
+
+    resolveIpc(COMPACT_MESSAGE);
+    await inFlight;
+    expect(state.runtimes[AGENT_A]?.pending_sends?.[0]?.message_id).toBe(COMPACT_MESSAGE);
+  });
+
+  it("queues behind a running turn without touching run_status", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, TURN_1, "go", [], "send-1", "2026-05-15T00:00:00Z");
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_2,
+      message_id: MESSAGE_1,
+      send_id: "send-1",
+      started_at: "2026-05-15T00:00:01Z",
+    } as NormalizedEvent);
+    invokeMock.mockResolvedValue(COMPACT_MESSAGE);
+
+    await state.dispatchCompaction(AGENT_A, COMPACT_SEND, COMPACT_PENDING, "2026-05-15T00:00:05Z");
+
+    // The live turn keeps the runtime; the compaction just lines up behind it.
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
+    expect(state.runtimes[AGENT_A]?.pending_sends).toHaveLength(1);
+  });
+
+  it("does not let an unrelated turn consume its pending slot", async () => {
+    // The compaction's receipt has not arrived, so its entry is at the front
+    // with no `message_id`. A workflow turn starting in that window names its
+    // own send, and must take nothing: consuming the compaction's entry would
+    // stamp `kind: "compaction"` onto an ordinary answer, hiding its content
+    // behind the compaction row, and leave the real compaction unclassified.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    let resolveIpc: (id: string) => void = () => {};
+    invokeMock.mockImplementation(
+      async () => await new Promise<string>((res) => (resolveIpc = res)),
+    );
+    const inFlight = state.dispatchCompaction(
+      AGENT_A,
+      COMPACT_SEND,
+      COMPACT_PENDING,
+      "2026-05-15T00:00:05Z",
+    );
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_2,
+      message_id: MESSAGE_1,
+      send_id: "send-from-a-workflow",
+      started_at: "2026-05-15T00:00:06Z",
+    } as NormalizedEvent);
+
+    const workflowTurn = state.transcripts[AGENT_A]?.find((t) => t.turn_id === TURN_2);
+    expect(workflowTurn?.role === "agent" && workflowTurn.kind).toBeUndefined();
+    expect(workflowTurn?.role === "agent" && workflowTurn.send_id).toBe("send-from-a-workflow");
+    // The compaction's entry is untouched, so its own turn_start still finds it.
+    expect(state.runtimes[AGENT_A]?.pending_sends).toHaveLength(1);
+    expect(state.runtimes[AGENT_A]?.pending_sends?.[0]?.kind).toBe("compaction");
+
+    resolveIpc(COMPACT_MESSAGE);
+    await inFlight;
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: COMPACT_TURN,
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      started_at: "2026-05-15T00:00:07Z",
+    } as NormalizedEvent);
+    const compactionTurn = state.transcripts[AGENT_A]?.find((t) => t.turn_id === COMPACT_TURN);
+    expect(compactionTurn?.role === "agent" && compactionTurn.kind).toBe("compaction");
+  });
+
+  it("consumes its own pending entry when a send was registered after it", async () => {
+    // The pre-receipt race the pending list exists to make safe. Both entries
+    // are receipt-less for an instant; if the compaction's `turn_start` took the
+    // *front* entry it would consume the send's slot and stamp the send's id
+    // onto a compaction turn — mis-attributing the send's eventual reply.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    invokeMock.mockResolvedValue(COMPACT_MESSAGE);
+    await state.dispatchCompaction(AGENT_A, COMPACT_SEND, COMPACT_PENDING, "2026-05-15T00:00:05Z");
+    state.dispatchUserTurn(AGENT_A, TURN_1, "later", [], "send-later", "2026-05-15T00:00:06Z");
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: COMPACT_TURN,
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      started_at: "2026-05-15T00:00:07Z",
+    } as NormalizedEvent);
+
+    const turn = state.transcripts[AGENT_A]?.find((t) => t.turn_id === COMPACT_TURN);
+    expect(turn?.role).toBe("agent");
+    expect(turn?.role === "agent" && turn.kind).toBe("compaction");
+    expect(turn?.role === "agent" && turn.send_id).toBe(COMPACT_SEND);
+    // The send's entry survives untouched.
+    expect(state.runtimes[AGENT_A]?.pending_sends).toEqual([
+      { send_id: "send-later", user_turn_id: TURN_1 },
+    ]);
+  });
+
+  it("drops a cancelled queued compaction without leaving a row", async () => {
+    // Decision 8: nothing ran, and there is no user message for a "cancelled"
+    // row to sit under — unlike a cancelled queued send, which renders one.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    invokeMock.mockResolvedValue(COMPACT_MESSAGE);
+    await state.dispatchCompaction(AGENT_A, COMPACT_SEND, COMPACT_PENDING, "2026-05-15T00:00:05Z");
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_cancelled",
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      agent_id: AGENT_A,
+      at: "2026-05-15T00:00:06Z",
+    } as NormalizedEvent);
+
+    expect(state.runtimes[AGENT_A]?.pending_sends ?? []).toEqual([]);
+    expect(state.transcripts[AGENT_A]).toEqual([]);
+  });
+
+  it("renders a failed compaction row when it never starts", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    invokeMock.mockResolvedValue(COMPACT_MESSAGE);
+    await state.dispatchCompaction(AGENT_A, COMPACT_SEND, COMPACT_PENDING, "2026-05-15T00:00:05Z");
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      agent_id: AGENT_A,
+      error: "the harness declined to compact this conversation",
+      at: "2026-05-15T00:00:06Z",
+    } as NormalizedEvent);
+
+    const turns = state.transcripts[AGENT_A] ?? [];
+    expect(turns).toHaveLength(1);
+    const turn = turns[0];
+    expect(turn?.role === "agent" && turn.kind).toBe("compaction");
+    expect(turn?.role === "agent" && turn.status).toBe("failed");
+    expect(turn?.role === "agent" && turn.error).toContain("declined to compact");
+  });
+
+  it("surfaces an IPC refusal as a failed compaction row", async () => {
+    // A refused harness / no session / unmaterialized branch never reaches the
+    // event stream, so the rejection has to render the reason itself.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    invokeMock.mockRejectedValue(new Error("alice has no conversation to compact yet"));
+
+    await state.dispatchCompaction(AGENT_A, COMPACT_SEND, COMPACT_PENDING, "2026-05-15T00:00:05Z");
+
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("idle");
+    expect(state.runtimes[AGENT_A]?.pending_sends ?? []).toEqual([]);
+    const turns = state.transcripts[AGENT_A] ?? [];
+    expect(turns).toHaveLength(1);
+    expect(turns[0]?.role === "agent" && turns[0].error).toContain("no conversation to compact");
+    // The shape, not just the text: without the kind this renders as an empty
+    // failed *response* with no prompt above it, which reads as a crash rather
+    // than as the precondition the backend named.
+    expect(turns[0]?.role === "agent" && turns[0].kind).toBe("compaction");
+  });
+
+  it("tells the terminal hook the turn was a compaction, so the recap can be fetched", async () => {
+    // The recap marker lives in the harness's own session file and nothing else
+    // fetches it — the compaction turn itself carries no content.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    const seen: { outcome: string; kind?: string }[] = [];
+    state.setTurnTerminalHook((_agentId, outcome, kind) => seen.push({ outcome, kind }));
+    invokeMock.mockResolvedValue(COMPACT_MESSAGE);
+    await state.dispatchCompaction(AGENT_A, COMPACT_SEND, COMPACT_PENDING, "2026-05-15T00:00:05Z");
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: COMPACT_TURN,
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      started_at: "2026-05-15T00:00:06Z",
+    } as NormalizedEvent);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: COMPACT_TURN,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:07Z",
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        context_input_tokens: 120000,
+        context_tokens_after_turn: 18000,
+        context_window: 200000,
+      },
+    } as NormalizedEvent);
+
+    expect(seen).toEqual([{ outcome: "completed", kind: "compaction" }]);
+    const turn = state.transcripts[AGENT_A]?.find((t) => t.turn_id === COMPACT_TURN);
+    // Usage is kept: it is what moves the sidebar context bar.
+    expect(turn?.role === "agent" && turn.usage?.context_tokens_after_turn).toBe(18000);
+    expect(turn?.role === "agent" && turn.status).toBe("complete");
+  });
+
+  it("reports an ordinary response to the terminal hook with no kind", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    const seen: { outcome: string; kind?: string }[] = [];
+    state.setTurnTerminalHook((_agentId, outcome, kind) => seen.push({ outcome, kind }));
+    state.dispatchUserTurn(AGENT_A, TURN_1, "go", [], "send-1", "2026-05-15T00:00:00Z");
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_2,
+      message_id: MESSAGE_1,
+      send_id: "send-1",
+      started_at: "2026-05-15T00:00:01Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_2,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:02Z",
+    } as NormalizedEvent);
+
+    expect(seen).toEqual([{ outcome: "completed", kind: undefined }]);
   });
 });

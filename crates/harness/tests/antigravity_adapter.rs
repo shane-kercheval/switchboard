@@ -1675,3 +1675,39 @@ async fn deleted_working_directory_is_reported_as_such_not_as_a_missing_binary()
         Ok(_) => panic!("expected Err(WorkingDirectoryMissing), got Ok"),
     }
 }
+
+/// Antigravity ships `/compact` in its binary but behind the remote Unleash
+/// flag `enable-compact-slash-command`, which is off. The trait default refuses.
+///
+/// Defense in depth behind `HarnessKind::supports_manual_compaction`. The flag
+/// is *remote*, so this can change without a version bump — when it opens, this
+/// test is where the new behavior gets asserted (and note that
+/// `--disable-slash-commands`, passed on every Antigravity dispatch, would have
+/// to be dropped conditionally even then).
+#[tokio::test]
+async fn compact_is_refused_as_an_unsupported_operation() {
+    let adapter = AntigravityAdapter::with_binary_path("agy");
+    let result = adapter
+        .compact(
+            &agy_agent(),
+            Path::new("/tmp"),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await;
+
+    // `EventStream` is not `Debug`, so unwrap the error by hand.
+    let Err(err) = result else {
+        panic!("Antigravity must refuse a compaction rather than returning a stream");
+    };
+    assert!(
+        matches!(
+            err,
+            DispatchError::UnsupportedOperation {
+                harness: HarnessKind::Antigravity,
+                ..
+            }
+        ),
+        "expected UnsupportedOperation, got {err:?}"
+    );
+}

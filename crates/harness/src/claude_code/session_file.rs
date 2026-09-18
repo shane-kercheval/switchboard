@@ -2951,6 +2951,54 @@ mod tests {
     }
 
     #[test]
+    fn manual_compaction_session_file_hydrates_one_compaction_marker() {
+        // A real session file from a Switchboard-shaped `-p "/compact"` dispatch
+        // (Claude 2.1.270, sanitized). The manual shape differs from the
+        // auto-compaction one the other tests cover: it writes **no** bare
+        // `/compact` `SlashCommand` record — nothing represents the request at
+        // all — so the recap summary is the sole witness to the compaction, and
+        // it is what the transcript renders beside the live turn.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        stage_session_file(
+            home.path(),
+            cwd.path(),
+            session_id,
+            include_str!("../../tests/fixtures/claude/compaction-manual.session.jsonl"),
+        );
+        let turns = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id)
+            .unwrap()
+            .turns;
+
+        let markers = compaction_markers(&turns);
+        assert_eq!(
+            markers.len(),
+            2,
+            "the probe session was compacted twice; each boundary hydrates its own marker"
+        );
+        for marker in &markers {
+            let SystemMarker::Compaction { summary } = marker else {
+                panic!("expected a Compaction marker, got {marker:?}");
+            };
+            assert!(
+                !summary.trim().is_empty(),
+                "the recap is what the marker renders; an empty one would show a bare row"
+            );
+        }
+        // The request itself left no record, so nothing may surface as a user
+        // prompt — a fabricated `/compact` prompt would enter send correlation.
+        assert!(
+            !turns.iter().any(|t| matches!(
+                t,
+                Turn::User { text, .. } if text.trim_start().starts_with("/compact")
+            )),
+            "a manual compaction writes no prompt record; none may be invented"
+        );
+    }
+
+    #[test]
     fn interactive_local_command_output_is_not_fabricated_as_an_agent_turn() {
         let turns = load_turns(&[
             local_command_record(

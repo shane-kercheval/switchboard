@@ -388,19 +388,28 @@ export async function migrateMessagePin(
 // harness agent content + journal outcome markers). Replaces per-agent
 // `loadTranscript` for the unified view.
 //
-// `draftAttachments` are staged paths the project's unsent compose draft still
-// points at. Loading a project garbage-collects every staged attachment the
-// journal doesn't reference; the backend cannot see a draft (it lives in this
-// process's localStorage), so an undeclared path is reclaimed and the restored
-// draft's chip dangles. Pass the draft's paths, or `[]` when there is no draft.
-export async function loadProjectConversation(
+// Read-only: reclaiming orphaned attachments is `reclaimProjectAttachments`'s
+// job, and is safe only at project open.
+export async function loadProjectConversation(projectId: ProjectId): Promise<ProjectConversation> {
+  return await invoke<ProjectConversation>("load_project_conversation", { projectId });
+}
+
+// Delete a project's orphaned staged attachments. **Call once per project open,
+// after `openProject` and before `listAgents`** — that ordering is what makes
+// deleting safe, because the backend's reference set (journal sends + the draft
+// paths declared here) cannot see an attachment belonging to a *queued* send, and
+// before the agents are registered no send can be queued. The backend refuses to
+// run twice per process, so a webview reload's repeat call is a no-op rather than
+// a deletion against a live backlog.
+//
+// `draftAttachments` are the staged paths this project's unsent compose draft
+// still points at; the draft lives in this process's localStorage, so an
+// undeclared path is reclaimed and the restored chip dangles.
+export async function reclaimProjectAttachments(
   projectId: ProjectId,
-  draftAttachments: string[] = [],
-): Promise<ProjectConversation> {
-  return await invoke<ProjectConversation>("load_project_conversation", {
-    projectId,
-    draftAttachments,
-  });
+  draftAttachments: string[],
+): Promise<void> {
+  await invoke("reclaim_project_attachments", { projectId, draftAttachments });
 }
 
 // Cheap per-agent session-file freshness check (stat only, no parse) that gates
@@ -572,6 +581,15 @@ export async function existingAttachmentPaths(
 // recipient cancels its in-flight turn iff it belongs to `sendId` and drops any
 // still-queued item of the send, never touching a later, unrelated turn. The
 // per-turn cancelled terminals flow back over the agent event channels.
+// Ask an agent to compact its own conversation: summarize the history so far and
+// continue from the summary. Returns the receipt `MessageId`; the turn's
+// lifecycle arrives on the agent's event channel like a send's, and `sendId` is
+// what cancels it while it is still queued. Claude-only — the backend refuses
+// every other harness, and the menu never offers it for them.
+export async function compactAgent(agentId: AgentId, sendId: SendId): Promise<MessageId> {
+  return await invoke<MessageId>("compact_agent", { agentId, sendId });
+}
+
 export async function cancelSend(sendId: SendId, recipients: AgentId[]): Promise<void> {
   await invoke("cancel_send", { sendId, recipients });
 }

@@ -321,24 +321,25 @@ use crate::commands::{
     cancel_forward_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
     check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
     check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
-    commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl,
-    create_agent_impl, create_project_impl, delete_project_impl, editor_open_argv,
-    existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl, fork_agent_impl,
-    forward_message_impl, forward_prompt_impl, get_preferences_impl, get_prompt_source_impl,
-    harness_adapter_for, install_status_for_adapter, list_agents_impl, list_mcp_providers_impl,
-    list_message_pins_impl, list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
-    load_project_conversation_impl, load_transcript_impl, migrate_message_pin_impl,
-    open_branch_comparison_file_difftool_impl, open_commit_file_difftool_impl, open_project_impl,
-    open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
-    project_session_fingerprints_impl, read_tracked_repo_from_inputs,
-    recheck_harness_installs_impl, remove_agent_impl, remove_mcp_provider_impl,
-    remove_message_pins_impl, remove_queued_message_impl, remove_tracked_repo_impl,
-    rename_agent_impl, rename_project_impl, render_prompt_impl, reorder_agents_impl,
-    resolve_saved_prompt_fresh_impl, resolve_saved_prompt_impl, resume_agent_in_terminal_impl,
-    reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
-    send_message_impl, set_active_project_impl, set_agent_selection_impl, set_message_pin_impl,
-    set_preferences_impl, set_project_archived_impl, set_project_directory_impl,
-    set_visible_project_impl, sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
+    commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, compact_agent_impl,
+    copy_builtin_prompt_impl, create_agent_impl, create_project_impl, delete_project_impl,
+    editor_open_argv, existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl,
+    fork_agent_impl, forward_message_impl, forward_prompt_impl, get_preferences_impl,
+    get_prompt_source_impl, harness_adapter_for, install_status_for_adapter, list_agents_impl,
+    list_mcp_providers_impl, list_message_pins_impl, list_projects_impl, list_prompts_impl,
+    list_tracked_repos_from_inputs, load_project_conversation_impl, load_transcript_impl,
+    migrate_message_pin_impl, open_branch_comparison_file_difftool_impl,
+    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
+    parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
+    read_tracked_repo_from_inputs, recheck_harness_installs_impl, reclaim_project_attachments_impl,
+    remove_agent_impl, remove_mcp_provider_impl, remove_message_pins_impl,
+    remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl, rename_project_impl,
+    render_prompt_impl, reorder_agents_impl, resolve_saved_prompt_fresh_impl,
+    resolve_saved_prompt_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
+    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
+    set_active_project_impl, set_agent_selection_impl, set_message_pin_impl, set_preferences_impl,
+    set_project_archived_impl, set_project_directory_impl, set_visible_project_impl,
+    sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
     spawn_prompt_resolution_change_notifications, stage_attachment_impl, sync_prompts_and_notify,
     terminal_open_argv, test_mcp_connection_impl, test_saved_mcp_provider_impl,
     tracked_repos_inputs, tracked_roots, validate_external_url, workspace_status_impl,
@@ -1157,6 +1158,25 @@ async fn send_message(
 }
 
 #[tauri::command]
+async fn compact_agent(
+    state: State<'_, AppState>,
+    agent_id: String,
+    send_id: String,
+) -> Result<String, String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    // Minted by the frontend, like a send's, so the pending row can be cancelled
+    // through `cancel_send` before any `TurnStart` carries the id back.
+    let sid = parse_uuid(&send_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let message_id = compact_agent_impl(state.inner(), id, sid, &home)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(message_id.to_string())
+}
+
+#[tauri::command]
 async fn stage_attachment(
     state: State<'_, AppState>,
     project_id: String,
@@ -1181,6 +1201,10 @@ async fn existing_attachment_paths(
     existing_attachment_paths_impl(state.inner(), pid, paths).map_err(|e| e.to_string())
 }
 
+/// No frontend caller today. Wiring one makes it a path by which a queued send
+/// leaves the queue, and the frontend's live user row for that send carries a
+/// `pending` flag that every such path must settle or drop — see the flag's doc
+/// on the user `Turn` in `src/lib/state/types.ts`.
 #[tauri::command]
 async fn remove_queued_message(
     state: State<'_, AppState>,
@@ -1698,21 +1722,37 @@ async fn open_branch_comparison_file_difftool(
     .map_err(|e| e.to_string())
 }
 
+/// Reclaim a project's orphaned staged attachments. **Call once per project
+/// open, after `open_project` and before `list_agents`** — see
+/// `reclaim_project_attachments_impl` for why that ordering is what makes
+/// deleting safe, and why a later call (or one from a reloaded webview) must not
+/// and does not reclaim again.
+#[tauri::command]
+async fn reclaim_project_attachments(
+    state: State<'_, AppState>,
+    project_id: String,
+    draft_attachments: Vec<String>,
+) -> Result<(), String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    let drafts: Vec<std::path::PathBuf> = draft_attachments
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    reclaim_project_attachments_impl(state.inner(), id, &drafts)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn load_project_conversation(
     state: State<'_, AppState>,
     project_id: String,
-    draft_attachments: Vec<String>,
 ) -> Result<ProjectConversation, String> {
     let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    let drafts: Vec<std::path::PathBuf> = draft_attachments
-        .into_iter()
-        .map(std::path::PathBuf::from)
-        .collect();
-    load_project_conversation_impl(state.inner(), id, &home, &drafts)
+    load_project_conversation_impl(state.inner(), id, &home)
         .await
         .map_err(|e| e.to_string())
 }
@@ -2350,6 +2390,7 @@ pub fn run() {
             list_project_agents_readonly,
             search_project_files,
             send_message,
+            compact_agent,
             stage_attachment,
             existing_attachment_paths,
             remove_queued_message,
@@ -2368,6 +2409,7 @@ pub fn run() {
             reveal_in_finder,
             load_transcript,
             load_project_conversation,
+            reclaim_project_attachments,
             project_session_fingerprints,
         ])
         .build(tauri::generate_context!())

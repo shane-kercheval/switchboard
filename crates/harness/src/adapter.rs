@@ -57,6 +57,19 @@ pub enum DispatchError {
     /// registry corruption; fail closed before spawning rather than degrade.
     #[error("invalid agent state: {0}")]
     InvalidAgentState(String),
+    /// The adapter does not implement the requested operation at all — today,
+    /// [`HarnessAdapter::compact`] on a harness whose compaction Switchboard
+    /// cannot drive. **Defense in depth, not the real gate**: the app layer
+    /// refuses first, on
+    /// `HarnessKind::supports_manual_compaction`, so reaching this means a
+    /// caller bypassed the capability predicate. Typed rather than folded into
+    /// `InvalidAgentState` because nothing about the *agent* is wrong — the
+    /// operation simply does not exist for its harness.
+    #[error("{harness} does not support this operation: {operation}")]
+    UnsupportedOperation {
+        harness: switchboard_core::HarnessKind,
+        operation: &'static str,
+    },
 }
 
 /// Per-dispatch options. Plumbed through `HarnessAdapter::dispatch` so
@@ -140,6 +153,38 @@ pub trait HarnessAdapter: Send + Sync {
         turn_id: TurnId,
         options: DispatchOptions,
     ) -> Result<EventStream, DispatchError>;
+
+    /// Ask the harness to **compact this agent's existing conversation** —
+    /// summarize the history so far and continue from the summary — and stream
+    /// the result. Same `cwd` contract as [`Self::dispatch`], and the same
+    /// stream contract: exactly one terminal `TurnEnd`, synthesized by the
+    /// adapter if the process dies without one.
+    ///
+    /// **A distinct operation rather than a flavour of `dispatch`**, because
+    /// `dispatch` means "a user-initiated turn with a prompt" everywhere it is
+    /// read, and a compaction is not that: it carries no prompt and no
+    /// attachments, it journals nothing, and its outcome is read from the
+    /// harness's own compaction verdict rather than from the turn's result.
+    /// Threading a "kind" through `dispatch`'s `prompt` parameter would make
+    /// every reader of that parameter wrong.
+    ///
+    /// The default implementation refuses with
+    /// [`DispatchError::UnsupportedOperation`], which is the correct answer for
+    /// every harness whose compaction Switchboard cannot mechanically drive —
+    /// see `HarnessKind::supports_manual_compaction` for
+    /// which, and why a `/compact` *prompt* is not an acceptable substitute.
+    async fn compact(
+        &self,
+        agent: &AgentRecord,
+        _cwd: &Path,
+        _turn_id: TurnId,
+        _options: DispatchOptions,
+    ) -> Result<EventStream, DispatchError> {
+        Err(DispatchError::UnsupportedOperation {
+            harness: agent.harness,
+            operation: "manual context compaction",
+        })
+    }
 
     /// Pre-flight check that the harness can be invoked. Returns
     /// `BinaryNotFound` if the binary is missing; `Ok(())` if the adapter

@@ -252,6 +252,8 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     case "set_active_project":
       backend.activeProjectId = args?.projectId as string;
       return null;
+    case "reclaim_project_attachments":
+      return null;
     case "list_agents": {
       const pid = (args?.projectId as string) ?? backend.activeProjectId;
       return backend.rosters.get(pid ?? "") ?? [];

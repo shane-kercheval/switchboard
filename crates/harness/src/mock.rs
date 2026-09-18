@@ -203,6 +203,101 @@ pub enum MockScenario {
     /// paths during that window. Distinct from [`Self::CompletesOnSignal`], which
     /// parks *before* the terminal (mid-turn).
     CompletesThenHolds(std::sync::Arc<tokio::sync::Notify>),
+
+    /// A **compaction** stream (served by [`MockHarnessAdapter::compact`], never
+    /// by `dispatch`): `Liveness → TurnEnd(Completed)` carrying the before/after
+    /// context occupancy a real compaction reports. No content chunks — a
+    /// compaction streams no answer. The standard compaction double.
+    CompactsSuccessfully,
+
+    /// A **compaction** stream that ends `Liveness → TurnEnd(Failed {
+    /// HarnessError })` — the harness declining to compact (its verdict said no,
+    /// which the parser turns into a failed turn even though the process exited
+    /// cleanly). Usage is withheld, as it is for a real refusal.
+    CompactionFails,
+
+    /// A **compaction** stream that emits one `Liveness`, then **awaits the
+    /// cancellation token** and ends without a terminal — the compaction mirror
+    /// of [`Self::AwaitCancellation`], so the dispatcher synthesizes
+    /// `TurnEnd { Cancelled }`.
+    CompactionAwaitsCancellation,
+
+    /// A **compaction** stream driven by two external signals: emit one
+    /// `Liveness`, park until `start_terminal`, emit the terminal (`Completed`,
+    /// or `Failed { HarnessError }` when `fail`), then park until `end_stream`
+    /// before ending.
+    ///
+    /// The two signals are what make the compaction waiter contract testable —
+    /// they split "mid-turn", "past the terminal", and "the stream has drained"
+    /// into three windows a test can step through, where a self-driving stream
+    /// collapses all three into one instant.
+    CompactionOnSignals {
+        start_terminal: std::sync::Arc<tokio::sync::Notify>,
+        end_stream: std::sync::Arc<tokio::sync::Notify>,
+        fail: bool,
+    },
+}
+
+impl MockScenario {
+    /// Whether this scenario scripts a **compaction** stream rather than a send.
+    /// `dispatch` refuses these and `compact` serves only these, so a mis-wired
+    /// test fails at the call instead of getting a stream the scenario never
+    /// described.
+    fn is_compaction(&self) -> bool {
+        matches!(
+            self,
+            Self::CompactsSuccessfully
+                | Self::CompactionFails
+                | Self::CompactionAwaitsCancellation
+                | Self::CompactionOnSignals { .. }
+        )
+    }
+}
+
+/// The usage a successful compaction reports: the context occupancy before and
+/// after the summary replaced the history, against the model's window. A real
+/// compaction makes no assistant call, so these are the turn's only token
+/// numbers — input/output are zero, not merely unknown.
+fn compaction_usage() -> TurnUsage {
+    TurnUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: None,
+        cache_creation_input_tokens: None,
+        context_input_tokens: Some(120_000),
+        context_tokens_after_turn: Some(18_000),
+        reasoning_output_tokens: None,
+        context_window: Some(200_000),
+        total_cost_usd: None,
+    }
+}
+
+/// The terminal a mock compaction ends on. Shares one shape across the
+/// compaction scenarios so they differ only in what they are testing.
+fn compaction_terminal(turn_id: TurnId, fail: bool) -> AdapterEvent {
+    AdapterEvent::TurnEnd {
+        turn_id,
+        outcome: if fail {
+            TurnOutcome::Failed {
+                kind: crate::events::FailureKind::HarnessError,
+                message: "the harness declined to compact this conversation".to_owned(),
+            }
+        } else {
+            TurnOutcome::Completed
+        },
+        ended_at: Utc::now(),
+        // A refused compaction's usage is withheld by the parser — its `result`
+        // reports an empty `modelUsage` that would otherwise blank the context
+        // bar after a compaction that changed nothing.
+        usage: (!fail).then(compaction_usage),
+        context_window_source: None,
+        // A compaction makes no assistant call, so it has neither key.
+        stable_message_id: None,
+        first_message_id: None,
+        spend: None,
+        model: None,
+        effort: None,
+    }
 }
 
 /// A `HarnessAdapter` that produces canned events without spawning any subprocess.
@@ -252,6 +347,12 @@ impl HarnessAdapter for MockHarnessAdapter {
     ) -> Result<EventStream, DispatchError> {
         if matches!(self.scenario, MockScenario::DispatchFails) {
             return Err(DispatchError::BinaryNotFound);
+        }
+        if self.scenario.is_compaction() {
+            return Err(DispatchError::UnsupportedOperation {
+                harness: agent.harness,
+                operation: "a send against a compaction-only mock scenario",
+            });
         }
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -811,9 +912,70 @@ impl HarnessAdapter for MockHarnessAdapter {
                     signal.notified().await;
                 });
             }
-            MockScenario::DispatchFails => {
-                // Handled by the early return above.
+            MockScenario::DispatchFails
+            | MockScenario::CompactsSuccessfully
+            | MockScenario::CompactionFails
+            | MockScenario::CompactionAwaitsCancellation
+            | MockScenario::CompactionOnSignals { .. } => {
+                // Handled by the early returns above.
                 unreachable!()
+            }
+        }
+
+        Ok(Box::pin(UnboundedReceiverStream::new(rx)))
+    }
+
+    async fn compact(
+        &self,
+        agent: &AgentRecord,
+        _cwd: &Path,
+        turn_id: TurnId,
+        options: crate::DispatchOptions,
+    ) -> Result<EventStream, DispatchError> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        match self.scenario {
+            MockScenario::CompactsSuccessfully | MockScenario::CompactionFails => {
+                let fail = matches!(self.scenario, MockScenario::CompactionFails);
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::Liveness { turn_id });
+                    let _ = tx.send(compaction_terminal(turn_id, fail));
+                });
+            }
+            MockScenario::CompactionAwaitsCancellation => {
+                let cancel_token = options.cancel_token.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::Liveness { turn_id });
+                    // Park until cancelled, then end the stream with no terminal
+                    // event — the dispatcher synthesizes Cancelled.
+                    cancel_token.cancelled().await;
+                });
+            }
+            MockScenario::CompactionOnSignals {
+                ref start_terminal,
+                ref end_stream,
+                fail,
+            } => {
+                let start_terminal = std::sync::Arc::clone(start_terminal);
+                let end_stream = std::sync::Arc::clone(end_stream);
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::Liveness { turn_id });
+                    start_terminal.notified().await;
+                    let _ = tx.send(compaction_terminal(turn_id, fail));
+                    // Hold the stream open past the terminal until released;
+                    // dropping `tx` on return closes it.
+                    end_stream.notified().await;
+                });
+            }
+            // Every other scenario models a *send*. Overriding this method
+            // replaces the trait's refusing default, so reproduce it here — a
+            // harness Switchboard cannot drive to compact is exactly what that
+            // default answers.
+            _ => {
+                return Err(DispatchError::UnsupportedOperation {
+                    harness: agent.harness,
+                    operation: "manual context compaction",
+                });
             }
         }
 

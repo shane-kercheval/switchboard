@@ -2514,7 +2514,7 @@ describe("prompt-mode fork", () => {
     releaseRender({ kind: "rendered", text: "RENDERED" });
 
     await waitFor(() =>
-      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(/alice is working/i),
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(/alice is busy/i),
     );
     expect(forks()).toHaveLength(0);
     expect(sends()).toHaveLength(0);

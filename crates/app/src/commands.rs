@@ -17,7 +17,7 @@ use switchboard_core::{
 };
 use switchboard_dispatcher::{
     CancelOutcome, CurrentTurnWait, DispatchContextFactory, Dispatcher, EventEmitter, OnBusy,
-    RemovedQueuedMessage, SendOutcome,
+    RemoveQueuedMessageError, RemovedQueuedMessage, SendOutcome, TurnKind,
 };
 use switchboard_harness::{
     CancelSource, ForwardedBlock, HarnessAdapter, MessageId, TurnOutcome,
@@ -135,11 +135,20 @@ fn conflicting_claim(
     })
 }
 
-/// Hold the post-eviction, pre-drain window open when a test asks. No-op in
-/// release builds (the field does not exist) and when unset.
+/// The barrier a test installed at `seam`, if any. `None` in release builds
+/// (the map does not exist) and when unset.
 #[cfg(test)]
-async fn wait_at_maintenance_barrier(state: &AppState) {
-    let barrier = lock(&state.maintenance_barrier).clone();
+fn test_seam(
+    state: &AppState,
+    seam: crate::state::TestSeam,
+) -> Option<Arc<crate::state::MaintenanceBarrier>> {
+    lock(&state.test_seams).get(&seam).cloned()
+}
+
+/// Hold a seam open when a test asks. Takes the barrier by value so a detached
+/// task can carry one it cloned out before spawning.
+#[cfg(test)]
+async fn wait_at_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>) {
     if let Some(barrier) = barrier {
         // Signal arrival *before* waiting, so a test can block on reaching this
         // point rather than guessing at it — and so deleting this call makes the
@@ -155,12 +164,34 @@ async fn wait_at_maintenance_barrier(state: &AppState) {
     }
 }
 
+/// [`wait_at_seam`] for a seam that sits **inside blocking work**, where there is
+/// no async context to await in. Blocking here is correct rather than a
+/// compromise: the caller is already on the blocking pool, which is what that
+/// pool is for, and the capture seam uses the same form for the same reason.
+#[cfg(test)]
+fn wait_at_blocking_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>) {
+    if let Some(barrier) = barrier {
+        // `notify_one` on both sides — see `wait_at_seam`.
+        barrier.entered.notify_one();
+        futures::executor::block_on(barrier.release.notified());
+    }
+}
+
+#[cfg(not(test))]
+fn wait_at_blocking_seam(_barrier: Option<()>) {}
+
+/// Hold the post-eviction, pre-drain window open when a test asks.
+#[cfg(test)]
+async fn wait_at_maintenance_barrier(state: &AppState) {
+    wait_at_seam(test_seam(state, crate::state::TestSeam::Maintenance)).await;
+}
+
 #[cfg(not(test))]
 #[expect(clippy::unused_async, reason = "matches the cfg(test) signature")]
 async fn wait_at_maintenance_barrier(_state: &AppState) {}
 
 /// Hold [`capture_dispatch_snapshot`] open **between its two reads**, inside the
-/// `registry_write` guard, when a test asks. See [`AppState::capture_barrier`].
+/// `registry_write` guard, when a test asks. See [`crate::state::TestSeam::Capture`].
 ///
 /// **Taking the already-read `Project` is what fixes the call site, and it is
 /// load-bearing rather than decorative.**
@@ -180,9 +211,9 @@ async fn wait_at_maintenance_barrier(_state: &AppState) {}
 /// thing beats a comment asking for the right one.
 #[cfg(test)]
 fn wait_between_project_and_generation_reads(state: &AppState, _project: &Project) {
-    let barrier = lock(&state.capture_barrier).clone();
+    let barrier = test_seam(state, crate::state::TestSeam::Capture);
     if let Some(barrier) = barrier {
-        // `notify_one` on both sides — see `wait_at_maintenance_barrier`.
+        // `notify_one` on both sides — see `wait_at_seam`.
         barrier.entered.notify_one();
         // Blocking, not `await`: the capture is synchronous and holds a `std`
         // mutex, which must never be held across an await point. The test drives
@@ -2451,7 +2482,7 @@ pub async fn fork_agent_impl(
 /// queued: waiting would hand the branch the answer to the very turn the user is
 /// branching away from.
 ///
-/// **A look, not a lock — but no longer only a look.** `is_turn_running` is a
+/// **A look, not a lock — but no longer only a look.** `running_turn_kind` is a
 /// non-blocking peek at the agent's actor (the dispatcher has no status flag by
 /// design — one turn in flight is structural), so on its own it leaves two
 /// windows: a parent turn starting between this reply and claude reading the
@@ -2470,7 +2501,12 @@ pub async fn fork_agent_impl(
 /// coupling that reasoning feared is real and is the accepted cost — see
 /// `crate::session_lock`.
 async fn ensure_fork_source_free(state: &AppState, source: &AgentRecord) -> Result<(), AppError> {
-    if state.dispatcher.is_turn_running(source.id).await {
+    if state
+        .dispatcher
+        .running_turn_kind(source.id)
+        .await
+        .is_some()
+    {
         return Err(AppError::ForkSourceBusy {
             name: source.name.clone(),
         });
@@ -2509,6 +2545,25 @@ async fn ensure_materializing_fork_may_dispatch(
     }
 }
 
+/// Whether `agent` is a **fork still awaiting materialization**: it carries fork
+/// provenance but has no session file of its own, so the next dispatch is the one
+/// that will copy its parent's session. Returns that parent's session id, which
+/// the fork gate needs and a bare `bool` would throw away.
+///
+/// Shared so the two questions asked about this state stay the same question:
+/// [`busy_fork_source`] asks whether the copy is safe to take right now, and
+/// [`compact_agent_impl`] asks whether a compaction would *be* that copy.
+pub(crate) fn unmaterialized_fork_parent(
+    agent: &AgentRecord,
+    directory: &Path,
+    home_dir: &Path,
+) -> Option<Uuid> {
+    let parent_session = agent.forked_from_session?;
+    resolve_session_file(agent, directory, home_dir)
+        .is_none()
+        .then_some(parent_session)
+}
+
 /// The shared policy: **the parent this dispatch would fork, if that parent is
 /// mid-turn right now** — `None` when the dispatch is safe (not a fork, already
 /// materialized, parent gone, or parent idle).
@@ -2532,10 +2587,7 @@ pub(crate) async fn busy_fork_source(
     directory: &Path,
     home_dir: &Path,
 ) -> Option<AgentRecord> {
-    let parent_session = agent.forked_from_session?;
-    if resolve_session_file(agent, directory, home_dir).is_some() {
-        return None;
-    }
+    let parent_session = unmaterialized_fork_parent(agent, directory, home_dir)?;
     // Self-referential provenance is corrupt data, not a policy question: the
     // adapter would be handed `--resume X --session-id X --fork-session`. The
     // caller turns this into a visible refusal; see the deadlock note below for
@@ -2565,7 +2617,7 @@ pub(crate) async fn busy_fork_source(
     let parent = lock(agents_by_id)
         .values()
         .find(|candidate| {
-            // Never match the agent itself. `is_turn_running` asks the target's
+            // Never match the agent itself. `running_turn_kind` asks the target's
             // own actor and awaits its reply, so an agent whose provenance names
             // its own session would ask a question only it can answer, from
             // inside the code path that is stopping it from answering —
@@ -2584,7 +2636,7 @@ pub(crate) async fn busy_fork_source(
         })
         .cloned();
     let parent = parent?;
-    // Stricter than `is_turn_running`: a parent mid-teardown can still be writing
+    // Stricter than `running_turn_kind`: a parent mid-teardown can still be writing
     // its session file, and that reads as "not running".
     if dispatcher.is_safe_to_fork_from(parent.id).await {
         None
@@ -3532,9 +3584,88 @@ pub async fn send_message_impl(
     }
 }
 
+/// Ask an agent to compact its own conversation — summarize the history so far
+/// and continue from the summary. Returns the receipt `MessageId`; the turn's
+/// lifecycle flows over the per-agent event channel exactly as a send's does, and
+/// the correlated `TurnStart` carries this id.
+///
+/// Shaped like [`send_message_impl`] — same dispatch snapshot, same factory, same
+/// generation check — because a compaction *is* a turn. What differs is the three
+/// gates in front of it, each refusing before anything is created or dispatched:
+///
+/// 1. **The harness capability**, which is the authority. A `/compact` *prompt*
+///    is not a substitute for the harnesses that lack it: they answer it with a
+///    model-authored claim of success while nothing is compacted (harness-behavior
+///    §3.9), so the refusal has to be real.
+/// 2. **A fork still awaiting materialization**, checked *before* the
+///    no-session gate below, which it would otherwise trip with a less useful
+///    message. A compaction must not be the dispatch that performs a fork.
+/// 3. **No session at all**, which is what keeps the adapter on its `--resume`
+///    branch: there is no conversation to summarize.
+///
+/// Deliberately **not** gated on the agent being idle. A compaction queues behind
+/// in-flight and queued work like any other turn (decision 1), so busy is not a
+/// refusal here.
+pub async fn compact_agent_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    send_id: SendId,
+    home_dir: &Path,
+) -> Result<MessageId, AppError> {
+    let (project, agent, generation) = capture_dispatch_snapshot(state, agent_id)?;
+    let project_id = project.id;
+    if !agent.harness.supports_manual_compaction() {
+        return Err(AppError::CompactionUnsupported {
+            harness: agent.harness,
+        });
+    }
+    if unmaterialized_fork_parent(&agent, &project.directory, home_dir).is_some() {
+        return Err(AppError::CompactionForkNotMaterialized {
+            name: agent.name.clone(),
+        });
+    }
+    if resolve_session_file(&agent, &project.directory, home_dir).is_none() {
+        return Err(AppError::CompactionSourceHasNoSession {
+            name: agent.name.clone(),
+        });
+    }
+    let adapter = adapter_for(state, &agent)?;
+    let factory: Arc<dyn DispatchContextFactory> = Arc::new(ProjectDispatchContextFactory::new(
+        project,
+        agent,
+        adapter,
+        crate::dispatch_context::DispatchDeps {
+            base_emitter: Arc::clone(&state.emitter),
+            needs_session_meta: Arc::clone(&state.needs_session_meta),
+            agents_by_id: Arc::clone(&state.agents_by_id),
+            registry_write: Arc::clone(&state.registry_write),
+            dispatcher: Arc::downgrade(&state.dispatcher),
+            home_dir: home_dir.to_path_buf(),
+            lock_root: state.lock_root.clone(),
+            project_generation: Arc::clone(&state.project_generation),
+            generation_at_capture: generation,
+            preferences: Arc::clone(&state.preferences),
+        },
+    ));
+    // Same last-moment check as a send: refuse if the project moved under us
+    // while the awaits above were pending.
+    reject_if_generation_changed(state, project_id, generation)?;
+    // `send_id` is minted by the frontend so it can cancel the compaction while
+    // it is still queued, before any `TurnStart` carries the id back. Unlike a
+    // send's it groups nothing — a compaction is never a fan-out.
+    Ok(state.dispatcher.compact_agent(agent_id, send_id, &factory))
+}
+
 /// Remove a not-yet-dispatched queued message by id, returning its payload so
 /// the compose bar can restore the text. Race-safe: `NotQueued` (already
 /// dequeued/started or never existed) maps to [`AppError::QueuedMessageNotFound`].
+///
+/// Both of the dispatcher's refusals collapse onto that one error *today*,
+/// because no surface offers removal for a compaction row — so a user has no way
+/// to tell them apart, and inventing a second message would describe a state they
+/// cannot reach. They are listed by name rather than caught by a wildcard so a
+/// *new* refusal reason has to be classified deliberately instead of silently
+/// inheriting "not found".
 pub async fn remove_queued_message_impl(
     state: &AppState,
     agent_id: AgentId,
@@ -3544,7 +3675,11 @@ pub async fn remove_queued_message_impl(
         .dispatcher
         .remove_queued_message(agent_id, message_id)
         .await
-        .map_err(|_| AppError::QueuedMessageNotFound(message_id))
+        .map_err(|e| match e {
+            RemoveQueuedMessageError::NotQueued | RemoveQueuedMessageError::NotRemovable => {
+                AppError::QueuedMessageNotFound(message_id)
+            }
+        })
 }
 
 /// Cancel an agent's in-flight turn (user-initiated stop). Idempotent: a
@@ -3944,11 +4079,19 @@ async fn resolve_source_completed_only(
         name: qualified_source_name(&agent.name, &project, recipient_project),
         ..agent
     };
-    if state.dispatcher.is_turn_running(agent_id).await {
+    // Name what the agent is actually doing: a compaction never produces a reply,
+    // so "still responding" would send the user looking for output that isn't
+    // coming.
+    let busy_with = match state.dispatcher.running_turn_kind(agent_id).await {
+        None => None,
+        Some(TurnKind::Send) => Some("is still responding"),
+        Some(TurnKind::Compaction) => Some("is compacting its context"),
+    };
+    if let Some(busy_with) = busy_with {
         return Err(AppError::Workflow(
             switchboard_workflow::WorkflowError::Invocation {
                 message: format!(
-                    "agent {:?} is still responding — wait for it to finish, then run the workflow",
+                    "agent {:?} {busy_with} — wait for it to finish, then run the workflow",
                     agent.name
                 ),
             },
@@ -6308,16 +6451,139 @@ fn gc_unreferenced_attachments(attachments_dir: &Path, referenced: &HashSet<Path
     }
 }
 
+/// Reclaim a project's orphaned staged attachments: delete every file in its
+/// attachments directory that neither a journal `Send` record nor
+/// `draft_attachments` refers to. Orphans come from a staged-but-unsent drop the
+/// user abandoned, or from a conversation that was removed.
+///
 /// `draft_attachments` are staged files the caller's *unsent* compose draft still
-/// points at. A draft lives in the frontend's machine-local storage, which the
-/// backend cannot see, so the caller must declare its live references or the GC
-/// below would reclaim them — leaving the restored draft's chips dangling at
-/// deleted paths. Pass an empty slice when there is no draft.
+/// points at. A draft lives in the frontend's machine-local storage, which this
+/// process cannot see, so the caller **must** declare its live references or a
+/// restored draft's chips are left dangling at deleted paths.
+///
+/// # When this is safe, and why it is a separate operation
+///
+/// The reference set above is blind to a **queued** send: the journal records a
+/// send at turn-start, and the composer clears its chips the instant the user
+/// sends. So between those two moments an attachment belongs to a real message
+/// and is referenced by nothing on disk — reclaiming then deletes the staged copy
+/// the message is about to use, and the agent is handed a path to nothing.
+///
+/// The only moment with no such window is before any of the project's agents can
+/// receive a send. Two things establish it together, and **both** are load-bearing:
+///
+/// 1. The frontend calls this after `open_project` and **before** it lists and
+///    registers the project's agents, so no agent exists for a send to target.
+///    That ordering lives in `ensureProjectLoaded`; this process cannot check it.
+/// 2. This function refuses to run twice for the same project in one **process**
+///    lifetime. A webview reload restarts the frontend — and therefore step 1 —
+///    while the dispatcher keeps its backlog, so the reloaded frontend's call
+///    would otherwise reclaim attachments belonging to work still queued here.
+///
+/// Both rest on a further assumption worth tripping over rather than
+/// rediscovering: backend-originated sends (workflow steps) carry no staged
+/// attachments, so nothing can enqueue an attachment-bearing send without the
+/// frontend. If that changes, or if a send path stops requiring an opened
+/// project, this boundary has to be rebuilt.
+///
+/// Reclaiming is opportunistic — a pure function of on-disk state, re-run on the
+/// next process start — so a skipped pass costs only disk.
+pub async fn reclaim_project_attachments_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    draft_attachments: &[PathBuf],
+) -> Result<(), AppError> {
+    let project = match lock(&state.projects).get(&project_id).cloned() {
+        Some(loaded) => loaded,
+        None => open_project_from_store(state, project_id)?,
+    };
+    let mut done = {
+        let mut passes = lock(&state.attachment_reclaims);
+        // A pass exists — running or finished. Either way, wait on *its*
+        // completion; never start another.
+        if let Some(done) = passes.get(&project_id) {
+            done.clone()
+        } else {
+            let (finished, done) = tokio::sync::watch::channel(false);
+            passes.insert(project_id, done.clone());
+            let drafts: Vec<PathBuf> = draft_attachments.to_vec();
+            #[cfg(test)]
+            let seam = test_seam(state, crate::state::TestSeam::Reclaim);
+            #[cfg(not(test))]
+            let seam: Option<()> = None;
+            // Detached on purpose: owned by the runtime, not by this caller. A
+            // caller that goes away (a page reload mid-pass) must neither cancel
+            // the pass nor let a later caller start a second one.
+            tokio::spawn(async move {
+                // Reading the journal and walking the attachments directory are
+                // blocking I/O on the project-open path — same reason
+                // `load_agent_transcript` is spawned rather than awaited.
+                if let Err(join_err) = tokio::task::spawn_blocking(move || {
+                    // **Inside** the blocking work, not before it. A seam in the
+                    // async wrapper would leave the deleting phase unobserved: a
+                    // regression that stopped awaiting this handle would signal
+                    // completion early, and the scan would still finish before any
+                    // assertion could notice. Parked here, that regression
+                    // releases a waiter while this closure is demonstrably still
+                    // running.
+                    wait_at_blocking_seam(seam);
+                    reclaim_pass(&project, &drafts);
+                })
+                .await
+                {
+                    tracing::warn!(
+                        %project_id,
+                        error = %join_err,
+                        "attachment reclaim worker did not finish — skipping this pass"
+                    );
+                }
+                // Signal on every exit. If this task itself dies the sender drops,
+                // which waiters below also read as "stopped".
+                let _ = finished.send(true);
+            });
+            done
+        }
+    };
+    // `Err` ⇒ the sender was dropped without a signal: the worker is gone, which
+    // is the same fact from a waiter's point of view.
+    let _ = done.wait_for(|finished| *finished).await;
+    Ok(())
+}
+
+/// One reclaim pass over a project's attachments directory. **Best effort**: an
+/// unreadable or corrupt journal skips the pass entirely and logs — it must never
+/// proceed with an empty reference set, which would delete every staged file. A
+/// skipped pass costs only disk (the next process start retries), whereas
+/// failing here used to abort project activation over housekeeping the user
+/// cannot act on. History loading stays fail-loud, so the underlying problem is
+/// still shown; it just no longer locks the user out of their agents.
+fn reclaim_pass(project: &Project, drafts: &[PathBuf]) {
+    let journal = match switchboard_core::journal::read_records(&project.journal_path()) {
+        Ok(journal) => journal,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project.id,
+                error = %e,
+                "journal unreadable — skipping attachment reclaim rather than deleting on a guess"
+            );
+            return;
+        }
+    };
+    let mut referenced = collect_referenced_attachment_paths(&journal);
+    referenced.extend(drafts.iter().cloned());
+    gc_unreferenced_attachments(&project.attachments_dir(), &referenced);
+}
+
+/// **Read-only.** This used to reclaim orphaned staged attachments, taking the
+/// caller's draft references so they were spared; both moved to
+/// [`reclaim_project_attachments_impl`], the only operation that can recognize
+/// the one moment reclaiming is safe. A loader that reclaims deletes a queued
+/// send's attachment every time the conversation is re-read, so this stays
+/// read-only.
 pub async fn load_project_conversation_impl(
     state: &AppState,
     project_id: ProjectId,
     home_dir: &Path,
-    draft_attachments: &[PathBuf],
 ) -> Result<ProjectConversation, AppError> {
     // Resolve the project and collect each agent's *owned* inputs while holding
     // the lock, then release it before doing any read+parse. `load_agent_transcript`
@@ -6328,15 +6594,6 @@ pub async fn load_project_conversation_impl(
         None => open_project_from_store(state, project_id)?,
     };
     let journal = switchboard_core::journal::read_records(&project.journal_path())?;
-
-    // Reclaim disk on load: delete any staged file referenced by neither a `Send`
-    // record nor the caller's live draft — orphans from a staged-but-unsent drop
-    // the user has since abandoned, or files whose conversation was removed.
-    // Pure function of (on-disk state, declared draft refs), so it's crash-safe
-    // (just re-runs next load) and needs no completion signal.
-    let mut referenced = collect_referenced_attachment_paths(&journal);
-    referenced.extend(draft_attachments.iter().cloned());
-    gc_unreferenced_attachments(&project.attachments_dir(), &referenced);
 
     let agents = project.list_agents()?;
 
@@ -7443,7 +7700,7 @@ mod tests {
     /// race the actor.
     async fn await_turn_running(state: &AppState, agent_id: AgentId) {
         for _ in 0..200 {
-            if state.dispatcher.is_turn_running(agent_id).await {
+            if state.dispatcher.running_turn_kind(agent_id).await.is_some() {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -7578,7 +7835,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_referential_provenance_is_refused_rather_than_asking_itself() {
-        // Corrupt data, not a policy question. `is_turn_running` asks the target
+        // Corrupt data, not a policy question. `running_turn_kind` asks the target
         // agent's own actor and awaits its reply, so an agent whose provenance
         // names its own session would ask a question only it can answer from
         // inside the code path blocking it from answering — a deadlock that no
@@ -7849,7 +8106,16 @@ mod tests {
         let refusal = preflight_for(&state, project_id, fork.id, home.path())
             .await
             .expect_err("a turn that would fork a busy parent must be refused at its start");
-        assert!(refusal.contains("is working"), "got: {refusal}");
+        // Compared against the error's own text rather than a phrase from it, so
+        // a copy change moves both together instead of failing here.
+        assert_eq!(
+            refusal,
+            AppError::ForkSourceBusy {
+                name: "alice".to_owned()
+            }
+            .to_string(),
+            "the start-moment refusal must be the busy-parent one, not some other failure"
+        );
 
         gate.notify_waiters();
     }
@@ -7876,6 +8142,7 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: Some(Arc::clone(&teardown)),
+            compaction: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
@@ -7998,7 +8265,7 @@ mod tests {
         let before = project_generation(&state, project_id);
 
         let barrier = Arc::new(crate::state::MaintenanceBarrier::default());
-        *lock(&state.capture_barrier) = Some(Arc::clone(&barrier));
+        lock(&state.test_seams).insert(crate::state::TestSeam::Capture, Arc::clone(&barrier));
         let entered = barrier.entered.notified();
         tokio::pin!(entered);
         entered.as_mut().enable();
@@ -9696,7 +9963,19 @@ mod tests {
         /// held. Without it a test cannot distinguish "released at turn end" from
         /// "released the instant cancel was requested."
         teardown: Option<Arc<crate::state::MaintenanceBarrier>>,
+        /// Scripts `compact`. `None` — the default for every fixture that is not
+        /// about compaction — makes the adapter refuse, which is what a harness
+        /// Switchboard cannot drive does.
+        compaction: Option<CompactionScript>,
         dispatches: std::sync::atomic::AtomicUsize,
+    }
+
+    /// How [`GatedRecordingAdapter`] should answer a compaction: park on `gate`
+    /// before the terminal (so a forward can register a current-turn wait against
+    /// a live compaction), then terminate `Failed` if `fails`, else `Completed`.
+    struct CompactionScript {
+        gate: Arc<tokio::sync::Notify>,
+        fails: bool,
     }
 
     #[async_trait]
@@ -9806,6 +10085,355 @@ mod tests {
                 tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
             ))
         }
+
+        async fn compact(
+            &self,
+            agent: &AgentRecord,
+            _cwd: &Path,
+            turn_id: switchboard_harness::TurnId,
+            options: switchboard_harness::DispatchOptions,
+        ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError> {
+            // Unscripted means unsupported — the trait default, reproduced here
+            // because overriding the method replaces it.
+            let Some(script) = &self.compaction else {
+                return Err(switchboard_harness::DispatchError::UnsupportedOperation {
+                    harness: agent.harness,
+                    operation: "manual context compaction",
+                });
+            };
+            let cancel_token = options.cancel_token.clone();
+            let gate = Arc::clone(&script.gate);
+            let fails = script.fails;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                // A compaction streams no answer, so the only pre-terminal event
+                // is a heartbeat — matching what the Claude adapter emits.
+                let _ = tx.send(switchboard_harness::AdapterEvent::Liveness { turn_id });
+                let cancelled = tokio::select! {
+                    () = gate.notified() => false,
+                    () = cancel_token.cancelled() => true,
+                };
+                if cancelled {
+                    // End with no terminal; the dispatcher synthesizes Cancelled.
+                    return;
+                }
+                let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
+                    turn_id,
+                    outcome: if fails {
+                        TurnOutcome::Failed {
+                            kind: switchboard_harness::FailureKind::HarnessError,
+                            message: "the harness declined to compact this conversation".to_owned(),
+                        }
+                    } else {
+                        TurnOutcome::Completed
+                    },
+                    ended_at: chrono::Utc::now(),
+                    usage: None,
+                    context_window_source: None,
+                    stable_message_id: None,
+                    first_message_id: None,
+                    spend: None,
+                    model: None,
+                    effort: None,
+                });
+            });
+            Ok(Box::pin(
+                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            ))
+        }
+    }
+
+    /// A [`GatedRecordingAdapter`] whose `compact` parks on `compaction_gate`
+    /// before terminating, so a test can hold a compaction live while a forward
+    /// resolves against it. Sends are ungated (nothing parks) — the compaction is
+    /// the only thing these fixtures hold.
+    fn compaction_adapter(
+        texts: &[&str],
+        compaction_gate: &Arc<tokio::sync::Notify>,
+        fails: bool,
+    ) -> Arc<dyn HarnessAdapter> {
+        Arc::new(GatedRecordingAdapter {
+            prompts: Arc::new(Mutex::new(Vec::new())),
+            selections: None,
+            chrome: None,
+            texts: texts.iter().map(|t| (*t).to_owned()).collect(),
+            gate: Arc::new(tokio::sync::Notify::new()),
+            // No send parks: `usize::MAX` is never a dispatch index.
+            park_at: usize::MAX,
+            extra_parks: Vec::new(),
+            fail_at: Vec::new(),
+            teardown: None,
+            compaction: Some(CompactionScript {
+                gate: Arc::clone(compaction_gate),
+                fails,
+            }),
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Manual context compaction — the app-layer gates, and what a forward sees
+    // while one is running.
+    // -----------------------------------------------------------------------
+
+    /// A loaded project whose Claude adapter parks its compactions on `gate`.
+    fn compaction_fixture(
+        texts: &[&str],
+        gate: &Arc<tokio::sync::Notify>,
+        fails: bool,
+    ) -> (TempDir, TempDir, AppState, Arc<RecordingEmitter>, ProjectId) {
+        let emitter = Arc::new(RecordingEmitter::new());
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state = AppState::new_for_test(
+            compaction_adapter(texts, gate, fails),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        (tmp, TempDir::new().unwrap(), state, emitter, project.id)
+    }
+
+    #[tokio::test]
+    async fn compaction_is_refused_for_every_harness_that_cannot_be_driven() {
+        // The capability predicate is the authority, and this is the gate that
+        // stands between a Codex or Antigravity agent and a `/compact` *prompt*
+        // — which those harnesses answer with a model-authored claim of success
+        // while nothing is compacted. A silent no-op would be the worst outcome
+        // available, so the refusal must be typed and loud.
+        let (_tmp, home, state, _gate, _project) =
+            compaction_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
+        for harness in [HarnessKind::Codex, HarnessKind::Antigravity] {
+            let agent = create_agent_impl(
+                &state,
+                &format!("agent-{harness}"),
+                harness,
+                AgentSelection::default(),
+            )
+            .unwrap();
+            let err = compact_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
+                .await
+                .expect_err("a harness Switchboard cannot compact must be refused");
+            assert!(
+                matches!(err, AppError::CompactionUnsupported { harness: h } if h == harness),
+                "got: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_is_refused_for_an_agent_with_no_session_yet() {
+        // Nothing has been said, so there is nothing to summarize — and refusing
+        // here is what keeps the adapter on its `--resume` branch instead of
+        // minting a session as a side effect of a maintenance action.
+        let (_tmp, home, state, _gate, _project) =
+            compaction_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
+        let agent = create_agent_impl(
+            &state,
+            "fresh",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+
+        let err = compact_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
+            .await
+            .expect_err("an agent with no session has nothing to compact");
+        assert!(
+            matches!(err, AppError::CompactionSourceHasNoSession { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_is_refused_for_a_fork_still_awaiting_materialization() {
+        // The branch's session is created by its first *send*. If a compaction
+        // were allowed to be that dispatch it would materialize the branch as a
+        // side effect — and the fork is a turn that needs a prompt, which a
+        // compaction does not have. The distinct error is what tells the user the
+        // specific thing to do (send a message), where the no-session error above
+        // would only say the agent is empty.
+        let (_tmp, home, state, _gate, _project) =
+            compaction_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
+        let mut agent = create_agent_impl(
+            &state,
+            "branch",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        // Fork provenance with no session file of its own — the residue of a
+        // fork whose first send failed to launch.
+        agent.forked_from_session = Some(Uuid::now_v7());
+        lock(&state.agents_by_id).insert(agent.id, agent.clone());
+
+        let err = compact_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
+            .await
+            .expect_err("a compaction must not be the dispatch that forks");
+        assert!(
+            matches!(err, AppError::CompactionForkNotMaterialized { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_is_accepted_for_a_claude_agent_with_a_session() {
+        // The happy path returns the dispatcher's receipt, and the turn runs on
+        // the agent's event channel like any other.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (_tmp, home, state, emitter, project_id) = compaction_fixture(&[], &gate, false);
+        let agent = seed_source(&state, home.path(), project_id, "alice", "ANSWER");
+
+        let message_id = compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
+            .await
+            .expect("a Claude agent with a session can be compacted");
+
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        let start = emitter
+            .snapshot()
+            .into_iter()
+            .find(|(_, v)| v["type"] == "turn_start")
+            .expect("turn_start");
+        assert_eq!(
+            start.1["message_id"].as_str().unwrap(),
+            message_id.to_string(),
+            "the receipt must correlate to the turn the frontend will render"
+        );
+        gate.notify_one();
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compaction_does_not_refuse_a_busy_agent() {
+        // Decision 1: a compaction queues like any other work rather than being
+        // gated on idleness. Accepting while a send is in flight is the whole
+        // behavior — a refusal here would push the user into watching the agent.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (_tmp, home, state, emitter, project_id) = compaction_fixture(&["LIVE"], &gate, false);
+        let agent = seed_source(&state, home.path(), project_id, "alice", "ANSWER");
+
+        send_msg_with_home(&state, agent, "a long task", home.path())
+            .await
+            .unwrap();
+        within(
+            &emitter,
+            "turn_start (send)",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
+            .await
+            .expect("a busy agent queues the compaction rather than refusing it");
+    }
+
+    /// Forward from `source` and return the composed body, asserting it resolved.
+    async fn forward_from(
+        state: &AppState,
+        source: AgentId,
+        home: &Path,
+        project: ProjectId,
+    ) -> String {
+        let outcome = forward_message_impl(
+            state,
+            String::new(),
+            vec![src(state, source)],
+            Uuid::now_v7(),
+            home,
+            project,
+        )
+        .await
+        .unwrap();
+        resolved(&outcome).to_owned()
+    }
+
+    #[tokio::test]
+    async fn forwarding_from_a_compacting_agent_delivers_its_previous_answer() {
+        // Decision 9: a compaction is invisible to forwarding. The forward waits
+        // for the compaction's process to be gone — so the session file is
+        // settled — and then reads the agent's latest *real* answer, because a
+        // compaction produces none. The failure this guards against is the
+        // forward resolving as an empty source and invalidating itself, which
+        // would turn a routine maintenance action into a broken workflow.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (_tmp, home, state, emitter, project_id) = compaction_fixture(&[], &gate, false);
+        let agent = seed_source(&state, home.path(), project_id, "alice", "REAL ANSWER");
+
+        compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
+            .await
+            .unwrap();
+        within(
+            &emitter,
+            "compaction in flight",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        // Drive the forward to its hold *before* releasing the compaction: a
+        // future is inert until polled, so a merely-constructed forward would
+        // register nothing and this would prove only that no forward exists.
+        let mut forward = Box::pin(forward_from(&state, agent, home.path(), project_id));
+        assert!(
+            futures::poll!(forward.as_mut()).is_pending(),
+            "the forward must hold while the compaction is live"
+        );
+        await_wait_registered(&state, agent).await;
+
+        gate.notify_one();
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), forward)
+            .await
+            .expect("the forward resolves once the compaction drains");
+        assert!(
+            body.contains("REAL ANSWER"),
+            "a compaction has no output of its own, so the forward takes the last real answer; got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_after_a_failed_compaction_delivers_the_same_answer() {
+        // A failed compaction leaves the conversation exactly as it was, so it
+        // must not change what a forward sees — and in particular must not
+        // invalidate it. Same assertion as the success case on purpose: the
+        // verdict is not supposed to matter here.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (_tmp, home, state, emitter, project_id) = compaction_fixture(&[], &gate, true);
+        let agent = seed_source(&state, home.path(), project_id, "alice", "REAL ANSWER");
+
+        compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
+            .await
+            .unwrap();
+        within(
+            &emitter,
+            "compaction in flight",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        gate.notify_one();
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+
+        let body = forward_from(&state, agent, home.path(), project_id).await;
+        assert!(
+            body.contains("REAL ANSWER"),
+            "a failed compaction changes nothing a forward can see; got: {body}"
+        );
     }
 
     /// Barrier proving `agent_id`'s actor has **processed** the
@@ -9820,7 +10448,7 @@ mod tests {
     /// idle arm as `Idle`. So a test must not release a parked turn until the wait
     /// is registered.
     ///
-    /// `is_turn_running` sends `PeekCurrentTurn` on the same FIFO mailbox, behind
+    /// `running_turn_kind` sends `PeekCurrentTurn` on the same FIFO mailbox, behind
     /// the wait. Awaiting its reply therefore proves the wait was serviced first,
     /// and a `true` reply proves it registered against a *live* turn rather than
     /// being answered from the post-terminal stash. Call this after `poll!` and
@@ -9828,7 +10456,7 @@ mod tests {
     /// stream cannot yield a terminal, so the biased arm cannot preempt the command.
     async fn await_wait_registered(state: &AppState, agent_id: AgentId) {
         assert!(
-            state.dispatcher.is_turn_running(agent_id).await,
+            state.dispatcher.running_turn_kind(agent_id).await.is_some(),
             "the forward's wait must register while the source's turn is still live"
         );
     }
@@ -9850,6 +10478,7 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: None,
+            compaction: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         (adapter, prompts)
@@ -9875,6 +10504,7 @@ mod tests {
             extra_parks: vec![(second.1, Arc::clone(second.0))],
             fail_at: fail_at.to_vec(),
             teardown: None,
+            compaction: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         (adapter, prompts)
@@ -13995,6 +14625,7 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: None,
+            compaction: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         let emitter = Arc::new(RecordingEmitter::new());
@@ -14073,6 +14704,7 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: None,
+            compaction: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         let emitter = Arc::new(RecordingEmitter::new());
@@ -14657,7 +15289,7 @@ mod tests {
         // Hold the post-eviction window open. Polling for it is not viable —
         // the drain finishes before a test can look.
         let barrier = Arc::new(crate::state::MaintenanceBarrier::default());
-        *lock(&state.maintenance_barrier) = Some(Arc::clone(&barrier));
+        lock(&state.test_seams).insert(crate::state::TestSeam::Maintenance, Arc::clone(&barrier));
         // Subscribe before spawning. The seam now uses `notify_one`, which
         // stores a permit and makes the ordering irrelevant — but subscribing
         // first is still the honest shape, and this line predates that change.
@@ -20704,7 +21336,7 @@ mod tests {
         .unwrap();
 
         let home = tmp.path().to_path_buf();
-        let conv = load_project_conversation_impl(&state, project_id, &home, &[])
+        let conv = load_project_conversation_impl(&state, project_id, &home)
             .await
             .unwrap();
 
@@ -20733,7 +21365,7 @@ mod tests {
         let (_agent, project_id) = project_with_agent(&state, &tmp);
 
         let home = tmp.path().to_path_buf();
-        let conv = load_project_conversation_impl(&state, project_id, &home, &[])
+        let conv = load_project_conversation_impl(&state, project_id, &home)
             .await
             .unwrap();
 
@@ -20762,18 +21394,197 @@ mod tests {
             .await
             .unwrap();
 
-        let home = tmp.path().to_path_buf();
-        load_project_conversation_impl(&state, project_id, &home, &[PathBuf::from(&drafted.path)])
+        reclaim_project_attachments_impl(&state, project_id, &[PathBuf::from(&drafted.path)])
             .await
             .unwrap();
 
         assert!(
             Path::new(&drafted.path).exists(),
-            "a staged file the caller declared as a live draft reference survives the load GC"
+            "a staged file the caller declared as a live draft reference survives the reclaim"
         );
         assert!(
             !Path::new(&abandoned.path).exists(),
             "a staged file referenced by neither the journal nor the draft is still reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn loading_a_conversation_never_reclaims_attachments() {
+        // The loader runs on every refresh, fork-history read, and retry. The
+        // GC's reference set cannot see a *queued* send — the journal records a
+        // send at turn-start and the composer clears its chips at send — so a
+        // loader that reclaimed would delete the staged copy a queued message is
+        // about to use, every time the conversation was re-read.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
+
+        let source = tmp.path().join("queued.png");
+        std::fs::write(&source, b"Q").unwrap();
+        let queued = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+
+        let home = tmp.path().to_path_buf();
+        load_project_conversation_impl(&state, project_id, &home)
+            .await
+            .unwrap();
+
+        assert!(
+            Path::new(&queued.path).exists(),
+            "reading a conversation must never delete a staged attachment"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaiming_runs_once_per_process_so_a_reloaded_frontend_cannot_repeat_it() {
+        // The frontend calls this before it registers a project's agents, so the
+        // first pass runs when no send can be queued. A webview reload restarts
+        // the frontend — and that ordering — while this process keeps its
+        // dispatcher backlog, so the reloaded frontend's call arrives at a moment
+        // when queued work *can* exist and must reclaim nothing.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
+
+        let first = tmp.path().join("orphan.png");
+        std::fs::write(&first, b"O").unwrap();
+        let orphan = stage_attachment_impl(&state, project_id, &first)
+            .await
+            .unwrap();
+
+        reclaim_project_attachments_impl(&state, project_id, &[])
+            .await
+            .unwrap();
+        assert!(
+            !Path::new(&orphan.path).exists(),
+            "the one pass per process still reclaims genuine orphans"
+        );
+
+        // Stand in for the attachment of a send queued after that first pass.
+        let second = tmp.path().join("queued-after-reload.png");
+        std::fs::write(&second, b"Q").unwrap();
+        let queued = stage_attachment_impl(&state, project_id, &second)
+            .await
+            .unwrap();
+
+        reclaim_project_attachments_impl(&state, project_id, &[])
+            .await
+            .unwrap();
+        assert!(
+            Path::new(&queued.path).exists(),
+            "a second reclaim in one process lifetime must be a no-op — the backlog it \
+             cannot see may already exist"
+        );
+    }
+
+    /// Frees a seam's parked worker however the test exits. See its one use.
+    struct ReleaseOnDrop(Arc<crate::state::MaintenanceBarrier>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_reclaim_caller_waits_for_the_running_worker_even_if_the_first_is_dropped() {
+        // The reload case in full. The first caller's page reloads mid-pass, so
+        // the caller vanishes; the second caller (the reloaded page) must not be
+        // released until the worker has actually stopped — otherwise it registers
+        // agents and accepts an attachment-bearing send that the still-running
+        // worker deletes. And dropping the first caller must not start a *second*
+        // worker, which could finish first and release the second caller early.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
+        let state = Arc::new(state);
+
+        let source = tmp.path().join("orphan.png");
+        std::fs::write(&source, b"O").unwrap();
+        let orphan = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+
+        let barrier = Arc::new(crate::state::MaintenanceBarrier::default());
+        lock(&state.test_seams).insert(crate::state::TestSeam::Reclaim, Arc::clone(&barrier));
+        // Release on drop. The worker is parked on a *blocking* thread, so a
+        // panicking assertion below that skipped the release would strand it and
+        // hang the runtime's shutdown — turning a clear assertion failure into a
+        // hung suite, which is the worst way to learn this test broke.
+        let _release = ReleaseOnDrop(Arc::clone(&barrier));
+        let entered = barrier.entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+
+        let first_state = Arc::clone(&state);
+        let first = tokio::spawn(async move {
+            reclaim_project_attachments_impl(&first_state, project_id, &[]).await
+        });
+        tokio::time::timeout(WAIT, entered)
+            .await
+            .expect("the worker reaches its seam");
+        // The initiating caller goes away while its worker is held open.
+        first.abort();
+        let _ = first.await;
+
+        let second_state = Arc::clone(&state);
+        let mut second = Box::pin(async move {
+            reclaim_project_attachments_impl(&second_state, project_id, &[]).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), second.as_mut())
+                .await
+                .is_err(),
+            "a caller arriving mid-pass must wait for the worker, not be released on the claim"
+        );
+        // Exactly one worker: a second would have signalled `entered` again.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                barrier.entered.notified()
+            )
+            .await
+            .is_err(),
+            "dropping the first caller must not start a second worker"
+        );
+        assert!(
+            Path::new(&orphan.path).exists(),
+            "precondition: the held worker has not scanned yet"
+        );
+
+        barrier.release.notify_one();
+        tokio::time::timeout(WAIT, second)
+            .await
+            .expect("the second caller completes once the worker stops")
+            .unwrap();
+        assert!(
+            !Path::new(&orphan.path).exists(),
+            "the one worker finished its pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_journal_skips_reclaiming_without_failing_the_open() {
+        // Housekeeping must not lock the user out. A journal line that will not
+        // parse used to abort project activation here; now the pass is skipped —
+        // and skipped means *nothing is deleted*, never "proceed with an empty
+        // reference set", which would reclaim every staged file.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        std::fs::create_dir_all(project.journal_path().parent().unwrap()).unwrap();
+        std::fs::write(project.journal_path(), "{ this is not json\n").unwrap();
+
+        let source = tmp.path().join("would-be-orphan.png");
+        std::fs::write(&source, b"O").unwrap();
+        let staged = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+
+        reclaim_project_attachments_impl(&state, project_id, &[])
+            .await
+            .expect("a corrupt journal is a reason to skip, not to fail the open");
+        assert!(
+            Path::new(&staged.path).exists(),
+            "a skipped pass deletes nothing"
         );
     }
 

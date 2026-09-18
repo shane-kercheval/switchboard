@@ -217,14 +217,51 @@ pub enum AppError {
     #[error("{name} has no session to branch from yet — send it a message first")]
     ForkSourceHasNoSession { name: String },
 
-    /// Fork: the source agent is running a turn, so a branch taken now would
-    /// inherit its in-flight prompt with a synthesized "No response requested."
-    /// placeholder instead of the real answer (harness-behavior §3.5, Probe A).
-    /// Refused rather than queued — waiting would deliver the answer to the
-    /// very turn the user is branching away from.
+    /// Compaction: Switchboard cannot mechanically drive this harness's
+    /// compaction. Like [`switchboard_core::CoreError::SessionForkUnsupported`]
+    /// this is a statement about **Switchboard's support**, not about what the
+    /// CLI can do — Codex compacts through a protocol Switchboard does not speak
+    /// — and saying otherwise would be false. Defense in depth: the frontend
+    /// never offers the action for these harnesses, so reaching this means a
+    /// caller bypassed the capability predicate.
     #[error(
-        "{name} is working — a branch taken now would not include its current answer; \
-         wait for it to finish, or cancel it first"
+        "Switchboard cannot compact {harness} conversations \
+         — it has no way to ask this harness to do it"
+    )]
+    CompactionUnsupported { harness: HarnessKind },
+
+    /// Compaction: the agent has no session file, so there is no conversation to
+    /// summarize. Worded as "no session" for the same reason
+    /// [`Self::ForkSourceHasNoSession`] is — a cancelled first turn still leaves a
+    /// resumable file, and compacting that is well-defined.
+    #[error("{name} has no conversation to compact yet — send it a message first")]
+    CompactionSourceHasNoSession { name: String },
+
+    /// Compaction: the agent carries fork provenance but has no session of its
+    /// own, so the *next ordinary send* is the dispatch that will copy its
+    /// parent's session. A compaction must not be that dispatch: it would create
+    /// the branch as a side effect of a maintenance action, and the fork is a
+    /// turn that needs a prompt. Normally unreachable — this state is the residue
+    /// of a fork whose first send failed to launch.
+    #[error("{name} hasn't branched from its source yet — send it a message first, then compact")]
+    CompactionForkNotMaterialized { name: String },
+
+    /// Fork: the source agent has a turn in flight, so the copy the branch takes
+    /// would be of a session file still being written. For a send that means the
+    /// branch inherits a synthesized "No response requested." placeholder instead
+    /// of the real answer (harness-behavior §3.5, Probe A); for a compaction it
+    /// means copying a half-rewritten history. Refused rather than queued —
+    /// waiting would deliver the answer to the very turn the user is branching
+    /// away from.
+    ///
+    /// The message is deliberately **not** kind-aware. Three of its four raise
+    /// sites reach their answer through `busy_fork_source`'s bool predicate, so
+    /// naming the kind would mean widening that predicate for a wording change —
+    /// and "its conversation must stop changing" is already true of both, where
+    /// "its current answer" was true only of a send.
+    #[error(
+        "{name} is busy — its conversation must stop changing before you can branch. \
+         Wait for it to finish, or cancel it first"
     )]
     ForkSourceBusy { name: String },
 

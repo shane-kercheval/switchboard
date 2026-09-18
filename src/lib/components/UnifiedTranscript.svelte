@@ -43,6 +43,7 @@
     groupRenderBlocks,
     INITIAL_WINDOW,
     lastAnswerTextOf,
+    type QueuedCompaction,
     REVEAL_BATCH,
     type RenderBlock,
     type UnifiedRow,
@@ -60,6 +61,7 @@
   import Badge from "$lib/components/ui/Badge.svelte";
   import AgentMessageBody from "$lib/components/AgentMessageBody.svelte";
   import CompactionMarker from "$lib/components/CompactionMarker.svelte";
+  import CompactionTurn from "$lib/components/CompactionTurn.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
@@ -216,7 +218,24 @@
     // Filter to the live roster so a removed agent leaves no orphan column
     // (the journal overlay retains its original recipient set).
     const knownAgentIds = new Set(agents.map((a) => a.id));
-    return buildUnifiedRows(turns, overlay, knownAgentIds);
+    return buildUnifiedRows(turns, overlay, knownAgentIds, queuedCompactions);
+  });
+
+  /// Compactions accepted but not yet started, read off the agents'
+  /// pending-send lists. Unlike a queued send — which renders as an affordance
+  /// under the prompt the user typed — a queued compaction has no prompt, so it
+  /// enters the row stream as its own row and needs `queued_at` to sit in the
+  /// right place. Cancel-requested entries are excluded, as they are for sends:
+  /// the row is going away.
+  const queuedCompactions = $derived.by(() => {
+    const queued: QueuedCompaction[] = [];
+    for (const agent of agents) {
+      for (const p of runtimes[agent.id]?.pending_sends ?? []) {
+        if (p.kind !== "compaction" || p.cancel_requested || p.queued_at === undefined) continue;
+        queued.push({ agent_id: agent.id, send_id: p.send_id, queued_at: p.queued_at });
+      }
+    }
+    return queued;
   });
 
   /// Group the flat rows into render blocks: standalone rows, plus one block per
@@ -511,7 +530,9 @@
     const set = new Set<string>();
     for (const agent of agents) {
       for (const p of runtimes[agent.id]?.pending_sends ?? []) {
-        if (!p.cancel_requested) set.add(p.send_id);
+        // A queued compaction shares this list but not this affordance — it has
+        // no user row to hang under, and renders its own row instead.
+        if (!p.cancel_requested && p.kind !== "compaction") set.add(p.send_id);
       }
     }
     return set;
@@ -1961,6 +1982,76 @@
   </div>
 {/snippet}
 
+<!-- A queued compaction: accepted by the backend, not started. It has no turn
+     and no prompt above it, so it stands alone rather than hanging under a user
+     message the way a queued *send* does. Cancelling fires `cancel_send` with
+     the entry's own id — the backend drops it and emits `message_cancelled`,
+     which removes the pending entry and (decision 8) appends no row. -->
+{#snippet queuedCompactionRow(row: Extract<UnifiedRow, { kind: "queued_compaction" }>)}
+  <div class="space-y-1.5" data-testid="turn" data-role="agent">
+    <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
+      <span class="text-fg" data-testid="turn-agent-name">{agentName(row.agent_id)}</span>
+      {#if agentById[row.agent_id]?.harness}
+        <HarnessIcon harness={agentById[row.agent_id]!.harness} testid="turn-harness-icon" />
+      {/if}
+    </div>
+    <div class="border-l-[0.5px] pl-3" style:border-left-color={agentBorderColor(row.agent_id)}>
+      <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="compaction-queued">
+        {@render liveTurnControl(
+          () => cancelSend(row.cancel_send_id, [row.agent_id]),
+          `Cancel queued compaction for ${agentName(row.agent_id)}`,
+          "compaction-queued-cancel",
+        )}
+        <span>Compaction queued</span>
+        <LoadingDots />
+      </div>
+    </div>
+  </div>
+{/snippet}
+
+<!-- A compaction that ran (or is running): the action row, never an empty
+     response. It keeps the agent header so attribution matches every other row
+     in a multi-agent transcript, and renders ungrouped — there is no prompt. -->
+{#snippet compactionTurnRow(turn: AgentTurn)}
+  <!-- `group` is what `messageMeta` reveals its details on — without it the
+       model and timestamp render but can never be shown, by hover or by
+       keyboard focus. -->
+  <div class="group space-y-1.5" data-testid="turn" data-role="agent">
+    <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
+      <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
+      {#if agentById[turn.agent_id]?.harness}
+        <HarnessIcon harness={agentById[turn.agent_id]!.harness} testid="turn-harness-icon" />
+      {/if}
+    </div>
+    <div class="border-l-[0.5px] pl-3" style:border-left-color={agentBorderColor(turn.agent_id)}>
+      <CompactionTurn
+        status={turn.status}
+        before={turn.usage?.context_input_tokens ?? undefined}
+        after={turn.usage?.context_tokens_after_turn ?? undefined}
+        error={turn.error}
+      />
+      {#if turn.status === "streaming"}
+        <!-- The same send-scoped cancel every running turn gets. Without it the
+             only way to stop a compaction is "Stop agent", which also discards
+             everything else queued for that agent — decision 1 makes a
+             compaction cancellable on its own terms. -->
+        {@render workingFooter(turn)}
+      {:else}
+        <!-- A compaction bills like any other turn, so an overage one has to
+             show its cost here; the accepted limitation is that cost is lost
+             after a restart, not that it never appears. -->
+        {@render messageMeta({
+          at: turn.started_at,
+          spend: turn.spend,
+          costUsd: turn.usage?.total_cost_usd,
+          model: modelOf(turn),
+          effort: effortOf(turn),
+        })}
+      {/if}
+    </div>
+  </div>
+{/snippet}
+
 {#snippet agentRow(row: Extract<UnifiedRow, { kind: "agent" }>)}
   {@const turn = row.turn}
   {@const harness = agentById[turn.agent_id]?.harness}
@@ -2407,6 +2498,10 @@
             {@render outcomeRow(block.row)}
           {:else if block.row.kind === "system_marker"}
             {@render systemMarkerRow(block.row)}
+          {:else if block.row.kind === "queued_compaction"}
+            {@render queuedCompactionRow(block.row)}
+          {:else if block.row.turn.kind === "compaction"}
+            {@render compactionTurnRow(block.row.turn)}
           {:else}
             {@render agentRow(block.row)}
           {/if}

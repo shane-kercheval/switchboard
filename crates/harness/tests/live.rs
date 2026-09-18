@@ -4002,3 +4002,211 @@ async fn live_antigravity_run_command_emits_shell_facet() {
         "CommandLine must decode transcript.jsonl's string-encoding, got {shell:?}"
     );
 }
+
+/// Run one minimal turn on `session_id`, asserting it completed.
+async fn live_claude_seed_turn(adapter: &ClaudeCodeAdapter, agent: &AgentRecord, prompt: &str) {
+    let events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            agent,
+            Path::new("/tmp"),
+            prompt,
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("seed dispatch should launch")
+        .collect()
+        .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "seed turn should complete, got {events:?}"
+    );
+}
+
+fn sole_live_terminal(events: &[AdapterEvent]) -> &AdapterEvent {
+    let terminals: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one terminal per turn, got {events:?}"
+    );
+    terminals[0]
+}
+
+/// A real `/compact` against the live CLI: the verified event protocol still
+/// produces a completed turn whose occupancy comes from `compact_boundary`, and
+/// the session file carries the boundary afterwards.
+///
+/// **The most expensive single live test in the suite.** A compaction is a
+/// full-context summarization call — $0.10–0.20 on a one-to-two-turn session at
+/// probe time (2026-09-16 @ 2.1.270), scaling with the conversation being
+/// compacted. Keep it on a minimal session; never point it at a real one.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_compact_succeeds_and_reports_the_boundary() {
+    let adapter = ClaudeCodeAdapter::new();
+    let session_id = Uuid::now_v7();
+    let agent = AgentRecord {
+        name: "compact-success".to_owned(),
+        session_locator: Some(SessionLocator::Uuid(session_id)),
+        ..live_agent()
+    };
+
+    // Two seed turns, so the compaction has a small but real conversation to
+    // summarize. (A one-turn session also compacts successfully — the refusal in
+    // the companion test needs a session that has *already* been compacted.)
+    live_claude_seed_turn(&adapter, &agent, "Reply with the single word 'ack'").await;
+    live_claude_seed_turn(&adapter, &agent, "Reply with the single word 'ack' again").await;
+
+    let events: Vec<AdapterEvent> = adapter
+        .compact(
+            &agent,
+            Path::new("/tmp"),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("compaction should launch on a materialized session")
+        .collect()
+        .await;
+
+    let AdapterEvent::TurnEnd { outcome, usage, .. } = sole_live_terminal(&events) else {
+        unreachable!("filtered to TurnEnd");
+    };
+    assert_eq!(
+        *outcome,
+        TurnOutcome::Completed,
+        "compaction should complete, got {events:?}"
+    );
+    let usage = usage
+        .as_ref()
+        .expect("a successful compaction reports usage from compact_metadata");
+    let (Some(before), Some(after)) = (usage.context_input_tokens, usage.context_tokens_after_turn)
+    else {
+        panic!("expected before/after occupancy, got {usage:?}");
+    };
+    assert!(
+        after < before,
+        "compaction should shrink the context: {before} → {after}"
+    );
+    assert!(
+        usage.context_window.is_some_and(|w| u64::from(w) >= after),
+        "the post-compaction `system/init` model should resolve an exact window, got {usage:?}"
+    );
+
+    // The durable half: the harness owns the boundary + recap, and that is what
+    // survives a restart (the live row does not).
+    // `claude_session_file_path` requires a CANONICAL cwd — on macOS `/tmp` is a
+    // symlink to `/private/tmp`, and the un-canonicalized form encodes to a
+    // directory that does not exist.
+    let cwd = Path::new("/tmp").canonicalize().expect("canonicalize /tmp");
+    let path = claude_session_file_path(&home_dir(), &cwd, &session_id);
+    let contents = std::fs::read_to_string(&path).expect("session file should exist");
+    assert!(
+        contents.contains("\"compact_boundary\""),
+        "session file at {} should record the compaction boundary",
+        path.display()
+    );
+}
+
+/// Compacting an **already-compacted** session: the CLI refuses with "Not enough
+/// messages to compact", and that refusal must surface as a `Failed` turn
+/// carrying the CLI's own message — **not** as the completed turn that `result`
+/// alone would report (`subtype:"success"`, `is_error:false`, exit 0).
+///
+/// The precondition is load-bearing and was got wrong once: a *fresh* one-turn
+/// session compacts **successfully**, so the refusal can only be reached by
+/// compacting twice. That costs this test two compactions — but the second runs
+/// against an already-summarized context, and the first is a one-turn session,
+/// so both are at the cheap end. Same "keep it minimal" caveat as the test above.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_compact_refusal_surfaces_as_a_failed_turn() {
+    let adapter = ClaudeCodeAdapter::new();
+    let session_id = Uuid::now_v7();
+    let agent = AgentRecord {
+        name: "compact-refusal".to_owned(),
+        session_locator: Some(SessionLocator::Uuid(session_id)),
+        ..live_agent()
+    };
+
+    live_claude_seed_turn(&adapter, &agent, "Reply with the single word 'ack'").await;
+
+    // First compaction: expected to succeed, and is only here to set up the
+    // refusal. Asserted so a change in this precondition fails loudly here
+    // rather than silently turning the real assertion below into a no-op.
+    let first: Vec<AdapterEvent> = adapter
+        .compact(
+            &agent,
+            Path::new("/tmp"),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("first compaction should launch")
+        .collect()
+        .await;
+    let AdapterEvent::TurnEnd {
+        outcome: first_outcome,
+        ..
+    } = sole_live_terminal(&first)
+    else {
+        unreachable!("filtered to TurnEnd");
+    };
+    assert_eq!(
+        *first_outcome,
+        TurnOutcome::Completed,
+        "a fresh one-turn session should compact successfully — if this now refuses,          the setup for the refusal below no longer holds"
+    );
+
+    // Second compaction, against the just-compacted context: too short.
+    let events: Vec<AdapterEvent> = adapter
+        .compact(
+            &agent,
+            Path::new("/tmp"),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("second compaction should launch")
+        .collect()
+        .await;
+
+    let AdapterEvent::TurnEnd {
+        outcome,
+        usage,
+        stable_message_id,
+        first_message_id,
+        ..
+    } = sole_live_terminal(&events)
+    else {
+        unreachable!("filtered to TurnEnd");
+    };
+    let TurnOutcome::Failed { kind, message } = outcome else {
+        panic!(
+            "a refused compaction must not report as completed — `result` says \
+             success, the verdict says otherwise. Got {outcome:?}"
+        );
+    };
+    assert_eq!(*kind, FailureKind::HarnessError);
+    assert!(
+        !message.trim().is_empty(),
+        "the refusal should carry the CLI's own message"
+    );
+    assert_eq!(
+        *usage, None,
+        "a refused compaction must report no usage — a zero-valued record would \
+         blank the context bar after a no-op"
+    );
+    assert_eq!(*stable_message_id, None);
+    assert_eq!(*first_message_id, None);
+}

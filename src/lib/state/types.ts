@@ -54,6 +54,32 @@ export type Turn =
       /// shared across a fan-out's per-recipient turns. Absent/empty for a plain
       /// send (optional like the other additive turn fields here).
       attachments?: Attachment[];
+      /// Set while the send is still waiting to run: from the optimistic append
+      /// until its turn starts, fails to start, or is cancelled. The unified
+      /// view renders a pending prompt after everything its agent has already
+      /// run, in queue order, whatever the submit time says. Never set on a
+      /// hydrated or journal-sourced row — history has by definition run, and a
+      /// prompt whose response could not be matched must keep its own time
+      /// rather than be mistaken for queued work.
+      ///
+      /// **Every path by which a send leaves the queue must clear this** — by
+      /// settling the row (`reducers.ts::settleUserRows`, reached from
+      /// `turn_start`, `message_cancelled`, and the pre-start failure helper
+      /// behind `message_failed` and `failSendStart`) or by dropping the row.
+      /// A path that forgets leaves the prompt pinned to the tail of its
+      /// agent's history until the project is reopened. The backend's
+      /// `remove_queued_message` (pull a queued send back) has no frontend
+      /// caller today; wiring one makes it such a path.
+      ///
+      /// Known display trade: a recipient that settles **without** a
+      /// `turn_start` — a backend admission refusal, a journal-write failure,
+      /// or the `send_message` IPC itself rejecting — is stamped at the moment
+      /// the frontend learned of it, and a reload may place that send
+      /// differently (an unjournaled failure has no record to reconstruct; a
+      /// journaled one is stamped at the attempt, not the receipt). It
+      /// self-corrects on reopen; carrying a separate "resolved" stamp to
+      /// close it is more state than the case deserves.
+      pending?: true;
     }
   | {
       role: "agent";
@@ -113,6 +139,17 @@ export type Turn =
       /// AdapterFailure → suggest "report bug"; AuthFailure → "run claude auth login").
       error?: string;
       error_kind?: FailureKind;
+      /// What this turn *is*, when it is not an ordinary response. `"compaction"`
+      /// marks a manual context compaction: a real turn that ran on the agent, in
+      /// execution order, but that has no prompt above it and no answer inside it
+      /// — so it renders as its own compact row rather than as an empty response.
+      ///
+      /// Absent on every ordinary turn, and never set on a hydrated one: a
+      /// compaction leaves no agent turn on disk (only the harness's own recap
+      /// marker), so a turn read from a session file is always a response.
+      /// `status` is untouched by this — a compaction is streaming, complete,
+      /// failed, or cancelled exactly like any other turn.
+      kind?: "compaction";
     };
 
 /// One ordered entry in an agent turn's content stream. Discriminated by
@@ -181,6 +218,17 @@ export type PendingSend = {
   /// (already running → cancel the live turn). Such an entry is no longer "live"
   /// work (excluded from the composer's stop affordance).
   cancel_requested?: boolean;
+  /// Set to `"compaction"` for a queued manual compaction. A compaction lives in
+  /// this list for the same reason a send does — it is work the backend has
+  /// accepted but not started, and its `turn_start` must consume *its own* entry.
+  /// Keeping it out of the list would let it consume a concurrent send's slot in
+  /// the pre-receipt race and mis-attribute that send's reply.
+  ///
+  /// Travels with `queued_at`: a compaction has no user turn to take a timestamp
+  /// from, so the queued row needs its own to sit in the right place in the
+  /// timeline. Both are absent for a send.
+  kind?: "compaction";
+  queued_at?: string;
 };
 
 /// Per-agent operational state.

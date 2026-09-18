@@ -13,6 +13,7 @@ import type { Turn } from "./types";
 
 const AGENT_A = "00000000-0000-7000-8000-000000000aaa";
 const AGENT_B = "00000000-0000-7000-8000-000000000bbb";
+const AGENT_C = "00000000-0000-7000-8000-000000000ccc";
 const TURN_1 = "00000000-0000-7000-8000-000000000001";
 const SEND_1 = "00000000-0000-7000-8000-0000000000d1";
 
@@ -22,6 +23,7 @@ function userTurn(
   startedAt: string,
   text = "hi",
   sendId?: string,
+  pending?: true,
 ): Turn {
   return {
     role: "user",
@@ -31,6 +33,7 @@ function userTurn(
     started_at: startedAt,
     text,
     attachments: [],
+    ...(pending === undefined ? {} : { pending }),
   };
 }
 
@@ -691,6 +694,312 @@ describe("groupRenderBlocks", () => {
     expect(blocks.map((b) => (b.kind === "row" ? b.row.kind : "fanout"))).toEqual([
       "user",
       "agent",
+    ]);
+  });
+});
+
+describe("queued compactions", () => {
+  const COMPACT_SEND = "00000000-0000-7000-8000-00000000c001";
+
+  it("interleaves chronologically instead of pinning to either end", () => {
+    // A compaction has no user message to anchor to, so `queued_at` is the only
+    // thing that can place it — and placement is the whole point: it must sit
+    // behind work already queued and ahead of work queued after, matching the
+    // order the backend will actually run them in.
+    const rows = buildUnifiedRows(
+      [
+        userTurn(TURN_1, AGENT_A, "2026-05-15T00:00:00Z", "first", SEND_1),
+        agentTurn("t-1", AGENT_A, "2026-05-15T00:00:01Z", SEND_1),
+      ],
+      [],
+      undefined,
+      [{ agent_id: AGENT_A, send_id: COMPACT_SEND, queued_at: "2026-05-15T00:00:02Z" }],
+    );
+
+    expect(rows.map((r) => r.kind)).toEqual(["user", "agent", "queued_compaction"]);
+    const queued = rows.at(-1);
+    expect(queued?.kind === "queued_compaction" && queued.cancel_send_id).toBe(COMPACT_SEND);
+    // Never grouped into a fan-out: a compaction belongs to no send.
+    expect(queued?.send_id).toBeUndefined();
+  });
+
+  it("sorts after a turn on its own agent that started while it waited", () => {
+    // Same agent: a turn that started at :09 is work queued ahead of the
+    // compaction (its prompt re-stamped to turn-start), and the compaction
+    // cannot run before it — so it renders below, not above by its earlier
+    // queued_at.
+    const rows = buildUnifiedRows(
+      [agentTurn("t-late", AGENT_A, "2026-05-15T00:00:09Z")],
+      [],
+      undefined,
+      [{ agent_id: AGENT_A, send_id: COMPACT_SEND, queued_at: "2026-05-15T00:00:02Z" }],
+    );
+    expect(rows.map((r) => r.kind)).toEqual(["agent", "queued_compaction"]);
+  });
+
+  it("keeps chronological order against another agent's later turn", () => {
+    // Nothing on its own agent has run since it was queued, so it is not
+    // lifted: another agent's later work stays below it.
+    const rows = buildUnifiedRows(
+      [agentTurn("t-late", AGENT_B, "2026-05-15T00:00:09Z")],
+      [],
+      undefined,
+      [{ agent_id: AGENT_A, send_id: COMPACT_SEND, queued_at: "2026-05-15T00:00:02Z" }],
+    );
+    expect(rows.map((r) => r.kind)).toEqual(["queued_compaction", "agent"]);
+  });
+
+  it("is filtered out with its agent when that agent is removed", () => {
+    // Same rule every other row follows — a removed agent leaves no orphan.
+    const rows = buildUnifiedRows([], [], new Set([AGENT_B]), [
+      { agent_id: AGENT_A, send_id: COMPACT_SEND, queued_at: "2026-05-15T00:00:02Z" },
+    ]);
+    expect(rows).toEqual([]);
+  });
+});
+
+describe("buildUnifiedRows: pending sends", () => {
+  const at = (seconds: string): string => `2026-05-16T00:00:${seconds}Z`;
+  const label = (r: UnifiedRow): string =>
+    r.kind === "user" ? `u:${r.text}` : r.kind === "agent" ? `a:${r.send_id ?? "?"}` : r.kind;
+
+  it("renders a still-queued sibling after the send that just started, not above it", () => {
+    // A queued at :00, B at :01, both behind a busy agent. A starts at :31 and
+    // its prompt is re-stamped there; B is still waiting at :01. Anchored on
+    // stamps alone, B would sit above A's exchange until B started too.
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-a", AGENT_A, at("31"), "a", "send-a"),
+        userTurn("u-b", AGENT_A, at("01"), "b", "send-b", true),
+        agentTurn("t-a", AGENT_A, at("31"), "send-a"),
+      ],
+      [],
+    );
+    expect(rows.map(label)).toEqual(["u:a", "a:send-a", "u:b"]);
+  });
+
+  it("keeps submit order among pending rows, queued compactions included", () => {
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-x", AGENT_A, at("31"), "x", "send-x"),
+        agentTurn("t-x", AGENT_A, at("31"), "send-x"),
+        userTurn("u-p2", AGENT_A, at("06"), "p2", "send-p2", true),
+        userTurn("u-p1", AGENT_A, at("05"), "p1", "send-p1", true),
+      ],
+      [],
+      undefined,
+      [{ agent_id: AGENT_A, send_id: "compact", queued_at: at("05.500") }],
+    );
+    expect(rows.map(label)).toEqual(["u:x", "a:send-x", "u:p1", "queued_compaction", "u:p2"]);
+  });
+
+  it("does not lift a pending send past another agent's later work", () => {
+    // Nothing on A has run since the send was queued, so it keeps chronological
+    // order against B rather than sinking to the bottom of the transcript.
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-a", AGENT_A, at("02"), "waiting", "send-a", true),
+        userTurn("u-b", AGENT_B, at("09"), "b", "send-b"),
+        agentTurn("t-b", AGENT_B, at("09"), "send-b"),
+      ],
+      [],
+    );
+    expect(rows.map(label)).toEqual(["u:waiting", "u:b", "a:send-b"]);
+  });
+
+  it("leaves a hydrated prompt with no matched response at its own time", () => {
+    // History whose response could not be correlated also has "no agent row"
+    // — but it carries no pending flag, so it is never mistaken for queued
+    // work and dragged below later activity.
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-old", AGENT_A, at("00"), "old", "send-old"),
+        agentTurn("t-later", AGENT_A, at("10")),
+      ],
+      [],
+    );
+    expect(rows.map(label)).toEqual(["u:old", "a:?"]);
+  });
+
+  it("anchors a partially started fan-out at the recipient that started", () => {
+    // Fan-out submitted at :00; A started at :10 (re-stamped), B still waits at
+    // :00. A recap A wrote at :05 belongs above the exchange, which it is only
+    // if the group anchors at A's start rather than B's submit.
+    const recap: ConversationItem = {
+      kind: "system_marker",
+      id: "m",
+      agent_id: AGENT_A,
+      marker: { marker_kind: "compaction", summary: "recap" },
+      at: at("05"),
+    };
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-a", AGENT_A, at("10"), "fan", SEND_1),
+        userTurn("u-b", AGENT_B, at("00"), "fan", SEND_1, true),
+        agentTurn("t-a", AGENT_A, at("10"), SEND_1),
+      ],
+      [recap],
+    );
+    expect(rows.map((r) => r.kind)).toEqual(["system_marker", "user", "agent"]);
+    expect(rows.find((r) => r.kind === "user")).toMatchObject({
+      at: at("10"),
+      queued_at: at("00"),
+      agent_ids: [AGENT_A, AGENT_B],
+      pending_agent_ids: [AGENT_B],
+    });
+  });
+
+  it("marks a fan-out pending only while no recipient has started", () => {
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-a", AGENT_A, at("00"), "fan", SEND_1, true),
+        userTurn("u-b", AGENT_B, at("00"), "fan", SEND_1, true),
+      ],
+      [],
+    );
+    expect(rows[0]).toMatchObject({
+      kind: "user",
+      at: at("00"),
+      queued_at: at("00"),
+      pending_agent_ids: [AGENT_A, AGENT_B],
+    });
+  });
+
+  it("lifts a pending fan-out when one recipient runs work queued ahead of it", () => {
+    // B is mid-turn (T). X was queued on A at :00, fan-out F to A and B at :01,
+    // S to B at :02. X starts on A at :31: F lifts behind X, and S — queued
+    // behind F on B — must lift behind F, not stay at :02 above it. Same for a
+    // compaction queued on B behind F.
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-t", AGENT_B, at("00"), "t", "send-t"),
+        agentTurn("a-t", AGENT_B, at("00"), "send-t"),
+        userTurn("u-x", AGENT_A, at("31"), "x", "send-x"),
+        agentTurn("a-x", AGENT_A, at("31"), "send-x"),
+        userTurn("u-fa", AGENT_A, at("01"), "f", "send-f", true),
+        userTurn("u-fb", AGENT_B, at("01"), "f", "send-f", true),
+        userTurn("u-s", AGENT_B, at("02"), "s", "send-s", true),
+      ],
+      [],
+      undefined,
+      [{ agent_id: AGENT_B, send_id: "compact", queued_at: at("03") }],
+    );
+    expect(rows.map(label)).toEqual([
+      "u:t",
+      "a:send-t",
+      "u:x",
+      "a:send-x",
+      "u:f",
+      "u:s",
+      "queued_compaction",
+    ]);
+  });
+
+  it("keeps a pending row queued ahead of a lifted fan-out above it", () => {
+    // P1 was queued on B before F, P2 after. F lifts behind X on A; P1 stays
+    // where B's queue has it (before F), P2 follows F.
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-t", AGENT_B, at("00"), "t", "send-t"),
+        agentTurn("a-t", AGENT_B, at("00"), "send-t"),
+        userTurn("u-x", AGENT_A, at("31"), "x", "send-x"),
+        agentTurn("a-x", AGENT_A, at("31"), "send-x"),
+        userTurn("u-p1", AGENT_B, at("00.500"), "p1", "send-p1", true),
+        userTurn("u-fa", AGENT_A, at("01"), "f", "send-f", true),
+        userTurn("u-fb", AGENT_B, at("01"), "f", "send-f", true),
+        userTurn("u-p2", AGENT_B, at("02"), "p2", "send-p2", true),
+      ],
+      [],
+    );
+    expect(rows.map(label)).toEqual(["u:t", "a:send-t", "u:p1", "u:x", "a:send-x", "u:f", "u:p2"]);
+  });
+
+  it("a fan-out started on one recipient holds its queue position on the other", () => {
+    // B's queue is E, F, G. A (idle) starts F at once at :31; B is still on T.
+    // F's row anchors at A's start. E, queued on B ahead of F, must stay above
+    // it; G, queued behind F, must follow it. Counting F as started work on B
+    // would drag E below F — a send B runs after E.
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-t", AGENT_B, at("00"), "t", "send-t"),
+        agentTurn("a-t", AGENT_B, at("00"), "send-t"),
+        userTurn("u-e", AGENT_B, at("05"), "e", "send-e", true),
+        userTurn("u-fa", AGENT_A, at("31"), "f", "send-f"),
+        userTurn("u-fb", AGENT_B, at("06"), "f", "send-f", true),
+        agentTurn("a-fa", AGENT_A, at("31"), "send-f"),
+        userTurn("u-g", AGENT_B, at("07"), "g", "send-g", true),
+      ],
+      [],
+    );
+    expect(rows.map(label)).toEqual(["u:t", "a:send-t", "u:e", "u:f", "a:send-f", "u:g"]);
+  });
+
+  it("a fan-out started on one recipient still lifts later work on the other past B's own runs", () => {
+    // Same shape, but B also finished an exchange at :40 after F started on A.
+    // G is behind F on B *and* behind B's :40 run, so it lands after both;
+    // F's row itself is not moved by B's later run — it sits where A started
+    // it, as a reload would show.
+    const rows = buildUnifiedRows(
+      [
+        userTurn("u-fa", AGENT_A, at("31"), "f", "send-f"),
+        userTurn("u-fb", AGENT_B, at("06"), "f", "send-f", true),
+        agentTurn("a-fa", AGENT_A, at("31"), "send-f"),
+        userTurn("u-b", AGENT_B, at("40"), "b", "send-b"),
+        agentTurn("a-b", AGENT_B, at("40"), "send-b"),
+        userTurn("u-g", AGENT_B, at("07"), "g", "send-g", true),
+      ],
+      [],
+    );
+    expect(rows.map(label)).toEqual(["u:f", "a:send-f", "u:b", "a:send-b", "u:g"]);
+  });
+
+  it("a fan-out placed at its first recipient's start stays there after the other recipient runs older work", () => {
+    // The documented boundary, not a defect. E was queued on B and C at :00; F
+    // to A and B at :01. A starts F at :31; C runs an older job X at :40, which
+    // lifts E (still fully pending) behind X. B's queue is E then F, but F sits
+    // at A's start and is never lifted — so the display reads F, X, E.
+    const during = buildUnifiedRows(
+      [
+        userTurn("u-eb", AGENT_B, at("00"), "e", "send-e", true),
+        userTurn("u-ec", AGENT_C, at("00"), "e", "send-e", true),
+        userTurn("u-fa", AGENT_A, at("31"), "f", "send-f"),
+        userTurn("u-fb", AGENT_B, at("01"), "f", "send-f", true),
+        agentTurn("a-fa", AGENT_A, at("31"), "send-f"),
+        userTurn("u-x", AGENT_C, at("40"), "x", "send-x"),
+        agentTurn("a-x", AGENT_C, at("40"), "send-x"),
+      ],
+      [],
+    );
+    expect(during.map(label)).toEqual(["u:f", "a:send-f", "u:x", "a:send-x", "u:e"]);
+
+    // B then runs E at :50 and F at :60 (C ran E at :55). F keeps A's :31, so
+    // the order is unchanged — and a reload, which groups the journal's
+    // per-recipient records at the earliest, shows the same. Chronology of
+    // start times holds; B's execution order is what the fan-out columns show.
+    const after = buildUnifiedRows(
+      [
+        userTurn("u-eb", AGENT_B, at("50"), "e", "send-e"),
+        userTurn("u-ec", AGENT_C, at("55"), "e", "send-e"),
+        agentTurn("a-eb", AGENT_B, at("50"), "send-e"),
+        agentTurn("a-ec", AGENT_C, at("55"), "send-e"),
+        userTurn("u-fa", AGENT_A, at("31"), "f", "send-f"),
+        userTurn("u-fb", AGENT_B, at("60"), "f", "send-f"),
+        agentTurn("a-fa", AGENT_A, at("31"), "send-f"),
+        agentTurn("a-fb", AGENT_B, at("60"), "send-f"),
+        userTurn("u-x", AGENT_C, at("40"), "x", "send-x"),
+        agentTurn("a-x", AGENT_C, at("40"), "send-x"),
+      ],
+      [],
+    );
+    expect(after.map(label)).toEqual([
+      "u:f",
+      "a:send-f",
+      "a:send-f",
+      "u:x",
+      "a:send-x",
+      "u:e",
+      "a:send-e",
+      "a:send-e",
     ]);
   });
 });

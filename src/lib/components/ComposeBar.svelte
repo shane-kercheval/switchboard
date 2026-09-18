@@ -1212,15 +1212,17 @@
   });
 
   /// Why a fork can't be taken right now, or `null` when it can. Probe-measured:
-  /// a branch taken mid-turn inherits a synthesized "No response requested."
-  /// placeholder instead of the parent's real answer, permanently. The backend
-  /// re-checks this at dispatch — here it keeps the offer off the screen and
-  /// gives the shortcut something to say.
+  /// a branch taken mid-turn copies a session file still being written — for a
+  /// send that means inheriting a synthesized "No response requested." placeholder
+  /// instead of the parent's real answer, permanently; for a compaction it means
+  /// copying a half-rewritten history. The backend re-checks this at dispatch —
+  /// here it keeps the offer off the screen and gives the shortcut something to
+  /// say. Keep this wording in step with `AppError::ForkSourceBusy`.
   const forkBlock = $derived.by((): string | null => {
     if (forkShapeBlock !== null) return forkShapeBlock;
     const candidate = forkCandidate;
     if (candidate !== null && agentIsWorking(runtimes[candidate.id])) {
-      return `${candidate.name} is working — a branch taken now would not include its current answer. Wait for it to finish, or cancel it first.`;
+      return `${candidate.name} is busy — its conversation must stop changing before you can branch. Wait for it to finish, or cancel it first.`;
     }
     return null;
   });

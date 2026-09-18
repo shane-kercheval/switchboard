@@ -81,6 +81,8 @@ describe("messageIdentityForRow", () => {
       text: "hello",
       attachments: [],
       live: false,
+      pending_agent_ids: [],
+      queued_at: "2026-08-07T12:00:00Z",
     };
     expect(messageIdentityForRow(user)).toEqual({
       kind: "pinnable",
@@ -100,6 +102,8 @@ describe("messageIdentityForRow", () => {
       text: "hello",
       attachments: [],
       live: false,
+      pending_agent_ids: [],
+      queued_at: "2026-08-07T12:00:00Z",
     };
     expect(messageIdentityForRow(imported).kind).toBe("unsupported");
     expect(messageIdentityForRow(agentRow(), "antigravity").kind).toBe("unsupported");

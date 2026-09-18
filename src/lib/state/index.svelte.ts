@@ -37,6 +37,7 @@ import {
   cancelAgent as apiCancelAgent,
   cancelSend as apiCancelSend,
   cancelTurn as apiCancelTurn,
+  compactAgent as apiCompactAgent,
   loadTranscript,
 } from "$lib/api";
 import type {
@@ -168,7 +169,15 @@ export function agentIsWorking(runtime: AgentRuntime | undefined): boolean {
 /// Driven from the existing `turn_end` boundary rather than a second `listen`
 /// per agent — that would break the one-listener-per-agent invariant this
 /// module documents.
-type TurnTerminalHook = (agentId: AgentId, outcome: "completed" | "failed" | "cancelled") => void;
+type TurnTerminalHook = (
+  agentId: AgentId,
+  outcome: "completed" | "failed" | "cancelled",
+  /// What the turn was. `"compaction"` is the signal the workspace store needs to
+  /// re-read the project conversation: a completed compaction leaves a recap
+  /// marker in the harness's own session file, and nothing else would ever fetch
+  /// it. Absent for an ordinary response.
+  kind?: "compaction",
+) => void;
 
 let turnTerminalHook: TurnTerminalHook | undefined;
 
@@ -503,6 +512,70 @@ export function dispatchUserTurn(
       : { ...runtime, pending_sends: pending };
 }
 
+/// Ask `agentId` to compact its own conversation, and register the pending entry
+/// that tracks it.
+///
+/// **The whole flow, not just the state half.** Registering the pending entry
+/// *before* the IPC is what makes the pre-receipt race safe — `turn_start` can
+/// arrive before `compact_agent` resolves, and it must find an entry to consume.
+/// Splitting registration from dispatch across two callers would let a future one
+/// get that order wrong, so there is one function and the menu item is a
+/// one-liner.
+///
+/// The entry goes in `pending_sends` alongside queued sends for the same reason:
+/// its `turn_start` must consume **its own** slot. An entry kept outside that
+/// list would let the compaction's `turn_start` claim a concurrent send's entry
+/// in the pre-receipt race and stamp that send's id onto the wrong turn.
+///
+/// No user turn is appended — a compaction is not something the user said. The
+/// queued row is derived from this entry instead, which is why it carries
+/// `queued_at`: with no user turn to borrow a timestamp from, that is the only
+/// thing that can place it in the timeline.
+export async function dispatchCompaction(
+  agentId: AgentId,
+  sendId: SendId,
+  // Both generated, not reactive state.
+  pendingTurnId: TurnId = crypto.randomUUID(),
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  queuedAt: string = new Date().toISOString(),
+): Promise<void> {
+  const runtime = runtimes[agentId];
+  if (runtime === undefined) {
+    console.error("[switchboard] dispatchCompaction called for unregistered agent", {
+      agent_id: agentId,
+    });
+    return;
+  }
+  const pending = [
+    ...(runtime.pending_sends ?? []),
+    {
+      send_id: sendId,
+      user_turn_id: pendingTurnId,
+      kind: "compaction" as const,
+      queued_at: queuedAt,
+    },
+  ];
+  // Same rule as a send: only an idle agent moves to "starting". A compaction
+  // requested while a turn runs just queues behind it.
+  runtimes[agentId] =
+    runtime.run_status === "idle"
+      ? { ...runtime, run_status: "starting", last_error: undefined, pending_sends: pending }
+      : { ...runtime, pending_sends: pending };
+  try {
+    const messageId = await apiCompactAgent(agentId, sendId);
+    recordSendAccepted(agentId, pendingTurnId, messageId);
+  } catch (e) {
+    // An IPC rejection (a refused harness, no session, an unmaterialized branch)
+    // never reaches the event stream, so it routes through the same pre-start
+    // failure path a rejected send uses — pruning the entry and rendering the
+    // reason in the transcript.
+    failSendStart(agentId, pendingTurnId, {
+      message: e instanceof Error ? e.message : String(e),
+      kind: "adapter_failure",
+    });
+  }
+}
+
 /// Record the accepted-send receipt (`message_id`) onto this send's pending
 /// entry (matched by `user_turn_id`). Called by the compose-bar after
 /// `send_message` resolves; the receipt lets the correlated `turn_start` /
@@ -594,6 +667,11 @@ export function failSendStart(
       at,
       error?.message ?? "send failed before the turn started",
       entry?.send_id,
+      // Without this a refused compaction — no session yet, an unmaterialized
+      // branch, an unsupported harness — renders as an empty failed *response*
+      // with no prompt above it, which reads as "the CLI broke" rather than as
+      // the precondition the backend actually named.
+      entry?.kind,
     ),
   );
 }
@@ -697,14 +775,37 @@ export function unregisterAgents(agentIds: AgentId[]): void {
 /// matching `messageId`, else the front (covers the race where the IPC receipt
 /// hasn't been recorded yet). Mirrors `reducers.ts::pickPendingIndex` so the
 /// transcript stamp and the runtime removal pick the same entry.
-function pendingEntryFor(runtime: AgentRuntime, messageId: MessageId): PendingSend | undefined {
+/// The pending entry an event consumes. Mirrors `pickPendingIndex` exactly —
+/// the two must agree or the transcript and the runtime act on different entries
+/// — so see that function for why identity is tried before position.
+function pendingEntryFor(
+  runtime: AgentRuntime,
+  messageId: MessageId,
+  sendId?: SendId,
+): PendingSend | undefined {
   const pending = runtime.pending_sends;
   const front = pending?.[0];
   if (front === undefined) return undefined;
   const byMsg = pending?.find((p) => p.message_id === messageId);
   if (byMsg !== undefined) return byMsg;
+  if (sendId !== undefined) return pending?.find((p) => p.send_id === sendId);
   // Front-fallback only during the pre-receipt race (mirrors pickPendingIndex).
   return front.message_id === undefined ? front : undefined;
+}
+
+/// The pending entry a `message_cancelled` event refers to — the exact receipt
+/// match first, then the event's authoritative `send_id` when cancellation raced
+/// ahead of `recordSendAccepted`. Mirrors the `runtimeReducer` arm that prunes
+/// the same entry, so the transcript and the runtime never act on different ones.
+function cancelledEntryFor(
+  runtime: AgentRuntime,
+  messageId: MessageId,
+  sendId: SendId,
+): PendingSend | undefined {
+  const pending = runtime.pending_sends;
+  return (
+    pending?.find((p) => p.message_id === messageId) ?? pending?.find((p) => p.send_id === sendId)
+  );
 }
 
 function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
@@ -736,7 +837,9 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   // pass its send_id so the new agent turn is stamped; `runtimeReducer` removes
   // the same entry in lockstep.
   const startEntry =
-    event.type === "turn_start" ? pendingEntryFor(priorRuntime, event.message_id) : undefined;
+    event.type === "turn_start"
+      ? pendingEntryFor(priorRuntime, event.message_id, event.send_id)
+      : undefined;
   // For a `message_failed` event, resolve the failed send via the same
   // `pendingEntryFor` lookup `turn_start` uses (and that `runtimeReducer`
   // mirrors via `pickPendingIndex`): exact message_id, else the front entry
@@ -752,7 +855,9 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
         // under the workflow's live user row. A `null` event `send_id` means the
         // send was never durably recorded → coerce to `undefined` so the reducer
         // renders no row (matching the empty reload).
-        (pendingEntryFor(priorRuntime, event.message_id)?.send_id ?? event.send_id ?? undefined)
+        (pendingEntryFor(priorRuntime, event.message_id, event.send_id ?? undefined)?.send_id ??
+        event.send_id ??
+        undefined)
       : undefined;
   // Prefer the locally-tracked pending-send (frontend-originated sends correlate
   // by `message_id`); fall back to the `turn_start` event's own `send_id` for a
@@ -761,6 +866,18 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   const eventSendId = event.type === "turn_start" ? event.send_id : undefined;
   const cancelledSendId = event.type === "message_cancelled" ? event.send_id : undefined;
   const sendId = startEntry?.send_id ?? eventSendId ?? cancelledSendId ?? failedSendId;
+  // The kind of the entry this event consumes, resolved from the *same* lookups
+  // that produced `sendId` so the transcript row and the runtime pruning always
+  // agree about what they are acting on. A backend-originated send (a workflow
+  // step) has no entry and is therefore never a compaction.
+  const pendingKind =
+    event.type === "turn_start"
+      ? startEntry?.kind
+      : event.type === "message_failed"
+        ? pendingEntryFor(priorRuntime, event.message_id, event.send_id ?? undefined)?.kind
+        : event.type === "message_cancelled"
+          ? cancelledEntryFor(priorRuntime, event.message_id, event.send_id)?.kind
+          : undefined;
   if (event.type === "turn_start") markRecipientStarted(sendId, agentId, event.turn_id);
   // Settle the send tracker from the events that carry a terminal outcome. Driven
   // from this existing boundary rather than a second `listen` per agent — that
@@ -773,7 +890,11 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
           ? "failed"
           : "completed";
     settleTurn(event.turn_id, agentId, outcome);
-    turnTerminalHook?.(agentId, outcome);
+    // Read off the turn itself, not a pending entry — `turn_start` consumed that
+    // entry when it created the turn, so by the terminal the turn is the only
+    // thing that still knows what this was.
+    const ending = priorTurns.find((t) => t.turn_id === event.turn_id);
+    turnTerminalHook?.(agentId, outcome, ending?.role === "agent" ? ending.kind : undefined);
   } else if (event.type === "message_failed") {
     settleRecipient(failedSendId, agentId, "failed");
     dispatchFailedHook?.(agentId);
@@ -791,6 +912,7 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
       receivedAt,
       sendId,
       priorRuntime?.in_flight_turn_id,
+      pendingKind,
     ),
   );
   runtimes[agentId] = runtimeReducer(priorRuntime, event);

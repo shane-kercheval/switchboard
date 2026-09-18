@@ -164,9 +164,13 @@ function scaledCount(value: number): number {
 // meter's "used / window" detail so one context size never reads two ways in
 // the same window. Deliberately lossy: these are display strings, and a card
 // column is too narrow to spend on digits nobody reads.
+/// `M` is the largest suffix. The tier is picked from the *rounded* value, not
+/// the raw one: rounding first and choosing after is what keeps 999,600 from
+/// rendering as `1000k` — the reading the `M` suffix exists to avoid.
 export function formatTokens(n: number): string {
   if (n < 1000) return String(n);
-  if (n < 1_000_000) return `${scaledCount(n / 1000)}k`;
+  const thousands = scaledCount(n / 1000);
+  if (thousands < 1000) return `${thousands}k`;
   return `${scaledCount(n / 1_000_000)}M`;
 }
 

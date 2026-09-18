@@ -182,6 +182,15 @@ describe("formatTokens", () => {
     expect(formatTokens(200_000)).toBe("200k");
   });
 
+  it("promotes to millions when the rounded thousands reach 1000", () => {
+    // The tier has to be picked after rounding, not before: 999,500 scales to
+    // 999.5, which rounds to 1000 and would print "1000k" — the exact reading
+    // the M suffix exists to avoid. Both sides of the hand-off are pinned.
+    expect(formatTokens(999_499)).toBe("999k");
+    expect(formatTokens(999_500)).toBe("1M");
+    expect(formatTokens(999_999)).toBe("1M");
+  });
+
   it("applies the same rounding rule in millions as in thousands", () => {
     expect(formatTokens(1_000_000)).toBe("1M");
     expect(formatTokens(1_250_000)).toBe("1.3M");

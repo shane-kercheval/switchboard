@@ -249,8 +249,16 @@ Settled here; the rationale must survive into code comments where marked.
 8. **Reset-passed hides a meter, per window.** A window whose `resetsAt` is in the past is dropped;
    the others still render. No dim, no age threshold.
 9. **Reset text is relative when near, absolute when far.** "Resets in 16 min" / "Resets in 3 h"
-   under 24 hours; "Resets Sun 8:00 AM" beyond. Full date and time in the tooltip. Computed at render
-   from `Date.now()`, not on a timer — recorded as a known limitation.
+   under 24 hours; "Resets Sat, Sep 19, 8:00 AM" beyond. Full date and time in the tooltip. Computed
+   at render from `Date.now()`, not on a timer — recorded as a known limitation.
+
+   The absolute form carries the **date**, not a bare weekday (an earlier draft of this decision said
+   "Resets Sun 8:00 AM"). A weekday alone is ambiguous exactly where the weekly window sits: a reset
+   six days and twenty hours out names today's weekday and reads as this morning. Switching the date
+   on past a distance threshold would have to compare local calendar dates rather than elapsed time
+   to catch that case, so the date is unconditional and there is no threshold. Implemented in M1 as
+   `utils.ts::formatResetCountdown`; the string is longer than the original draft, so a cell that
+   runs out of width should drop the weekday before it drops the date.
 10. **Both harnesses use the same label strings for the same window.** Codex `primary` (300 min) and
     `secondary` (10080 min) are "5-hour limit" and "Weekly · all models"; its bare `used_percent`
     fallback is a meter labeled "Quota". *(Comment where the Codex labels are derived.)*
@@ -434,9 +442,13 @@ for the user (telemetry flags, internal capability strings).
 One component draws every "how full is this" gauge in the app, and the context bar is its first
 user.
 
-- The context bar reads "Context after last turn" left, "121.1k / 1M" and "12%" right, bar beneath —
-  same position and clean-hide rules as today.
-- A reset-time helper renders "in 16 min" / "in 3 h" / "Sun 8:00 AM" from a future instant,
+- The context bar reads "Context used" left, "121k / 1M" and "12%" right, bar beneath — same
+  position and clean-hide rules as today. Label shortened from "Context after last turn" during M1:
+  measured in WebKit, the full phrase needs 115px against an 85px budget at the default 240px
+  sidebar, so it rendered clipped to "Context after l…". The "as of the last completed turn"
+  qualifier moves to the row's tooltip when M2 adds one. Token density is `k`/`M` via
+  `utils.ts::formatTokens`, which rounds to whole thousands above 10k — hence "121k", not "121.1k".
+- A reset-time helper renders "in 16 min" / "in 3 h" / "Sat, Sep 19, 8:00 AM" from a future instant,
   deterministically under test.
 - Nothing about the rate-limit cells or the chips changes yet.
 

@@ -6,6 +6,9 @@ import {
   currentIsoTimestamp,
   formatDuration,
   formatHomePath,
+  formatResetCountdown,
+  formatTokens,
+  formatUsedPercent,
   isIsoTimestampAfter,
   isIsoTimestampBefore,
   relativeTime,
@@ -162,5 +165,101 @@ describe("relativeTime", () => {
 describe("currentIsoTimestamp", () => {
   it("accepts an injected clock for deterministic callers", () => {
     expect(currentIsoTimestamp(new Date("2026-05-25T12:00:00Z"))).toBe("2026-05-25T12:00:00.000Z");
+  });
+});
+
+describe("formatTokens", () => {
+  it("renders exact counts below a thousand", () => {
+    expect(formatTokens(0)).toBe("0");
+    expect(formatTokens(990)).toBe("990");
+  });
+
+  it("renders one decimal below 10k and whole thousands above", () => {
+    expect(formatTokens(1000)).toBe("1k");
+    expect(formatTokens(2340)).toBe("2.3k");
+    expect(formatTokens(23_400)).toBe("23k");
+    expect(formatTokens(121_100)).toBe("121k");
+    expect(formatTokens(200_000)).toBe("200k");
+  });
+
+  it("applies the same rounding rule in millions as in thousands", () => {
+    expect(formatTokens(1_000_000)).toBe("1M");
+    expect(formatTokens(1_250_000)).toBe("1.3M");
+    expect(formatTokens(12_000_000)).toBe("12M");
+  });
+});
+
+describe("formatUsedPercent", () => {
+  it("rounds to a whole percent", () => {
+    expect(formatUsedPercent(0)).toBe("0%");
+    expect(formatUsedPercent(0.1)).toBe("10%");
+    expect(formatUsedPercent(0.666)).toBe("67%");
+  });
+
+  it("reports over-full usage rather than clamping", () => {
+    // Only a bar's fill clamps; a quota that says 103% used is stating a fact.
+    expect(formatUsedPercent(1.03)).toBe("103%");
+  });
+
+  it("matches the Codex rate-limit cell's rounding for whole-percent sources", () => {
+    // That cell rendered `usedPercent.toFixed(0)` off a 0-100 number; the meter
+    // takes a 0-1 fraction. Parity holds for whole percents, which is what the
+    // claim is limited to: dividing by 100 and multiplying back is not exact,
+    // so a source of 28.5 renders "29" directly and "28" through the fraction
+    // (28.5 / 100 * 100 is 28.499999999999996). Not asserted here — when the
+    // Codex windows move onto the meter, that conversion picks its own rounding
+    // and this should not have frozen the by-product of the current one.
+    for (const usedPercent of [0, 7, 42, 99, 100]) {
+      expect(formatUsedPercent(usedPercent / 100)).toBe(`${usedPercent}%`);
+    }
+  });
+});
+
+describe("formatResetCountdown", () => {
+  // Locale and zone are pinned so these can assert literal strings; computing
+  // the expectation through the same Intl call would assert nothing.
+  const FORMAT = { locales: "en-US", timeZone: "UTC" } as const;
+  const NOW = new Date("2026-09-17T12:00:00Z");
+  const ms = (iso: string): number => new Date(iso).getTime();
+
+  it("counts down in minutes under an hour", () => {
+    expect(formatResetCountdown(ms("2026-09-17T12:16:00Z"), NOW, FORMAT)).toBe("in 16 min");
+  });
+
+  it("rounds a sub-minute reset up rather than showing zero", () => {
+    expect(formatResetCountdown(ms("2026-09-17T12:00:20Z"), NOW, FORMAT)).toBe("in 1 min");
+  });
+
+  it("counts down in whole hours under a day", () => {
+    expect(formatResetCountdown(ms("2026-09-17T15:00:00Z"), NOW, FORMAT)).toBe("in 3 h");
+    expect(formatResetCountdown(ms("2026-09-17T15:59:00Z"), NOW, FORMAT)).toBe("in 3 h");
+  });
+
+  it("switches to weekday, date, and clock beyond a day", () => {
+    expect(formatResetCountdown(ms("2026-09-19T08:00:00Z"), NOW, FORMAT)).toBe(
+      "Sat, Sep 19, 8:00 AM",
+    );
+  });
+
+  it("names the date for a reset just under a week out, where the weekday repeats", () => {
+    // Thursday noon to the following Thursday 8 AM is 6 d 20 h — under seven
+    // days, yet the weekday alone would say "Thu" and read as this morning.
+    expect(formatResetCountdown(ms("2026-09-24T08:00:00Z"), NOW, FORMAT)).toBe(
+      "Thu, Sep 24, 8:00 AM",
+    );
+  });
+
+  it("renders a passed reset as a clock time, never a negative countdown", () => {
+    expect(formatResetCountdown(ms("2026-09-17T09:30:00Z"), NOW, FORMAT)).toBe("9:30 AM");
+    expect(formatResetCountdown(NOW.getTime(), NOW, FORMAT)).toBe("12:00 PM");
+  });
+
+  it("honours the caller's zone", () => {
+    expect(
+      formatResetCountdown(ms("2026-09-19T08:00:00Z"), NOW, {
+        locales: "en-US",
+        timeZone: "America/Los_Angeles",
+      }),
+    ).toBe("Sat, Sep 19, 1:00 AM");
   });
 });

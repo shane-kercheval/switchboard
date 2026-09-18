@@ -11,6 +11,7 @@
   /// Ungrouped by construction — a compaction has no prompt above it, because it
   /// is not something the user said.
   import { History } from "@lucide/svelte";
+  import { formatTokens } from "$lib/utils";
 
   let {
     status,
@@ -31,17 +32,9 @@
     error?: string;
   } = $props();
 
-  /// Tokens at transcript density: `23.4k`, `990`. Not a general-purpose
-  /// formatter — it exists so the before/after pair reads as one short phrase.
-  function tokens(n: number): string {
-    if (n < 1000) return String(n);
-    const thousands = n / 1000;
-    return `${thousands < 10 ? thousands.toFixed(1) : Math.round(thousands)}k`;
-  }
-
   const counts = $derived(
     before !== undefined && after !== undefined
-      ? `${tokens(before)} → ${tokens(after)} tokens`
+      ? `${formatTokens(before)} → ${formatTokens(after)} tokens`
       : undefined,
   );
 

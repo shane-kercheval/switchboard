@@ -56,7 +56,7 @@
     type AgentSessionInfo,
   } from "$lib/api";
   import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
-  import { cn, relativeTime } from "$lib/utils";
+  import { cn, formatTokens, relativeTime } from "$lib/utils";
   import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
@@ -79,6 +79,7 @@
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
+  import Meter from "$lib/components/ui/Meter.svelte";
   import { ICON_BUTTON_CLASS, ICON_BUTTON_ON_PANEL_CLASS } from "$lib/components/ui/iconButton";
 
   /// An agent is "active" — currently driving work — when its turn is in-flight
@@ -655,9 +656,13 @@
     await dispatchCompaction(agentId, crypto.randomUUID());
   }
 
-  /// Context utilization — `context_tokens_after_turn / context_window` from
-  /// the most recent completed agent turn. Forward-looking signal ("how full
-  /// will the next turn's context be").
+  type ContextOccupancy = { usedTokens: number; windowTokens: number; fraction: number };
+
+  /// Context occupancy — `context_tokens_after_turn` over `context_window`
+  /// from the most recent completed agent turn. Forward-looking signal ("how
+  /// full will the next turn's context be"). The raw operands come back beside
+  /// the fraction because the meter shows both, and rescanning the transcript
+  /// for them could disagree with the fraction on a mid-render update.
   ///
   /// `context_input_tokens` is the harness-reconciled input-side occupancy
   /// (see `TurnUsage`): for Claude it sums the disjoint cache fields (cached +
@@ -671,7 +676,7 @@
   /// occupancy. Both it and `context_window` must be present; otherwise the bar
   /// is hidden. An impossible occupancy is hidden rather than clamped, so bad
   /// telemetry never masquerades as a plausible 100%.
-  function contextUtilization(agentId: AgentId): number | undefined {
+  function contextOccupancy(agentId: AgentId): ContextOccupancy | undefined {
     const turns = transcripts[agentId] ?? [];
     for (let i = turns.length - 1; i >= 0; i--) {
       const turn = turns[i];
@@ -686,7 +691,7 @@
       const occupancy = turn.usage.context_tokens_after_turn;
       if (occupancy === undefined || occupancy === null) return undefined;
       if (occupancy > window) return undefined;
-      return occupancy / window;
+      return { usedTokens: occupancy, windowTokens: window, fraction: occupancy / window };
     }
     return undefined;
   }
@@ -1008,7 +1013,7 @@
     <div class="flex flex-col gap-1.5 px-2 pt-1 pb-2" bind:this={agentListEl}>
       {#each displayAgents as agent (agent.id)}
         {@const runtime = runtimes[agent.id]}
-        {@const util = contextUtilization(agent.id)}
+        {@const context = contextOccupancy(agent.id)}
         {@const codexWindows =
           agent.harness === "codex" ? codexRateLimitView(runtime?.last_rate_limit, Date.now()) : []}
         <!-- `Date.now()` read once per render for the reset-in-the-future gate.
@@ -1602,19 +1607,14 @@
                  cost / quota / context at all. A transient absence (a fresh agent
                  pre-first-turn) hides identically to a permanent one; that's the
                  intended behavior, not a case to distinguish. -->
-            {#if util !== undefined}
+            {#if context !== undefined}
               <div class="mt-1.5 flex items-end gap-1.5" data-testid="agent-context-bar">
-                <div class="min-w-0 flex-1">
-                  <div class="text-muted mb-0.5 text-[11px]">
-                    context after last turn: {(util * 100).toFixed(0)}%
-                  </div>
-                  <div class="bg-active h-1 w-full overflow-hidden rounded">
-                    <div
-                      class="bg-fg h-full"
-                      style:width="{Math.min(util * 100, 100).toFixed(1)}%"
-                    ></div>
-                  </div>
-                </div>
+                <Meter
+                  label="Context used"
+                  value={context.fraction}
+                  detail="{formatTokens(context.usedTokens)} / {formatTokens(context.windowTokens)}"
+                  class="flex-1"
+                />
                 {#if supportsManualCompaction(agent.harness)}
                   {@const armed = compactConfirmAgentId === agent.id}
                   {#snippet compactButton(props: Record<string, unknown>, armed: boolean)}

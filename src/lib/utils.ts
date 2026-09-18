@@ -150,3 +150,85 @@ export function relativeTime(iso: string, now: Date = new Date()): string {
   if (weeks < 5) return `${weeks}w ago`;
   return new Date(iso).toLocaleDateString();
 }
+
+/// One rounding rule for every magnitude of a scaled count: one decimal below
+/// 10, whole numbers above, and never a rendered trailing zero — `1`, `2.3`,
+/// `23`. Integer math rather than `toFixed` precisely so `1` does not become
+/// `1.0`.
+function scaledCount(value: number): number {
+  return value < 10 ? Math.round(value * 10) / 10 : Math.round(value);
+}
+
+// Token counts at card and transcript density: `990`, `1k`, `2.3k`, `121k`,
+// `1.3M`. Shared by the compaction summary's before/after pair and the context
+// meter's "used / window" detail so one context size never reads two ways in
+// the same window. Deliberately lossy: these are display strings, and a card
+// column is too narrow to spend on digits nobody reads.
+export function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${scaledCount(n / 1000)}k`;
+  return `${scaledCount(n / 1_000_000)}M`;
+}
+
+/// The one place a used fraction becomes a percentage string. `value` is 0–1
+/// **used** (never remaining — see `Meter`'s `value` doc). Deliberately not
+/// clamped: a source reporting over-100% usage is saying something true, and
+/// only the bar's fill width clamps.
+export function formatUsedPercent(value: number): string {
+  return `${(value * 100).toFixed(0)}%`;
+}
+
+/// Locale and time zone, injectable purely so date formatting is assertable
+/// against literal strings under test. Production call sites pass nothing and
+/// get the user's own locale and zone, which is what every other formatter here
+/// does.
+export type DateFormatContext = {
+  locales?: Intl.LocalesArgument;
+  timeZone?: string;
+};
+
+/// Countdown to a future instant, for a usage window's reset: "in 16 min" /
+/// "in 3 h" under a day, weekday + date + clock beyond it ("Sat, Sep 19, 8:00
+/// AM") — a window days out is easier to place on a calendar than to count down
+/// to. `now` is injectable so tests stay deterministic.
+///
+/// The absolute form always carries the date. A weekday alone is ambiguous at
+/// the seven-day mark, which is exactly where the weekly usage window sits: a
+/// reset six days and twenty hours out still names today's weekday and reads as
+/// this morning. A threshold that switched the date on beyond some distance
+/// would have to compare local calendar dates, not elapsed time, to catch that
+/// — carrying the date unconditionally removes the boundary instead of moving
+/// it.
+///
+/// An instant that is not in the future renders the bare clock rather than a
+/// negative countdown. Callers are expected to drop a window whose reset has
+/// passed, so this is a floor under a case that shouldn't render, not a state
+/// worth its own copy.
+export function formatResetCountdown(
+  resetsAtMs: number,
+  now: Date = new Date(),
+  format: DateFormatContext = {},
+): string {
+  const target = new Date(resetsAtMs);
+  const clock: Intl.DateTimeFormatOptions = {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: format.timeZone,
+  };
+  const remainingMs = resetsAtMs - now.getTime();
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    return target.toLocaleTimeString(format.locales, clock);
+  }
+  const minutes = Math.floor(remainingMs / 60_000);
+  // Rounded up below a minute so a reset seconds away never reads "in 0 min",
+  // which looks like a stuck counter rather than an imminent one.
+  if (minutes < 60) return `in ${Math.max(1, minutes)} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `in ${hours} h`;
+  return target.toLocaleString(format.locales, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    ...clock,
+  });
+}

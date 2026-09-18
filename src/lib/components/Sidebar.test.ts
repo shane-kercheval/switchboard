@@ -2325,9 +2325,10 @@ describe("compact context action", () => {
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent(
-      "context after last turn: 10%",
-    );
+    const bar = screen.getByTestId("agent-context-bar");
+    expect(bar).toHaveTextContent("Context used");
+    expect(bar).toHaveTextContent("20k / 200k");
+    expect(bar).toHaveTextContent("10%");
   });
 
   it("leaves the bar unchanged after a compaction that carried no usage", async () => {
@@ -2368,9 +2369,9 @@ describe("compact context action", () => {
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent(
-      "context after last turn: 60%",
-    );
+    const bar = screen.getByTestId("agent-context-bar");
+    expect(bar).toHaveTextContent("120k / 200k");
+    expect(bar).toHaveTextContent("60%");
   });
 });
 

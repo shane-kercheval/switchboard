@@ -109,12 +109,32 @@ conversation) returns the report as `result` text: `total_cost_usd: 0`, `duratio
 
 Token cells are human-formatted: `366`, `4k`, `1.9k`, `952.1k`, `1m`, `~30`, `< 20`.
 
-**It writes to the session file.** Three records per call: an `isMeta` `<local-command-caveat>` user
-record, a `<command-name>/context</command-name>` user record, and a `system/local_command` record
-whose `content` is the whole report inside `<local-command-stdout>`. Our disk parser
-(`claude_code/session_file.rs`) currently treats a local-command input/output pair as a **completed
-agent turn** with the output as its text — so without M4's parser change, every breakdown would
-reappear on reload as a Claude response containing the report.
+**The report is also emitted as structured JSON, live and on disk** (re-probed with Switchboard's
+exact argv — `--output-format stream-json --include-partial-messages --verbose
+--dangerously-skip-permissions --add-dir /`). The markdown is a rendering of this object, and the
+object is exact where the text is approximate (the `~30` skill rows are `31` and `16`):
+
+- **Live**: the synthetic `assistant` event (`message.model: "<synthetic>"`) carries
+  `local_command_run: {"command": "context", "args": ""}`, `local_command_source` (the markdown),
+  and **`context_usage`**: `{ model, total_tokens, raw_max_tokens, percentage, categories:
+  [{name, tokens, kind: "used" | "deferred" | "buffer" | "free"}], mcp_tools: [{name, server_name,
+  tokens}], memory_files: [{path, type, tokens}], agents: [{agent_type, source, tokens}], skills:
+  [{name, source, tokens}] }`. The `result` carries `local_command: "context"` and the markdown as
+  `result`; `modelUsage` is `{}`, so no context-window snapshot is derived from a report turn.
+- **On disk**, three records per call: an `isMeta` `<local-command-caveat>` `user` record, a
+  `<command-name>/context</command-name>` `user` record (both `entrypoint: "sdk-cli"`), then a
+  `system/local_command` record — `entrypoint: "sdk-cli"`, `parentUuid` = the command record's
+  uuid, `content` = the markdown inside `<local-command-stdout>`, **`commandRun: {"command":
+  "context", "args": ""}`**, and **`contextUsage`** (same object, camelCase key).
+
+**What the disk parser does with them today: drops them.** `handle_system` in
+`claude_code/session_file.rs` pairs a local-command *input* to its output only when the input is
+itself a `system/local_command` record with a leading `/`; a `<command-name>` `user` record is
+housekeeping and never opens a pending command, so the output record hits the "orphaned sdk-cli
+local-command output" warning and is discarded. (An earlier draft of this plan said the pair became
+a completed agent turn; it does not.) The recorded probe — stream and session file — is the M4
+fixture; the artifacts sit at `/tmp/ctxfix/` and `~/.claude/projects/-private-tmp-ctxfix/` until
+recorded, and the probe is free to repeat.
 
 ### Codex (0.154.0)
 
@@ -235,9 +255,12 @@ for the user (telemetry flags, internal capability strings).
     harness's run settings as display pairs (Claude: permission mode, output style; Codex: sandbox,
     approval policy, personality, shell, timezone). A label/value list rather than one field per
     setting because the two harnesses share no setting names and the card renders them identically.
-    All default empty, so a harness that lacks a field clean-hides it. Typed because the rate-limit
-    payload's opaque-`unknown` pattern exists for a shape we did not control and did not want to
-    model; this shape we are choosing to model. *(Comment on the struct.)*
+    **Each list is `Option<Vec<_>>`: `None` means the runtime source did not report it; `Some([])`
+    means it reported an empty list.** The distinction is load-bearing for decision 13 — a Claude
+    `init` with zero MCP servers is authoritative, and filling it from a config file would show
+    servers as loaded that are not. Typed because the rate-limit payload's opaque-`unknown` pattern
+    exists for a shape we did not control and did not want to model; this shape we are choosing to
+    model. *(Comment on the struct, on the `Option` semantics.)*
 
     **Where each harness fills them.** Claude: `parse_session_meta` from `system/init`, live.
     Codex: the post-terminal session-file enrichment in `codex/session_file.rs` — the same path
@@ -246,13 +269,26 @@ for the user (telemetry flags, internal capability strings).
     servers stay on the config loader with `"configured"` status; `codex mcp list` is out of scope.
     *(Comment on the Codex extractor: the skills block is a scraped markdown format like the
     context report, hence a fixture-driven parser with a names-only fallback.)*
-13. **Claude's inventory is persisted to the metadata sidecar with a capture time, and rendered
-    with the "as of" qualifier after a reload; Codex's is not persisted, because the rollout is
-    re-read on reload (class B).** For Claude this resolves G14 by the convention the rate-limit snapshot
-    already set: a stale status is fine when it says it is stale. On reload the sidecar snapshot wins
-    over the config-loader registry (it is what the last turn actually loaded, with status); the
-    loader remains the fallback for an agent that has never dispatched. The reducer's fill-if-empty
-    / live-overwrites contract applies unchanged. *(Comment on the sidecar field, citing G14.)*
+13. **Precedence: a runtime-supplied list replaces completely, including an empty one; the config
+    loaders fill a list only when no runtime source ever supplied it.** This holds at every merge
+    point — the live `session_meta` reducer, `merge_meta_with_loaders` on reload, and the sidecar
+    overlay — and is the opposite of the rate-limit overlay's fill-if-empty, for a stated reason: the
+    loaders are registries without status, and the runtime value is what the harness actually
+    loaded. There are no loader-only appends when a runtime list is present. Codex MCP servers are
+    the one list with no runtime source, so they stay loader-backed with status `"configured"`.
+    *(Comment on `merge_meta_with_loaders`: replace-not-fill, and why it departs from the rate-limit
+    rule.)*
+
+    **Delivery.** Codex emits `SessionMeta` after **every** turn's enrichment, not only the first —
+    inventory changes between turns must reach the card. `AdapterEvent::SessionMeta` gains a
+    `source: SessionMetaSource { StreamOnly, SessionFileBacked }` discriminator mirroring
+    `RateLimitSource`, dropped at the `NormalizedEvent` boundary; the dispatcher persists the
+    inventory snapshot only for `StreamOnly`, which keeps it harness-agnostic. Claude's inventory
+    (stream-only, class C) therefore lands in the metadata sidecar with a capture time and renders
+    with the "as of" qualifier after a reload — resolving G14 by the convention the rate-limit
+    snapshot set: a stale status is fine when it says it is stale. Codex's is re-read from the
+    rollout (class B) and never persisted. *(Comment on the sidecar field, citing G14; comment on
+    the source enum, citing `RateLimitSource`.)*
 14. **The two chips become an "Environment" disclosure row on the card.** Collapsed: one line of
     counts with the only status that matters called out — "MCP 7 · 2 need auth · Agents 6 · Plugins
     1 · Skills 30 · Memory 1". Expanded: sections in that order — MCP servers (name, `StatusDot`,
@@ -265,8 +301,13 @@ for the user (telemetry flags, internal capability strings).
     label — the set is unknown beyond the two observed, so unknown statuses must show, not hide.
     A Codex card renders the same row from the subset it has: MCP servers (config names, no status
     dot — "configured" is not a runtime status and must not render as one), skills with
-    descriptions, approved commands behind a count line, and the settings line. Sections a harness
-    reports nothing for never render.
+    descriptions from the rollout, approved commands behind a count line, and the settings line.
+    Before an agent's first turn, Codex skills come from the existing `codex/skills.rs` scanner
+    (`~/.agents/skills` and `<cwd>/.agents/skills`, the roots Codex's documentation lists) and are
+    labelled as configured, not loaded; the scanner is incomplete — Codex also loads system and
+    plugin roots — and is deliberately **not** extended to reproduce Codex's discovery. Once the
+    agent has run, the rollout is the authority (decision 13). Sections a harness reports nothing
+    for never render.
 
 **Context breakdown**
 
@@ -284,23 +325,45 @@ for the user (telemetry flags, internal capability strings).
     `Invocation::Context` positional is `/context`, bare and unescaped by construction, sharing every
     flag with a send. Fails closed with no session file, as `compact` does. *(Comments mirror the
     compaction ones.)*
-17. **No transcript row, ever — not queued, not live, not on reload.** A report is not conversation.
-    The pending entry kind is `"context_report"`; the unified view renders nothing for it (unlike a
-    queued compaction); `turn_start` creates no agent turn for it; the completion event carries the
-    report to runtime state, not to the transcript. *(Comment on the pending-kind branch.)*
-18. **Parsed in Rust into a structured `ContextReport`, shipped as JSON.** Model, used and window
-    token counts, the category rows, and the four item tables, each row keeping its **raw token
-    string** and a parsed integer estimate with an `approximate` flag (for `~30` / `< 20`). A parse
-    failure does not fail the turn: the event carries `unparsed: true` with the raw text, and the
-    panel shows the raw text. Parsing is fixture-driven off a recorded report; the live test asserts
-    the current CLI still parses. *(Comment on the parser: markdown is a scraped format, hence the
-    raw-text fallback.)*
-19. **Durable through the session file, not the sidecar.** The disk parser routes a local-command
-    pair whose command is `/context` to a new `SystemMarker::ContextReport { report }` instead of a
-    completed agent turn; the transcript renders nothing for that marker kind; the frontend derives
-    the latest report per agent from the markers and stamps it "as of" the marker's time. Live, the
-    completion event overwrites it. Other local-command pairs keep today's completed-turn path.
-    *(Comment on the routing branch.)*
+17. **No transcript row, ever — not queued, not live, not on reload — so the report carries its own
+    request state.** A report is not conversation. The pending entry kind is `"context_report"`; the
+    unified view renders nothing for it (unlike a queued compaction); `turn_start` creates no agent
+    turn for it; the completion event carries the report to runtime state, not to the transcript.
+    Because there is no row, there is no place for a failure to show — compaction's failed row is
+    what tells the user a compaction failed, and the sidebar deliberately renders no `last_error`.
+    So `AgentRuntime` keeps `context_report_request: { send_id, turn_id?, phase: queued | running |
+    done | failed | cancelled, error? }`, set on dispatch and advanced by `turn_start`, `turn_end`,
+    `message_failed`, `message_cancelled`, and `failSendStart`. **It is cleared only by the next
+    report dispatch, never by an ordinary send** — otherwise a failure message would vanish the
+    moment the user sent a message. One slot: the panel's button is disabled while a request is
+    queued or running, so a second click cannot orphan the first request's correlation. The dialog
+    renders the request state beside the previous report, which is retained. *(Comment on the
+    pending-kind branch and on the request record's clear rule.)*
+18. **`ContextReport` is deserialized from the structured object; the markdown is the fallback.**
+    Live, from `assistant.context_usage`; on disk, from `contextUsage`. Categories keep the CLI's
+    `kind`; every item row keeps its exact integer tokens. Only when the object is absent (an older
+    CLI) does the markdown parser run, and only that path carries an `approximate` flag for `~30` /
+    `< 20`. A decode failure on either path does not fail the turn: the event carries
+    `unparsed: true` with the raw markdown, and the panel shows the raw text. The live test asserts
+    the structured object is still present and decodes. *(Comment on the parser: structured first;
+    markdown is a scraped format kept only as the fallback, hence the raw-text safety net.)*
+
+    **In `StreamMode::ContextReport` the parser swallows the synthetic envelope.** The report's
+    `assistant` event is intercepted before ordinary assistant handling: no `ContentChunk` for its
+    text, no synthetic `TurnIdentity`, so nothing downstream — the dispatcher's `captured_text`, the
+    forward path — has to know to ignore report text. *(Comment on the interception.)*
+19. **Durable through the session file, not the sidecar — routed on the self-describing output
+    record, no pairing.** In `handle_system`, before the pending-command pairing: an `sdk-cli`
+    `local_command` record whose `commandRun.command == "context"` emits
+    `SystemMarker::ContextReport { report }` and returns — from `contextUsage` when present, from the
+    markdown otherwise (decision 18) — so the routing does not depend on the structured object being
+    there, and the fallback path cannot fall into the orphaned-output branch. No agent turn, no
+    pending input required. The transcript renders nothing for that marker kind; the frontend derives
+    the latest report per agent from the markers and stamps it "as of" the marker's time; live, the
+    completion event overwrites it. Other local-command records keep today's path. The `isMeta`
+    caveat record that precedes the command is treated by `is_meta_continuation` as a mid-turn
+    continuation; the fixture test must show it neither extends the preceding agent turn nor pulls
+    the following turn backward. *(Comment on the routing branch, naming `commandRun` as the key.)*
 20. **UI: a panel opened from the context meter's chevron, and from the agent menu ("Context
     breakdown…").** `Dialog`, titled "Context breakdown · <agent>". Header: the context meter with
     model and "as of". Body: one meter per category, in the CLI's order, label left, "<tokens> ·
@@ -380,8 +443,10 @@ negative.
 
 - Primitive unit tests: label/detail/percentage text; fill width from value; clamp above 1; tone
   switches the fill token; rounding matches the Codex cell's current output for the same inputs.
-- Reset-text unit tests with fixed `now`: 16 minutes → "in 16 min"; 3 hours → "in 3 h"; 2 days →
-  weekday + clock; a past instant → clock form.
+- Reset-text unit tests with fixed `now`, **`TZ` and locale pinned in the test setup, asserting
+  literal strings** (computing the expectation through the same formatter would test nothing): 16
+  minutes → "in 16 min"; 3 hours → "in 3 h"; 2 days → the literal weekday + clock; a past instant →
+  the literal clock form.
 - Sidebar context-bar tests pass with the new copy; one new assertion for the token detail.
 - `make check` green. No docs.
 
@@ -468,20 +533,24 @@ The card says what the agent has loaded and whether it is usable, not just how m
 shape; parse the new fields in `parse_session_meta` (`memory_paths` is a map — take its values);
 wire type and `AgentMeta` in the frontend follow. The `session_meta` reducer carries them through.
 
-**Adapter — Codex (decision 12).** In `codex/session_file.rs`, extend the post-terminal enrichment
-to read `world_state.state` and `turn_context` into the same typed fields: skills from the
-`host_skills` markdown (`- <name>: <description> (file: <root>/<path>)` lines, roots table
+**Adapter — Codex (decision 12, 13).** In `codex/session_file.rs`, extend the post-terminal
+enrichment to read `world_state.state` and `turn_context` into the same typed fields: skills from
+the `host_skills` markdown (`- <name>: <description> (file: <root>/<path>)` lines, roots table
 expanded), settings from `turn_context` and `world_state.environments`, approved commands from
-`permissions.approved_command_prefixes` (joined with spaces). Record a fixture rollout from a probe
-session, with `base_instructions` truncated, under `crates/harness/tests/fixtures/codex/`. A
-`host_skills` block that fails to parse yields an empty skills list and a parse warning, not a
-failed load.
+`permissions.approved_command_prefixes` (joined with spaces). In `codex/mod.rs`, emit `SessionMeta`
+after every enrichment, dropping the `is_first_turn` gate (the loaders were already documented as
+fresh on every emission; the reducer overwrites). Record a fixture rollout from a probe session,
+with `base_instructions` truncated, under `crates/harness/tests/fixtures/codex/`. A `host_skills`
+block that fails to parse yields `Some([])` for skills plus a parse warning, not a failed load; a
+rollout with no `world_state` yields `None`.
 
-**Persistence (decision 13).** `MetaSidecar` gains an inventory snapshot (the typed fields plus
-`captured_at`), recorded on `SessionMeta` like the rate-limit snapshot; the reload path fills
-`meta` from it when present (with an `as_of` beside it, mirroring `last_rate_limit_as_of`) and from
-the config loader otherwise. Schema version bumps only if the file's existing fields change shape;
-an additive optional field does not need one.
+**Precedence and persistence (decision 13).** `AdapterEvent::SessionMeta` gains `source`; the
+dispatcher persists an inventory snapshot to `MetaSidecar` (typed fields plus `captured_at`) only for
+`StreamOnly`. `merge_meta_with_loaders` becomes replace-not-fill: a `Some` list from the parser or
+snapshot replaces the loader's list even when empty; `None` takes the loader's. The sidecar overlay
+applies the same rule and stamps `meta_as_of`. `codex/skills.rs` is unchanged apart from its module
+doc recording that it is the pre-first-turn fallback and incomplete by design. Schema version bumps
+only if the file's existing fields change shape; an additive optional field does not need one.
 
 **UI (decision 14).** Replace the chips with the disclosure row. Reuse the card's collapsed-state
 pattern for the per-agent expanded flag. `StatusDot` for status, `Tooltip` with the supplemental
@@ -493,7 +562,14 @@ delay for full memory paths. Keep `agent-meta` as the outer test id.
   CLI) yields empty defaults; `memory_paths` map → values list; `source` optional.
 - Codex fixture tests: the recorded rollout yields the skills with descriptions and expanded paths,
   the settings pairs, and the approved commands; a rollout without `world_state` (older CLI) yields
-  empty defaults; a malformed `host_skills` block yields empty skills plus a warning.
+  `None`; a malformed `host_skills` block yields `Some([])` plus a warning. Two-turn adapter test
+  with `world_state` changed between turns → the second `SessionMeta` carries the change.
+- Precedence: `merge_meta_with_loaders` with an explicit-empty runtime list and a non-empty loader
+  list → empty wins; runtime list conflicting with the loader → runtime wins with no appends; `None`
+  → loader. `load_codex_transcript` end to end with a scanner directory disjoint from the rollout's
+  skills → the rollout's. Claude sidecar overlay with a loader registry present → snapshot statuses
+  win and `as_of` is set; never-dispatched agent → loader, no `as_of`. Dispatcher: a
+  `SessionFileBacked` meta is not persisted.
 - Sidecar round-trip test for the inventory snapshot; a sidecar without it reads as absent.
 - `Sidebar.test.ts`: collapsed line text with counts and the needs-auth count; expanded sections
   present/absent by data; `needs-auth` → warning dot with label; unknown status string → warning dot
@@ -525,7 +601,9 @@ The user can see what is occupying a Claude agent's context window, per category
 ### Implementation Outline
 
 Follow the compaction plan's milestone structure — capability + adapter + parser, then dispatcher,
-then app command + frontend — and mirror its tests one for one where the shape is the same.
+then app command + frontend — and mirror its tests one for one where the shape is the same. **Land
+the disk-parser change and its fixture first**, before the work item exists, so a report can never
+reach `forward.rs::latest_completed_agent_text` as an agent's answer.
 
 **Capability and adapter (decision 16).** `supports_context_report` in `switchboard_core` beside
 `supports_manual_compaction`, with the same fake-success rationale. `HarnessAdapter::context_report`
@@ -533,12 +611,14 @@ with the `UnsupportedOperation` default; Codex and Antigravity adapter tests ass
 Claude: `Invocation::Context`, the `compaction_argv_matches_send_argv_except_the_positional` test
 extended to cover it, fail-closed on a missing session file, `StreamMode::ContextReport`.
 
-**Parser (decision 18).** In `StreamMode::ContextReport` the stream parser takes the `result` text
-and produces the completion event carrying `ContextReport` (or `unparsed` + raw). The markdown parser
-lives in the harness crate, is pure, and is tested against a recorded fixture of the full report plus
-edge fixtures: empty MCP section, approximate skill tokens, an unknown category row (kept, rendered by
-name), a table with a missing column (row skipped, report still `parsed`). The `AdapterEvent` /
-`NormalizedEvent` gain `ContextReport { agent_id, report }`.
+**Parser (decision 18).** In `StreamMode::ContextReport` the stream parser intercepts the synthetic
+`assistant` event, decodes `context_usage` into `ContextReport` (falling back to
+`local_command_source` markdown when absent), emits no content chunks and no `TurnIdentity` for it,
+and produces the completion event carrying the report (or `unparsed` + raw). Both decoders live in
+the harness crate, are pure, and are tested against the recorded stream fixture plus edge cases: the
+object stripped (markdown path), an unknown category `kind` (kept, rendered by name), a malformed
+object (`unparsed`, raw text retained). The `AdapterEvent` / `NormalizedEvent` gain
+`ContextReport { agent_id, report }`.
 
 **Dispatcher (decision 15).** `WorkPayload::ContextReport`, `TurnKind::ContextReport`; every
 `TurnKind::Compaction` arm gains the sibling with the same behaviour except that the frontend is told
@@ -548,39 +628,50 @@ nothing on complete/fail/cancel, waiters resolve idle, not removable as a queued
 harness fails the message without starting a turn.
 
 **Disk parser (decision 19).** `SystemMarker::ContextReport { report: ContextReport }` in
-`transcript.rs`; `finish_pending_local_command` routes a pair whose command record names `/context`
-to it, re-using the markdown parser; a fixture of a session file with a `/context` pair pins that no
-agent turn is produced and the marker carries the parsed report. The merge treats it like every
-`Turn::System` (never a send slot).
+`transcript.rs`; `handle_system` routes an `sdk-cli` `local_command` with `commandRun.command ==
+"context"` to it before the pairing logic, re-using the decoders. The fixture is the recorded
+session file with a completed turn on each side of the three records; it pins: one marker, zero
+agent turns, zero parse warnings, the preceding turn not extended by the `isMeta` caveat record, the
+following turn not merged backward, and `latest_completed_agent_text` not returning the report. The
+same fixture with `contextUsage` removed → marker via the markdown path. The merge treats it like
+every `Turn::System` (never a send slot).
 
 **App (decision 15, 17).** `context_report_agent_impl` with the three gates `compact_agent_impl`
 has; `#[tauri::command]` shim; `AppError` variants for unsupported / no session, worded for the user.
 
 **Frontend (decision 17, 20).** `PendingSend.kind` gains `"context_report"`; `dispatchContextReport`
-beside `dispatchCompaction`; the unified view renders no row for the pending entry and `turn_start`
-appends no agent turn for the kind; the completion event lands in
-`AgentRuntime.last_context_report` (+ `_as_of`); on hydrate the latest `context_report` marker fills
-it when absent; `UnifiedTranscript` renders nothing for the marker kind. The panel is a new component
-taking the report and the busy/queued state; the context meter's chevron and the menu item open it.
+beside `dispatchCompaction` sets `context_report_request`; the unified view renders no row for the
+pending entry and `turn_start` appends no agent turn for the kind but advances the request to
+`running`; `turn_end` / `message_failed` / `message_cancelled` / `failSendStart` advance it to its
+terminal phase; the completion event lands in `AgentRuntime.last_context_report` (+ `_as_of`); on
+hydrate the latest `context_report` marker fills it when absent; `UnifiedTranscript` renders nothing
+for the marker kind. The panel is a new component taking the report and the request state; the
+context meter's chevron and the menu item open it; its button is disabled while a request is queued
+or running.
 
 **Live drift guard.** `live_claude_context_report_parses`: a fresh "ack" turn, then a
-`context_report` on that session; asserts `parsed`, the category rows present, and used/window
-tokens positive. One extra local command, no extra model call.
+`context_report` on that session; asserts the structured object was present (not the fallback), the
+category rows present, and used/window tokens positive. One extra local command, no extra model
+call.
 
 ### Definition of Done
 
-- Harness: capability test; Codex and Antigravity refusal tests; Claude argv test; markdown parser
-  fixtures above; stream-parser test that a `ContextReport` mode turn completes carrying the report
-  and that a garbled result completes with `unparsed`.
-- Disk parser: the `/context` pair fixture → marker, no agent turn; an unrelated local-command pair
-  still → completed turn.
+- Harness: capability test; Codex and Antigravity refusal tests; Claude argv test; decoder fixtures
+  above; stream-parser test that a `ContextReport` mode turn completes carrying the report, emits no
+  content chunks and no `TurnIdentity`, and that a garbled object completes with `unparsed`.
+- Disk parser: the fixture assertions listed in the outline; an unrelated `sdk-cli` local-command
+  pair still → completed turn.
 - Dispatcher: the mirrored compaction set.
 - App: gates (unsupported harness, no session, unmaterialized fork) and the happy path against the
   mock.
-- Frontend: reducer tests for the pending kind (no row, no turn), the completion event, and hydrate
-  fill-if-empty from the marker; panel component tests for empty state, parsed report rendering
-  (category meters, grouped MCP section), unparsed fallback, queued button state; Sidebar tests for
-  chevron/menu presence gated on harness.
+- Frontend: reducer tests for the pending kind (no row, no turn), each request-phase transition, the
+  clear-only-on-next-report rule (an ordinary send leaves a `failed` request in place), the
+  completion event, and hydrate fill-if-empty from the marker; component-level tests with mocked
+  `invoke`/`listen` for completion arriving before the IPC resolves, IPC rejection, runtime failure
+  after start, cancel while queued, cancel while running — each asserting the dialog copy and that
+  the prior report and its timestamp remain; panel tests for empty state, parsed rendering (category
+  meters, grouped MCP section), unparsed fallback, and the disabled button while in flight; Sidebar
+  tests for chevron/menu presence gated on harness.
 - Live test passes on `make test-live-claude`.
 
 ---
@@ -625,15 +716,20 @@ counter", "weekly `overageResetsAt`", or the §0 claim that `/context` emits no 
 ## Known limitations to record
 
 - Reset text and the reset-passed gate are computed per render, not on a timer.
+- **The card reflects the windows supplied by the latest event.** A per-model weekly meter shown
+  after a Fable turn disappears after a Sonnet turn on the same agent, even though the limit is
+  still in force; retaining it live would not survive a reload (the sidecar persists the raw event),
+  so it is not retained.
 - The per-model window's model label is live-only; after reload it reads "Weekly · model-specific".
 - Which models the per-model window covers is a server-side allowlist the stream never names.
-- The context report is a scraped markdown format; the raw-text fallback is the safety net, and the
-  live test is the tripwire.
+- The context report's structured object is undocumented; the markdown fallback and raw-text safety
+  net cover its absence, and the live test is the tripwire.
 - Each report writes three records into the agent's session file; the CLI's own TUI shows them on
   resume. Same trade compaction makes.
 - Memory *files* are named only by the report; `init` gives the memory directory.
 - Codex: no runtime tool or MCP status exists in the stream or rollout; MCP rows show configured
-  names only. The blocked-state fields are recorded, not rendered, until observed populated.
+  names only, and pre-first-turn skills come from an incomplete scanner labelled as configured. The
+  blocked-state fields are recorded, not rendered, until observed populated.
 
 ## Out of scope (deliberately)
 

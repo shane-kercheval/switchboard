@@ -25,7 +25,11 @@ defend.** Get the data on screen in the described shape; adjust the shape after.
 
 ## What the stream carries (verified)
 
-None of this is in Anthropic's public docs. The live tests in M2 and M4 are the drift guards.
+None of this is in Anthropic's public docs, and none of it is in OpenAI's. **Every milestone that
+reads a field discovered by probe carries a live test against the real CLI** — M2 the usage windows,
+M3 the Claude `init` inventory and the Codex `world_state` extraction, M4 the context report. A
+fixture test keeps passing against a recorded shape after the CLI has moved; only a live test
+notices. Per `AGENTS.md` → "Live testing against real harnesses".
 
 ### Usage windows
 
@@ -132,9 +136,23 @@ object is exact where the text is approximate (the `~30` skill rows are `31` and
 itself a `system/local_command` record with a leading `/`; a `<command-name>` `user` record is
 housekeeping and never opens a pending command, so the output record hits the "orphaned sdk-cli
 local-command output" warning and is discarded. (An earlier draft of this plan said the pair became
-a completed agent turn; it does not.) The recorded probe — stream and session file — is the M4
-fixture; the artifacts sit at `/tmp/ctxfix/` and `~/.claude/projects/-private-tmp-ctxfix/` until
-recorded, and the probe is free to repeat.
+a completed agent turn; it does not.)
+
+**Regenerate the M4 fixtures rather than hunting for the originals** — the probe is free (no model
+call) and takes about a minute, and a fixture recorded against the CLI version you build on is worth
+more than one recorded today:
+
+```sh
+mkdir -p /tmp/ctxprobe && cd /tmp/ctxprobe
+sid=$(python3 -c "import uuid;print(uuid.uuid4())")
+claude -p --output-format stream-json --include-partial-messages --verbose \
+  --dangerously-skip-permissions --add-dir / --session-id "$sid" -- "/context" > stream.jsonl
+# session file: ~/.claude/projects/-tmp-ctxprobe/$sid.jsonl
+```
+
+Record both, truncating the MCP-tool list to a handful of entries across two servers (the real one
+is 80 rows) and keeping one `~N` and one `< N` skill row so the markdown fallback path has something
+approximate to parse. Note the CLI version in the fixture's header comment.
 
 ### Codex (0.154.0)
 
@@ -576,6 +594,16 @@ delay for full memory paths. Keep `agent-meta` as the outer test id.
   with that string; "as of" shown only when rehydrated; a Codex agent renders its sections with no
   status dot on MCP rows; an agent with an empty inventory renders no environment row.
 - Existing chip tests updated to the new row.
+- **Live drift guards — the milestone reads eight undocumented fields across two harnesses and has
+  none today.** `live_claude_session_meta_carries_inventory`: one "ack" turn, asserts `system/init`
+  still yields `agents`, `plugins` (with `name` and `version`), `memory_paths`, `slash_commands`, and
+  `source` on at least one MCP server — shape and presence, never counts or names, which are
+  account-specific. `live_codex_world_state_yields_inventory`: two "ack" turns on one session,
+  asserts the first yields skills parsed out of `host_skills` with non-empty descriptions plus the
+  settings pairs and approved commands, and that the **second** turn emits `SessionMeta` too (the
+  `is_first_turn` removal — a fixture cannot see that gate). The `host_skills` scrape is the most
+  fragile read in the plan; this is the only thing that would notice the format moving. Names carry
+  their harness per the live-test naming convention.
 - Docs: G14 marked closed (M5 does the writing).
 
 ---

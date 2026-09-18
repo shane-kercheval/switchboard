@@ -1136,6 +1136,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                     let _ = tx.send(AdapterEvent::ContextReport {
                         agent_id,
                         report: mock_context_report(),
+                        at: Utc::now(),
                     });
                     let _ = tx.send(context_report_terminal(turn_id, false));
                 });

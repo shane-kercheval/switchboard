@@ -1531,8 +1531,14 @@
                  intended behavior, not a case to distinguish. -->
             {#if context !== undefined}
               <div class="mt-1.5 flex items-end gap-1.5" data-testid="agent-context-bar">
+                <!-- "Context", not "Context used": the row carries two buttons
+                     beside the meter and the longer label no longer fits — it
+                     clipped by 11px at the default sidebar width, measured in
+                     WebKit. Nothing is lost, since the detail beside it already
+                     reads "121.1k / 1M · 12%". Pinned by
+                     `tests/browser/agent-context-row-fit.browser.test.ts`. -->
                 <Meter
-                  label="Context used"
+                  label="Context"
                   value={context.fraction}
                   detail="{formatTokens(context.usedTokens)} / {formatTokens(context.windowTokens)}"
                   class="flex-1"
@@ -1646,7 +1652,7 @@
   onClose={() => (breakdownAgentId = null)}
   agentName={breakdownAgent?.name ?? ""}
   report={breakdownAgentId === null ? undefined : runtimes[breakdownAgentId]?.last_context_report}
-  asOf={breakdownAgentId === null ? null : runtimes[breakdownAgentId]?.last_context_report_as_of}
+  at={breakdownAgentId === null ? null : runtimes[breakdownAgentId]?.last_context_report_at}
   request={breakdownAgentId === null
     ? undefined
     : runtimes[breakdownAgentId]?.context_report_request}

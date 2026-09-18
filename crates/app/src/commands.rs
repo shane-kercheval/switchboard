@@ -5321,9 +5321,10 @@ pub struct AgentConversationMeta {
     /// and when the harness took it. Projected by the loader rather than read
     /// off the items below, because the markers reach the frontend as
     /// project-level `ConversationItem`s and the panel needs one value per
-    /// agent.
+    /// agent. Carried on every report, unlike the `*_as_of` qualifiers above —
+    /// see `LoadedTranscript::last_context_report_at`.
     pub last_context_report: Option<switchboard_harness::ContextReport>,
-    pub last_context_report_as_of: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_context_report_at: Option<chrono::DateTime<chrono::Utc>>,
     pub warnings: Vec<switchboard_harness::ParseWarning>,
     pub load_error: Option<String>,
 }
@@ -6419,7 +6420,7 @@ fn merge_project_conversation(
             last_rate_limit_as_of: transcript.last_rate_limit_as_of,
             meta_as_of: transcript.meta_as_of,
             last_context_report: transcript.last_context_report,
-            last_context_report_as_of: transcript.last_context_report_as_of,
+            last_context_report_at: transcript.last_context_report_at,
             warnings: transcript.warnings,
             load_error,
         });
@@ -10283,6 +10284,7 @@ mod tests {
                             raw: "## Context Usage".to_owned(),
                             ..switchboard_harness::ContextReport::default()
                         },
+                        at: chrono::Utc::now(),
                     });
                 }
                 let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {

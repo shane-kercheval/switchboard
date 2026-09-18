@@ -252,7 +252,8 @@ pub enum AppError {
     /// frontend shows no chevron and no menu item for these harnesses, so
     /// reaching this means a caller bypassed the capability predicate.
     #[error(
-        "Switchboard cannot read {harness}'s context breakdown          — it has no way to ask this harness what is in its context window"
+        "Switchboard cannot read {harness}'s context breakdown \
+         — it has no way to ask this harness what is in its context window"
     )]
     ContextReportUnsupported { harness: HarnessKind },
 
@@ -268,7 +269,8 @@ pub enum AppError {
     /// the branch as a side effect of a *read*. Same residue-of-a-failed-fork
     /// state as [`Self::CompactionForkNotMaterialized`].
     #[error(
-        "{name} hasn't branched from its source yet          — send it a message first, then analyze its context"
+        "{name} hasn't branched from its source yet \
+         — send it a message first, then analyze its context"
     )]
     ContextReportForkNotMaterialized { name: String },
 

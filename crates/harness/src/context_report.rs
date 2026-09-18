@@ -133,17 +133,72 @@ pub fn decode(structured: Option<&Value>, raw: &str) -> ContextReport {
     }
 }
 
+/// Read one token count from the structured object.
+///
+/// **A count this cannot read fails the whole decode rather than becoming a
+/// zero**, which is the difference between the panel falling back to the
+/// printed table and the panel confidently rendering every row as `0`. The
+/// second is the worse outcome by far: nothing about it says anything went
+/// wrong, and it is indistinguishable from a genuinely empty context.
+///
+/// A whole-number float is *accepted* rather than rejected. JSON has a single
+/// number type, so a CLI that starts emitting `4026.0` has not changed what it
+/// means — falling back to the rounded markdown there would discard an exact
+/// value we can plainly read. A fractional count (`4026.7`) is refused: tokens
+/// are not fractional, so rounding one and presenting it as measured would
+/// re-introduce the invented number this function exists to prevent.
+fn token_count(row: &Value, key: &str) -> Option<u64> {
+    let value = row.get(key)?;
+    if let Some(exact) = value.as_u64() {
+        return Some(exact);
+    }
+    let number = value.as_f64()?;
+    // Three separate refusals, each with its own job: not a number at all, not a
+    // whole one (rounding it and calling it measured is the invented number this
+    // function exists to refuse), and outside what `u64` can hold — where the
+    // cast below would silently saturate to a wrong count.
+    #[allow(clippy::cast_precision_loss)]
+    // Strictly less than: `u64::MAX as f64` rounds *up* to 2^64, so `<=` would
+    // admit exactly 2^64 and the cast below would saturate to `u64::MAX` — the
+    // one outcome this guard exists to refuse.
+    let in_range = number >= 0.0 && number < u64::MAX as f64;
+    if !number.is_finite() || number.fract() != 0.0 || !in_range {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(number as u64)
+}
+
 /// Read the structured object. `None` when it carries neither a window size nor
 /// a single category — an object that empty tells the user nothing the markdown
-/// would not tell them better, so the fallback should get its turn.
+/// would not tell them better, so the fallback should get its turn — and `None`
+/// when any row's token count is unreadable (see [`token_count`]).
 fn from_structured(value: &Value, raw: &str) -> Option<ContextReport> {
     let object = value.as_object()?;
-    let categories: Vec<ContextCategory> = object
-        .get("categories")
-        .and_then(Value::as_array)
-        .map(|rows| rows.iter().filter_map(structured_category).collect())
-        .unwrap_or_default();
-    let max_tokens = object.get("raw_max_tokens").and_then(Value::as_u64);
+    let categories: Vec<ContextCategory> = match object.get("categories") {
+        Some(rows) => rows
+            .as_array()?
+            .iter()
+            // Two different rejections, in two stages: a nameless row is
+            // dropped and the rest of the list still decodes, while an
+            // unreadable count fails the collect and takes the whole decode
+            // with it.
+            .filter(|row| row.get("name").and_then(Value::as_str).is_some())
+            .map(structured_category)
+            .collect::<Option<Vec<ContextCategory>>>()?,
+        None => Vec::new(),
+    };
+    // An absent `raw_max_tokens` is "the CLI did not report a window"; a present
+    // but unreadable one is a shape change, and the two must not collapse — the
+    // second fails the decode so the markdown gets its turn.
+    let max_tokens = match object.get("raw_max_tokens") {
+        Some(_) => Some(token_count(value, "raw_max_tokens")?),
+        None => None,
+    };
+    let total_tokens = match object.get("total_tokens") {
+        Some(_) => Some(token_count(value, "total_tokens")?),
+        None => None,
+    };
     if categories.is_empty() && max_tokens.is_none() {
         return None;
     }
@@ -152,25 +207,25 @@ fn from_structured(value: &Value, raw: &str) -> Option<ContextReport> {
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        total_tokens: object.get("total_tokens").and_then(Value::as_u64),
+        total_tokens,
         max_tokens,
         categories,
-        mcp_tools: structured_items(object.get("mcp_tools"), "name", "server_name"),
-        memory_files: structured_items(object.get("memory_files"), "path", "type"),
-        agents: structured_items(object.get("agents"), "agent_type", "source"),
-        skills: structured_items(object.get("skills"), "name", "source"),
+        mcp_tools: structured_items(object.get("mcp_tools"), "name", "server_name")?,
+        memory_files: structured_items(object.get("memory_files"), "path", "type")?,
+        agents: structured_items(object.get("agents"), "agent_type", "source")?,
+        skills: structured_items(object.get("skills"), "name", "source")?,
         raw: raw.to_owned(),
         unparsed: false,
     })
 }
 
+/// `None` when the row's token count is unreadable, which fails the whole
+/// decode at the caller's collect. Nameless rows are filtered out before this
+/// runs, so the only rejection here is the count.
 fn structured_category(row: &Value) -> Option<ContextCategory> {
     Some(ContextCategory {
         name: row.get("name").and_then(Value::as_str)?.to_owned(),
-        tokens: row
-            .get("tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
+        tokens: token_count(row, "tokens")?,
         kind: row
             .get("kind")
             .and_then(Value::as_str)
@@ -183,12 +238,28 @@ fn structured_category(row: &Value) -> Option<ContextCategory> {
 /// Project one of the object's four item lists. `name_key` and `detail_key`
 /// differ per list because the CLI names the same two columns differently in
 /// each; a row missing its name is dropped rather than rendered nameless.
-fn structured_items(list: Option<&Value>, name_key: &str, detail_key: &str) -> Vec<ContextItem> {
-    let Some(rows) = list.and_then(Value::as_array) else {
-        return Vec::new();
+///
+/// **An absent list is an empty one; a present list with an unreadable count is
+/// a decode failure.** The distinction matters because an account with no MCP
+/// servers and a CLI whose shape moved must not look the same.
+fn structured_items(
+    list: Option<&Value>,
+    name_key: &str,
+    detail_key: &str,
+) -> Option<Vec<ContextItem>> {
+    let Some(list) = list else {
+        return Some(Vec::new());
     };
+    // A present list that is not an array is a shape change, not an empty
+    // account: failing the decode here is what sends the reader to the printed
+    // table, which may well carry the section perfectly. Returning an empty vec
+    // would delete the section from a report still marked as read successfully —
+    // the same silent loss the strict count read above exists to prevent.
+    let rows = list.as_array()?;
     rows.iter()
-        .filter_map(|row| {
+        // Same two-stage rejection as the category list above.
+        .filter(|row| row.get(name_key).and_then(Value::as_str).is_some())
+        .map(|row| {
             Some(ContextItem {
                 name: row.get(name_key).and_then(Value::as_str)?.to_owned(),
                 detail: row
@@ -196,10 +267,7 @@ fn structured_items(list: Option<&Value>, name_key: &str, detail_key: &str) -> V
                     .and_then(Value::as_str)
                     .filter(|text| !text.is_empty())
                     .map(str::to_owned),
-                tokens: row
-                    .get("tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default(),
+                tokens: token_count(row, "tokens")?,
                 approximate: false,
             })
         })
@@ -605,6 +673,208 @@ mod tests {
 
         assert_eq!(report.skills.len(), 1);
         assert_eq!(report.skills[0].name, "kept");
+    }
+
+    #[test]
+    fn an_unreadable_category_count_falls_through_to_the_markdown() {
+        // The failure this prevents is silent: with a zero default every row
+        // renders `0`, nothing is flagged, and the printed table that would
+        // have parsed is never consulted.
+        let (_, raw) = fixture_parts();
+        let report = decode(
+            Some(&json!({
+                "raw_max_tokens": 1_000_000,
+                "categories": [{"name": "Messages", "tokens": "4,026", "kind": "used"}],
+            })),
+            &raw,
+        );
+
+        assert!(!report.unparsed, "the markdown rescued it");
+        assert_eq!(report.categories.len(), 11);
+        assert!(
+            report.skills.iter().any(|skill| skill.approximate),
+            "the markdown path ran: {report:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_item_count_falls_through_too() {
+        let (_, raw) = fixture_parts();
+        let report = decode(
+            Some(&json!({
+                "raw_max_tokens": 1_000_000,
+                "categories": [{"name": "Messages", "tokens": 10, "kind": "used"}],
+                "skills": [{"name": "dataviz", "tokens": null}],
+            })),
+            &raw,
+        );
+
+        assert_eq!(
+            report.categories.len(),
+            11,
+            "decoded from the table instead"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_window_size_falls_through_rather_than_vanishing() {
+        // Reading the header totals leniently while the rows are strict would
+        // leave the panel with meters and no scale.
+        let (_, raw) = fixture_parts();
+        let report = decode(
+            Some(&json!({
+                "raw_max_tokens": "1m",
+                "categories": [{"name": "Messages", "tokens": 10, "kind": "used"}],
+            })),
+            &raw,
+        );
+
+        assert!(!report.unparsed);
+        assert_eq!(report.max_tokens, Some(1_000_000));
+        assert_eq!(report.categories.len(), 11);
+    }
+
+    #[test]
+    fn a_report_with_neither_a_readable_object_nor_readable_text_is_unparsed() {
+        let report = decode(
+            Some(&json!({
+                "raw_max_tokens": 1_000_000,
+                "categories": [{"name": "Messages", "tokens": "4,026"}],
+            })),
+            "nothing parseable here",
+        );
+
+        assert!(report.unparsed);
+        assert_eq!(report.raw, "nothing parseable here");
+    }
+
+    #[test]
+    fn a_whole_number_float_is_read_rather_than_refused() {
+        // JSON has one number type, so `4026.0` has not changed what the CLI
+        // means — falling back to the rounded table would discard an exact
+        // value we can plainly read.
+        let report = decode(
+            Some(&json!({
+                "raw_max_tokens": 200_000.0,
+                "total_tokens": 4_026.0,
+                "categories": [{"name": "Messages", "tokens": 4_026.0, "kind": "used"}],
+            })),
+            "",
+        );
+
+        assert!(!report.unparsed);
+        assert_eq!(report.max_tokens, Some(200_000));
+        assert_eq!(report.total_tokens, Some(4_026));
+        assert_eq!(report.categories[0].tokens, 4_026);
+        assert!(!report.categories[0].approximate);
+    }
+
+    #[test]
+    fn a_fractional_count_is_refused_rather_than_rounded() {
+        // Tokens are not fractional. Rounding one and presenting it as measured
+        // is the same invented number the zero default produced.
+        let report = decode(
+            Some(&json!({
+                "raw_max_tokens": 200_000,
+                "categories": [{"name": "Messages", "tokens": 4_026.7, "kind": "used"}],
+            })),
+            "",
+        );
+
+        assert!(report.unparsed);
+    }
+
+    #[test]
+    fn a_count_too_large_for_the_type_is_refused_rather_than_saturated() {
+        // The cast would clamp to `u64::MAX` and present it as the measurement.
+        let report = decode(
+            Some(&json!({
+                "raw_max_tokens": 200_000,
+                "categories": [{"name": "Messages", "tokens": 1e30, "kind": "used"}],
+            })),
+            "",
+        );
+
+        assert!(report.unparsed);
+    }
+
+    #[test]
+    fn a_genuine_zero_stays_a_measured_zero() {
+        let report = decode(
+            Some(&json!({
+                "raw_max_tokens": 200_000,
+                "categories": [{"name": "Messages", "tokens": 0, "kind": "used"}],
+            })),
+            "",
+        );
+
+        assert!(!report.unparsed);
+        assert_eq!(report.categories[0].tokens, 0);
+    }
+
+    #[test]
+    fn a_list_that_is_not_an_array_falls_through_to_the_markdown() {
+        // The section would otherwise vanish from a report still marked as read
+        // successfully, with the table that carries it never consulted.
+        let (_, raw) = fixture_parts();
+        let report = decode(
+            Some(&json!({
+                "raw_max_tokens": 1_000_000,
+                "categories": [{"name": "Messages", "tokens": 10, "kind": "used"}],
+                "mcp_tools": {"docs": ["read", "update"]},
+            })),
+            &raw,
+        );
+
+        assert!(!report.unparsed, "the markdown rescued it");
+        assert_eq!(
+            report.mcp_tools.len(),
+            4,
+            "the table's MCP rows are what the panel shows: {report:?}"
+        );
+        assert_eq!(report.categories.len(), 11);
+    }
+
+    #[test]
+    fn a_count_of_exactly_two_to_the_sixty_fourth_is_refused() {
+        // The boundary the range guard exists for: `u64::MAX as f64` rounds up
+        // to this value, so a `<=` comparison would admit it and the cast would
+        // saturate to `u64::MAX`.
+        let report = decode(
+            Some(&json!({
+                "raw_max_tokens": 200_000,
+                "categories": [{"name": "Messages", "tokens": 18_446_744_073_709_551_616.0_f64,
+                                "kind": "used"}],
+            })),
+            "",
+        );
+
+        assert!(report.unparsed);
+    }
+
+    #[test]
+    fn an_absent_list_is_empty_while_an_unreadable_one_is_a_failure() {
+        // An account with no MCP servers and a CLI whose shape moved must not
+        // look the same.
+        let absent = decode(
+            Some(&json!({
+                "raw_max_tokens": 200_000,
+                "categories": [{"name": "Messages", "tokens": 1, "kind": "used"}],
+            })),
+            "",
+        );
+        assert!(!absent.unparsed);
+        assert!(absent.mcp_tools.is_empty());
+
+        let unreadable = decode(
+            Some(&json!({
+                "raw_max_tokens": 200_000,
+                "categories": [{"name": "Messages", "tokens": 1, "kind": "used"}],
+                "mcp_tools": [{"name": "t", "server_name": "s", "tokens": {}}],
+            })),
+            "",
+        );
+        assert!(unreadable.unparsed);
     }
 
     #[test]

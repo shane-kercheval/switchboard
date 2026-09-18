@@ -1524,7 +1524,20 @@ fn parse_context_report_envelope(obj: &Value, agent_id: AgentId) -> ParseOutcome
     ParseOutcome::Event(AdapterEvent::ContextReport {
         agent_id,
         report: crate::context_report::decode(structured, raw),
+        // The envelope's own `timestamp`, not our arrival clock. The disk
+        // marker takes its time from the same CLI clock, so reading it here is
+        // what makes a report show the same moment before and after a reload
+        // rather than two readings a network hop apart. Arrival is the fallback
+        // for a future stream that stops carrying the field.
+        at: envelope_timestamp(obj).unwrap_or_else(Utc::now),
     })
+}
+
+/// The CLI's own `timestamp` on a stream record, when it carries a parseable
+/// one.
+fn envelope_timestamp(obj: &Value) -> Option<DateTime<Utc>> {
+    let text = obj.get("timestamp").and_then(Value::as_str)?;
+    Some(DateTime::parse_from_rfc3339(text).ok()?.with_timezone(&Utc))
 }
 
 fn strip_local_command_stdout(text: &str) -> Option<&str> {
@@ -3860,6 +3873,49 @@ mod context_report_tests {
             ),
             "events: {events:#?}"
         );
+    }
+
+    #[test]
+    fn a_report_is_stamped_with_the_clis_own_time_not_our_arrival() {
+        // The disk marker takes its time from the same CLI clock, so reading the
+        // envelope's is what makes one report show one moment either side of a
+        // reload. Stamping arrival instead drifts by a network hop and, worse,
+        // is a different clock entirely.
+        let events = replay(REPORT);
+
+        let Some(AdapterEvent::ContextReport { at, .. }) = events
+            .iter()
+            .find(|event| matches!(event, AdapterEvent::ContextReport { .. }))
+        else {
+            panic!("expected a report: {events:#?}");
+        };
+        assert_eq!(
+            at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "2026-09-18T15:48:31.451Z"
+        );
+    }
+
+    #[test]
+    fn a_report_whose_envelope_carries_no_time_still_lands() {
+        // The fallback exists for a stream that stops carrying the field; the
+        // report is far too useful to drop over a missing timestamp.
+        let stripped: String = REPORT
+            .lines()
+            .map(|line| {
+                let Ok(mut record) = serde_json::from_str::<Value>(line) else {
+                    return line.to_owned();
+                };
+                if let Some(object) = record.as_object_mut() {
+                    object.remove("timestamp");
+                }
+                record.to_string()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        let events = replay(&stripped);
+
+        assert!(!sole_report(&events).unparsed);
     }
 
     #[test]

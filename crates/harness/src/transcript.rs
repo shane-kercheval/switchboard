@@ -294,15 +294,21 @@ pub struct LoadedTranscript {
     /// The most recent `/context` breakdown recorded in this session file, and
     /// the moment the harness took it.
     ///
-    /// Unlike the two `*_as_of` fields above, **both of these are filled by the
-    /// loader**, because a report is class B — durable in the harness's own file
-    /// — so its age is the marker's own timestamp rather than a sidecar capture
-    /// time. It is projected out of the turns rather than left for the consumer
-    /// to find, so that every hydration path gets it identically: the markers
-    /// themselves are routed to the project-level overlay and never reach a
-    /// per-agent turn list.
+    /// Named `_at` rather than `_as_of` deliberately, because it is **not** the
+    /// same kind of field as the two above. Those qualify a value restored from
+    /// the sidecar and are cleared the moment a live one arrives; this one is
+    /// carried by every report, live ones included. A rate-limit payload is
+    /// refreshed by every turn, so a live value is current by construction — a
+    /// breakdown is a measurement of one instant that nothing updates, and each
+    /// turn after it makes it more wrong.
+    ///
+    /// Filled by the loader rather than the app-layer overlay: a report is class
+    /// B, durable in the harness's own file, so its time is the marker's own
+    /// timestamp. It is projected out of the turns rather than left for the
+    /// consumer to find, because the markers are routed to the project-level
+    /// overlay and never reach a per-agent turn list.
     pub last_context_report: Option<crate::context_report::ContextReport>,
-    pub last_context_report_as_of: Option<DateTime<Utc>>,
+    pub last_context_report_at: Option<DateTime<Utc>>,
     pub warnings: Vec<ParseWarning>,
 }
 
@@ -324,7 +330,7 @@ impl LoadedTranscript {
         });
         if let Some((report, at)) = latest {
             self.last_context_report = Some(report);
-            self.last_context_report_as_of = Some(at);
+            self.last_context_report_at = Some(at);
         }
     }
 }

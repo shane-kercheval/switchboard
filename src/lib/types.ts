@@ -314,7 +314,7 @@ export type NormalizedEvent =
   // The `/context` breakdown for one agent, from a report run. Agent-scoped:
   // it describes the agent's window, not the maintenance turn that measured
   // it, so it lands on runtime state rather than in the transcript.
-  | { type: "context_report"; agent_id: AgentId; report: ContextReport }
+  | { type: "context_report"; agent_id: AgentId; report: ContextReport; at: string }
   | {
       type: "session_meta";
       agent_id: AgentId;
@@ -400,9 +400,12 @@ export type LoadedTranscript = {
   /// The newest `/context` breakdown recorded in this agent's session file, and
   /// when the harness took it (ISO-8601). Projected by the loader because the
   /// markers themselves never reach a per-agent turn list — `load_transcript`
-  /// filters `role: "system"` out before the IPC.
+  /// filters `role: "system"` out before the IPC. Unlike the `*_as_of` fields
+  /// above this is carried by every report, live ones included: nothing
+  /// refreshes a breakdown, so a report with no time attached is a number the
+  /// user cannot interpret.
   last_context_report?: ContextReport | null;
-  last_context_report_as_of?: string | null;
+  last_context_report_at?: string | null;
   warnings: ParseWarning[];
 };
 
@@ -488,7 +491,7 @@ export type Hydrate = {
   /// the harness took it. Fills `AgentRuntime.last_context_report` only when the
   /// runtime has none — live > disk, like `meta` and `last_rate_limit`.
   last_context_report?: ContextReport | null;
-  last_context_report_as_of?: string | null;
+  last_context_report_at?: string | null;
 };
 
 export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
@@ -1020,7 +1023,7 @@ export type AgentConversationMeta = {
   /// The newest `/context` breakdown from this agent's session file, and when
   /// the harness took it. See `LoadedTranscript.last_context_report`.
   last_context_report?: ContextReport | null;
-  last_context_report_as_of?: string | null;
+  last_context_report_at?: string | null;
   warnings: ParseWarning[];
   load_error?: string | null;
 };

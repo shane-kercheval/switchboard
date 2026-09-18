@@ -390,11 +390,14 @@ export type AgentRuntime = {
   /// `context_report` event, or from the latest `context_report` marker in the
   /// session file on hydrate. Absent until one has been run.
   last_context_report?: ContextReport;
-  /// Capture time of `last_context_report` when it came from a session-file
-  /// marker on hydrate. ISO-8601 string; `null` once a live event overwrites the
-  /// in-memory value. Drives the panel's "as of …" qualifier — a breakdown is a
-  /// measurement of one moment, and a reopened project's is always old.
-  last_context_report_as_of?: string | null;
+  /// When `last_context_report` was measured (ISO-8601).
+  ///
+  /// **Always set alongside the report, live or restored** — deliberately unlike
+  /// `last_rate_limit_as_of`, which is a disk-snapshot qualifier cleared by a
+  /// live event. Every turn refreshes a rate-limit payload, so a live one is
+  /// current by construction; nothing refreshes a breakdown, so a live one
+  /// starts aging the instant it lands and the panel must say when it was taken.
+  last_context_report_at?: string;
   /// The state of the report the user last asked for. Survives an ordinary send;
   /// see [`ContextReportRequest`] for why. One slot: the panel's button is
   /// disabled while a request is queued or running, so a second click cannot

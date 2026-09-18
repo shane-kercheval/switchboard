@@ -620,6 +620,13 @@ function loadedItemToItem(item: LoadedTurnItem): TurnItem {
 /// `send_id` is matched alongside `message_id` because of the pre-receipt race:
 /// `turn_start` can arrive before the `context_report_agent` IPC resolves, so
 /// the request may not know its own `message_id` yet.
+///
+/// A pre-start **failure** has neither id available — the dispatcher journals
+/// nothing for a maintenance turn, so its `message_failed` carries
+/// `send_id: null` — and is therefore matched through the queued work item
+/// instead. Getting that wrong strands the request at `queued` forever: the
+/// panel's button is disabled while a request is in flight, and that button is
+/// the only way to start another one.
 function advanceContextReportRequest(runtime: AgentRuntime, input: ReducerInput): AgentRuntime {
   const request = runtime.context_report_request;
   if (request === undefined) return runtime;
@@ -641,9 +648,23 @@ function advanceContextReportRequest(runtime: AgentRuntime, input: ReducerInput)
       if (input.outcome.status === "completed") return settled({ ...request, phase: "done" });
       if (input.outcome.status === "cancelled") return settled({ ...request, phase: "cancelled" });
       return settled({ ...request, phase: "failed", error: input.outcome.message });
-    case "message_failed":
-      if (input.message_id !== request.message_id) return runtime;
+    case "message_failed": {
+      if (input.message_id === request.message_id) {
+        return settled({ ...request, phase: "failed", error: input.error });
+      }
+      // No id match: resolve the entry this failure is about the same way the
+      // runtime's own `message_failed` arm does, and claim it when that entry is
+      // this request's. Safe to read here because this function runs *before*
+      // that arm removes it.
+      const index = pickPendingIndex(
+        runtime.pending_sends,
+        input.message_id,
+        input.send_id ?? undefined,
+      );
+      const entry = index >= 0 ? runtime.pending_sends?.[index] : undefined;
+      if (entry?.kind !== "context_report" || entry.send_id !== request.send_id) return runtime;
       return settled({ ...request, phase: "failed", error: input.error });
+    }
     case "message_cancelled":
       if (input.message_id !== request.message_id && input.send_id !== request.send_id) {
         return runtime;
@@ -877,14 +898,16 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       };
 
     case "context_report":
-      // A live report replaces whatever was there and clears the "as of"
-      // qualifier — the value is no longer a snapshot read off disk. The request
-      // this answers is advanced by `turn_end`, not here: the event arrives
-      // before the terminal, and a request is not done until the turn is.
+      // A live report replaces whatever was there **and keeps its own capture
+      // time** rather than clearing it the way a live rate-limit event clears
+      // its qualifier. Nothing refreshes a breakdown, so "live" here means
+      // "measured just now", not "current from now on". The request this answers
+      // is advanced by `turn_end`, not here: the event arrives before the
+      // terminal, and a request is not done until the turn is.
       return {
         ...runtime,
         last_context_report: input.report,
-        last_context_report_as_of: null,
+        last_context_report_at: input.at,
       };
 
     case "hydrate": {
@@ -920,10 +943,10 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       }
       if (next.last_context_report === undefined && input.last_context_report != null) {
         // Same unit-of-two fill: a report and the moment it was taken. A live
-        // event that already landed keeps its value and its null `as_of`, so a
-        // slow hydrate cannot re-age a fresh measurement.
+        // event that already landed keeps both, so a slow hydrate cannot replace
+        // a fresh measurement with an older one.
         next.last_context_report = input.last_context_report;
-        next.last_context_report_as_of = input.last_context_report_as_of ?? null;
+        next.last_context_report_at = input.last_context_report_at ?? undefined;
       }
       return next;
     }

@@ -1986,6 +1986,7 @@ describe("context breakdown requests", () => {
   const MESSAGE = "00000000-0000-7000-8000-00000000d003";
   const TURN = "00000000-0000-7000-8000-00000000d004";
   const QUEUED_AT = "2026-05-15T00:00:05Z";
+  const MEASURED_AT = "2026-05-15T00:00:06Z";
 
   const REPORT = {
     model: "claude-fable-5-1",
@@ -2046,6 +2047,7 @@ describe("context breakdown requests", () => {
       type: "context_report",
       agent_id: AGENT_A,
       report: REPORT,
+      at: MEASURED_AT,
     } as unknown as NormalizedEvent);
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_end",
@@ -2056,7 +2058,10 @@ describe("context breakdown requests", () => {
 
     expect(state.runtimes[AGENT_A]?.context_report_request?.phase).toBe("done");
     expect(state.runtimes[AGENT_A]?.last_context_report).toEqual(REPORT);
-    expect(state.runtimes[AGENT_A]?.last_context_report_as_of).toBeNull();
+    expect(
+      state.runtimes[AGENT_A]?.last_context_report_at,
+      "a live report carries when it was measured; nothing else will refresh it",
+    ).toBe(MEASURED_AT);
     expect(
       state.transcripts[AGENT_A],
       "a report is not conversation — it gets no row at any phase",
@@ -2163,6 +2168,7 @@ describe("context breakdown requests", () => {
       type: "context_report",
       agent_id: AGENT_A,
       report: REPORT,
+      at: MEASURED_AT,
     } as unknown as NormalizedEvent);
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_end",
@@ -2202,6 +2208,7 @@ describe("context breakdown requests", () => {
       type: "context_report",
       agent_id: AGENT_A,
       report: REPORT,
+      at: MEASURED_AT,
     } as unknown as NormalizedEvent);
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_end",
@@ -2283,6 +2290,65 @@ describe("context breakdown requests", () => {
       error: "claude does not support this operation",
     });
     expect(state.transcripts[AGENT_A]).toEqual([]);
+  });
+
+  it("recovers from a launch failure that beats its own receipt", async () => {
+    // The dead end this prevents: the failure carries no send id (nothing was
+    // journaled) and the receipt has not arrived, so with no other correlation
+    // the request sits at "queued" forever — and the panel's button, which is
+    // the only way to start another, stays disabled.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    let resolveIpc: (id: string) => void = () => {};
+    invokeMock.mockImplementation(
+      async () => await new Promise<string>((res) => (resolveIpc = res)),
+    );
+    const inFlight = state.dispatchContextReport(AGENT_A, SEND, PENDING, QUEUED_AT);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: MESSAGE,
+      send_id: null,
+      agent_id: AGENT_A,
+      error: "claude: command not found",
+    } as unknown as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, { type: "agent_idle", agent_id: AGENT_A });
+
+    expect(state.runtimes[AGENT_A]?.context_report_request).toMatchObject({
+      phase: "failed",
+      error: "claude: command not found",
+    });
+
+    resolveIpc(MESSAGE);
+    await inFlight;
+    // The late receipt stamps its id without reviving the request.
+    expect(state.runtimes[AGENT_A]?.context_report_request?.phase).toBe("failed");
+    expect(state.transcripts[AGENT_A]).toEqual([]);
+  });
+
+  it("leaves a concurrent send's pre-receipt failure alone", async () => {
+    // The entry-based correlation must not claim a concurrent *send*'s failure
+    // just because the report's receipt is still in flight.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    let resolveIpc: (id: string) => void = () => {};
+    invokeMock.mockImplementation(
+      async () => await new Promise<string>((res) => (resolveIpc = res)),
+    );
+    const inFlight = state.dispatchContextReport(AGENT_A, SEND, PENDING, QUEUED_AT);
+    state.dispatchUserTurn(AGENT_A, TURN_1, "go", [], "send-9", "2026-05-15T00:00:07Z");
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      send_id: "send-9",
+      agent_id: AGENT_A,
+      error: "the send failed",
+    } as unknown as NormalizedEvent);
+
+    expect(state.runtimes[AGENT_A]?.context_report_request?.phase).toBe("queued");
+    resolveIpc(MESSAGE);
+    await inFlight;
   });
 
   it("does not let an unrelated turn advance its request", async () => {

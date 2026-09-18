@@ -571,7 +571,7 @@ describe("project staleness refresh", () => {
             max_tokens: 1_000_000,
             raw: "## Context Usage",
           },
-          last_context_report_as_of: "2026-09-18T15:48:31Z",
+          last_context_report_at: "2026-09-18T15:48:31Z",
           warnings: [],
           load_error: null,
         },
@@ -580,7 +580,7 @@ describe("project staleness refresh", () => {
 
     expect(await ws.activateProject(PROJECT_1)).toBe("activated");
     await vi.waitFor(() =>
-      expect(state.runtimes[AGENT_1]?.last_context_report_as_of).toBe("2026-09-18T15:48:31Z"),
+      expect(state.runtimes[AGENT_1]?.last_context_report_at).toBe("2026-09-18T15:48:31Z"),
     );
     expect(state.runtimes[AGENT_1]?.last_context_report?.max_tokens).toBe(1_000_000);
   });

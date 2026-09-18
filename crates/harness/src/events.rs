@@ -515,6 +515,14 @@ pub enum AdapterEvent {
     ContextReport {
         agent_id: AgentId,
         report: crate::context_report::ContextReport,
+        /// When the measurement was taken.
+        ///
+        /// **Carried on every report, live ones included** — unlike a rate-limit
+        /// payload, which every turn refreshes, a breakdown is a measurement of
+        /// one instant that nothing updates. Each turn after it makes it more
+        /// wrong, in exactly the direction the panel exists to warn about, so a
+        /// report with no time attached is a number the user cannot interpret.
+        at: DateTime<Utc>,
     },
     /// A runtime-assigned session locator the adapter just learned (Codex's
     /// `thread_id`+date on first dispatch; Antigravity's conversation UUID on
@@ -657,6 +665,7 @@ pub enum NormalizedEvent {
     ContextReport {
         agent_id: AgentId,
         report: crate::context_report::ContextReport,
+        at: DateTime<Utc>,
     },
     /// A send **failed before any turn started**: either the journal write of
     /// the user's send failed (no durable record, no outcome marker), or the
@@ -757,6 +766,10 @@ impl AdapterEvent {
     /// returns `None`. (Replaces a total `From` impl, which couldn't honestly
     /// represent the no-wire-form case without a panicking arm.)
     #[must_use]
+    // Long because it is one exhaustive arm per event variant, which is the
+    // property that makes a new variant a compile error here rather than a
+    // silent drop. Splitting it would trade that for an arbitrary boundary.
+    #[allow(clippy::too_many_lines, reason = "one arm per event variant")]
     pub fn into_normalized(self) -> Option<NormalizedEvent> {
         Some(match self {
             AdapterEvent::ContentChunk {
@@ -866,9 +879,15 @@ impl AdapterEvent {
                 inventory,
                 raw,
             },
-            AdapterEvent::ContextReport { agent_id, report } => {
-                NormalizedEvent::ContextReport { agent_id, report }
-            }
+            AdapterEvent::ContextReport {
+                agent_id,
+                report,
+                at,
+            } => NormalizedEvent::ContextReport {
+                agent_id,
+                report,
+                at,
+            },
             // Internal adapter → dispatcher event; persisted to the registry,
             // never shown to the frontend.
             AdapterEvent::SessionLocatorCaptured { .. } => return None,

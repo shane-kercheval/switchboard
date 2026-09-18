@@ -2667,7 +2667,7 @@ describe("compact context action", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const bar = screen.getByTestId("agent-context-bar");
-    expect(bar).toHaveTextContent("Context used");
+    expect(bar).toHaveTextContent("Context");
     expect(bar).toHaveTextContent("20k / 200k");
     expect(bar).toHaveTextContent("10%");
   });

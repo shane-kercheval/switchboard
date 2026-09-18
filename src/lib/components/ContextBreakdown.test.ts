@@ -23,7 +23,7 @@ const REPORT: ContextReport = {
 
 type Overrides = {
   report?: ContextReport;
-  asOf?: string | null;
+  at?: string | null;
   request?: ContextReportRequest;
   onRefresh?: () => void;
 };
@@ -36,7 +36,7 @@ function mount(overrides: Overrides = {}): { onRefresh: ReturnType<typeof vi.fn>
       onClose: () => {},
       agentName: "alice",
       report: overrides.report,
-      asOf: overrides.asOf ?? null,
+      at: overrides.at ?? null,
       request: overrides.request,
       onRefresh: overrides.onRefresh ?? onRefresh,
     },
@@ -84,13 +84,18 @@ describe("ContextBreakdown", () => {
     );
   });
 
-  it("qualifies a report restored from disk with its age", () => {
-    mount({ report: REPORT, asOf: "2026-09-18T15:48:31Z" });
+  it("says when the breakdown was measured", () => {
+    // Every report gets this line, however fresh. A breakdown measures one
+    // instant and each turn after it grows the context it describes, so an
+    // unqualified one is a number the reader cannot place.
+    mount({ report: REPORT, at: "2026-09-18T15:48:31Z" });
     expect(screen.getByTestId("context-breakdown-as-of")).toBeInTheDocument();
   });
 
-  it("presents a live report without an age qualifier", () => {
-    mount({ report: REPORT, asOf: null });
+  it("shows no time for a report that arrived without one", () => {
+    // Only reachable from an older persisted shape; a missing time renders
+    // nothing rather than a fabricated "just now".
+    mount({ report: REPORT, at: null });
     expect(screen.queryByTestId("context-breakdown-as-of")).not.toBeInTheDocument();
   });
 
@@ -115,7 +120,7 @@ describe("ContextBreakdown", () => {
     // measurement still available.
     mount({
       report: REPORT,
-      asOf: "2026-09-18T15:48:31Z",
+      at: "2026-09-18T15:48:31Z",
       request: { send_id: "s", phase: "failed", error: "alice has no conversation yet" },
     });
 
@@ -137,6 +142,21 @@ describe("ContextBreakdown", () => {
     mount({ report: REPORT, request: { send_id: "s", phase: "done" } });
     expect(screen.queryByTestId("context-breakdown-request-note")).not.toBeInTheDocument();
     expect(screen.getByTestId("context-breakdown-refresh")).toHaveTextContent("Refresh");
+  });
+
+  it("reveals a memory file's full path through the app's tooltip, not the browser's", async () => {
+    mount({
+      report: {
+        ...REPORT,
+        memory_files: [{ name: "/Users/example/.claude/CLAUDE.md", detail: "User", tokens: 167 }],
+      },
+    });
+    await fireEvent.click(screen.getByTestId("context-breakdown-toggle-memory"));
+
+    const row = within(screen.getByTestId("context-breakdown-rows-memory")).getByText("CLAUDE.md");
+    expect(row).not.toHaveAttribute("title");
+    // The primitive marks its trigger; a native `title` would leave it bare.
+    expect(row).toHaveAttribute("data-tooltip-trigger");
   });
 
   it("asks for a new report when refreshed", async () => {

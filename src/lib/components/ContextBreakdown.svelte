@@ -10,9 +10,11 @@
   /// **Nothing here is fetched.** The panel renders whatever report the agent
   /// already has, and the Refresh button dispatches a new one. That keeps the
   /// panel honest about two states the alternative would blur: an agent that has
-  /// never been analyzed (empty state, not a spinner) and one whose report is
-  /// from a previous session (shown, with its age).
+  /// never been analyzed (empty state, not a spinner) and one measured a while
+  /// ago (shown, with its age).
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import Meter from "$lib/components/ui/Meter.svelte";
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import { breakdownView } from "$lib/contextBreakdown";
@@ -25,23 +27,18 @@
     onClose: () => void;
     agentName: string;
     report: ContextReport | undefined;
-    /// Capture time of a report restored from the session file (ISO-8601).
-    /// `null` once a live report replaces it. A breakdown is a measurement of
-    /// one moment, so a reopened project's is always old and says so.
-    asOf?: string | null;
+    /// When the report was measured (ISO-8601).
+    ///
+    /// **Always rendered when present, however fresh.** A breakdown measures one
+    /// instant and every turn after it grows the context it describes, so an
+    /// unqualified one is a number the reader cannot place — and "it looks
+    /// recent" is not something the panel can know.
+    at?: string | null;
     request?: ContextReportRequest;
     onRefresh: () => void;
   };
 
-  let {
-    open = $bindable(),
-    onClose,
-    agentName,
-    report,
-    asOf,
-    request,
-    onRefresh,
-  }: Props = $props();
+  let { open = $bindable(), onClose, agentName, report, at, request, onRefresh }: Props = $props();
 
   const view = $derived(breakdownView(report));
   /// One request at a time: while this is true the button is disabled, so a
@@ -68,7 +65,11 @@
   let openSections = $state<Record<string, boolean>>({});
   let rawOpen = $state(false);
 
-  function formatAsOf(iso: string): string {
+  /// Absolute, not relative. A relative string is computed once at render with
+  /// no timer behind it, so a panel left open would sit at "12 minutes ago"
+  /// indefinitely — stale text about staleness. Matches the agent card's
+  /// environment row.
+  function formatMeasuredAt(iso: string): string {
     return new Date(iso).toLocaleString(undefined, {
       month: "short",
       day: "numeric",
@@ -97,9 +98,9 @@
           />
         </div>
       {/if}
-      {#if asOf != null}
+      {#if at != null}
         <p class="text-muted text-[11px] italic" data-testid="context-breakdown-as-of">
-          as of {formatAsOf(asOf)}
+          as of {formatMeasuredAt(at)}
         </p>
       {/if}
 
@@ -160,7 +161,23 @@
                 {/if}
                 {#each group.rows as row, ri (ri)}
                   <div class="text-muted flex items-baseline gap-2 text-[11px]">
-                    <span class="min-w-0 truncate" title={row.title ?? undefined}>{row.name}</span>
+                    {#if row.title === null}
+                      <span class="min-w-0 truncate">{row.name}</span>
+                    {:else}
+                      <!-- The app's tooltip, never the browser's native `title`
+                           — same full-path-on-hover case the agent card's
+                           environment row handles, and `focusable={false}`
+                           because it only expands text already in the DOM. -->
+                      <Tooltip
+                        label={row.title}
+                        delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+                        focusable={false}
+                      >
+                        {#snippet trigger(props)}
+                          <span {...props} class="min-w-0 cursor-default truncate">{row.name}</span>
+                        {/snippet}
+                      </Tooltip>
+                    {/if}
                     {#if row.detail !== null}
                       <span class="shrink-0 opacity-70">{row.detail}</span>
                     {/if}

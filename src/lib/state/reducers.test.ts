@@ -2181,52 +2181,58 @@ describe("runtimeReducer", () => {
     expect(r.last_rate_limit_as_of).toBe("2026-05-27T18:42:11Z");
   });
 
-  it("hydrate fills last_context_report + its as_of when currently empty", () => {
+  it("hydrate fills last_context_report and the moment it was measured", () => {
     const r = runtimeReducer(fresh(), {
       type: "hydrate",
       agent_id: AGENT_A,
       turns: [],
       last_context_report: { raw: "## Context Usage", max_tokens: 200_000 },
-      last_context_report_as_of: "2026-09-18T15:48:31Z",
+      last_context_report_at: "2026-09-18T15:48:31Z",
     });
     expect(r.last_context_report).toEqual({ raw: "## Context Usage", max_tokens: 200_000 });
-    // A breakdown is a measurement of one moment, so the moment rides with it.
-    expect(r.last_context_report_as_of).toBe("2026-09-18T15:48:31Z");
+    expect(r.last_context_report_at).toBe("2026-09-18T15:48:31Z");
   });
 
-  it("a live context_report replaces a hydrated one and drops its as_of", () => {
+  it("a live context_report replaces a hydrated one and carries its own time", () => {
+    // Deliberately unlike `rate_limit_event`, which clears its qualifier on a
+    // live value. Nothing refreshes a breakdown, so a live one is "measured just
+    // now" rather than "current from now on" — dropping the time here is what
+    // would let it go stale unannounced.
     let r = runtimeReducer(fresh(), {
       type: "hydrate",
       agent_id: AGENT_A,
       turns: [],
       last_context_report: { raw: "old", max_tokens: 200_000 },
-      last_context_report_as_of: "2026-09-18T15:48:31Z",
+      last_context_report_at: "2026-09-18T15:48:31Z",
     });
     r = runtimeReducer(r, {
       type: "context_report",
       agent_id: AGENT_A,
       report: { raw: "new", max_tokens: 1_000_000 },
+      at: "2026-09-18T18:00:00Z",
     });
     expect(r.last_context_report).toEqual({ raw: "new", max_tokens: 1_000_000 });
-    expect(r.last_context_report_as_of).toBeNull();
+    expect(r.last_context_report_at).toBe("2026-09-18T18:00:00Z");
   });
 
-  it("hydrate after a live context_report leaves the live value and its null as_of", () => {
-    // Fill-if-empty: a slow project load must not re-age a fresh measurement.
+  it("hydrate after a live context_report leaves the live value and its own time", () => {
+    // Fill-if-empty: a slow project load must not replace a fresh measurement
+    // with an older one, nor re-date it.
     let r = runtimeReducer(fresh(), {
       type: "context_report",
       agent_id: AGENT_A,
       report: { raw: "live", max_tokens: 1_000_000 },
+      at: "2026-09-18T18:00:00Z",
     });
     r = runtimeReducer(r, {
       type: "hydrate",
       agent_id: AGENT_A,
       turns: [],
       last_context_report: { raw: "disk", max_tokens: 200_000 },
-      last_context_report_as_of: "2026-09-18T15:48:31Z",
+      last_context_report_at: "2026-09-18T15:48:31Z",
     });
     expect(r.last_context_report).toEqual({ raw: "live", max_tokens: 1_000_000 });
-    expect(r.last_context_report_as_of).toBeNull();
+    expect(r.last_context_report_at).toBe("2026-09-18T18:00:00Z");
   });
 
   it("live rate_limit_event after a stale hydrate clears as_of to null (stale → live)", () => {

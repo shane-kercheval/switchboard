@@ -789,6 +789,18 @@ counter", "weekly `overageResetsAt`", or the §0 claim that `/context` emits no 
   net cover its absence, and the live test is the tripwire.
 - Each report writes three records into the agent's session file; the CLI's own TUI shows them on
   resume. Same trade compaction makes.
+- **Only Switchboard-dispatched reports are captured; a `/context` run in the resumed terminal is
+  not.** The routing sits behind the existing `entrypoint == "sdk-cli"` gate, and a probe of the
+  interactive TUI (claude 2.1.274) shows why moving it would make things worse rather than better.
+  The terminal *does* write a `commandRun: {"command": "context"}` record — so the gate, not the
+  key, is what excludes it — but that record's content is the terminal's own coloured rendering
+  (ANSI escapes and box-drawing glyphs), not the markdown table, and it carries **no `contextUsage`
+  object at all**. Decoding it would produce `unparsed` plus a panel full of escape codes. The
+  readable markdown exists on a *separate* record — `user`, `isMeta: true`, child of the command
+  record by `parentUuid` — which `is_meta_continuation` currently skips cleanly (verified: it does
+  not leak into the preceding agent turn). Capturing it would therefore need cross-record pairing,
+  which is exactly what keying on the self-describing record was chosen to avoid, plus a carve-out
+  in that guard, for a report that could only ever be the rounded markdown one.
 - Memory *files* are named only by the report; `init` gives the memory directory.
 - Codex: no runtime tool or MCP status exists in the stream or rollout; MCP rows show configured
   names only, and pre-first-turn skills come from an incomplete scanner labelled as configured. The

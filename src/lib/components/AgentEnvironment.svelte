@@ -78,19 +78,28 @@
           </p>
         {/if}
 
+        <!-- The harness-supplied lists below are keyed by index, never by
+             name. They are replaced wholesale on every event and hold no
+             per-row state, so a name key buys no reconciliation — and it
+             imposes a uniqueness the sources cannot honor: a recorded Claude
+             `init` lists `deep-research` twice, and a user copying a bundled
+             skill to customize it is the ordinary way two entries share a
+             name. Svelte throws on a duplicate key in production as well as
+             dev, with no error boundary here to catch it. -->
         {#if view.servers !== null}
           <div data-testid="agent-env-mcp">
             <p class={SECTION_LABEL}>MCP servers</p>
-            {#each view.servers as server (server.name)}
+            {#each view.servers as server, i (i)}
               <div class={ROW}>
                 {#if server.tone !== undefined}
                   <!-- The dot is the sole signal only when the status is
-                       plain `connected`; otherwise the raw status renders
-                       beside it, so an unknown value is named, not just
-                       coloured. -->
+                       plain `connected`, and then its accessible name is that
+                       status — the sibling text carries the server's name,
+                       not its health. Otherwise the raw status renders beside
+                       it as visible text and the dot is decorative. -->
                   <StatusDot
                     status={server.tone}
-                    label={server.statusLabel === undefined ? server.name : undefined}
+                    label={server.statusLabel === undefined ? server.status : undefined}
                     class="translate-y-[-1px]"
                     testid="agent-env-mcp-dot"
                   />
@@ -117,7 +126,7 @@
         {#if view.plugins !== null}
           <div data-testid="agent-env-plugins">
             <p class={SECTION_LABEL}>Plugins</p>
-            {#each view.plugins as plugin (plugin.name)}
+            {#each view.plugins as plugin, i (i)}
               <p class="text-muted text-[11px]">
                 {plugin.name}{plugin.version === undefined ? "" : ` @ ${plugin.version}`}
               </p>
@@ -128,7 +137,7 @@
         {#if view.memory !== null}
           <div data-testid="agent-env-memory">
             <p class={SECTION_LABEL}>Memory</p>
-            {#each view.memory as entry (entry.path)}
+            {#each view.memory as entry, i (i)}
               <!-- The basename alone is ambiguous across scopes, so the full
                    path is on hover rather than wrapped onto the card. -->
               <Tooltip
@@ -162,7 +171,7 @@
               <ExpandCollapseIcon expanded={open} size={11} strokeWidth={1.8} class="ml-auto" />
             </button>
             {#if open}
-              {#each view.skills as skill (skill.name)}
+              {#each view.skills as skill, i (i)}
                 <div class="text-muted text-[11px]">
                   <span>{skill.name}</span>
                   {#if skill.description !== undefined}

@@ -1134,12 +1134,13 @@ export async function hydrateProject(
         }
         continue;
       }
-      applyAgentHydrate(agentId, {
-        turns: turnsByAgent.get(agentId) ?? [],
-        meta: meta?.meta ?? null,
-        last_rate_limit: meta?.last_rate_limit ?? null,
-        last_rate_limit_as_of: meta?.last_rate_limit_as_of ?? null,
-      });
+      // Spread rather than a hand-listed mapping: this call site dropped the
+      // inventory's capture time by omitting it from such a list, and a list
+      // here would have to be updated for every field the backend adds. The
+      // extra `AgentConversationMeta` keys (`agent_id`, `warnings`,
+      // `load_error`) ride along inert — the builder reads only the fields it
+      // declares, and supplies the authoritative agent id itself.
+      applyAgentHydrate(agentId, { turns: turnsByAgent.get(agentId) ?? [], ...meta });
     }
 
     conversations[projectId] = { items: overlay, status: "complete" };

@@ -549,6 +549,40 @@ describe("project staleness refresh", () => {
     return turns.map((t) => (t.role === "agent" ? t.hydration_key : undefined)).filter(Boolean);
   }
 
+  it("carries each agent's inventory capture time through project hydration", async () => {
+    // The project-scoped path enumerates the per-agent meta fields by hand
+    // when it feeds `applyAgentHydrate`, so a field the backend adds reaches
+    // the runtime only if it is named there too. Same seam, other caller.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend([agent(AGENT_1, PROJECT_1)]);
+    conversation = {
+      items: [],
+      agents: [
+        {
+          agent_id: AGENT_1,
+          meta: {
+            model: "claude-fable-5-1",
+            harness_version: "",
+            inventory: { mcp_servers: [{ name: "gmail", status: "needs-auth" }] },
+          },
+          last_rate_limit: null,
+          meta_as_of: "2026-09-17T12:00:00Z",
+          warnings: [],
+          load_error: null,
+        },
+      ],
+    };
+
+    expect(await ws.activateProject(PROJECT_1)).toBe("activated");
+    await vi.waitFor(() =>
+      expect(state.runtimes[AGENT_1]?.meta_as_of).toBe("2026-09-17T12:00:00Z"),
+    );
+    expect(state.runtimes[AGENT_1]?.meta?.inventory.mcp_servers).toEqual([
+      { name: "gmail", status: "needs-auth" },
+    ]);
+  });
+
   it("re-reads on reactivation when a refresh-capable file advanced; the new turn appears exactly once", async () => {
     const ws = await loadWorkspaceState();
     const state = await loadAgentState();

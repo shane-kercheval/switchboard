@@ -1249,6 +1249,82 @@ describe("hydrateAgent", () => {
     expect(state.transcripts[AGENT_A]).toHaveLength(1);
   });
 
+  it("carries the inventory's capture time from the IPC reply to the runtime", async () => {
+    // The seam the reducer tests cannot see: the backend stamps `meta_as_of`
+    // when the inventory came from the metadata sidecar, and the card renders
+    // it as "as of <time>". A hydrate that rebuilt its event from a fixed
+    // list of fields once dropped it here — every layer tested green while
+    // the card presented a days-old snapshot as live.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+
+    invokeMock.mockResolvedValueOnce({
+      turns: [],
+      meta: {
+        model: "claude-fable-5-1",
+        harness_version: "",
+        inventory: { mcp_servers: [{ name: "gmail", status: "needs-auth" }] },
+      },
+      last_rate_limit: null,
+      meta_as_of: "2026-09-17T12:00:00Z",
+      warnings: [],
+    });
+
+    await state.hydrateAgent(AGENT_A);
+    expect(state.runtimes[AGENT_A]?.meta?.inventory.mcp_servers).toEqual([
+      { name: "gmail", status: "needs-auth" },
+    ]);
+    expect(state.runtimes[AGENT_A]?.meta_as_of).toBe("2026-09-17T12:00:00Z");
+  });
+
+  it("a live inventory that lands before hydration resolves never inherits the snapshot's age", async () => {
+    // Ordering race: the reducer fills meta only where absent, so a live
+    // `session_meta` that arrives first must win and the disk snapshot's
+    // capture time must not be stamped onto it — an "as of" on a live
+    // inventory would age it past the staleness threshold.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+
+    let resolveLoad: (v: unknown) => void = () => {};
+    invokeMock.mockImplementationOnce(
+      () =>
+        new Promise((r) => {
+          resolveLoad = r;
+        }),
+    );
+    const hydrating = state.hydrateAgent(AGENT_A);
+    await vi.waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("load_transcript", { agentId: AGENT_A }),
+    );
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "claude-fable-5-1",
+      harness_version: "2.1.274",
+      inventory: { mcp_servers: [{ name: "gmail", status: "connected" }] },
+      raw: {},
+    });
+
+    resolveLoad({
+      turns: [],
+      meta: {
+        model: "claude-fable-5-1",
+        harness_version: "",
+        inventory: { mcp_servers: [{ name: "gmail", status: "needs-auth" }] },
+      },
+      last_rate_limit: null,
+      meta_as_of: "2026-09-17T12:00:00Z",
+      warnings: [],
+    });
+    await hydrating;
+
+    expect(state.runtimes[AGENT_A]?.meta?.inventory.mcp_servers).toEqual([
+      { name: "gmail", status: "connected" },
+    ]);
+    expect(state.runtimes[AGENT_A]?.meta_as_of).toBeNull();
+  });
+
   it("flips to failed and retains the error text on IPC rejection", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));

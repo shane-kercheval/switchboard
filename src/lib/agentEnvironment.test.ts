@@ -32,16 +32,43 @@ describe("environmentView summary", () => {
     ).toBe("MCP 2 · Agents 2 · Plugins 1 · Skills 1 · Memory 1");
   });
 
-  it("calls out how many servers need attention", () => {
+  it("calls out how many servers need auth", () => {
     expect(
       view({
         mcp_servers: [
           { name: "a", status: "connected" },
           { name: "b", status: "needs-auth" },
-          { name: "c", status: "some-future-status" },
+          { name: "c", status: "needs-auth" },
         ],
       }).summary,
     ).toBe("MCP 3 · 2 need auth");
+  });
+
+  it("does not call a status it cannot diagnose an auth problem", () => {
+    // The status set is open. A server reporting `disconnected`, or anything
+    // a future CLI adds, must not be counted under an instruction that will
+    // not fix it — and no status name is invented for it either; the
+    // expanded row names the raw value.
+    expect(
+      view({
+        mcp_servers: [
+          { name: "a", status: "connected" },
+          { name: "b", status: "disconnected" },
+          { name: "c", status: "some-future-status" },
+        ],
+      }).summary,
+    ).toBe("MCP 3 · 2 need attention");
+  });
+
+  it("reports both kinds of trouble as separate counts", () => {
+    expect(
+      view({
+        mcp_servers: [
+          { name: "a", status: "needs-auth" },
+          { name: "b", status: "disconnected" },
+        ],
+      }).summary,
+    ).toBe("MCP 2 · 1 need auth · 1 need attention");
   });
 
   it("omits the needs-attention clause when every server is connected", () => {
@@ -99,6 +126,9 @@ describe("environmentView sections", () => {
     const server = view({ mcp_servers: [{ name: "a", status: "connected" }] }).servers?.[0];
     expect(server?.tone).toBe("idle");
     expect(server?.statusLabel).toBeUndefined();
+    // The raw status still rides along: it is the dot's accessible name in
+    // this one case where the dot is the sole status signal.
+    expect(server?.status).toBe("connected");
   });
 
   it("gives an unknown status the warning dot and names it", () => {

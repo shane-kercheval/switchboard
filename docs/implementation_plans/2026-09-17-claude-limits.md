@@ -322,7 +322,12 @@ for the user (telemetry flags, internal capability strings).
     the source enum, citing `RateLimitSource`.)*
 14. **The two chips become an "Environment" disclosure row on the card.** Collapsed: a line of
     counts with the only status that matters called out — "MCP 7 · 2 need auth · Agents 6 · Plugins
-    1 · Skills 30 · Memory 1". **That line wraps; "one line" was written before it was measured.**
+    1 · Skills 30 · Memory 1". The callout is two counts, not one: "N need auth" for the
+    `needs-auth` status actually observed, and "N need attention" for any other non-connected
+    status, each shown only when non-zero. A single "need auth" count folded `disconnected` and
+    every future status under an instruction that would not fix them; a single generic label threw
+    away the actionable copy for the one status we have seen. No status *name* is invented for the
+    unobserved ones (the reasoning decision 4 applies to unknown window keys). **That line wraps; "one line" was written before it was measured.**
     A busy account's summary needs ~367px against the ~224px a default-width (240px) card gives it —
     127px clipped, measured in WebKit — and truncating dropped the Skills and Memory counts off the
     card entirely, which is precisely what this decision's governing rule forbids. Two lines of 11px
@@ -802,6 +807,11 @@ counter", "weekly `overageResetsAt`", or the §0 claim that `/context` emits no 
   inert.** Their only consumer was Codex's first-turn `SessionMeta` gate, which this milestone
   removed. They are documented as inert rather than deleted: the removal touches the app layer's
   attach flow and a documented lock ordering, which is its own change and carries its own risk.
+- **The Environment row's lists are keyed by index, never by name.** A recorded Claude `init`
+  (`tool-vocabulary.jsonl`) lists `deep-research` twice among 21 skills, and Svelte throws on a
+  duplicate `{#each}` key in production as well as dev, with no error boundary in the app to catch
+  it. The rows are replaced wholesale on every event and carry no per-item state, so a name key
+  bought nothing; duplicates are preserved rather than merged so the count matches what the harness said.
 - **An absent `init` key yields `None`, not the "empty defaults" this milestone's Definition of Done
   first said.** The two readings differ only for a list that has a config-file fallback, and there
   `None` is clearly right: an older CLI that never emitted `mcp_servers` must fall back to the

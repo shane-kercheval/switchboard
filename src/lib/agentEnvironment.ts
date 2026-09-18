@@ -29,6 +29,9 @@ export type ServerTone = "idle" | "warning";
 
 export type EnvironmentServer = {
   name: string;
+  /// The harness's own status string, verbatim. The connected dot's
+  /// accessible name — the one case where the dot is the sole status signal.
+  status: string;
   /// Which config scope registered it, when the harness says.
   source?: string;
   /// `undefined` draws **no dot**: the entry came from a config file, and
@@ -39,6 +42,12 @@ export type EnvironmentServer = {
   tone?: ServerTone;
   /// Shown beside the dot when the status is not plain `connected`, so an
   /// unknown value is named rather than merely coloured.
+  ///
+  /// Equivalent to `status` whenever `tone` is `warning` today, and kept as
+  /// its own field rather than derived from the tone deliberately: whether a
+  /// status is worth *naming* is not the same question as which colour it
+  /// gets. Deriving text visibility from the tone would silently stop naming
+  /// any status a future third tone covered.
   statusLabel?: string;
 };
 
@@ -87,6 +96,7 @@ function serverTone(status: string): ServerTone | undefined {
 function toServer(server: McpServerStatus): EnvironmentServer {
   return {
     name: server.name,
+    status: server.status,
     source: server.source,
     tone: serverTone(server.status),
     statusLabel:
@@ -96,12 +106,34 @@ function toServer(server: McpServerStatus): EnvironmentServer {
   };
 }
 
-/// How many servers are in a state the user has to act on. Called out in the
-/// collapsed line because it is the one thing about the list that cannot wait
-/// for the user to expand it — a card reading "MCP 7" while two of them are
-/// unusable is the failure this row exists to prevent.
-function needsAttentionCount(servers: readonly McpServerStatus[]): number {
-  return servers.filter((s) => serverTone(s.status) === "warning").length;
+/// The one non-healthy status observed so far, and the only one whose cause
+/// the collapsed line may name.
+const NEEDS_AUTH_STATUS = "needs-auth";
+
+/// How many servers are in a state the user has to act on, split by whether
+/// the cause is known. Called out in the collapsed line because it is the one
+/// thing about the list that cannot wait for the user to expand it — a card
+/// reading "MCP 7" while two of them are unusable is the failure this row
+/// exists to prevent.
+///
+/// Two counts rather than one: "need auth" is actionable copy for the status
+/// we have actually seen, and any other warning status is reported as
+/// needing attention rather than being folded under an auth instruction that
+/// will not fix it. No status *name* is invented for the unobserved ones —
+/// the same reasoning that drops unknown usage-window keys rather than
+/// labelling them — and the expanded row names each raw status regardless.
+function attentionCounts(servers: readonly McpServerStatus[]): {
+  needsAuth: number;
+  other: number;
+} {
+  let needsAuth = 0;
+  let other = 0;
+  for (const server of servers) {
+    if (serverTone(server.status) !== "warning") continue;
+    if (server.status === NEEDS_AUTH_STATUS) needsAuth += 1;
+    else other += 1;
+  }
+  return { needsAuth, other };
 }
 
 function summaryOf(inventory: SessionInventory): string {
@@ -109,11 +141,9 @@ function summaryOf(inventory: SessionInventory): string {
   const servers = present(inventory.mcp_servers);
   if (servers !== null) {
     parts.push(`MCP ${servers.length}`);
-    const attention = needsAttentionCount(servers);
-    // Phrased as a count rather than a status name because the statuses are
-    // not a closed set; "need auth" is what the observed one means and reads
-    // as an instruction.
-    if (attention > 0) parts.push(`${attention} need auth`);
+    const { needsAuth, other } = attentionCounts(servers);
+    if (needsAuth > 0) parts.push(`${needsAuth} need auth`);
+    if (other > 0) parts.push(`${other} need attention`);
   }
   // Tools, commands and the allowlist are deliberately absent: they run to
   // three digits, would dominate the line, and are one click away.

@@ -353,20 +353,29 @@ export async function retryAgentHydration(agentId: AgentId): Promise<void> {
 /// hydration guard) — this helper only applies.
 export function applyAgentHydrate(
   agentId: AgentId,
-  loaded: {
-    turns: Hydrate["turns"];
-    meta?: Hydrate["meta"];
-    last_rate_limit?: Hydrate["last_rate_limit"];
-    last_rate_limit_as_of?: Hydrate["last_rate_limit_as_of"];
-  },
+  /// Exactly the reducer event's own fields, minus the two this function
+  /// supplies. Derived from `Hydrate` rather than hand-listed so there is one
+  /// type to keep in sync instead of two: a field added to the wire event is
+  /// readable here without editing this signature.
+  loaded: Omit<Hydrate, "type" | "agent_id">,
 ): void {
-  const hydrate: Hydrate = {
+  /// `Required<Hydrate>` rather than `Hydrate`: every optional wire field must
+  /// be named below or this stops compiling. The inventory's capture time was
+  /// once dropped exactly here — computed by the backend, read by the reducer,
+  /// and lost in this rebuild — and because the field is optional on the wire
+  /// type, omitting it type-checked. Note `Pick` would not help; it preserves
+  /// optionality. This catches only *construction* completeness: a field the
+  /// backend never sends, or one hardcoded to `null`, still compiles, which is
+  /// why the seam tests in `index.test.ts` drive each field through the mocked
+  /// IPC reply rather than into the reducer directly.
+  const hydrate: Required<Hydrate> = {
     type: "hydrate",
     agent_id: agentId,
     turns: loaded.turns,
     meta: loaded.meta ?? null,
     last_rate_limit: loaded.last_rate_limit ?? null,
     last_rate_limit_as_of: loaded.last_rate_limit_as_of ?? null,
+    meta_as_of: loaded.meta_as_of ?? null,
   };
   const priorTurns = transcripts[agentId] ?? [];
   // Pass the in-flight turn_id so a refresh re-read can't supersede an

@@ -60,6 +60,29 @@ test("the collapsed counts line reports its overflow at the card's widths", asyn
   expect(row.scrollWidth - row.clientWidth).toBeLessThanOrEqual(1);
 });
 
+test("a summary carrying both kinds of trouble still does not clip", async () => {
+  // Both status segments can legitimately appear together, and "one is
+  // nearly always zero" is not a layout argument — it is the kind of unmeasured
+  // assumption this file exists to replace.
+  render(AgentEnvironmentHost, {
+    props: {
+      width: DEFAULT_WIDTH,
+      inventory: {
+        ...BUSY,
+        mcp_servers: [...BUSY.mcp_servers!, { name: "h", status: "disconnected" }],
+      },
+    },
+  });
+
+  await expect.element(page.getByTestId("agent-env-summary")).toBeInTheDocument();
+  expect((page.getByTestId("agent-env-summary").element() as HTMLElement).textContent).toBe(
+    "MCP 8 · 2 need auth · 1 need attention · Agents 6 · Plugins 1 · Skills 30 · Memory 1",
+  );
+  expect(overflow("agent-env-summary")).toBe(0);
+  const row = page.getByTestId("agent-env-toggle").element() as HTMLElement;
+  expect(row.scrollWidth - row.clientWidth).toBeLessThanOrEqual(1);
+});
+
 test("a typical summary fits the default card width", async () => {
   // The common case is not the busy one: an agent with a couple of servers
   // and no plugins reads fully without expanding.

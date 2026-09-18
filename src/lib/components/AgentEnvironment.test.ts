@@ -73,6 +73,73 @@ describe("AgentEnvironment", () => {
     );
   });
 
+  it("names the connected dot by its status, not the server beside it", async () => {
+    // The sibling text already says "tiddly"; the dot is the sole signal for
+    // health, so its accessible name must be the health.
+    render(AgentEnvironment, {
+      props: { inventory: { mcp_servers: [{ name: "tiddly", status: "connected" }] } },
+    });
+    await expand();
+
+    const dot = screen.getByTestId("agent-env-mcp-dot");
+    expect(dot).toHaveAttribute("aria-label", "connected");
+    expect(dot).not.toHaveAttribute("aria-label", "tiddly");
+  });
+
+  it("keeps the warning dot decorative beside its visible status", async () => {
+    render(AgentEnvironment, {
+      props: { inventory: { mcp_servers: [{ name: "gmail", status: "needs-auth" }] } },
+    });
+    await expand();
+
+    const dot = screen.getByTestId("agent-env-mcp-dot");
+    expect(dot).toHaveAttribute("aria-hidden", "true");
+    expect(screen.getByTestId("agent-env-mcp")).toHaveTextContent("needs-auth");
+  });
+
+  it("renders every entry when a harness reports two with the same name", async () => {
+    // A recorded Claude `init` lists `deep-research` twice; copying a bundled
+    // skill to customize it is the ordinary way that happens. A keyed list
+    // threw on this in production. Duplicates are preserved, not merged: the
+    // count must match what the harness reported, and two same-named skills
+    // from different roots are two skills.
+    render(AgentEnvironment, {
+      props: {
+        inventory: {
+          mcp_servers: [
+            { name: "tiddly", status: "connected" },
+            { name: "tiddly", status: "needs-auth" },
+          ],
+          plugins: [
+            { name: "kit", version: "1" },
+            { name: "kit", version: "2" },
+          ],
+          memory_paths: ["/same", "/same"],
+          skills: [
+            { name: "deep-research", description: "bundled" },
+            { name: "deep-research", description: "customized" },
+          ],
+        },
+      },
+    });
+    await expand();
+
+    // Servers: both rows survive with their own status, not one row twice.
+    const dots = screen.getAllByTestId("agent-env-mcp-dot");
+    expect(dots).toHaveLength(2);
+    expect(dots[0]).toHaveClass("bg-status-idle");
+    expect(dots[1]).toHaveClass("bg-warning");
+    expect(screen.getByTestId("agent-env-plugins")).toHaveTextContent("kit @ 1");
+    expect(screen.getByTestId("agent-env-plugins")).toHaveTextContent("kit @ 2");
+    expect(screen.getAllByTestId("agent-env-memory-entry")).toHaveLength(2);
+
+    await fireEvent.click(screen.getByTestId("agent-env-skills-toggle"));
+    const skills = screen.getByTestId("agent-env-skills");
+    expect(skills).toHaveTextContent("Skills · 2");
+    expect(skills).toHaveTextContent("deep-research — bundled");
+    expect(skills).toHaveTextContent("deep-research — customized");
+  });
+
   it("shows a needs-auth server as a warning naming its status", async () => {
     render(AgentEnvironment, { props: { inventory: CLAUDE } });
     await expand();

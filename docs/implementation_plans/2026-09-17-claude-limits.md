@@ -242,9 +242,9 @@ Settled here; the rationale must survive into code comments where marked.
    overwrites both fields. *(Comment on the reducer arm and the fallback label.)*
 6. **The CLI's threshold warning becomes the meter's warning tone.** `status: "allowed_warning"`
    names the window in `rateLimitType` and the threshold in `surpassedThreshold`; that meter fills
-   with the `warning` token and its tooltip gains "above N% of this limit". The second event of a
-   turn carries the superset, so last-write-wins is correct. `status: "rejected"` stays the failure
-   path (harness-behavior §1.4).
+   with the `warning` token. The tooltip does not repeat the harness's internal cutoff. The second
+   event of a turn carries the superset, so last-write-wins is correct. `status: "rejected"` stays
+   the failure path (harness-behavior §1.4).
 7. **The overage escalation and the snapshot-age line are unchanged.** "⚡ using credits" is about
    what is being billed, not how full a window is; it stays beneath the meters. The rehydrated
    "snapshot from …" line stays: Claude's payload is stream-only, and a days-old weekly percentage is
@@ -500,8 +500,8 @@ the same way.
 - Claude: "5-hour limit", "Weekly · all models", and — after a turn on a per-model-capped model —
   "Weekly · <that model>", each a meter with "Resets in …" and the used percentage.
 - A window the CLI flags as past its warning threshold fills amber.
-- Hover shows each window's full reset date and time, the threshold line when flagged, the overage
-  window when billing to credits, and after a restart the "snapshot from …" line.
+- Hover shows each window's full reset date and time, the overage window when billing to credits,
+  and after a restart the "snapshot from …" line.
 - A window whose reset has passed disappears; the others stay. "⚡ using credits" still appears
   beneath the meters when overaging.
 - An older or changed CLI that sends no `unifiedWindows` shows a single meter for the top-level
@@ -524,8 +524,8 @@ or `resetsAt` not a number → skip; reset-passed → skip. Warning tone from th
 `codexRateLimitView` keeps its logic and adopts the shared labels.
 
 **Rendering.** Both cells render their list through the primitive, then (Claude) the amber overage
-line, then the tooltip content as today plus the threshold line. A shared snippet for the two
-near-identical cells is at the implementer's discretion.
+line, then the tooltip content. A shared snippet for the two near-identical cells is at the
+implementer's discretion.
 
 **Live drift guard.** `live_claude_rate_limit_carries_unified_windows`, one "ack" turn:
 `unifiedWindows.five_hour` and `.seven_day` each with number `utilization` in `[0, 1]` and number
@@ -536,7 +536,7 @@ near-identical cells is at the implementer's discretion.
 `Sidebar.test.ts`: two windows → two meters, fraction → percent (`0.27` → "27%"), reset text present;
 three windows with `meta.model` seeded → third meter "Weekly · <model>", generic label for a legacy
 snapshot hydrated without a model; `allowed_warning` on `seven_day_overage_included` → that meter warning
-tone + tooltip threshold line, others neutral; reset-passed on `five_hour` → only the weekly meter;
+tone, no tooltip threshold line, others neutral; reset-passed on `five_hour` → only the weekly meter;
 overage → amber line beneath the meters + tooltip window; no `unifiedWindows` → one meter, no
 percentage (the existing Claude tests are this coverage — retitle any whose name reads as the primary
 path); unknown key `seven_day_cowork` beside the known two → exactly two meters; malformed

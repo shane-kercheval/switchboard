@@ -1998,7 +1998,7 @@ describe("Sidebar Claude rate-limit tooltip", () => {
     expect(detail).toHaveTextContent(/Weekly · all models\s+27% used\s+Resets/);
   });
 
-  it("names the threshold the harness flagged, on that window's line only", async () => {
+  it("does not expose the harness's internal warning threshold in the tooltip", async () => {
     await renderClaudeWithRateLimit(
       {
         status: "allowed_warning",
@@ -2013,12 +2013,9 @@ describe("Sidebar Claude rate-limit tooltip", () => {
     await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
     await vi.advanceTimersByTimeAsync(500);
     const detail = await waitFor(() => screen.getByTestId("agent-rate-detail"));
-    // Per line, not over the whole tooltip: `textContent` concatenates the
-    // paragraphs, so a cross-line regex would match a threshold clause that
-    // belongs to the *other* window.
     expect(within(detail).getByText("Weekly · all models")).toBeInTheDocument();
-    expect(within(detail).getByText("Warning threshold")).toBeInTheDocument();
-    expect(within(detail).getByText("75%")).toBeInTheDocument();
+    expect(within(detail).queryByText("Warning threshold")).toBeNull();
+    expect(within(detail).queryByText("75%")).toBeNull();
     expect(within(detail).getAllByText("Resets")).toHaveLength(2);
   });
 

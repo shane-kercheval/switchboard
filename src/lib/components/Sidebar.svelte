@@ -850,9 +850,9 @@
   {/each}
 {/snippet}
 
-<!-- Tooltip rows for the same windows: the percentage spelled out, the full
-     reset date the inline countdown compresses, and the harness's own threshold
-     line when it flagged one. -->
+<!-- Tooltip rows for the same windows: the percentage spelled out and the full
+     reset date the inline countdown compresses. The meter's amber tone carries
+     the harness's threshold warning without repeating its internal cutoff. -->
 {#snippet usageWindowDetail(windows: UsageWindow[])}
   <div class="min-w-64 space-y-2.5">
     {#each windows as w (w.key)}
@@ -866,12 +866,6 @@
           <div class="text-primary-fg/70 grid grid-cols-[auto_1fr] gap-4 text-[12px]">
             <span>Resets</span>
             <span class="text-right tabular-nums">{formatResetDateTime(w.resetsAtMs)}</span>
-          </div>
-        {/if}
-        {#if w.surpassedThreshold !== undefined}
-          <div class="text-warning grid grid-cols-[auto_1fr] gap-4 text-[12px]">
-            <span>Warning threshold</span>
-            <span class="text-right tabular-nums">{formatUsedPercent(w.surpassedThreshold)}</span>
           </div>
         {/if}
       </section>
@@ -1609,7 +1603,7 @@
                    about billing, layered beneath the meters only when spending
                    credits. One always-present tooltip carries full reset dates
                    (a weekly window is days out, beyond the inline countdown),
-                   the threshold line, and the snapshot age when rehydrated.
+                   and the snapshot age when rehydrated.
                    Stream-only, so it survives restart via the metadata
                    sidecar. -->
               <div class="text-muted mt-2 text-[10px] font-medium tracking-wide uppercase">

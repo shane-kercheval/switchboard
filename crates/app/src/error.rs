@@ -246,6 +246,32 @@ pub enum AppError {
     #[error("{name} hasn't branched from its source yet — send it a message first, then compact")]
     CompactionForkNotMaterialized { name: String },
 
+    /// Context breakdown: Switchboard cannot ask this harness what is in its
+    /// context window. Same "statement about Switchboard's support" framing as
+    /// [`Self::CompactionUnsupported`], and the same defense-in-depth role — the
+    /// frontend shows no chevron and no menu item for these harnesses, so
+    /// reaching this means a caller bypassed the capability predicate.
+    #[error(
+        "Switchboard cannot read {harness}'s context breakdown          — it has no way to ask this harness what is in its context window"
+    )]
+    ContextReportUnsupported { harness: HarnessKind },
+
+    /// Context breakdown: the agent has no session file, so there is no context
+    /// to measure. Same wording rationale as
+    /// [`Self::CompactionSourceHasNoSession`].
+    #[error("{name} has no conversation to analyze yet — send it a message first")]
+    ContextReportSourceHasNoSession { name: String },
+
+    /// Context breakdown: the agent carries fork provenance but has no session
+    /// of its own, so the next ordinary send is the dispatch that will copy its
+    /// parent's session. A report must not be that dispatch — it would create
+    /// the branch as a side effect of a *read*. Same residue-of-a-failed-fork
+    /// state as [`Self::CompactionForkNotMaterialized`].
+    #[error(
+        "{name} hasn't branched from its source yet          — send it a message first, then analyze its context"
+    )]
+    ContextReportForkNotMaterialized { name: String },
+
     /// Fork: the source agent has a turn in flight, so the copy the branch takes
     /// would be of a session file still being written. For a send that means the
     /// branch inherits a synthesized "No response requested." placeholder instead

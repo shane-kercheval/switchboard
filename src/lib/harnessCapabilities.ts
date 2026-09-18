@@ -18,3 +18,16 @@ import type { HarnessKind } from "$lib/types";
 export function supportsManualCompaction(harness: HarnessKind | undefined): boolean {
   return harness === "claude_code";
 }
+
+/// Whether Switchboard can ask this harness for a **context breakdown** — what
+/// is occupying the agent's context window.
+///
+/// Claude Code only, and for the same reason as compaction rather than a
+/// coincidentally identical one: Claude's CLI intercepts `/context` locally and
+/// answers with a structured measurement, while the other two have no such
+/// interception, so the command reaches the model as an ordinary message and is
+/// answered with an invented breakdown. Every figure in that answer looks like a
+/// measurement, which makes it worse than no panel at all.
+export function supportsContextReport(harness: HarnessKind | undefined): boolean {
+  return harness === "claude_code";
+}

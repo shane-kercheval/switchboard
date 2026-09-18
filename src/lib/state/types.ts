@@ -15,6 +15,7 @@ import type {
   AgentId,
   Attachment,
   ContentKind,
+  ContextReport,
   FailureKind,
   MessageId,
   ParseWarning,
@@ -227,8 +228,33 @@ export type PendingSend = {
   /// Travels with `queued_at`: a compaction has no user turn to take a timestamp
   /// from, so the queued row needs its own to sit in the right place in the
   /// timeline. Both are absent for a send.
-  kind?: "compaction";
+  ///
+  /// `"context_report"` marks a queued context breakdown, which is in this list
+  /// for the same correlation reason but renders **nothing** — not queued, not
+  /// running, not on reload. A report is not conversation, so the unified view
+  /// skips it entirely rather than showing a row (see `pendingKind`).
+  kind?: "compaction" | "context_report";
   queued_at?: string;
+};
+
+/// One in-flight or finished context-report request.
+///
+/// A report has **no transcript row**, so it has no place for a failure to show
+/// — a failed compaction is visible because its row is; the sidebar deliberately
+/// renders no `last_error`. This record is where a report's outcome lives
+/// instead, and the panel renders it beside the previous report.
+///
+/// **Cleared only by the next report dispatch, never by an ordinary send.** If a
+/// send cleared it, a failure message would vanish the moment the user typed
+/// anything, which is exactly when they would be looking for it.
+export type ContextReportRequest = {
+  send_id: SendId;
+  message_id?: MessageId;
+  /// The turn once one started — the correlation a cancel or a late failure
+  /// uses.
+  turn_id?: TurnId;
+  phase: "queued" | "running" | "done" | "failed" | "cancelled";
+  error?: string;
 };
 
 /// Per-agent operational state.
@@ -360,6 +386,20 @@ export type AgentRuntime = {
   /// and absent for a harness that re-reads its inventory from a durable file.
   /// Drives the card's "as of …" qualifier on the environment row.
   meta_as_of?: string | null;
+  /// The most recent `/context` breakdown for this agent — from a live
+  /// `context_report` event, or from the latest `context_report` marker in the
+  /// session file on hydrate. Absent until one has been run.
+  last_context_report?: ContextReport;
+  /// Capture time of `last_context_report` when it came from a session-file
+  /// marker on hydrate. ISO-8601 string; `null` once a live event overwrites the
+  /// in-memory value. Drives the panel's "as of …" qualifier — a breakdown is a
+  /// measurement of one moment, and a reopened project's is always old.
+  last_context_report_as_of?: string | null;
+  /// The state of the report the user last asked for. Survives an ordinary send;
+  /// see [`ContextReportRequest`] for why. One slot: the panel's button is
+  /// disabled while a request is queued or running, so a second click cannot
+  /// orphan the first request's correlation.
+  context_report_request?: ContextReportRequest;
   /// Model of the turn that delivered `last_rate_limit`, used to label Claude's
   /// per-model weekly window (which the payload itself never names).
   /// Deliberately **not** persisted in the metadata sidecar: a label restored

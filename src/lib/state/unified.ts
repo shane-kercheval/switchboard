@@ -383,6 +383,13 @@ export function buildUnifiedRows(
         reason: item.reason,
       });
     } else if (item.kind === "system_marker") {
+      // A `/context` breakdown is recorded in the session file but is not
+      // conversation, so it gets no row at any width. Dropped here rather than
+      // rendered as nothing by the row snippet: that snippet draws the agent
+      // name and hover timestamp *around* the marker body, so an empty body
+      // would still leave a bare labelled row in the transcript. Its content
+      // reaches the user through the breakdown panel instead.
+      if (item.marker.marker_kind === "context_report") continue;
       rows.push({
         kind: "system_marker",
         at: item.at,

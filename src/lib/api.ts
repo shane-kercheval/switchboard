@@ -590,6 +590,15 @@ export async function compactAgent(agentId: AgentId, sendId: SendId): Promise<Me
   return await invoke<MessageId>("compact_agent", { agentId, sendId });
 }
 
+// Ask an agent what is occupying its context window. Returns the receipt
+// `MessageId`; the run's lifecycle arrives on the agent's event channel like a
+// send's, the breakdown itself arrives as a `context_report` event, and `sendId`
+// is what cancels it while it is still queued. Claude-only — the backend refuses
+// every other harness, and no card offers the action for them.
+export async function contextReportAgent(agentId: AgentId, sendId: SendId): Promise<MessageId> {
+  return await invoke<MessageId>("context_report_agent", { agentId, sendId });
+}
+
 export async function cancelSend(sendId: SendId, recipients: AgentId[]): Promise<void> {
   await invoke("cancel_send", { sendId, recipients });
 }

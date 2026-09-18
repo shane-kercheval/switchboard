@@ -3656,6 +3656,75 @@ pub async fn compact_agent_impl(
     Ok(state.dispatcher.compact_agent(agent_id, send_id, &factory))
 }
 
+/// Ask `agent_id`'s harness what is occupying its context window, and return the
+/// receipt `MessageId` the correlated `TurnStart` will carry.
+///
+/// The compaction sibling of this function documents why each piece is shaped
+/// the way it is; the three gates are the same three, refusing before anything
+/// is created or dispatched:
+///
+/// 1. **The harness capability.** A `/context` *prompt* is not a substitute: the
+///    harnesses that lack the local interception answer it with a model-authored
+///    breakdown whose every figure reads as a measurement (harness-behavior
+///    §3.9).
+/// 2. **A fork still awaiting materialization**, checked before the no-session
+///    gate it would otherwise trip with a less useful message. A *read* must not
+///    be the dispatch that performs a fork.
+/// 3. **No session at all**, which keeps the adapter on its `--resume` branch.
+///
+/// Deliberately **not** gated on the agent being idle: the report queues behind
+/// in-flight work like any other turn. The panel says so while it waits.
+pub async fn context_report_agent_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    send_id: SendId,
+    home_dir: &Path,
+) -> Result<MessageId, AppError> {
+    let (project, agent, generation) = capture_dispatch_snapshot(state, agent_id)?;
+    let project_id = project.id;
+    if !agent.harness.supports_context_report() {
+        return Err(AppError::ContextReportUnsupported {
+            harness: agent.harness,
+        });
+    }
+    if unmaterialized_fork_parent(&agent, &project.directory, home_dir).is_some() {
+        return Err(AppError::ContextReportForkNotMaterialized {
+            name: agent.name.clone(),
+        });
+    }
+    if resolve_session_file(&agent, &project.directory, home_dir).is_none() {
+        return Err(AppError::ContextReportSourceHasNoSession {
+            name: agent.name.clone(),
+        });
+    }
+    let adapter = adapter_for(state, &agent)?;
+    let factory: Arc<dyn DispatchContextFactory> = Arc::new(ProjectDispatchContextFactory::new(
+        project,
+        agent,
+        adapter,
+        crate::dispatch_context::DispatchDeps {
+            base_emitter: Arc::clone(&state.emitter),
+            needs_session_meta: Arc::clone(&state.needs_session_meta),
+            agents_by_id: Arc::clone(&state.agents_by_id),
+            registry_write: Arc::clone(&state.registry_write),
+            dispatcher: Arc::downgrade(&state.dispatcher),
+            home_dir: home_dir.to_path_buf(),
+            lock_root: state.lock_root.clone(),
+            project_generation: Arc::clone(&state.project_generation),
+            generation_at_capture: generation,
+            preferences: Arc::clone(&state.preferences),
+        },
+    ));
+    // Same last-moment check as a send: refuse if the project moved under us
+    // while the awaits above were pending.
+    reject_if_generation_changed(state, project_id, generation)?;
+    // `send_id` is minted by the frontend so it can cancel the report while it is
+    // still queued, before any `TurnStart` carries the id back.
+    Ok(state
+        .dispatcher
+        .context_report_agent(agent_id, send_id, &factory))
+}
+
 /// Remove a not-yet-dispatched queued message by id, returning its payload so
 /// the compose bar can restore the text. Race-safe: `NotQueued` (already
 /// dequeued/started or never existed) maps to [`AppError::QueuedMessageNotFound`].
@@ -4079,13 +4148,14 @@ async fn resolve_source_completed_only(
         name: qualified_source_name(&agent.name, &project, recipient_project),
         ..agent
     };
-    // Name what the agent is actually doing: a compaction never produces a reply,
-    // so "still responding" would send the user looking for output that isn't
-    // coming.
+    // Name what the agent is actually doing: neither maintenance kind ever
+    // produces a reply, so "still responding" would send the user looking for
+    // output that isn't coming.
     let busy_with = match state.dispatcher.running_turn_kind(agent_id).await {
         None => None,
         Some(TurnKind::Send) => Some("is still responding"),
         Some(TurnKind::Compaction) => Some("is compacting its context"),
+        Some(TurnKind::ContextReport) => Some("is analyzing its context"),
     };
     if let Some(busy_with) = busy_with {
         return Err(AppError::Workflow(
@@ -5247,6 +5317,13 @@ pub struct AgentConversationMeta {
     /// sidecar. Same qualifier role as `last_rate_limit_as_of`: `None` means
     /// the inventory is live or re-read from a durable harness file.
     pub meta_as_of: Option<chrono::DateTime<chrono::Utc>>,
+    /// The newest `/context` breakdown recorded in this agent's session file,
+    /// and when the harness took it. Projected by the loader rather than read
+    /// off the items below, because the markers reach the frontend as
+    /// project-level `ConversationItem`s and the panel needs one value per
+    /// agent.
+    pub last_context_report: Option<switchboard_harness::ContextReport>,
+    pub last_context_report_as_of: Option<chrono::DateTime<chrono::Utc>>,
     pub warnings: Vec<switchboard_harness::ParseWarning>,
     pub load_error: Option<String>,
 }
@@ -6341,6 +6418,8 @@ fn merge_project_conversation(
             last_rate_limit: transcript.last_rate_limit,
             last_rate_limit_as_of: transcript.last_rate_limit_as_of,
             meta_as_of: transcript.meta_as_of,
+            last_context_report: transcript.last_context_report,
+            last_context_report_as_of: transcript.last_context_report_as_of,
             warnings: transcript.warnings,
             load_error,
         });
@@ -8164,7 +8243,7 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: Some(Arc::clone(&teardown)),
-            compaction: None,
+            maintenance: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
@@ -9988,14 +10067,16 @@ mod tests {
         /// Scripts `compact`. `None` — the default for every fixture that is not
         /// about compaction — makes the adapter refuse, which is what a harness
         /// Switchboard cannot drive does.
-        compaction: Option<CompactionScript>,
+        maintenance: Option<MaintenanceScript>,
         dispatches: std::sync::atomic::AtomicUsize,
     }
 
-    /// How [`GatedRecordingAdapter`] should answer a compaction: park on `gate`
-    /// before the terminal (so a forward can register a current-turn wait against
-    /// a live compaction), then terminate `Failed` if `fails`, else `Completed`.
-    struct CompactionScript {
+    /// How [`GatedRecordingAdapter`] should answer a maintenance operation —
+    /// either kind: park on `gate` before the terminal (so a forward can register
+    /// a current-turn wait against a live one), then terminate `Failed` if
+    /// `fails`, else `Completed`. One script serves both `compact` and
+    /// `context_report`; a test drives only one of them.
+    struct MaintenanceScript {
         gate: Arc<tokio::sync::Notify>,
         fails: bool,
     }
@@ -10117,7 +10198,7 @@ mod tests {
         ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError> {
             // Unscripted means unsupported — the trait default, reproduced here
             // because overriding the method replaces it.
-            let Some(script) = &self.compaction else {
+            let Some(script) = &self.maintenance else {
                 return Err(switchboard_harness::DispatchError::UnsupportedOperation {
                     harness: agent.harness,
                     operation: "manual context compaction",
@@ -10163,15 +10244,80 @@ mod tests {
                 tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
             ))
         }
+
+        async fn context_report(
+            &self,
+            agent: &AgentRecord,
+            _cwd: &Path,
+            turn_id: switchboard_harness::TurnId,
+            options: switchboard_harness::DispatchOptions,
+        ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError> {
+            // Unscripted means unsupported — the trait default, reproduced here
+            // because overriding the method replaces it.
+            let Some(script) = &self.maintenance else {
+                return Err(switchboard_harness::DispatchError::UnsupportedOperation {
+                    harness: agent.harness,
+                    operation: "context breakdown",
+                });
+            };
+            let cancel_token = options.cancel_token.clone();
+            let gate = Arc::clone(&script.gate);
+            let fails = script.fails;
+            let agent_id = agent.id;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let cancelled = tokio::select! {
+                    () = gate.notified() => false,
+                    () = cancel_token.cancelled() => true,
+                };
+                if cancelled {
+                    // End with no terminal; the dispatcher synthesizes Cancelled.
+                    return;
+                }
+                if !fails {
+                    let _ = tx.send(switchboard_harness::AdapterEvent::ContextReport {
+                        agent_id,
+                        report: switchboard_harness::ContextReport {
+                            total_tokens: Some(48_000),
+                            max_tokens: Some(200_000),
+                            raw: "## Context Usage".to_owned(),
+                            ..switchboard_harness::ContextReport::default()
+                        },
+                    });
+                }
+                let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
+                    turn_id,
+                    outcome: if fails {
+                        TurnOutcome::Failed {
+                            kind: switchboard_harness::FailureKind::HarnessError,
+                            message: "the harness could not produce a context report".to_owned(),
+                        }
+                    } else {
+                        TurnOutcome::Completed
+                    },
+                    ended_at: chrono::Utc::now(),
+                    usage: None,
+                    context_window_source: None,
+                    stable_message_id: None,
+                    first_message_id: None,
+                    spend: None,
+                    model: None,
+                    effort: None,
+                });
+            });
+            Ok(Box::pin(
+                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            ))
+        }
     }
 
-    /// A [`GatedRecordingAdapter`] whose `compact` parks on `compaction_gate`
+    /// A [`GatedRecordingAdapter`] whose `compact` parks on `maintenance_gate`
     /// before terminating, so a test can hold a compaction live while a forward
     /// resolves against it. Sends are ungated (nothing parks) — the compaction is
     /// the only thing these fixtures hold.
-    fn compaction_adapter(
+    fn maintenance_adapter(
         texts: &[&str],
-        compaction_gate: &Arc<tokio::sync::Notify>,
+        maintenance_gate: &Arc<tokio::sync::Notify>,
         fails: bool,
     ) -> Arc<dyn HarnessAdapter> {
         Arc::new(GatedRecordingAdapter {
@@ -10185,8 +10331,8 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: None,
-            compaction: Some(CompactionScript {
-                gate: Arc::clone(compaction_gate),
+            maintenance: Some(MaintenanceScript {
+                gate: Arc::clone(maintenance_gate),
                 fails,
             }),
             dispatches: std::sync::atomic::AtomicUsize::new(0),
@@ -10199,7 +10345,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A loaded project whose Claude adapter parks its compactions on `gate`.
-    fn compaction_fixture(
+    fn maintenance_fixture(
         texts: &[&str],
         gate: &Arc<tokio::sync::Notify>,
         fails: bool,
@@ -10207,7 +10353,7 @@ mod tests {
         let emitter = Arc::new(RecordingEmitter::new());
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let state = AppState::new_for_test(
-            compaction_adapter(texts, gate, fails),
+            maintenance_adapter(texts, gate, fails),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
@@ -10219,6 +10365,132 @@ mod tests {
         (tmp, TempDir::new().unwrap(), state, emitter, project.id)
     }
 
+    // -----------------------------------------------------------------------
+    // Context breakdown — the same three app-layer gates as a compaction.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_context_report_is_refused_for_every_harness_that_cannot_be_driven() {
+        // The capability predicate is the authority. What stands behind this
+        // gate is a `/context` *prompt*, which Codex and Antigravity answer by
+        // writing a breakdown out of nothing — and a fabricated set of token
+        // counts is worse than no panel, because every figure in it reads as a
+        // measurement.
+        let (_tmp, home, state, _gate, _project) =
+            maintenance_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
+        for harness in [HarnessKind::Codex, HarnessKind::Antigravity] {
+            let agent = create_agent_impl(
+                &state,
+                &format!("agent-{harness}"),
+                harness,
+                AgentSelection::default(),
+            )
+            .unwrap();
+            let err = context_report_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
+                .await
+                .expect_err("a harness Switchboard cannot ask must be refused");
+            assert!(
+                matches!(err, AppError::ContextReportUnsupported { harness: h } if h == harness),
+                "got: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_context_report_is_refused_for_an_agent_with_no_session_yet() {
+        // Nothing has been said, so there is no context to measure — and
+        // refusing here keeps the adapter on its `--resume` branch instead of
+        // minting a session as a side effect of a read.
+        let (_tmp, home, state, _gate, _project) =
+            maintenance_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
+        let agent = create_agent_impl(
+            &state,
+            "fresh",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+
+        let err = context_report_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
+            .await
+            .expect_err("an agent with no session has no context to analyze");
+        assert!(
+            matches!(err, AppError::ContextReportSourceHasNoSession { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_context_report_is_refused_for_a_fork_still_awaiting_materialization() {
+        // The branch's session is created by its first *send*. Allowing a report
+        // to be that dispatch would materialize the branch as a side effect of a
+        // read, and the fork is a turn that needs a prompt.
+        let (_tmp, home, state, _gate, _project) =
+            maintenance_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
+        let mut agent = create_agent_impl(
+            &state,
+            "branch",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        agent.forked_from_session = Some(Uuid::now_v7());
+        lock(&state.agents_by_id).insert(agent.id, agent.clone());
+
+        let err = context_report_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
+            .await
+            .expect_err("a report must not be the dispatch that forks");
+        assert!(
+            matches!(err, AppError::ContextReportForkNotMaterialized { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_context_report_is_accepted_for_a_claude_agent_with_a_session() {
+        // The happy path returns the dispatcher's receipt and emits the report on
+        // the agent's event channel, correlated to the turn the frontend renders
+        // the request state from.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (_tmp, home, state, emitter, project_id) = maintenance_fixture(&[], &gate, false);
+        let agent = seed_source(&state, home.path(), project_id, "alice", "ANSWER");
+
+        let message_id = context_report_agent_impl(&state, agent, SendId::now_v7(), home.path())
+            .await
+            .expect("a Claude agent with a session can be analyzed");
+
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        let start = emitter
+            .snapshot()
+            .into_iter()
+            .find(|(_, v)| v["type"] == "turn_start")
+            .expect("turn_start");
+        assert_eq!(
+            start.1["message_id"].as_str().unwrap(),
+            message_id.to_string(),
+            "the receipt must correlate to the request the frontend is tracking"
+        );
+
+        gate.notify_one();
+        within(
+            &emitter,
+            "context_report",
+            emitter.wait_for_type("context_report", 1),
+        )
+        .await;
+        let report = emitter
+            .snapshot()
+            .into_iter()
+            .find(|(_, v)| v["type"] == "context_report")
+            .expect("context_report");
+        assert_eq!(report.1["report"]["max_tokens"].as_u64(), Some(200_000));
+    }
+
     #[tokio::test]
     async fn compaction_is_refused_for_every_harness_that_cannot_be_driven() {
         // The capability predicate is the authority, and this is the gate that
@@ -10227,7 +10499,7 @@ mod tests {
         // while nothing is compacted. A silent no-op would be the worst outcome
         // available, so the refusal must be typed and loud.
         let (_tmp, home, state, _gate, _project) =
-            compaction_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
+            maintenance_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
         for harness in [HarnessKind::Codex, HarnessKind::Antigravity] {
             let agent = create_agent_impl(
                 &state,
@@ -10252,7 +10524,7 @@ mod tests {
         // here is what keeps the adapter on its `--resume` branch instead of
         // minting a session as a side effect of a maintenance action.
         let (_tmp, home, state, _gate, _project) =
-            compaction_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
+            maintenance_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
         let agent = create_agent_impl(
             &state,
             "fresh",
@@ -10279,7 +10551,7 @@ mod tests {
         // specific thing to do (send a message), where the no-session error above
         // would only say the agent is empty.
         let (_tmp, home, state, _gate, _project) =
-            compaction_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
+            maintenance_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
         let mut agent = create_agent_impl(
             &state,
             "branch",
@@ -10306,7 +10578,7 @@ mod tests {
         // The happy path returns the dispatcher's receipt, and the turn runs on
         // the agent's event channel like any other.
         let gate = Arc::new(tokio::sync::Notify::new());
-        let (_tmp, home, state, emitter, project_id) = compaction_fixture(&[], &gate, false);
+        let (_tmp, home, state, emitter, project_id) = maintenance_fixture(&[], &gate, false);
         let agent = seed_source(&state, home.path(), project_id, "alice", "ANSWER");
 
         let message_id = compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
@@ -10344,7 +10616,7 @@ mod tests {
         // gated on idleness. Accepting while a send is in flight is the whole
         // behavior — a refusal here would push the user into watching the agent.
         let gate = Arc::new(tokio::sync::Notify::new());
-        let (_tmp, home, state, emitter, project_id) = compaction_fixture(&["LIVE"], &gate, false);
+        let (_tmp, home, state, emitter, project_id) = maintenance_fixture(&["LIVE"], &gate, false);
         let agent = seed_source(&state, home.path(), project_id, "alice", "ANSWER");
 
         send_msg_with_home(&state, agent, "a long task", home.path())
@@ -10391,7 +10663,7 @@ mod tests {
         // forward resolving as an empty source and invalidating itself, which
         // would turn a routine maintenance action into a broken workflow.
         let gate = Arc::new(tokio::sync::Notify::new());
-        let (_tmp, home, state, emitter, project_id) = compaction_fixture(&[], &gate, false);
+        let (_tmp, home, state, emitter, project_id) = maintenance_fixture(&[], &gate, false);
         let agent = seed_source(&state, home.path(), project_id, "alice", "REAL ANSWER");
 
         compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
@@ -10431,7 +10703,7 @@ mod tests {
         // invalidate it. Same assertion as the success case on purpose: the
         // verdict is not supposed to matter here.
         let gate = Arc::new(tokio::sync::Notify::new());
-        let (_tmp, home, state, emitter, project_id) = compaction_fixture(&[], &gate, true);
+        let (_tmp, home, state, emitter, project_id) = maintenance_fixture(&[], &gate, true);
         let agent = seed_source(&state, home.path(), project_id, "alice", "REAL ANSWER");
 
         compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
@@ -10500,7 +10772,7 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: None,
-            compaction: None,
+            maintenance: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         (adapter, prompts)
@@ -10526,7 +10798,7 @@ mod tests {
             extra_parks: vec![(second.1, Arc::clone(second.0))],
             fail_at: fail_at.to_vec(),
             teardown: None,
-            compaction: None,
+            maintenance: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         (adapter, prompts)
@@ -14780,7 +15052,7 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: None,
-            compaction: None,
+            maintenance: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         let emitter = Arc::new(RecordingEmitter::new());
@@ -14859,7 +15131,7 @@ mod tests {
             extra_parks: Vec::new(),
             fail_at: Vec::new(),
             teardown: None,
-            compaction: None,
+            maintenance: None,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         });
         let emitter = Arc::new(RecordingEmitter::new());
@@ -17109,10 +17381,8 @@ mod tests {
         LoadedTranscript {
             turns,
             meta: None,
-            last_rate_limit: None,
-            last_rate_limit_as_of: None,
-            meta_as_of: None,
             warnings: Vec::new(),
+            ..LoadedTranscript::default()
         }
     }
 
@@ -21383,18 +21653,14 @@ mod tests {
         let a_t = LoadedTranscript {
             turns: Vec::new(),
             meta: None,
-            last_rate_limit: None,
-            last_rate_limit_as_of: None,
-            meta_as_of: None,
             warnings: vec![warn("a busted")],
+            ..LoadedTranscript::default()
         };
         let b_t = LoadedTranscript {
             turns: Vec::new(),
             meta: None,
-            last_rate_limit: None,
-            last_rate_limit_as_of: None,
-            meta_as_of: None,
             warnings: vec![warn("b busted")],
+            ..LoadedTranscript::default()
         };
 
         let merged = merge_project_conversation(Vec::new(), vec![(a, a_t, None), (b, b_t, None)]);

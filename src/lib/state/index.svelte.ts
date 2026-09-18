@@ -38,6 +38,7 @@ import {
   cancelSend as apiCancelSend,
   cancelTurn as apiCancelTurn,
   compactAgent as apiCompactAgent,
+  contextReportAgent as apiContextReportAgent,
   loadTranscript,
 } from "$lib/api";
 import type {
@@ -376,6 +377,8 @@ export function applyAgentHydrate(
     last_rate_limit: loaded.last_rate_limit ?? null,
     last_rate_limit_as_of: loaded.last_rate_limit_as_of ?? null,
     meta_as_of: loaded.meta_as_of ?? null,
+    last_context_report: loaded.last_context_report ?? null,
+    last_context_report_as_of: loaded.last_context_report_as_of ?? null,
   };
   const priorTurns = transcripts[agentId] ?? [];
   // Pass the in-flight turn_id so a refresh re-read can't supersede an
@@ -585,6 +588,85 @@ export async function dispatchCompaction(
   }
 }
 
+/// Ask `agentId` what is occupying its context window, and register both the
+/// pending entry that correlates the turn and the request record the panel
+/// renders from.
+///
+/// Structured exactly like [`dispatchCompaction`] — the pending entry is
+/// registered *before* the IPC so the pre-receipt `turn_start` finds its own
+/// slot — with one addition it does not need: a `context_report_request`.
+///
+/// **That record exists because a report has no transcript row.** A failed
+/// compaction is legible because its row says so; a report has nothing at any
+/// phase, so queued/running/failed/cancelled would all look identical (nothing
+/// happening) without somewhere to put them.
+///
+/// **The previous report is deliberately left in place.** A refresh that fails
+/// should leave the last good breakdown on screen with the failure beside it,
+/// not blank the panel — the old measurement is still the best one available.
+export async function dispatchContextReport(
+  agentId: AgentId,
+  sendId: SendId,
+  // Both generated, not reactive state.
+  pendingTurnId: TurnId = crypto.randomUUID(),
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  queuedAt: string = new Date().toISOString(),
+): Promise<void> {
+  const runtime = runtimes[agentId];
+  if (runtime === undefined) {
+    console.error("[switchboard] dispatchContextReport called for unregistered agent", {
+      agent_id: agentId,
+    });
+    return;
+  }
+  const pending = [
+    ...(runtime.pending_sends ?? []),
+    {
+      send_id: sendId,
+      user_turn_id: pendingTurnId,
+      kind: "context_report" as const,
+      queued_at: queuedAt,
+    },
+  ];
+  // One slot, replaced outright: the panel disables its button while a request
+  // is queued or running, so the only way here is from a settled request — and
+  // the new one is what the user is now waiting on.
+  const next: AgentRuntime = {
+    ...runtime,
+    pending_sends: pending,
+    context_report_request: { send_id: sendId, phase: "queued" },
+  };
+  // Same rule as a send: only an idle agent moves to "starting".
+  runtimes[agentId] =
+    runtime.run_status === "idle"
+      ? { ...next, run_status: "starting", last_error: undefined }
+      : next;
+  try {
+    const messageId = await apiContextReportAgent(agentId, sendId);
+    recordSendAccepted(agentId, pendingTurnId, messageId);
+    // Stamp the receipt on the request too, so a later `message_failed` — which
+    // carries no `send_id` when nothing was journaled — can still find it.
+    // Read fresh: `turn_start` may have advanced the phase while the IPC was in
+    // flight, and that progress must not be rolled back.
+    const current = runtimes[agentId];
+    if (current?.context_report_request?.send_id === sendId) {
+      runtimes[agentId] = {
+        ...current,
+        context_report_request: { ...current.context_report_request, message_id: messageId },
+      };
+    }
+  } catch (e) {
+    // An IPC rejection (a refused harness, no session, an unmaterialized branch)
+    // never reaches the event stream, so it routes through the same pre-start
+    // failure path a rejected send uses — which, for this kind, records the
+    // reason on the request rather than in the transcript.
+    failSendStart(agentId, pendingTurnId, {
+      message: e instanceof Error ? e.message : String(e),
+      kind: "adapter_failure",
+    });
+  }
+}
+
 /// Record the accepted-send receipt (`message_id`) onto this send's pending
 /// entry (matched by `user_turn_id`). Called by the compose-bar after
 /// `send_message` resolves; the receipt lets the correlated `turn_start` /
@@ -655,16 +737,35 @@ export function failSendStart(
   settleRecipient(entry?.send_id, agentId, "failed");
   const remaining = [...pending.slice(0, idx), ...pending.slice(idx + 1)];
   const pending_sends = remaining.length === 0 ? undefined : remaining;
+  // A refused context report has no row to fail in, so the refusal has to land
+  // on the request record — which is the only place the panel can read it. The
+  // request is matched by `send_id` because this path runs *before* any
+  // `message_id` exists: the IPC that would have minted one is what rejected.
+  const context_report_request =
+    entry?.kind === "context_report" &&
+    runtime.context_report_request?.send_id === entry.send_id &&
+    error !== undefined
+      ? { ...runtime.context_report_request, phase: "failed" as const, error: error.message }
+      : runtime.context_report_request;
   runtimes[agentId] =
     runtime.run_status === "starting"
-      ? { ...runtime, run_status: "idle", last_error: error, pending_sends }
-      : { ...runtime, last_error: error, pending_sends };
+      ? {
+          ...runtime,
+          run_status: "idle",
+          last_error: error,
+          pending_sends,
+          context_report_request,
+        }
+      : { ...runtime, last_error: error, pending_sends, context_report_request };
   // Surface the failure in the transcript (the same place post-start failures
   // and the post-reload journal marker render it) rather than only in runtime
   // state. The optimistic user turn already sits above it; this adds the failed
   // response beneath. Keyed on `user_turn_id` (the IPC-reject path has no
   // backend `message_id`), so it can't collide with a `message_failed` event's
   // `failed-${message_id}` row.
+  // A report renders nothing at any phase — see the `pendingKind` contract on
+  // `transcriptReducer`. Its failure is already on the request record above.
+  if (entry?.kind === "context_report") return;
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const at = new Date().toISOString();
   setTranscript(

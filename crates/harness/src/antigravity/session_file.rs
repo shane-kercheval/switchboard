@@ -518,10 +518,10 @@ impl Reconstruction {
                 // stays `None` so the loaders may fill them.
                 inventory: SessionInventory::default(),
             }),
-            last_rate_limit: None,
-            last_rate_limit_as_of: None,
-            meta_as_of: None,
             warnings: self.warnings,
+            // Antigravity records no `/context` breakdown — the marker's only
+            // producer is the Claude parser.
+            ..LoadedTranscript::default()
         }
     }
 }

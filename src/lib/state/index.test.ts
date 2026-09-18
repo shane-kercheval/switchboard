@@ -1979,3 +1979,361 @@ describe("manual context compaction", () => {
     expect(seen).toEqual([{ outcome: "completed", kind: undefined }]);
   });
 });
+
+describe("context breakdown requests", () => {
+  const SEND = "00000000-0000-7000-8000-00000000d001";
+  const PENDING = "00000000-0000-7000-8000-00000000d002";
+  const MESSAGE = "00000000-0000-7000-8000-00000000d003";
+  const TURN = "00000000-0000-7000-8000-00000000d004";
+  const QUEUED_AT = "2026-05-15T00:00:05Z";
+
+  const REPORT = {
+    model: "claude-fable-5-1",
+    total_tokens: 48_000,
+    max_tokens: 200_000,
+    categories: [{ name: "Messages", tokens: 48_000, kind: "used" }],
+    raw: "## Context Usage",
+  };
+
+  async function dispatched(state: Awaited<ReturnType<typeof loadState>>): Promise<void> {
+    invokeMock.mockResolvedValue(MESSAGE);
+    await state.dispatchContextReport(AGENT_A, SEND, PENDING, QUEUED_AT);
+  }
+
+  it("registers its pending entry before the IPC and renders no transcript row", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    let resolveIpc: (id: string) => void = () => {};
+    invokeMock.mockImplementation(
+      async () => await new Promise<string>((res) => (resolveIpc = res)),
+    );
+
+    const inFlight = state.dispatchContextReport(AGENT_A, SEND, PENDING, QUEUED_AT);
+
+    expect(state.runtimes[AGENT_A]?.pending_sends).toEqual([
+      { send_id: SEND, user_turn_id: PENDING, kind: "context_report", queued_at: QUEUED_AT },
+    ]);
+    expect(state.runtimes[AGENT_A]?.context_report_request).toEqual({
+      send_id: SEND,
+      phase: "queued",
+    });
+    expect(state.transcripts[AGENT_A]).toEqual([]);
+
+    resolveIpc(MESSAGE);
+    await inFlight;
+    expect(state.runtimes[AGENT_A]?.context_report_request?.message_id).toBe(MESSAGE);
+  });
+
+  it("advances queued → running → done without creating a turn", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    await dispatched(state);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN,
+      message_id: MESSAGE,
+      send_id: SEND,
+      started_at: "2026-05-15T00:00:06Z",
+    } as NormalizedEvent);
+    expect(state.runtimes[AGENT_A]?.context_report_request).toMatchObject({
+      phase: "running",
+      turn_id: TURN,
+    });
+    expect(state.transcripts[AGENT_A]).toEqual([]);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "context_report",
+      agent_id: AGENT_A,
+      report: REPORT,
+    } as unknown as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:07Z",
+    } as NormalizedEvent);
+
+    expect(state.runtimes[AGENT_A]?.context_report_request?.phase).toBe("done");
+    expect(state.runtimes[AGENT_A]?.last_context_report).toEqual(REPORT);
+    expect(state.runtimes[AGENT_A]?.last_context_report_as_of).toBeNull();
+    expect(
+      state.transcripts[AGENT_A],
+      "a report is not conversation — it gets no row at any phase",
+    ).toEqual([]);
+  });
+
+  it("records a runtime failure on the request, not in the transcript", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    await dispatched(state);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN,
+      message_id: MESSAGE,
+      send_id: SEND,
+      started_at: "2026-05-15T00:00:06Z",
+    } as NormalizedEvent);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN,
+      outcome: { status: "failed", kind: "harness_error", message: "the CLI fell over" },
+      ended_at: "2026-05-15T00:00:07Z",
+    } as NormalizedEvent);
+
+    expect(state.runtimes[AGENT_A]?.context_report_request).toMatchObject({
+      phase: "failed",
+      error: "the CLI fell over",
+    });
+    // The panel is the only surface this failure has: there is no row for it.
+    expect(state.transcripts[AGENT_A]).toEqual([]);
+  });
+
+  it("records an IPC rejection on the request and renders no failed row", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    invokeMock.mockRejectedValue(new Error("alice has no conversation to analyze yet"));
+
+    await state.dispatchContextReport(AGENT_A, SEND, PENDING, QUEUED_AT);
+
+    expect(state.runtimes[AGENT_A]?.context_report_request).toMatchObject({
+      phase: "failed",
+      error: "alice has no conversation to analyze yet",
+    });
+    expect(state.transcripts[AGENT_A]).toEqual([]);
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("idle");
+  });
+
+  it("records a cancellation while queued", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    await dispatched(state);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_cancelled",
+      message_id: MESSAGE,
+      send_id: SEND,
+      agent_id: AGENT_A,
+    } as unknown as NormalizedEvent);
+
+    expect(state.runtimes[AGENT_A]?.context_report_request?.phase).toBe("cancelled");
+    expect(state.transcripts[AGENT_A]).toEqual([]);
+  });
+
+  it("records a cancellation while running", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    await dispatched(state);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN,
+      message_id: MESSAGE,
+      send_id: SEND,
+      started_at: "2026-05-15T00:00:06Z",
+    } as NormalizedEvent);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN,
+      outcome: { status: "cancelled" },
+      ended_at: "2026-05-15T00:00:07Z",
+    } as NormalizedEvent);
+
+    expect(state.runtimes[AGENT_A]?.context_report_request?.phase).toBe("cancelled");
+  });
+
+  it("keeps a settled request through an ordinary send, and the previous report through a failure", async () => {
+    // Clearing on a send would make a failure message vanish the moment the
+    // user typed anything — which is exactly when they would be looking for it.
+    // And a failed refresh must leave the last good breakdown on screen: an old
+    // measurement is still the best one available.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    await dispatched(state);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN,
+      message_id: MESSAGE,
+      send_id: SEND,
+      started_at: "2026-05-15T00:00:06Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "context_report",
+      agent_id: AGENT_A,
+      report: REPORT,
+    } as unknown as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN,
+      outcome: { status: "failed", kind: "harness_error", message: "the CLI fell over" },
+      ended_at: "2026-05-15T00:00:07Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, { type: "agent_idle", agent_id: AGENT_A });
+
+    state.dispatchUserTurn(AGENT_A, TURN_1, "unrelated", [], "send-9", "2026-05-15T00:00:08Z");
+
+    expect(state.runtimes[AGENT_A]?.context_report_request).toMatchObject({ phase: "failed" });
+    expect(state.runtimes[AGENT_A]?.last_context_report).toEqual(REPORT);
+  });
+
+  it("files a report that lands before the IPC resolves", async () => {
+    // The whole run can finish inside the `context_report_agent` await: the CLI
+    // answers `/context` locally in about half a second. The report must be
+    // filed anyway, or the panel that asked for it shows the empty state while
+    // the measurement it requested has already arrived and been dropped.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    let resolveIpc: (id: string) => void = () => {};
+    invokeMock.mockImplementation(
+      async () => await new Promise<string>((res) => (resolveIpc = res)),
+    );
+    const inFlight = state.dispatchContextReport(AGENT_A, SEND, PENDING, QUEUED_AT);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN,
+      message_id: MESSAGE,
+      send_id: SEND,
+      started_at: "2026-05-15T00:00:06Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "context_report",
+      agent_id: AGENT_A,
+      report: REPORT,
+    } as unknown as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:07Z",
+    } as NormalizedEvent);
+
+    resolveIpc(MESSAGE);
+    await inFlight;
+
+    expect(state.runtimes[AGENT_A]?.last_context_report).toEqual(REPORT);
+    expect(state.runtimes[AGENT_A]?.context_report_request?.phase).toBe("done");
+  });
+
+  it("leaves a settled request alone when a later, unrelated turn ends", async () => {
+    // The request is cleared only by the next report. Without the turn match on
+    // the terminal, the very next message the user sent would flip a *failed*
+    // request to "done" — erasing the explanation the panel exists to show,
+    // at the moment the user went looking for it.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    await dispatched(state);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN,
+      message_id: MESSAGE,
+      send_id: SEND,
+      started_at: "2026-05-15T00:00:06Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN,
+      outcome: { status: "failed", kind: "harness_error", message: "the CLI fell over" },
+      ended_at: "2026-05-15T00:00:07Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, { type: "agent_idle", agent_id: AGENT_A });
+
+    state.dispatchUserTurn(AGENT_A, TURN_1, "next", [], "send-9", "2026-05-15T00:00:08Z");
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_2,
+      message_id: MESSAGE_1,
+      send_id: "send-9",
+      started_at: "2026-05-15T00:00:09Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_2,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:10Z",
+    } as NormalizedEvent);
+
+    expect(state.runtimes[AGENT_A]?.context_report_request).toMatchObject({
+      phase: "failed",
+      error: "the CLI fell over",
+    });
+  });
+
+  it("records a pre-start failure on the request without inventing a row", async () => {
+    // The adapter failed to launch, so the backend reports `message_failed`
+    // rather than a terminal. A send renders a failed bubble here; a report has
+    // no bubble, and the row that would be invented for it has no prompt above
+    // it to make sense of.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    await dispatched(state);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: MESSAGE,
+      send_id: null,
+      agent_id: AGENT_A,
+      error: "claude does not support this operation",
+    } as unknown as NormalizedEvent);
+
+    expect(state.runtimes[AGENT_A]?.context_report_request).toMatchObject({
+      phase: "failed",
+      error: "claude does not support this operation",
+    });
+    expect(state.transcripts[AGENT_A]).toEqual([]);
+  });
+
+  it("does not let an unrelated turn advance its request", async () => {
+    // The request correlates on its own ids. A concurrent workflow turn naming
+    // its own send must leave the queued report queued — advancing it would
+    // make the panel claim the report is running when nothing of the sort is.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    await dispatched(state);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_2,
+      message_id: MESSAGE_1,
+      send_id: "someone-elses-send",
+      started_at: "2026-05-15T00:00:06Z",
+    } as NormalizedEvent);
+
+    expect(state.runtimes[AGENT_A]?.context_report_request?.phase).toBe("queued");
+  });
+
+  it("advances a request whose receipt has not landed yet", async () => {
+    // The pre-receipt race: `turn_start` can arrive before the IPC resolves, so
+    // the request has no `message_id` to match on and `send_id` is the only
+    // correlation available.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    let resolveIpc: (id: string) => void = () => {};
+    invokeMock.mockImplementation(
+      async () => await new Promise<string>((res) => (resolveIpc = res)),
+    );
+    const inFlight = state.dispatchContextReport(AGENT_A, SEND, PENDING, QUEUED_AT);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN,
+      message_id: MESSAGE,
+      send_id: SEND,
+      started_at: "2026-05-15T00:00:06Z",
+    } as NormalizedEvent);
+    expect(state.runtimes[AGENT_A]?.context_report_request).toMatchObject({
+      phase: "running",
+      turn_id: TURN,
+    });
+
+    resolveIpc(MESSAGE);
+    await inFlight;
+    // The late receipt must stamp the id without rolling the phase back.
+    expect(state.runtimes[AGENT_A]?.context_report_request).toMatchObject({
+      phase: "running",
+      message_id: MESSAGE,
+    });
+  });
+});

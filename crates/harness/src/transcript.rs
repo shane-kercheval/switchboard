@@ -76,6 +76,17 @@ pub enum SystemMarker {
     /// stops a bare `/compact` from masquerading as a correlating `Turn::User`
     /// and desyncing the send↔turn join. `command` is the verbatim command text.
     SlashCommand { command: String },
+    /// A `/context` breakdown the harness ran on this session. Carried as a
+    /// marker rather than an agent turn because a report is not conversation:
+    /// the transcript renders nothing for it, and the frontend reads the latest
+    /// one per agent to fill the breakdown panel after a reopen.
+    ///
+    /// Routing it here is also what keeps a report out of the *answer* path —
+    /// left as an agent turn it would become the newest completed text and so
+    /// the thing [`crate::forward::latest_completed_agent_text`] forwards.
+    ContextReport {
+        report: crate::context_report::ContextReport,
+    },
 }
 
 /// One reconstructed turn. Discriminated by `role` matching the event-vocabulary
@@ -280,7 +291,42 @@ pub struct LoadedTranscript {
     /// inventory (Codex re-reads its rollout on every load, so there is
     /// nothing stale to qualify).
     pub meta_as_of: Option<DateTime<Utc>>,
+    /// The most recent `/context` breakdown recorded in this session file, and
+    /// the moment the harness took it.
+    ///
+    /// Unlike the two `*_as_of` fields above, **both of these are filled by the
+    /// loader**, because a report is class B — durable in the harness's own file
+    /// — so its age is the marker's own timestamp rather than a sidecar capture
+    /// time. It is projected out of the turns rather than left for the consumer
+    /// to find, so that every hydration path gets it identically: the markers
+    /// themselves are routed to the project-level overlay and never reach a
+    /// per-agent turn list.
+    pub last_context_report: Option<crate::context_report::ContextReport>,
+    pub last_context_report_as_of: Option<DateTime<Utc>>,
     pub warnings: Vec<ParseWarning>,
+}
+
+impl LoadedTranscript {
+    /// Fill [`Self::last_context_report`] and its timestamp from the newest
+    /// `ContextReport` marker among the turns.
+    ///
+    /// Newest by position, not by timestamp: the turns are already in the order
+    /// the harness wrote them, and a file whose clock jumped backwards should
+    /// still show the report that was taken last.
+    pub(crate) fn project_latest_context_report(&mut self) {
+        let latest = self.turns.iter().rev().find_map(|turn| match turn {
+            Turn::System {
+                marker: SystemMarker::ContextReport { report },
+                started_at,
+                ..
+            } => Some((report.clone(), *started_at)),
+            _ => None,
+        });
+        if let Some((report, at)) = latest {
+            self.last_context_report = Some(report);
+            self.last_context_report_as_of = Some(at);
+        }
+    }
 }
 
 /// Session-scope metadata reconstructed from the session file + harness

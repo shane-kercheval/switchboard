@@ -1720,3 +1720,37 @@ async fn compact_is_refused_as_an_unsupported_operation() {
         "expected UnsupportedOperation, got {err:?}"
     );
 }
+
+/// Antigravity exposes no context accounting, and `--disable-slash-commands` is
+/// passed on every dispatch anyway. The trait default refuses.
+///
+/// Defense in depth behind `HarnessKind::supports_context_report`, guarding the
+/// same hazard as the compaction refusal above: a `/context` prompt would be
+/// answered by the model with invented figures rather than refused.
+#[tokio::test]
+async fn context_report_is_refused_as_an_unsupported_operation() {
+    let adapter = AntigravityAdapter::with_binary_path("agy");
+    let result = adapter
+        .context_report(
+            &agy_agent(),
+            Path::new("/tmp"),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await;
+
+    // `EventStream` is not `Debug`, so unwrap the error by hand.
+    let Err(err) = result else {
+        panic!("Antigravity must refuse a context report rather than returning a stream");
+    };
+    assert!(
+        matches!(
+            err,
+            DispatchError::UnsupportedOperation {
+                harness: HarnessKind::Antigravity,
+                ..
+            }
+        ),
+        "expected UnsupportedOperation, got {err:?}"
+    );
+}

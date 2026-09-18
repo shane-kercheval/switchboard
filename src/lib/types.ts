@@ -311,6 +311,10 @@ export type NormalizedEvent =
       hydration_key?: string | null;
     }
   | { type: "rate_limit_event"; agent_id: AgentId; info: unknown }
+  // The `/context` breakdown for one agent, from a report run. Agent-scoped:
+  // it describes the agent's window, not the maintenance turn that measured
+  // it, so it lands on runtime state rather than in the transcript.
+  | { type: "context_report"; agent_id: AgentId; report: ContextReport }
   | {
       type: "session_meta";
       agent_id: AgentId;
@@ -393,6 +397,12 @@ export type LoadedTranscript = {
   /// inventory is live or re-read from a durable harness file, so the card
   /// presents it without an "as of" qualifier.
   meta_as_of?: string | null;
+  /// The newest `/context` breakdown recorded in this agent's session file, and
+  /// when the harness took it (ISO-8601). Projected by the loader because the
+  /// markers themselves never reach a per-agent turn list — `load_transcript`
+  /// filters `role: "system"` out before the IPC.
+  last_context_report?: ContextReport | null;
+  last_context_report_as_of?: string | null;
   warnings: ParseWarning[];
 };
 
@@ -474,6 +484,11 @@ export type Hydrate = {
   /// Capture time of `meta.inventory` from the metadata sidecar (see
   /// `LoadedTranscript.meta_as_of`).
   meta_as_of?: string | null;
+  /// The newest `/context` breakdown from this agent's session file, and when
+  /// the harness took it. Fills `AgentRuntime.last_context_report` only when the
+  /// runtime has none — live > disk, like `meta` and `last_rate_limit`.
+  last_context_report?: ContextReport | null;
+  last_context_report_as_of?: string | null;
 };
 
 export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
@@ -935,7 +950,57 @@ export type ConversationItem =
 // the user sees it ran, but non-correlating.
 export type SystemMarker =
   | { marker_kind: "compaction"; summary: string }
-  | { marker_kind: "slash_command"; command: string };
+  | { marker_kind: "slash_command"; command: string }
+  // A `/context` run recorded in the session file. Renders nothing — a report is
+  // not conversation — and exists so a reopened project can fill the breakdown
+  // panel from the latest one, stamped "as of" the marker's time.
+  | { marker_kind: "context_report"; report: ContextReport };
+
+// Mirror of Rust `ContextReport` (`crates/harness/src/context_report.rs`).
+//
+// Every optional list is `skip_serializing_if = "Vec::is_empty"` on the Rust
+// side, so an absent key means an empty list rather than an unknown one — the
+// opposite of `SessionInventory`'s `Option<Vec<_>>`, and deliberately: a report
+// is a single measurement of one moment, with no config loader to merge against.
+export type ContextReport = {
+  model?: string | null;
+  // Tokens occupied and the window's size. Absent when neither decoder found
+  // them; the panel then shows the raw text alone.
+  total_tokens?: number | null;
+  max_tokens?: number | null;
+  // In the CLI's own order. **No percentage field** — every percentage the
+  // panel shows is `tokens / max_tokens`, the same arithmetic the CLI does.
+  categories?: ContextCategory[];
+  // `detail` is the MCP server; the panel groups on it.
+  mcp_tools?: ContextItem[];
+  // `name` is the file's full path, `detail` its type.
+  memory_files?: ContextItem[];
+  agents?: ContextItem[];
+  skills?: ContextItem[];
+  // The markdown the CLI printed, verbatim and always present.
+  raw: string;
+  // Neither decoder could read the report. The panel shows `raw` and says so.
+  unparsed?: boolean;
+};
+
+export type ContextCategory = {
+  name: string;
+  tokens: number;
+  // The CLI's own classification — observed `used`, `deferred`, `buffer`,
+  // `free`. Opaque on purpose: an unrecognized kind must still render under its
+  // own name rather than be assigned a meaning.
+  kind?: string;
+  approximate?: boolean;
+};
+
+export type ContextItem = {
+  name: string;
+  detail?: string | null;
+  tokens: number;
+  // The CLI rounded this count (`~30`, `< 20`) and the exact value is lost.
+  // Only the markdown fallback sets it.
+  approximate?: boolean;
+};
 
 // Per-agent metadata carried alongside the merged items. `warnings` and
 // `load_error` are agent-scoped: one agent's transcript failing to load leaves
@@ -952,6 +1017,10 @@ export type AgentConversationMeta = {
   /// Capture time of `meta.inventory` from the metadata sidecar. See
   /// `LoadedTranscript.meta_as_of`.
   meta_as_of?: string | null;
+  /// The newest `/context` breakdown from this agent's session file, and when
+  /// the harness took it. See `LoadedTranscript.last_context_report`.
+  last_context_report?: ContextReport | null;
+  last_context_report_as_of?: string | null;
   warnings: ParseWarning[];
   load_error?: string | null;
 };

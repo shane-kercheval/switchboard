@@ -32,6 +32,7 @@ const agentSessionInfoMock = vi.fn();
 const openSessionFileMock = vi.fn();
 const resumeAgentInTerminalMock = vi.fn<(id: string) => Promise<void>>();
 const compactAgentMock = vi.fn<(agentId: string, sendId: string) => Promise<string>>();
+const contextReportAgentMock = vi.fn<(agentId: string, sendId: string) => Promise<string>>();
 vi.mock("$lib/api", () => ({
   agentSessionInfo: (id: string) => agentSessionInfoMock(id),
   openSessionFile: async (id: string) => {
@@ -42,6 +43,7 @@ vi.mock("$lib/api", () => ({
   cancelSend: vi.fn(),
   cancelTurn: vi.fn(),
   compactAgent: (agentId: string, sendId: string) => compactAgentMock(agentId, sendId),
+  contextReportAgent: (agentId: string, sendId: string) => contextReportAgentMock(agentId, sendId),
   loadTranscript: vi.fn(),
 }));
 
@@ -279,13 +281,14 @@ describe("Sidebar", () => {
     ).toEqual([
       "Rename",
       "Collapse",
+      "Context breakdown…",
       "Compact context",
       "Resume in terminal",
       "Open session file",
       "Model settings…",
       "Delete agent",
     ]);
-    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(7);
+    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(8);
   });
 
   it("shows only currently available menu actions", async () => {
@@ -2710,6 +2713,109 @@ describe("compact context action", () => {
     const bar = screen.getByTestId("agent-context-bar");
     expect(bar).toHaveTextContent("120k / 200k");
     expect(bar).toHaveTextContent("60%");
+  });
+});
+
+describe("context breakdown", () => {
+  function seedContextBar(state: Awaited<ReturnType<typeof loadState>>, agent: AgentRecord): void {
+    state.transcripts[agent.id] = [
+      {
+        role: "agent",
+        turn_id: `turn-1-${agent.id}`,
+        agent_id: agent.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          context_input_tokens: 120_000,
+          context_tokens_after_turn: 120_000,
+          context_window: 200_000,
+        },
+      },
+    ];
+  }
+
+  it("offers the chevron beside the meter it explains, for a Claude agent", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const bar = await screen.findByTestId("agent-context-bar");
+    expect(within(bar).getByTestId("agent-context-breakdown-button")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["codex", CODEX_AGENT],
+    ["antigravity", ANTIGRAVITY_AGENT],
+  ])("withholds the chevron and the menu item from a %s agent", async (_harness, agent) => {
+    // Both harnesses report context, so the bar renders and only the
+    // affordances must be absent — which is what makes this a gate test rather
+    // than an absent-bar test. What stands behind the gate is a `/context`
+    // prompt answered with invented figures.
+    const state = await loadState();
+    await state.registerAgent(agent);
+    seedContextBar(state, agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    const bar = await screen.findByTestId("agent-context-bar");
+    expect(within(bar).queryByTestId("agent-context-breakdown-button")).toBeNull();
+    const menu = await openAgentActions();
+    expect(within(menu).queryByTestId("agent-action-context-breakdown")).toBeNull();
+  });
+
+  it("opens the panel from the chevron, with the agent's own report", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("expected a runtime");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      last_context_report: {
+        model: "claude-fable-5-1",
+        total_tokens: 48_000,
+        max_tokens: 200_000,
+        categories: [{ name: "Messages", tokens: 48_000, kind: "used" }],
+        raw: "## Context Usage",
+      },
+    };
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    await fireEvent.click(await screen.findByTestId("agent-context-breakdown-button"));
+
+    const panel = await screen.findByTestId("context-breakdown");
+    expect(within(panel).getByTestId("context-breakdown-usage")).toHaveTextContent("48k / 200k");
+    expect(within(panel).queryByTestId("context-breakdown-empty")).toBeNull();
+  });
+
+  it("opens from the agent menu with an empty state before anything has measured it", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const menu = await openAgentActions();
+    await fireEvent.click(within(menu).getByTestId("agent-action-context-breakdown"));
+
+    expect(await screen.findByTestId("context-breakdown-empty")).toBeInTheDocument();
+  });
+
+  it("dispatches a report when the panel asks for one", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    contextReportAgentMock.mockResolvedValue("00000000-0000-7000-8000-00000000d0aa");
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const menu = await openAgentActions();
+    await fireEvent.click(within(menu).getByTestId("agent-action-context-breakdown"));
+
+    await fireEvent.click(await screen.findByTestId("context-breakdown-refresh"));
+
+    await waitFor(() =>
+      expect(contextReportAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, expect.any(String)),
+    );
   });
 });
 

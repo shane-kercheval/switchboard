@@ -44,7 +44,14 @@ import type {
   SendId,
   TurnId,
 } from "$lib/types";
-import type { AgentRuntime, PendingSend, ToolCall, Turn, TurnItem } from "./types";
+import type {
+  AgentRuntime,
+  ContextReportRequest,
+  PendingSend,
+  ToolCall,
+  Turn,
+  TurnItem,
+} from "./types";
 
 export function transcriptReducer(
   turns: Turn[],
@@ -65,10 +72,21 @@ export function transcriptReducer(
   // lookup, for the three events that consume an entry (`turn_start`,
   // `message_failed`, `message_cancelled`) — a compaction renders as its own row,
   // or as no row at all, where a send renders a response.
-  pendingKind?: "compaction",
+  //
+  // A `"context_report"` entry renders **nothing on every one of those three
+  // paths**. A report is not conversation, so it has no row at any phase — which
+  // is exactly why its outcome has to live somewhere else
+  // (`AgentRuntime.context_report_request`), and why "no row" cannot be relaxed
+  // to "no row unless it failed."
+  pendingKind?: "compaction" | "context_report",
 ): Turn[] {
   switch (input.type) {
     case "turn_start": {
+      // A context report never becomes a turn. Guarded in each of the three
+      // arms rather than once at the top of the function, because `pendingKind`
+      // is only supplied for these three events today — a single early return
+      // would start silently dropping content the moment that changed.
+      if (pendingKind === "context_report") return turns;
       // Defense-in-depth: duplicate turn_start (dispatcher bug, late retry
       // delivery) must not append a second agent turn with the same id —
       // the unified-view's `{#each ... (turn_id)}` keyed render would
@@ -159,7 +177,9 @@ export function transcriptReducer(
       // without a row. Nothing ran, and there is no user message for a
       // "cancelled" row to sit under — unlike a cancelled queued send, whose row
       // renders beneath the prompt the user did type.
-      if (pendingKind === "compaction") return turns;
+      // A report adds nothing on this path either — its cancellation shows in
+      // the panel, which is the only place it was ever visible.
+      if (pendingKind === "compaction" || pendingKind === "context_report") return turns;
       const turn_id = `cancelled-${input.message_id}`;
       if (findTurn(turns, turn_id) !== undefined) return turns;
       return [
@@ -192,6 +212,10 @@ export function transcriptReducer(
       // Idempotent on the derived `turn_id` (the failed turn itself carries
       // `sendId`, so a re-delivery is skipped by this same guard).
       if (sendId === undefined) return turns;
+      // A failed report has no row to fail in. This is the case that forces
+      // `AgentRuntime.context_report_request` to exist: the failure has to be
+      // legible somewhere, and the panel is the only surface it has.
+      if (pendingKind === "context_report") return turns;
       if (turns.some((t) => t.role === "agent" && t.send_id === sendId)) return turns;
       return appendFailedTurnImpl(
         turns,
@@ -585,7 +609,53 @@ function loadedItemToItem(item: LoadedTurnItem): TurnItem {
   };
 }
 
+/// Advance `runtime.context_report_request` for the four events that can move
+/// it, and return the runtime unchanged when this event is not the request's.
+///
+/// **Correlation is by the request's own ids, not by a pending-send lookup.**
+/// The pending entry is consumed by `turn_start`, so by `turn_end` there is
+/// nothing left to ask what the turn was — and the whole reason this record
+/// exists is that a report has no transcript row to carry that answer.
+///
+/// `send_id` is matched alongside `message_id` because of the pre-receipt race:
+/// `turn_start` can arrive before the `context_report_agent` IPC resolves, so
+/// the request may not know its own `message_id` yet.
+function advanceContextReportRequest(runtime: AgentRuntime, input: ReducerInput): AgentRuntime {
+  const request = runtime.context_report_request;
+  if (request === undefined) return runtime;
+  const settled = (next: ContextReportRequest): AgentRuntime => ({
+    ...runtime,
+    context_report_request: next,
+  });
+  switch (input.type) {
+    case "turn_start":
+      if (
+        request.phase !== "queued" ||
+        (input.message_id !== request.message_id && input.send_id !== request.send_id)
+      ) {
+        return runtime;
+      }
+      return settled({ ...request, phase: "running", turn_id: input.turn_id });
+    case "turn_end":
+      if (request.turn_id !== input.turn_id) return runtime;
+      if (input.outcome.status === "completed") return settled({ ...request, phase: "done" });
+      if (input.outcome.status === "cancelled") return settled({ ...request, phase: "cancelled" });
+      return settled({ ...request, phase: "failed", error: input.outcome.message });
+    case "message_failed":
+      if (input.message_id !== request.message_id) return runtime;
+      return settled({ ...request, phase: "failed", error: input.error });
+    case "message_cancelled":
+      if (input.message_id !== request.message_id && input.send_id !== request.send_id) {
+        return runtime;
+      }
+      return settled({ ...request, phase: "cancelled" });
+    default:
+      return runtime;
+  }
+}
+
 export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): AgentRuntime {
+  runtime = advanceContextReportRequest(runtime, input);
   switch (input.type) {
     case "turn_start":
       // Backend-confirmed dispatch: `starting → processing`. The
@@ -806,6 +876,17 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         last_rate_limit_awaiting_model: runtime.current_turn_model === undefined ? true : undefined,
       };
 
+    case "context_report":
+      // A live report replaces whatever was there and clears the "as of"
+      // qualifier — the value is no longer a snapshot read off disk. The request
+      // this answers is advanced by `turn_end`, not here: the event arrives
+      // before the terminal, and a request is not done until the turn is.
+      return {
+        ...runtime,
+        last_context_report: input.report,
+        last_context_report_as_of: null,
+      };
+
     case "hydrate": {
       // **Fill-if-empty for scalars.** Live `session_meta` and
       // `rate_limit_event` always overwrite; `hydrate.meta` /
@@ -836,6 +917,13 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         // live value + its null `as_of` stay in place.
         next.last_rate_limit = input.last_rate_limit;
         next.last_rate_limit_as_of = input.last_rate_limit_as_of ?? null;
+      }
+      if (next.last_context_report === undefined && input.last_context_report != null) {
+        // Same unit-of-two fill: a report and the moment it was taken. A live
+        // event that already landed keeps its value and its null `as_of`, so a
+        // slow hydrate cannot re-age a fresh measurement.
+        next.last_context_report = input.last_context_report;
+        next.last_context_report_as_of = input.last_context_report_as_of ?? null;
       }
       return next;
     }

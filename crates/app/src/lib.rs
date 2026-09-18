@@ -322,13 +322,13 @@ use crate::commands::{
     check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
     check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
     commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, compact_agent_impl,
-    copy_builtin_prompt_impl, create_agent_impl, create_project_impl, delete_project_impl,
-    editor_open_argv, existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl,
-    fork_agent_impl, forward_message_impl, forward_prompt_impl, get_preferences_impl,
-    get_prompt_source_impl, harness_adapter_for, install_status_for_adapter, list_agents_impl,
-    list_mcp_providers_impl, list_message_pins_impl, list_projects_impl, list_prompts_impl,
-    list_tracked_repos_from_inputs, load_project_conversation_impl, load_transcript_impl,
-    migrate_message_pin_impl, open_branch_comparison_file_difftool_impl,
+    context_report_agent_impl, copy_builtin_prompt_impl, create_agent_impl, create_project_impl,
+    delete_project_impl, editor_open_argv, existing_attachment_paths_impl, fetch_repo_impl,
+    file_diff_impl, fork_agent_impl, forward_message_impl, forward_prompt_impl,
+    get_preferences_impl, get_prompt_source_impl, harness_adapter_for, install_status_for_adapter,
+    list_agents_impl, list_mcp_providers_impl, list_message_pins_impl, list_projects_impl,
+    list_prompts_impl, list_tracked_repos_from_inputs, load_project_conversation_impl,
+    load_transcript_impl, migrate_message_pin_impl, open_branch_comparison_file_difftool_impl,
     open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
     parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
     read_tracked_repo_from_inputs, recheck_harness_installs_impl, reclaim_project_attachments_impl,
@@ -1171,6 +1171,25 @@ async fn compact_agent(
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     let message_id = compact_agent_impl(state.inner(), id, sid, &home)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(message_id.to_string())
+}
+
+#[tauri::command]
+async fn context_report_agent(
+    state: State<'_, AppState>,
+    agent_id: String,
+    send_id: String,
+) -> Result<String, String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    // Minted by the frontend, like a send's, so a queued report can be cancelled
+    // through `cancel_send` before any `TurnStart` carries the id back.
+    let sid = parse_uuid(&send_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let message_id = context_report_agent_impl(state.inner(), id, sid, &home)
         .await
         .map_err(|e| e.to_string())?;
     Ok(message_id.to_string())
@@ -2391,6 +2410,7 @@ pub fn run() {
             search_project_files,
             send_message,
             compact_agent,
+            context_report_agent,
             stage_attachment,
             existing_attachment_paths,
             remove_queued_message,

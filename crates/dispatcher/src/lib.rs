@@ -264,6 +264,12 @@ enum WorkPayload {
     /// Carries no prompt and no attachments — it is not something the user said,
     /// and nothing about it is journaled.
     Compact,
+    /// Ask the harness what is occupying the agent's context window. Like
+    /// `Compact` it carries no prompt and journals nothing; unlike it, it costs
+    /// nothing and changes nothing — but it still writes to the session file, so
+    /// it must serialize with turns under the same lock and therefore runs
+    /// through the actor rather than beside it.
+    ContextReport,
 }
 
 impl WorkPayload {
@@ -271,6 +277,7 @@ impl WorkPayload {
         match self {
             Self::Send { .. } => TurnKind::Send,
             Self::Compact => TurnKind::Compaction,
+            Self::ContextReport => TurnKind::ContextReport,
         }
     }
 }
@@ -278,14 +285,21 @@ impl WorkPayload {
 /// What a turn is doing — the classification an observer can read without the
 /// work item's payload.
 ///
-/// A compaction is a real turn through the actor: it queues, streams, cancels,
-/// and terminates exactly like a send. It is simply **not conversational** — no
-/// prompt, nothing journaled, no forwardable text — so every place that must
-/// tell the two apart branches on this rather than on the presence of a prompt.
+/// The maintenance kinds are real turns through the actor: they queue, stream,
+/// cancel, and terminate exactly like a send. They are simply **not
+/// conversational** — no prompt, nothing journaled, no forwardable text — so
+/// every place that must tell them apart from a send branches on this rather
+/// than on the presence of a prompt.
+///
+/// `Compaction` and `ContextReport` behave identically everywhere in the
+/// dispatcher; they are separate variants because an observer needs to say
+/// which one an agent is busy with, and because a single "maintenance" variant
+/// would make that unanswerable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnKind {
     Send,
     Compaction,
+    ContextReport,
 }
 
 /// The model/effort-dependent part of an agent record captured for one send.
@@ -1136,6 +1150,39 @@ impl Dispatcher {
         self.enqueue(agent_id, item, factory)
     }
 
+    /// Accept a **context breakdown** for `agent_id`: ask the harness what is
+    /// occupying its context window. Every property of
+    /// [`Self::compact_agent`] holds here — always enqueues, runs through the
+    /// same actor in the same FIFO position, journals nothing, produces no
+    /// forwardable text, has no awaitable variant, and cancels through
+    /// [`Self::cancel_send`] by `send_id` while queued.
+    ///
+    /// It goes through the actor **even though it changes nothing**, because it
+    /// still writes three records to the harness's session file: the only writer
+    /// of that file must stay the per-agent actor, or a report interleaves with
+    /// a turn under the session lock.
+    ///
+    /// Callers must gate on `HarnessKind::supports_context_report` first.
+    pub fn context_report_agent(
+        &self,
+        agent_id: AgentId,
+        send_id: SendId,
+        factory: &Arc<dyn DispatchContextFactory>,
+    ) -> MessageId {
+        // Snapshotted for the same reason a compaction's is: the report measures
+        // the window of the model that will run, so it must carry the selection
+        // the user had when they asked.
+        let selection = factory.selection_snapshot();
+        let item = WorkItem {
+            message_id: Uuid::now_v7(),
+            send_id,
+            payload: WorkPayload::ContextReport,
+            selection,
+            completion: None,
+        };
+        self.enqueue(agent_id, item, factory)
+    }
+
     /// Like [`send_message`](Self::send_message), but hands back a one-shot
     /// channel that resolves with the turn's [`CompletionResult`] (outcome +
     /// captured text) when this send's turn terminates. Used by the workflow
@@ -1962,6 +2009,11 @@ async fn run_turn(
         // call. `options` rides through unchanged — the cancel token is what
         // makes a compaction cancellable like any other turn.
         WorkPayload::Compact => adapter.compact(&agent, &cwd, turn_id, options).await,
+        // Same reasoning as the compaction above, and the same hazard: a
+        // `/context` *prompt* on a harness without the local interception is
+        // answered by the model with an invented breakdown, so the refusal has
+        // to live in the type of the call rather than in a string.
+        WorkPayload::ContextReport => adapter.context_report(&agent, &cwd, turn_id, options).await,
     };
 
     let stream = match launched {
@@ -1983,7 +2035,7 @@ async fn run_turn(
                     journal.record_outcome(turn_id, agent_id, &outcome, started_at, Utc::now());
                     Some(item.send_id)
                 }
-                TurnKind::Compaction => None,
+                TurnKind::Compaction | TurnKind::ContextReport => None,
             };
             emit_message_failed(
                 emitter.as_ref(),
@@ -2076,7 +2128,7 @@ async fn drain_turn(
     // Current-turn waiters bound to a *compaction*, held here rather than in
     // `awaiters` — they are answered at stream drain, not at the terminal. See
     // where they are drained, below the loop.
-    let mut compaction_waiters: Vec<oneshot::Sender<CurrentTurnWait>> = Vec::new();
+    let mut maintenance_waiters: Vec<oneshot::Sender<CurrentTurnWait>> = Vec::new();
     let mut terminal_seen = false;
     // The terminal outcome + captured text, stashed once observed so a
     // `WaitForCurrentTurn` arriving *after* the terminal but before the stream
@@ -2477,7 +2529,9 @@ async fn drain_turn(
                         // Registered mid-compaction *or* arriving after its
                         // terminal — either way it is held and answered `Idle` at
                         // stream drain (see below the loop), never here.
-                        TurnKind::Compaction => compaction_waiters.push(reply),
+                        TurnKind::Compaction | TurnKind::ContextReport => {
+                            maintenance_waiters.push(reply);
+                        }
                         // Mid-turn: register to fire at this turn's terminal. If
                         // the terminal already passed (we're draining post-terminal
                         // enrichment), answer immediately with the stashed outcome
@@ -2503,7 +2557,7 @@ async fn drain_turn(
                         // the terminal. Same boundary its waiters resolve at.
                         let running = match kind {
                             TurnKind::Send => terminal.is_none(),
-                            TurnKind::Compaction => true,
+                            TurnKind::Compaction | TurnKind::ContextReport => true,
                         };
                         let _ = reply.send(running.then_some(kind));
                     }
@@ -2611,7 +2665,7 @@ async fn drain_turn(
     // session file, and an adapter ends its stream only once it has reaped the
     // process — so this is the first moment that file is settled. Holds for every
     // outcome alike: completed, failed, and cancelled.
-    for reply in compaction_waiters {
+    for reply in maintenance_waiters {
         let _ = reply.send(CurrentTurnWait::Idle);
     }
 

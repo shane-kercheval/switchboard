@@ -1706,3 +1706,38 @@ async fn compact_is_refused_as_an_unsupported_operation() {
         "expected UnsupportedOperation, got {err:?}"
     );
 }
+
+/// A `/context` breakdown is Claude-only: Codex exposes no context accounting at
+/// all, and the trait default refuses.
+///
+/// Defense in depth behind `HarnessKind::supports_context_report`. What a bypass
+/// must not produce is a `/context` *prompt* — Codex answers one by writing a
+/// plausible breakdown out of nothing, and a fabricated set of token counts is
+/// worse than no panel (harness-behavior §3.9).
+#[tokio::test]
+async fn context_report_is_refused_as_an_unsupported_operation() {
+    let adapter = CodexAdapter::with_binary_path(FAKE_CODEX);
+    let result = adapter
+        .context_report(
+            &codex_agent(),
+            Path::new("/tmp"),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await;
+
+    // `EventStream` is not `Debug`, so unwrap the error by hand.
+    let Err(err) = result else {
+        panic!("Codex must refuse a context report rather than returning a stream");
+    };
+    assert!(
+        matches!(
+            err,
+            DispatchError::UnsupportedOperation {
+                harness: HarnessKind::Codex,
+                ..
+            }
+        ),
+        "expected UnsupportedOperation, got {err:?}"
+    );
+}

@@ -193,6 +193,33 @@ impl HarnessKind {
             Self::Codex | Self::Antigravity => false,
         }
     }
+
+    /// Whether Switchboard can ask this harness for a **breakdown of what is
+    /// occupying the agent's context window** — the headless equivalent of the
+    /// interactive `/context`.
+    ///
+    /// True only for Claude, whose CLI intercepts `/context` locally on the
+    /// ordinary `-p` dispatch path and answers with both a structured
+    /// `context_usage` object and the printed table, at no model cost.
+    ///
+    /// **The fake-success hazard is the reason this is a predicate rather than
+    /// a universal `/context` prompt**, exactly as for
+    /// [`Self::supports_manual_compaction`]: Codex and Antigravity have no such
+    /// interception, so `/context` reaches them as an ordinary message and the
+    /// model writes a plausible-looking breakdown out of nothing — probed on
+    /// Codex, which answered a `/context` prompt with 58 output tokens of
+    /// invented figures. A fabricated context breakdown is worse than none,
+    /// because every number in it looks like a measurement. Per
+    /// `harness-behavior.md` §3.9.
+    ///
+    /// Same authority + exhaustiveness role as the siblings above.
+    #[must_use]
+    pub fn supports_context_report(self) -> bool {
+        match self {
+            Self::ClaudeCode => true,
+            Self::Codex | Self::Antigravity => false,
+        }
+    }
 }
 
 /// The two independent per-agent selection axes. A closed, complete set — model
@@ -328,6 +355,16 @@ mod tests {
         assert!(HarnessKind::ClaudeCode.supports_manual_compaction());
         assert!(!HarnessKind::Codex.supports_manual_compaction());
         assert!(!HarnessKind::Antigravity.supports_manual_compaction());
+    }
+
+    #[test]
+    fn supports_context_report_is_claude_only() {
+        // A `/context` prompt on the other two is answered by the model with an
+        // invented breakdown whose every figure reads as a measurement — this
+        // gate is what keeps the chevron and the menu item off those cards.
+        assert!(HarnessKind::ClaudeCode.supports_context_report());
+        assert!(!HarnessKind::Codex.supports_context_report());
+        assert!(!HarnessKind::Antigravity.supports_context_report());
     }
 
     #[test]

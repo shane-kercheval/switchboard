@@ -173,15 +173,17 @@ pub struct ParserState {
 }
 
 /// Which operation a [`ParserState`] is reading the stream of. Claude emits the
-/// same record vocabulary for both, but a compaction assigns different meaning
-/// to three of them — `system/status` carries the verdict, the `<synthetic>`
-/// assistant envelope is a diagnostic rather than an answer, and `result` is not
-/// the verdict at all.
+/// same record vocabulary for all three, but the maintenance operations assign
+/// different meaning to some of them — for a compaction, `system/status` carries
+/// the verdict, the `<synthetic>` assistant envelope is a diagnostic rather than
+/// an answer, and `result` is not the verdict at all; for a context report, the
+/// `<synthetic>` envelope *is* the whole payload and is swallowed whole.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamMode {
     #[default]
     Send,
     Compaction,
+    ContextReport,
 }
 
 /// What Claude's `system/status` record said about a requested compaction.
@@ -279,6 +281,10 @@ impl ParserState {
 
     fn compacting(&self) -> bool {
         self.mode == StreamMode::Compaction
+    }
+
+    fn reporting_context(&self) -> bool {
+        self.mode == StreamMode::ContextReport
     }
 
     /// The effort to stamp on this turn's terminal, or `None` to render nothing.
@@ -411,6 +417,18 @@ pub fn parse_line(
         Some("stream_event") => parse_stream_event(&value, turn_id, state),
         Some("result") => parse_result(&value, turn_id, state),
         Some("system") => parse_system_event(&value, turn_id, agent_id, state),
+        // In context-report mode the assistant envelope carries the report and
+        // nothing else, so it is intercepted **before** ordinary assistant
+        // handling rather than filtered inside it. The difference is not
+        // stylistic: `parse_assistant_envelope` would otherwise announce a
+        // `TurnIdentity` from the synthetic message's id and emit the printed
+        // table as content — giving the turn a durable dedup key pointing at a
+        // message no session file contains, and feeding the report's markdown to
+        // the dispatcher's `captured_text` and thence to the forward path. This
+        // way nothing downstream has to know to ignore report text.
+        Some("assistant") if state.reporting_context() => {
+            parse_context_report_envelope(&value, agent_id)
+        }
         Some("assistant") => parse_assistant_envelope(&value, turn_id, state),
         Some("user") => parse_user_envelope(&value, turn_id),
         Some("rate_limit_event") => parse_rate_limit_event(&value, agent_id, state),
@@ -636,7 +654,7 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
             turn_id,
             outcome,
             ended_at: Utc::now(),
-            usage: withhold_usage_on_failed_compaction(state, usage),
+            usage: withhold_usage_on_a_turn_that_measured_nothing(state, usage),
             context_window_source,
             spend,
             model: state.last_assistant_model.clone(),
@@ -653,7 +671,11 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
     // the heartbeat stays armed between cycles. The adapter emits the folded
     // terminal at stream EOF via `take_final_turn_end`, gated on exit status.
     state.pending_completed_terminal = Some(PendingCompletedTerminal {
-        usage,
+        // Gated on both paths, not just the failure one above: a context report
+        // succeeds, so the folded terminal is the only place its zero-valued
+        // usage could reach the wire. (A compaction only ever folds here when
+        // its verdict was `Succeeded`, where the gate is a no-op.)
+        usage: withhold_usage_on_a_turn_that_measured_nothing(state, usage),
         context_window_source,
         spend,
     });
@@ -721,7 +743,8 @@ fn compaction_failure(state: &ParserState, diagnostic: Option<&str>) -> Option<T
     })
 }
 
-/// Drop the usage record entirely when a compaction failed.
+/// Drop the usage record entirely when the turn measured nothing — a failed
+/// compaction, or any context report.
 ///
 /// A refused compaction's `result` carries an **empty** `modelUsage`, so the
 /// extractor falls back to `result.usage` — whose zero-valued token fields are
@@ -745,10 +768,21 @@ fn compaction_failure(state: &ParserState, diagnostic: Option<&str>) -> Option<T
 /// therefore the *verdict*, never the terminal outcome. Do not "simplify" this
 /// to "failed turns carry no usage"; that would re-break the dirty-exit case,
 /// which `a_folded_success_still_fails_on_a_dirty_exit` pins.
-fn withhold_usage_on_failed_compaction(
+///
+/// **A context report is withheld unconditionally**, for the same mechanism and
+/// a simpler reason: it makes no model call at all, so its `modelUsage` is
+/// always empty and its `result.usage` always schema-present zeros. It is free
+/// by construction, so there is no turn it could truthfully bill — and letting
+/// its zero-Some through would make "the report does not blank the very bar its
+/// chevron opens" depend on the frontend suppressing the row, rather than on the
+/// event never carrying the number.
+fn withhold_usage_on_a_turn_that_measured_nothing(
     state: &ParserState,
     usage: Option<TurnUsage>,
 ) -> Option<TurnUsage> {
+    if state.reporting_context() {
+        return None;
+    }
     if state.compacting()
         && !matches!(
             &state.compaction_verdict,
@@ -1467,6 +1501,35 @@ fn stringify_tool_result_content(content: Option<&Value>) -> String {
         return texts.join("\n");
     }
     String::new()
+}
+
+/// Swallow a context report's synthetic `assistant` envelope and emit the
+/// decoded report — the only event a `/context` stream produces.
+///
+/// The structured object is `context_usage`; the printed table arrives as
+/// `local_command_source`, wrapped in the same `<local-command-stdout>` tags the
+/// session file uses. Both are handed to the decoder, which prefers the object
+/// and keeps the text either way.
+///
+/// `Skip` when the envelope carries neither, so a future stream that interleaves
+/// some other synthetic record into a report run does not produce an empty
+/// panel.
+fn parse_context_report_envelope(obj: &Value, agent_id: AgentId) -> ParseOutcome {
+    let structured = obj.get("context_usage");
+    let source = obj.get("local_command_source").and_then(Value::as_str);
+    if structured.is_none() && source.is_none() {
+        return ParseOutcome::Skip;
+    }
+    let raw = source.map_or("", |text| strip_local_command_stdout(text).unwrap_or(text));
+    ParseOutcome::Event(AdapterEvent::ContextReport {
+        agent_id,
+        report: crate::context_report::decode(structured, raw),
+    })
+}
+
+fn strip_local_command_stdout(text: &str) -> Option<&str> {
+    text.strip_prefix("<local-command-stdout>")
+        .and_then(|body| body.strip_suffix("</local-command-stdout>"))
 }
 
 fn parse_rate_limit_event(obj: &Value, agent_id: AgentId, state: &mut ParserState) -> ParseOutcome {
@@ -3719,6 +3782,230 @@ mod compaction_tests {
                 .iter()
                 .any(|e| matches!(e, AdapterEvent::TurnIdentity { .. })),
             "a send still announces its dedup identity"
+        );
+    }
+}
+
+/// Context-report-mode parsing, driven from the recorded `/context` stream in
+/// `tests/fixtures/claude/` (claude 2.1.274, Switchboard's exact argv).
+///
+/// The property under test throughout: **the report's envelope is swallowed
+/// whole**. Everything the run produces downstream of the parser is the
+/// `ContextReport` event and a terminal — no content, no turn identity, no
+/// usage — so nothing further along has to know that report text is not an
+/// answer.
+#[cfg(test)]
+mod context_report_tests {
+    use super::*;
+    use crate::context_report::ContextReport;
+
+    const REPORT: &str = include_str!("../tests/fixtures/claude/context-report.stream.jsonl");
+
+    fn tid() -> TurnId {
+        uuid::Uuid::nil()
+    }
+
+    fn aid() -> AgentId {
+        AgentId::from(uuid::Uuid::nil())
+    }
+
+    fn replay(fixture: &str) -> Vec<AdapterEvent> {
+        let mut state = ParserState::for_stream(StreamMode::ContextReport, None);
+        let (turn_id, agent_id) = (tid(), aid());
+        let mut events: Vec<AdapterEvent> = Vec::new();
+        for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
+            match parse_line(line, turn_id, agent_id, &mut state) {
+                ParseOutcome::Event(ev) => events.push(ev),
+                ParseOutcome::Events(evs) => events.extend(evs),
+                ParseOutcome::Skip => {}
+                ParseOutcome::Error(e) => panic!("unexpected parse error: {e}"),
+            }
+        }
+        if let Some(end) = state.take_final_turn_end(turn_id, TurnOutcome::Completed) {
+            events.push(end);
+        }
+        events
+    }
+
+    fn sole_report(events: &[AdapterEvent]) -> &ContextReport {
+        let found: Vec<&ContextReport> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ContextReport { report, .. } => Some(report),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one report per run: {events:#?}");
+        found[0]
+    }
+
+    #[test]
+    fn a_report_run_completes_carrying_the_decoded_report() {
+        let events = replay(REPORT);
+
+        let report = sole_report(&events);
+        assert!(!report.unparsed);
+        assert_eq!(report.model.as_deref(), Some("claude-fable-5-1"));
+        assert_eq!(report.max_tokens, Some(1_000_000));
+        assert_eq!(report.categories.len(), 11);
+        assert!(!report.raw.is_empty());
+
+        assert!(
+            matches!(
+                events.last(),
+                Some(AdapterEvent::TurnEnd {
+                    outcome: TurnOutcome::Completed,
+                    ..
+                })
+            ),
+            "events: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn a_report_run_emits_no_content_and_no_turn_identity() {
+        let events = replay(REPORT);
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::ContentChunk { .. })),
+            "the printed table must not reach the transcript as an answer: {events:#?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::TurnIdentity { .. })),
+            "the synthetic message id names a message no session file holds, so it \
+             must never become a dedup key: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn a_report_run_carries_no_usage_and_no_context_window() {
+        let events = replay(REPORT);
+
+        let Some(AdapterEvent::TurnEnd {
+            usage,
+            context_window_source,
+            model,
+            first_message_id,
+            stable_message_id,
+            ..
+        }) = events.last()
+        else {
+            panic!("expected a terminal, got {events:#?}");
+        };
+        // The run makes no model call: `modelUsage` is empty and `result.usage`
+        // is schema-present zeros. Emitting that would make the newest
+        // usage-bearing turn a free one with no window, blanking the context bar
+        // the panel was opened from.
+        assert!(usage.is_none(), "usage: {usage:?}");
+        assert!(context_window_source.is_none());
+        assert!(model.is_none());
+        assert!(first_message_id.is_none());
+        assert!(stable_message_id.is_none());
+    }
+
+    #[test]
+    fn a_report_run_still_reports_the_session_inventory() {
+        // `system/init` arrives on this dispatch like any other, and the card's
+        // environment row should not go stale because the user asked for a
+        // breakdown.
+        let events = replay(REPORT);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SessionMeta { .. })),
+            "events: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn a_report_whose_object_is_garbled_completes_with_the_raw_text() {
+        let garbled: String = REPORT
+            .lines()
+            .map(|line| {
+                let Ok(mut record) = serde_json::from_str::<Value>(line) else {
+                    return line.to_owned();
+                };
+                if let Some(object) = record.as_object_mut()
+                    && object.contains_key("context_usage")
+                {
+                    object.insert("context_usage".to_owned(), Value::Bool(true));
+                    object.insert(
+                        "local_command_source".to_owned(),
+                        Value::String(
+                            "<local-command-stdout>unreadable</local-command-stdout>".to_owned(),
+                        ),
+                    );
+                }
+                record.to_string()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        let events = replay(&garbled);
+
+        let report = sole_report(&events);
+        assert!(report.unparsed);
+        assert_eq!(report.raw, "unreadable");
+        assert!(
+            matches!(
+                events.last(),
+                Some(AdapterEvent::TurnEnd {
+                    outcome: TurnOutcome::Completed,
+                    ..
+                })
+            ),
+            "a report Switchboard cannot read is not a harness failure: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn a_synthetic_envelope_carrying_no_report_is_skipped() {
+        // Nothing in a `/context` run produces this today. If a future CLI
+        // interleaves some other synthetic record, it must not land as an empty
+        // panel that overwrites the previous report.
+        let mut state = ParserState::for_stream(StreamMode::ContextReport, None);
+        let line = r#"{"type":"assistant","message":{"id":"m1","model":"<synthetic>","content":[{"type":"text","text":"hi"}]}}"#;
+
+        assert!(matches!(
+            parse_line(line, tid(), aid(), &mut state),
+            ParseOutcome::Skip
+        ));
+    }
+
+    #[test]
+    fn outside_report_mode_the_same_envelope_is_ordinary_assistant_output() {
+        // The interception is mode-gated: an ordinary send that somehow carried
+        // a `context_usage` key must keep its existing handling.
+        let events = {
+            let mut state = ParserState::for_stream(StreamMode::Send, None);
+            let mut events = Vec::new();
+            for line in REPORT.lines().filter(|l| !l.trim().is_empty()) {
+                match parse_line(line, tid(), aid(), &mut state) {
+                    ParseOutcome::Event(ev) => events.push(ev),
+                    ParseOutcome::Events(evs) => events.extend(evs),
+                    ParseOutcome::Skip => {}
+                    ParseOutcome::Error(e) => panic!("unexpected parse error: {e}"),
+                }
+            }
+            events
+        };
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::ContextReport { .. })),
+            "events: {events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::TurnIdentity { .. })),
+            "events: {events:#?}"
         );
     }
 }

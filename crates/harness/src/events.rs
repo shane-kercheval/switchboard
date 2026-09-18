@@ -507,6 +507,15 @@ pub enum AdapterEvent {
         /// `NormalizedEvent` conversion below).
         source: SessionMetaSource,
     },
+    /// The breakdown of what is occupying this agent's context window, from a
+    /// `/context` run. Agent-scoped rather than turn-scoped: it describes the
+    /// agent's window, not the maintenance turn that measured it, and the
+    /// frontend files it on the agent's runtime state rather than the
+    /// transcript.
+    ContextReport {
+        agent_id: AgentId,
+        report: crate::context_report::ContextReport,
+    },
     /// A runtime-assigned session locator the adapter just learned (Codex's
     /// `thread_id`+date on first dispatch; Antigravity's conversation UUID on
     /// first dispatch or a fork-and-heal). The dispatcher persists it to the
@@ -645,6 +654,10 @@ pub enum NormalizedEvent {
         inventory: SessionInventory,
         raw: serde_json::Value,
     },
+    ContextReport {
+        agent_id: AgentId,
+        report: crate::context_report::ContextReport,
+    },
     /// A send **failed before any turn started**: either the journal write of
     /// the user's send failed (no durable record, no outcome marker), or the
     /// adapter failed to launch before `TurnStart` (the send was journaled and
@@ -732,6 +745,7 @@ impl AdapterEvent {
             | AdapterEvent::TurnEnd { .. } => true,
             AdapterEvent::RateLimitEvent { .. }
             | AdapterEvent::SessionMeta { .. }
+            | AdapterEvent::ContextReport { .. }
             | AdapterEvent::SessionLocatorCaptured { .. } => false,
         }
     }
@@ -852,6 +866,9 @@ impl AdapterEvent {
                 inventory,
                 raw,
             },
+            AdapterEvent::ContextReport { agent_id, report } => {
+                NormalizedEvent::ContextReport { agent_id, report }
+            }
             // Internal adapter → dispatcher event; persisted to the registry,
             // never shown to the frontend.
             AdapterEvent::SessionLocatorCaptured { .. } => return None,

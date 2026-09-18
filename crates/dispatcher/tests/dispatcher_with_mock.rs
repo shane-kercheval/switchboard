@@ -5358,19 +5358,22 @@ async fn wait_for_current_turn_resolves_when_registered_after_the_terminal() {
 }
 
 // ---------------------------------------------------------------------------
-// Compactions — the second kind of work an agent's actor runs.
+// Maintenance turns — compactions and context reports, the other two kinds of
+// work an agent's actor runs.
 //
-// These pin the ways a compaction must behave *identically* to a send (it
+// These pin the ways a maintenance turn must behave *identically* to a send (it
 // queues, streams, cancels, and parks idle the same way) and the ways it must
 // not (it journals nothing at all, it is not removable as a queued message, and
-// it never resolves a current-turn waiter with a conversational terminal).
+// it never resolves a current-turn waiter with a conversational terminal). The
+// two kinds share every one of those properties, so the report cases below are a
+// deliberate mirror of the compaction cases above rather than a new contract.
 // ---------------------------------------------------------------------------
 
-/// What [`compaction_fixture`] hands a test: the dispatcher under test, its
+/// What [`maintenance_fixture`] hands a test: the dispatcher under test, its
 /// recording emitter and journal, the agent, and the factory its actor is built
 /// from (already a trait object, since both `send_message` and `compact_agent`
 /// take one).
-type CompactionFixture = (
+type MaintenanceFixture = (
     Arc<Dispatcher>,
     Arc<RecordingEmitter>,
     Arc<RecordingJournal>,
@@ -5380,9 +5383,9 @@ type CompactionFixture = (
 
 /// Stand up a dispatcher + agent whose actor runs `scenarios` in order, with a
 /// journal the test can inspect. Mirrors the per-test boilerplate above; the
-/// compaction suite needs the journal on every case, since "nothing was written"
-/// is most of what it asserts.
-fn compaction_fixture(scenarios: impl IntoIterator<Item = MockScenario>) -> CompactionFixture {
+/// maintenance suite needs the journal on every case, since "nothing was
+/// written" is most of what it asserts.
+fn maintenance_fixture(scenarios: impl IntoIterator<Item = MockScenario>) -> MaintenanceFixture {
     let dispatcher = Arc::new(Dispatcher::new());
     let emitter = Arc::new(RecordingEmitter::new());
     let journal = Arc::new(RecordingJournal::default());
@@ -5398,21 +5401,21 @@ fn compaction_fixture(scenarios: impl IntoIterator<Item = MockScenario>) -> Comp
 
 /// Assert the journal holds nothing whatsoever. Deliberately exhaustive over
 /// every record kind rather than "no `Send`": the rule being protected is that a
-/// compaction leaves **no** durable trace, and an outcome marker or a send↔turn
-/// link would each be a visible transcript artifact for a turn the user never
-/// sent.
+/// maintenance turn leaves **no** durable trace, and an outcome marker or a
+/// send↔turn link would each be a visible transcript artifact for a turn the
+/// user never sent.
 fn assert_journal_untouched(journal: &RecordingJournal, after: &str) {
     assert!(
         journal.sends.lock().unwrap().is_empty(),
-        "a compaction journaled a send ({after})"
+        "journaled a send ({after})"
     );
     assert!(
         journal.outcomes.lock().unwrap().is_empty(),
-        "a compaction journaled an outcome marker ({after})"
+        "journaled an outcome marker ({after})"
     );
     assert!(
         journal.links.lock().unwrap().is_empty(),
-        "a compaction journaled a send↔turn link ({after})"
+        "journaled a send↔turn link ({after})"
     );
 }
 
@@ -5445,7 +5448,7 @@ async fn compaction_on_an_idle_agent_runs_at_once_and_parks_idle() {
     // on the terminal, then `AgentIdle`. The frontend renders its row entirely
     // from these, so they have to be the same events a send produces.
     let (dispatcher, emitter, journal, agent, factory) =
-        compaction_fixture([MockScenario::CompactsSuccessfully]);
+        maintenance_fixture([MockScenario::CompactsSuccessfully]);
     let send_id = SendId::now_v7();
 
     let message_id = dispatcher.compact_agent(agent.id, send_id, &factory);
@@ -5492,7 +5495,7 @@ async fn compaction_queues_behind_the_running_turn_and_an_earlier_queued_send() 
     // A compaction takes its FIFO place like any other work: it must not jump the
     // queue (it would compact away context the queued send was written against)
     // and it must not be starved.
-    let (dispatcher, emitter, _journal, agent, factory) = compaction_fixture([
+    let (dispatcher, emitter, _journal, agent, factory) = maintenance_fixture([
         MockScenario::AwaitCancellation,
         MockScenario::Streaming,
         MockScenario::CompactsSuccessfully,
@@ -5560,7 +5563,7 @@ async fn compaction_queues_behind_the_running_turn_and_an_earlier_queued_send() 
 #[tokio::test]
 async fn a_completed_compaction_journals_nothing() {
     let (dispatcher, emitter, journal, agent, factory) =
-        compaction_fixture([MockScenario::CompactsSuccessfully]);
+        maintenance_fixture([MockScenario::CompactsSuccessfully]);
     dispatcher.compact_agent(agent.id, SendId::now_v7(), &factory);
     within(
         &emitter,
@@ -5576,7 +5579,7 @@ async fn a_failed_compaction_journals_nothing() {
     // The case most likely to regress: a *failed* send journals an outcome
     // marker, and a compaction takes the same terminal path to get there.
     let (dispatcher, emitter, journal, agent, factory) =
-        compaction_fixture([MockScenario::CompactionFails]);
+        maintenance_fixture([MockScenario::CompactionFails]);
     dispatcher.compact_agent(agent.id, SendId::now_v7(), &factory);
     within(
         &emitter,
@@ -5603,7 +5606,7 @@ async fn a_cancelled_compaction_journals_nothing() {
     // The dispatcher *synthesizes* this terminal, which is a second, independent
     // journal-write path from the adapter-terminal one above.
     let (dispatcher, emitter, journal, agent, factory) =
-        compaction_fixture([MockScenario::CompactionAwaitsCancellation]);
+        maintenance_fixture([MockScenario::CompactionAwaitsCancellation]);
     let send_id = SendId::now_v7();
     dispatcher.compact_agent(agent.id, send_id, &factory);
     within(
@@ -5634,7 +5637,7 @@ async fn a_cancelled_compaction_journals_nothing() {
 async fn cancel_send_drops_a_queued_compaction_with_message_cancelled() {
     // A queued compaction is dropped by the same signal a queued send is, so the
     // frontend's pending entry resolves through a path it already handles.
-    let (dispatcher, emitter, journal, agent, factory) = compaction_fixture([
+    let (dispatcher, emitter, journal, agent, factory) = maintenance_fixture([
         MockScenario::AwaitCancellation,
         MockScenario::CompactsSuccessfully,
     ]);
@@ -5696,7 +5699,7 @@ async fn cancel_send_drops_a_queued_compaction_with_message_cancelled() {
 #[tokio::test]
 async fn cancel_agent_drains_a_running_compaction_like_a_send() {
     let (dispatcher, emitter, journal, agent, factory) =
-        compaction_fixture([MockScenario::CompactionAwaitsCancellation]);
+        maintenance_fixture([MockScenario::CompactionAwaitsCancellation]);
     dispatcher.compact_agent(agent.id, SendId::now_v7(), &factory);
     within(
         &emitter,
@@ -5732,7 +5735,7 @@ async fn a_queued_compaction_is_not_removable_as_a_queued_message() {
     // part that matters, leaves the work queued rather than dropping something
     // the caller could not restore. Reporting `NotQueued` here would be a lie
     // about an item that is still going to run.
-    let (dispatcher, emitter, _journal, agent, factory) = compaction_fixture([
+    let (dispatcher, emitter, _journal, agent, factory) = maintenance_fixture([
         MockScenario::AwaitCancellation,
         MockScenario::CompactsSuccessfully,
     ]);
@@ -5787,7 +5790,7 @@ async fn an_unsupported_compaction_fails_the_message_without_starting_a_turn() {
     // `MessageFailed` with no `send_id` (nothing durable to reconstruct), no
     // `TurnStart`, and an agent that still works afterwards.
     let (dispatcher, emitter, journal, agent, factory) =
-        compaction_fixture([MockScenario::Streaming]);
+        maintenance_fixture([MockScenario::Streaming]);
 
     dispatcher.compact_agent(agent.id, SendId::now_v7(), &factory);
     within(
@@ -5883,7 +5886,7 @@ async fn compaction_waiters_resolve_idle_at_drain(fail: bool) {
     let start_terminal = Arc::new(tokio::sync::Notify::new());
     let end_stream = Arc::new(tokio::sync::Notify::new());
     let (dispatcher, emitter, journal, agent, factory) =
-        compaction_fixture([MockScenario::CompactionOnSignals {
+        maintenance_fixture([MockScenario::CompactionOnSignals {
             start_terminal: Arc::clone(&start_terminal),
             end_stream: Arc::clone(&end_stream),
             fail,
@@ -5952,7 +5955,7 @@ async fn a_cancelled_compactions_waiter_resolves_idle_not_cancelled() {
     // invalidate — the caller should read disk, exactly as for the other
     // outcomes.
     let (dispatcher, emitter, _journal, agent, factory) =
-        compaction_fixture([MockScenario::CompactionAwaitsCancellation]);
+        maintenance_fixture([MockScenario::CompactionAwaitsCancellation]);
     let send_id = SendId::now_v7();
     dispatcher.compact_agent(agent.id, send_id, &factory);
     within(
@@ -5980,7 +5983,7 @@ async fn a_send_queued_behind_a_compaction_is_unaffected_by_its_waiter() {
     // run and journal exactly as if no waiter existed.
     let start_terminal = Arc::new(tokio::sync::Notify::new());
     let end_stream = Arc::new(tokio::sync::Notify::new());
-    let (dispatcher, emitter, journal, agent, factory) = compaction_fixture([
+    let (dispatcher, emitter, journal, agent, factory) = maintenance_fixture([
         MockScenario::CompactionOnSignals {
             start_terminal: Arc::clone(&start_terminal),
             end_stream: Arc::clone(&end_stream),
@@ -6035,4 +6038,291 @@ async fn a_send_queued_behind_a_compaction_is_unaffected_by_its_waiter() {
         "only the send is journaled; the compaction before it is not"
     );
     assert_eq!(sends[0].1, "after the compaction");
+}
+
+// ---------------------------------------------------------------------------
+// Context reports — the same work item as a compaction, with a different ask.
+//
+// Every property asserted above for a compaction holds here; these cases exist
+// because "identical behaviour" is a claim about the code, and the code reaches
+// it through separate `WorkPayload` and `TurnKind` variants that a future change
+// could give divergent arms without any test noticing.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_context_report_on_an_idle_agent_runs_at_once_and_parks_idle() {
+    let (dispatcher, emitter, journal, agent, factory) =
+        maintenance_fixture([MockScenario::ReportsContext]);
+    let send_id = SendId::now_v7();
+
+    let message_id = dispatcher.context_report_agent(agent.id, send_id, &factory);
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let start = sole_event(&emitter, "turn_start");
+    assert_eq!(
+        extract_message_id(&start),
+        message_id,
+        "TurnStart must correlate to the receipt context_report_agent returned"
+    );
+    assert_eq!(
+        start["send_id"].as_str().unwrap(),
+        send_id.to_string(),
+        "TurnStart must carry the send_id the caller can cancel with"
+    );
+
+    let report = sole_event(&emitter, "context_report");
+    assert_eq!(
+        report["report"]["max_tokens"].as_u64(),
+        Some(200_000),
+        "the decoded report must reach the frontend: {report:?}"
+    );
+
+    let end = sole_event(&emitter, "turn_end");
+    assert_eq!(extract_turn_id(&end), extract_turn_id(&start));
+    assert_eq!(end["outcome"]["status"].as_str(), Some("completed"));
+    assert!(
+        end["usage"].is_null(),
+        "a report makes no model call; a zero-valued usage record would make the \
+         newest usage-bearing turn a free one with no window: {end:?}"
+    );
+
+    let types: Vec<String> = emitter
+        .snapshot()
+        .iter()
+        .map(|(_, v)| event_type(v).to_owned())
+        .collect();
+    assert_eq!(
+        types,
+        ["turn_start", "context_report", "turn_end", "agent_idle"]
+    );
+    assert_journal_untouched(&journal, "a completed context report");
+}
+
+#[tokio::test]
+async fn a_context_report_queues_behind_the_running_turn_and_an_earlier_queued_send() {
+    // A report takes its FIFO place like any other work. It must not jump the
+    // queue — it would then measure a window the queued send is about to change,
+    // and report a number that is already stale when it renders.
+    let (dispatcher, emitter, _journal, agent, factory) = maintenance_fixture([
+        MockScenario::AwaitCancellation,
+        MockScenario::Streaming,
+        MockScenario::ReportsContext,
+    ]);
+
+    let running = dispatcher
+        .send_message(
+            agent.id,
+            "running",
+            vec![],
+            SendId::now_v7(),
+            Arc::clone(&factory),
+            OnBusy::Enqueue,
+        )
+        .await;
+    let SendOutcome::Accepted(running) = running else {
+        panic!("the first send must be accepted: {running:?}");
+    };
+    within(
+        &emitter,
+        "turn_start (running)",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+
+    let queued_send = dispatcher
+        .send_message(
+            agent.id,
+            "queued",
+            vec![],
+            SendId::now_v7(),
+            Arc::clone(&factory),
+            OnBusy::Enqueue,
+        )
+        .await;
+    let SendOutcome::Accepted(queued_send) = queued_send else {
+        panic!("the second send must be accepted: {queued_send:?}");
+    };
+
+    let report = dispatcher.context_report_agent(agent.id, SendId::now_v7(), &factory);
+    assert_eq!(
+        started_message_ids(&emitter),
+        vec![running],
+        "the report must not start while other work is in flight or queued"
+    );
+
+    assert_eq!(
+        dispatcher.cancel(agent.id, CancelSource::User),
+        CancelOutcome::Requested
+    );
+    within(
+        &emitter,
+        "turn_start (all three)",
+        emitter.wait_for_type("turn_start", 3),
+    )
+    .await;
+    assert_eq!(
+        started_message_ids(&emitter),
+        vec![running, queued_send, report],
+        "the report runs only after both earlier items terminate"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_context_report_journals_nothing() {
+    let (dispatcher, emitter, journal, agent, factory) =
+        maintenance_fixture([MockScenario::ContextReportFails]);
+
+    dispatcher.context_report_agent(agent.id, SendId::now_v7(), &factory);
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let end = sole_event(&emitter, "turn_end");
+    assert_eq!(end["outcome"]["status"].as_str(), Some("failed"));
+    assert_eq!(
+        count_type(&emitter.snapshot(), "context_report"),
+        0,
+        "a failed run has no report to file"
+    );
+    assert_journal_untouched(&journal, "a failed context report");
+}
+
+#[tokio::test]
+async fn a_cancelled_context_report_journals_nothing() {
+    let (dispatcher, emitter, journal, agent, factory) =
+        maintenance_fixture([MockScenario::ContextReportAwaitsCancellation]);
+    let send_id = SendId::now_v7();
+
+    dispatcher.context_report_agent(agent.id, send_id, &factory);
+    within(
+        &emitter,
+        "turn_start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    dispatcher.cancel_send(send_id, &[agent.id], CancelSource::User);
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let end = sole_event(&emitter, "turn_end");
+    assert_eq!(
+        end["outcome"]["status"].as_str(),
+        Some("cancelled"),
+        "cancel-send on the report's own send_id cancels it"
+    );
+    assert_journal_untouched(&journal, "a cancelled context report");
+}
+
+#[tokio::test]
+async fn a_cancelled_context_reports_waiter_resolves_idle_not_cancelled() {
+    // Same answer a compaction gives, and for the same reason: there is no
+    // conversational turn to invalidate, so the caller should read disk.
+    let (dispatcher, emitter, _journal, agent, factory) =
+        maintenance_fixture([MockScenario::ContextReportAwaitsCancellation]);
+    let send_id = SendId::now_v7();
+    dispatcher.context_report_agent(agent.id, send_id, &factory);
+    within(
+        &emitter,
+        "turn_start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+
+    // The helper's own assertion doubles as the proof that a report reports
+    // running for the whole drain, and reports its own kind while doing so.
+    let waiter =
+        register_current_turn_wait(&dispatcher, agent.id, TurnKind::ContextReport, "mid-report")
+            .await;
+    dispatcher.cancel_send(send_id, &[agent.id], CancelSource::User);
+    assert_eq!(current_turn_within(waiter).await, CurrentTurnWait::Idle);
+}
+
+#[tokio::test]
+async fn a_queued_context_report_is_not_removable_as_a_queued_message() {
+    let (dispatcher, emitter, _journal, agent, factory) = maintenance_fixture([
+        MockScenario::AwaitCancellation,
+        MockScenario::ReportsContext,
+    ]);
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "first",
+            vec![],
+            SendId::now_v7(),
+            Arc::clone(&factory),
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "turn_start (running)",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+
+    let report = dispatcher.context_report_agent(agent.id, SendId::now_v7(), &factory);
+    assert_eq!(
+        dispatcher
+            .remove_queued_message(agent.id, report)
+            .await
+            .unwrap_err(),
+        RemoveQueuedMessageError::NotRemovable
+    );
+
+    assert_eq!(
+        dispatcher.cancel(agent.id, CancelSource::User),
+        CancelOutcome::Requested
+    );
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    assert!(
+        started_message_ids(&emitter).contains(&report),
+        "the refused removal must have left the report queued, not dropped it"
+    );
+}
+
+#[tokio::test]
+async fn an_unsupported_context_report_fails_the_message_without_starting_a_turn() {
+    let (dispatcher, emitter, journal, agent, factory) =
+        maintenance_fixture([MockScenario::Streaming]);
+
+    dispatcher.context_report_agent(agent.id, SendId::now_v7(), &factory);
+    within(
+        &emitter,
+        "message_failed",
+        emitter.wait_for_type("message_failed", 1),
+    )
+    .await;
+
+    let failed = sole_event(&emitter, "message_failed");
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not support this operation"),
+        "got: {failed:?}"
+    );
+    assert!(
+        failed["send_id"].is_null(),
+        "nothing was journaled, so the frontend must invent no transcript row"
+    );
+    assert_eq!(count_type(&emitter.snapshot(), "turn_start"), 0);
+    assert_journal_untouched(&journal, "a refused context report");
 }

@@ -185,6 +185,32 @@ pub trait HarnessAdapter: Send + Sync {
         })
     }
 
+    /// Ask the harness for a **breakdown of what is occupying this agent's
+    /// context window** and stream the result. Same `cwd` and stream contracts
+    /// as [`Self::dispatch`] and [`Self::compact`].
+    ///
+    /// A distinct operation for the same reason compaction is one: it carries
+    /// no prompt, journals nothing, and its result is a structured report rather
+    /// than an answer. It differs from compaction in costing nothing — the CLI
+    /// answers it locally, with no model call.
+    ///
+    /// The default implementation refuses with
+    /// [`DispatchError::UnsupportedOperation`]; see
+    /// `HarnessKind::supports_context_report` for which harnesses that covers
+    /// and why a `/context` *prompt* is not an acceptable substitute.
+    async fn context_report(
+        &self,
+        agent: &AgentRecord,
+        _cwd: &Path,
+        _turn_id: TurnId,
+        _options: DispatchOptions,
+    ) -> Result<EventStream, DispatchError> {
+        Err(DispatchError::UnsupportedOperation {
+            harness: agent.harness,
+            operation: "context breakdown",
+        })
+    }
+
     /// Pre-flight check that the harness can be invoked. Returns
     /// `BinaryNotFound` if the binary is missing; `Ok(())` if the adapter
     /// is ready to dispatch. In-process adapters (e.g., the mock) return

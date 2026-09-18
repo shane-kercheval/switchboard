@@ -230,6 +230,56 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             options.cancel_token,
         )
     }
+
+    /// Ask Claude what is occupying this agent's context window. Shares every
+    /// dispatch flag with a send for the same reason `compact` does — the report
+    /// measures the window the agent's own model runs in, so it must be
+    /// requested under that model's configuration.
+    ///
+    /// Unlike a compaction this costs nothing: the CLI answers `/context`
+    /// locally, with no model call (`total_cost_usd: 0`, empty `modelUsage`).
+    ///
+    /// Fails closed with no session file, and resumes rather than forks, for the
+    /// reasons spelled out on `compact` — a maintenance action must never mint a
+    /// session or materialize a fork as a side effect.
+    async fn context_report(
+        &self,
+        agent: &AgentRecord,
+        cwd: &Path,
+        turn_id: TurnId,
+        options: crate::DispatchOptions,
+    ) -> Result<EventStream, DispatchError> {
+        let Some(SessionLocator::Uuid(session_id)) = &agent.session_locator else {
+            return Err(DispatchError::InvalidAgentState(format!(
+                "Claude agent {} has no session locator — there is no context to report on",
+                agent.id
+            )));
+        };
+        if !session_file_exists(cwd, session_id) {
+            return Err(DispatchError::InvalidAgentState(format!(
+                "Claude agent {} has no session file yet — there is no context to report on",
+                agent.id
+            )));
+        }
+        let binary = crate::subprocess::resolve_binary(&self.claude_binary_path)?;
+        let args = build_args(&BuildArgsInput {
+            agent,
+            invocation: Invocation::Context,
+            cwd,
+            chrome: options.chrome_integration,
+            home_override: None,
+            grants: &self.working_directory_grants,
+        });
+        spawn_stream(
+            &binary,
+            &args,
+            cwd,
+            agent,
+            turn_id,
+            StreamMode::ContextReport,
+            options.cancel_token,
+        )
+    }
 }
 
 /// Spawn `claude` with `args` and return the parsed event stream. Shared by
@@ -301,6 +351,9 @@ enum Invocation<'a> {
     /// Compact the agent's existing conversation. See
     /// [`ClaudeCodeAdapter::compact`].
     Compact,
+    /// Report what is occupying the agent's context window. See
+    /// [`ClaudeCodeAdapter::context_report`].
+    Context,
 }
 
 /// Everything one `claude -p` invocation is built from. A struct rather than
@@ -346,9 +399,9 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
         // its actual cwd, so any divergence here means we look in the
         // wrong place and pass `--session-id` when we should `--resume`.
         //
-        // Only the prompt arms consult the file — a compaction resumes its own
-        // session whatever the answer — so short-circuit rather than stat a path
-        // whose result the `Compact` arm discards.
+        // Only the prompt arms consult the file — the maintenance invocations
+        // resume their own session whatever the answer — so short-circuit rather
+        // than stat a path whose result those arms discard.
         let exists = matches!(invocation, Invocation::Prompt(_))
             && match home_override {
                 Some(home) => session_exists_in(home, cwd, session_id),
@@ -362,18 +415,19 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
             // appear exactly once in its lifetime even though the provenance
             // field is never cleared.
             //
-            // A compaction takes it **unconditionally**, whatever the file says.
-            // It is never a session's first dispatch — there would be nothing to
-            // compact — and it must never materialize a fork as the side effect
-            // of a maintenance action: Claude's fork is a turn that needs a
-            // prompt, and a compaction has none. `compact` refuses before
-            // spawning when the file is absent, which is where the actionable
-            // error comes from; this pattern is what makes "a compaction can
-            // neither mint nor fork a session" true by construction rather than
-            // by call order. If the file vanishes in between, claude reports an
+            // A compaction or a context report takes it **unconditionally**,
+            // whatever the file says. Neither is ever a session's first dispatch
+            // — there would be nothing to compact or to measure — and neither
+            // may materialize a fork as the side effect of a maintenance action:
+            // Claude's fork is a turn that needs a prompt, and these carry none.
+            // Both operations refuse before spawning when the file is absent,
+            // which is where the actionable error comes from; this pattern is
+            // what makes "a maintenance action can neither mint nor fork a
+            // session" true by construction rather than by call order. If the file vanishes in between, claude reports an
             // unresumable session and the turn fails cleanly — which is the
             // right failure, unlike silently branching or minting one.
-            (Invocation::Compact, _, _) | (Invocation::Prompt(_), true, _) => {
+            (Invocation::Compact | Invocation::Context, _, _)
+            | (Invocation::Prompt(_), true, _) => {
                 args.push("--resume".to_owned());
                 args.push(session_id.to_string());
             }
@@ -449,6 +503,11 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
         // exception out of the escape; it is a separate operation whose
         // positional never passes through it.
         Invocation::Compact => COMPACT_COMMAND.to_owned(),
+        // Bare and unescaped for the same reason, and with the same
+        // consequence if it were not: a space-prefixed `/context` would reach
+        // the model as a message, and the model would answer it with a
+        // fabricated breakdown rather than the CLI's measurement.
+        Invocation::Context => CONTEXT_COMMAND.to_owned(),
     });
     args
 }
@@ -457,6 +516,9 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
 /// `/compact <instructions>`; custom instructions are deliberately out of scope,
 /// so this is the whole argument.
 const COMPACT_COMMAND: &str = "/compact";
+
+/// The exact positional a context report sends. `/context` takes no arguments.
+const CONTEXT_COMMAND: &str = "/context";
 
 /// The exact text handed to `claude -p` for a given dispatch prompt.
 ///
@@ -1008,13 +1070,14 @@ mod tests {
     }
 
     #[test]
-    fn compaction_argv_matches_send_argv_except_the_positional() {
-        // The property that keeps the two from drifting: a compaction runs with
-        // the agent's *entire* dispatch configuration — resume, model, effort,
-        // chrome, --add-dir, --include-partial-messages — because the
-        // summarization call is real, billed work the user chose that model for.
-        // Any flag a future change adds to a send lands on a compaction too, or
-        // this fails.
+    fn maintenance_argv_matches_send_argv_except_the_positional() {
+        // The property that keeps them from drifting: a maintenance invocation
+        // runs with the agent's *entire* dispatch configuration — resume, model,
+        // effort, chrome, --add-dir, --include-partial-messages — because it
+        // acts on the conversation the user configured that way. (A compaction's
+        // summarization is real billed work under the chosen model; a context
+        // report measures the window that model runs in.) Any flag a future
+        // change adds to a send lands on both, or this fails.
         let home = tempfile::TempDir::new().unwrap();
         let project = tempfile::TempDir::new().unwrap();
         let session_id = Uuid::now_v7();
@@ -1029,36 +1092,43 @@ mod tests {
             chrome: true,
             ..input(&agent, project.path(), home.path())
         });
-        let compaction = build_args(&BuildArgsInput {
-            invocation: Invocation::Compact,
-            chrome: true,
-            ..input(&agent, project.path(), home.path())
-        });
 
-        assert_eq!(
-            send.len(),
-            compaction.len(),
-            "same argv shape: {send:?} vs {compaction:?}"
-        );
-        assert_eq!(
-            send[..send.len() - 1],
-            compaction[..compaction.len() - 1],
-            "every flag identical; only the positional may differ"
-        );
-        assert_eq!(
-            compaction.last().map(String::as_str),
-            Some("/compact"),
-            "bare and UNESCAPED — the transport space-prefix is never on this path"
-        );
-        assert_eq!(compaction[compaction.len() - 2], "--");
+        for (invocation, positional) in [
+            (Invocation::Compact, "/compact"),
+            (Invocation::Context, "/context"),
+        ] {
+            let args = build_args(&BuildArgsInput {
+                invocation,
+                chrome: true,
+                ..input(&agent, project.path(), home.path())
+            });
+
+            assert_eq!(
+                send.len(),
+                args.len(),
+                "same argv shape for {positional}: {send:?} vs {args:?}"
+            );
+            assert_eq!(
+                send[..send.len() - 1],
+                args[..args.len() - 1],
+                "every flag identical for {positional}; only the positional may differ"
+            );
+            assert_eq!(
+                args.last().map(String::as_str),
+                Some(positional),
+                "bare and UNESCAPED — the transport space-prefix is never on this path"
+            );
+            assert_eq!(args[args.len() - 2], "--");
+        }
     }
 
     #[test]
-    fn compaction_always_resumes_its_own_session_never_forks() {
-        // A compaction must not materialize a fork as the side effect of a
-        // maintenance action: Claude's fork is a turn that needs a prompt. An
-        // unmaterialized fork is the exact record shape that would otherwise
-        // take the fork branch, so pin it here rather than trusting call order.
+    fn maintenance_always_resumes_its_own_session_never_forks() {
+        // A maintenance invocation must not materialize a fork as a side effect:
+        // Claude's fork is a turn that needs a prompt, and neither of these has
+        // one. An unmaterialized fork is the exact record shape that would
+        // otherwise take the fork branch, so pin it here rather than trusting
+        // call order.
         let home = tempfile::TempDir::new().unwrap();
         let project = tempfile::TempDir::new().unwrap();
         let session_id = Uuid::now_v7();
@@ -1068,19 +1138,77 @@ mod tests {
             ..agent_with_session(session_id)
         };
 
-        let args = build_args(&BuildArgsInput {
-            invocation: Invocation::Compact,
-            ..input(&agent, project.path(), home.path())
-        });
+        for invocation in [Invocation::Compact, Invocation::Context] {
+            let args = build_args(&BuildArgsInput {
+                invocation,
+                ..input(&agent, project.path(), home.path())
+            });
 
-        assert!(!args.contains(&"--fork-session".to_owned()));
+            assert!(!args.contains(&"--fork-session".to_owned()));
+            assert!(
+                !args.contains(&"--session-id".to_owned()),
+                "a maintenance action can neither mint nor branch a session: {args:?}"
+            );
+            assert!(!args.contains(&parent_session.to_string()));
+            let resume = flag_at(&args, "--resume");
+            assert_eq!(args[resume + 1], session_id.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn context_report_refuses_an_agent_with_no_session_file() {
+        // Fail closed for the same reason `compact` does: letting the CLI
+        // proceed would mint a fresh session whose entire contents are one
+        // context report, or branch a fork as the side effect of a read.
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::now_v7());
+        let adapter = ClaudeCodeAdapter::with_binary_path("claude");
+
+        let err = adapter
+            .context_report(
+                &agent,
+                project.path(),
+                Uuid::now_v7(),
+                crate::DispatchOptions::default(),
+            )
+            .await;
+
+        // `EventStream` is not `Debug`, so unwrap the error by hand.
+        let Err(err) = err else {
+            panic!("no session file — nothing to report on");
+        };
         assert!(
-            !args.contains(&"--session-id".to_owned()),
-            "a compaction can neither mint nor branch a session"
+            matches!(err, DispatchError::InvalidAgentState(_)),
+            "expected InvalidAgentState, got {err:?}"
         );
-        assert!(!args.contains(&parent_session.to_string()));
-        let resume = flag_at(&args, "--resume");
-        assert_eq!(args[resume + 1], session_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn context_report_refuses_an_agent_with_no_session_locator() {
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = AgentRecord {
+            session_locator: None,
+            ..agent_with_session(Uuid::now_v7())
+        };
+        let adapter = ClaudeCodeAdapter::with_binary_path("claude");
+
+        let err = adapter
+            .context_report(
+                &agent,
+                project.path(),
+                Uuid::now_v7(),
+                crate::DispatchOptions::default(),
+            )
+            .await;
+
+        // `EventStream` is not `Debug`, so unwrap the error by hand.
+        let Err(err) = err else {
+            panic!("no locator — nothing to report on");
+        };
+        assert!(
+            matches!(err, DispatchError::InvalidAgentState(_)),
+            "expected InvalidAgentState, got {err:?}"
+        );
     }
 
     #[tokio::test]

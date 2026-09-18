@@ -487,6 +487,30 @@ describe("buildUnifiedRows: system markers (compaction)", () => {
     expect((marker as Extract<UnifiedRow, { kind: "system_marker" }>).send_id).toBeUndefined();
   });
 
+  it("gives a context-report marker no row at all", () => {
+    // Not "renders an empty body": the row snippet draws the agent name and the
+    // hover timestamp *around* the marker, so an empty body would still leave a
+    // bare labelled row in the transcript. A breakdown is not conversation, and
+    // its content reaches the user through the panel instead.
+    const rows = buildUnifiedRows(
+      [
+        userTurn(TURN_1, AGENT_A, "2026-05-16T00:00:00Z", "go", SEND_1),
+        agentTurn("a1", AGENT_A, "2026-05-16T00:00:01Z", SEND_1),
+      ],
+      [
+        {
+          kind: "system_marker",
+          id: `marker:${AGENT_A}:report`,
+          agent_id: AGENT_A,
+          marker: { marker_kind: "context_report", report: { raw: "## Context Usage" } },
+          at: "2026-05-16T00:00:02Z",
+        },
+      ],
+    );
+
+    expect(rows.map((r) => r.kind)).toEqual(["user", "agent"]);
+  });
+
   it("attributes a marker to its own agent and prunes it when that agent leaves the roster", () => {
     // Agent B's marker must not leak into a roster that no longer includes B —
     // the marker is per-agent, not project-wide.

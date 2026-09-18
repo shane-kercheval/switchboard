@@ -1,6 +1,7 @@
 <script lang="ts">
   import {
     Check,
+    ChartPie,
     Columns2,
     Eye,
     EyeOff,
@@ -19,12 +20,13 @@
   import type { AgentSelection, AgentRecord, AgentId, ProjectId } from "$lib/types";
   import {
     dispatchCompaction,
+    dispatchContextReport,
     retryAgentHydration,
     runtimes,
     stopAgent,
     transcripts,
   } from "$lib/state/index.svelte";
-  import { supportsManualCompaction } from "$lib/harnessCapabilities";
+  import { supportsContextReport, supportsManualCompaction } from "$lib/harnessCapabilities";
   import {
     removeAgent,
     renameAgent,
@@ -86,6 +88,7 @@
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import Meter from "$lib/components/ui/Meter.svelte";
   import AgentEnvironment from "$lib/components/AgentEnvironment.svelte";
+  import ContextBreakdown from "$lib/components/ContextBreakdown.svelte";
   import { ICON_BUTTON_CLASS, ICON_BUTTON_ON_PANEL_CLASS } from "$lib/components/ui/iconButton";
 
   /// An agent is "active" — currently driving work — when its turn is in-flight
@@ -662,6 +665,19 @@
     await dispatchCompaction(agentId, crypto.randomUUID());
   }
 
+  /// The agent whose breakdown panel is open, or `null`. One at a time — the
+  /// panel is a modal.
+  let breakdownAgentId = $state<AgentId | null>(null);
+  const breakdownAgent = $derived(
+    breakdownAgentId === null ? undefined : agents.find((a) => a.id === breakdownAgentId),
+  );
+
+  /// Unlike the compact button, no arm-then-confirm step: a report costs
+  /// nothing, changes nothing, and is the thing the user just asked for.
+  async function startContextReport(agentId: AgentId): Promise<void> {
+    await dispatchContextReport(agentId, crypto.randomUUID());
+  }
+
   type ContextOccupancy = { usedTokens: number; windowTokens: number; fraction: number };
 
   /// Context occupancy — `context_tokens_after_turn` over `context_window`
@@ -1149,6 +1165,21 @@
                         Stop agent
                       </DropdownMenuItem>
                     {/if}
+                    {#if supportsContextReport(agent.harness)}
+                      <DropdownMenuItem
+                        onSelect={() => (breakdownAgentId = agent.id)}
+                        class="gap-2"
+                        data-testid="agent-action-context-breakdown"
+                      >
+                        <ChartPie
+                          size={14}
+                          strokeWidth={1.8}
+                          class="text-muted shrink-0"
+                          aria-hidden="true"
+                        />
+                        Context breakdown…
+                      </DropdownMenuItem>
+                    {/if}
                     {#if supportsManualCompaction(agent.harness)}
                       <!-- Never disabled while busy: a compaction queues behind
                            the running turn like any other work, so greying it out
@@ -1506,6 +1537,25 @@
                   detail="{formatTokens(context.usedTokens)} / {formatTokens(context.windowTokens)}"
                   class="flex-1"
                 />
+                {#if supportsContextReport(agent.harness)}
+                  <!-- The meter says how full; this opens what it is full of.
+                       No arm-then-confirm step, unlike the compact button
+                       beside it: opening the panel runs nothing at all. -->
+                  <Tooltip label="Context breakdown" side="top">
+                    {#snippet trigger(props)}
+                      <button
+                        {...props}
+                        type="button"
+                        class="text-muted hover:text-fg hover:bg-active -mb-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded"
+                        aria-label="Context breakdown"
+                        data-testid="agent-context-breakdown-button"
+                        onclick={() => (breakdownAgentId = agent.id)}
+                      >
+                        <ChartPie size={13} strokeWidth={1.8} aria-hidden="true" />
+                      </button>
+                    {/snippet}
+                  </Tooltip>
+                {/if}
                 {#if supportsManualCompaction(agent.harness)}
                   {@const armed = compactConfirmAgentId === agent.id}
                   {#snippet compactButton(props: Record<string, unknown>, armed: boolean)}
@@ -1590,6 +1640,20 @@
     </div>
   </SidebarSection>
 </SidebarPanel>
+
+<ContextBreakdown
+  open={breakdownAgent !== undefined}
+  onClose={() => (breakdownAgentId = null)}
+  agentName={breakdownAgent?.name ?? ""}
+  report={breakdownAgentId === null ? undefined : runtimes[breakdownAgentId]?.last_context_report}
+  asOf={breakdownAgentId === null ? null : runtimes[breakdownAgentId]?.last_context_report_as_of}
+  request={breakdownAgentId === null
+    ? undefined
+    : runtimes[breakdownAgentId]?.context_report_request}
+  onRefresh={() => {
+    if (breakdownAgentId !== null) void startContextReport(breakdownAgentId);
+  }}
+/>
 
 <Dialog
   bind:open={resumeOpen}

@@ -4535,3 +4535,112 @@ async fn live_claude_compact_refusal_surfaces_as_a_failed_turn() {
     assert_eq!(*stable_message_id, None);
     assert_eq!(*first_message_id, None);
 }
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_context_report_parses() {
+    // The breakdown panel reads `assistant.context_usage`, a structured object
+    // that appears in no published Claude Code documentation — it was found by
+    // re-probing 2.1.274 with Switchboard's exact argv. A fixture replays the
+    // shape we recorded and would keep passing forever after the CLI renamed a
+    // key or dropped the object.
+    //
+    // **The failure mode this guards is a quiet downgrade, not a crash.** With
+    // the object gone the decoder falls back to scraping the printed markdown,
+    // which still produces a panel — one whose every token count is the CLI's
+    // rounded figure (`4k`, `~30`) rather than the exact one. So this asserts
+    // the *structured* path ran, which is the only thing that distinguishes the
+    // two.
+    //
+    // Costs one extra local command and no model call: `/context` is
+    // intercepted by the CLI (`total_cost_usd: 0`, empty `modelUsage`).
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+
+    // A report needs a session to measure, and fails closed without one.
+    let warmup = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Reply with the single word 'ack'",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let _: Vec<AdapterEvent> = warmup.collect().await;
+
+    let turn_id = Uuid::now_v7();
+    let stream = adapter
+        .context_report(
+            &agent,
+            Path::new("/tmp"),
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("a context report should launch against the session the warmup created");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let report = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::ContextReport { report, .. } => Some(report),
+            _ => None,
+        })
+        .expect("a `/context` run must emit exactly one ContextReport: {events:?}");
+
+    assert!(
+        !report.unparsed,
+        "neither decoder could read the report — the CLI's output shape has moved: {}",
+        report.raw
+    );
+    assert!(
+        report
+            .categories
+            .iter()
+            .all(|category| !category.approximate)
+            && report.skills.iter().all(|skill| !skill.approximate),
+        "every count is exact only on the structured path; an approximate one means \
+         `context_usage` is gone and the markdown scraper ran instead: {report:?}"
+    );
+    assert!(
+        report.max_tokens.is_some_and(|max| max > 0),
+        "`raw_max_tokens` must still arrive — without it the panel has no scale and \
+         renders no meters at all: {report:?}"
+    );
+    assert!(
+        report.total_tokens.is_some_and(|used| used > 0),
+        "`total_tokens` must still arrive: {report:?}"
+    );
+    assert!(
+        !report.categories.is_empty(),
+        "`categories` is the breakdown itself; an empty list is an empty panel: {report:?}"
+    );
+    assert!(
+        report
+            .categories
+            .iter()
+            .all(|category| !category.name.is_empty()),
+        "every category renders under its own name: {report:?}"
+    );
+
+    // The report is swallowed whole: nothing downstream should have to know
+    // that its markdown is not an answer.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::ContentChunk { .. })),
+        "the printed table must not reach the transcript as content: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "the report turn must complete: {events:?}"
+    );
+}

@@ -743,21 +743,24 @@
     });
   }
 
-  /// Per-agent collapsed state. Default expanded; ephemeral (resets on reload).
-  let collapsed = $state<Record<string, boolean>>({});
-
   function toggleCollapsed(agentId: AgentId): void {
-    collapsed[agentId] = !collapsed[agentId];
+    layout.setAgentCardCollapsed(
+      projectId,
+      agentId,
+      !layout.agentCardCollapsedFor(projectId, agentId),
+    );
   }
 
-  const allExpanded = $derived(agents.every((a) => !(collapsed[a.id] ?? false)));
+  const allExpanded = $derived(
+    agents.every((agent) => !layout.agentCardCollapsedFor(projectId, agent.id)),
+  );
 
   function toggleAll(): void {
-    if (allExpanded) {
-      for (const a of agents) collapsed[a.id] = true;
-    } else {
-      for (const a of agents) delete collapsed[a.id];
-    }
+    layout.setAllAgentCardsCollapsed(
+      projectId,
+      agents.map((agent) => agent.id),
+      allExpanded,
+    );
   }
 
   /// Inline rename editor. Only one card edits at a time, so a single
@@ -997,7 +1000,7 @@
           agent.effort === null &&
           agent.model_choices.length === 0 &&
           agent.effort_choices.length === 0}
-        {@const isCollapsed = collapsed[agent.id] ?? false}
+        {@const isCollapsed = layout.agentCardCollapsedFor(projectId, agent.id)}
         {@const active = isActive(agent.id)}
         {@const recipientSelected = !workflowActive && recipientSelection.includes(agent.id)}
         {@const sessionInfo = sessionInfoByAgent[agent.id]}

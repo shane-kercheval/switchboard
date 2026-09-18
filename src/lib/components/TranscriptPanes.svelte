@@ -23,6 +23,7 @@
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
+  import TruncatedText from "$lib/components/ui/TruncatedText.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import { cn } from "$lib/utils";
   import { shortcut } from "$lib/platform";
@@ -631,15 +632,19 @@
                 <div class="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
                   {#each paneMemberAgents(pane) as member (member.id)}
                     <span
-                      class="border-border bg-panel text-fg inline-flex h-5 max-w-28 min-w-0 items-center gap-1 rounded-full border px-1.5 text-[11px]"
+                      class="group/member border-border bg-panel text-fg inline-flex h-5 max-w-full min-w-0 items-center rounded-full border px-1.5 text-[11px]"
                       data-testid="pane-member-chip"
                       data-agent-id={member.id}
                     >
-                      <HarnessIcon harness={member.harness} size="sm" class="h-3 w-3 shrink-0" />
-                      <span class="truncate">{member.name}</span>
+                      <HarnessIcon
+                        harness={member.harness}
+                        size="sm"
+                        class="mr-1 h-3 w-3 shrink-0"
+                      />
+                      <TruncatedText text={member.name} testid="pane-member-name" />
                       <button
                         type="button"
-                        class="text-muted hover:text-status-failed hover:border-status-failed hover:bg-status-failed-soft/70 -mr-1 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-transparent"
+                        class="text-muted hover:text-status-failed hover:border-status-failed hover:bg-status-failed-soft/70 pointer-events-none inline-flex h-4 w-0 shrink-0 items-center justify-center overflow-hidden rounded-full border border-transparent opacity-0 transition-[width,margin,opacity] group-focus-within/member:pointer-events-auto group-focus-within/member:ml-1 group-focus-within/member:w-4 group-focus-within/member:opacity-100 group-hover/member:pointer-events-auto group-hover/member:ml-1 group-hover/member:w-4 group-hover/member:opacity-100"
                         aria-label={`Remove ${member.name} from ${pane.name}`}
                         data-testid="pane-member-remove"
                         onclick={(event) => {

@@ -44,6 +44,8 @@ const BOB: AgentRecord = {
   effort_choices: [],
   created_at: "2026-05-16T00:00:01Z",
 };
+const LONG_AGENT_NAME = "reviewer-with-an-unnecessarily-long-distinguishing-suffix";
+const LONG_BOB: AgentRecord = { ...BOB, name: LONG_AGENT_NAME };
 const ROSTER_IDS = [ALICE.id, BOB.id];
 
 function paneEl(i: number): HTMLElement {
@@ -114,6 +116,35 @@ test("the min-width clamp holds: a gutter dragged past the floor stops there", a
   dragGutterTo(rowLeft + 50); // far past the 360px floor
 
   await expect.poll(() => paneWidth(0)).toBeGreaterThanOrEqual(MIN_PANE_WIDTH_PX - 2);
+});
+
+test("pane member chips use available width and reveal their remove control on demand", async () => {
+  await registerAgent(ALICE);
+  await registerAgent(LONG_BOB);
+  moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, LONG_BOB.id);
+  mountPanes({ projectId: PROJECT_ID, agents: [ALICE, LONG_BOB], width: 1400 });
+
+  const chip = page.getByTestId("pane-member-chip").nth(1);
+  const name = page.getByTestId("pane-member-name").nth(1);
+  const remove = page.getByTestId("pane-member-remove").nth(1);
+  await expect.element(name).toHaveAttribute("data-truncated", "false");
+  await expect.poll(() => remove.element().getBoundingClientRect().width).toBeLessThanOrEqual(2);
+
+  await chip.hover();
+  await expect.element(remove).toBeVisible();
+  await expect.element(name).toHaveAttribute("data-truncated", "false");
+});
+
+test("a truncated pane member name exposes its full value in a tooltip", async () => {
+  await registerAgent(ALICE);
+  await registerAgent(LONG_BOB);
+  moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, LONG_BOB.id);
+  mountPanes({ projectId: PROJECT_ID, agents: [ALICE, LONG_BOB], width: 760 });
+
+  const name = page.getByTestId("pane-member-name").nth(1);
+  await expect.element(name).toHaveAttribute("data-truncated", "true");
+  await name.hover();
+  await expect.element(page.getByTestId("tooltip-content")).toHaveTextContent(LONG_AGENT_NAME);
 });
 
 test("two panes scroll independently: one held off-bottom, the other stays pinned", async () => {

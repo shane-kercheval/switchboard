@@ -145,6 +145,7 @@ beforeEach(async () => {
   // state under the still-mounted previous component.
   (await import("$lib/state/transcriptPanes.svelte"))._testing.reset();
   (await import("$lib/state/recipientSelection.svelte"))._testing.reset();
+  (await import("$lib/layout.svelte"))._testing.reset();
 });
 
 afterEach(async () => {
@@ -266,6 +267,29 @@ describe("Sidebar", () => {
     await fireEvent.keyDown(card, { key: " " });
     expect(card).toHaveAttribute("data-collapsed", "true");
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
+  });
+
+  it("restores each project's collapsed cards after switching projects and reloading", async () => {
+    const state = await loadState();
+    const { _testing: layoutTesting } = await import("$lib/layout.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+
+    const first = render(Sidebar, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] },
+    });
+    await fireEvent.click(screen.getByTestId("agent-collapse-toggle"));
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "true");
+    first.unmount();
+
+    const otherProject = render(Sidebar, {
+      props: { projectId: "project-b", agents: [CLAUDE_AGENT] },
+    });
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "false");
+    otherProject.unmount();
+
+    layoutTesting.reloadFromStorage();
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "true");
   });
 
   it("does not collapse the card when a click completes text selection", async () => {

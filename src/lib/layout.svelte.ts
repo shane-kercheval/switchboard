@@ -1,14 +1,15 @@
-import type { ProjectId } from "$lib/types";
+import type { AgentId, ProjectId } from "$lib/types";
 
 /// Persisted app-layout preferences: sidebar widths + collapse state, the Git
 /// view's repository-pane width, and the diff panel's file-list width.
 ///
 /// **Device-local, with explicit project-scoped preferences.** Sidebar widths
 /// and open state express facts about the device and mean the same thing in
-/// every project. The selected right-sidebar content and Pins ordering are
-/// keyed by project, however: switching projects restores how that project's
-/// right sidebar was last used. (Transcript pane *fractions* are also
-/// per-project because pane membership is; see `state/transcriptPanes.svelte.ts`.)
+/// every project. The selected right-sidebar content, Pins ordering, and
+/// collapsed agent cards are keyed by project, however: switching projects
+/// restores how that project's right sidebar was last used. (Transcript pane
+/// *fractions* are also per-project because pane membership is; see
+/// `state/transcriptPanes.svelte.ts`.)
 ///
 /// Like the theme (`theme.svelte.ts`), this lives in `localStorage` rather than
 /// the git-trackable `config.yaml`: layout is a device-local appearance
@@ -85,6 +86,7 @@ export type PinsSortMode = "pinned_at" | "message_at";
 type ProjectLayoutPreferences = {
   rightSidebarMode?: RightSidebarMode;
   pinsSortMode?: PinsSortMode;
+  collapsedAgentIds?: AgentId[];
 };
 
 type LayoutState = {
@@ -117,16 +119,31 @@ function parsePinsSortMode(value: unknown): PinsSortMode | undefined {
   return undefined;
 }
 
+function parseAgentIds(value: unknown): AgentId[] | undefined {
+  if (!Array.isArray(value) || !value.every((id) => typeof id === "string")) return undefined;
+  return [...new Set(value)];
+}
+
 function parseProjectPreferences(value: unknown): Record<ProjectId, ProjectLayoutPreferences> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(
     Object.entries(value).flatMap(([projectId, stored]) => {
       if (projectId.length === 0 || stored === null || typeof stored !== "object") return [];
-      const raw = stored as { rightSidebarMode?: unknown; pinsSortMode?: unknown };
+      const raw = stored as {
+        rightSidebarMode?: unknown;
+        pinsSortMode?: unknown;
+        collapsedAgentIds?: unknown;
+      };
       const rightSidebarMode = parseRightSidebarMode(raw.rightSidebarMode);
       const pinsSortMode = parsePinsSortMode(raw.pinsSortMode);
-      if (rightSidebarMode === undefined && pinsSortMode === undefined) return [];
-      return [[projectId, { rightSidebarMode, pinsSortMode }]];
+      const collapsedAgentIds = parseAgentIds(raw.collapsedAgentIds);
+      if (
+        rightSidebarMode === undefined &&
+        pinsSortMode === undefined &&
+        collapsedAgentIds === undefined
+      )
+        return [];
+      return [[projectId, { rightSidebarMode, pinsSortMode, collapsedAgentIds }]];
     }),
   );
 }
@@ -250,6 +267,31 @@ export const layout = {
     state.projectPreferences[projectId] = {
       ...state.projectPreferences[projectId],
       pinsSortMode: mode,
+    };
+    persist();
+  },
+  agentCardCollapsedFor(projectId: ProjectId, agentId: AgentId): boolean {
+    return state.projectPreferences[projectId]?.collapsedAgentIds?.includes(agentId) ?? false;
+  },
+  setAgentCardCollapsed(projectId: ProjectId, agentId: AgentId, collapsed: boolean): void {
+    const current = state.projectPreferences[projectId]?.collapsedAgentIds ?? [];
+    const collapsedAgentIds = collapsed
+      ? current.includes(agentId)
+        ? current
+        : [...current, agentId]
+      : current.filter((id) => id !== agentId);
+    state.projectPreferences[projectId] = {
+      ...state.projectPreferences[projectId],
+      collapsedAgentIds,
+    };
+    persist();
+  },
+  setAllAgentCardsCollapsed(projectId: ProjectId, agentIds: AgentId[], collapsed: boolean): void {
+    state.projectPreferences[projectId] = {
+      ...state.projectPreferences[projectId],
+      collapsedAgentIds: collapsed
+        ? agentIds.filter((id, index) => agentIds.indexOf(id) === index)
+        : [],
     };
     persist();
   },

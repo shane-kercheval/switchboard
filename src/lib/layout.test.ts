@@ -48,6 +48,7 @@ describe("layout store", () => {
     expect(layout.pinsSidebarWidth).toBe(PINS_SIDEBAR_DEFAULT_WIDTH);
     expect(layout.rightSidebarModeFor("p-a")).toBe(RIGHT_SIDEBAR_DEFAULT_MODE);
     expect(layout.pinsSortModeFor("p-a")).toBe(PINS_SORT_DEFAULT_MODE);
+    expect(layout.agentCardCollapsedFor("p-a", "agent-a")).toBe(false);
     expect(layout.projectsSidebarOpen).toBe(true);
     expect(layout.rightSidebarOpen).toBe(true);
     expect(layout.gitRepoWidth).toBe(GIT_REPO_DEFAULT_WIDTH);
@@ -60,6 +61,7 @@ describe("layout store", () => {
     layout.pinsSidebarWidth = 380;
     layout.setRightSidebarMode("p-a", "pins");
     layout.setPinsSortMode("p-a", "message_at");
+    layout.setAgentCardCollapsed("p-a", "agent-a", true);
     layout.projectsSidebarOpen = false;
     layout.rightSidebarOpen = false;
     layout.gitRepoWidth = 380;
@@ -70,6 +72,8 @@ describe("layout store", () => {
     expect(layout.pinsSidebarWidth).toBe(380);
     expect(layout.rightSidebarModeFor("p-a")).toBe("pins");
     expect(layout.pinsSortModeFor("p-a")).toBe("message_at");
+    expect(layout.agentCardCollapsedFor("p-a", "agent-a")).toBe(true);
+    expect(layout.agentCardCollapsedFor("p-b", "agent-a")).toBe(false);
     expect(layout.rightSidebarModeFor("p-b")).toBe("agents");
     expect(layout.pinsSortModeFor("p-b")).toBe("pinned_at");
     expect(layout.projectsSidebarOpen).toBe(false);
@@ -184,12 +188,30 @@ describe("layout store", () => {
   it("removes persisted preferences for a permanently deleted project", () => {
     layout.setRightSidebarMode("p-a", "pins");
     layout.setPinsSortMode("p-a", "message_at");
+    layout.setAgentCardCollapsed("p-a", "agent-a", true);
 
     layout.removeProjectPreferences("p-a");
     _testing.reloadFromStorage();
 
     expect(layout.rightSidebarModeFor("p-a")).toBe("agents");
     expect(layout.pinsSortModeFor("p-a")).toBe("pinned_at");
+    expect(layout.agentCardCollapsedFor("p-a", "agent-a")).toBe(false);
+  });
+
+  it("persists individual and collapse-all card state per project", () => {
+    layout.setAgentCardCollapsed("p-a", "agent-a", true);
+    layout.setAllAgentCardsCollapsed("p-b", ["agent-a", "agent-b"], true);
+    _testing.reloadFromStorage();
+
+    expect(layout.agentCardCollapsedFor("p-a", "agent-a")).toBe(true);
+    expect(layout.agentCardCollapsedFor("p-a", "agent-b")).toBe(false);
+    expect(layout.agentCardCollapsedFor("p-b", "agent-a")).toBe(true);
+    expect(layout.agentCardCollapsedFor("p-b", "agent-b")).toBe(true);
+
+    layout.setAllAgentCardsCollapsed("p-b", ["agent-a", "agent-b"], false);
+    expect(layout.agentCardCollapsedFor("p-b", "agent-a")).toBe(false);
+    expect(layout.agentCardCollapsedFor("p-b", "agent-b")).toBe(false);
+    expect(layout.agentCardCollapsedFor("p-a", "agent-a")).toBe(true);
   });
 
   it("degrades a corrupt blob to defaults", () => {
@@ -211,6 +233,8 @@ describe("layout store", () => {
         projectPreferences: {
           "p-a": { rightSidebarMode: "unknown", pinsSortMode: "random" },
           "p-b": { rightSidebarMode: "pins", pinsSortMode: "message_at" },
+          "p-d": { collapsedAgentIds: ["agent-a", "agent-a", "agent-b"] },
+          "p-e": { collapsedAgentIds: ["agent-a", 4] },
           "p-c": "invalid",
         },
       },
@@ -223,6 +247,9 @@ describe("layout store", () => {
     expect(layout.pinsSortModeFor("p-a")).toBe("pinned_at");
     expect(layout.rightSidebarModeFor("p-b")).toBe("pins");
     expect(layout.pinsSortModeFor("p-b")).toBe("message_at");
+    expect(layout.agentCardCollapsedFor("p-d", "agent-a")).toBe(true);
+    expect(layout.agentCardCollapsedFor("p-d", "agent-b")).toBe(true);
+    expect(layout.agentCardCollapsedFor("p-e", "agent-a")).toBe(false);
   });
 
   it("survives a persist failure with the in-memory value intact", () => {

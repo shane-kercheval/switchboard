@@ -14,9 +14,13 @@ card does not show, found by probing Claude Code **2.1.274** on 2026-09-17:
    tools, MCP tools, skills, agents, memory files, autocompact buffer, free space) and per item. Our
    docs say it returns nothing; that was true once.
 
-This plan renders all three on the card — every limit as the same meter the context bar already is,
-the environment as an expandable list, and the breakdown as a panel opened from the context meter —
-and corrects the docs. **The UI below is a best guess to iterate on in the app, not a spec to
+Codex **0.154.0** was probed the same way (below). It is the mirror image: its live stream is nearly
+empty and everything useful is in the session file we already read — where we parse three records
+and discard the rest. Nothing is hiding somewhere we do not look.
+
+This plan renders all three on the card, for both harnesses where the harness supplies the data —
+every limit as the same meter the context bar already is, the environment as an expandable list, and
+the breakdown as a panel opened from the context meter — and corrects the docs. **The UI below is a best guess to iterate on in the app, not a spec to
 defend.** Get the data on screen in the described shape; adjust the shape after.
 
 ## What the stream carries (verified)
@@ -112,6 +116,53 @@ whose `content` is the whole report inside `<local-command-stdout>`. Our disk pa
 agent turn** with the output as its text — so without M4's parser change, every breakdown would
 reappear on reload as a Claude response containing the report.
 
+### Codex (0.154.0)
+
+**The `--json` stream** carries `thread.started`, `turn.started`, `item.*`, and `turn.completed`
+with token usage. No model, no rate limits, no tools, no environment. Everything below is in the
+rollout (`~/.codex/sessions/…/rollout-*.jsonl`), which `codex/session_file.rs` already reads
+post-terminal (class B — durable, no sidecar needed).
+
+- `session_meta`: `cli_version`, `originator`, `model_provider`, `history_mode`, and
+  `base_instructions` — the full 21 KB system prompt.
+- `turn_context` (we read `model`, `effort`, `cwd`): also `approval_policy`, `sandbox_policy`,
+  `permission_profile`, `personality`, `summary`, `collaboration_mode`, `multi_agent_version`.
+- `world_state.state` (not read at all): `host_skills` — a markdown block listing skill roots and
+  every skill with name, description, and path; `environments` — cwd, shell, status, timezone, and
+  the filesystem permission profile; `permissions.approved_command_prefixes` — the user's approved
+  command allowlist (4.7 KB on the probe account); `personality`; `collaboration_mode`;
+  `multi_agent_mode`.
+- `event_msg/task_started.model_context_window` and `token_usage_record` with per-turn and
+  cumulative thread usage.
+- `event_msg/token_count.rate_limits` (we read `primary` / `secondary`):
+
+  ```json
+  { "limit_id": "codex", "limit_name": null,
+    "primary": { "used_percent": 67.0, "window_minutes": 10080, "resets_at": 1789845487 },
+    "secondary": null,
+    "credits": { "has_credits": false, "unlimited": false, "balance": "0" },
+    "individual_limit": null, "spend_control_reached": null,
+    "plan_type": "prolite", "rate_limit_reached_type": null }
+  ```
+
+  On this plan `secondary` is null and `primary` is the **weekly** window. G8's "primary ~5-hour +
+  secondary weekly" describes one plan's shape, not the contract; the code already labels from
+  `window_minutes`, so only the doc is wrong. From the binary: `rate_limit_reached_type` takes
+  `allowed` / `limit_reached` / `primary_window`, and `spend_control_reached` is a
+  `SpendControlLimitDetails` — the "you are blocked" signals, as distinct from "how full". Neither
+  was observed populated. The binary's `RateLimitWindowSnapshot` also carries `remaining` /
+  `remaining_percent` fields never seen in output; decision 1's used-standard covers them if they
+  appear.
+
+**Codex has no tool or MCP inventory anywhere** — not in the stream, not in the rollout. The only
+way to learn the tool list is to ask the model (costs tokens, unverifiable). MCP server names come
+from `config.toml` via our loader with status `"configured"`; `codex mcp list` reports real
+status and auth per server but is a separate subprocess, not part of a turn.
+
+**Codex has no `/context`.** `codex exec "/status"`, `"/context"`, and `"/usage"` are all answered
+by the *model*, in fluent prose, from inference — 58 output tokens for a fabricated status report.
+The §3.9 fake-success hazard, confirmed for three more commands.
+
 ## Decisions
 
 Settled here; the rationale must survive into code comments where marked.
@@ -176,15 +227,28 @@ click; a long list (tools, commands) collapses to a count and expands to the ful
 harness reports is withheld because it is long. What is withheld is only what carries no meaning
 for the user (telemetry flags, internal capability strings).
 
-12. **`SessionMeta` gains typed fields; the frontend never reads `raw`.** `agents: Vec<String>`,
-    `plugins: Vec<{name, version, source}>`, `memory_paths: Vec<String>` (the map's values),
-    `slash_commands: Vec<String>`, `permission_mode: Option<String>`, `output_style: Option<String>`,
-    and `source: Option<String>` on `McpServerStatus`. All default
-    empty, so Codex and Antigravity emit them empty and the card clean-hides them. Typed because the
-    rate-limit payload's opaque-`unknown` pattern exists for a shape we did not control and did not
-    want to model; this shape we are choosing to model. *(Comment on the struct.)*
-13. **The inventory is persisted to the metadata sidecar with a capture time, and rendered with the
-    "as of" qualifier after a reload.** This resolves G14 by the convention the rate-limit snapshot
+12. **`SessionMeta` gains typed fields shaped to fit both harnesses; the frontend never reads
+    `raw`.** `agents: Vec<String>`, `plugins: Vec<{name, version, source}>`, `memory_paths:
+    Vec<String>`, `slash_commands: Vec<String>`, `approved_commands: Vec<String>`, `source:
+    Option<String>` on `McpServerStatus`; `skills` becomes `Vec<{name, description: Option, path:
+    Option}>` (Claude supplies names, Codex all three); and `settings: Vec<{label, value}>` — the
+    harness's run settings as display pairs (Claude: permission mode, output style; Codex: sandbox,
+    approval policy, personality, shell, timezone). A label/value list rather than one field per
+    setting because the two harnesses share no setting names and the card renders them identically.
+    All default empty, so a harness that lacks a field clean-hides it. Typed because the rate-limit
+    payload's opaque-`unknown` pattern exists for a shape we did not control and did not want to
+    model; this shape we are choosing to model. *(Comment on the struct.)*
+
+    **Where each harness fills them.** Claude: `parse_session_meta` from `system/init`, live.
+    Codex: the post-terminal session-file enrichment in `codex/session_file.rs` — the same path
+    `rate_limits` already takes — from `world_state` (skills parsed out of the `host_skills`
+    markdown block; environment; approved commands) and `turn_context` (settings). Codex MCP
+    servers stay on the config loader with `"configured"` status; `codex mcp list` is out of scope.
+    *(Comment on the Codex extractor: the skills block is a scraped markdown format like the
+    context report, hence a fixture-driven parser with a names-only fallback.)*
+13. **Claude's inventory is persisted to the metadata sidecar with a capture time, and rendered
+    with the "as of" qualifier after a reload; Codex's is not persisted, because the rollout is
+    re-read on reload (class B).** For Claude this resolves G14 by the convention the rate-limit snapshot
     already set: a stale status is fine when it says it is stale. On reload the sidecar snapshot wins
     over the config-loader registry (it is what the last turn actually loaded, with status); the
     loader remains the fallback for an agent that has never dispatched. The reducer's fill-if-empty
@@ -199,6 +263,10 @@ for the user (telemetry flags, internal capability strings).
     ephemeral like the card's other disclosure. Status vocabulary: `connected` →
     the idle/neutral dot, `needs-auth` and anything else → the warning dot with the raw status as its
     label — the set is unknown beyond the two observed, so unknown statuses must show, not hide.
+    A Codex card renders the same row from the subset it has: MCP servers (config names, no status
+    dot — "configured" is not a runtime status and must not render as one), skills with
+    descriptions, approved commands behind a count line, and the settings line. Sections a harness
+    reports nothing for never render.
 
 **Context breakdown**
 
@@ -267,6 +335,9 @@ for the user (telemetry flags, internal capability strings).
   `crates/harness/src/claude_code/session_file.rs` (`pending_local_command`,
   `finish_pending_local_command`, `extract_local_command_output`), `crates/harness/src/transcript.rs`
   (`SystemMarker`), `crates/harness/src/meta_sidecar.rs`.
+- `crates/harness/src/codex/session_file.rs` (the post-terminal `enrichment` and its `rate_limits`
+  extraction — the pattern Codex's inventory follows), `codex/config.rs` (`load_mcp_servers`,
+  `CONFIGURED_STATUS`), `codex/skills.rs`.
 - `crates/dispatcher/src/lib.rs`: every `TurnKind::Compaction` arm.
 - `crates/app/src/commands.rs`: `compact_agent_impl` and its gates; the reload path that builds
   `LoadedTranscript.meta` from the config loader.
@@ -386,14 +457,25 @@ The card says what the agent has loaded and whether it is usable, not just how m
   label; the collapsed line counts them.
 - After a restart the list is what the last turn loaded, marked "as of <time>"; an agent that has
   never run shows the registry from the config loader as today, with no status.
-- Codex and Antigravity cards show whatever subset their harness reports; empty sections never render.
+- A Codex card shows the same row from its rollout: skills with descriptions, the approved-command
+  allowlist behind a count, and a settings line (sandbox, approval policy, personality, shell,
+  timezone); MCP servers as configured names without a status dot.
+- Antigravity cards show whatever subset their harness reports; empty sections never render.
 
 ### Implementation Outline
 
-**Adapter (decision 12).** Extend `SessionMeta` and `McpServerStatus`; parse the new fields in
-`parse_session_meta` (`memory_paths` is a map — take its values); wire type and `AgentMeta` in the
-frontend follow. The `session_meta` reducer carries them through. Other harnesses' adapters emit the
-defaults.
+**Adapter — Claude (decision 12).** Extend `SessionMeta`, `McpServerStatus`, and the skill entry
+shape; parse the new fields in `parse_session_meta` (`memory_paths` is a map — take its values);
+wire type and `AgentMeta` in the frontend follow. The `session_meta` reducer carries them through.
+
+**Adapter — Codex (decision 12).** In `codex/session_file.rs`, extend the post-terminal enrichment
+to read `world_state.state` and `turn_context` into the same typed fields: skills from the
+`host_skills` markdown (`- <name>: <description> (file: <root>/<path>)` lines, roots table
+expanded), settings from `turn_context` and `world_state.environments`, approved commands from
+`permissions.approved_command_prefixes` (joined with spaces). Record a fixture rollout from a probe
+session, with `base_instructions` truncated, under `crates/harness/tests/fixtures/codex/`. A
+`host_skills` block that fails to parse yields an empty skills list and a parse warning, not a
+failed load.
 
 **Persistence (decision 13).** `MetaSidecar` gains an inventory snapshot (the typed fields plus
 `captured_at`), recorded on `SessionMeta` like the rate-limit snapshot; the reload path fills
@@ -407,13 +489,16 @@ delay for full memory paths. Keep `agent-meta` as the outer test id.
 
 ### Definition of Done
 
-- Parser unit tests: an init with all fields populates them; an init without them (older CLI,
-  another harness) yields empty defaults; `memory_paths` map → values list; `source` optional.
+- Claude parser unit tests: an init with all fields populates them; an init without them (older
+  CLI) yields empty defaults; `memory_paths` map → values list; `source` optional.
+- Codex fixture tests: the recorded rollout yields the skills with descriptions and expanded paths,
+  the settings pairs, and the approved commands; a rollout without `world_state` (older CLI) yields
+  empty defaults; a malformed `host_skills` block yields empty skills plus a warning.
 - Sidecar round-trip test for the inventory snapshot; a sidecar without it reads as absent.
 - `Sidebar.test.ts`: collapsed line text with counts and the needs-auth count; expanded sections
   present/absent by data; `needs-auth` → warning dot with label; unknown status string → warning dot
-  with that string; "as of" shown only when rehydrated; a Codex agent with empty inventory renders
-  no environment row.
+  with that string; "as of" shown only when rehydrated; a Codex agent renders its sections with no
+  status dot on MCP rows; an agent with an empty inventory renders no environment row.
 - Existing chip tests updated to the new row.
 - Docs: G14 marked closed (M5 does the writing).
 
@@ -516,7 +601,13 @@ Small; compress accordingly.
     as-of convention named; a new row for the context breakdown (Claude ✅ on demand; Codex /
     Antigravity ❌ — same hazard as §3.9).
   - §3.9 or a sibling §3.10: the `/context` protocol, cost (none), session-file footprint, and the
-    disk-parser routing; name the live test.
+    disk-parser routing; name the live test. In §3.9's fake-success list, add the Codex `/status`,
+    `/context`, `/usage` probes (model-authored, 58 output tokens) as evidence.
+  - G8 (closed): the window shape is per plan — `secondary` can be null and `primary` can be the
+    weekly window; labels derive from `window_minutes`. Record `rate_limit_reached_type`
+    (`allowed` / `limit_reached` / `primary_window`) and `spend_control_reached` as the blocked
+    signals, **observed only null — unverified, not built against**; and that Codex exposes no tool
+    or MCP inventory in stream or rollout (`codex mcp list` is the only status source).
   - §6: a 2.1.274 entry for all three observations.
 - `docs/system-design.md`
   - §7 sidebar matrix: "Quota % (window used)" Claude ✓; add rows for environment inventory and
@@ -541,6 +632,8 @@ counter", "weekly `overageResetsAt`", or the §0 claim that `/context` emits no 
 - Each report writes three records into the agent's session file; the CLI's own TUI shows them on
   resume. Same trade compaction makes.
 - Memory *files* are named only by the report; `init` gives the memory directory.
+- Codex: no runtime tool or MCP status exists in the stream or rollout; MCP rows show configured
+  names only. The blocked-state fields are recorded, not rendered, until observed populated.
 
 ## Out of scope (deliberately)
 
@@ -549,5 +642,8 @@ counter", "weekly `overageResetsAt`", or the §0 claim that `/context` emits no 
 - Running the report automatically (per turn, or on open). It is on demand; the panel says how old it
   is.
 - Fast-mode state, `capabilities`, and the telemetry flags on `init` — internal, no user meaning.
+- Codex `plan_type` and `credits` (not wanted), and running `codex mcp list` as a side subprocess
+  for MCP status.
+- Rendering Codex's `base_instructions` (the 21 KB system prompt) or the blocked-state fields.
 - Per-turn cache-hit ratios, per-model cost on multi-model turns, subagent stats, time-to-first-token
   — all present on `result`, none asked for.

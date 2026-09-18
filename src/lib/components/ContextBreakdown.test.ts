@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import ContextBreakdown from "./ContextBreakdown.svelte";
@@ -25,11 +25,9 @@ type Overrides = {
   report?: ContextReport;
   at?: string | null;
   request?: ContextReportRequest;
-  onRefresh?: () => void;
 };
 
-function mount(overrides: Overrides = {}): { onRefresh: ReturnType<typeof vi.fn> } {
-  const onRefresh = vi.fn();
+function mount(overrides: Overrides = {}): void {
   render(ContextBreakdown, {
     props: {
       open: true,
@@ -38,17 +36,15 @@ function mount(overrides: Overrides = {}): { onRefresh: ReturnType<typeof vi.fn>
       report: overrides.report,
       at: overrides.at ?? null,
       request: overrides.request,
-      onRefresh: overrides.onRefresh ?? onRefresh,
     },
   });
-  return { onRefresh };
 }
 
 describe("ContextBreakdown", () => {
-  it("offers to analyze when nothing has measured the agent yet", () => {
+  it("shows the settled empty state when no report is available", () => {
     mount();
     expect(screen.getByTestId("context-breakdown-empty")).toBeInTheDocument();
-    expect(screen.getByTestId("context-breakdown-refresh")).toHaveTextContent("Analyze context");
+    expect(screen.queryByTestId("context-breakdown-refresh")).not.toBeInTheDocument();
     // Nothing to show the raw of, so no disclosure for it.
     expect(screen.queryByTestId("context-breakdown-raw-toggle")).not.toBeInTheDocument();
   });
@@ -99,19 +95,20 @@ describe("ContextBreakdown", () => {
     expect(screen.queryByTestId("context-breakdown-as-of")).not.toBeInTheDocument();
   });
 
-  it("says a queued request is waiting on the current turn, and refuses a second click", () => {
-    // One slot: a second dispatch while the first is in flight would orphan the
-    // first request's correlation, leaving the panel tracking a run it can no
-    // longer match an event to.
-    mount({ report: REPORT, request: { send_id: "s", phase: "queued" } });
-    const button = screen.getByTestId("context-breakdown-refresh");
-    expect(button).toHaveTextContent("Queued — runs after the current turn");
-    expect(button).toBeDisabled();
+  it("shows a spinner while the initial analysis is queued", () => {
+    mount({ request: { send_id: "s", phase: "queued" } });
+    const loading = screen.getByTestId("context-breakdown-loading");
+    expect(loading).toHaveTextContent("Context analysis queued…");
+    expect(loading.querySelector(".animate-spin")).not.toBeNull();
+    expect(screen.queryByTestId("context-breakdown-empty")).not.toBeInTheDocument();
   });
 
-  it("disables the button while the report is running", () => {
+  it("shows a spinner instead of the stale report while a refresh is running", () => {
     mount({ report: REPORT, request: { send_id: "s", phase: "running" } });
-    expect(screen.getByTestId("context-breakdown-refresh")).toBeDisabled();
+    expect(screen.getByTestId("context-breakdown-loading")).toHaveTextContent(
+      "Refreshing context…",
+    );
+    expect(screen.queryByTestId("context-breakdown-usage")).not.toBeInTheDocument();
   });
 
   it("names a failure and keeps the previous report beside it", () => {
@@ -129,7 +126,7 @@ describe("ContextBreakdown", () => {
     );
     expect(screen.getByTestId("context-breakdown-usage")).toHaveTextContent("25k / 1M");
     expect(screen.getByTestId("context-breakdown-as-of")).toBeInTheDocument();
-    expect(screen.getByTestId("context-breakdown-refresh")).toBeEnabled();
+    expect(screen.queryByTestId("context-breakdown-loading")).not.toBeInTheDocument();
   });
 
   it("names a cancellation and keeps the previous report", () => {
@@ -141,7 +138,7 @@ describe("ContextBreakdown", () => {
   it("says nothing about a settled successful request — the numbers are the message", () => {
     mount({ report: REPORT, request: { send_id: "s", phase: "done" } });
     expect(screen.queryByTestId("context-breakdown-request-note")).not.toBeInTheDocument();
-    expect(screen.getByTestId("context-breakdown-refresh")).toHaveTextContent("Refresh");
+    expect(screen.queryByTestId("context-breakdown-refresh")).not.toBeInTheDocument();
   });
 
   it("reveals a memory file's full path through the app's tooltip, not the browser's", async () => {
@@ -157,11 +154,5 @@ describe("ContextBreakdown", () => {
     expect(row).not.toHaveAttribute("title");
     // The primitive marks its trigger; a native `title` would leave it bare.
     expect(row).toHaveAttribute("data-tooltip-trigger");
-  });
-
-  it("asks for a new report when refreshed", async () => {
-    const { onRefresh } = mount({ report: REPORT });
-    await fireEvent.click(screen.getByTestId("context-breakdown-refresh"));
-    expect(onRefresh).toHaveBeenCalledTimes(1);
   });
 });

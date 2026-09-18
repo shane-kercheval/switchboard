@@ -236,21 +236,22 @@ describe("formatResetCountdown", () => {
     expect(formatResetCountdown(ms("2026-09-17T12:00:20Z"), NOW)).toBe("in 1 min");
   });
 
-  it("counts down in whole hours under a day", () => {
+  it("rounds partial hours up so the countdown never understates the wait", () => {
     expect(formatResetCountdown(ms("2026-09-17T15:00:00Z"), NOW)).toBe("in 3 h");
-    expect(formatResetCountdown(ms("2026-09-17T15:59:00Z"), NOW)).toBe("in 3 h");
+    expect(formatResetCountdown(ms("2026-09-17T15:59:00Z"), NOW)).toBe("in 4 h");
   });
 
-  it("counts down in whole days beyond a day", () => {
+  it("rounds partial days up so the countdown never understates the wait", () => {
     // Relative at every distance, so the weekly window's reset stays short
     // enough to sit beside its label in the card column.
     expect(formatResetCountdown(ms("2026-09-18T12:00:00Z"), NOW)).toBe("in 1 d");
     expect(formatResetCountdown(ms("2026-09-22T12:00:00Z"), NOW)).toBe("in 5 d");
-    expect(formatResetCountdown(ms("2026-09-24T08:00:00Z"), NOW)).toBe("in 6 d");
+    expect(formatResetCountdown(ms("2026-09-19T05:00:00Z"), NOW)).toBe("in 2 d");
+    expect(formatResetCountdown(ms("2026-09-24T08:00:00Z"), NOW)).toBe("in 7 d");
   });
 
   it("crosses from hours to days at 24 hours", () => {
-    expect(formatResetCountdown(ms("2026-09-18T11:59:00Z"), NOW)).toBe("in 23 h");
+    expect(formatResetCountdown(ms("2026-09-18T11:59:00Z"), NOW)).toBe("in 1 d");
     expect(formatResetCountdown(ms("2026-09-18T12:00:00Z"), NOW)).toBe("in 1 d");
   });
 

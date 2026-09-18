@@ -629,9 +629,9 @@ export async function dispatchContextReport(
       queued_at: queuedAt,
     },
   ];
-  // One slot, replaced outright: the panel disables its button while a request
-  // is queued or running, so the only way here is from a settled request — and
-  // the new one is what the user is now waiting on.
+  // One slot, replaced outright: the panel opener refuses to dispatch while a
+  // request is queued or running, so the only way here is from a settled
+  // request — and the new one is what the user is now waiting on.
   const next: AgentRuntime = {
     ...runtime,
     pending_sends: pending,

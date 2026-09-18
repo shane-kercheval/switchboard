@@ -369,9 +369,10 @@ for the user (telemetry flags, internal capability strings).
     done | failed | cancelled, error? }`, set on dispatch and advanced by `turn_start`, `turn_end`,
     `message_failed`, `message_cancelled`, and `failSendStart`. **It is cleared only by the next
     report dispatch, never by an ordinary send** — otherwise a failure message would vanish the
-    moment the user sent a message. One slot: the panel's button is disabled while a request is
-    queued or running, so a second click cannot orphan the first request's correlation. The dialog
-    renders the request state beside the previous report, which is retained. *(Comment on the
+    moment the user sent a message. One slot: the panel opener does not dispatch when a request is
+    already queued or running, so closing and reopening the dialog cannot orphan the first request's
+    correlation. The dialog replaces its contents with a spinner while the request is in flight;
+    after it settles, the previous report is retained if the refresh failed. *(Comment on the
     pending-kind branch and on the request record's clear rule.)*
 18. **`ContextReport` is deserialized from the structured object; the markdown is the fallback.**
     Live, from `assistant.context_usage`; on disk, from `contextUsage`. Categories keep the CLI's
@@ -398,16 +399,16 @@ for the user (telemetry flags, internal capability strings).
     caveat record that precedes the command is treated by `is_meta_continuation` as a mid-turn
     continuation; the fixture test must show it neither extends the preceding agent turn nor pulls
     the following turn backward. *(Comment on the routing branch, naming `commandRun` as the key.)*
-20. **UI: a panel opened from the context meter's chevron, and from the agent menu ("Context
-    breakdown…").** `Dialog`, titled "Context breakdown · <agent>". Header: the context meter with
-    model and "as of". Body: one meter per category, in the CLI's order, label left, "<tokens> ·
-    <percent>" right; deferred-tool rows show tokens only (the CLI reports no percentage). Below,
-    collapsible sections — MCP tools grouped by server with per-server totals (the flat 80-row
-    table is unreadable), custom agents, memory files, skills — each `ExpandCollapseIcon`, collapsed
-    by default. Footer: "Refresh" (runs the report; while the agent is busy the button reads
-    "Queued — runs after the current turn"), and a "Raw report" disclosure. Empty state when no
-    report exists: one sentence and an "Analyze context" button. Row-level meters reuse the primitive
-    with no detail text where the CLI gives none.
+20. **UI: a panel opened from the context meter's icon, and from the agent menu ("Context
+    breakdown…").** Either entry point immediately dispatches a fresh report and opens the `Dialog`,
+    titled "Context breakdown · <agent>"; the content area shows a spinner while the initial analysis
+    or refresh is queued or running. After it settles, the header shows the context meter with model
+    and "as of". Body: one meter per category, in the CLI's order, label left, "<tokens> · <percent>"
+    right; deferred-tool rows show tokens only (the CLI reports no percentage). Below, collapsible
+    sections — MCP tools grouped by server with per-server totals (the flat 80-row table is
+    unreadable), custom agents, memory files, skills — each `ExpandCollapseIcon`, collapsed by
+    default, followed by a "Raw report" disclosure. Row-level meters reuse the primitive with no
+    detail text where the CLI gives none.
 
 ## Required reading before implementing
 
@@ -633,10 +634,10 @@ paths. Keep `agent-meta` as the outer test id.
 
 The user can see what is occupying a Claude agent's context window, per category and per item.
 
-- The context meter on a Claude card shows a chevron; clicking it (or "Context breakdown…" in the
-  agent menu) opens the panel. First open shows an empty state with "Analyze context".
-- Running it on an idle agent fills the panel in about a second. On a busy agent the button says it
-  is queued and the panel fills when the current turn finishes.
+- The context meter on a Claude card shows a breakdown icon; clicking it (or "Context breakdown…"
+  in the agent menu) opens the panel and starts an analysis immediately.
+- Running it on an idle agent fills the panel in about a second. On a busy agent the panel shows a
+  queued spinner and fills when the current turn finishes.
 - The panel shows the model, used/window tokens, a meter per category in the CLI's order, and
   collapsible per-item sections: MCP tools grouped by server, custom agents, memory files, skills.
 - No row appears in the transcript for the report — live or after reopening the project.

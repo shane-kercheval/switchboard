@@ -2,21 +2,21 @@
   /// The context-breakdown panel: what is occupying one agent's context window,
   /// per category and per item.
   ///
-  /// Opened from the context meter's chevron or the agent menu. The meter on
+  /// Opened from the context meter's icon or the agent menu. The meter on
   /// the card answers "how full"; this answers "with what" — which is the
   /// question you actually act on, because the answer is usually a tool list
   /// nobody chose to load.
   ///
-  /// **Nothing here is fetched.** The panel renders whatever report the agent
-  /// already has, and the Refresh button dispatches a new one. That keeps the
-  /// panel honest about two states the alternative would blur: an agent that has
-  /// never been analyzed (empty state, not a spinner) and one measured a while
-  /// ago (shown, with its age).
+  /// The opener dispatches a fresh report before this renders. While that report
+  /// is queued or running, the panel gives the request the whole content area;
+  /// after it settles, the last good report remains available even if the
+  /// refresh failed.
   import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import Meter from "$lib/components/ui/Meter.svelte";
   import Dialog from "$lib/components/ui/Dialog.svelte";
+  import Spinner from "$lib/components/ui/Spinner.svelte";
   import { breakdownView } from "$lib/contextBreakdown";
   import { formatTokens } from "$lib/utils";
   import type { ContextReportRequest } from "$lib/state/types";
@@ -35,20 +35,18 @@
     /// recent" is not something the panel can know.
     at?: string | null;
     request?: ContextReportRequest;
-    onRefresh: () => void;
   };
 
-  let { open = $bindable(), onClose, agentName, report, at, request, onRefresh }: Props = $props();
+  let { open = $bindable(), onClose, agentName, report, at, request }: Props = $props();
 
   const view = $derived(breakdownView(report));
-  /// One request at a time: while this is true the button is disabled, so a
-  /// second click cannot orphan the first request's correlation.
   const inFlight = $derived(request?.phase === "queued" || request?.phase === "running");
 
-  const buttonLabel = $derived.by(() => {
-    if (request?.phase === "queued") return "Queued — runs after the current turn";
-    if (request?.phase === "running") return "Analyzing…";
-    return view === null ? "Analyze context" : "Refresh";
+  const loadingLabel = $derived.by(() => {
+    const action = view === null ? "analysis" : "refresh";
+    return request?.phase === "queued"
+      ? `Context ${action} queued…`
+      : `${action === "analysis" ? "Analyzing" : "Refreshing"} context…`;
   });
 
   /// The one place a settled request is described. `done` says nothing: the
@@ -83,10 +81,19 @@
 
 <Dialog bind:open {onClose} title="Context breakdown · {agentName}" contentClass="max-w-xl">
   <div class="space-y-3" data-testid="context-breakdown">
-    {#if view === null}
+    {#if inFlight}
+      <div
+        class="text-muted flex min-h-24 items-center justify-center gap-2 text-sm"
+        role="status"
+        aria-live="polite"
+        data-testid="context-breakdown-loading"
+      >
+        <Spinner class="h-4 w-4" />
+        <span>{loadingLabel}</span>
+      </div>
+    {:else if view === null}
       <p class="text-muted text-sm" data-testid="context-breakdown-empty">
-        Nothing has measured this agent's context yet. Analyzing it asks the harness for a breakdown
-        — it runs locally, costs nothing, and takes about a second.
+        No context breakdown is available.
       </p>
     {:else}
       {#if view.usage !== null}
@@ -197,31 +204,22 @@
       </p>
     {/if}
 
-    <div class="flex items-center gap-2 pt-1">
-      <button
-        type="button"
-        class="border-border hover:bg-active rounded border px-2 py-1 text-xs disabled:opacity-50"
-        disabled={inFlight}
-        onclick={onRefresh}
-        data-testid="context-breakdown-refresh"
-      >
-        {buttonLabel}
-      </button>
-      {#if view !== null}
+    {#if !inFlight && view !== null}
+      <div class="flex items-center justify-end pt-1">
         <button
           type="button"
           onclick={() => (rawOpen = !rawOpen)}
-          class="text-muted hover:text-fg ml-auto flex items-center gap-1 text-[11px]"
+          class="text-muted hover:text-fg flex items-center gap-1 text-[11px]"
           aria-expanded={rawOpen}
           data-testid="context-breakdown-raw-toggle"
         >
           Raw report
           <ExpandCollapseIcon expanded={rawOpen} size={11} strokeWidth={1.8} />
         </button>
-      {/if}
-    </div>
+      </div>
+    {/if}
 
-    {#if rawOpen && view !== null}
+    {#if !inFlight && rawOpen && view !== null}
       <pre
         class="bg-active text-muted max-h-64 overflow-auto rounded p-2 text-[10px] whitespace-pre-wrap"
         data-testid="context-breakdown-raw">{view.raw}</pre>

@@ -198,11 +198,13 @@ export function formatUsedPercent(value: number): string {
 export function formatResetCountdown(resetsAtMs: number, now: Date = new Date()): string {
   const remainingMs = resetsAtMs - now.getTime();
   if (!Number.isFinite(remainingMs) || remainingMs <= 0) return "now";
-  const minutes = Math.floor(remainingMs / 60_000);
-  // Rounded up below a minute so a reset seconds away never reads "in 0 min",
-  // which looks like a stuck counter rather than an imminent one.
-  if (minutes < 60) return `in ${Math.max(1, minutes)} min`;
-  const hours = Math.floor(minutes / 60);
+  // Ceiling the displayed unit keeps this compact approximation from claiming
+  // a reset sooner than it will actually happen (41 hours is "in 2 d", not
+  // "in 1 d"). Escalate a rounded 60 minutes / 24 hours to the next unit so
+  // the boundary still reads naturally.
+  const minutes = Math.ceil(remainingMs / 60_000);
+  if (minutes < 60) return `in ${minutes} min`;
+  const hours = Math.ceil(remainingMs / 3_600_000);
   if (hours < 24) return `in ${hours} h`;
-  return `in ${Math.floor(hours / 24)} d`;
+  return `in ${Math.ceil(remainingMs / 86_400_000)} d`;
 }

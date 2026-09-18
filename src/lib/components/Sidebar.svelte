@@ -675,6 +675,16 @@
     breakdownAgentId === null ? undefined : agents.find((a) => a.id === breakdownAgentId),
   );
 
+  /// Open first so feedback is immediate, then dispatch unless this agent
+  /// already has a report queued or running. The guard preserves the request's
+  /// single correlation slot if the dialog is closed and reopened mid-run.
+  function openContextBreakdown(agentId: AgentId): void {
+    breakdownAgentId = agentId;
+    const phase = runtimes[agentId]?.context_report_request?.phase;
+    if (phase === "queued" || phase === "running") return;
+    void startContextReport(agentId);
+  }
+
   /// Unlike the compact button, no arm-then-confirm step: a report costs
   /// nothing, changes nothing, and is the thing the user just asked for.
   async function startContextReport(agentId: AgentId): Promise<void> {
@@ -1214,7 +1224,7 @@
                     {/if}
                     {#if supportsContextReport(agent.harness)}
                       <DropdownMenuItem
-                        onSelect={() => (breakdownAgentId = agent.id)}
+                        onSelect={() => openContextBreakdown(agent.id)}
                         class="gap-2"
                         data-testid="agent-action-context-breakdown"
                       >
@@ -1488,9 +1498,8 @@
                 class="flex-1"
               />
               {#if supportsContextReport(agent.harness)}
-                <!-- The meter says how full; this opens what it is full of.
-                       No arm-then-confirm step, unlike the compact button
-                       beside it: opening the panel runs nothing at all. -->
+                <!-- The meter says how full; this asks for a fresh breakdown
+                     and opens the result panel immediately. -->
                 <Tooltip label="Context breakdown" side="top">
                   {#snippet trigger(props)}
                     <button
@@ -1499,7 +1508,7 @@
                       class={cn(ICON_BUTTON_CLASS, "-mb-0.5 h-5 w-5")}
                       aria-label="Context breakdown"
                       data-testid="agent-context-breakdown-button"
-                      onclick={() => (breakdownAgentId = agent.id)}
+                      onclick={() => openContextBreakdown(agent.id)}
                     >
                       <ChartPie size={14} strokeWidth={1.8} aria-hidden="true" />
                     </button>
@@ -1724,9 +1733,6 @@
   request={breakdownAgentId === null
     ? undefined
     : runtimes[breakdownAgentId]?.context_report_request}
-  onRefresh={() => {
-    if (breakdownAgentId !== null) void startContextReport(breakdownAgentId);
-  }}
 />
 
 <Dialog

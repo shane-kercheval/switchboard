@@ -135,6 +135,8 @@ beforeEach(() => {
   copyTextMock.mockResolvedValue(undefined);
   compactAgentMock.mockReset();
   compactAgentMock.mockResolvedValue("00000000-0000-7000-8000-00000000c003");
+  contextReportAgentMock.mockReset();
+  contextReportAgentMock.mockResolvedValue("00000000-0000-7000-8000-00000000d0aa");
 });
 
 beforeEach(async () => {
@@ -1629,14 +1631,13 @@ async function renderClaudeWithRateLimit(
 }
 
 /// The window keys the probe saw on a Fable turn, each with a used fraction and
-/// a future reset. The offsets carry deliberate slack past the hour and day
-/// boundaries: the countdown floors, and `epochFromNow` truncates to whole
-/// seconds, so an exactly-4-hour reset renders "in 3 h" and would flip on
-/// clock jitter.
+/// a future reset. The offsets carry deliberate slack from the hour and day
+/// boundaries: the countdown rounds up, so keeping each instant just below its
+/// displayed boundary prevents clock jitter from changing the assertion.
 function unifiedWindows(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    five_hour: { utilization: 0.33, resetsAt: epochFromNow(4 * 3600 + 60) },
-    seven_day: { utilization: 0.27, resetsAt: epochFromNow(5 * 86400 + 3600) },
+    five_hour: { utilization: 0.33, resetsAt: epochFromNow(4 * 3600 - 60) },
+    seven_day: { utilization: 0.27, resetsAt: epochFromNow(5 * 86400 - 3600) },
     ...overrides,
   };
 }
@@ -2828,7 +2829,7 @@ describe("context breakdown", () => {
     expect(within(menu).queryByTestId("agent-action-context-breakdown")).toBeNull();
   });
 
-  it("opens the panel from the chevron, with the agent's own report", async () => {
+  it("opens the panel and refreshes immediately from the context icon", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     seedContextBar(state, CLAUDE_AGENT);
@@ -2849,34 +2850,42 @@ describe("context breakdown", () => {
     await fireEvent.click(await screen.findByTestId("agent-context-breakdown-button"));
 
     const panel = await screen.findByTestId("context-breakdown");
-    expect(within(panel).getByTestId("context-breakdown-usage")).toHaveTextContent("48k / 200k");
-    expect(within(panel).queryByTestId("context-breakdown-empty")).toBeNull();
-  });
-
-  it("opens from the agent menu with an empty state before anything has measured it", async () => {
-    const state = await loadState();
-    await state.registerAgent(CLAUDE_AGENT);
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
-
-    const menu = await openAgentActions();
-    await fireEvent.click(within(menu).getByTestId("agent-action-context-breakdown"));
-
-    expect(await screen.findByTestId("context-breakdown-empty")).toBeInTheDocument();
-  });
-
-  it("dispatches a report when the panel asks for one", async () => {
-    const state = await loadState();
-    await state.registerAgent(CLAUDE_AGENT);
-    contextReportAgentMock.mockResolvedValue("00000000-0000-7000-8000-00000000d0aa");
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
-    const menu = await openAgentActions();
-    await fireEvent.click(within(menu).getByTestId("agent-action-context-breakdown"));
-
-    await fireEvent.click(await screen.findByTestId("context-breakdown-refresh"));
-
-    await waitFor(() =>
-      expect(contextReportAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, expect.any(String)),
+    expect(within(panel).getByTestId("context-breakdown-loading")).toHaveTextContent(
+      "Context refresh queued…",
     );
+    expect(within(panel).queryByTestId("context-breakdown-usage")).toBeNull();
+    expect(contextReportAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, expect.any(String));
+  });
+
+  it("opens and starts the initial analysis immediately from the agent menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const menu = await openAgentActions();
+    await fireEvent.click(within(menu).getByTestId("agent-action-context-breakdown"));
+
+    expect(await screen.findByTestId("context-breakdown-loading")).toHaveTextContent(
+      "Context analysis queued…",
+    );
+    expect(contextReportAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, expect.any(String));
+  });
+
+  it("does not dispatch a second report when reopening one already in flight", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("expected a runtime");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      context_report_request: { send_id: "already-running", phase: "running" },
+    };
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const menu = await openAgentActions();
+    await fireEvent.click(within(menu).getByTestId("agent-action-context-breakdown"));
+
+    expect(await screen.findByTestId("context-breakdown-loading")).toBeInTheDocument();
+    expect(contextReportAgentMock).not.toHaveBeenCalled();
   });
 });
 

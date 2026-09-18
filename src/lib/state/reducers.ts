@@ -939,6 +939,7 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         // populated it (and cleared `as_of` to null), this no-ops and the
         // live value + its null `as_of` stay in place.
         next.last_rate_limit = input.last_rate_limit;
+        next.last_rate_limit_model = input.last_rate_limit_model ?? undefined;
         next.last_rate_limit_as_of = input.last_rate_limit_as_of ?? null;
       }
       if (next.last_context_report === undefined && input.last_context_report != null) {

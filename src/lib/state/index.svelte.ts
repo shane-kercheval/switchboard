@@ -375,6 +375,7 @@ export function applyAgentHydrate(
     turns: loaded.turns,
     meta: loaded.meta ?? null,
     last_rate_limit: loaded.last_rate_limit ?? null,
+    last_rate_limit_model: loaded.last_rate_limit_model ?? null,
     last_rate_limit_as_of: loaded.last_rate_limit_as_of ?? null,
     meta_as_of: loaded.meta_as_of ?? null,
     last_context_report: loaded.last_context_report ?? null,

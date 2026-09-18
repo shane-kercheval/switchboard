@@ -2,14 +2,16 @@
   import {
     Check,
     ChartPie,
+    ChevronDown,
+    ChevronRight,
     Columns2,
     Eye,
     EyeOff,
     FileText,
     GripVertical,
-    History,
     MoreHorizontal,
     Pencil,
+    RotateCcw,
     SlidersHorizontal,
     Square,
     Terminal,
@@ -434,7 +436,7 @@
   // --- Roster reordering -------------------------------------------------
   // Roster order is the canonical display order app-wide (these cards, the
   // compose chips and their ⌘1..9 numbering, pane columns), so all reorder
-  // gestures funnel into one commit path: Alt+Arrow and dragging the far-right
+  // gestures funnel into one commit path: Alt+Arrow and dragging the leading-edge
   // hover grip.
 
   let reorderError = $state<{ agentId: AgentId; message: string } | null>(null);
@@ -849,15 +851,29 @@
      reset date the inline countdown compresses, and the harness's own threshold
      line when it flagged one. -->
 {#snippet usageWindowDetail(windows: UsageWindow[])}
-  {#each windows as w (w.key)}
-    <p>
-      {w.label}: {formatUsedPercent(w.usedFraction)} used{w.resetsAtMs === null
-        ? ""
-        : ` · resets ${formatResetDateTime(w.resetsAtMs)}`}{w.surpassedThreshold === undefined
-        ? ""
-        : ` · above ${formatUsedPercent(w.surpassedThreshold)} of this limit`}
-    </p>
-  {/each}
+  <div class="min-w-64 space-y-2.5">
+    {#each windows as w (w.key)}
+      <section class="space-y-1">
+        <div class="flex items-baseline gap-4">
+          <span class="min-w-0 font-medium">{w.label}</span>
+          <span class="ml-auto shrink-0 tabular-nums">{formatUsedPercent(w.usedFraction)} used</span
+          >
+        </div>
+        {#if w.resetsAtMs !== null}
+          <div class="text-primary-fg/70 grid grid-cols-[auto_1fr] gap-4 text-[12px]">
+            <span>Resets</span>
+            <span class="text-right tabular-nums">{formatResetDateTime(w.resetsAtMs)}</span>
+          </div>
+        {/if}
+        {#if w.surpassedThreshold !== undefined}
+          <div class="text-warning grid grid-cols-[auto_1fr] gap-4 text-[12px]">
+            <span>Warning threshold</span>
+            <span class="text-right tabular-nums">{formatUsedPercent(w.surpassedThreshold)}</span>
+          </div>
+        {/if}
+      </section>
+    {/each}
+  </div>
 {/snippet}
 
 {#snippet compactTooltipContent()}
@@ -964,6 +980,16 @@
               )
             : null}
         {@const overageAsOf = runtime?.last_rate_limit_as_of}
+        {@const usageWarning = rlView?.windows.find(
+          (window) => window.surpassedThreshold !== undefined,
+        )}
+        {@const agentSelection = selectionForAgent(agent)}
+        {@const effortSupport = effortSupportFor(agent.harness, agent.model)}
+        {@const emptySelection =
+          agent.model === null &&
+          agent.effort === null &&
+          agent.model_choices.length === 0 &&
+          agent.effort_choices.length === 0}
         {@const isCollapsed = collapsed[agent.id] ?? false}
         {@const active = isActive(agent.id)}
         {@const recipientSelected = !workflowActive && recipientSelection.includes(agent.id)}
@@ -975,7 +1001,7 @@
         <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
         <div
           class={cn(
-            "group bg-raised hover:ring-active focus-visible:ring-focus cursor-pointer rounded-md px-2.5 py-2 transition-shadow hover:shadow-sm hover:ring-1 focus-visible:ring-1 focus-visible:outline-none",
+            "group bg-raised hover:ring-active focus-visible:ring-focus relative cursor-pointer rounded-lg px-2.5 py-2 transition-shadow hover:shadow-sm hover:ring-1 focus-visible:ring-1 focus-visible:outline-none",
             recipientSelected && "ring-accent hover:ring-accent ring-1",
             dragState?.started === true &&
               dragState.agentId === agent.id &&
@@ -990,7 +1016,7 @@
           use:agentRowPointerActions={agent.id}
           animate:flip={{ duration: dragState?.started === true ? 0 : 150 }}
         >
-          <div class="flex items-center justify-between gap-2">
+          <div class="flex items-center justify-between gap-1">
             {#if editingAgentId === agent.id}
               <!-- Edit mode swaps the whole left side: an <input> can't nest in
                    the collapse-toggle <button>, and the harness icon becomes a
@@ -1047,7 +1073,21 @@
               </Tooltip>
             {:else}
               {@const agentHidden = isAgentHidden(projectId, rosterIds, agent.id)}
-              <div class="flex min-h-7 min-w-0 flex-1 items-center px-1.5 text-left">
+              <button
+                type="button"
+                class="text-muted hover:text-fg hover:bg-control-hover focus-visible:ring-focus inline-flex h-6 w-5 shrink-0 items-center justify-center rounded-full focus-visible:ring-1 focus-visible:outline-none"
+                aria-label={isCollapsed ? `Expand ${agent.name}` : `Collapse ${agent.name}`}
+                aria-expanded={!isCollapsed}
+                data-testid="agent-collapse-toggle"
+                onclick={() => toggleCollapsed(agent.id)}
+              >
+                {#if isCollapsed}
+                  <ChevronRight size={13} strokeWidth={1.8} aria-hidden="true" />
+                {:else}
+                  <ChevronDown size={13} strokeWidth={1.8} aria-hidden="true" />
+                {/if}
+              </button>
+              <div class="flex min-h-7 min-w-0 flex-1 items-center text-left">
                 <span
                   class="text-fg cursor-text truncate text-[13px] font-semibold"
                   data-testid="agent-name"
@@ -1070,13 +1110,12 @@
                         "shrink-0",
                         // The eye stays visible while the agent is hidden (it's
                         // the state indicator); otherwise it appears on hover
-                        // like the actions trigger. `hidden`, not `opacity-0`:
-                        // an invisible button still reserves its width, and
-                        // that reserved gutter is what was truncating names —
-                        // the name takes the full row until the icons reveal.
+                        // like the actions trigger. `invisible` preserves the
+                        // action gutter so revealing controls never shifts the
+                        // harness identity or reflows the header.
                         agentHidden
                           ? "text-muted"
-                          : "hidden group-hover:inline-flex group-focus-visible:inline-flex group-has-[:focus-visible]:inline-flex group-has-[[data-state=open]]:inline-flex",
+                          : "invisible group-hover:visible group-focus-visible:visible group-has-[:focus-visible]:visible group-has-[[data-state=open]]:visible",
                       )}
                       aria-label={agentHidden ? `Show ${agent.name}` : `Hide ${agent.name}`}
                       aria-pressed={agentHidden}
@@ -1095,7 +1134,7 @@
                   triggerClass={cn(
                     ICON_BUTTON_CLASS,
                     "shrink-0",
-                    "hidden group-focus-visible:inline-flex group-has-[:focus-visible]:inline-flex group-hover:inline-flex data-[state=open]:inline-flex",
+                    "invisible group-focus-visible:visible group-has-[:focus-visible]:visible group-hover:visible data-[state=open]:visible",
                   )}
                   triggerLabel={`Actions for ${agent.name}`}
                   triggerTestid="agent-actions-trigger"
@@ -1190,7 +1229,7 @@
                         tooltipContent={compactTooltipContent}
                         data-testid="agent-action-compact"
                       >
-                        <History
+                        <RotateCcw
                           size={14}
                           strokeWidth={1.8}
                           class="text-muted shrink-0"
@@ -1309,10 +1348,10 @@
                 {#if agents.length > 1}
                   <span
                     class={cn(
-                      "text-muted h-3 w-3 shrink-0 cursor-grab touch-none items-center justify-center active:cursor-grabbing",
+                      "text-muted flex h-4 w-3 shrink-0 cursor-grab touch-none items-center justify-center active:cursor-grabbing",
                       dragState?.agentId === agent.id
-                        ? "inline-flex"
-                        : "hidden group-hover:inline-flex group-focus-visible:inline-flex group-has-[:focus-visible]:inline-flex group-has-[[data-state=open]]:inline-flex",
+                        ? "visible"
+                        : "invisible group-hover:visible group-focus-visible:visible group-has-[:focus-visible]:visible group-has-[[data-state=open]]:visible",
                     )}
                     data-testid="agent-drag-grip"
                     data-agent-card-control
@@ -1339,94 +1378,208 @@
               {renameError}
             </div>
           {/if}
-          {#if !isCollapsed}
-            {#if runtime?.hydration_error}
-              <div class="mt-1 space-y-1" data-testid="agent-hydration-error">
-                <!-- Clamp the inline reason to two lines: it keeps an
+          {#if runtime?.hydration_error}
+            <div class="mt-1 space-y-1" data-testid="agent-hydration-error">
+              <!-- Clamp the inline reason to two lines: it keeps an
                      at-a-glance "why" without a long path-bearing error (the
                      `LoadTranscriptError::Io` message now names the session
                      file) ballooning the narrow card. The full verbatim text
                      stays available via Details. -->
-                <div class="text-status-failed line-clamp-2 text-xs break-words">
-                  history failed to load: {runtime.hydration_error}
-                </div>
-                <div class="flex items-center gap-3 text-xs">
-                  <button
-                    type="button"
-                    class="text-accent hover:underline"
-                    data-testid="agent-hydration-retry"
-                    onclick={() => void retryAgentHydration(agent.id)}
-                  >
-                    Retry
-                  </button>
-                  <button
-                    type="button"
-                    class="text-muted hover:text-fg hover:underline"
-                    data-testid="agent-hydration-details"
-                    onclick={() => {
-                      hydrationDetailsName = agent.name;
-                      hydrationDetailsError = runtime.hydration_error ?? "";
-                      hydrationDetailsOpen = true;
-                    }}
-                  >
-                    Details
-                  </button>
-                </div>
+              <div class="text-status-failed line-clamp-2 text-xs break-words">
+                history failed to load: {runtime.hydration_error}
               </div>
-            {/if}
-            <!-- Selected model/effort is future-send intent, never observed
+              <div class="flex items-center gap-3 text-xs">
+                <button
+                  type="button"
+                  class="text-accent hover:underline"
+                  data-testid="agent-hydration-retry"
+                  onclick={() => void retryAgentHydration(agent.id)}
+                >
+                  Retry
+                </button>
+                <button
+                  type="button"
+                  class="text-muted hover:text-fg hover:underline"
+                  data-testid="agent-hydration-details"
+                  onclick={() => {
+                    hydrationDetailsName = agent.name;
+                    hydrationDetailsError = runtime.hydration_error ?? "";
+                    hydrationDetailsOpen = true;
+                  }}
+                >
+                  Details
+                </button>
+              </div>
+            </div>
+          {/if}
+          <!-- Selected model/effort is future-send intent, never observed
                  runtime history. The transcript footer owns the actual model
                  used by each completed turn. -->
-            {@const agentSelection = selectionForAgent(agent)}
-            {@const effortSupport = effortSupportFor(agent.harness, agent.model)}
-            {@const emptySelection =
-              agent.model === null &&
-              agent.effort === null &&
-              agent.model_choices.length === 0 &&
-              agent.effort_choices.length === 0}
-            {#if canConfigureSelection(agent)}
-              <div
-                class="mt-1.5 flex min-w-0 flex-wrap items-center gap-1"
-                data-testid="agent-selection"
-              >
-                {#if emptySelection}
-                  <span class="text-muted text-xs" data-testid="agent-selection-default">
-                    Harness/session default
-                  </span>
-                {:else if agent.model_choices.length > 0}
-                  <AgentSelectionChip
-                    axis="model"
-                    harness={agent.harness}
-                    selection={agentSelection}
-                    busy={selectionBusy(agent.id)}
-                    onActivate={(selection) => void activateSelection(agent, selection)}
-                  />
-                {:else if agent.model === null && SUPPORTS_MODEL_SELECTION[agent.harness]}
-                  <span class="text-muted text-xs" data-testid="agent-model-default">
-                    Model: Harness/session default
-                  </span>
+          {#if canConfigureSelection(agent)}
+            <div
+              class="mt-1.5 flex min-w-0 flex-wrap items-center gap-1"
+              data-testid="agent-selection"
+            >
+              {#if emptySelection}
+                <span class="text-muted text-xs" data-testid="agent-selection-default">
+                  Harness/session default
+                </span>
+              {:else if agent.model_choices.length > 0}
+                <AgentSelectionChip
+                  axis="model"
+                  harness={agent.harness}
+                  selection={agentSelection}
+                  busy={selectionBusy(agent.id)}
+                  onActivate={(selection) => void activateSelection(agent, selection)}
+                />
+              {:else if agent.model === null && SUPPORTS_MODEL_SELECTION[agent.harness]}
+                <span class="text-muted text-xs" data-testid="agent-model-default">
+                  Model: Harness/session default
+                </span>
+              {/if}
+              {#if agent.effort_choices.length > 0 && effortSupport.kind !== "none"}
+                <AgentSelectionChip
+                  axis="effort"
+                  harness={agent.harness}
+                  selection={agentSelection}
+                  busy={selectionBusy(agent.id)}
+                  onActivate={(selection) => void activateSelection(agent, selection)}
+                />
+              {:else if !emptySelection && agent.effort === null && effortSupport.kind !== "none" && SUPPORTS_EFFORT_SELECTION[agent.harness]}
+                <span class="text-muted text-xs" data-testid="agent-effort-default">
+                  Effort: Harness/session default
+                </span>
+              {/if}
+            </div>
+          {/if}
+          {#if selectionSaveErrors[agent.id]}
+            <p class="text-status-failed mt-1 text-xs" data-testid="agent-selection-save-error">
+              {selectionSaveErrors[agent.id]}
+            </p>
+          {/if}
+          <!-- Clean-hide convention: every metadata cell above and below is
+                 presence-gated, so a value a harness never reports simply never
+                 renders — no blank label, no empty bar, no "—" placeholder. These
+                 absences are correct, not gaps: some harnesses expose no `context_window`
+                 (the bar below never renders for it), and Antigravity reports no
+                 cost / quota / context at all. A transient absence (a fresh agent
+                 pre-first-turn) hides identically to a permanent one; that's the
+                 intended behavior, not a case to distinguish. -->
+          {#if context !== undefined}
+            <div class="mt-1.5 flex items-end gap-1.5" data-testid="agent-context-bar">
+              <!-- "Context", not "Context used": the row carries two buttons
+                     beside the meter and the longer label no longer fits — it
+                     clipped by 11px at the default sidebar width, measured in
+                     WebKit. Nothing is lost, since the detail beside it already
+                     reads "121.1k / 1M · 12%". Pinned by
+                     `tests/browser/agent-context-row-fit.browser.test.ts`. -->
+              <Meter
+                label="Context"
+                value={context.fraction}
+                detail="{formatTokens(context.usedTokens)} / {formatTokens(context.windowTokens)}"
+                class="flex-1"
+              />
+              {#if supportsContextReport(agent.harness)}
+                <!-- The meter says how full; this opens what it is full of.
+                       No arm-then-confirm step, unlike the compact button
+                       beside it: opening the panel runs nothing at all. -->
+                <Tooltip label="Context breakdown" side="top">
+                  {#snippet trigger(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      class={cn(ICON_BUTTON_CLASS, "-mb-0.5 h-5 w-5")}
+                      aria-label="Context breakdown"
+                      data-testid="agent-context-breakdown-button"
+                      onclick={() => (breakdownAgentId = agent.id)}
+                    >
+                      <ChartPie size={14} strokeWidth={1.8} aria-hidden="true" />
+                    </button>
+                  {/snippet}
+                </Tooltip>
+              {/if}
+              {#if supportsManualCompaction(agent.harness)}
+                {@const armed = compactConfirmAgentId === agent.id}
+                {#snippet compactButton(props: Record<string, unknown>, armed: boolean)}
+                  {@const closeOnLeave = triggerHandler(props, "onpointerleave")}
+                  {@const closeOnBlur = triggerHandler(props, "onblur")}
+                  <button
+                    {...props}
+                    type="button"
+                    class={armed
+                      ? cn(ICON_BUTTON_CLASS, "text-accent -mb-0.5 h-5 w-5")
+                      : cn(ICON_BUTTON_CLASS, "-mb-0.5 h-5 w-5")}
+                    aria-label={armed ? "Compact now" : "Compact context"}
+                    data-armed={armed ? "true" : "false"}
+                    data-testid="agent-compact-button"
+                    onclick={() => {
+                      if (armed) {
+                        void startCompaction(agent.id);
+                      } else {
+                        compactConfirmAgentId = agent.id;
+                        compactConfirmTooltipOpen = true;
+                      }
+                    }}
+                    onpointerleave={(event) => {
+                      closeOnLeave?.(event);
+                      disarmCompaction();
+                    }}
+                    onblur={(event) => {
+                      closeOnBlur?.(event);
+                      disarmCompaction();
+                    }}
+                  >
+                    {#if armed}
+                      <Check size={13} strokeWidth={2.2} aria-hidden="true" />
+                    {:else}
+                      <RotateCcw size={14} strokeWidth={1.8} aria-hidden="true" />
+                    {/if}
+                  </button>
+                {/snippet}
+                <!-- Two instances, not one with a swapped label. The primitive
+                       closes a tooltip when its trigger is clicked and latches it
+                       shut until a fresh pointer-enter — right for an ordinary
+                       button, wrong here, where the click is exactly what needs
+                       explaining and the pointer never leaves. Arming mounts a
+                       second, unsuppressed tooltip already open. Disarms on
+                       pointer leave rather than on a timer or an outside click:
+                       the button is the only thing that armed it, so leaving it
+                       is the clearest "I didn't mean that". -->
+                {#if armed}
+                  <Tooltip
+                    label="Confirm compaction?"
+                    side="top"
+                    bind:open={compactConfirmTooltipOpen}
+                  >
+                    {#snippet trigger(props)}
+                      {@render compactButton(props, true)}
+                    {/snippet}
+                  </Tooltip>
+                {:else}
+                  <Tooltip side="top" reopen="fresh-hover">
+                    {#snippet trigger(props)}
+                      {@render compactButton(props, false)}
+                    {/snippet}
+                    {@render compactTooltipContent()}
+                  </Tooltip>
                 {/if}
-                {#if agent.effort_choices.length > 0 && effortSupport.kind !== "none"}
-                  <AgentSelectionChip
-                    axis="effort"
-                    harness={agent.harness}
-                    selection={agentSelection}
-                    busy={selectionBusy(agent.id)}
-                    onActivate={(selection) => void activateSelection(agent, selection)}
-                  />
-                {:else if !emptySelection && agent.effort === null && effortSupport.kind !== "none" && SUPPORTS_EFFORT_SELECTION[agent.harness]}
-                  <span class="text-muted text-xs" data-testid="agent-effort-default">
-                    Effort: Harness/session default
-                  </span>
-                {/if}
-              </div>
-            {/if}
-            {#if selectionSaveErrors[agent.id]}
-              <p class="text-status-failed mt-1 text-xs" data-testid="agent-selection-save-error">
-                {selectionSaveErrors[agent.id]}
-              </p>
-            {/if}
-            <AgentEnvironment inventory={runtime?.meta?.inventory} asOf={runtime?.meta_as_of} />
+              {/if}
+            </div>
+          {/if}
+          {#if isCollapsed && (usageWarning !== undefined || (rlView?.overage ?? null) !== null)}
+            <div
+              class="text-warning mt-1.5 space-y-0.5 text-[11px]"
+              data-testid="agent-compact-warnings"
+            >
+              {#if usageWarning !== undefined}
+                <p>{usageWarning.label} · {formatUsedPercent(usageWarning.usedFraction)} used</p>
+              {/if}
+              {#if rlView?.overage !== null && rlView?.overage !== undefined}
+                <p>⚡ using credits</p>
+              {/if}
+            </div>
+          {/if}
+          {#if !isCollapsed}
             <!-- Per-turn cost is deliberately NOT shown on the card — it
                  renders inline per-message in the transcript (real-spend turns
                  only). There is no per-agent cost total (system-design §2): the
@@ -1445,6 +1598,9 @@
                    the threshold line, and the snapshot age when rehydrated.
                    Stream-only, so it survives restart via the metadata
                    sidecar. -->
+              <div class="text-muted mt-2 text-[10px] font-medium tracking-wide uppercase">
+                Usage limits
+              </div>
               <Tooltip side="right">
                 {#snippet trigger(props)}
                   <!-- tabindex=0 so keyboard users can open the tooltip; a <div>
@@ -1475,24 +1631,32 @@
                     {/if}
                   </div>
                 {/snippet}
-                <div class="max-w-xs space-y-1 text-[13px]" data-testid="agent-rate-detail">
+                <div class="space-y-2.5 text-[13px]" data-testid="agent-rate-detail">
+                  <p class="font-medium">Usage details</p>
                   {@render usageWindowDetail(rlView.windows)}
                   {#if rlView.fallback !== null}
-                    <p>
-                      {rlView.fallback.label} resets {formatResetDateTime(
-                        rlView.fallback.resetsAtMs,
-                      )}
-                    </p>
+                    <div class="grid grid-cols-[auto_1fr] gap-4">
+                      <span>{rlView.fallback.label}</span>
+                      <span class="text-right tabular-nums">
+                        Resets {formatResetDateTime(rlView.fallback.resetsAtMs)}
+                      </span>
+                    </div>
                   {/if}
                   {#if rlView.overage !== null}
-                    <p>
-                      Spending usage credits{rlView.overage.resetsAtMs !== null
-                        ? ` — overage window resets ${formatResetDateTime(rlView.overage.resetsAtMs)}`
-                        : "."}
-                    </p>
+                    <div class="text-warning border-primary-fg/20 border-t pt-2">
+                      <p class="font-medium">Spending usage credits</p>
+                      {#if rlView.overage.resetsAtMs !== null}
+                        <p class="mt-0.5 text-[12px]">
+                          Overage window resets {formatResetDateTime(rlView.overage.resetsAtMs)}
+                        </p>
+                      {/if}
+                    </div>
                   {/if}
                   {#if overageAsOf != null}
-                    <p class="text-primary-fg/70" data-testid="agent-rate-snapshot">
+                    <p
+                      class="text-primary-fg/70 border-primary-fg/20 border-t pt-2 text-[12px]"
+                      data-testid="agent-rate-snapshot"
+                    >
                       Snapshot from {relativeTime(overageAsOf)} — send a message to refresh.
                     </p>
                   {/if}
@@ -1504,6 +1668,9 @@
                    Claude's. Session-file-backed (class B, durable), so no
                    snapshot-age qualifier, and Codex reports no threshold flag,
                    so no window here ever warns. -->
+              <div class="text-muted mt-2 text-[10px] font-medium tracking-wide uppercase">
+                Usage limits
+              </div>
               <Tooltip side="right">
                 {#snippet trigger(props)}
                   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
@@ -1516,120 +1683,13 @@
                     {@render usageMeters(codexWindows)}
                   </div>
                 {/snippet}
-                <div class="max-w-xs space-y-1 text-[13px]" data-testid="agent-rate-limit-detail">
+                <div class="space-y-2.5 text-[13px]" data-testid="agent-rate-limit-detail">
+                  <p class="font-medium">Usage details</p>
                   {@render usageWindowDetail(codexWindows)}
                 </div>
               </Tooltip>
             {/if}
-            <!-- Clean-hide convention: every metadata cell above and below is
-                 presence-gated, so a value a harness never reports simply never
-                 renders — no blank label, no empty bar, no "—" placeholder. These
-                 absences are correct, not gaps: some harnesses expose no `context_window`
-                 (the bar below never renders for it), and Antigravity reports no
-                 cost / quota / context at all. A transient absence (a fresh agent
-                 pre-first-turn) hides identically to a permanent one; that's the
-                 intended behavior, not a case to distinguish. -->
-            {#if context !== undefined}
-              <div class="mt-1.5 flex items-end gap-1.5" data-testid="agent-context-bar">
-                <!-- "Context", not "Context used": the row carries two buttons
-                     beside the meter and the longer label no longer fits — it
-                     clipped by 11px at the default sidebar width, measured in
-                     WebKit. Nothing is lost, since the detail beside it already
-                     reads "121.1k / 1M · 12%". Pinned by
-                     `tests/browser/agent-context-row-fit.browser.test.ts`. -->
-                <Meter
-                  label="Context"
-                  value={context.fraction}
-                  detail="{formatTokens(context.usedTokens)} / {formatTokens(context.windowTokens)}"
-                  class="flex-1"
-                />
-                {#if supportsContextReport(agent.harness)}
-                  <!-- The meter says how full; this opens what it is full of.
-                       No arm-then-confirm step, unlike the compact button
-                       beside it: opening the panel runs nothing at all. -->
-                  <Tooltip label="Context breakdown" side="top">
-                    {#snippet trigger(props)}
-                      <button
-                        {...props}
-                        type="button"
-                        class="text-muted hover:text-fg hover:bg-active -mb-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded"
-                        aria-label="Context breakdown"
-                        data-testid="agent-context-breakdown-button"
-                        onclick={() => (breakdownAgentId = agent.id)}
-                      >
-                        <ChartPie size={13} strokeWidth={1.8} aria-hidden="true" />
-                      </button>
-                    {/snippet}
-                  </Tooltip>
-                {/if}
-                {#if supportsManualCompaction(agent.harness)}
-                  {@const armed = compactConfirmAgentId === agent.id}
-                  {#snippet compactButton(props: Record<string, unknown>, armed: boolean)}
-                    {@const closeOnLeave = triggerHandler(props, "onpointerleave")}
-                    {@const closeOnBlur = triggerHandler(props, "onblur")}
-                    <button
-                      {...props}
-                      type="button"
-                      class={armed
-                        ? "text-accent hover:bg-active -mb-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded"
-                        : "text-muted hover:text-fg hover:bg-active -mb-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded"}
-                      aria-label={armed ? "Compact now" : "Compact context"}
-                      data-armed={armed ? "true" : "false"}
-                      data-testid="agent-compact-button"
-                      onclick={() => {
-                        if (armed) {
-                          void startCompaction(agent.id);
-                        } else {
-                          compactConfirmAgentId = agent.id;
-                          compactConfirmTooltipOpen = true;
-                        }
-                      }}
-                      onpointerleave={(event) => {
-                        closeOnLeave?.(event);
-                        disarmCompaction();
-                      }}
-                      onblur={(event) => {
-                        closeOnBlur?.(event);
-                        disarmCompaction();
-                      }}
-                    >
-                      {#if armed}
-                        <Check size={13} strokeWidth={2.2} aria-hidden="true" />
-                      {:else}
-                        <History size={13} strokeWidth={1.8} aria-hidden="true" />
-                      {/if}
-                    </button>
-                  {/snippet}
-                  <!-- Two instances, not one with a swapped label. The primitive
-                       closes a tooltip when its trigger is clicked and latches it
-                       shut until a fresh pointer-enter — right for an ordinary
-                       button, wrong here, where the click is exactly what needs
-                       explaining and the pointer never leaves. Arming mounts a
-                       second, unsuppressed tooltip already open. Disarms on
-                       pointer leave rather than on a timer or an outside click:
-                       the button is the only thing that armed it, so leaving it
-                       is the clearest "I didn't mean that". -->
-                  {#if armed}
-                    <Tooltip
-                      label="Confirm compaction?"
-                      side="top"
-                      bind:open={compactConfirmTooltipOpen}
-                    >
-                      {#snippet trigger(props)}
-                        {@render compactButton(props, true)}
-                      {/snippet}
-                    </Tooltip>
-                  {:else}
-                    <Tooltip side="top" reopen="fresh-hover">
-                      {#snippet trigger(props)}
-                        {@render compactButton(props, false)}
-                      {/snippet}
-                      {@render compactTooltipContent()}
-                    </Tooltip>
-                  {/if}
-                {/if}
-              </div>
-            {/if}
+            <AgentEnvironment inventory={runtime?.meta?.inventory} asOf={runtime?.meta_as_of} />
           {/if}
           {#if removeError?.agentId === agent.id}
             <div class="text-status-failed mt-1 text-xs" data-testid="agent-remove-error">

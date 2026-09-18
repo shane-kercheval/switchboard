@@ -383,6 +383,13 @@ describe("GitRepoNode GitHub actions", () => {
 });
 
 describe("GitRepoNode supplemental text tooltips", () => {
+  function markKeyboardFocus(element: HTMLElement): void {
+    const nativeMatches = element.matches.bind(element);
+    vi.spyOn(element, "matches").mockImplementation((selector: string) =>
+      selector === ":focus-visible" ? true : nativeMatches(selector),
+    );
+  }
+
   it("uses one long-delay keyboard target for repository identity", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     render(GitRepoNode, { props: props("/a") });
@@ -412,6 +419,7 @@ describe("GitRepoNode supplemental text tooltips", () => {
 
     const branch = screen.getByTestId("branch-select");
     expect(branch.querySelector('[tabindex="0"]')).toBeNull();
+    markKeyboardFocus(branch);
 
     await fireEvent.keyDown(window, { key: "Tab" });
     await fireEvent.focus(branch);
@@ -441,6 +449,7 @@ describe("GitRepoNode supplemental text tooltips", () => {
     const identity = screen.getByTestId("detached-identity");
     expect(identity).toHaveAttribute("tabindex", "0");
     expect(identity.querySelector('[tabindex="0"]')).toBeNull();
+    markKeyboardFocus(identity);
 
     await fireEvent.keyDown(window, { key: "Tab" });
     await fireEvent.focus(identity);
@@ -460,6 +469,7 @@ describe("GitRepoNode supplemental text tooltips", () => {
 
     const commitRow = screen.getAllByTestId("commit-row")[0]!;
     expect(commitRow.querySelector('[tabindex="0"]')).toBeNull();
+    markKeyboardFocus(commitRow);
 
     await fireEvent.keyDown(window, { key: "Tab" });
     await fireEvent.focus(commitRow);

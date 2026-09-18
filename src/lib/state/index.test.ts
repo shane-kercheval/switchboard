@@ -1277,6 +1277,27 @@ describe("hydrateAgent", () => {
     expect(state.runtimes[AGENT_A]?.meta_as_of).toBe("2026-09-17T12:00:00Z");
   });
 
+  it("carries the rate-limit model from the IPC reply to the runtime", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+
+    invokeMock.mockResolvedValueOnce({
+      turns: [],
+      meta: null,
+      last_rate_limit: {
+        unifiedWindows: {
+          seven_day_overage_included: { utilization: 0.79, resetsAt: 1_800_000_000 },
+        },
+      },
+      last_rate_limit_model: "claude-fable-5-1",
+      last_rate_limit_as_of: "2026-09-17T12:00:00Z",
+      warnings: [],
+    });
+
+    await state.hydrateAgent(AGENT_A);
+    expect(state.runtimes[AGENT_A]?.last_rate_limit_model).toBe("claude-fable-5-1");
+  });
+
   it("a live inventory that lands before hydration resolves never inherits the snapshot's age", async () => {
     // Ordering race: the reducer fills meta only where absent, so a live
     // `session_meta` that arrives first must win and the disk snapshot's

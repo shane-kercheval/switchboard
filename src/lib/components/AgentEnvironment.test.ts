@@ -36,13 +36,17 @@ async function expand(): Promise<void> {
 }
 
 describe("AgentEnvironment", () => {
-  it("collapses to one line of counts", () => {
+  it("collapses to one line with only actionable status", async () => {
     render(AgentEnvironment, { props: { inventory: CLAUDE } });
 
-    expect(screen.getByTestId("agent-env-summary")).toHaveTextContent(
+    expect(screen.getByTestId("agent-env-toggle")).toHaveTextContent("Environment");
+    expect(screen.getByTestId("agent-env-summary")).toHaveTextContent("1 need auth");
+    expect(screen.queryByTestId("agent-env-detail")).toBeNull();
+
+    await expand();
+    expect(screen.getByTestId("agent-env-inventory-summary")).toHaveTextContent(
       "MCP 2 · 1 need auth · Agents 2 · Plugins 1 · Skills 1 · Memory 1",
     );
-    expect(screen.queryByTestId("agent-env-detail")).toBeNull();
   });
 
   it("renders nothing when the harness reported no inventory", () => {
@@ -63,14 +67,27 @@ describe("AgentEnvironment", () => {
 
     const detail = screen.getByTestId("agent-env-detail");
     expect(within(detail).getByTestId("agent-env-mcp")).toBeInTheDocument();
-    expect(within(detail).getByTestId("agent-env-agents")).toHaveTextContent("Explore, Plan");
+    const agents = within(detail).getByTestId("agent-env-agents");
+    expect(agents).not.toHaveTextContent("Explore");
+    await fireEvent.click(within(detail).getByTestId("agent-env-agents-toggle"));
+    expect(within(agents).getByText("Explore")).toBeInTheDocument();
+    expect(within(agents).getByText("Plan")).toBeInTheDocument();
     expect(within(detail).getByTestId("agent-env-plugins")).toHaveTextContent(
       "anthropic-skills @ 0.0.1",
     );
     expect(within(detail).getByTestId("agent-env-memory")).toHaveTextContent("memory");
-    expect(within(detail).getByTestId("agent-env-settings")).toHaveTextContent(
-      "Permission mode: bypassPermissions · Output style: default",
-    );
+    const settings = within(detail).getByTestId("agent-env-settings");
+    expect(within(settings).getByText("Permission mode")).toBeInTheDocument();
+    expect(within(settings).getByText("bypassPermissions")).toBeInTheDocument();
+    expect(within(settings).getByText("Output style")).toBeInTheDocument();
+    expect(within(settings).getByText("default")).toBeInTheDocument();
+    const commands = within(detail).getByTestId("agent-env-list-slash_commands");
+    expect(
+      commands.compareDocumentPosition(agents) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      agents.compareDocumentPosition(settings) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("names the connected dot by its status, not the server beside it", async () => {
@@ -84,6 +101,8 @@ describe("AgentEnvironment", () => {
     const dot = screen.getByTestId("agent-env-mcp-dot");
     expect(dot).toHaveAttribute("aria-label", "connected");
     expect(dot).not.toHaveAttribute("aria-label", "tiddly");
+    expect(dot).not.toHaveAttribute("tabindex");
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
   });
 
   it("keeps the warning dot decorative beside its visible status", async () => {
@@ -127,7 +146,7 @@ describe("AgentEnvironment", () => {
     // Servers: both rows survive with their own status, not one row twice.
     const dots = screen.getAllByTestId("agent-env-mcp-dot");
     expect(dots).toHaveLength(2);
-    expect(dots[0]).toHaveClass("bg-status-idle");
+    expect(dots[0]).toHaveClass("bg-accent");
     expect(dots[1]).toHaveClass("bg-warning");
     expect(screen.getByTestId("agent-env-plugins")).toHaveTextContent("kit @ 1");
     expect(screen.getByTestId("agent-env-plugins")).toHaveTextContent("kit @ 2");
@@ -136,8 +155,9 @@ describe("AgentEnvironment", () => {
     await fireEvent.click(screen.getByTestId("agent-env-skills-toggle"));
     const skills = screen.getByTestId("agent-env-skills");
     expect(skills).toHaveTextContent("Skills · 2");
-    expect(skills).toHaveTextContent("deep-research — bundled");
-    expect(skills).toHaveTextContent("deep-research — customized");
+    expect(within(skills).getAllByText("deep-research")).toHaveLength(2);
+    expect(within(skills).getByText("bundled")).toBeInTheDocument();
+    expect(within(skills).getByText("customized")).toBeInTheDocument();
   });
 
   it("shows a needs-auth server as a warning naming its status", async () => {
@@ -148,7 +168,7 @@ describe("AgentEnvironment", () => {
     expect(mcp).toHaveTextContent("needs-auth");
     const dots = screen.getAllByTestId("agent-env-mcp-dot");
     expect(dots).toHaveLength(2);
-    expect(dots[0]).toHaveClass("bg-status-idle");
+    expect(dots[0]).toHaveClass("bg-accent");
     expect(dots[1]).toHaveClass("bg-warning");
   });
 
@@ -187,7 +207,7 @@ describe("AgentEnvironment", () => {
     expect(screen.getByTestId("agent-env-list-approved_commands")).toBeInTheDocument();
   });
 
-  it("keeps a long list behind a count line that expands in place", async () => {
+  it("keeps a long list behind a one-line trigger that opens a popover", async () => {
     render(AgentEnvironment, { props: { inventory: CLAUDE } });
     await expand();
 
@@ -196,7 +216,12 @@ describe("AgentEnvironment", () => {
     expect(tools).not.toHaveTextContent("Bash");
 
     await fireEvent.click(screen.getByTestId("agent-env-list-toggle-tools"));
-    expect(screen.getByTestId("agent-env-list-tools")).toHaveTextContent("Bash, Read");
+    expect(
+      within(screen.getByTestId("agent-env-list-tools")).getByText("Bash"),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("agent-env-list-tools")).getByText("Read"),
+    ).toBeInTheDocument();
   });
 
   it("keeps skills behind their own count line, with descriptions", async () => {
@@ -208,9 +233,12 @@ describe("AgentEnvironment", () => {
     expect(skills).not.toHaveTextContent("Build polished reports.");
 
     await fireEvent.click(screen.getByTestId("agent-env-skills-toggle"));
-    expect(screen.getByTestId("agent-env-skills")).toHaveTextContent(
-      "build-report — Build polished reports.",
-    );
+    expect(
+      within(screen.getByTestId("agent-env-skills")).getByText("build-report"),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("agent-env-skills")).getByText("Build polished reports."),
+    ).toBeInTheDocument();
   });
 
   it("expands the approved-command allowlist as command lines", async () => {
@@ -218,9 +246,9 @@ describe("AgentEnvironment", () => {
     await expand();
     await fireEvent.click(screen.getByTestId("agent-env-list-toggle-approved_commands"));
 
-    expect(screen.getByTestId("agent-env-list-approved_commands")).toHaveTextContent(
-      "brew install jq, ls",
-    );
+    const commands = screen.getByTestId("agent-env-list-approved_commands");
+    expect(within(commands).getByText("brew install jq")).toBeInTheDocument();
+    expect(within(commands).getByText("ls")).toBeInTheDocument();
   });
 
   it("says the list is a snapshot only when it was rehydrated", async () => {

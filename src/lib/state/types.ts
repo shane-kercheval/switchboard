@@ -404,11 +404,8 @@ export type AgentRuntime = {
   /// orphan the first request's correlation.
   context_report_request?: ContextReportRequest;
   /// Model of the turn that delivered `last_rate_limit`, used to label Claude's
-  /// per-model weekly window (which the payload itself never names).
-  /// Deliberately **not** persisted in the metadata sidecar: a label restored
-  /// from disk could outlive the model it described. Absent after a reload, so
-  /// the window falls back to a generic label until the next live event stamps
-  /// it.
+  /// per-model weekly window (which the payload itself never names). Persisted
+  /// beside that exact payload so the association remains valid on reopen.
   last_rate_limit_model?: string;
   /// Model reported by the **current turn's** `session_meta`, cleared at
   /// `turn_start`. Separate from `meta.model`, which survives across turns for

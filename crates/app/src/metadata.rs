@@ -46,6 +46,7 @@ impl MetadataCache for ProjectMetadataCache {
         &self,
         agent_id: AgentId,
         info: serde_json::Value,
+        model: Option<String>,
         captured_at: DateTime<Utc>,
     ) {
         // The cache is per-agent (one instance per dispatch context); the
@@ -74,6 +75,7 @@ impl MetadataCache for ProjectMetadataCache {
         if let Err(e) = switchboard_harness::meta_sidecar::write_rate_limit(
             &self.sidecar_path,
             info,
+            model,
             captured_at,
         ) {
             tracing::warn!(

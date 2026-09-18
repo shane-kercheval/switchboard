@@ -12,4 +12,18 @@ describe("StatusDot", () => {
     const { container } = render(StatusDot, { props: { status: "idle" } });
     expect(container.querySelector("span")).toHaveClass("bg-status-idle");
   });
+
+  it("uses the green accent token for a successful state", () => {
+    const { container } = render(StatusDot, { props: { status: "success" } });
+    expect(container.querySelector("span")).toHaveClass("bg-accent");
+  });
+
+  it("can retain a labelled hover tooltip without joining the Tab order", () => {
+    const { container } = render(StatusDot, {
+      props: { status: "success", label: "connected", focusable: false },
+    });
+    const dot = container.querySelector("span");
+    expect(dot).toHaveAttribute("aria-label", "connected");
+    expect(dot).not.toHaveAttribute("tabindex");
+  });
 });

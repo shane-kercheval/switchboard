@@ -89,6 +89,10 @@
     skipDelayDuration?: number;
     disableHoverableContent?: boolean;
     disabled?: boolean;
+    /// Ignore focus assigned by pointer interaction, dialog restoration, or
+    /// application code. Keyboard focus still opens the tooltip. Defaults to
+    /// true so a tooltip cannot appear away from the pointer merely because a
+    /// trigger regained focus.
     ignoreNonKeyboardFocus?: boolean;
     /// Disable pointer-driven opening when an existing control owns keyboard
     /// access to details whose nested text/icons retain their own hover tooltips.
@@ -126,7 +130,7 @@
     skipDelayDuration = 300,
     disableHoverableContent = true,
     disabled = false,
-    ignoreNonKeyboardFocus = undefined,
+    ignoreNonKeyboardFocus = true,
     openOnHover = true,
     focusable = true,
     reopen = "default",
@@ -264,13 +268,7 @@
 </script>
 
 <Bits.Provider {delayDuration} skipDelayDuration={reopen === "fresh-hover" ? 0 : skipDelayDuration}>
-  <Bits.Root
-    bind:open
-    {tether}
-    {disableHoverableContent}
-    {disabled}
-    ignoreNonKeyboardFocus={ignoreNonKeyboardFocus ?? reopen === "fresh-hover"}
-  >
+  <Bits.Root bind:open {tether} {disableHoverableContent} {disabled} {ignoreNonKeyboardFocus}>
     <Bits.Trigger {tether}>
       {#snippet child({ props })}
         {@render trigger(tooltipTriggerProps(props))}

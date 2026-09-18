@@ -386,6 +386,9 @@ export type LoadedTranscript = {
   turns: LoadedTurn[];
   meta?: SessionMetaInfo | null;
   last_rate_limit?: unknown;
+  /// Model captured with a stream-only rate-limit snapshot. This keeps a
+  /// model-specific quota label exact across app restarts.
+  last_rate_limit_model?: string | null;
   /// Capture time of `last_rate_limit` when restored from the per-agent
   /// metadata sidecar (a stream-only/class-C value, e.g. Claude's overage
   /// signal, that would otherwise be lost on restart). ISO-8601 string.
@@ -480,6 +483,8 @@ export type Hydrate = {
   turns: LoadedTurn[];
   meta?: SessionMetaInfo | null;
   last_rate_limit?: unknown;
+  /// Model captured with `last_rate_limit` in the metadata sidecar.
+  last_rate_limit_model?: string | null;
   /// Capture time of `last_rate_limit` from the metadata sidecar (see
   /// `LoadedTranscript.last_rate_limit_as_of`). `null` when the value is
   /// live or class-B.
@@ -1013,6 +1018,8 @@ export type AgentConversationMeta = {
   agent_id: AgentId;
   meta?: SessionMetaInfo | null;
   last_rate_limit?: unknown;
+  /// Model captured with `last_rate_limit` in the metadata sidecar.
+  last_rate_limit_model?: string | null;
   /// Capture time of `last_rate_limit` from the metadata sidecar (ISO-8601);
   /// `null`/absent for live or class-B sources. See
   /// `LoadedTranscript.last_rate_limit_as_of`.

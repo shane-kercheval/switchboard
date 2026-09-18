@@ -4793,6 +4793,7 @@ fn apply_meta_sidecar_overlay(
         && let Some(snapshot) = sidecar.rate_limit
     {
         transcript.last_rate_limit = Some(snapshot.payload);
+        transcript.last_rate_limit_model = snapshot.model;
         transcript.last_rate_limit_as_of = Some(snapshot.captured_at);
     }
 
@@ -5309,6 +5310,9 @@ pub struct AgentConversationMeta {
     pub agent_id: AgentId,
     pub meta: Option<switchboard_harness::SessionMetaInfo>,
     pub last_rate_limit: Option<serde_json::Value>,
+    /// Model captured with `last_rate_limit`; used to name model-specific
+    /// quota windows after hydration.
+    pub last_rate_limit_model: Option<String>,
     /// Capture time of `last_rate_limit` when restored from the metadata
     /// sidecar (stream-only/class-C value); drives the UI staleness
     /// qualifier. `None` for live values and for class-B (durable) sources.
@@ -6417,6 +6421,7 @@ fn merge_project_conversation(
             agent_id,
             meta: transcript.meta,
             last_rate_limit: transcript.last_rate_limit,
+            last_rate_limit_model: transcript.last_rate_limit_model,
             last_rate_limit_as_of: transcript.last_rate_limit_as_of,
             meta_as_of: transcript.meta_as_of,
             last_context_report: transcript.last_context_report,
@@ -13363,6 +13368,7 @@ mod tests {
             schema_version: 1,
             rate_limit: Some(switchboard_harness::meta_sidecar::RateLimitSnapshot {
                 payload: serde_json::json!({"isUsingOverage": true}),
+                model: Some("claude-fable-5-1".to_owned()),
                 captured_at: captured,
             }),
             context_window: None,
@@ -13374,6 +13380,10 @@ mod tests {
             Some(serde_json::json!({"isUsingOverage": true}))
         );
         assert_eq!(transcript.last_rate_limit_as_of, Some(captured));
+        assert_eq!(
+            transcript.last_rate_limit_model.as_deref(),
+            Some("claude-fable-5-1")
+        );
     }
 
     fn inventory_sidecar(
@@ -13521,6 +13531,7 @@ mod tests {
             schema_version: 1,
             rate_limit: Some(switchboard_harness::meta_sidecar::RateLimitSnapshot {
                 payload: serde_json::json!({"should": "not win"}),
+                model: Some("should-not-win".to_owned()),
                 captured_at: chrono::Utc::now(),
             }),
             context_window: None,
@@ -14116,6 +14127,7 @@ mod tests {
         switchboard_harness::meta_sidecar::write_rate_limit(
             &sidecar_path,
             serde_json::json!({"isUsingOverage": true, "resetsAt": 1_778_701_800u64}),
+            Some("claude-fable-5-1".to_owned()),
             captured,
         )
         .unwrap();
@@ -14126,6 +14138,10 @@ mod tests {
             Some(serde_json::json!({"isUsingOverage": true, "resetsAt": 1_778_701_800u64}))
         );
         assert_eq!(result.last_rate_limit_as_of, Some(captured));
+        assert_eq!(
+            result.last_rate_limit_model.as_deref(),
+            Some("claude-fable-5-1")
+        );
     }
 
     #[tokio::test]

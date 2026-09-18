@@ -272,6 +272,10 @@ pub struct LoadedTranscript {
     pub turns: Vec<Turn>,
     pub meta: Option<SessionMetaInfo>,
     pub last_rate_limit: Option<serde_json::Value>,
+    /// Model captured with `last_rate_limit` when the app restores a
+    /// stream-only snapshot. `None` for harness-file-backed values and legacy
+    /// sidecars that predate model persistence.
+    pub last_rate_limit_model: Option<String>,
     /// Capture time of `last_rate_limit` when it was restored from the
     /// per-agent metadata sidecar (a stream-only/class-C value that would
     /// otherwise be lost on restart). Drives the UI's "as of …" staleness

@@ -166,6 +166,8 @@ describe("Sidebar", () => {
     const icons = screen.getAllByTestId("agent-harness-icon");
     expect(icons[0]).toHaveAttribute("alt", "Claude");
     expect(icons[1]).toHaveAttribute("alt", "Codex");
+    expect(icons[0]!.parentElement).toHaveClass("rounded-full", "overflow-hidden");
+    expect(screen.getAllByTestId("sidebar-agent")[0]).toHaveClass("rounded-lg");
   });
 
   it("outlines only the agents selected to receive the draft", async () => {
@@ -220,23 +222,48 @@ describe("Sidebar", () => {
         },
       },
     ];
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      last_rate_limit: {
+        status: "allowed",
+        unifiedWindows: {
+          five_hour: { utilization: 0.25, resetsAt: epochFromNow(3600) },
+        },
+      },
+      meta: {
+        model: "claude-sonnet-4-6",
+        harness_version: "2.1.274",
+        inventory: { skills: [{ name: "debug" }] },
+      },
+    };
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    // Expanded by default → details (the context bar) are visible.
+    // Context remains visible in both full and compact card states.
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-rate-limit-claude")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-meta")).toBeInTheDocument();
 
     await fireEvent.click(screen.getByTestId("sidebar-agent"));
-    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "true");
+    expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-selection-default")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
+    expect(screen.queryByTestId("agent-meta")).toBeNull();
 
     await openAgentActions();
     await fireEvent.click(await screen.findByTestId("agent-action-collapse"));
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-rate-limit-claude")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-meta")).toBeInTheDocument();
 
     const card = screen.getByTestId("sidebar-agent");
     card.focus();
     await fireEvent.keyDown(card, { key: " " });
-    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+    expect(card).toHaveAttribute("data-collapsed", "true");
+    expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
   });
 
   it("does not collapse the card when a click completes text selection", async () => {
@@ -253,6 +280,45 @@ describe("Sidebar", () => {
     selection.mockRestore();
   });
 
+  it("keeps actionable usage warnings visible in compact mode without environment alerts", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      last_rate_limit: {
+        status: "allowed_warning",
+        rateLimitType: "seven_day",
+        surpassedThreshold: 0.75,
+        isUsingOverage: true,
+        overageResetsAt: epochFromNow(6 * 86400),
+        unifiedWindows: {
+          seven_day: { utilization: 0.91, resetsAt: epochFromNow(5 * 86400) },
+        },
+      },
+      meta: {
+        model: "claude-sonnet-4-6",
+        harness_version: "2.1.274",
+        inventory: { mcp_servers: [{ name: "gmail", status: "needs-auth" }] },
+      },
+    };
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    expect(screen.queryByTestId("agent-compact-warnings")).toBeNull();
+
+    const toggle = screen.getByTestId("agent-collapse-toggle");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    const warnings = screen.getByTestId("agent-compact-warnings");
+    expect(warnings).toHaveTextContent("Weekly · all models · 91% used");
+    expect(warnings).toHaveTextContent("using credits");
+    expect(warnings).not.toHaveTextContent("MCP");
+    expect(warnings).not.toHaveTextContent("need auth");
+  });
+
   it("renders the harness icon and a hover-revealed actions menu trigger", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
@@ -265,10 +331,8 @@ describe("Sidebar", () => {
 
     expect(screen.getByTestId("agent-harness-icon")).toBeInTheDocument();
     const trigger = screen.getByTestId("agent-actions-trigger");
-    // `hidden`, not `opacity-0`: a transparent icon still reserves its width,
-    // and that gutter is what truncated names. Reveal is display-based.
-    expect(trigger).toHaveClass("hidden");
-    expect(trigger).toHaveClass("group-hover:inline-flex");
+    expect(trigger).toHaveClass("invisible");
+    expect(trigger).toHaveClass("group-hover:visible");
 
     const menu = await openAgentActions();
     expect(await screen.findByTestId("agent-action-resume")).toBeInTheDocument();
@@ -518,7 +582,10 @@ describe("Sidebar", () => {
     const toggleAll = screen.getByTestId("sidebar-toggle-all");
     expect(toggleAll).toHaveAccessibleName("Collapse all agents");
     await fireEvent.click(toggleAll);
-    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+    expect(
+      screen.getAllByTestId("sidebar-agent").every((card) => card.dataset.collapsed === "true"),
+    ).toBe(true);
+    expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
     expect(toggleAll).toHaveAccessibleName("Expand all agents");
 
     await fireEvent.click(toggleAll);
@@ -835,12 +902,12 @@ describe("Sidebar", () => {
       "Harness/session default",
     );
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
-    expect(screen.getByTestId("agent-env-summary")).toHaveTextContent("MCP 1 · Skills 1");
+    expect(screen.getByTestId("agent-env-summary")).toHaveTextContent("View details");
   });
 
   // --- Environment row wiring ------------------------------------------------
   //
-  // The row's own behavior — the collapsed counts, the status dots, the
+  // The row's own behavior — the summary trigger, the status dots, the
   // count-line expansions — is covered in `AgentEnvironment.test.ts`. These
   // pin the wiring: which runtime fields the card feeds it, and that it
   // clean-hides for an agent with nothing to show.
@@ -906,7 +973,9 @@ describe("Sidebar", () => {
     expect(screen.getByTestId("agent-env-mcp")).toHaveTextContent("tiddly");
     expect(screen.queryByTestId("agent-env-mcp-dot")).toBeNull();
     expect(screen.getByTestId("agent-env-list-approved_commands")).toBeInTheDocument();
-    expect(screen.getByTestId("agent-env-settings")).toHaveTextContent("Sandbox: read-only");
+    const settings = screen.getByTestId("agent-env-settings");
+    expect(within(settings).getByText("Sandbox")).toBeInTheDocument();
+    expect(within(settings).getByText("read-only")).toBeInTheDocument();
   });
 
   // --- Model / effort: change actions + intent display -----------------------
@@ -1496,9 +1565,10 @@ describe("Sidebar", () => {
 
     expect(screen.getByTestId("agent-effort-chip")).toHaveTextContent("High");
     expect(screen.getByTestId("agent-effort-chip").tagName).toBe("SPAN");
+    expect(screen.getByTestId("agent-effort-chip")).toHaveClass("rounded-full");
   });
 
-  it("gives the name the full row until hover: shared-prefix names stay distinguishable at rest", async () => {
+  it("reserves stable action slots for shared-prefix names", async () => {
     const state = await loadState();
     const a = {
       ...CLAUDE_AGENT,
@@ -1516,15 +1586,13 @@ describe("Sidebar", () => {
 
     const names = screen.getAllByTestId("agent-name").map((el) => el.textContent?.trim());
     expect(names).toEqual(["gpt-5-5-minimal", "gpt-5-5-minimal-2"]);
-    // The room comes from the action icons being `hidden` (display: none —
-    // zero width) until hover/focus, rather than `opacity-0` (invisible but
-    // still reserving a two-icon gutter). The name truncates only while the
-    // icons are revealed.
+    // The action gutter stays reserved so revealing controls never moves the
+    // harness icon or reflows the header.
     for (const toggle of screen.getAllByTestId("agent-visibility-toggle")) {
-      expect(toggle).toHaveClass("hidden");
+      expect(toggle).toHaveClass("invisible");
     }
     for (const trigger of screen.getAllByTestId("agent-actions-trigger")) {
-      expect(trigger).toHaveClass("hidden");
+      expect(trigger).toHaveClass("invisible");
     }
   });
 });
@@ -1761,9 +1829,7 @@ describe("Sidebar Claude usage windows", () => {
     expect(meters[2]).toHaveTextContent("79%");
   });
 
-  it("falls back to a generic per-model label when no model was observed", async () => {
-    // After a reload the sidecar restores the payload but deliberately not the
-    // model, so the window must not name one it cannot vouch for.
+  it("falls back to a generic per-model label for a legacy snapshot without a model", async () => {
     await renderClaudeWithRateLimit(
       {
         status: "allowed",
@@ -1913,9 +1979,10 @@ describe("Sidebar Claude rate-limit tooltip", () => {
     await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
     await vi.advanceTimersByTimeAsync(500);
     const detail = await waitFor(() => screen.getByTestId("agent-rate-detail"));
-    expect(detail).toHaveTextContent("5-hour limit resets");
+    expect(detail).toHaveTextContent("5-hour limit");
+    expect(detail).toHaveTextContent("Resets");
     // The overage window is surfaced here.
-    expect(detail).toHaveTextContent("overage window resets");
+    expect(detail).toHaveTextContent(/overage window resets/i);
     // Live snapshot (as_of null) → no snapshot-age line.
     expect(screen.queryByTestId("agent-rate-snapshot")).toBeNull();
   });
@@ -1927,8 +1994,8 @@ describe("Sidebar Claude rate-limit tooltip", () => {
     await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
     await vi.advanceTimersByTimeAsync(500);
     const detail = await waitFor(() => screen.getByTestId("agent-rate-detail"));
-    expect(detail).toHaveTextContent(/5-hour limit: 33% used · resets/);
-    expect(detail).toHaveTextContent(/Weekly · all models: 27% used · resets/);
+    expect(detail).toHaveTextContent(/5-hour limit\s+33% used\s+Resets/);
+    expect(detail).toHaveTextContent(/Weekly · all models\s+27% used\s+Resets/);
   });
 
   it("names the threshold the harness flagged, on that window's line only", async () => {
@@ -1949,13 +2016,10 @@ describe("Sidebar Claude rate-limit tooltip", () => {
     // Per line, not over the whole tooltip: `textContent` concatenates the
     // paragraphs, so a cross-line regex would match a threshold clause that
     // belongs to the *other* window.
-    expect(
-      within(detail).getByText(
-        /^Weekly · all models: 79% used · resets .+ · above 75% of this limit$/,
-      ),
-    ).toBeInTheDocument();
-    // The unflagged window's line ends at its reset date.
-    expect(within(detail).getByText(/^5-hour limit: 33% used · resets .+$/)).toBeInTheDocument();
+    expect(within(detail).getByText("Weekly · all models")).toBeInTheDocument();
+    expect(within(detail).getByText("Warning threshold")).toBeInTheDocument();
+    expect(within(detail).getByText("75%")).toBeInTheDocument();
+    expect(within(detail).getAllByText("Resets")).toHaveLength(2);
   });
 
   it("adds a snapshot-age + refresh line on hover when rehydrated (as_of set)", async () => {
@@ -2041,8 +2105,8 @@ describe("Sidebar Codex rate-limit windows", () => {
       await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit"));
       await vi.advanceTimersByTimeAsync(500);
       const detail = await waitFor(() => screen.getByTestId("agent-rate-limit-detail"));
-      expect(detail).toHaveTextContent(/5-hour limit: 42% used · resets/);
-      expect(detail).toHaveTextContent(/Weekly · all models: 7% used · resets/);
+      expect(detail).toHaveTextContent(/5-hour limit\s+42% used\s+Resets/);
+      expect(detail).toHaveTextContent(/Weekly · all models\s+7% used\s+Resets/);
     } finally {
       vi.useRealTimers();
     }

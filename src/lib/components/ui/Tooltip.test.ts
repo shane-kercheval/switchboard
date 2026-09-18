@@ -45,10 +45,28 @@ describe("Tooltip", () => {
 
   it("opens on keyboard focus as well as pointer hover (a11y)", async () => {
     render(Harness, { props: { mode: "label" } });
-    await fireEvent.focus(screen.getByTestId("tt-trigger"));
+    const trigger = screen.getByTestId("tt-trigger");
+    vi.spyOn(trigger, "matches").mockImplementation(
+      (selector: string) => selector === ":focus-visible",
+    );
+    await fireEvent.keyDown(window, { key: "Tab" });
+    await fireEvent.focus(trigger);
     await vi.advanceTimersByTimeAsync(700);
     const content = await waitFor(() => screen.getByTestId("tooltip-content"));
     expect(content).toHaveTextContent("hello label");
+  });
+
+  it("ignores programmatic focus that is not keyboard-visible", async () => {
+    render(Harness, { props: { mode: "label" } });
+    const trigger = screen.getByTestId("tt-trigger");
+    vi.spyOn(trigger, "matches").mockImplementation((selector: string) =>
+      selector === ":focus-visible" ? false : HTMLElement.prototype.matches.call(trigger, selector),
+    );
+
+    await fireEvent.focus(trigger);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
   });
 
   it("keeps supplemental hover text out of the keyboard tab order", async () => {
@@ -66,6 +84,9 @@ describe("Tooltip", () => {
   it("can delegate details to keyboard focus without claiming nested hover", async () => {
     render(Harness, { props: { mode: "focus-only" } });
     const trigger = screen.getByTestId("tt-trigger");
+    vi.spyOn(trigger, "matches").mockImplementation(
+      (selector: string) => selector === ":focus-visible",
+    );
 
     await fireEvent.pointerEnter(trigger);
     await vi.advanceTimersByTimeAsync(1000);

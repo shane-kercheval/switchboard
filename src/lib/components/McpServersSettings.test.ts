@@ -459,6 +459,10 @@ describe("McpServersSettings — OAuth delta hardening", () => {
     expect(signIn.disabled).toBe(true);
     expect(signIn).not.toHaveAttribute("title");
     expect(tooltipTrigger).toHaveAttribute("tabindex", "0");
+    const nativeMatches = tooltipTrigger.matches.bind(tooltipTrigger);
+    vi.spyOn(tooltipTrigger, "matches").mockImplementation((selector: string) =>
+      selector === ":focus-visible" ? true : nativeMatches(selector),
+    );
     vi.useFakeTimers({ shouldAdvanceTime: true });
     await fireEvent.focus(tooltipTrigger);
     await vi.advanceTimersByTimeAsync(1100);

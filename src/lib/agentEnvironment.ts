@@ -1,17 +1,18 @@
-/// Derives the agent card's Environment row from what the harness reported
-/// having loaded.
+/// Derives the agent card's Environment entry and detail popover from what the
+/// harness reported having loaded.
 ///
 /// Kept out of `Sidebar.svelte` for the same reason `usageWindows.ts` is: this
 /// is input validation and presentation policy over an undocumented,
 /// per-harness shape, and it is worth testing directly rather than only
 /// through rendered markup.
 ///
-/// **The governing rule is disclosure, not omission.** Nothing the harness
-/// reports is dropped because the list is long — a long list collapses to a
-/// count line that expands in place. What *is* dropped is a list the harness
-/// never reported and a list it reported as empty: neither has anything to
-/// show, so neither draws a section. The two still differ upstream, where
-/// only the unreported one may be filled from a config registry.
+/// **The governing rule is disclosure, not omission.** The narrow card shows
+/// only actionable state; the complete inventory lives in a bounded popover,
+/// where long lists collapse to count lines. What *is* dropped is a list the
+/// harness never reported and a list it reported as empty: neither has
+/// anything to show, so neither draws a section. The two still differ
+/// upstream, where only the unreported one may be filled from a config
+/// registry.
 import { basename } from "$lib/utils";
 import type { McpServerStatus, SessionInventory, SettingPair, SkillEntry } from "$lib/types";
 
@@ -25,7 +26,7 @@ const CONFIGURED_STATUS = "configured";
 /// whatever the harness called it, rather than hide behind a calm dot.
 const CONNECTED_STATUS = "connected";
 
-export type ServerTone = "idle" | "warning";
+export type ServerTone = "success" | "warning";
 
 export type EnvironmentServer = {
   name: string;
@@ -51,8 +52,8 @@ export type EnvironmentServer = {
   statusLabel?: string;
 };
 
-/// A list long enough to live behind a count line ("Tools · 109") that expands
-/// in place.
+/// A list long enough to live behind a count line ("Tools · 109") inside the
+/// detail popover.
 export type EnvironmentList = {
   key: string;
   label: string;
@@ -67,8 +68,12 @@ export type EnvironmentPlugin = { name: string; version?: string };
 /// is nothing to draw; the view itself is `null` when that is true of all of
 /// them.
 export type EnvironmentView = {
-  /// The collapsed line: "MCP 7 · 2 need auth · Agents 6 · Skills 30".
+  /// The detail popover's inventory overview.
   summary: string;
+  /// Actionable state that remains visible on the compact card trigger. The
+  /// complete inventory summary belongs inside the detail popover, where it
+  /// has enough width to remain readable.
+  attentionSummary: string | null;
   servers: EnvironmentServer[] | null;
   agents: string[] | null;
   plugins: EnvironmentPlugin[] | null;
@@ -90,7 +95,7 @@ function present<T>(list: readonly T[] | undefined): T[] | null {
 
 function serverTone(status: string): ServerTone | undefined {
   if (status === CONFIGURED_STATUS) return undefined;
-  return status === CONNECTED_STATUS ? "idle" : "warning";
+  return status === CONNECTED_STATUS ? "success" : "warning";
 }
 
 function toServer(server: McpServerStatus): EnvironmentServer {
@@ -159,6 +164,16 @@ function summaryOf(inventory: SessionInventory): string {
   return parts.join(" · ");
 }
 
+function attentionSummaryOf(inventory: SessionInventory): string | null {
+  const servers = present(inventory.mcp_servers);
+  if (servers === null) return null;
+  const { needsAuth, other } = attentionCounts(servers);
+  const parts: string[] = [];
+  if (needsAuth > 0) parts.push(`${needsAuth} need auth`);
+  if (other > 0) parts.push(`${other} need attention`);
+  return parts.length === 0 ? null : parts.join(" · ");
+}
+
 export function environmentView(inventory: SessionInventory | undefined): EnvironmentView | null {
   if (inventory === undefined) return null;
 
@@ -175,6 +190,7 @@ export function environmentView(inventory: SessionInventory | undefined): Enviro
 
   const view: EnvironmentView = {
     summary: summaryOf(inventory),
+    attentionSummary: attentionSummaryOf(inventory),
     servers: servers === null ? null : servers.map(toServer),
     agents: present(inventory.agents),
     plugins: present(inventory.plugins)?.map(({ name, version }) => ({ name, version })) ?? null,

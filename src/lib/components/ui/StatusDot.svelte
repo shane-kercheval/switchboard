@@ -3,33 +3,35 @@
   /// and dark. Used where a label would be too heavy (e.g. the "background
   /// activity" indicator on a non-active project row).
   ///
-  /// `"warning"` is accepted alongside the run statuses and names the caution role
-  /// rather than a run state — an MCP server the harness reports as
-  /// `needs-auth` is not "failed", it is something the user can fix. It is
-  /// deliberately **not** added to `BadgeStatus`: that type is the run-state
-  /// vocabulary, and `app.css` keeps `warning` a separate role precisely so
-  /// re-tuning run colors cannot drag warnings along.
+  /// `"success"` and `"warning"` are accepted alongside the run statuses for
+  /// healthy and caution states that are not themselves agent run states.
   import { cn } from "$lib/utils";
   import type { BadgeStatus } from "$lib/status";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
 
   type Props = {
-    status: BadgeStatus | "warning";
+    status: BadgeStatus | "success" | "warning";
     /// When set, the dot is the sole status signal: exposes an accessible name
     /// + tooltip. When omitted, the dot is decorative (a sibling text label
     /// carries the meaning) and is hidden from assistive tech.
     label?: string;
+    /// Whether a labelled dot joins the Tab order. Keep this false when the
+    /// dot sits inside a focus-managed surface such as a popover; its label
+    /// remains exposed to assistive technology and its tooltip still opens on
+    /// hover.
+    focusable?: boolean;
     testid?: string;
     class?: string;
   };
 
-  let { status, label, testid, class: className }: Props = $props();
+  let { status, label, focusable = true, testid, class: className }: Props = $props();
 
-  const DOT: Record<BadgeStatus | "warning", string> = {
+  const DOT: Record<BadgeStatus | "success" | "warning", string> = {
     idle: "bg-status-idle",
     processing: "bg-status-processing",
     failed: "bg-status-failed",
     cancelled: "bg-status-cancelled",
+    success: "bg-accent",
     warning: "bg-warning",
   };
 </script>
@@ -46,7 +48,7 @@
 {/snippet}
 
 {#if label}
-  <Tooltip {label}>{#snippet trigger(props)}{@render dot(props)}{/snippet}</Tooltip>
+  <Tooltip {label} {focusable}>{#snippet trigger(props)}{@render dot(props)}{/snippet}</Tooltip>
 {:else}
   {@render dot()}
 {/if}

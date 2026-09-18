@@ -1,3 +1,4 @@
+import { tick } from "svelte";
 import { expect, test, vi } from "vitest";
 import { page } from "vitest/browser";
 
@@ -21,7 +22,7 @@ import { transcripts } from "$lib/state/index.svelte";
 import { layout } from "$lib/layout.svelte";
 
 /// The default and minimum agent-sidebar widths.
-const DEFAULT_WIDTH = 240;
+const DEFAULT_WIDTH = 280;
 const MIN_WIDTH = 200;
 
 /// A Claude agent whose last turn reported occupancy, which is what makes the
@@ -91,4 +92,22 @@ test("the context row records its residual clipping at the minimum width", async
 
   expect(labelClipping()).toBeGreaterThan(0);
   expect(labelClipping()).toBeLessThan(30);
+});
+
+test("restoring focus to context breakdown does not open its tooltip", async () => {
+  await renderAt(DEFAULT_WIDTH);
+
+  // Establish pointer modality before simulating focus restoration. WebKit
+  // treats bare programmatic focus as keyboard-visible until it has observed
+  // pointer input, which is not the dialog-close path this guards.
+  const collapse = page.getByTestId("agent-collapse-toggle");
+  await collapse.click();
+  await collapse.click();
+  const breakdown = page.getByTestId("agent-context-breakdown-button").element() as HTMLElement;
+  breakdown.focus();
+  await tick();
+
+  expect(document.activeElement).toBe(breakdown);
+  expect(breakdown.matches(":focus-visible")).toBe(false);
+  expect(document.querySelector('[data-testid="tooltip-content"]')).toBeNull();
 });

@@ -61,18 +61,20 @@ describe("environmentView summary", () => {
   });
 
   it("reports both kinds of trouble as separate counts", () => {
-    expect(
-      view({
-        mcp_servers: [
-          { name: "a", status: "needs-auth" },
-          { name: "b", status: "disconnected" },
-        ],
-      }).summary,
-    ).toBe("MCP 2 · 1 need auth · 1 need attention");
+    const v = view({
+      mcp_servers: [
+        { name: "a", status: "needs-auth" },
+        { name: "b", status: "disconnected" },
+      ],
+    });
+    expect(v.summary).toBe("MCP 2 · 1 need auth · 1 need attention");
+    expect(v.attentionSummary).toBe("1 need auth · 1 need attention");
   });
 
   it("omits the needs-attention clause when every server is connected", () => {
-    expect(view({ mcp_servers: [{ name: "a", status: "connected" }] }).summary).toBe("MCP 1");
+    const v = view({ mcp_servers: [{ name: "a", status: "connected" }] });
+    expect(v.summary).toBe("MCP 1");
+    expect(v.attentionSummary).toBeNull();
   });
 
   it("does not count config-file entries as needing attention", () => {
@@ -122,9 +124,9 @@ describe("environmentView sections", () => {
     ).not.toBeNull();
   });
 
-  it("gives a connected server the calm dot and no status text", () => {
+  it("gives a connected server the success dot and no status text", () => {
     const server = view({ mcp_servers: [{ name: "a", status: "connected" }] }).servers?.[0];
-    expect(server?.tone).toBe("idle");
+    expect(server?.tone).toBe("success");
     expect(server?.statusLabel).toBeUndefined();
     // The raw status still rides along: it is the dot's accessible name in
     // this one case where the dot is the sole status signal.

@@ -101,11 +101,11 @@ pub enum MockScenario {
     /// requiring a subprocess.
     CodexPostTerminalEnrichment,
 
-    /// Emits `ContentChunk → TurnEnd(Completed) → RateLimitEvent` with the
-    /// given [`RateLimitSource`]. The vehicle for the dispatcher's
-    /// metadata-persistence durability-gate test: run once with `StreamOnly`
-    /// (must persist) and once with `SessionFileBacked` (must not), asserting
-    /// the injected `MetadataCache`.
+    /// Emits `ContentChunk → TurnEnd(Completed) → RateLimitEvent → SessionMeta`
+    /// with matching durability sources. The vehicle for the dispatcher's
+    /// rate-limit persistence gate and its rate-before-model repair: run once
+    /// with `StreamOnly` (must persist, then pair the model) and once with
+    /// `SessionFileBacked` (must not), asserting the injected `MetadataCache`.
     RateLimitWithSource(crate::events::RateLimitSource),
 
     /// Emits `ContentChunk → TurnEnd(Completed) → SessionMeta` whose
@@ -729,6 +729,19 @@ impl HarnessAdapter for MockHarnessAdapter {
                         agent_id,
                         info: serde_json::json!({"primary": {"used_percent": 42.0}}),
                         source,
+                    });
+                    let meta_source = if source == crate::events::RateLimitSource::StreamOnly {
+                        crate::events::SessionMetaSource::StreamOnly
+                    } else {
+                        crate::events::SessionMetaSource::SessionFileBacked
+                    };
+                    let _ = tx.send(AdapterEvent::SessionMeta {
+                        agent_id,
+                        model: "mock-fable".to_owned(),
+                        harness_version: "test".to_owned(),
+                        inventory: crate::events::SessionInventory::default(),
+                        raw: serde_json::Value::Null,
+                        source: meta_source,
                     });
                 });
             }

@@ -57,6 +57,12 @@ pub struct RateLimitSnapshot {
     /// Opaque payload, exactly as received from the harness's
     /// `rate_limit_event` (Claude's `isUsingOverage` / `resetsAt` / etc.).
     pub payload: serde_json::Value,
+    /// Model reported by the same turn that delivered this payload. Claude's
+    /// model-specific weekly window does not repeat the model in the rate-limit
+    /// object, so keeping it beside the snapshot preserves the exact label on
+    /// reopen. Legacy snapshots omit it and retain the generic fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Wall-clock time this snapshot was captured (ISO-8601 UTC on disk).
     pub captured_at: DateTime<Utc>,
 }
@@ -205,12 +211,14 @@ pub enum MetaSidecarError {
 pub fn write_rate_limit(
     path: &Path,
     payload: serde_json::Value,
+    model: Option<String>,
     captured_at: DateTime<Utc>,
 ) -> Result<(), MetaSidecarError> {
     let mut sidecar = read(path).unwrap_or_default();
     sidecar.schema_version = SCHEMA_VERSION;
     sidecar.rate_limit = Some(RateLimitSnapshot {
         payload,
+        model,
         captured_at,
     });
     persist(path, &sidecar)
@@ -348,6 +356,7 @@ mod tests {
         write_rate_limit(
             &path,
             serde_json::json!({"x": 1}),
+            None,
             ts("2026-09-17T12:00:00Z"),
         )
         .unwrap();
@@ -361,7 +370,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("a.meta.json");
         let at = ts("2026-09-17T12:00:00Z");
-        write_rate_limit(&path, serde_json::json!({"isUsingOverage": true}), at).unwrap();
+        write_rate_limit(&path, serde_json::json!({"isUsingOverage": true}), None, at).unwrap();
         write_context_window(&path, 200_000, "m".to_owned(), "msg_1".to_owned(), at).unwrap();
         write_inventory(&path, sample_inventory(), at).unwrap();
 
@@ -412,11 +421,18 @@ mod tests {
         let path = tmp.path().join("agent.meta.json");
         let payload = serde_json::json!({"isUsingOverage": true, "resetsAt": 1_778_701_800u64});
         let captured = ts("2026-05-27T18:42:11Z");
-        write_rate_limit(&path, payload.clone(), captured).unwrap();
+        write_rate_limit(
+            &path,
+            payload.clone(),
+            Some("claude-fable-5-1".to_owned()),
+            captured,
+        )
+        .unwrap();
 
         let read_back = read(&path).expect("sidecar present after write");
         let rl = read_back.rate_limit.expect("rate_limit populated");
         assert_eq!(rl.payload, payload);
+        assert_eq!(rl.model.as_deref(), Some("claude-fable-5-1"));
         assert_eq!(rl.captured_at, captured);
         assert_eq!(read_back.schema_version, SCHEMA_VERSION);
     }
@@ -436,6 +452,7 @@ mod tests {
         write_rate_limit(
             &path,
             serde_json::json!({"a": 1}),
+            None,
             ts("2026-05-27T00:00:00Z"),
         )
         .unwrap();
@@ -449,12 +466,14 @@ mod tests {
         write_rate_limit(
             &path,
             serde_json::json!({"v": 1}),
+            None,
             ts("2026-05-27T00:00:00Z"),
         )
         .unwrap();
         write_rate_limit(
             &path,
             serde_json::json!({"v": 2}),
+            None,
             ts("2026-05-27T01:00:00Z"),
         )
         .unwrap();
@@ -496,6 +515,7 @@ mod tests {
         write_rate_limit(
             &path,
             serde_json::json!({"isUsingOverage": true}),
+            None,
             ts("2026-05-31T12:00:00Z"),
         )
         .unwrap();
@@ -567,6 +587,7 @@ mod tests {
         write_rate_limit(
             &path,
             serde_json::json!({"good": true}),
+            None,
             ts("2026-05-27T00:00:00Z"),
         )
         .unwrap();

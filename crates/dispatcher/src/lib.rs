@@ -773,6 +773,7 @@ pub trait MetadataCache: Send + Sync {
         &self,
         agent_id: AgentId,
         info: serde_json::Value,
+        model: Option<String>,
         captured_at: DateTime<Utc>,
     );
 
@@ -825,7 +826,14 @@ pub trait MetadataCache: Send + Sync {
 pub struct NoopMetadataCache;
 
 impl MetadataCache for NoopMetadataCache {
-    fn record_rate_limit(&self, _: AgentId, _: serde_json::Value, _: DateTime<Utc>) {}
+    fn record_rate_limit(
+        &self,
+        _: AgentId,
+        _: serde_json::Value,
+        _: Option<String>,
+        _: DateTime<Utc>,
+    ) {
+    }
     fn record_context_window(&self, _: AgentId, _: u32, _: String, _: String, _: DateTime<Utc>) {}
     fn record_inventory(&self, _: AgentId, _: SessionInventory, _: DateTime<Utc>) {}
     fn record_turn_spend(
@@ -2169,6 +2177,13 @@ async fn drain_turn(
     // Antigravity's post-exit drain emits content + `SessionMeta` after the
     // capture). We keep looping only to service commands and let the child exit.
     let mut force_failed = false;
+    // A rate-limit payload and the model that names its model-specific window
+    // arrive as separate events. Keep their same-turn association here so the
+    // metadata sidecar can restore the exact label after restart. Either event
+    // may arrive first (compaction currently emits rate limit before init), so
+    // a later model observation repairs the just-written snapshot.
+    let mut rate_limit_model: Option<String> = None;
+    let mut stream_rate_limit_payload: Option<serde_json::Value> = None;
 
     loop {
         tokio::select! {
@@ -2388,6 +2403,20 @@ async fn drain_turn(
                     awaiters.fire(outcome, &text);
                     terminal = Some((outcome.clone(), text));
                 }
+                if let AdapterEvent::TurnEnd { model: Some(model), .. }
+                    | AdapterEvent::SessionMeta { model, .. } = &event
+                    && !model.is_empty()
+                {
+                    rate_limit_model = Some(model.clone());
+                    if let Some(payload) = &stream_rate_limit_payload {
+                        metadata.record_rate_limit(
+                            agent_id,
+                            payload.clone(),
+                            rate_limit_model.clone(),
+                            Utc::now(),
+                        );
+                    }
+                }
                 // Persist stream-only (class-C) rate-limit snapshots so they
                 // survive an app restart. The gate is on the event's `source`,
                 // not the harness — keeping the dispatcher harness-agnostic.
@@ -2397,7 +2426,13 @@ async fn drain_turn(
                 if let AdapterEvent::RateLimitEvent { agent_id: a, info, source } = &event
                     && *source == RateLimitSource::StreamOnly
                 {
-                    metadata.record_rate_limit(*a, info.clone(), Utc::now());
+                    stream_rate_limit_payload = Some(info.clone());
+                    metadata.record_rate_limit(
+                        *a,
+                        info.clone(),
+                        rate_limit_model.clone(),
+                        Utc::now(),
+                    );
                 }
                 // Persist the stream-only environment inventory, on the same
                 // source-gated and harness-agnostic terms as the two snapshots

@@ -106,12 +106,12 @@ test("the clickable card surface gains an outline and icon controls retain disti
 // CSS visibility — what jsdom physically cannot exercise
 // ---------------------------------------------------------------------------
 
-// The grip is display:none by default, so it reserves no empty slot. Hover
-// reveals it at the far right and intentionally shifts the harness icon left.
-test("drag grip is unreserved by default and appears at the far right on hover", async () => {
+// The grip occupies a fixed trailing gutter inside the card. Revealing it must
+// not move the identity or action controls elsewhere in the header.
+test("drag grip appears to the right without shifting the harness icon", async () => {
   render(SidebarHost, { projectId: PROJECT_ID, agents: THREE_AGENTS });
 
-  // All three grips start hidden (Tailwind `hidden` = display:none).
+  // All three grips start visually hidden while retaining their fixed geometry.
   for (let i = 0; i < 3; i++) {
     await expect.element(page.getByTestId("agent-drag-grip").nth(i)).not.toBeVisible();
   }
@@ -122,10 +122,12 @@ test("drag grip is unreserved by default and appears at the far right on hover",
   await card.hover();
 
   await expect.element(page.getByTestId("agent-drag-grip").nth(0)).toBeVisible();
-  expect(
-    (page.getByTestId("agent-drag-grip").nth(0).element() as HTMLElement).getBoundingClientRect().x,
-  ).toBeGreaterThan(harness.getBoundingClientRect().x);
-  expect(harness.getBoundingClientRect().x).toBeLessThan(harnessXBeforeHover);
+  const gripRect = (
+    page.getByTestId("agent-drag-grip").nth(0).element() as HTMLElement
+  ).getBoundingClientRect();
+  expect(gripRect.x).toBeGreaterThanOrEqual(harness.getBoundingClientRect().right);
+  expect(card.element().getBoundingClientRect().right - gripRect.right).toBeGreaterThanOrEqual(8);
+  expect(harness.getBoundingClientRect().x).toBe(harnessXBeforeHover);
   // Other cards' grips are unaffected.
   await expect.element(page.getByTestId("agent-drag-grip").nth(1)).not.toBeVisible();
 });
@@ -156,6 +158,9 @@ test("keyboard focus reveals the card controls and keeps them visible within the
   expect(firstCard.element().matches(":focus-visible")).toBe(true);
   await expect.element(page.getByTestId("agent-actions-trigger").nth(0)).toBeVisible();
 
+  const collapse = page.getByTestId("agent-collapse-toggle").nth(0).element() as HTMLElement;
+  collapse.focus();
+  expect(document.activeElement).toBe(collapse);
   await userEvent.tab();
   expect(document.activeElement).toBe(page.getByTestId("agent-visibility-toggle").nth(0).element());
   await expect.element(page.getByTestId("agent-actions-trigger").nth(0)).toBeVisible();

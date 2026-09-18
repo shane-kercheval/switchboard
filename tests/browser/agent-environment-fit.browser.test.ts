@@ -4,14 +4,9 @@ import { render } from "vitest-browser-svelte";
 import AgentEnvironmentHost from "./AgentEnvironmentHost.svelte";
 import type { SessionInventory } from "$lib/types";
 
-/// The default and minimum agent-sidebar widths (`layout.svelte`'s
-/// `SIDEBAR_MIN_WIDTH` and the agents sidebar default).
-const DEFAULT_WIDTH = 240;
+const DEFAULT_WIDTH = 280;
 const MIN_WIDTH = 200;
 
-/// A realistic worst case rather than a contrived one: the counts from the
-/// probe account that drove this milestone's design — seven MCP servers with
-/// two needing auth, plus every other section populated.
 const BUSY: SessionInventory = {
   mcp_servers: [
     { name: "a", status: "connected" },
@@ -28,42 +23,25 @@ const BUSY: SessionInventory = {
   memory_paths: ["/m"],
 };
 
-/// How many pixels of the element's text are clipped. Zero means it fits.
 function overflow(testid: string): number {
   const el = page.getByTestId(testid).element() as HTMLElement;
   return el.scrollWidth - el.clientWidth;
 }
 
-test("the collapsed counts line reports its overflow at the card's widths", async () => {
-  // Measured, not estimated — the preceding milestone's label estimates were
-  // wrong by 3-7x. This test's job is to make the fit a recorded number that
-  // moves visibly if the summary's wording changes, not to assert a design.
+function lineCount(testid: string): number {
+  const el = page.getByTestId(testid).element() as HTMLElement;
+  return el.getBoundingClientRect().height / Number.parseFloat(getComputedStyle(el).lineHeight);
+}
+
+test("the card trigger stays to one line and shows only actionable status", async () => {
   render(AgentEnvironmentHost, { props: { width: DEFAULT_WIDTH, inventory: BUSY } });
 
-  await expect.element(page.getByTestId("agent-env-summary")).toBeInTheDocument();
-  const text = (page.getByTestId("agent-env-summary").element() as HTMLElement).textContent;
-  expect(text).toBe("MCP 7 · 2 need auth · Agents 6 · Plugins 1 · Skills 30 · Memory 1");
-
-  // **No horizontal clipping, at any content length.** The busiest realistic
-  // summary needs ~367px against the ~224px a default-width card gives it, so
-  // it wraps. Truncating instead dropped the Skills and Memory counts off the
-  // card entirely (measured: 127px clipped), which is the one thing this row
-  // is specifically not allowed to do.
-  expect(overflow("agent-env-summary")).toBe(0);
-
-  // It wraps, rather than overflowing the row or pushing the chevron out of
-  // the card — a chevron off the card would make the row unopenable.
-  const summary = page.getByTestId("agent-env-summary").element() as HTMLElement;
-  const oneLine = Number.parseFloat(getComputedStyle(summary).lineHeight);
-  expect(summary.getBoundingClientRect().height).toBeGreaterThan(oneLine * 1.5);
-  const row = page.getByTestId("agent-env-toggle").element() as HTMLElement;
-  expect(row.scrollWidth - row.clientWidth).toBeLessThanOrEqual(1);
+  await expect.element(page.getByTestId("agent-env-summary")).toHaveTextContent("2 need auth");
+  expect(lineCount("agent-env-toggle")).toBeLessThan(1.5);
+  expect(overflow("agent-env-toggle")).toBeLessThanOrEqual(1);
 });
 
-test("a summary carrying both kinds of trouble still does not clip", async () => {
-  // Both status segments can legitimately appear together, and "one is
-  // nearly always zero" is not a layout argument — it is the kind of unmeasured
-  // assumption this file exists to replace.
+test("both kinds of MCP trouble remain available without wrapping the card", async () => {
   render(AgentEnvironmentHost, {
     props: {
       width: DEFAULT_WIDTH,
@@ -74,46 +52,49 @@ test("a summary carrying both kinds of trouble still does not clip", async () =>
     },
   });
 
-  await expect.element(page.getByTestId("agent-env-summary")).toBeInTheDocument();
-  expect((page.getByTestId("agent-env-summary").element() as HTMLElement).textContent).toBe(
-    "MCP 8 · 2 need auth · 1 need attention · Agents 6 · Plugins 1 · Skills 30 · Memory 1",
-  );
-  expect(overflow("agent-env-summary")).toBe(0);
-  const row = page.getByTestId("agent-env-toggle").element() as HTMLElement;
-  expect(row.scrollWidth - row.clientWidth).toBeLessThanOrEqual(1);
+  const row = page.getByTestId("agent-env-toggle");
+  await expect
+    .element(row)
+    .toHaveAccessibleName("Environment details, 2 need auth · 1 need attention");
+  expect(lineCount("agent-env-toggle")).toBeLessThan(1.5);
+  expect(overflow("agent-env-toggle")).toBeLessThanOrEqual(1);
 });
 
-test("a typical summary fits the default card width", async () => {
-  // The common case is not the busy one: an agent with a couple of servers
-  // and no plugins reads fully without expanding.
-  render(AgentEnvironmentHost, {
-    props: {
-      width: DEFAULT_WIDTH,
-      inventory: {
-        mcp_servers: [
-          { name: "a", status: "connected" },
-          { name: "b", status: "needs-auth" },
-        ],
-        skills: [{ name: "s" }],
-      },
-    },
-  });
+test("the full inventory moves to the bounded detail popover", async () => {
+  render(AgentEnvironmentHost, { props: { width: DEFAULT_WIDTH, inventory: BUSY } });
 
-  await expect.element(page.getByTestId("agent-env-summary")).toBeInTheDocument();
-  expect((page.getByTestId("agent-env-summary").element() as HTMLElement).textContent).toBe(
-    "MCP 2 · 1 need auth · Skills 1",
-  );
-  expect(overflow("agent-env-summary")).toBe(0);
+  await page.getByTestId("agent-env-toggle").click();
+  await expect.element(page.getByTestId("agent-env-detail")).toBeVisible();
+  await expect
+    .element(page.getByTestId("agent-env-inventory-summary"))
+    .toHaveTextContent("MCP 7 · 2 need auth · Agents 6 · Plugins 1 · Skills 30 · Memory 1");
+
+  const detail = page.getByTestId("agent-env-detail").element() as HTMLElement;
+  expect(detail.scrollHeight).toBeGreaterThanOrEqual(detail.clientHeight);
+  expect(detail.getBoundingClientRect().left).toBeGreaterThanOrEqual(0);
 });
 
-test("nothing clips at the minimum card width either", async () => {
-  // 200px is the sidebar's floor, where M1's context-meter labels still clip
-  // by a few pixels. The counts line must not join them: it wraps to however
-  // many lines it needs.
+test("opening details does not focus or open the connected-status tooltip", async () => {
+  render(AgentEnvironmentHost, { props: { width: DEFAULT_WIDTH, inventory: BUSY } });
+
+  await page.getByTestId("agent-env-toggle").click();
+  await expect.element(page.getByTestId("agent-env-detail")).toBeVisible();
+
+  const connected = page.getByTestId("agent-env-mcp-dot").first();
+  const dot = connected.element() as HTMLElement;
+  expect(dot.classList.contains("bg-accent")).toBe(true);
+  expect(dot.tabIndex).toBe(-1);
+  expect(document.activeElement).not.toBe(dot);
+  expect(document.querySelector('[data-testid="tooltip-content"]')).toBeNull();
+
+  await connected.hover();
+  await expect.element(page.getByTestId("tooltip-content")).toHaveTextContent("connected");
+});
+
+test("the trigger remains a single contained row at the minimum sidebar width", async () => {
   render(AgentEnvironmentHost, { props: { width: MIN_WIDTH, inventory: BUSY } });
 
-  await expect.element(page.getByTestId("agent-env-summary")).toBeInTheDocument();
-  expect(overflow("agent-env-summary")).toBe(0);
-  const row = page.getByTestId("agent-env-toggle").element() as HTMLElement;
-  expect(row.scrollWidth - row.clientWidth).toBeLessThanOrEqual(1);
+  await expect.element(page.getByTestId("agent-env-toggle")).toBeInTheDocument();
+  expect(lineCount("agent-env-toggle")).toBeLessThan(1.5);
+  expect(overflow("agent-env-toggle")).toBeLessThanOrEqual(1);
 });

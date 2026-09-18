@@ -26,10 +26,10 @@ import type { ProjectId } from "$lib/types";
 const STORAGE_KEY = "switchboard-layout";
 const STORAGE_VERSION = 1;
 
-/// Defaults match the pre-resizable Tailwind widths (`w-72` / `w-60`) so an
-/// untouched install looks identical.
+/// Defaults are sized for each rail's content. The agent rail is wider than
+/// its original `w-60` now that cards carry context and usage meters.
 export const PROJECTS_SIDEBAR_DEFAULT_WIDTH = 288;
-export const AGENTS_SIDEBAR_DEFAULT_WIDTH = 240;
+export const AGENTS_SIDEBAR_DEFAULT_WIDTH = 280;
 export const PINS_SIDEBAR_DEFAULT_WIDTH = 360;
 export const GIT_REPO_DEFAULT_WIDTH = 360;
 export const DIFF_FILE_LIST_DEFAULT_WIDTH = 256;

@@ -2085,22 +2085,23 @@ describe("runtimeReducer", () => {
   });
 
   it("hydrate never overwrites the model stamped by a live rate_limit_event", () => {
-    // The sidecar deliberately carries no model, so a reload must not clear or
-    // replace a label a live event already vouched for.
+    // The model belongs to the same fill-if-empty unit as the payload. A late
+    // disk snapshot must not replace a label a live event already vouched for.
     let r = withRateLimit(withMeta(withTurnStart(fresh()), "claude-fable-5-1"));
     r = runtimeReducer(r, {
       type: "hydrate",
       agent_id: AGENT_A,
       turns: [],
       last_rate_limit: { unifiedWindows: {} },
+      last_rate_limit_model: "claude-opus-4-8",
       last_rate_limit_as_of: "2026-05-27T18:42:11Z",
     });
     expect(r.last_rate_limit_model).toBe("claude-fable-5-1");
   });
 
-  it("hydrate supplies no model and never marks a snapshot for repair", () => {
-    // Disk-filled `meta.model` is first-model-wins and can predate the
-    // snapshot, which is exactly the stale value turn-scoping keeps out.
+  it("hydrate uses only the model persisted with the rate-limit snapshot", () => {
+    // Disk-filled `meta.model` is first-model-wins and can predate the quota
+    // snapshot. The sidecar's paired model is the one that labels it.
     const r = runtimeReducer(fresh(), {
       type: "hydrate",
       agent_id: AGENT_A,
@@ -2111,10 +2112,11 @@ describe("runtimeReducer", () => {
         inventory: {},
       },
       last_rate_limit: { unifiedWindows: {} },
+      last_rate_limit_model: "claude-fable-5-1",
       last_rate_limit_as_of: "2026-05-27T18:42:11Z",
     });
     expect(r.meta?.model).toBe("claude-sonnet-5");
-    expect(r.last_rate_limit_model).toBeUndefined();
+    expect(r.last_rate_limit_model).toBe("claude-fable-5-1");
     expect(r.last_rate_limit_awaiting_model).toBeUndefined();
     expect(r.current_turn_model).toBeUndefined();
   });
@@ -2174,9 +2176,11 @@ describe("runtimeReducer", () => {
       agent_id: AGENT_A,
       turns: [],
       last_rate_limit: { primary: { used_percent: 10.0 } },
+      last_rate_limit_model: "claude-fable-5-1",
       last_rate_limit_as_of: "2026-05-27T18:42:11Z",
     });
     expect(r.last_rate_limit).toEqual({ primary: { used_percent: 10.0 } });
+    expect(r.last_rate_limit_model).toBe("claude-fable-5-1");
     // The capture time rides along with the value it qualifies.
     expect(r.last_rate_limit_as_of).toBe("2026-05-27T18:42:11Z");
   });

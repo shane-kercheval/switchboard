@@ -302,10 +302,11 @@ impl ConversationJournal for RecordingJournal {
 type TurnSpendCall = (AgentId, String, Option<f64>, TurnSpend, DateTime<Utc>);
 type ContextWindowCall = (AgentId, u32, String, String, DateTime<Utc>);
 type InventoryCall = (AgentId, SessionInventory, DateTime<Utc>);
+type RateLimitCall = (AgentId, serde_json::Value, Option<String>, DateTime<Utc>);
 
 #[derive(Default)]
 struct RecordingMetadataCache {
-    calls: Mutex<Vec<(AgentId, serde_json::Value, DateTime<Utc>)>>,
+    calls: Mutex<Vec<RateLimitCall>>,
     context_window_calls: Mutex<Vec<ContextWindowCall>>,
     turn_spend_calls: Mutex<Vec<TurnSpendCall>>,
     inventory_calls: Mutex<Vec<InventoryCall>>,
@@ -316,12 +317,13 @@ impl MetadataCache for RecordingMetadataCache {
         &self,
         agent_id: AgentId,
         info: serde_json::Value,
+        model: Option<String>,
         captured_at: DateTime<Utc>,
     ) {
         self.calls
             .lock()
             .unwrap()
-            .push((agent_id, info, captured_at));
+            .push((agent_id, info, model, captured_at));
     }
 
     fn record_context_window(
@@ -1570,12 +1572,14 @@ async fn stream_only_rate_limit_is_persisted_to_metadata_cache() {
     let calls = metadata.calls.lock().unwrap();
     assert_eq!(
         calls.len(),
-        1,
-        "StreamOnly rate-limit must be persisted exactly once"
+        2,
+        "a rate-limit arriving before its model is first persisted generically, then repaired"
     );
-    let (recorded_agent, payload, captured_at) = &calls[0];
+    assert_eq!(calls[0].2, None);
+    let (recorded_agent, payload, model, captured_at) = &calls[1];
     assert_eq!(*recorded_agent, agent.id);
     assert_eq!(payload["primary"]["used_percent"], 42.0);
+    assert_eq!(model.as_deref(), Some("mock-fable"));
     assert!(
         *captured_at >= before && *captured_at <= after,
         "captured_at must be stamped at record time (roughly now)"

@@ -230,16 +230,16 @@ Settled here; the rationale must survive into code comments where marked.
    keys are not Claude Code windows on any plan we can probe; a junk label is worse than a dropped
    window. The full list is recorded in harness-behavior so a future probe can extend the map.
    *(Comment on the label map, naming the binary as the source.)*
-5. **The per-model window is labeled with the model that produced the snapshot — live only.** The
+5. **The per-model window is labeled with the model that produced the snapshot.** The
    label uses the model's **family name** (`agentSelection.ts::claudeModelFamilyLabel`, e.g.
    `claude-fable-5-1` → "Fable"), not the raw stream id: the id needs 136px against an 85px budget at
    the default sidebar width, and the family name is the word the user selected the model by. The
    window arrives only on turns run on an allowlisted model, so the model of the turn that delivered
    the event is a truthful label. The `rate_limit_event` reducer records the runtime's observed model
-   beside the payload as `last_rate_limit_model`. The sidecar does not carry it; after a reload the
-   label is "Weekly · model-specific", and the snapshot line already says the value is old. A live
-   event overwrites both fields, so a stale label cannot outlive the next turn. *(Comment on the
-   reducer arm and the fallback label.)*
+   beside the payload as `last_rate_limit_model`. The sidecar carries the same-turn model beside the
+   exact payload, so the family label survives reload without borrowing the session's older model.
+   A legacy sidecar without that additive field falls back to "Weekly · model-specific". A live event
+   overwrites both fields. *(Comment on the reducer arm and the fallback label.)*
 6. **The CLI's threshold warning becomes the meter's warning tone.** `status: "allowed_warning"`
    names the window in `rateLimitType` and the threshold in `surpassedThreshold`; that meter fills
    with the `warning` token and its tooltip gains "above N% of this limit". The second event of a
@@ -521,7 +521,8 @@ the same way.
 ### Implementation Outline
 
 **Runtime state (decision 5).** `AgentRuntime.last_rate_limit_model?: string`, stamped by the
-`rate_limit_event` arm from the runtime's observed model; `hydrate` leaves it absent.
+`rate_limit_event` arm from the runtime's observed model and restored by `hydrate` when the metadata
+sidecar carries the model paired with that snapshot.
 
 **Derivation (`Sidebar.svelte`).** Replace `rateLimitView`'s single `window` with a list in the
 meter's shape read from `unifiedWindows` in decision 4's order, with the label map and the
@@ -541,8 +542,8 @@ near-identical cells is at the implementer's discretion.
 ### Definition of Done
 
 `Sidebar.test.ts`: two windows → two meters, fraction → percent (`0.27` → "27%"), reset text present;
-three windows with `meta.model` seeded → third meter "Weekly · <model>", generic label after
-`hydrate` without a model; `allowed_warning` on `seven_day_overage_included` → that meter warning
+three windows with `meta.model` seeded → third meter "Weekly · <model>", generic label for a legacy
+snapshot hydrated without a model; `allowed_warning` on `seven_day_overage_included` → that meter warning
 tone + tooltip threshold line, others neutral; reset-passed on `five_hour` → only the weekly meter;
 overage → amber line beneath the meters + tooltip window; no `unifiedWindows` → one meter, no
 percentage (the existing Claude tests are this coverage — retitle any whose name reads as the primary
@@ -742,8 +743,8 @@ Small; compress accordingly.
     space-prefix rule and its rationale intact — the report action bypasses it by construction like
     compaction.
   - §1.4 Claude row and §3 "Rate-limit / quota" cell: `unifiedWindows`, the `allowed_warning`
-    second event, the full key list and which render, the per-model window's model-gating and
-    live-only label; fix "5-hour + weekly `overageResetsAt`" (it is the overage credit window).
+    second event, the full key list and which render, and the per-model window's model-gating;
+    fix "5-hour + weekly `overageResetsAt`" (it is the overage credit window).
   - §3 metadata table: the inventory fields now surfaced and persisted; G14 → ✅ closed with the
     as-of convention named; a new row for the context breakdown (Claude ✅ on demand; Codex /
     Antigravity ❌ — same hazard as §3.9).
@@ -776,7 +777,8 @@ counter", "weekly `overageResetsAt`", or the §0 claim that `/context` emits no 
   after a Fable turn disappears after a Sonnet turn on the same agent, even though the limit is
   still in force; retaining it live would not survive a reload (the sidecar persists the raw event),
   so it is not retained.
-- The per-model window's model label is live-only; after reload it reads "Weekly · model-specific".
+- A legacy metadata sidecar without the additive model field reads "Weekly · model-specific" until
+  the next live event refreshes the snapshot.
 - Which models the per-model window covers is a server-side allowlist the stream never names.
 - **A threshold warning naming a window we do not render is dropped along with the window.** The
   amber tone is attached to the flagged window, so if `rateLimitType` names a key outside the

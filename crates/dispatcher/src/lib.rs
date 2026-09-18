@@ -2406,6 +2406,7 @@ async fn drain_turn(
                 if let AdapterEvent::TurnEnd { model: Some(model), .. }
                     | AdapterEvent::SessionMeta { model, .. } = &event
                     && !model.is_empty()
+                    && rate_limit_model.as_deref() != Some(model.as_str())
                 {
                     rate_limit_model = Some(model.clone());
                     if let Some(payload) = &stream_rate_limit_payload {

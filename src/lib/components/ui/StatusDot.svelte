@@ -4,7 +4,10 @@
   /// activity" indicator on a non-active project row).
   ///
   /// `"success"` and `"warning"` are accepted alongside the run statuses for
-  /// healthy and caution states that are not themselves agent run states.
+  /// healthy and caution states that are not themselves agent run states. They
+  /// stay outside `BadgeStatus` so environment health does not expand the
+  /// run-state vocabulary; warning also keeps its independent semantic token,
+  /// so re-tuning run colors cannot alter caution states.
   import { cn } from "$lib/utils";
   import type { BadgeStatus } from "$lib/status";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";

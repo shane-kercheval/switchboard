@@ -26,6 +26,7 @@ import { render } from "vitest-browser-svelte";
 import SidebarHost from "./SidebarHost.svelte";
 import { PROJECT_ID, ALICE } from "./fixtures";
 import { setRecipients, _testing as selectionState } from "$lib/state/recipientSelection.svelte";
+import { layout } from "$lib/layout.svelte";
 import type { AgentRecord } from "$lib/types";
 
 // Two extra agents to give the roster a real layout to measure against.
@@ -57,10 +58,14 @@ const CAROL: AgentRecord = {
 
 const THREE_AGENTS = [ALICE, BOB, CAROL];
 
+const LONG_ALICE: AgentRecord = { ...ALICE, name: "shared-agent-a" };
+const LONG_BOB: AgentRecord = { ...BOB, name: "shared-agent-b" };
+
 beforeEach(() => {
   reorderAgentsMock.mockReset();
   reorderAgentsMock.mockResolvedValue(undefined);
   selectionState.reset();
+  layout.agentsSidebarWidth = 280;
 });
 
 test("selected recipients keep a thin accent outline at rest and on hover", async () => {
@@ -130,6 +135,26 @@ test("drag grip appears to the right without shifting the harness icon", async (
   expect(harness.getBoundingClientRect().x).toBe(harnessXBeforeHover);
   // Other cards' grips are unaffected.
   await expect.element(page.getByTestId("agent-drag-grip").nth(1)).not.toBeVisible();
+});
+
+test.each([
+  { width: 280, overflows: false },
+  { width: 240, overflows: true },
+  { width: 200, overflows: true },
+])("the full agent name remains available at a $width px sidebar", async ({ width, overflows }) => {
+  await page.viewport(1600, 900);
+  layout.agentsSidebarWidth = width;
+  render(SidebarHost, { projectId: PROJECT_ID, agents: [LONG_ALICE, LONG_BOB, CAROL] });
+
+  const card = page.getByTestId("sidebar-agent").first();
+  const name = page.getByTestId("agent-name").first();
+  const nameElement = name.element() as HTMLElement;
+  const overflow = nameElement.scrollWidth - nameElement.clientWidth;
+  expect(overflow > 1).toBe(overflows);
+  await expect.element(card).toHaveAccessibleName(/shared-agent-a/);
+
+  await name.hover();
+  await expect.element(page.getByTestId("tooltip-content")).toHaveTextContent("shared-agent-a");
 });
 
 test("pointer focus does not pin a card's hover controls after the pointer leaves", async () => {

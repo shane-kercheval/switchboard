@@ -85,6 +85,7 @@
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
@@ -1087,14 +1088,22 @@
                   <ChevronDown size={13} strokeWidth={1.8} aria-hidden="true" />
                 {/if}
               </button>
-              <div class="flex min-h-7 min-w-0 flex-1 items-center text-left">
-                <span
-                  class="text-fg cursor-text truncate text-[13px] font-semibold"
-                  data-testid="agent-name"
-                >
-                  {agent.name}
-                </span>
-              </div>
+              <Tooltip
+                label={agent.name}
+                delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+                focusable={false}
+              >
+                {#snippet trigger(props)}
+                  <div {...props} class="flex min-h-7 min-w-0 flex-1 items-center text-left">
+                    <span
+                      class="text-fg cursor-text truncate text-[13px] font-semibold"
+                      data-testid="agent-name"
+                    >
+                      {agent.name}
+                    </span>
+                  </div>
+                {/snippet}
+              </Tooltip>
               <div class="flex shrink-0 items-center gap-0.5">
                 <Tooltip
                   label={agentHidden ? `Show ${agent.name}` : `Hide ${agent.name} (⌥-click: solo)`}
@@ -1112,7 +1121,10 @@
                         // the state indicator); otherwise it appears on hover
                         // like the actions trigger. `invisible` preserves the
                         // action gutter so revealing controls never shifts the
-                        // harness identity or reflows the header.
+                        // harness identity or reflows the header. This gutter
+                        // previously truncated names without a recovery path;
+                        // the wider default and full-name tooltip above now
+                        // make that trade explicit and keep names discoverable.
                         agentHidden
                           ? "text-muted"
                           : "invisible group-hover:visible group-focus-visible:visible group-has-[:focus-visible]:visible group-has-[[data-state=open]]:visible",

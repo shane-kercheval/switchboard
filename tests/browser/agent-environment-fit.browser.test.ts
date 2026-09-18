@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { page } from "vitest/browser";
+import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-svelte";
 import AgentEnvironmentHost from "./AgentEnvironmentHost.svelte";
 import type { SessionInventory } from "$lib/types";
@@ -72,6 +72,23 @@ test("the full inventory moves to the bounded detail popover", async () => {
   const detail = page.getByTestId("agent-env-detail").element() as HTMLElement;
   expect(detail.scrollHeight).toBeGreaterThanOrEqual(detail.clientHeight);
   expect(detail.getBoundingClientRect().left).toBeGreaterThanOrEqual(0);
+});
+
+test("keyboard opening announces a dialog and Escape restores the trigger", async () => {
+  render(AgentEnvironmentHost, { props: { width: DEFAULT_WIDTH, inventory: BUSY } });
+
+  const trigger = page.getByTestId("agent-env-toggle");
+  (trigger.element() as HTMLElement).focus();
+
+  for (const key of ["{Enter}", "{Space}"]) {
+    await userEvent.keyboard(key);
+    const dialog = page.getByRole("dialog", { name: "Environment details" });
+    await expect.element(dialog).toBeVisible();
+
+    await userEvent.keyboard("{Escape}");
+    await expect.element(dialog).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(trigger.element());
+  }
 });
 
 test("opening details does not focus or open the connected-status tooltip", async () => {

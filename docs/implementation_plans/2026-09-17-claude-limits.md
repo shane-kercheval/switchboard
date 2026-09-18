@@ -320,27 +320,19 @@ for the user (telemetry flags, internal capability strings).
     snapshot set: a stale status is fine when it says it is stale. Codex's is re-read from the
     rollout (class B) and never persisted. *(Comment on the sidecar field, citing G14; comment on
     the source enum, citing `RateLimitSource`.)*
-14. **The two chips become an "Environment" disclosure row on the card.** Collapsed: a line of
-    counts with the only status that matters called out — "MCP 7 · 2 need auth · Agents 6 · Plugins
-    1 · Skills 30 · Memory 1". The callout is two counts, not one: "N need auth" for the
+14. **The two chips become an "Environment" disclosure on an expanded card.** A collapsed card
+    keeps the model, effort, context meter, and critical quota warnings visible, but omits
+    Environment entirely: authentication warnings are common for configured servers a user does not
+    rely on and do not justify making every compact card taller. Expanding the card reveals one
+    trigger row. It shows "View details" when the inventory is healthy, "N need auth" for the
     `needs-auth` status actually observed, and "N need attention" for any other non-connected
-    status, each shown only when non-zero. A single "need auth" count folded `disconnected` and
-    every future status under an instruction that would not fix them; a single generic label threw
-    away the actionable copy for the one status we have seen. No status *name* is invented for the
-    unobserved ones (the reasoning decision 4 applies to unknown window keys). **That line wraps; "one line" was written before it was measured.**
-    A busy account's summary needs ~367px against the ~224px a default-width (240px) card gives it —
-    127px clipped, measured in WebKit — and truncating dropped the Skills and Memory counts off the
-    card entirely, which is precisely what this decision's governing rule forbids. Two lines of 11px
-    text is the cheaper price than losing half the counts, and
-    `tests/browser/agent-environment-fit.browser.test.ts` pins that nothing clips at either the
-    default or the 200px minimum. Expanded: sections in that order — MCP servers (name, `StatusDot`,
-    source), custom agents (names), plugins (name @ version), memory paths (basename, full path on
-    hover), skills, tools, and slash commands — each of the last three a count line ("Tools · 109")
-    that expands to the full sorted list — and a final settings line (permission mode, output
-    style). Uses `ExpandCollapseIcon` at both levels; per-agent collapsed state, default collapsed,
-    ephemeral like the card's other disclosure. Status vocabulary: `connected` →
-    the idle/neutral dot, `needs-auth` and anything else → the warning dot with the raw status as its
-    label — the set is unknown beyond the two observed, so unknown statuses must show, not hide.
+    status, with both counts when both apply. The complete inventory opens in a bounded, named
+    popover so long lists never extend the card. Its sections include MCP servers (name, `StatusDot`,
+    source), plugins (name @ version), memory paths (basename, full path on hover), skills, tools,
+    slash commands, custom agents, and settings (permission mode, output style); the long lists use
+    nested disclosures. Status vocabulary: `connected` → the healthy green dot, `needs-auth` and
+    anything else → the warning dot with the raw status as its label — the set is unknown beyond the
+    two observed, so unknown statuses must show, not hide.
     A Codex card renders the same row from the subset it has: MCP servers (config names, no status
     dot — "configured" is not a runtime status and must not render as one), skills with
     descriptions from the rollout, approved commands behind a count line, and the settings line.
@@ -560,18 +552,15 @@ does not overwrite it. Rust: the live test passes on `make test-live-claude`.
 
 The card says what the agent has loaded and whether it is usable, not just how many.
 
-- A Claude card's chip row becomes one collapsed line: "MCP 7 · 2 need auth · Agents 6 · Plugins 1 ·
-  Skills 30 · Memory 1". Expanding lists each MCP server with a status dot and source, the agents,
-  the plugins with versions, the memory paths, and — each behind its own count line that expands to
-  the full list — the skills, the 109 tools, and the 98 slash commands, then a settings line
-  (permission mode, output style).
+- An expanded Claude card shows a compact Environment trigger. It carries only actionable status;
+  the full counts and inventory open in a bounded popover instead of changing card height.
 - A server that reports anything other than `connected` shows as a warning with the status as its
-  label; the collapsed line counts them.
+  label in the expanded card and popover. Collapsed cards omit Environment status.
 - After a restart the list is what the last turn loaded, marked "as of <time>"; an agent that has
   never run shows the registry from the config loader as today, with no status.
-- A Codex card shows the same row from its rollout: skills with descriptions, the approved-command
-  allowlist behind a count, and a settings line (sandbox, approval policy, personality, shell,
-  timezone); MCP servers as configured names without a status dot.
+- A Codex card shows the same disclosure from its rollout: skills with descriptions, the
+  approved-command allowlist behind a count, and settings (sandbox, approval policy, personality,
+  shell, timezone); MCP servers appear as configured names without a status dot.
 - Antigravity cards show whatever subset their harness reports; empty sections never render.
 
 ### Implementation Outline
@@ -599,9 +588,9 @@ applies the same rule and stamps `meta_as_of`. `codex/skills.rs` is unchanged ap
 doc recording that it is the pre-first-turn fallback and incomplete by design. Schema version bumps
 only if the file's existing fields change shape; an additive optional field does not need one.
 
-**UI (decision 14).** Replace the chips with the disclosure row. Reuse the card's collapsed-state
-pattern for the per-agent expanded flag. `StatusDot` for status, `Tooltip` with the supplemental
-delay for full memory paths. Keep `agent-meta` as the outer test id.
+**UI (decision 14).** Replace the chips with an expanded-card trigger and bounded `Popover`.
+`StatusDot` communicates server status; `Tooltip` with the supplemental delay exposes full memory
+paths. Keep `agent-meta` as the outer test id.
 
 ### Definition of Done
 
@@ -618,10 +607,11 @@ delay for full memory paths. Keep `agent-meta` as the outer test id.
   win and `as_of` is set; never-dispatched agent → loader, no `as_of`. Dispatcher: a
   `SessionFileBacked` meta is not persisted.
 - Sidecar round-trip test for the inventory snapshot; a sidecar without it reads as absent.
-- `Sidebar.test.ts`: collapsed line text with counts and the needs-auth count; expanded sections
-  present/absent by data; `needs-auth` → warning dot with label; unknown status string → warning dot
-  with that string; "as of" shown only when rehydrated; a Codex agent renders its sections with no
-  status dot on MCP rows; an agent with an empty inventory renders no environment row.
+- `Sidebar.test.ts`: collapsed cards omit Environment while retaining model, effort, context, and
+  critical quota warnings; expanded cards expose the Environment trigger and full popover;
+  `needs-auth` → warning dot with label; unknown status string → warning dot with that string; "as
+  of" shown only when rehydrated; a Codex agent renders its sections with no status dot on MCP rows;
+  an agent with an empty inventory renders no environment row.
 - Existing chip tests updated to the new row.
 - **Live drift guards — the milestone reads eight undocumented fields across two harnesses and has
   none today.** `live_claude_session_meta_carries_inventory`: one "ack" turn, asserts `system/init`

@@ -42,6 +42,7 @@
       triggerClass="text-muted hover:bg-hover hover:text-fg focus-visible:ring-focus flex w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-left text-[11px] transition-colors focus-visible:ring-1 focus-visible:outline-none"
       triggerLabel={`Environment details${view.attentionSummary === null ? "" : `, ${view.attentionSummary}`}`}
       triggerTestid="agent-env-toggle"
+      contentLabel="Environment details"
       contentTestid="agent-env-detail"
     >
       {#snippet trigger()}

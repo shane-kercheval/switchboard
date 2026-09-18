@@ -15,6 +15,7 @@
     triggerClass?: string;
     triggerLabel?: string;
     triggerTestid?: string;
+    contentLabel: string;
     contentClass?: string;
     contentTestid?: string;
   };
@@ -28,6 +29,7 @@
     triggerClass,
     triggerLabel,
     triggerTestid,
+    contentLabel,
     contentClass,
     contentTestid,
   }: Props = $props();
@@ -43,6 +45,8 @@
       {align}
       sideOffset={8}
       collisionPadding={12}
+      role="dialog"
+      aria-label={contentLabel}
       data-testid={contentTestid}
       class={cn(
         "border-border/90 bg-raised z-50 max-h-[min(34rem,var(--bits-popover-content-available-height,34rem))] w-[min(24rem,calc(100vw-1.5rem))] overflow-y-auto rounded-lg border p-3 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.12)] outline-none",

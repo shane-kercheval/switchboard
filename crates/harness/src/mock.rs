@@ -108,6 +108,12 @@ pub enum MockScenario {
     /// `SessionFileBacked` (must not), asserting the injected `MetadataCache`.
     RateLimitWithSource(crate::events::RateLimitSource),
 
+    /// Emits Claude's ordinary ordering: `SessionMeta → RateLimitEvent →
+    /// TurnEnd(Completed)`, with the same model on the metadata and terminal.
+    /// The dispatcher should persist the complete snapshot once rather than
+    /// rewriting it when the terminal repeats the already-known model.
+    RateLimitAfterModel,
+
     /// Emits `ContentChunk → TurnEnd(Completed) → SessionMeta` whose
     /// inventory names one MCP server, tagged with the given
     /// [`SessionMetaSource`]. The inventory counterpart of
@@ -742,6 +748,40 @@ impl HarnessAdapter for MockHarnessAdapter {
                         inventory: crate::events::SessionInventory::default(),
                         raw: serde_json::Value::Null,
                         source: meta_source,
+                    });
+                });
+            }
+            MockScenario::RateLimitAfterModel => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::SessionMeta {
+                        agent_id,
+                        model: "mock-fable".to_owned(),
+                        harness_version: "test".to_owned(),
+                        inventory: crate::events::SessionInventory::default(),
+                        raw: serde_json::Value::Null,
+                        source: crate::events::SessionMetaSource::StreamOnly,
+                    });
+                    let _ = tx.send(AdapterEvent::RateLimitEvent {
+                        agent_id,
+                        info: serde_json::json!({"primary": {"used_percent": 42.0}}),
+                        source: crate::events::RateLimitSource::StreamOnly,
+                    });
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        first_message_id: None,
+                        spend: None,
+                        model: Some("mock-fable".to_owned()),
+                        effort: None,
                     });
                 });
             }

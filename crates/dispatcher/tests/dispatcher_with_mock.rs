@@ -1587,6 +1587,48 @@ async fn stream_only_rate_limit_is_persisted_to_metadata_cache() {
 }
 
 #[tokio::test]
+async fn stream_only_rate_limit_with_known_model_is_persisted_once() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::RateLimitAfterModel],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let calls = metadata.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "a terminal repeating the already-known model must not rewrite the snapshot"
+    );
+    assert_eq!(calls[0].0, agent.id);
+    assert_eq!(calls[0].1["primary"]["used_percent"], 42.0);
+    assert_eq!(calls[0].2.as_deref(), Some("mock-fable"));
+}
+
+#[tokio::test]
 async fn session_file_backed_rate_limit_is_not_persisted() {
     // Durability gate, negative case: a SessionFileBacked rate-limit (class-B,
     // already durable in the harness's own session file — Codex) must NOT be

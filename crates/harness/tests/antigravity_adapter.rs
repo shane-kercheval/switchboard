@@ -1364,17 +1364,17 @@ async fn dispatch_session_meta_carries_loaded_registries() {
         .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
         .expect("SessionMeta emitted post-terminal");
     match meta {
-        AdapterEvent::SessionMeta {
-            mcp_servers,
-            skills,
-            ..
-        } => {
+        AdapterEvent::SessionMeta { inventory, .. } => {
+            let mcp_servers = inventory.mcp_servers.as_ref().expect("MCP servers present");
             assert!(
                 mcp_servers.iter().any(|s| s.name == "tiddly"),
                 "configured MCP server reached SessionMeta; got {mcp_servers:?}"
             );
+            let skills = inventory.skills.as_ref().expect("skills present");
             assert!(
-                skills.contains(&"chrome-devtools-plugin/troubleshooting".to_owned()),
+                skills
+                    .iter()
+                    .any(|s| s.name == "chrome-devtools-plugin/troubleshooting"),
                 "qualified skill reached SessionMeta; got {skills:?}"
             );
         }
@@ -1407,11 +1407,7 @@ async fn hydration_meta_carries_loaded_registries() {
     let loaded =
         load_antigravity_transcript(home.path(), cwd.path(), Some(uuid), agent.id).unwrap();
     let meta = loaded.meta.expect("meta present");
-    assert!(meta.mcp_servers.iter().any(|s| s.name == "tiddly"));
-    assert!(
-        meta.skills
-            .contains(&"chrome-devtools-plugin/troubleshooting".to_owned())
-    );
+    assert_registries_loaded(&meta);
     // Registries layer onto the parsed turns, not replace them.
     assert_eq!(loaded.turns.len(), 2);
 }
@@ -1430,10 +1426,23 @@ async fn hydration_none_conversation_still_surfaces_registries() {
     let meta = loaded
         .meta
         .expect("registry meta even with no conversation");
-    assert!(meta.mcp_servers.iter().any(|s| s.name == "tiddly"));
+    assert_registries_loaded(&meta);
+}
+
+/// The staged registries as they must appear in hydrated meta — shared by the
+/// with-conversation and never-dispatched wiring seams.
+fn assert_registries_loaded(meta: &switchboard_harness::SessionMetaInfo) {
+    let servers = meta
+        .inventory
+        .mcp_servers
+        .as_ref()
+        .expect("MCP servers present");
+    assert!(servers.iter().any(|s| s.name == "tiddly"));
+    let skills = meta.inventory.skills.as_ref().expect("skills present");
     assert!(
-        meta.skills
-            .contains(&"chrome-devtools-plugin/troubleshooting".to_owned())
+        skills
+            .iter()
+            .any(|s| s.name == "chrome-devtools-plugin/troubleshooting")
     );
 }
 

@@ -4681,7 +4681,9 @@ fn apply_turnmeta_overlay(
 
 /// Overlay a metadata sidecar's snapshots onto a freshly-loaded transcript.
 ///
-/// Two independent stream-only fields are restored, each fill-if-empty:
+/// Three independent stream-only fields are restored. The first two are
+/// fill-if-empty; the inventory is **replace-not-fill**, and the asymmetry is
+/// deliberate — see its bullet.
 ///
 /// - **Rate limit** (transcript-level): fills `last_rate_limit` (+ its
 ///   `last_rate_limit_as_of` capture time) *only* when the loader left it
@@ -4697,9 +4699,18 @@ fn apply_turnmeta_overlay(
 ///   positional or model-only overlay would present stale telemetry as current.
 ///   Legacy snapshots without both provenance fields clean-hide. Never
 ///   synthesize a turn or `TurnUsage`.
+/// - **Environment inventory** (session-level): each list the snapshot carries
+///   **replaces** the loader's, including an empty one, and only a list the
+///   snapshot left `None` keeps the loader's — the same rule
+///   `merge_meta_with_loaders` applies, via the same `SessionInventory::overlay`.
+///   It is not fill-if-empty because the loader always produces *something*
+///   (it reads config files, which almost always list some MCP servers), so
+///   filling-if-empty would mean the snapshot could never win. What the last
+///   turn loaded, with real connection statuses, beats what config says is
+///   configured. Stamps `meta_as_of` so the card can label the list as a
+///   snapshot rather than present it as live — the resolution G14 asks for.
 ///
-/// A `None` sidecar (missing/corrupt) is a no-op. Mirrors the frontend
-/// reducer's hydrate fill-if-empty semantics.
+/// A `None` sidecar (missing/corrupt) is a no-op.
 fn apply_meta_sidecar_overlay(
     transcript: &mut switchboard_harness::LoadedTranscript,
     sidecar: Option<switchboard_harness::meta_sidecar::MetaSidecar>,
@@ -4713,6 +4724,12 @@ fn apply_meta_sidecar_overlay(
     {
         transcript.last_rate_limit = Some(snapshot.payload);
         transcript.last_rate_limit_as_of = Some(snapshot.captured_at);
+    }
+
+    if let Some(snapshot) = sidecar.inventory {
+        let meta = transcript.meta.get_or_insert_with(Default::default);
+        meta.inventory.overlay(snapshot.inventory);
+        transcript.meta_as_of = Some(snapshot.captured_at);
     }
 
     if let Some(snapshot) = sidecar.context_window
@@ -5226,6 +5243,10 @@ pub struct AgentConversationMeta {
     /// sidecar (stream-only/class-C value); drives the UI staleness
     /// qualifier. `None` for live values and for class-B (durable) sources.
     pub last_rate_limit_as_of: Option<chrono::DateTime<chrono::Utc>>,
+    /// Capture time of `meta.inventory` when restored from the metadata
+    /// sidecar. Same qualifier role as `last_rate_limit_as_of`: `None` means
+    /// the inventory is live or re-read from a durable harness file.
+    pub meta_as_of: Option<chrono::DateTime<chrono::Utc>>,
     pub warnings: Vec<switchboard_harness::ParseWarning>,
     pub load_error: Option<String>,
 }
@@ -6319,6 +6340,7 @@ fn merge_project_conversation(
             meta: transcript.meta,
             last_rate_limit: transcript.last_rate_limit,
             last_rate_limit_as_of: transcript.last_rate_limit_as_of,
+            meta_as_of: transcript.meta_as_of,
             warnings: transcript.warnings,
             load_error,
         });
@@ -12117,10 +12139,9 @@ mod tests {
                             agent_id,
                             model: "test-model".to_owned(),
                             harness_version: "0.0.0".to_owned(),
-                            tools: vec![],
-                            mcp_servers: vec![],
-                            skills: vec![],
+                            inventory: switchboard_harness::SessionInventory::default(),
                             raw: serde_json::Value::Null,
+                            source: switchboard_harness::SessionMetaSource::StreamOnly,
                         });
                     }
                     let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
@@ -13071,6 +13092,7 @@ mod tests {
                 captured_at: captured,
             }),
             context_window: None,
+            inventory: None,
         };
         apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
         assert_eq!(
@@ -13078,6 +13100,137 @@ mod tests {
             Some(serde_json::json!({"isUsingOverage": true}))
         );
         assert_eq!(transcript.last_rate_limit_as_of, Some(captured));
+    }
+
+    fn inventory_sidecar(
+        inventory: switchboard_harness::SessionInventory,
+        captured_at: chrono::DateTime<chrono::Utc>,
+    ) -> switchboard_harness::meta_sidecar::MetaSidecar {
+        switchboard_harness::meta_sidecar::MetaSidecar {
+            schema_version: 1,
+            rate_limit: None,
+            context_window: None,
+            inventory: Some(switchboard_harness::meta_sidecar::InventorySnapshot {
+                inventory,
+                captured_at,
+            }),
+        }
+    }
+
+    fn server(name: &str, status: &str) -> switchboard_harness::McpServerStatus {
+        switchboard_harness::McpServerStatus {
+            name: name.to_owned(),
+            status: status.to_owned(),
+            source: None,
+        }
+    }
+
+    #[test]
+    fn overlay_replaces_the_loader_registry_and_stamps_the_capture_time() {
+        // Claude-shape (class C): the loader filled `mcp_servers` from config
+        // with the status-less `"configured"` placeholder. The snapshot is
+        // what the last turn actually loaded, with real statuses, so it wins
+        // — and `meta_as_of` is what lets the card say the list is a snapshot
+        // rather than present it as live.
+        let captured = chrono::DateTime::parse_from_rfc3339("2026-09-17T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            meta: Some(switchboard_harness::SessionMetaInfo {
+                model: "claude-fable-5-1".to_owned(),
+                harness_version: String::new(),
+                inventory: switchboard_harness::SessionInventory {
+                    mcp_servers: Some(vec![server("tiddly", "configured")]),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(inventory_sidecar(
+                switchboard_harness::SessionInventory {
+                    mcp_servers: Some(vec![server("tiddly", "needs-auth")]),
+                    ..Default::default()
+                },
+                captured,
+            )),
+        );
+        let meta = transcript.meta.expect("meta present");
+        assert_eq!(
+            meta.inventory.mcp_servers,
+            Some(vec![server("tiddly", "needs-auth")]),
+            "the snapshot's real status must win over the config placeholder"
+        );
+        assert_eq!(meta.model, "claude-fable-5-1", "scalars are untouched");
+        assert_eq!(transcript.meta_as_of, Some(captured));
+    }
+
+    #[test]
+    fn overlay_keeps_the_loader_list_for_what_the_snapshot_never_reported() {
+        // Replace-not-fill applies per list, not wholesale: a snapshot from a
+        // turn that reported no skills must not blank the scanner's list.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            meta: Some(switchboard_harness::SessionMetaInfo {
+                inventory: switchboard_harness::SessionInventory {
+                    mcp_servers: Some(vec![server("tiddly", "configured")]),
+                    skills: Some(vec![switchboard_harness::SkillEntry::from_name(
+                        "dataviz".to_owned(),
+                    )]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(inventory_sidecar(
+                switchboard_harness::SessionInventory {
+                    mcp_servers: Some(vec![]),
+                    ..Default::default()
+                },
+                chrono::Utc::now(),
+            )),
+        );
+        let inventory = transcript.meta.expect("meta present").inventory;
+        assert_eq!(
+            inventory.mcp_servers,
+            Some(vec![]),
+            "an explicitly-empty snapshot list still replaces the loader's"
+        );
+        assert_eq!(
+            inventory.skills,
+            Some(vec![switchboard_harness::SkillEntry::from_name(
+                "dataviz".to_owned()
+            )]),
+            "a list the snapshot never reported keeps the loader's"
+        );
+    }
+
+    #[test]
+    fn a_never_dispatched_agent_keeps_the_loader_registry_with_no_as_of() {
+        // No sidecar exists yet, so the card shows the config registries and
+        // says nothing about staleness — there is no snapshot to be stale.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            meta: Some(switchboard_harness::SessionMetaInfo {
+                inventory: switchboard_harness::SessionInventory {
+                    mcp_servers: Some(vec![server("tiddly", "configured")]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_meta_sidecar_overlay(&mut transcript, None);
+        assert_eq!(
+            transcript.meta.expect("meta present").inventory.mcp_servers,
+            Some(vec![server("tiddly", "configured")])
+        );
+        assert!(
+            transcript.meta_as_of.is_none(),
+            "no snapshot → no staleness qualifier"
+        );
     }
 
     #[test]
@@ -13097,6 +13250,7 @@ mod tests {
                 captured_at: chrono::Utc::now(),
             }),
             context_window: None,
+            inventory: None,
         };
         apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
         assert_eq!(
@@ -13171,6 +13325,7 @@ mod tests {
                 message_id: Some(message_id.to_owned()),
                 captured_at: chrono::Utc::now(),
             }),
+            inventory: None,
         }
     }
 
@@ -16956,6 +17111,7 @@ mod tests {
             meta: None,
             last_rate_limit: None,
             last_rate_limit_as_of: None,
+            meta_as_of: None,
             warnings: Vec::new(),
         }
     }
@@ -21229,6 +21385,7 @@ mod tests {
             meta: None,
             last_rate_limit: None,
             last_rate_limit_as_of: None,
+            meta_as_of: None,
             warnings: vec![warn("a busted")],
         };
         let b_t = LoadedTranscript {
@@ -21236,6 +21393,7 @@ mod tests {
             meta: None,
             last_rate_limit: None,
             last_rate_limit_as_of: None,
+            meta_as_of: None,
             warnings: vec![warn("b busted")],
         };
 

@@ -3,6 +3,7 @@
 //! sequences. These run as part of `make test`; live tests against the real
 //! `codex` CLI live in `crates/harness/tests/live.rs` (`#[ignore]`-gated).
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use futures::StreamExt;
@@ -799,45 +800,64 @@ command = "x"
         _ => unreachable!(),
     }
 
-    // SessionMeta carries model, harness_version, MCP server, skill, and
-    // base_instructions.text is stripped from raw.
-    match &events[session_meta_idx] {
-        AdapterEvent::SessionMeta {
-            model,
-            harness_version,
-            mcp_servers,
-            skills,
-            tools,
-            raw,
-            ..
-        } => {
-            assert_eq!(model, "gpt-5.5");
-            assert_eq!(harness_version, "0.130.0");
-            assert!(tools.is_empty(), "tools is vec![] for Codex");
-            assert!(
-                mcp_servers.iter().any(|s| s.name == "user_alpha"),
-                "merged MCP servers must include user_alpha"
-            );
-            assert_eq!(skills, &vec!["user_skill".to_owned()]);
-            // base_instructions.text must be stripped to keep IPC payloads small.
-            let stripped = raw.pointer("/payload/base_instructions/text");
-            assert_eq!(
-                stripped,
-                Some(&serde_json::Value::String(
-                    "<stripped — see codex-cli-observed.md>".to_owned()
-                )),
-                "base_instructions.text must be stripped in raw"
-            );
-        }
-        _ => unreachable!(),
-    }
+    assert_first_turn_session_meta(&events[session_meta_idx]);
+}
+
+/// The `SessionMeta` a first enriched turn must carry: model and version off
+/// the rollout, the loader-merged registries, and `base_instructions.text`
+/// stripped out of `raw`.
+fn assert_first_turn_session_meta(event: &AdapterEvent) {
+    let AdapterEvent::SessionMeta {
+        model,
+        harness_version,
+        inventory,
+        raw,
+        ..
+    } = event
+    else {
+        panic!("expected SessionMeta, got {event:?}");
+    };
+    assert_eq!(model, "gpt-5.5");
+    assert_eq!(harness_version, "0.130.0");
+    assert!(
+        inventory.tools.is_none(),
+        "Codex reports no tool inventory anywhere — absent, not empty"
+    );
+    let mcp_servers = inventory
+        .mcp_servers
+        .as_ref()
+        .expect("MCP servers come from the config loader");
+    assert!(
+        mcp_servers.iter().any(|s| s.name == "user_alpha"),
+        "merged MCP servers must include user_alpha"
+    );
+    let skill_names: Vec<&str> = inventory
+        .skills
+        .as_ref()
+        .expect("skills present")
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(skill_names, vec!["user_skill"]);
+    // base_instructions.text must be stripped to keep IPC payloads small.
+    assert_eq!(
+        raw.pointer("/payload/base_instructions/text"),
+        Some(&serde_json::Value::String(
+            "<stripped — see codex-cli-observed.md>".to_owned()
+        )),
+        "base_instructions.text must be stripped in raw"
+    );
 }
 
 #[tokio::test]
-async fn resume_turn_omits_session_meta_but_still_emits_rate_limit_and_enriches() {
+async fn resume_turn_emits_session_meta_and_rate_limit_and_enriches() {
     // A resuming agent carries its locator on the record, so the adapter treats
-    // this as a resume. SessionMeta is first-turn-only (prior.is_none() → true
-    // only when there's no locator at dispatch start).
+    // this as a resume — and must still emit `SessionMeta`. The inventory in
+    // the rollout changes between turns (a skill installed, a command
+    // approved, the sandbox widened), so a once-per-session emission would
+    // leave the card describing the agent as it was on its first turn. There
+    // used to be a first-turn gate here; re-emitting has no side effects (the
+    // reducer replaces the record, and both registries re-read from disk).
     let cwd = tempfile::TempDir::new().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let today = chrono::Utc::now().date_naive();
@@ -863,11 +883,13 @@ async fn resume_turn_omits_session_meta_but_still_emits_rate_limit_and_enriches(
         terminal_idx < rate_limit_idx,
         "RateLimitEvent must follow TurnEnd on resume turns too; got indices {terminal_idx}, {rate_limit_idx}"
     );
+    let session_meta_idx = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
+        .expect("SessionMeta must fire on a resume turn, not only the first");
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, AdapterEvent::SessionMeta { .. })),
-        "SessionMeta MUST NOT fire on resume turns — got {events:#?}"
+        terminal_idx < session_meta_idx,
+        "SessionMeta must follow TurnEnd, like the rate-limit event; got indices {terminal_idx}, {session_meta_idx}"
     );
     // TurnEnd is still enriched.
     let enriched_window = events.iter().find_map(|e| match e {
@@ -881,16 +903,139 @@ async fn resume_turn_omits_session_meta_but_still_emits_rate_limit_and_enriches(
     );
 }
 
+/// A rollout whose `world_state` reports the given skills and approved
+/// commands, so a test can change the inventory between turns the way
+/// installing a skill or approving a command would.
+///
+/// Built with `json!` rather than a raw string: the `host_skills` body is
+/// markdown whose `"### ` sequences terminate every practical raw-string
+/// delimiter.
+fn world_state_content(skill_lines: &[&str], commands: &serde_json::Value) -> String {
+    let body = format!(
+        "### Skill roots\n- `r0` = `/root`\n### Available skills\n{}\n",
+        skill_lines.join("\n")
+    );
+    let records = [
+        serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"cli_version": "0.154.0", "base_instructions": {"text": "long system prompt"}},
+        }),
+        serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00.500Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.6-terra", "cwd": "/example/cwd", "approval_policy": "never"},
+        }),
+        serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00.700Z",
+            "type": "world_state",
+            "payload": {"full": true, "state": {
+                "host_skills": {"body": body},
+                "permissions": {"approved_command_prefixes": commands},
+            }},
+        }),
+        serde_json::json!({
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "model_context_window": 258_400},
+        }),
+    ];
+    let mut out = String::new();
+    for record in &records {
+        writeln!(out, "{record}").expect("writing to a String cannot fail");
+    }
+    out
+}
+
+/// The inventory off the first `SessionMeta` in an event stream.
+fn session_meta_inventory(events: &[AdapterEvent]) -> switchboard_harness::SessionInventory {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::SessionMeta { inventory, .. } => Some(inventory.clone()),
+            _ => None,
+        })
+        .expect("SessionMeta emitted")
+}
+
 #[tokio::test]
-async fn attach_flow_first_dispatch_forces_session_meta_despite_locator_present() {
+async fn a_second_turn_reports_an_inventory_that_changed_between_turns() {
+    // The reason the first-turn gate had to go: a skill installed or a
+    // command approved mid-session must reach the card. A fixture cannot see
+    // the gate itself — only two dispatches against one session can.
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let today = chrono::Utc::now().date_naive();
+    let agent = codex_agent_resuming(FIXTURE_THREAD_ID, today);
+
+    stage_session_file(
+        home.path(),
+        today,
+        FIXTURE_THREAD_ID,
+        &world_state_content(
+            &["- alpha: First skill. (file: r0/alpha/SKILL.md)"],
+            &serde_json::json!([["ls"]]),
+        ),
+    );
+    let first = dispatch_with_home(&agent, cwd.path(), home.path(), &fixture("text-only")).await;
+    let before = session_meta_inventory(&first);
+    assert_eq!(
+        before
+            .skills
+            .as_deref()
+            .expect("skills present")
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha"]
+    );
+    assert_eq!(before.approved_commands, Some(vec!["ls".to_owned()]));
+
+    // The user installs a skill and approves a command; Codex rewrites its
+    // rollout's `world_state`.
+    stage_session_file(
+        home.path(),
+        today,
+        FIXTURE_THREAD_ID,
+        &world_state_content(
+            &[
+                "- alpha: First skill. (file: r0/alpha/SKILL.md)",
+                "- beta: Newly installed. (file: r0/beta/SKILL.md)",
+            ],
+            &serde_json::json!([["ls"], ["git", "push"]]),
+        ),
+    );
+    let second = dispatch_with_home(&agent, cwd.path(), home.path(), &fixture("text-only")).await;
+    let after = session_meta_inventory(&second);
+    assert_eq!(
+        after
+            .skills
+            .as_deref()
+            .expect("skills present")
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta"],
+        "the second turn must carry the newly installed skill"
+    );
+    assert_eq!(
+        after.approved_commands,
+        Some(vec!["ls".to_owned(), "git push".to_owned()]),
+        "the second turn must carry the newly approved command"
+    );
+}
+
+#[tokio::test]
+async fn attach_flow_first_dispatch_emits_session_meta_despite_locator_present() {
     // An attached agent already has its locator on the record (mimicking the
-    // attach-existing-session flow). The adapter's prior.is_none() heuristic
-    // would normally classify this as a resume and skip SessionMeta — leaving
-    // the sidebar's MCP/skills/model listing empty for attached Codex agents
-    // until some other path fires.
+    // attach-existing-session flow), which the old first-turn gate read as a
+    // resume — leaving an attached Codex agent's card empty until some other
+    // path fired. `is_first_dispatch_after_attach` existed to override that.
     //
-    // With DispatchOptions::is_first_dispatch_after_attach = true, the adapter
-    // must treat the dispatch as a first turn and emit SessionMeta.
+    // Now that every turn emits `SessionMeta`, the attach dispatch is covered
+    // without the override. This test is kept as the regression guard for the
+    // case the flag was introduced for: an attached agent's first dispatch
+    // must populate the card, however that is achieved.
     let cwd = tempfile::TempDir::new().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let today = chrono::Utc::now().date_naive();
@@ -922,7 +1067,7 @@ async fn attach_flow_first_dispatch_forces_session_meta_despite_locator_present(
         .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }));
     assert!(
         session_meta.is_some(),
-        "is_first_dispatch_after_attach must force SessionMeta on a resume dispatch; got events: {events:#?}"
+        "an attached agent's first dispatch must emit SessionMeta; got events: {events:#?}"
     );
 }
 
@@ -1109,7 +1254,7 @@ command = "p"
     let session_meta = events
         .iter()
         .find_map(|e| match e {
-            AdapterEvent::SessionMeta { mcp_servers, .. } => Some(mcp_servers.clone()),
+            AdapterEvent::SessionMeta { inventory, .. } => inventory.mcp_servers.clone(),
             _ => None,
         })
         .expect("SessionMeta emitted on first turn");

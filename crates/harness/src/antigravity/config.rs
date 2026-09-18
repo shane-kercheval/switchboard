@@ -53,6 +53,7 @@ pub fn load_mcp_servers(home_dir: &Path, _cwd: &Path) -> Vec<McpServerStatus> {
         .map(|name| McpServerStatus {
             name,
             status: CONFIGURED_STATUS.to_owned(),
+            source: None,
         })
         .collect()
 }

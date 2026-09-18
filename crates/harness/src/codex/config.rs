@@ -137,6 +137,7 @@ fn merge_scopes(user_names: Vec<String>, project_names: Vec<String>) -> Vec<McpS
         .map(|name| McpServerStatus {
             name,
             status: CONFIGURED_STATUS.to_owned(),
+            source: None,
         })
         .collect();
     for user_name in user_names {
@@ -144,6 +145,7 @@ fn merge_scopes(user_names: Vec<String>, project_names: Vec<String>) -> Vec<McpS
             merged.push(McpServerStatus {
                 name: user_name,
                 status: CONFIGURED_STATUS.to_owned(),
+                source: None,
             });
         }
     }

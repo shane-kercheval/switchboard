@@ -121,7 +121,40 @@ export type EditPair = { old: string; new: string };
 // task id for status-only updates (Claude `TaskUpdate` carries no text).
 export type TodoItem = { content: string; status: string };
 
-export type McpServerStatus = { name: string; status: string };
+// `status` and `source` are the harness's own vocabularies (opaque strings),
+// so a new value on either never breaks deserialization. `source` names the
+// config scope that registered the server ("user" / "claudeai" / …) when the
+// harness says; the config loaders report none.
+export type McpServerStatus = { name: string; status: string; source?: string };
+
+// One skill the harness has loaded. Claude's `system/init` supplies names
+// only; Codex's rollout supplies all three.
+export type SkillEntry = { name: string; description?: string; path?: string };
+
+export type PluginEntry = { name: string; version?: string; source?: string };
+
+// One of the harness's run settings, as a display pair — the two wired
+// harnesses share no setting names, and the card renders them identically.
+export type SettingPair = { label: string; value: string };
+
+// What the harness reports having loaded for a session.
+//
+// **Every list is optional, and the distinction is load-bearing.** Absent
+// means the harness did not report the list at all; an empty array means it
+// reported an empty one. Only the absent case may be filled from a config
+// registry (the Rust side does that merge), and only the absent case renders
+// no section on the card — an empty array is an authoritative zero.
+export type SessionInventory = {
+  tools?: string[];
+  mcp_servers?: McpServerStatus[];
+  skills?: SkillEntry[];
+  agents?: string[];
+  plugins?: PluginEntry[];
+  memory_paths?: string[];
+  slash_commands?: string[];
+  approved_commands?: string[];
+  settings?: SettingPair[];
+};
 
 // Per-turn usage carried on `turn_end.usage`. `total_cost_usd` is Claude
 // Code only (subscription auth has no dollar number for Codex). Tokens are
@@ -283,9 +316,7 @@ export type NormalizedEvent =
       agent_id: AgentId;
       model: string;
       harness_version: string;
-      tools: string[];
-      mcp_servers: McpServerStatus[];
-      skills: string[];
+      inventory: SessionInventory;
       raw: unknown;
     }
   // Emitted by the dispatcher as the last event on the per-agent channel
@@ -357,6 +388,11 @@ export type LoadedTranscript = {
   /// `null` for live values and for class-B (already-durable) sources;
   /// drives the UI "as of …" staleness qualifier.
   last_rate_limit_as_of?: string | null;
+  /// Capture time of `meta.inventory` when restored from the metadata sidecar
+  /// (ISO-8601). Same role as `last_rate_limit_as_of`: `null`/absent means the
+  /// inventory is live or re-read from a durable harness file, so the card
+  /// presents it without an "as of" qualifier.
+  meta_as_of?: string | null;
   warnings: ParseWarning[];
 };
 
@@ -365,9 +401,7 @@ export type ParseWarning = { line_number: number; reason: string };
 export type SessionMetaInfo = {
   model: string;
   harness_version: string;
-  tools: string[];
-  mcp_servers: McpServerStatus[];
-  skills: string[];
+  inventory: SessionInventory;
 };
 
 // Wire shape of `crate::transcript::Turn` — matches the in-state `Turn`
@@ -437,6 +471,9 @@ export type Hydrate = {
   /// `LoadedTranscript.last_rate_limit_as_of`). `null` when the value is
   /// live or class-B.
   last_rate_limit_as_of?: string | null;
+  /// Capture time of `meta.inventory` from the metadata sidecar (see
+  /// `LoadedTranscript.meta_as_of`).
+  meta_as_of?: string | null;
 };
 
 export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
@@ -912,6 +949,9 @@ export type AgentConversationMeta = {
   /// `null`/absent for live or class-B sources. See
   /// `LoadedTranscript.last_rate_limit_as_of`.
   last_rate_limit_as_of?: string | null;
+  /// Capture time of `meta.inventory` from the metadata sidecar. See
+  /// `LoadedTranscript.meta_as_of`.
+  meta_as_of?: string | null;
   warnings: ParseWarning[];
   load_error?: string | null;
 };

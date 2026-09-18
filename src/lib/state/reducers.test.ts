@@ -1893,15 +1893,65 @@ describe("runtimeReducer", () => {
       agent_id: AGENT_A,
       model: "claude-sonnet-4-6",
       harness_version: "2.1.140",
-      tools: ["Bash", "Read"],
-      mcp_servers: [{ name: "tiddly", status: "connected" }],
-      skills: ["debug"],
+      inventory: {
+        tools: ["Bash", "Read"],
+        mcp_servers: [{ name: "tiddly", status: "connected" }],
+        skills: [{ name: "debug" }],
+      },
       raw: {},
     };
     const r = runtimeReducer(fresh(), ev);
     expect(r.meta?.model).toBe("claude-sonnet-4-6");
-    expect(r.meta?.tools).toEqual(["Bash", "Read"]);
-    expect(r.meta?.mcp_servers).toEqual([{ name: "tiddly", status: "connected" }]);
+    expect(r.meta?.inventory.tools).toEqual(["Bash", "Read"]);
+    expect(r.meta?.inventory.mcp_servers).toEqual([{ name: "tiddly", status: "connected" }]);
+    expect(r.meta?.inventory.skills).toEqual([{ name: "debug" }]);
+  });
+
+  it("session_meta replaces the whole inventory rather than merging", () => {
+    // What the harness reports is what it has loaded *now*. Keeping a list it
+    // stopped reporting would draw a registry the agent no longer has.
+    let r = runtimeReducer(fresh(), {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "m",
+      harness_version: "v",
+      inventory: { agents: ["Explore"], skills: [{ name: "dataviz" }] },
+      raw: {},
+    });
+    r = runtimeReducer(r, {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "m",
+      harness_version: "v",
+      inventory: { agents: ["Explore", "Plan"] },
+      raw: {},
+    });
+    expect(r.meta?.inventory.agents).toEqual(["Explore", "Plan"]);
+    expect(r.meta?.inventory.skills).toBeUndefined();
+  });
+
+  it("a live session_meta clears the snapshot staleness qualifier", () => {
+    // A live inventory is not a snapshot, so "as of" is meaningless — and
+    // must be nulled rather than stamped `now`, which would age an actively
+    // streaming agent past the staleness threshold.
+    const hydrated = runtimeReducer(fresh(), {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      meta: { model: "m", harness_version: "v", inventory: { agents: ["Explore"] } },
+      meta_as_of: "2026-09-17T12:00:00Z",
+    });
+    expect(hydrated.meta_as_of).toBe("2026-09-17T12:00:00Z");
+
+    const live = runtimeReducer(hydrated, {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "m",
+      harness_version: "v",
+      inventory: { agents: ["Explore"] },
+      raw: {},
+    });
+    expect(live.meta_as_of).toBeNull();
   });
 
   it("session_meta with empty model keeps the previously-shown model", () => {
@@ -1912,9 +1962,7 @@ describe("runtimeReducer", () => {
       agent_id: AGENT_A,
       model: "gemini-3.5-flash",
       harness_version: "1.0.0",
-      tools: [],
-      mcp_servers: [],
-      skills: [],
+      inventory: {},
       raw: {},
     });
     expect(r.meta?.model).toBe("gemini-3.5-flash");
@@ -1924,9 +1972,7 @@ describe("runtimeReducer", () => {
       agent_id: AGENT_A,
       model: "",
       harness_version: "1.0.0",
-      tools: [],
-      mcp_servers: [],
-      skills: [],
+      inventory: {},
       raw: {},
     });
     expect(r.meta?.model).toBe("gemini-3.5-flash");
@@ -1951,9 +1997,7 @@ describe("runtimeReducer", () => {
       agent_id: AGENT_A,
       model,
       harness_version: "2.1.274",
-      tools: [],
-      mcp_servers: [],
-      skills: [],
+      inventory: {},
       raw: {},
     });
   }
@@ -2064,9 +2108,7 @@ describe("runtimeReducer", () => {
       meta: {
         model: "claude-sonnet-5",
         harness_version: "2.1.274",
-        tools: [],
-        mcp_servers: [],
-        skills: [],
+        inventory: {},
       },
       last_rate_limit: { unifiedWindows: {} },
       last_rate_limit_as_of: "2026-05-27T18:42:11Z",
@@ -2091,9 +2133,11 @@ describe("runtimeReducer", () => {
       meta: {
         model: "claude-sonnet-4-6",
         harness_version: "2.1.140",
-        tools: ["Bash"],
-        mcp_servers: [{ name: "srv", status: "configured" }],
-        skills: ["debug"],
+        inventory: {
+          tools: ["Bash"],
+          mcp_servers: [{ name: "srv", status: "configured" }],
+          skills: [{ name: "debug" }],
+        },
       },
     });
     expect(r.hydration_status).toBe("complete");
@@ -2107,9 +2151,7 @@ describe("runtimeReducer", () => {
       agent_id: AGENT_A,
       model: "live-model",
       harness_version: "live-version",
-      tools: [],
-      mcp_servers: [],
-      skills: [],
+      inventory: {},
       raw: {},
     });
     // Subsequent hydrate carries a different model — must NOT overwrite.
@@ -2120,9 +2162,7 @@ describe("runtimeReducer", () => {
       meta: {
         model: "disk-model",
         harness_version: "disk-version",
-        tools: [],
-        mcp_servers: [],
-        skills: [],
+        inventory: {},
       },
     });
     expect(r.meta?.model).toBe("live-model");

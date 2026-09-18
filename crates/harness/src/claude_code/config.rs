@@ -143,6 +143,7 @@ fn merge_scopes(
         .map(|name| McpServerStatus {
             name,
             status: CONFIGURED_STATUS.to_owned(),
+            source: None,
         })
         .collect();
     for name in local_names {
@@ -150,6 +151,7 @@ fn merge_scopes(
             merged.push(McpServerStatus {
                 name,
                 status: CONFIGURED_STATUS.to_owned(),
+                source: None,
             });
         }
     }
@@ -158,6 +160,7 @@ fn merge_scopes(
             merged.push(McpServerStatus {
                 name,
                 status: CONFIGURED_STATUS.to_owned(),
+                source: None,
             });
         }
     }

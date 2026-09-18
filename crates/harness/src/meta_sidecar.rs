@@ -43,6 +43,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use switchboard_core::AgentId;
 
+use crate::events::SessionInventory;
+
 /// Current on-disk schema version. Bumped only on a breaking shape change;
 /// an unrecognized version reads as empty (best-effort, forward-compatible).
 const SCHEMA_VERSION: u32 = 1;
@@ -87,6 +89,23 @@ pub struct ContextWindowSnapshot {
     pub captured_at: DateTime<Utc>,
 }
 
+/// One persisted snapshot of the harness's environment inventory — the
+/// registries, allowlists and run settings it reported having loaded.
+///
+/// Stream-only for Claude: `system/init` carries the whole inventory and the
+/// session file records none of it, so without this the card falls back to the
+/// config-file registries — which say what is *configured*, with no connection
+/// status — until the agent's next turn. Closes G14 in
+/// `docs/harness-behavior.md` by the convention [`RateLimitSnapshot`] set: a
+/// stale inventory is acceptable precisely because `captured_at` lets the card
+/// say it is stale.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InventorySnapshot {
+    pub inventory: SessionInventory,
+    /// Wall-clock time this snapshot was captured (ISO-8601 UTC on disk).
+    pub captured_at: DateTime<Utc>,
+}
+
 /// The metadata sidecar file contents. Fields are optional so the schema can
 /// grow additively (a new class-C field is a new `Option` field, not a
 /// breaking change — `schema_version` is bumped only on a breaking shape
@@ -98,6 +117,8 @@ pub struct MetaSidecar {
     pub rate_limit: Option<RateLimitSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<ContextWindowSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<InventorySnapshot>,
 }
 
 impl Default for MetaSidecar {
@@ -106,6 +127,7 @@ impl Default for MetaSidecar {
             schema_version: SCHEMA_VERSION,
             rate_limit: None,
             context_window: None,
+            inventory: None,
         }
     }
 }
@@ -216,6 +238,22 @@ pub fn write_context_window(
     persist(path, &sidecar)
 }
 
+/// Persist the latest inventory snapshot (last-write-wins for that field).
+/// Preserves the other snapshots alongside it, like every other writer here.
+pub fn write_inventory(
+    path: &Path,
+    inventory: SessionInventory,
+    captured_at: DateTime<Utc>,
+) -> Result<(), MetaSidecarError> {
+    let mut sidecar = read(path).unwrap_or_default();
+    sidecar.schema_version = SCHEMA_VERSION;
+    sidecar.inventory = Some(InventorySnapshot {
+        inventory,
+        captured_at,
+    });
+    persist(path, &sidecar)
+}
+
 /// Write the whole sidecar **atomically** via a sibling `.tmp` + `rename` so a
 /// crash mid-write can't leave a torn file. The `.tmp` sits in the same
 /// directory as the target, guaranteeing a same-filesystem (atomic) rename — a
@@ -260,6 +298,77 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn sample_inventory() -> SessionInventory {
+        SessionInventory {
+            mcp_servers: Some(vec![crate::events::McpServerStatus {
+                name: "tiddly".to_owned(),
+                status: "needs-auth".to_owned(),
+                source: Some("claudeai".to_owned()),
+            }]),
+            // An explicit empty list: the harness said "zero plugins", which
+            // must survive the round trip distinguishably from "unreported".
+            plugins: Some(vec![]),
+            settings: Some(vec![crate::events::SettingPair {
+                label: "Permission mode".to_owned(),
+                value: "bypassPermissions".to_owned(),
+            }]),
+            ..SessionInventory::default()
+        }
+    }
+
+    #[test]
+    fn inventory_snapshot_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("a.meta.json");
+        let captured = ts("2026-09-17T12:00:00Z");
+        write_inventory(&path, sample_inventory(), captured).unwrap();
+
+        let snapshot = read(&path).unwrap().inventory.expect("inventory persisted");
+        assert_eq!(snapshot.inventory, sample_inventory());
+        assert_eq!(snapshot.captured_at, captured);
+        assert_eq!(
+            snapshot.inventory.plugins,
+            Some(vec![]),
+            "an explicit empty list must not read back as unreported"
+        );
+        assert_eq!(
+            snapshot.inventory.agents, None,
+            "an unreported list must not read back as empty"
+        );
+    }
+
+    #[test]
+    fn a_sidecar_without_an_inventory_reads_as_absent() {
+        // Every existing sidecar on disk is one of these — the field is
+        // additive, so the schema version deliberately does not move.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("a.meta.json");
+        write_rate_limit(
+            &path,
+            serde_json::json!({"x": 1}),
+            ts("2026-09-17T12:00:00Z"),
+        )
+        .unwrap();
+        let sidecar = read(&path).unwrap();
+        assert!(sidecar.inventory.is_none());
+        assert!(sidecar.rate_limit.is_some(), "the other field still reads");
+    }
+
+    #[test]
+    fn writing_an_inventory_preserves_the_other_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("a.meta.json");
+        let at = ts("2026-09-17T12:00:00Z");
+        write_rate_limit(&path, serde_json::json!({"isUsingOverage": true}), at).unwrap();
+        write_context_window(&path, 200_000, "m".to_owned(), "msg_1".to_owned(), at).unwrap();
+        write_inventory(&path, sample_inventory(), at).unwrap();
+
+        let sidecar = read(&path).unwrap();
+        assert!(sidecar.rate_limit.is_some(), "rate limit survived");
+        assert!(sidecar.context_window.is_some(), "window survived");
+        assert!(sidecar.inventory.is_some());
     }
 
     #[test]

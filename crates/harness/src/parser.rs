@@ -3,8 +3,9 @@ use serde_json::Value;
 use switchboard_core::AgentId;
 
 use crate::events::{
-    AdapterEvent, ContentKind, FailureKind, McpServerStatus, ToolKind, TurnId, TurnOutcome,
-    TurnSpend, TurnUsage,
+    AdapterEvent, ContentKind, FailureKind, McpServerStatus, PluginEntry, SessionInventory,
+    SessionMetaSource, SettingPair, SkillEntry, ToolKind, TurnId, TurnOutcome, TurnSpend,
+    TurnUsage,
 };
 
 /// Authored auth-failure message for Claude. Replaces Claude's
@@ -1023,42 +1024,85 @@ fn parse_system_event(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    let tools = obj
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mcp_servers = obj
-        .get("mcp_servers")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(parse_mcp_server_status)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let skills = obj
-        .get("skills")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-
     ParseOutcome::Event(AdapterEvent::SessionMeta {
         agent_id,
         model,
         harness_version,
-        tools,
-        mcp_servers,
-        skills,
+        inventory: parse_init_inventory(obj),
         raw: obj.clone(),
+        // Claude's inventory exists only on this event — `system/init` has no
+        // on-disk analog in the session file (class C) — so the dispatcher
+        // caches it for restart continuity.
+        source: SessionMetaSource::StreamOnly,
+    })
+}
+
+/// Read the environment inventory off a `system/init` record.
+///
+/// **An absent key yields `None`, not an empty list.** The two are different
+/// claims (see [`SessionInventory`]): only `None` lets the config loaders fill
+/// the list on a later reload, which is the correct degradation for an older
+/// CLI that does not emit the key at all. An `init` that *does* emit the key
+/// with an empty array is reporting an authoritative zero and is preserved as
+/// `Some([])`.
+fn parse_init_inventory(obj: &Value) -> SessionInventory {
+    SessionInventory {
+        tools: string_list(obj, "tools"),
+        mcp_servers: obj
+            .get("mcp_servers")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(parse_mcp_server_status).collect()),
+        // Claude reports skill names only; descriptions and paths stay `None`
+        // (Codex's rollout is the one source that carries all three).
+        skills: string_list(obj, "skills")
+            .map(|names| names.into_iter().map(SkillEntry::from_name).collect()),
+        agents: string_list(obj, "agents"),
+        plugins: obj
+            .get("plugins")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(parse_plugin_entry).collect()),
+        // `memory_paths` is a **map** of kind → path (`{"auto": "<dir>"}`),
+        // not a list; the paths are its values. The concrete memory *files*
+        // are named only by the `/context` report.
+        memory_paths: obj.get("memory_paths").and_then(Value::as_object).map(|m| {
+            m.values()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        }),
+        slash_commands: string_list(obj, "slash_commands"),
+        // Claude reports no approved-command allowlist on `init`; that list is
+        // Codex's.
+        approved_commands: None,
+        settings: parse_init_settings(obj),
+    }
+}
+
+/// The run settings Claude reports on `init`, as display pairs. Absent keys
+/// are skipped rather than rendered blank; all keys absent yields `None`, so
+/// the card draws no settings line at all.
+fn parse_init_settings(obj: &Value) -> Option<Vec<SettingPair>> {
+    let pairs: Vec<SettingPair> = [
+        ("Permission mode", "permissionMode"),
+        ("Output style", "output_style"),
+    ]
+    .into_iter()
+    .filter_map(|(label, key)| {
+        let value = obj.get(key).and_then(Value::as_str)?;
+        (!value.is_empty()).then(|| SettingPair {
+            label: label.to_owned(),
+            value: value.to_owned(),
+        })
+    })
+    .collect();
+    (!pairs.is_empty()).then_some(pairs)
+}
+
+/// An array-of-strings field, `None` when the key is absent or not an array.
+fn string_list(obj: &Value, key: &str) -> Option<Vec<String>> {
+    obj.get(key).and_then(Value::as_array).map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
     })
 }
 
@@ -1119,6 +1163,17 @@ fn parse_mcp_server_status(v: &Value) -> Option<McpServerStatus> {
     Some(McpServerStatus {
         name: v.get("name").and_then(Value::as_str)?.to_owned(),
         status: v.get("status").and_then(Value::as_str)?.to_owned(),
+        source: v.get("source").and_then(Value::as_str).map(str::to_owned),
+    })
+}
+
+/// One `init.plugins` entry. Only `name` is required — a plugin with no
+/// version renders as a bare name rather than being dropped.
+fn parse_plugin_entry(v: &Value) -> Option<PluginEntry> {
+    Some(PluginEntry {
+        name: v.get("name").and_then(Value::as_str)?.to_owned(),
+        version: v.get("version").and_then(Value::as_str).map(str::to_owned),
+        source: v.get("source").and_then(Value::as_str).map(str::to_owned),
     })
 }
 
@@ -2132,6 +2187,15 @@ mod tests {
         assert_eq!(select_context_window(&result, None, None, None), None);
     }
 
+    /// The inventory off a `system/init` line, or a panic naming what came
+    /// out instead.
+    fn init_inventory(line: &str) -> SessionInventory {
+        match parse_one_with_agent(line, tid(), aid()) {
+            ParseOutcome::Event(AdapterEvent::SessionMeta { inventory, .. }) => inventory,
+            other => panic!("expected SessionMeta, got {other:?}"),
+        }
+    }
+
     #[test]
     fn system_init_yields_session_meta() {
         let agent_id = aid();
@@ -2141,22 +2205,149 @@ mod tests {
                 agent_id: aid_out,
                 model,
                 harness_version,
-                tools,
-                mcp_servers,
-                skills,
+                inventory,
+                source,
                 ..
             }) => {
                 assert_eq!(aid_out, agent_id);
                 assert_eq!(model, "claude-sonnet-4-6");
                 assert_eq!(harness_version, "2.1.140");
-                assert_eq!(tools, vec!["Bash", "Read", "mcp__srv__do"]);
-                assert_eq!(mcp_servers.len(), 1);
-                assert_eq!(mcp_servers[0].name, "srv");
-                assert_eq!(mcp_servers[0].status, "connected");
-                assert_eq!(skills, vec!["debug"]);
+                assert_eq!(
+                    inventory.tools,
+                    Some(vec![
+                        "Bash".to_owned(),
+                        "Read".to_owned(),
+                        "mcp__srv__do".to_owned()
+                    ])
+                );
+                let servers = inventory.mcp_servers.expect("mcp_servers reported");
+                assert_eq!(servers.len(), 1);
+                assert_eq!(servers[0].name, "srv");
+                assert_eq!(servers[0].status, "connected");
+                assert_eq!(
+                    servers[0].source, None,
+                    "an init without `source` carries none"
+                );
+                assert_eq!(
+                    inventory.skills,
+                    Some(vec![SkillEntry::from_name("debug".to_owned())])
+                );
+                // Claude's inventory has no session-file analog, so it must be
+                // cached for restart continuity.
+                assert_eq!(source, SessionMetaSource::StreamOnly);
             }
             _ => panic!("expected SessionMeta"),
         }
+    }
+
+    #[test]
+    fn system_init_carries_the_whole_environment_inventory() {
+        let line = r#"{"type":"system","subtype":"init","model":"claude-fable-5-1","mcp_servers":[{"name":"tiddly","status":"needs-auth","source":"claudeai"}],"agents":["Explore","Plan"],"plugins":[{"name":"anthropic-skills","path":"/p","source":"marketplace","version":"0.0.1"}],"memory_paths":{"auto":"/home/me/.claude/memory"},"slash_commands":["init","review"],"skills":["dataviz"],"permissionMode":"bypassPermissions","output_style":"default"}"#;
+        let inventory = init_inventory(line);
+
+        let servers = inventory.mcp_servers.expect("mcp_servers reported");
+        assert_eq!(servers[0].status, "needs-auth");
+        assert_eq!(servers[0].source.as_deref(), Some("claudeai"));
+        assert_eq!(
+            inventory.agents,
+            Some(vec!["Explore".to_owned(), "Plan".to_owned()])
+        );
+        assert_eq!(
+            inventory.plugins,
+            Some(vec![PluginEntry {
+                name: "anthropic-skills".to_owned(),
+                version: Some("0.0.1".to_owned()),
+                source: Some("marketplace".to_owned()),
+            }])
+        );
+        // `memory_paths` is a map of kind → path; the paths are its values.
+        assert_eq!(
+            inventory.memory_paths,
+            Some(vec!["/home/me/.claude/memory".to_owned()])
+        );
+        assert_eq!(
+            inventory.slash_commands,
+            Some(vec!["init".to_owned(), "review".to_owned()])
+        );
+        assert_eq!(
+            inventory.settings,
+            Some(vec![
+                SettingPair {
+                    label: "Permission mode".to_owned(),
+                    value: "bypassPermissions".to_owned(),
+                },
+                SettingPair {
+                    label: "Output style".to_owned(),
+                    value: "default".to_owned(),
+                },
+            ])
+        );
+        assert_eq!(
+            inventory.approved_commands, None,
+            "the approved-command allowlist is Codex's; Claude reports none"
+        );
+    }
+
+    #[test]
+    fn an_older_init_without_the_inventory_keys_reports_nothing() {
+        // Absent is not empty: only `None` lets the config loaders fill the
+        // list on a later reload, which is the right degradation for a CLI
+        // that never emitted the key. Reporting `Some([])` here would claim an
+        // authoritative zero the harness never stated.
+        let inventory =
+            init_inventory(r#"{"type":"system","subtype":"init","model":"claude-sonnet-4-6"}"#);
+        assert!(
+            inventory.is_empty(),
+            "every list must be absent, got {inventory:?}"
+        );
+    }
+
+    #[test]
+    fn an_init_reporting_an_empty_list_is_authoritative() {
+        // The other side of the same distinction: an `init` that says "zero
+        // MCP servers" means none are connected, and that must survive the
+        // merge instead of being topped up from a config file.
+        let inventory = init_inventory(
+            r#"{"type":"system","subtype":"init","model":"m","mcp_servers":[],"skills":[]}"#,
+        );
+        assert_eq!(inventory.mcp_servers, Some(vec![]));
+        assert_eq!(inventory.skills, Some(vec![]));
+    }
+
+    #[test]
+    fn a_plugin_without_a_version_keeps_its_name() {
+        let inventory = init_inventory(
+            r#"{"type":"system","subtype":"init","model":"m","plugins":[{"name":"bare"},{"path":"/no-name"}]}"#,
+        );
+        assert_eq!(
+            inventory.plugins,
+            Some(vec![PluginEntry {
+                name: "bare".to_owned(),
+                version: None,
+                source: None,
+            }]),
+            "a nameless entry is unrenderable and dropped; a version-less one is not"
+        );
+    }
+
+    #[test]
+    fn init_settings_skip_absent_and_blank_keys() {
+        let only_mode = init_inventory(
+            r#"{"type":"system","subtype":"init","model":"m","permissionMode":"plan","output_style":""}"#,
+        );
+        assert_eq!(
+            only_mode.settings,
+            Some(vec![SettingPair {
+                label: "Permission mode".to_owned(),
+                value: "plan".to_owned(),
+            }]),
+            "a blank value renders nothing rather than an empty row"
+        );
+        let neither = init_inventory(r#"{"type":"system","subtype":"init","model":"m"}"#);
+        assert_eq!(
+            neither.settings, None,
+            "no readable setting → no settings line at all"
+        );
     }
 
     #[test]

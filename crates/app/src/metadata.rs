@@ -123,6 +123,40 @@ impl MetadataCache for ProjectMetadataCache {
         }
     }
 
+    fn record_inventory(
+        &self,
+        agent_id: AgentId,
+        inventory: switchboard_harness::SessionInventory,
+        captured_at: DateTime<Utc>,
+    ) {
+        // Same per-agent wiring guard as the snapshots above: skip rather than
+        // persist another agent's environment under this one.
+        debug_assert_eq!(
+            agent_id, self.agent_id,
+            "metadata cache built for {} received event for {agent_id}",
+            self.agent_id
+        );
+        if agent_id != self.agent_id {
+            tracing::warn!(
+                expected = %self.agent_id,
+                got = %agent_id,
+                "metadata cache agent_id mismatch — skipping inventory write to avoid persisting another agent's data"
+            );
+            return;
+        }
+        if let Err(e) = switchboard_harness::meta_sidecar::write_inventory(
+            &self.sidecar_path,
+            inventory,
+            captured_at,
+        ) {
+            tracing::warn!(
+                agent_id = %self.agent_id,
+                error = %e,
+                "failed to persist inventory snapshot to metadata sidecar — restart continuity degraded; turn unaffected"
+            );
+        }
+    }
+
     fn record_turn_spend(
         &self,
         agent_id: AgentId,

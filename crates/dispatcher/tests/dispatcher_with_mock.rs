@@ -29,7 +29,8 @@ use switchboard_dispatcher::{
 };
 use switchboard_harness::{
     CancelSource, ContextWindowSource, DispatchOptions, FailureKind, HarnessAdapter, MessageId,
-    MockHarnessAdapter, MockScenario, RateLimitSource, TurnId, TurnOutcome, TurnSpend,
+    MockHarnessAdapter, MockScenario, RateLimitSource, SessionInventory, SessionMetaSource, TurnId,
+    TurnOutcome, TurnSpend,
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -300,12 +301,14 @@ impl ConversationJournal for RecordingJournal {
 /// turn's cost, the overage snapshot, and the capture time.
 type TurnSpendCall = (AgentId, String, Option<f64>, TurnSpend, DateTime<Utc>);
 type ContextWindowCall = (AgentId, u32, String, String, DateTime<Utc>);
+type InventoryCall = (AgentId, SessionInventory, DateTime<Utc>);
 
 #[derive(Default)]
 struct RecordingMetadataCache {
     calls: Mutex<Vec<(AgentId, serde_json::Value, DateTime<Utc>)>>,
     context_window_calls: Mutex<Vec<ContextWindowCall>>,
     turn_spend_calls: Mutex<Vec<TurnSpendCall>>,
+    inventory_calls: Mutex<Vec<InventoryCall>>,
 }
 
 impl MetadataCache for RecordingMetadataCache {
@@ -336,6 +339,18 @@ impl MetadataCache for RecordingMetadataCache {
             message_id,
             captured_at,
         ));
+    }
+
+    fn record_inventory(
+        &self,
+        agent_id: AgentId,
+        inventory: SessionInventory,
+        captured_at: DateTime<Utc>,
+    ) {
+        self.inventory_calls
+            .lock()
+            .unwrap()
+            .push((agent_id, inventory, captured_at));
     }
 
     fn record_turn_spend(
@@ -1427,6 +1442,90 @@ async fn agent_idle_is_last_after_codex_post_terminal_enrichment_sequence() {
         last_idx,
         type_sequence.len() - 1,
         "AgentIdle must be strictly the final event — no trailing events allowed"
+    );
+}
+
+/// Drive one turn of the given scenario and return the dispatched agent's id
+/// alongside the inventory snapshots the injected metadata cache recorded.
+async fn inventory_calls_for(scenario: MockScenario) -> (AgentId, Vec<InventoryCall>) {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let factory = TestFactory::sequence_with_metadata(
+        [scenario],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+    dispatcher
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let calls = metadata.inventory_calls.lock().unwrap().clone();
+    (agent.id, calls)
+}
+
+#[tokio::test]
+async fn a_stream_only_inventory_is_persisted_to_the_metadata_cache() {
+    // Durability gate: Claude's `system/init` inventory has no session-file
+    // equivalent (class C), so it must be cached to survive a restart — and
+    // the gate is on the event's `source`, not the harness, which is what
+    // keeps the dispatcher harness-agnostic.
+    let before = Utc::now();
+    let (agent_id, calls) = inventory_calls_for(MockScenario::SessionMetaWithSource(
+        SessionMetaSource::StreamOnly,
+    ))
+    .await;
+    let after = Utc::now();
+
+    assert_eq!(
+        calls.len(),
+        1,
+        "a StreamOnly inventory must be persisted exactly once"
+    );
+    let (recorded_agent, inventory, captured_at) = &calls[0];
+    assert_eq!(*recorded_agent, agent_id);
+    assert_eq!(
+        inventory
+            .mcp_servers
+            .as_deref()
+            .and_then(|s| s.first())
+            .map(|s| s.status.as_str()),
+        Some("needs-auth"),
+        "the snapshot carries the real statuses, which is the point of caching it"
+    );
+    assert!(
+        *captured_at >= before && *captured_at <= after,
+        "captured_at must be stamped at record time (roughly now) so the card can age it"
+    );
+}
+
+#[tokio::test]
+async fn a_session_file_backed_inventory_is_not_persisted() {
+    // Negative case: Codex's inventory is re-read from its own rollout on
+    // every load (class B). A cached copy could only go stale against a file
+    // that is already durable.
+    let (_, calls) = inventory_calls_for(MockScenario::SessionMetaWithSource(
+        SessionMetaSource::SessionFileBacked,
+    ))
+    .await;
+    assert!(
+        calls.is_empty(),
+        "a SessionFileBacked inventory must NOT be persisted (the harness file is canonical); got {calls:?}"
     );
 }
 

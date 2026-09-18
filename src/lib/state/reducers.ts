@@ -761,10 +761,16 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
           // model, so this is a no-op for them.
           model: input.model !== "" ? input.model : (runtime.meta?.model ?? ""),
           harness_version: input.harness_version,
-          tools: input.tools,
-          mcp_servers: input.mcp_servers,
-          skills: input.skills,
+          // The whole inventory is replaced, never merged with the previous
+          // event's: what the harness reports is what it has loaded *now*, and
+          // keeping a list it stopped reporting would show a registry the
+          // agent no longer has.
+          inventory: input.inventory,
         },
+        // A live event is not a snapshot, so the staleness qualifier is
+        // meaningless — cleared to null exactly as `rate_limit_event` clears
+        // its own, never stamped `now`.
+        meta_as_of: null,
       };
     }
 
@@ -816,10 +822,12 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         next.meta = {
           model: input.meta.model,
           harness_version: input.meta.harness_version,
-          tools: input.meta.tools,
-          mcp_servers: input.meta.mcp_servers,
-          skills: input.meta.skills,
+          inventory: input.meta.inventory,
         };
+        // Carried beside the meta it qualifies and only when the meta is
+        // actually taken: an "as of" without the snapshot it describes would
+        // age a live inventory.
+        next.meta_as_of = input.meta_as_of ?? null;
       }
       if (next.last_rate_limit === undefined && input.last_rate_limit != null) {
         // Fill `last_rate_limit` and its `as_of` together — they're one unit.

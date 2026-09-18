@@ -23,7 +23,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use switchboard_core::AgentId;
 
-use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnSpend, TurnUsage};
+use crate::events::{
+    ContentKind, McpServerStatus, SessionInventory, SkillEntry, ToolKind, TurnId, TurnSpend,
+    TurnUsage,
+};
 
 /// Origin of a reconstructed user prompt. The conversation merge uses it to
 /// decide whether the journal already owns this prompt (suppress the harness
@@ -270,6 +273,13 @@ pub struct LoadedTranscript {
     /// class-B value (e.g. Codex's session-file rate-limit) carries `None`
     /// here because it's already durable and needs no staleness qualifier.
     pub last_rate_limit_as_of: Option<DateTime<Utc>>,
+    /// Capture time of `meta.inventory` when it was restored from the
+    /// per-agent metadata sidecar. Same role and same caveats as
+    /// [`Self::last_rate_limit_as_of`]: **always `None` from the per-harness
+    /// loaders**, set only by the app-layer overlay, and `None` for a class-B
+    /// inventory (Codex re-reads its rollout on every load, so there is
+    /// nothing stale to qualify).
+    pub meta_as_of: Option<DateTime<Utc>>,
     pub warnings: Vec<ParseWarning>,
 }
 
@@ -281,13 +291,11 @@ pub struct LoadedTranscript {
 /// `harness_version` may be empty on Claude (no on-disk analog of Codex's
 /// `cli_version`); consumers tolerate empty strings as "absent" per the
 /// existing live-path convention in `parse_system_event`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SessionMetaInfo {
     pub model: String,
     pub harness_version: String,
-    pub tools: Vec<String>,
-    pub mcp_servers: Vec<McpServerStatus>,
-    pub skills: Vec<String>,
+    pub inventory: SessionInventory,
 }
 
 /// One per-line parse issue inside an otherwise-readable session file.
@@ -329,31 +337,38 @@ pub enum LoadTranscriptError {
     AmbiguousSessionFile,
 }
 
-/// Compose a `SessionMetaInfo` from parser-extracted fields (`model`,
-/// `harness_version`) and config-loader output (`mcp_servers`, `skills`).
-/// Used by both per-harness `load_*_transcript` entry points to keep the
-/// two-source merge identical across harnesses.
+/// Compose a `SessionMetaInfo` from parser-extracted fields and config-loader
+/// output. Used by every per-harness `load_*_transcript` entry point to keep
+/// the two-source merge identical across harnesses.
 ///
-/// Parser-extracted fields are preserved verbatim. Config-loader output
-/// is layered on top of whatever the parser found. `tools` is always empty
-/// (no tools registry on disk for either harness; the live `system/init`
-/// event is the only populator).
+/// **Replace, not fill: a list the parser supplied wins outright, including an
+/// empty one, and the loaders fill only a list the parser left `None`.** There
+/// are no loader-side appends. This is the opposite of the rate-limit
+/// overlay's fill-if-empty rule, deliberately: the loaders read config
+/// registries, which say what is *configured* and carry no status, while the
+/// parser's lists say what the harness actually *loaded*. A session whose
+/// `init` reported zero MCP servers has none connected, and topping that up
+/// from `.mcp.json` would draw servers on the card that the agent cannot call.
+///
+/// Both loader arguments are themselves optional so a harness with no registry
+/// of that kind (Claude has no on-disk skills status; Codex has no tool
+/// inventory at all) passes `None` rather than an empty list that would read as
+/// an authoritative zero.
 #[must_use]
 pub fn merge_meta_with_loaders(
     parser_meta: Option<SessionMetaInfo>,
-    mcp_servers: Vec<McpServerStatus>,
-    skills: Vec<String>,
+    mcp_servers: Option<Vec<McpServerStatus>>,
+    skills: Option<Vec<SkillEntry>>,
 ) -> SessionMetaInfo {
-    let (model, harness_version) = parser_meta
-        .map(|m| (m.model, m.harness_version))
-        .unwrap_or_default();
-    SessionMetaInfo {
-        model,
-        harness_version,
-        tools: vec![],
+    let mut meta = parser_meta.unwrap_or_default();
+    let mut merged = SessionInventory {
         mcp_servers,
         skills,
-    }
+        ..SessionInventory::default()
+    };
+    merged.overlay(std::mem::take(&mut meta.inventory));
+    meta.inventory = merged;
+    meta
 }
 
 #[cfg(test)]
@@ -510,34 +525,85 @@ mod tests {
         );
     }
 
+    fn server(name: &str, status: &str) -> McpServerStatus {
+        McpServerStatus {
+            name: name.to_owned(),
+            status: status.to_owned(),
+            source: None,
+        }
+    }
+
     #[test]
-    fn merge_meta_with_loaders_uses_parser_fields_and_layers_loader_output() {
+    fn merge_meta_with_loaders_keeps_parser_scalars_and_fills_absent_lists() {
         let parser_meta = Some(SessionMetaInfo {
             model: "gpt-5.4".to_owned(),
             harness_version: "0.130.0".to_owned(),
-            tools: vec!["should_be_dropped".to_owned()],
-            mcp_servers: vec![],
-            skills: vec![],
+            inventory: SessionInventory::default(),
         });
-        let mcp = vec![McpServerStatus {
-            name: "tiddly".to_owned(),
-            status: "configured".to_owned(),
-        }];
-        let skills = vec!["debug".to_owned()];
-        let merged = merge_meta_with_loaders(parser_meta, mcp.clone(), skills.clone());
+        let mcp = vec![server("tiddly", "configured")];
+        let skills = vec![SkillEntry::from_name("debug".to_owned())];
+        let merged = merge_meta_with_loaders(parser_meta, Some(mcp.clone()), Some(skills.clone()));
         assert_eq!(merged.model, "gpt-5.4");
         assert_eq!(merged.harness_version, "0.130.0");
-        assert!(merged.tools.is_empty(), "tools always empty");
-        assert_eq!(merged.mcp_servers, mcp);
-        assert_eq!(merged.skills, skills);
+        assert_eq!(merged.inventory.mcp_servers, Some(mcp));
+        assert_eq!(merged.inventory.skills, Some(skills));
+    }
+
+    #[test]
+    fn a_runtime_empty_list_beats_a_non_empty_loader_list() {
+        // The load-bearing case for the `Option` semantics: a harness that
+        // reported zero MCP servers has none connected, and topping the list
+        // up from a config file would draw servers the agent cannot call.
+        let parser_meta = Some(SessionMetaInfo {
+            inventory: SessionInventory {
+                mcp_servers: Some(vec![]),
+                skills: Some(vec![]),
+                ..SessionInventory::default()
+            },
+            ..SessionMetaInfo::default()
+        });
+        let merged = merge_meta_with_loaders(
+            parser_meta,
+            Some(vec![server("tiddly", "configured")]),
+            Some(vec![SkillEntry::from_name("debug".to_owned())]),
+        );
+        assert_eq!(merged.inventory.mcp_servers, Some(vec![]));
+        assert_eq!(merged.inventory.skills, Some(vec![]));
+    }
+
+    #[test]
+    fn a_runtime_list_replaces_the_loader_list_without_appending() {
+        let parser_meta = Some(SessionMetaInfo {
+            inventory: SessionInventory {
+                mcp_servers: Some(vec![server("tiddly", "needs-auth")]),
+                ..SessionInventory::default()
+            },
+            ..SessionMetaInfo::default()
+        });
+        let merged = merge_meta_with_loaders(
+            parser_meta,
+            Some(vec![
+                server("tiddly", "configured"),
+                server("loader-only", "configured"),
+            ]),
+            None,
+        );
+        // Not a union: the loader-only entry is gone and the colliding entry
+        // keeps the runtime's real status, not the config file's placeholder.
+        assert_eq!(
+            merged.inventory.mcp_servers,
+            Some(vec![server("tiddly", "needs-auth")])
+        );
     }
 
     #[test]
     fn merge_meta_with_loaders_handles_no_parser_contribution() {
-        let merged = merge_meta_with_loaders(None, vec![], vec![]);
+        let merged = merge_meta_with_loaders(None, None, None);
         assert!(merged.model.is_empty());
         assert!(merged.harness_version.is_empty());
-        assert!(merged.mcp_servers.is_empty());
-        assert!(merged.skills.is_empty());
+        assert!(
+            merged.inventory.is_empty(),
+            "nothing reported anything — every list stays absent"
+        );
     }
 }

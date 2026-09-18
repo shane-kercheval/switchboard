@@ -64,7 +64,10 @@ use serde_json::Value;
 use switchboard_core::AgentId;
 use uuid::Uuid;
 
-use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnUsage};
+use crate::events::{
+    ContentKind, McpServerStatus, SessionInventory, SettingPair, SkillEntry, ToolKind, TurnId,
+    TurnUsage,
+};
 use crate::transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
     TurnStatus, merge_meta_with_loaders,
@@ -72,6 +75,7 @@ use crate::transcript::{
 
 use super::config::load_mcp_servers;
 use super::skills::load_skills;
+use super::world_state::{self, WorldState};
 
 /// Per-attempt backoff between session-file read tries. Codex writes the
 /// session file synchronously per `docs/research/archive/codex-cli-observed.md`; by
@@ -148,6 +152,20 @@ pub struct Enrichment {
     /// `context_window` is left `None` here; the adapter overlays it
     /// separately from the `task_started`-derived [`Self::context_window`].
     pub per_turn_usage: Option<TurnUsage>,
+    /// The skills Codex loaded, parsed out of `world_state.state.host_skills`
+    /// — a markdown block written for the model, and the only source that
+    /// exists (see `world_state` module docs). `None` when the rollout carries
+    /// no `world_state`, which is what an older Codex writes; the config-file
+    /// scanner then fills the list instead.
+    pub skills: Option<Vec<SkillEntry>>,
+    /// The user's approved-command allowlist from
+    /// `world_state.state.permissions.approved_command_prefixes`, each argv
+    /// prefix joined into one command line.
+    pub approved_commands: Option<Vec<String>>,
+    /// Codex's run settings as display pairs — sandbox, approval policy,
+    /// personality, shell, timezone — from the last `turn_context` and the
+    /// accumulated `world_state`.
+    pub settings: Option<Vec<SettingPair>>,
     /// The **current turn's** content-bearing `Edit` facets, in record order —
     /// mode-selected single source: legacy `apply_patch` calls /
     /// `patch_apply_end` events on legacy rollouts, `item_completed/FileChange`
@@ -519,6 +537,10 @@ fn task_started_timestamp(value: &Value) -> Option<chrono::DateTime<chrono::Utc>
         .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
 }
 
+// One pass over the rollout feeding a dozen independent last-wins /
+// turn-scoped fields; splitting it would mean threading the same accumulators
+// through helpers for no readability gain.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn parse_session_content(content: &str) -> Enrichment {
     let mut enrichment = Enrichment::default();
@@ -531,6 +553,15 @@ pub fn parse_session_content(content: &str) -> Enrichment {
     // Running shell cwd (turn_context precedes the turn's tool records) —
     // resolves relative apply_patch paths; observed paths are absolute.
     let mut current_cwd: Option<std::path::PathBuf> = None;
+    // Folded across every `world_state` record rather than taken from the last
+    // one — those records are snapshot-plus-delta (see the `world_state`
+    // module doc), so the last is routinely a one-key update.
+    let mut world = WorldState::default();
+    // The last `turn_context` payload, kept whole for the settings projection.
+    // Last-wins for the same reason the per-turn model is: these are the
+    // *current* turn's selections, and the card describes the agent as it
+    // stands now.
+    let mut last_turn_context: Option<Value> = None;
 
     for (idx, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
@@ -584,6 +615,12 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         .get("cwd")
                         .and_then(Value::as_str)
                         .map(std::path::PathBuf::from);
+                    last_turn_context = Some(p.clone());
+                }
+            }
+            "world_state" => {
+                if let Some(p) = payload {
+                    world.absorb(p);
                 }
             }
             // Gated like the reconstruction path's text arms: patch facets
@@ -667,6 +704,12 @@ pub fn parse_session_content(content: &str) -> Enrichment {
             }
             _ => {}
         }
+    }
+
+    if !world.is_empty() {
+        enrichment.skills = world.skills();
+        enrichment.approved_commands = world.approved_commands();
+        enrichment.settings = world_state::settings(&world, last_turn_context.as_ref());
     }
 
     enrichment
@@ -884,7 +927,7 @@ pub async fn load_with_retry(
 pub fn build_session_meta_fields(
     enrichment: &Enrichment,
     mcp_servers: Vec<McpServerStatus>,
-    skills: Vec<String>,
+    scanned_skills: Vec<SkillEntry>,
 ) -> Option<SessionMetaFields> {
     if enrichment.model.is_none() && enrichment.cli_version.is_none() {
         return None;
@@ -892,21 +935,48 @@ pub fn build_session_meta_fields(
     Some(SessionMetaFields {
         model: enrichment.model.clone().unwrap_or_default(),
         harness_version: enrichment.cli_version.clone().unwrap_or_default(),
-        mcp_servers,
-        skills,
+        inventory: enrichment.inventory(Some(mcp_servers), Some(scanned_skills)),
         raw: enrichment.session_meta_raw.clone().unwrap_or(Value::Null),
     })
 }
 
 /// Fields ready to plug into [`crate::events::AdapterEvent::SessionMeta`].
-/// `tools` is always `vec![]` for Codex — no equivalent registry source on
-/// disk; kept implicit on the adapter side rather than carried here.
 pub struct SessionMetaFields {
     pub model: String,
     pub harness_version: String,
-    pub mcp_servers: Vec<McpServerStatus>,
-    pub skills: Vec<String>,
+    pub inventory: SessionInventory,
     pub raw: Value,
+}
+
+impl Enrichment {
+    /// Project the rollout-derived inventory, letting the config loaders fill
+    /// only what the rollout did not report — the same replace-not-fill rule
+    /// [`crate::transcript::merge_meta_with_loaders`] applies on reload, so a
+    /// live `SessionMeta` and a reloaded one agree.
+    ///
+    /// MCP servers have no rollout source at all (Codex records its loaded
+    /// servers nowhere — not the stream, not the rollout), so they are always
+    /// the loader's, carrying the `"configured"` status that says so. `tools`
+    /// stays `None` for the same absence: claiming zero tools would be a
+    /// statement Codex never made.
+    #[must_use]
+    pub fn inventory(
+        &self,
+        mcp_servers: Option<Vec<McpServerStatus>>,
+        scanned_skills: Option<Vec<SkillEntry>>,
+    ) -> SessionInventory {
+        SessionInventory {
+            tools: None,
+            mcp_servers,
+            skills: self.skills.clone().or(scanned_skills),
+            agents: None,
+            plugins: None,
+            memory_paths: None,
+            slash_commands: None,
+            approved_commands: self.approved_commands.clone(),
+            settings: self.settings.clone(),
+        }
+    }
 }
 
 /// Load a Codex session file and project it into a
@@ -943,8 +1013,8 @@ pub fn load_codex_transcript(
         return Ok(LoadedTranscript {
             meta: Some(merge_meta_with_loaders(
                 None,
-                load_mcp_servers(home_dir, cwd),
-                load_skills(home_dir, cwd),
+                Some(load_mcp_servers(home_dir, cwd)),
+                Some(scanned_skill_entries(home_dir, cwd)),
             )),
             ..LoadedTranscript::default()
         });
@@ -960,10 +1030,22 @@ pub fn load_codex_transcript(
     let mut transcript = parse_codex_transcript_content(&content, agent_id);
     transcript.meta = Some(merge_meta_with_loaders(
         transcript.meta.take(),
-        load_mcp_servers(home_dir, cwd),
-        load_skills(home_dir, cwd),
+        Some(load_mcp_servers(home_dir, cwd)),
+        Some(scanned_skill_entries(home_dir, cwd)),
     ));
     Ok(transcript)
+}
+
+/// The skills-directory scan as inventory entries — the pre-first-turn
+/// fallback only. Once the agent has run, the rollout's `host_skills` block is
+/// the authority and replaces this outright (`merge_meta_with_loaders`),
+/// because the scanner reads only the two documented roots and Codex loads
+/// more (see `skills.rs`).
+fn scanned_skill_entries(home_dir: &Path, cwd: &Path) -> Vec<SkillEntry> {
+    load_skills(home_dir, cwd)
+        .into_iter()
+        .map(SkillEntry::from_name)
+        .collect()
 }
 
 /// Parse Codex session-file content into a `LoadedTranscript` (no FS access).
@@ -993,13 +1075,14 @@ pub(crate) fn parse_codex_transcript_content(content: &str, agent_id: AgentId) -
     // rate_limits, then merge into our LoadedTranscript shape. Single source
     // of truth for meta fields.
     let enrichment = parse_session_content(content);
-    t.last_rate_limit = enrichment.rate_limits;
+    t.last_rate_limit.clone_from(&enrichment.rate_limits);
+    // The rollout's own inventory only — the config loaders are layered on in
+    // `load_codex_transcript`, which is the one place that knows the home and
+    // working directories.
     t.meta = Some(SessionMetaInfo {
-        model: enrichment.model.unwrap_or_default(),
-        harness_version: enrichment.cli_version.unwrap_or_default(),
-        tools: vec![],
-        mcp_servers: vec![],
-        skills: vec![],
+        model: enrichment.model.clone().unwrap_or_default(),
+        harness_version: enrichment.cli_version.clone().unwrap_or_default(),
+        inventory: enrichment.inventory(None, None),
     });
     t
 }
@@ -2765,6 +2848,7 @@ impl CodexReconstruction {
             meta: None,
             last_rate_limit: None,
             last_rate_limit_as_of: None,
+            meta_as_of: None,
             warnings: self.warnings,
         }
     }
@@ -3350,6 +3434,213 @@ mod tests {
             }
         }
         snapshots
+    }
+
+    /// The recorded `world_state` rollout (codex 0.154.0 — the version is in
+    /// the fixture's own `session_meta.cli_version`). The real block carries
+    /// ~30 skills across 7 roots and a 4.7 KB allowlist; the fixture keeps
+    /// three skills spanning two roots and three commands.
+    fn world_state_fixture() -> Enrichment {
+        let content = std::fs::read_to_string(fixture_path("world-state.session.jsonl")).unwrap();
+        parse_session_content(&content)
+    }
+
+    #[test]
+    fn world_state_fixture_yields_skills_with_descriptions_and_expanded_paths() {
+        let skills = world_state_fixture().skills.expect("host_skills parsed");
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["imagegen", "skill-creator", "data-analytics:build-report"]
+        );
+        assert!(
+            skills.iter().all(|s| s.description.is_some()),
+            "every recorded entry carries a description: {skills:?}"
+        );
+        assert_eq!(
+            skills[2].path.as_deref(),
+            Some(
+                "/Users/example/.codex/plugins/cache/openai-curated-remote/data-analytics/1.0.9/skills/build-report/SKILL.md"
+            ),
+            "the root abbreviation must expand to the absolute path"
+        );
+    }
+
+    #[test]
+    fn world_state_fixture_yields_the_settings_pairs() {
+        let settings = world_state_fixture().settings.expect("settings parsed");
+        let rendered: Vec<(&str, &str)> = settings
+            .iter()
+            .map(|p| (p.label.as_str(), p.value.as_str()))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("Sandbox", "read-only"),
+                ("Approval policy", "never"),
+                ("Personality", "pragmatic"),
+                ("Shell", "zsh"),
+                ("Timezone", "America/Los_Angeles"),
+            ]
+        );
+    }
+
+    #[test]
+    fn world_state_fixture_yields_the_approved_command_allowlist() {
+        assert_eq!(
+            world_state_fixture().approved_commands,
+            Some(vec![
+                "brew install clerk/stable/clerk".to_owned(),
+                "clerk whoami".to_owned(),
+                "ls".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_rollout_without_world_state_reports_no_inventory() {
+        // An older Codex writes no `world_state` record at all. Every list
+        // must stay absent so the config-file scanner can still fill what it
+        // can — `Some([])` here would blank the card's sections instead.
+        let content = std::fs::read_to_string(fixture_path("rate-limits.session.jsonl")).unwrap();
+        let enrichment = parse_session_content(&content);
+        assert_eq!(enrichment.skills, None);
+        assert_eq!(enrichment.approved_commands, None);
+        assert_eq!(enrichment.settings, None);
+        assert!(
+            enrichment.inventory(None, None).is_empty(),
+            "no runtime source reported anything"
+        );
+    }
+
+    #[test]
+    fn the_rollout_skills_replace_the_scanned_ones() {
+        // Decision: once the agent has run, the rollout is the authority. The
+        // directory scanner reads only the two documented roots while Codex
+        // loads more, so appending the scan to the rollout's list would show
+        // skills as loaded that Codex never mentioned.
+        let inventory = world_state_fixture().inventory(
+            None,
+            Some(vec![SkillEntry::from_name("scanned-only".to_owned())]),
+        );
+        let names: Vec<&str> = inventory
+            .skills
+            .as_deref()
+            .expect("skills present")
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"scanned-only"),
+            "the scan must not append to the rollout's list: {names:?}"
+        );
+        assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn the_scanned_skills_fill_in_when_the_rollout_reports_none() {
+        let content = std::fs::read_to_string(fixture_path("rate-limits.session.jsonl")).unwrap();
+        let inventory = parse_session_content(&content).inventory(
+            None,
+            Some(vec![SkillEntry::from_name("scanned-only".to_owned())]),
+        );
+        assert_eq!(
+            inventory.skills,
+            Some(vec![SkillEntry::from_name("scanned-only".to_owned())])
+        );
+    }
+
+    #[test]
+    fn load_codex_transcript_prefers_the_rollout_skills_over_the_scanner() {
+        // The one place the two sources actually meet on disk. The scanner
+        // directory is deliberately **disjoint** from the rollout's skills: a
+        // union would be visible as four entries, and appending would show
+        // `scanner-only` as loaded when Codex never mentioned it.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let session_id = "00000000-0000-7000-8000-000000000001";
+
+        let skill_dir = home.path().join(".agents/skills/scanner-only");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# scanner-only").unwrap();
+        // Prove the scanner can see it, so a pass below is precedence rather
+        // than a mis-staged directory.
+        assert_eq!(
+            load_skills(home.path(), cwd.path()),
+            vec!["scanner-only".to_owned()],
+            "the staged scanner directory must be readable"
+        );
+
+        let dir = session_directory(home.path(), date);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(
+            fixture_path("world-state.session.jsonl"),
+            dir.join(format!("rollout-2026-01-01T00-00-00-{session_id}.jsonl")),
+        )
+        .unwrap();
+
+        let loaded = load_codex_transcript(
+            home.path(),
+            cwd.path(),
+            session_id,
+            Some(date),
+            Uuid::now_v7(),
+        )
+        .unwrap();
+        let inventory = loaded.meta.expect("meta present").inventory;
+        let names: Vec<&str> = inventory
+            .skills
+            .as_deref()
+            .expect("skills present")
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["imagegen", "skill-creator", "data-analytics:build-report"],
+            "the rollout is the authority once the agent has run"
+        );
+        // The MCP list is the one with no rollout source at all, so the config
+        // loader still fills it — with the status that says so.
+        assert!(
+            inventory
+                .mcp_servers
+                .as_ref()
+                .is_some_and(|servers| servers.iter().all(|s| s.status == "configured")),
+            "MCP servers stay loader-backed: {:?}",
+            inventory.mcp_servers
+        );
+    }
+
+    #[test]
+    fn load_codex_transcript_falls_back_to_the_scanner_before_the_first_turn() {
+        // A never-dispatched agent has no rollout at all, so the scanner is
+        // what the card shows — labelled as configured, not loaded.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let skill_dir = home.path().join(".agents/skills/scanner-only");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# scanner-only").unwrap();
+
+        let loaded =
+            load_codex_transcript(home.path(), cwd.path(), "", None, Uuid::now_v7()).unwrap();
+        let inventory = loaded.meta.expect("meta present").inventory;
+        assert_eq!(
+            inventory.skills,
+            Some(vec![SkillEntry::from_name("scanner-only".to_owned())])
+        );
+        assert!(
+            loaded.meta_as_of.is_none(),
+            "the loaders are re-read every open — nothing to age"
+        );
+    }
+
+    #[test]
+    fn codex_never_claims_a_tool_inventory() {
+        // Codex records its tools nowhere — not the stream, not the rollout.
+        // `None` says that; `Some([])` would claim it loaded zero tools.
+        assert_eq!(world_state_fixture().inventory(None, None).tools, None);
     }
 
     #[test]

@@ -108,6 +108,13 @@ pub enum MockScenario {
     /// the injected `MetadataCache`.
     RateLimitWithSource(crate::events::RateLimitSource),
 
+    /// Emits `ContentChunk → TurnEnd(Completed) → SessionMeta` whose
+    /// inventory names one MCP server, tagged with the given
+    /// [`SessionMetaSource`]. The inventory counterpart of
+    /// [`Self::RateLimitWithSource`]: run once with `StreamOnly` (must
+    /// persist) and once with `SessionFileBacked` (must not).
+    SessionMetaWithSource(crate::events::SessionMetaSource),
+
     /// Emits `ContentChunk → TurnEnd(Completed)` whose `usage` carries the given
     /// context occupancy and `context_window`, tagged with the given
     /// [`ContextWindowSource`]. The
@@ -597,13 +604,17 @@ impl HarnessAdapter for MockHarnessAdapter {
                         agent_id,
                         model: "gpt-test".to_owned(),
                         harness_version: "0.130.0".to_owned(),
-                        tools: vec![],
-                        mcp_servers: vec![crate::events::McpServerStatus {
-                            name: "fs".to_owned(),
-                            status: "connected".to_owned(),
-                        }],
-                        skills: vec![],
+                        inventory: crate::events::SessionInventory {
+                            mcp_servers: Some(vec![crate::events::McpServerStatus {
+                                name: "fs".to_owned(),
+                                status: "connected".to_owned(),
+                                source: None,
+                            }]),
+                            skills: Some(vec![]),
+                            ..crate::events::SessionInventory::default()
+                        },
                         raw: serde_json::Value::Null,
+                        source: crate::events::SessionMetaSource::SessionFileBacked,
                     });
                 });
             }
@@ -629,6 +640,42 @@ impl HarnessAdapter for MockHarnessAdapter {
                     let _ = tx.send(AdapterEvent::RateLimitEvent {
                         agent_id,
                         info: serde_json::json!({"primary": {"used_percent": 42.0}}),
+                        source,
+                    });
+                });
+            }
+            MockScenario::SessionMetaWithSource(source) => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        first_message_id: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                    });
+                    let _ = tx.send(AdapterEvent::SessionMeta {
+                        agent_id,
+                        model: "test-model".to_owned(),
+                        harness_version: "0.0.0".to_owned(),
+                        inventory: crate::events::SessionInventory {
+                            mcp_servers: Some(vec![crate::events::McpServerStatus {
+                                name: "tiddly".to_owned(),
+                                status: "needs-auth".to_owned(),
+                                source: None,
+                            }]),
+                            ..crate::events::SessionInventory::default()
+                        },
+                        raw: serde_json::Value::Null,
                         source,
                     });
                 });

@@ -65,7 +65,7 @@ use serde_json::Value;
 use switchboard_core::AgentId;
 use uuid::Uuid;
 
-use crate::events::{ContentKind, TurnId, TurnUsage};
+use crate::events::{ContentKind, SessionInventory, SkillEntry, TurnId, TurnUsage};
 use crate::parser::classify_claude_tool_kind;
 use crate::transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, SystemMarker, Turn,
@@ -95,8 +95,8 @@ pub fn load_claude_transcript(
         return Ok(LoadedTranscript {
             meta: Some(merge_meta_with_loaders(
                 None,
-                load_mcp_servers(home_dir, cwd),
-                load_skills(home_dir, cwd),
+                Some(load_mcp_servers(home_dir, cwd)),
+                Some(loaded_skill_entries(home_dir, cwd)),
             )),
             ..LoadedTranscript::default()
         });
@@ -124,10 +124,19 @@ pub fn load_claude_transcript(
     let mut transcript = state.finalize();
     transcript.meta = Some(merge_meta_with_loaders(
         transcript.meta.take(),
-        load_mcp_servers(home_dir, cwd),
-        load_skills(home_dir, cwd),
+        Some(load_mcp_servers(home_dir, cwd)),
+        Some(loaded_skill_entries(home_dir, cwd)),
     ));
     Ok(transcript)
+}
+
+/// The skills-directory scan as inventory entries. The scanner knows only
+/// names — `system/init` is the only source of a Claude skill's description.
+fn loaded_skill_entries(home_dir: &Path, cwd: &Path) -> Vec<SkillEntry> {
+    load_skills(home_dir, cwd)
+        .into_iter()
+        .map(SkillEntry::from_name)
+        .collect()
 }
 
 fn resolve_session_path(home_dir: &Path, cwd: &Path, session_id: Uuid) -> Option<PathBuf> {
@@ -1052,18 +1061,20 @@ impl ReconstructionState {
                 "provenance-less user prompts beginning with '/' not matched as known bookkeeping commands (expected for genuine path/slash prompts; investigate only alongside an observed send↔turn duplicate)"
             );
         }
+        // Claude's session file records no environment inventory — `system/init`
+        // is live-only (class C) — so every list stays `None` and the loaders,
+        // then the sidecar overlay, may fill them.
         let meta = self.first_model.map(|model| SessionMetaInfo {
             model,
             harness_version: String::new(),
-            tools: vec![],
-            mcp_servers: vec![],
-            skills: vec![],
+            inventory: SessionInventory::default(),
         });
         LoadedTranscript {
             turns: self.turns,
             meta,
             last_rate_limit: None,
             last_rate_limit_as_of: None,
+            meta_as_of: None,
             warnings: self.warnings,
         }
     }

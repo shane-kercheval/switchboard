@@ -320,9 +320,15 @@ for the user (telemetry flags, internal capability strings).
     snapshot set: a stale status is fine when it says it is stale. Codex's is re-read from the
     rollout (class B) and never persisted. *(Comment on the sidecar field, citing G14; comment on
     the source enum, citing `RateLimitSource`.)*
-14. **The two chips become an "Environment" disclosure row on the card.** Collapsed: one line of
+14. **The two chips become an "Environment" disclosure row on the card.** Collapsed: a line of
     counts with the only status that matters called out — "MCP 7 · 2 need auth · Agents 6 · Plugins
-    1 · Skills 30 · Memory 1". Expanded: sections in that order — MCP servers (name, `StatusDot`,
+    1 · Skills 30 · Memory 1". **That line wraps; "one line" was written before it was measured.**
+    A busy account's summary needs ~367px against the ~224px a default-width (240px) card gives it —
+    127px clipped, measured in WebKit — and truncating dropped the Skills and Memory counts off the
+    card entirely, which is precisely what this decision's governing rule forbids. Two lines of 11px
+    text is the cheaper price than losing half the counts, and
+    `tests/browser/agent-environment-fit.browser.test.ts` pins that nothing clips at either the
+    default or the 200px minimum. Expanded: sections in that order — MCP servers (name, `StatusDot`,
     source), custom agents (names), plugins (name @ version), memory paths (basename, full path on
     hover), skills, tools, and slash commands — each of the last three a count line ("Tools · 109")
     that expands to the full sorted list — and a final settings line (permission mode, output
@@ -782,6 +788,25 @@ counter", "weekly `overageResetsAt`", or the §0 claim that `/context` emits no 
 - Codex: no runtime tool or MCP status exists in the stream or rollout; MCP rows show configured
   names only, and pre-first-turn skills come from an incomplete scanner labelled as configured. The
   blocked-state fields are recorded, not rendered, until observed populated.
+- **`world_state` is snapshot-plus-delta, and the reader folds per key.** A `full: false` record
+  carries only the keys that changed, so a last-record-wins read would erase `host_skills` the
+  moment any delta landed (measured: 77 of 1,222 local rollouts carry more than one record, one
+  carried 28). Recorded because the fold is the non-obvious part — the single-record probe the plan
+  was written from shows none of it.
+- **The `host_skills` scrape can degrade silently in one direction.** A body with the expected
+  headings but reworded entry lines yields an empty list plus a warning, which renders as no Skills
+  section — indistinguishable on the card from an account with no skills. The live guard is what
+  makes this loud; there is no in-app signal, deliberately, because an error row on a display-only
+  registry would be worse than an absent section.
+- **`is_first_dispatch_after_attach` and its `AppState::needs_session_meta` bookkeeping are now
+  inert.** Their only consumer was Codex's first-turn `SessionMeta` gate, which this milestone
+  removed. They are documented as inert rather than deleted: the removal touches the app layer's
+  attach flow and a documented lock ordering, which is its own change and carries its own risk.
+- **An absent `init` key yields `None`, not the "empty defaults" this milestone's Definition of Done
+  first said.** The two readings differ only for a list that has a config-file fallback, and there
+  `None` is clearly right: an older CLI that never emitted `mcp_servers` must fall back to the
+  registry, while `Some([])` would claim an authoritative zero and blank the section. The DoD wording
+  predates decision 12's `Option` semantics; decision 12 governs.
 
 ## Out of scope (deliberately)
 

@@ -188,9 +188,9 @@ describe("event routing", () => {
       agent_id: AGENT_A,
       model: "claude-sonnet-4-6",
       harness_version: "2.1.140",
-      tools: ["Bash"],
-      mcp_servers: [],
-      skills: [],
+      inventory: {
+        tools: ["Bash"],
+      },
       raw: {},
     });
     fireTo(`agent:${AGENT_A}`, {
@@ -1236,9 +1236,7 @@ describe("hydrateAgent", () => {
       meta: {
         model: "claude-sonnet-4-6",
         harness_version: "2.1.140",
-        tools: [],
-        mcp_servers: [],
-        skills: [],
+        inventory: {},
       },
       last_rate_limit: null,
       warnings: [],

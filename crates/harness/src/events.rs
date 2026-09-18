@@ -60,6 +60,148 @@ pub enum ToolKind {
 pub struct McpServerStatus {
     pub name: String,
     pub status: String,
+    /// Which config scope registered the server ("user" / "claudeai" /
+    /// "project" / …), when the harness says. Opaque for the same reason
+    /// `status` is. `None` from the config loaders, which read a file that
+    /// names no scope beyond the one they read it from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// One skill the harness has loaded. Claude's `system/init` supplies names
+/// only; Codex's rollout supplies all three. `description` and `path` are
+/// therefore per-harness, not per-skill, optional.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl SkillEntry {
+    /// A skill known only by name — what every config-loader directory scan
+    /// and Claude's `system/init` can supply.
+    #[must_use]
+    pub fn from_name(name: String) -> Self {
+        Self {
+            name,
+            description: None,
+            path: None,
+        }
+    }
+}
+
+/// One plugin the harness has loaded (Claude's `init.plugins`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// One of the harness's run settings, as a display pair.
+///
+/// A label/value list rather than one typed field per setting because the two
+/// wired harnesses share no setting names — Claude reports permission mode and
+/// output style, Codex reports sandbox, approval policy, personality, shell and
+/// timezone — and the card renders them identically. Modelling each would add a
+/// field per harness quirk for no reader that treats them differently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SettingPair {
+    pub label: String,
+    pub value: String,
+}
+
+/// What the harness has loaded for a session: the registries, the run
+/// settings, and the allowlists it reports.
+///
+/// **Every list is `Option<Vec<_>>`, and the distinction is load-bearing.**
+/// `None` means the runtime source did not report the list at all; `Some([])`
+/// means it reported an empty one. Only `None` may be filled from a config
+/// loader ([`crate::transcript::merge_meta_with_loaders`]): a Claude `init`
+/// reporting zero MCP servers is authoritative, and filling that from
+/// `.mcp.json` would show servers as loaded that are not. Collapsing the two
+/// into a bare empty `Vec` makes "the harness says none" indistinguishable
+/// from "nobody has asked yet."
+///
+/// Typed rather than opaque JSON, unlike `RateLimitEvent.info`: that shape is
+/// vendor-controlled and we chose not to model it. This one we are choosing to
+/// model, and both harnesses' fields are mapped onto it at their own parsers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SessionInventory {
+    /// Tool names. Claude's `init.tools`; no harness has an on-disk analog, and
+    /// Codex reports no tool inventory anywhere (neither stream nor rollout),
+    /// so it stays `None` there rather than claiming zero tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Vec<McpServerStatus>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<SkillEntry>>,
+    /// Custom agent (subagent) type names. Claude's `init.agents`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<Vec<PluginEntry>>,
+    /// Directories or files the harness loaded memory from. Claude reports
+    /// `init.memory_paths` as a **map** of kind → path; the values are what
+    /// lands here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_paths: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slash_commands: Option<Vec<String>>,
+    /// The user's approved-command allowlist (Codex's
+    /// `world_state.permissions.approved_command_prefixes`), each prefix joined
+    /// into one displayable command line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_commands: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Vec<SettingPair>>,
+}
+
+impl SessionInventory {
+    /// Layer a higher-precedence inventory over this one: **every list
+    /// `higher` reports replaces this one's, including an empty list, and a
+    /// list `higher` left `None` keeps this one's.**
+    ///
+    /// This is the one implementation of the precedence rule, shared by every
+    /// merge point — the reload merge with the config loaders
+    /// ([`crate::transcript::merge_meta_with_loaders`]) and the metadata
+    /// sidecar's overlay. `Option::or` *is* the rule: `Some(vec![])` survives
+    /// it, which is the whole point, and is what an empty `Vec` could not
+    /// express.
+    pub fn overlay(&mut self, higher: Self) {
+        self.tools = higher.tools.or_else(|| self.tools.take());
+        self.mcp_servers = higher.mcp_servers.or_else(|| self.mcp_servers.take());
+        self.skills = higher.skills.or_else(|| self.skills.take());
+        self.agents = higher.agents.or_else(|| self.agents.take());
+        self.plugins = higher.plugins.or_else(|| self.plugins.take());
+        self.memory_paths = higher.memory_paths.or_else(|| self.memory_paths.take());
+        self.slash_commands = higher.slash_commands.or_else(|| self.slash_commands.take());
+        self.approved_commands = higher
+            .approved_commands
+            .or_else(|| self.approved_commands.take());
+        self.settings = higher.settings.or_else(|| self.settings.take());
+    }
+
+    /// Whether the harness reported nothing at all. The card renders no
+    /// environment row for such an agent rather than an empty disclosure.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_none()
+            && self.mcp_servers.is_none()
+            && self.skills.is_none()
+            && self.agents.is_none()
+            && self.plugins.is_none()
+            && self.memory_paths.is_none()
+            && self.slash_commands.is_none()
+            && self.approved_commands.is_none()
+            && self.settings.is_none()
+    }
 }
 
 /// Where a `RateLimitEvent`'s payload is durable — the dispatcher's gate for
@@ -83,6 +225,31 @@ pub enum RateLimitSource {
     /// Already persisted by the harness in its own session file (class B); the
     /// harness file is canonical and durable, so Switchboard does **not**
     /// re-persist it. Codex's session-file-enriched rate-limit.
+    SessionFileBacked,
+}
+
+/// Where a `SessionMeta` event's inventory is durable — the dispatcher's gate
+/// for whether to persist it to the per-agent metadata sidecar.
+///
+/// Mirrors [`RateLimitSource`] exactly, and for the same reason: it rides on
+/// [`AdapterEvent::SessionMeta`], is dropped at the [`NormalizedEvent`]
+/// boundary, and keeps the persistence rule in the type system instead of a
+/// `match harness {…}` in the dispatcher. Claude's inventory comes from the
+/// live `system/init` and has no on-disk analog (class C), so it must be
+/// cached to survive a restart; Codex's is re-read from its rollout on every
+/// load (class B) and must not be.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SessionMetaSource {
+    /// Live stream only; the dispatcher persists the inventory snapshot with a
+    /// capture time so the card can render it with an "as of" qualifier after a
+    /// reload. Closes G14 in `docs/harness-behavior.md` by the convention the
+    /// rate-limit snapshot set: a stale inventory is fine when it says it is
+    /// stale.
+    StreamOnly,
+    /// Read back out of the harness's own session file on every load; never
+    /// re-persisted. Codex's rollout-derived inventory.
     SessionFileBacked,
 }
 
@@ -331,10 +498,14 @@ pub enum AdapterEvent {
         agent_id: AgentId,
         model: String,
         harness_version: String,
-        tools: Vec<String>,
-        mcp_servers: Vec<McpServerStatus>,
-        skills: Vec<String>,
+        /// What the harness reports having loaded. See [`SessionInventory`] for
+        /// why each list is optional.
+        inventory: SessionInventory,
         raw: serde_json::Value,
+        /// Where this inventory is durable — gates Switchboard-side
+        /// persistence. Not carried to the frontend (dropped in the
+        /// `NormalizedEvent` conversion below).
+        source: SessionMetaSource,
     },
     /// A runtime-assigned session locator the adapter just learned (Codex's
     /// `thread_id`+date on first dispatch; Antigravity's conversation UUID on
@@ -471,9 +642,7 @@ pub enum NormalizedEvent {
         agent_id: AgentId,
         model: String,
         harness_version: String,
-        tools: Vec<String>,
-        mcp_servers: Vec<McpServerStatus>,
-        skills: Vec<String>,
+        inventory: SessionInventory,
         raw: serde_json::Value,
     },
     /// A send **failed before any turn started**: either the journal write of
@@ -666,21 +835,21 @@ impl AdapterEvent {
             AdapterEvent::RateLimitEvent { agent_id, info, .. } => {
                 NormalizedEvent::RateLimitEvent { agent_id, info }
             }
+            // `source` is intentionally dropped, exactly as
+            // `RateLimitEvent`'s is — an internal persistence discriminator
+            // (see `SessionMetaSource`).
             AdapterEvent::SessionMeta {
                 agent_id,
                 model,
                 harness_version,
-                tools,
-                mcp_servers,
-                skills,
+                inventory,
                 raw,
+                ..
             } => NormalizedEvent::SessionMeta {
                 agent_id,
                 model,
                 harness_version,
-                tools,
-                mcp_servers,
-                skills,
+                inventory,
                 raw,
             },
             // Internal adapter → dispatcher event; persisted to the registry,
@@ -1125,23 +1294,66 @@ mod tests {
             agent_id: fresh_agent_id(),
             model: "claude-sonnet-4-6".to_owned(),
             harness_version: "2.1.140".to_owned(),
-            tools: vec!["Bash".to_owned(), "Read".to_owned()],
-            mcp_servers: vec![McpServerStatus {
-                name: "tiddly".to_owned(),
-                status: "connected".to_owned(),
-            }],
-            skills: vec!["debug".to_owned()],
+            inventory: SessionInventory {
+                tools: Some(vec!["Bash".to_owned(), "Read".to_owned()]),
+                mcp_servers: Some(vec![McpServerStatus {
+                    name: "tiddly".to_owned(),
+                    status: "connected".to_owned(),
+                    source: Some("user".to_owned()),
+                }]),
+                skills: Some(vec![SkillEntry {
+                    name: "debug".to_owned(),
+                    description: Some("Debug things".to_owned()),
+                    path: Some("/root/debug/SKILL.md".to_owned()),
+                }]),
+                agents: Some(vec!["Explore".to_owned()]),
+                plugins: Some(vec![PluginEntry {
+                    name: "anthropic-skills".to_owned(),
+                    version: Some("0.0.1".to_owned()),
+                    source: Some("marketplace".to_owned()),
+                }]),
+                memory_paths: Some(vec!["/home/me/.claude/memory".to_owned()]),
+                slash_commands: Some(vec!["init".to_owned()]),
+                approved_commands: None,
+                settings: Some(vec![SettingPair {
+                    label: "Permission mode".to_owned(),
+                    value: "bypassPermissions".to_owned(),
+                }]),
+            },
             raw: json!({"subtype": "init", "cwd": "/tmp"}),
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "session_meta");
         assert_eq!(value["model"], "claude-sonnet-4-6");
         assert_eq!(value["harness_version"], "2.1.140");
-        assert_eq!(value["tools"], json!(["Bash", "Read"]));
-        assert_eq!(value["mcp_servers"][0]["name"], "tiddly");
-        assert_eq!(value["mcp_servers"][0]["status"], "connected");
-        assert_eq!(value["skills"], json!(["debug"]));
+        assert_eq!(value["inventory"]["tools"], json!(["Bash", "Read"]));
+        assert_eq!(value["inventory"]["mcp_servers"][0]["name"], "tiddly");
+        assert_eq!(value["inventory"]["mcp_servers"][0]["status"], "connected");
+        assert_eq!(value["inventory"]["mcp_servers"][0]["source"], "user");
+        assert_eq!(value["inventory"]["skills"][0]["name"], "debug");
+        assert_eq!(
+            value["inventory"]["skills"][0]["description"],
+            "Debug things"
+        );
+        assert_eq!(value["inventory"]["agents"], json!(["Explore"]));
+        assert_eq!(value["inventory"]["plugins"][0]["version"], "0.0.1");
+        assert_eq!(
+            value["inventory"]["memory_paths"],
+            json!(["/home/me/.claude/memory"])
+        );
+        assert_eq!(value["inventory"]["slash_commands"], json!(["init"]));
+        assert_eq!(
+            value["inventory"]["settings"][0]["label"],
+            "Permission mode"
+        );
         assert_eq!(value["raw"]["subtype"], "init");
+        // A list the harness never reported is absent from the wire, not
+        // `null` and not `[]` — the frontend's own "reported nothing" check
+        // reads the same distinction the Rust side does.
+        assert!(
+            value["inventory"].get("approved_commands").is_none(),
+            "an unreported list must not appear on the wire: {value}"
+        );
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);
     }
@@ -1336,10 +1548,9 @@ mod tests {
             agent_id: fresh_agent_id(),
             model: "claude-sonnet-4-6".to_owned(),
             harness_version: "2.1.140".to_owned(),
-            tools: vec![],
-            mcp_servers: vec![],
-            skills: vec![],
+            inventory: SessionInventory::default(),
             raw: json!({}),
+            source: SessionMetaSource::StreamOnly,
         };
         let normalized = adapter
             .into_normalized()
@@ -1348,6 +1559,25 @@ mod tests {
             normalized,
             NormalizedEvent::SessionMeta { model, .. } if model == "claude-sonnet-4-6"
         ));
+        // The persistence discriminator is internal, exactly as the
+        // rate-limit event's is.
+        let value = serde_json::to_value(
+            AdapterEvent::SessionMeta {
+                agent_id: fresh_agent_id(),
+                model: String::new(),
+                harness_version: String::new(),
+                inventory: SessionInventory::default(),
+                raw: json!({}),
+                source: SessionMetaSource::StreamOnly,
+            }
+            .into_normalized()
+            .expect("lifts"),
+        )
+        .unwrap();
+        assert!(
+            value.get("source").is_none(),
+            "SessionMetaSource must not reach the frontend: {value}"
+        );
     }
 
     #[test]

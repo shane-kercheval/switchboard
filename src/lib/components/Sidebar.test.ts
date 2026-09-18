@@ -808,7 +808,7 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("agent-context-bar")).toBeNull();
   });
 
-  it("renders MCP/skills metadata without replacing selected model intent", async () => {
+  it("renders the environment inventory without replacing selected model intent", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     const runtime = state.runtimes[CLAUDE_AGENT.id];
@@ -818,9 +818,11 @@ describe("Sidebar", () => {
       meta: {
         model: "claude-sonnet-4-6",
         harness_version: "2.1.140",
-        tools: ["Bash", "Read"],
-        mcp_servers: [{ name: "tiddly", status: "connected" }],
-        skills: ["debug"],
+        inventory: {
+          tools: ["Bash", "Read"],
+          mcp_servers: [{ name: "tiddly", status: "connected" }],
+          skills: [{ name: "debug" }],
+        },
       },
     };
 
@@ -830,10 +832,78 @@ describe("Sidebar", () => {
       "Harness/session default",
     );
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
-    expect(screen.getByTestId("agent-mcp-chip")).toHaveTextContent("1");
-    expect(screen.getByTestId("agent-skills-chip")).toHaveTextContent("1");
-    expect(screen.getByTestId("agent-mcp-chip")).toHaveClass("cursor-default");
-    expect(screen.getByTestId("agent-skills-chip")).toHaveClass("cursor-default");
+    expect(screen.getByTestId("agent-env-summary")).toHaveTextContent("MCP 1 · Skills 1");
+  });
+
+  // --- Environment row wiring ------------------------------------------------
+  //
+  // The row's own behavior — the collapsed counts, the status dots, the
+  // count-line expansions — is covered in `AgentEnvironment.test.ts`. These
+  // pin the wiring: which runtime fields the card feeds it, and that it
+  // clean-hides for an agent with nothing to show.
+
+  it("hides the environment row for an agent that reported no inventory", async () => {
+    // A fresh agent that has never run: nothing loaded, so no row at all
+    // rather than a disclosure that opens onto nothing.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.queryByTestId("agent-meta")).toBeNull();
+  });
+
+  it("feeds the environment row the rehydrated snapshot time", async () => {
+    // Claude's inventory is stream-only, so after a restart the card shows
+    // what the last turn loaded and says so.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      meta: {
+        model: "claude-fable-5-1",
+        harness_version: "2.1.274",
+        inventory: { agents: ["Explore"] },
+      },
+      meta_as_of: "2026-09-17T12:00:00Z",
+    };
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await fireEvent.click(screen.getByTestId("agent-env-toggle"));
+
+    expect(screen.getByTestId("agent-env-as-of")).toHaveTextContent(/^as of /);
+  });
+
+  it("renders a Codex card's rollout inventory with no status dot", async () => {
+    // Codex records no MCP status anywhere, so its servers come from
+    // `config.toml` — a configured name is not a runtime status and must not
+    // render as one.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    const runtime = state.runtimes[CODEX_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CODEX_AGENT.id] = {
+      ...runtime,
+      meta: {
+        model: "gpt-5.6-terra",
+        harness_version: "0.154.0",
+        inventory: {
+          mcp_servers: [{ name: "tiddly", status: "configured" }],
+          skills: [{ name: "build-report", description: "Build reports." }],
+          approved_commands: ["ls"],
+          settings: [{ label: "Sandbox", value: "read-only" }],
+        },
+      },
+    };
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+    await fireEvent.click(screen.getByTestId("agent-env-toggle"));
+
+    expect(screen.getByTestId("agent-env-mcp")).toHaveTextContent("tiddly");
+    expect(screen.queryByTestId("agent-env-mcp-dot")).toBeNull();
+    expect(screen.getByTestId("agent-env-list-approved_commands")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-env-settings")).toHaveTextContent("Sandbox: read-only");
   });
 
   // --- Model / effort: change actions + intent display -----------------------
@@ -1354,9 +1424,7 @@ describe("Sidebar", () => {
       meta: {
         model: "claude-opus-4-8",
         harness_version: "2.1.140",
-        tools: [],
-        mcp_servers: [],
-        skills: [],
+        inventory: {},
       },
     };
 
@@ -1382,9 +1450,7 @@ describe("Sidebar", () => {
       meta: {
         model: "claude-sonnet-4-6",
         harness_version: "2.1.140",
-        tools: [],
-        mcp_servers: [],
-        skills: [],
+        inventory: {},
       },
     };
 
@@ -2059,9 +2125,7 @@ describe("Sidebar agent-scoped event tolerance", () => {
       agent_id: CLAUDE_AGENT.id,
       model: "claude-sonnet-4-6",
       harness_version: "2.1.140",
-      tools: [],
-      mcp_servers: [],
-      skills: [],
+      inventory: {},
       raw: {},
     };
     const runtime = state.runtimes[CLAUDE_AGENT.id];
@@ -2071,9 +2135,7 @@ describe("Sidebar agent-scoped event tolerance", () => {
       meta: {
         model: meta.model,
         harness_version: meta.harness_version,
-        tools: meta.tools,
-        mcp_servers: meta.mcp_servers,
-        skills: meta.skills,
+        inventory: meta.inventory,
       },
     };
     // Runtime metadata never becomes future-send intent.

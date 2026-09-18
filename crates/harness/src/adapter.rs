@@ -89,15 +89,15 @@ pub struct DispatchOptions {
     /// "first turn" heuristic — `prior.is_none()` — would otherwise
     /// misclassify the dispatch as a resume).
     ///
-    /// Adapters that need to re-emit per-session metadata react to this:
-    /// the Codex adapter forces `SessionMeta` emission, ensuring the
-    /// sidebar's MCP/skills/model registry populates on the first
-    /// post-attach turn instead of staying empty until some other code
-    /// path fires.
-    ///
-    /// Adapters with no first-dispatch-conditional behavior (Claude Code)
-    /// ignore this field — Claude emits `SessionMeta` from its
-    /// `system/init` stream event on every dispatch regardless.
+    /// **No adapter reads this today.** Its one consumer was the Codex
+    /// adapter's first-turn gate on `SessionMeta`, which existed because the
+    /// inventory was emitted once per session and a post-attach dispatch would
+    /// have been misread as a resume. Codex now emits `SessionMeta` after
+    /// every turn — the inventory changes between turns and the card must show
+    /// the current one — so there is no first dispatch to distinguish, and
+    /// Claude never had one (its `system/init` arrives on every dispatch).
+    /// The field and its `AppState::needs_session_meta` bookkeeping are
+    /// retained but inert; they can be retired independently of any adapter.
     pub is_first_dispatch_after_attach: bool,
 
     /// Whether this turn should get browser tools, from the user-global
@@ -143,8 +143,7 @@ pub trait HarnessAdapter: Send + Sync {
     ///
     /// `options` carries caller-side conditions (see [`DispatchOptions`]),
     /// including `options.cancel_token`, which the dispatcher fires to request
-    /// cancellation of this turn. Normal sends pass `DispatchOptions::default()`;
-    /// the attach-existing-session flow sets `is_first_dispatch_after_attach`.
+    /// cancellation of this turn. Normal sends pass `DispatchOptions::default()`.
     async fn dispatch(
         &self,
         agent: &AgentRecord,

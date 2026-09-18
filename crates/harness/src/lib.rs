@@ -36,8 +36,8 @@ pub use codex::session_file::{
 };
 pub use events::{
     AdapterEvent, CancelSource, ContentKind, ContextWindowSource, FailureKind, McpServerStatus,
-    MessageId, NormalizedEvent, RateLimitSource, ToolKind, TurnId, TurnOutcome, TurnSpend,
-    TurnUsage,
+    MessageId, NormalizedEvent, PluginEntry, RateLimitSource, SessionInventory, SessionMetaSource,
+    SettingPair, SkillEntry, ToolKind, TurnId, TurnOutcome, TurnSpend, TurnUsage,
 };
 pub use facets::{
     EditChange, EditPair, EditedFile, McpMutation, McpMutationField, TodoItem, ToolFacet,

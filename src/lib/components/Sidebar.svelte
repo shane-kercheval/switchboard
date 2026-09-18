@@ -9,13 +9,11 @@
     History,
     MoreHorizontal,
     Pencil,
-    Plug,
     SlidersHorizontal,
     Square,
     Terminal,
     Trash2,
     X,
-    Zap,
   } from "@lucide/svelte";
   import { flip } from "svelte/animate";
   import type { AgentSelection, AgentRecord, AgentId, ProjectId } from "$lib/types";
@@ -87,6 +85,7 @@
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import Meter from "$lib/components/ui/Meter.svelte";
+  import AgentEnvironment from "$lib/components/AgentEnvironment.svelte";
   import { ICON_BUTTON_CLASS, ICON_BUTTON_ON_PANEL_CLASS } from "$lib/components/ui/iconButton";
 
   /// An agent is "active" — currently driving work — when its turn is in-flight
@@ -1396,38 +1395,7 @@
                 {selectionSaveErrors[agent.id]}
               </p>
             {/if}
-            {#if runtime?.meta && (runtime.meta.mcp_servers.length > 0 || runtime.meta.skills.length > 0)}
-              <div class="mt-1.5 flex items-center gap-1" data-testid="agent-meta">
-                {#if runtime.meta.mcp_servers.length > 0}
-                  {@const mcpCount = runtime.meta.mcp_servers.length}
-                  <Tooltip label={`${mcpCount} MCP server${mcpCount === 1 ? "" : "s"}`} side="top">
-                    {#snippet trigger(props)}
-                      <span
-                        {...props}
-                        class="bg-panel text-muted inline-flex cursor-default items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
-                        data-testid="agent-mcp-chip"
-                      >
-                        <Plug size={11} strokeWidth={1.8} aria-hidden="true" />{mcpCount}
-                      </span>
-                    {/snippet}
-                  </Tooltip>
-                {/if}
-                {#if runtime.meta.skills.length > 0}
-                  {@const skillCount = runtime.meta.skills.length}
-                  <Tooltip label={`${skillCount} skill${skillCount === 1 ? "" : "s"}`} side="top">
-                    {#snippet trigger(props)}
-                      <span
-                        {...props}
-                        class="bg-panel text-muted inline-flex cursor-default items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
-                        data-testid="agent-skills-chip"
-                      >
-                        <Zap size={11} strokeWidth={1.8} aria-hidden="true" />{skillCount}
-                      </span>
-                    {/snippet}
-                  </Tooltip>
-                {/if}
-              </div>
-            {/if}
+            <AgentEnvironment inventory={runtime?.meta?.inventory} asOf={runtime?.meta_as_of} />
             <!-- Per-turn cost is deliberately NOT shown on the card — it
                  renders inline per-message in the transcript (real-spend turns
                  only). There is no per-agent cost total (system-design §2): the

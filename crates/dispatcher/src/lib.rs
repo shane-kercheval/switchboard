@@ -125,8 +125,8 @@ use switchboard_core::{
 };
 use switchboard_harness::{
     AdapterEvent, CancelSource, ContentKind, ContextWindowSource, DispatchOptions, EventStream,
-    FailureKind, HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, TurnId, TurnOutcome,
-    TurnSpend,
+    FailureKind, HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, SessionInventory,
+    SessionMetaSource, TurnId, TurnOutcome, TurnSpend,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -776,6 +776,18 @@ pub trait MetadataCache: Send + Sync {
         captured_at: DateTime<Utc>,
     );
 
+    /// Persist the latest environment-inventory snapshot for `agent_id`.
+    /// Last-write-wins. Stream-only for Claude (`system/init` carries the
+    /// registries, the session file records none of them), so it must be
+    /// cached for the card to show what the last turn loaded rather than
+    /// falling back to the status-less config registries after a restart.
+    fn record_inventory(
+        &self,
+        agent_id: AgentId,
+        inventory: SessionInventory,
+        captured_at: DateTime<Utc>,
+    );
+
     /// Append one real-spend turn's cost + overage telemetry, keyed on the
     /// turn's per-message id. Stream-only for Claude (cost/overage arrive on the
     /// `result` record, never in the session file), so it must be persisted to
@@ -801,6 +813,7 @@ pub struct NoopMetadataCache;
 impl MetadataCache for NoopMetadataCache {
     fn record_rate_limit(&self, _: AgentId, _: serde_json::Value, _: DateTime<Utc>) {}
     fn record_context_window(&self, _: AgentId, _: u32, _: String, _: String, _: DateTime<Utc>) {}
+    fn record_inventory(&self, _: AgentId, _: SessionInventory, _: DateTime<Utc>) {}
     fn record_turn_spend(
         &self,
         _: AgentId,
@@ -2333,6 +2346,18 @@ async fn drain_turn(
                     && *source == RateLimitSource::StreamOnly
                 {
                     metadata.record_rate_limit(*a, info.clone(), Utc::now());
+                }
+                // Persist the stream-only environment inventory, on the same
+                // source-gated and harness-agnostic terms as the two snapshots
+                // around it: Claude's `system/init` (class C) is cached so the
+                // card can show what the last turn actually loaded, while
+                // Codex's rollout-derived inventory (class B) is re-read from
+                // the harness's own file on every load and must not be
+                // shadow-cached.
+                if let AdapterEvent::SessionMeta { agent_id: a, inventory, source, .. } = &event
+                    && *source == SessionMetaSource::StreamOnly
+                {
+                    metadata.record_inventory(*a, inventory.clone(), Utc::now());
                 }
                 // Persist the stream-only context window so the context bar
                 // survives restart. Same source-gated, harness-agnostic posture

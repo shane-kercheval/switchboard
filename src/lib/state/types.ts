@@ -16,10 +16,10 @@ import type {
   Attachment,
   ContentKind,
   FailureKind,
-  McpServerStatus,
   MessageId,
   ParseWarning,
   SendId,
+  SessionInventory,
   ToolFacet,
   ToolKind,
   TurnId,
@@ -354,6 +354,12 @@ export type AgentRuntime = {
   /// and for class-B sources. Drives the UI "as of …" staleness qualifier:
   /// the staleness check is `as_of != null && age(as_of) > threshold`.
   last_rate_limit_as_of?: string | null;
+  /// Capture time of `meta.inventory` when it came from the metadata sidecar
+  /// on hydration (Claude's `system/init` is stream-only, class C). ISO-8601
+  /// string; `null` once a live `session_meta` overwrites the in-memory value,
+  /// and absent for a harness that re-reads its inventory from a durable file.
+  /// Drives the card's "as of …" qualifier on the environment row.
+  meta_as_of?: string | null;
   /// Model of the turn that delivered `last_rate_limit`, used to label Claude's
   /// per-model weekly window (which the payload itself never names).
   /// Deliberately **not** persisted in the metadata sidecar: a label restored
@@ -400,9 +406,10 @@ export type AgentRuntime = {
 export type AgentMeta = {
   model: string;
   harness_version: string;
-  tools: string[];
-  mcp_servers: McpServerStatus[];
-  skills: string[];
+  /// What the harness reports having loaded. See `SessionInventory` in
+  /// `src/lib/types.ts` for why an absent list and an empty one mean
+  /// different things.
+  inventory: SessionInventory;
 };
 
 /// Per-agent turn lists, keyed by `agent_id`. Render-time merge produces the

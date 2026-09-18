@@ -1941,6 +1941,142 @@ describe("runtimeReducer", () => {
     expect(r.last_rate_limit).toEqual({ primary: { used_percent: 42.0 } });
   });
 
+  /// Model attribution for Claude's per-model weekly window. The label must
+  /// name the model of the turn that produced the snapshot — never a model
+  /// carried over from an earlier turn, because the recorded compaction stream
+  /// emits the rate-limit event *before* that turn's `init`.
+  function withMeta(runtime: AgentRuntime, model: string): AgentRuntime {
+    return runtimeReducer(runtime, {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model,
+      harness_version: "2.1.274",
+      tools: [],
+      mcp_servers: [],
+      skills: [],
+      raw: {},
+    });
+  }
+
+  function withRateLimit(runtime: AgentRuntime): AgentRuntime {
+    return runtimeReducer(runtime, {
+      type: "rate_limit_event",
+      agent_id: AGENT_A,
+      info: { unifiedWindows: {} },
+    });
+  }
+
+  function withTurnStart(runtime: AgentRuntime): AgentRuntime {
+    return runtimeReducer(runtime, {
+      type: "turn_start",
+      turn_id: "00000000-0000-7000-8000-000000000t01",
+      message_id: "00000000-0000-7000-8000-000000000m01",
+      send_id: "00000000-0000-7000-8000-000000000s01",
+      started_at: "2026-09-17T12:00:00Z",
+    });
+  }
+
+  it("stamps the model reported by the same turn (init before rate limit)", () => {
+    // The ordinary Claude order: `init` names the model, then the rate-limit
+    // event carries the windows.
+    const r = withRateLimit(withMeta(withTurnStart(fresh()), "claude-fable-5-1"));
+    expect(r.last_rate_limit_model).toBe("claude-fable-5-1");
+    expect(r.last_rate_limit_awaiting_model).toBeUndefined();
+  });
+
+  it("never labels a snapshot with a previous turn's model", () => {
+    // The bug this guards: a Sonnet turn, then a model switch, then a
+    // compaction whose rate-limit event precedes its `init`. Reading the
+    // surviving `meta.model` would label the new Fable window "Weekly ·
+    // Sonnet".
+    let r = withRateLimit(withMeta(withTurnStart(fresh()), "claude-sonnet-5"));
+    expect(r.last_rate_limit_model).toBe("claude-sonnet-5");
+
+    r = withRateLimit(withTurnStart(r));
+    // Mid-turn, before this turn's `init`: no model may be claimed.
+    expect(r.last_rate_limit_model).toBeUndefined();
+    expect(r.meta?.model).toBe("claude-sonnet-5");
+
+    r = withMeta(r, "claude-fable-5-1");
+    // The same turn's `init` supplies the label the snapshot was waiting for.
+    expect(r.last_rate_limit_model).toBe("claude-fable-5-1");
+    expect(r.last_rate_limit_awaiting_model).toBeUndefined();
+  });
+
+  it("does not repair a snapshot across a turn boundary", () => {
+    // A turn that emitted a rate-limit event and then died before its `init`
+    // leaves a model-less snapshot. The *next* turn's `init` describes a
+    // different turn and must not label it.
+    let r = withRateLimit(withTurnStart(fresh()));
+    expect(r.last_rate_limit_awaiting_model).toBe(true);
+
+    r = withMeta(withTurnStart(r), "claude-fable-5-1");
+    expect(r.last_rate_limit_model).toBeUndefined();
+  });
+
+  it("keeps the same-turn model across a second rate-limit event", () => {
+    // A turn emits two events — the second carries the threshold warning and a
+    // superset of windows. The label must survive the overwrite rather than
+    // dropping back to the awaiting state.
+    let r = withRateLimit(withMeta(withTurnStart(fresh()), "claude-fable-5-1"));
+    r = withRateLimit(r);
+    expect(r.last_rate_limit_model).toBe("claude-fable-5-1");
+    expect(r.last_rate_limit_awaiting_model).toBeUndefined();
+  });
+
+  it("an empty model neither claims the turn nor repairs a snapshot", () => {
+    // Antigravity sends "" on a plain resume, meaning "no model info on this
+    // event" — it must not become a label.
+    let r = withRateLimit(withTurnStart(fresh()));
+    r = withMeta(r, "");
+    expect(r.last_rate_limit_model).toBeUndefined();
+    expect(r.last_rate_limit_awaiting_model).toBe(true);
+  });
+
+  it("rate_limit_event with no meta yet leaves the model absent", () => {
+    // A rate-limit event can land before any `session_meta`; the window then
+    // falls back to a generic label rather than naming a model we never saw.
+    const r = withRateLimit(fresh());
+    expect(r.last_rate_limit_model).toBeUndefined();
+  });
+
+  it("hydrate never overwrites the model stamped by a live rate_limit_event", () => {
+    // The sidecar deliberately carries no model, so a reload must not clear or
+    // replace a label a live event already vouched for.
+    let r = withRateLimit(withMeta(withTurnStart(fresh()), "claude-fable-5-1"));
+    r = runtimeReducer(r, {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      last_rate_limit: { unifiedWindows: {} },
+      last_rate_limit_as_of: "2026-05-27T18:42:11Z",
+    });
+    expect(r.last_rate_limit_model).toBe("claude-fable-5-1");
+  });
+
+  it("hydrate supplies no model and never marks a snapshot for repair", () => {
+    // Disk-filled `meta.model` is first-model-wins and can predate the
+    // snapshot, which is exactly the stale value turn-scoping keeps out.
+    const r = runtimeReducer(fresh(), {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      meta: {
+        model: "claude-sonnet-5",
+        harness_version: "2.1.274",
+        tools: [],
+        mcp_servers: [],
+        skills: [],
+      },
+      last_rate_limit: { unifiedWindows: {} },
+      last_rate_limit_as_of: "2026-05-27T18:42:11Z",
+    });
+    expect(r.meta?.model).toBe("claude-sonnet-5");
+    expect(r.last_rate_limit_model).toBeUndefined();
+    expect(r.last_rate_limit_awaiting_model).toBeUndefined();
+    expect(r.current_turn_model).toBeUndefined();
+  });
+
   it("ignores unknown wire-format variants without crashing", () => {
     const prev = fresh();
     const future = { type: "future_variant" } as unknown as NormalizedEvent;

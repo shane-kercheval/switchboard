@@ -182,57 +182,27 @@ export function formatUsedPercent(value: number): string {
   return `${(value * 100).toFixed(0)}%`;
 }
 
-/// Locale and time zone, injectable purely so date formatting is assertable
-/// against literal strings under test. Production call sites pass nothing and
-/// get the user's own locale and zone, which is what every other formatter here
-/// does.
-export type DateFormatContext = {
-  locales?: Intl.LocalesArgument;
-  timeZone?: string;
-};
-
-/// Countdown to a future instant, for a usage window's reset: "in 16 min" /
-/// "in 3 h" under a day, weekday + date + clock beyond it ("Sat, Sep 19, 8:00
-/// AM") — a window days out is easier to place on a calendar than to count down
-/// to. `now` is injectable so tests stay deterministic.
+/// Countdown to a future instant, for a usage window's reset: "in 16 min",
+/// "in 3 h", "in 5 d". Relative at **every** distance, because this renders
+/// inline in an agent-card column about 180px wide, where an absolute date
+/// ("Tue, Sep 22, 9:01 PM") crowds out the window label it belongs to. The
+/// absolute form is not lost: the cells' tooltips carry the full reset date,
+/// which is where there is room for it. Rendering no weekday also retires the
+/// ambiguity an earlier draft had to work around — a bare weekday six days out
+/// names today and reads as this morning.
 ///
-/// The absolute form always carries the date. A weekday alone is ambiguous at
-/// the seven-day mark, which is exactly where the weekly usage window sits: a
-/// reset six days and twenty hours out still names today's weekday and reads as
-/// this morning. A threshold that switched the date on beyond some distance
-/// would have to compare local calendar dates, not elapsed time, to catch that
-/// — carrying the date unconditionally removes the boundary instead of moving
-/// it.
-///
-/// An instant that is not in the future renders the bare clock rather than a
-/// negative countdown. Callers are expected to drop a window whose reset has
-/// passed, so this is a floor under a case that shouldn't render, not a state
-/// worth its own copy.
-export function formatResetCountdown(
-  resetsAtMs: number,
-  now: Date = new Date(),
-  format: DateFormatContext = {},
-): string {
-  const target = new Date(resetsAtMs);
-  const clock: Intl.DateTimeFormatOptions = {
-    hour: "numeric",
-    minute: "2-digit",
-    timeZone: format.timeZone,
-  };
+/// `now` is injectable so tests stay deterministic. An instant that is not in
+/// the future renders "now" rather than a negative countdown; callers drop a
+/// window whose reset has passed, so that is a floor under a state which
+/// shouldn't render, not a case worth its own copy.
+export function formatResetCountdown(resetsAtMs: number, now: Date = new Date()): string {
   const remainingMs = resetsAtMs - now.getTime();
-  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
-    return target.toLocaleTimeString(format.locales, clock);
-  }
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return "now";
   const minutes = Math.floor(remainingMs / 60_000);
   // Rounded up below a minute so a reset seconds away never reads "in 0 min",
   // which looks like a stuck counter rather than an imminent one.
   if (minutes < 60) return `in ${Math.max(1, minutes)} min`;
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `in ${hours} h`;
-  return target.toLocaleString(format.locales, {
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-    ...clock,
-  });
+  return `in ${Math.floor(hours / 24)} d`;
 }

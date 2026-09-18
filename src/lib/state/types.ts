@@ -354,6 +354,26 @@ export type AgentRuntime = {
   /// and for class-B sources. Drives the UI "as of …" staleness qualifier:
   /// the staleness check is `as_of != null && age(as_of) > threshold`.
   last_rate_limit_as_of?: string | null;
+  /// Model of the turn that delivered `last_rate_limit`, used to label Claude's
+  /// per-model weekly window (which the payload itself never names).
+  /// Deliberately **not** persisted in the metadata sidecar: a label restored
+  /// from disk could outlive the model it described. Absent after a reload, so
+  /// the window falls back to a generic label until the next live event stamps
+  /// it.
+  last_rate_limit_model?: string;
+  /// Model reported by the **current turn's** `session_meta`, cleared at
+  /// `turn_start`. Separate from `meta.model`, which survives across turns for
+  /// its other consumers: only a same-turn observation may label a rate-limit
+  /// snapshot, because a stream can emit the rate-limit event before its `init`
+  /// (the recorded compaction order) and `meta` would then name the previous
+  /// turn's model.
+  current_turn_model?: string;
+  /// Set when `last_rate_limit` was stored before this turn's model was known,
+  /// so the `session_meta` still to come can supply the label. Cleared at
+  /// `turn_start` — a turn that dies before its `init` must not hand its
+  /// snapshot to the next turn's model — and never set by `hydrate`, whose
+  /// `meta.model` is first-model-wins and may predate the snapshot entirely.
+  last_rate_limit_awaiting_model?: true;
   /// Disk-rehydration lifecycle. Newly-created agents start at
   /// `"complete"` (nothing to hydrate); registered/attached agents pass
   /// through `"pending"` → `"loading"` → `"complete"`. Compose-bar Send

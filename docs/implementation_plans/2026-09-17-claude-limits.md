@@ -231,6 +231,9 @@ Settled here; the rationale must survive into code comments where marked.
    window. The full list is recorded in harness-behavior so a future probe can extend the map.
    *(Comment on the label map, naming the binary as the source.)*
 5. **The per-model window is labeled with the model that produced the snapshot — live only.** The
+   label uses the model's **family name** (`agentSelection.ts::claudeModelFamilyLabel`, e.g.
+   `claude-fable-5-1` → "Fable"), not the raw stream id: the id needs 136px against an 85px budget at
+   the default sidebar width, and the family name is the word the user selected the model by. The
    window arrives only on turns run on an allowlisted model, so the model of the turn that delivered
    the event is a truthful label. The `rate_limit_event` reducer records the runtime's observed model
    beside the payload as `last_rate_limit_model`. The sidecar does not carry it; after a reload the
@@ -248,17 +251,19 @@ Settled here; the rationale must survive into code comments where marked.
    exactly its case. `overageStatus` / `overageDisabledReason` are not rendered.
 8. **Reset-passed hides a meter, per window.** A window whose `resetsAt` is in the past is dropped;
    the others still render. No dim, no age threshold.
-9. **Reset text is relative when near, absolute when far.** "Resets in 16 min" / "Resets in 3 h"
-   under 24 hours; "Resets Sat, Sep 19, 8:00 AM" beyond. Full date and time in the tooltip. Computed
-   at render from `Date.now()`, not on a timer — recorded as a known limitation.
+9. **Inline reset text is relative at every distance; the absolute date lives in the tooltip.**
+   "in 16 min" / "in 3 h" / "in 5 d" beside the meter; the full date and time on hover. Computed at
+   render from `Date.now()`, not on a timer — recorded as a known limitation.
 
-   The absolute form carries the **date**, not a bare weekday (an earlier draft of this decision said
-   "Resets Sun 8:00 AM"). A weekday alone is ambiguous exactly where the weekly window sits: a reset
-   six days and twenty hours out names today's weekday and reads as this morning. Switching the date
-   on past a distance threshold would have to compare local calendar dates rather than elapsed time
-   to catch that case, so the date is unconditional and there is no threshold. Implemented in M1 as
-   `utils.ts::formatResetCountdown`; the string is longer than the original draft, so a cell that
-   runs out of width should drop the weekday before it drops the date.
+   Two earlier drafts of this decision put an absolute form inline ("Resets Sun 8:00 AM", then
+   "Resets Sat, Sep 19, 8:00 AM" once a bare weekday was found ambiguous six days out). **Both are
+   superseded**, and the reason is measured rather than argued: the meter's label, its reset text and
+   its percentage share a column ~177px wide at the default sidebar width, and an absolute date takes
+   ~100px of it — it crowded the label it belonged to off the card. A relative countdown is compact
+   at every distance, and rendering no weekday retires the ambiguity the second draft existed to fix.
+   `utils.ts::formatResetCountdown` is therefore pure arithmetic with no locale or time-zone
+   formatting; the cells' tooltips carry the absolute date via `formatResetDateTime`, where there is
+   room for it.
 10. **Both harnesses use the same label strings for the same window.** Codex `primary` (300 min) and
     `secondary` (10080 min) are "5-hour limit" and "Weekly · all models"; its bare `used_percent`
     fallback is a meter labeled "Quota". *(Comment where the Codex labels are derived.)*
@@ -448,8 +453,8 @@ user.
   sidebar, so it rendered clipped to "Context after l…". The "as of the last completed turn"
   qualifier moves to the row's tooltip when M2 adds one. Token density is `k`/`M` via
   `utils.ts::formatTokens`, which rounds to whole thousands above 10k — hence "121k", not "121.1k".
-- A reset-time helper renders "in 16 min" / "in 3 h" / "Sat, Sep 19, 8:00 AM" from a future instant,
-  deterministically under test.
+- A reset-time helper renders "in 16 min" / "in 3 h" / "in 5 d" from a future instant,
+  deterministically under test. (M2 revised this to relative-only — see decision 9.)
 - Nothing about the rate-limit cells or the chips changes yet.
 
 ### Implementation Outline
@@ -762,6 +767,13 @@ counter", "weekly `overageResetsAt`", or the §0 claim that `/context` emits no 
   so it is not retained.
 - The per-model window's model label is live-only; after reload it reads "Weekly · model-specific".
 - Which models the per-model window covers is a server-side allowlist the stream never names.
+- **A threshold warning naming a window we do not render is dropped along with the window.** The
+  amber tone is attached to the flagged window, so if `rateLimitType` names a key outside the
+  rendered set (`seven_day_cowork` and its siblings), the CLI's "near a cap" signal is lost. Not
+  observed in any probe — the rendered keys cover every window seen across Claude 2.1.263–2.1.274 —
+  so this is unobserved rather than impossible. Deliberately not filled with a generic amber line:
+  the probe that would reveal such a plan is the same one that would supply the window's real label,
+  at which point it renders properly and a generic line is dead code.
 - The context report's structured object is undocumented; the markdown fallback and raw-text safety
   net cover its absence, and the live test is the tripwire.
 - Each report writes three records into the agent's session file; the CLI's own TUI shows them on

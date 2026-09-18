@@ -614,6 +614,14 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
           runtime.pending_sends,
           pickPendingIndex(runtime.pending_sends, input.message_id, input.send_id),
         ),
+        // Both model-attribution fields are per-turn and reset here. `meta`
+        // itself deliberately survives (other consumers read it across turns);
+        // what must not survive is the claim that its model describes *this*
+        // turn. Clearing the pending flag is what stops a turn that died before
+        // its `init` from handing its rate-limit snapshot to the next turn's
+        // model.
+        current_turn_model: undefined,
+        last_rate_limit_awaiting_model: undefined,
       };
 
     case "message_failed": {
@@ -728,9 +736,22 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       }
       return { ...runtime, quiet_since: undefined };
 
-    case "session_meta":
+    case "session_meta": {
+      // An empty model carries no model info (see below), so it neither
+      // records a per-turn observation nor repairs a waiting snapshot.
+      const observed = input.model !== "" ? input.model : undefined;
+      const repairs = observed !== undefined && runtime.last_rate_limit_awaiting_model === true;
       return {
         ...runtime,
+        current_turn_model: observed ?? runtime.current_turn_model,
+        // Repair: this turn's rate-limit event landed before its `init` (the
+        // compaction stream emits them in that order), so the snapshot is
+        // already stored with no model. `init` names the model for the same
+        // turn, which is exactly the label that snapshot needs.
+        last_rate_limit_model: repairs ? observed : runtime.last_rate_limit_model,
+        last_rate_limit_awaiting_model: repairs
+          ? undefined
+          : runtime.last_rate_limit_awaiting_model,
         meta: {
           // Empty model means "no model info on this event," not "set the
           // model to blank." Antigravity only reports a model when the
@@ -745,13 +766,39 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
           skills: input.skills,
         },
       };
+    }
 
     case "rate_limit_event":
       // A live event overwrites the in-memory value; the `as_of` qualifier
       // (the on-disk snapshot's age) is meaningless once live data lands, so
       // clear it to null — never stamp `now`, which would spuriously age an
       // actively-streaming session past the staleness threshold.
-      return { ...runtime, last_rate_limit: input.info, last_rate_limit_as_of: null };
+      //
+      // The observed model is stamped beside the payload because Claude's
+      // per-model weekly window never names its own model: the event carries
+      // that window only on turns run against an allowlisted model, so the
+      // model of the turn that delivered the snapshot is a truthful label for
+      // it.
+      //
+      // Read from `current_turn_model` — the model *this* turn's `init`
+      // reported — and never from `meta.model`, which survives across turns.
+      // `meta` would name the previous model whenever the rate-limit event
+      // precedes the turn's `init`, which is the recorded order on a compaction
+      // stream: switch model, compact, and the new Fable window would read
+      // "Weekly · Sonnet". When no model has been observed for this turn the
+      // snapshot is stored without one (the window falls back to a generic
+      // label) and flagged for repair by the `init` still to come.
+      //
+      // Codex is unaffected by construction: its `session_meta` and
+      // `rate_limit_event` both arrive in the post-terminal enrichment, and its
+      // window view never reads this label.
+      return {
+        ...runtime,
+        last_rate_limit: input.info,
+        last_rate_limit_as_of: null,
+        last_rate_limit_model: runtime.current_turn_model,
+        last_rate_limit_awaiting_model: runtime.current_turn_model === undefined ? true : undefined,
+      };
 
     case "hydrate": {
       // **Fill-if-empty for scalars.** Live `session_meta` and

@@ -487,6 +487,92 @@ async fn live_claude_rate_limit_precedes_result() {
 
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_rate_limit_carries_unified_windows() {
+    // The agent card draws a meter per usage window from `unifiedWindows`, a
+    // field that appears in no published Claude Code documentation — it was
+    // found by probing 2.1.274. A fixture test replays the shape we recorded
+    // and would keep passing forever after the CLI stopped sending it; only a
+    // live test notices. If this fails, the card silently degrades to the
+    // no-percentage fallback (a bare reset line) and nobody finds out from the
+    // offline suite.
+    //
+    // Shape, not values: `utilization` is whatever the account has spent. The
+    // per-model window (`seven_day_overage_included`) is deliberately NOT
+    // asserted — it arrives only on turns run against a server-side allowlist
+    // of models, so its presence is plan- and model-dependent and would make
+    // this test fail for reasons that aren't drift.
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Reply with only the word ack.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let payloads: Vec<&serde_json::Value> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::RateLimitEvent { info, .. } => Some(info),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !payloads.is_empty(),
+        "Claude must emit a rate_limit_event every turn"
+    );
+
+    // The **last** payload, not the first: the reducer overwrites
+    // `last_rate_limit` on every event, so the last one is what the card draws
+    // and what the sidecar persists. A turn can emit more than one (the second
+    // carries the threshold warning plus a superset of windows), and a release
+    // that sent good windows first and degraded ones second would leave the
+    // card on its no-percentage fallback while a first-match assertion still
+    // passed.
+    let unified = payloads
+        .last()
+        .and_then(|info| info.get("unifiedWindows"))
+        .and_then(serde_json::Value::as_object)
+        .expect(
+            "rate_limit_event must carry a `unifiedWindows` object — the per-window usage meters \
+             read it, and without it the card falls back to a reset line with no percentage",
+        );
+
+    for key in ["five_hour", "seven_day"] {
+        let window = unified
+            .get(key)
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| panic!("`unifiedWindows` must carry a `{key}` object"));
+        let utilization = window
+            .get("utilization")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("`{key}.utilization` must be a number"));
+        assert!(
+            (0.0..=1.0).contains(&utilization),
+            "`{key}.utilization` must be a 0-1 fraction used, got {utilization} — the meter reads \
+             it as a fraction and would render a wrong percentage if this became 0-100"
+        );
+        // `is_number`, not `as_i64`: the frontend gate is `typeof === "number"`,
+        // so a release that started sending a float would still render. A
+        // stricter assertion here would fail for a shape the card handles.
+        assert!(
+            window
+                .get("resetsAt")
+                .is_some_and(serde_json::Value::is_number),
+            "`{key}.resetsAt` must be a number (unix seconds) — the window is dropped without it"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_thinking_emits_liveness() {
     // While the model reasons, the CLI streams `thinking_delta` /
     // `signature_delta`. On a redacting model the thinking text is empty and

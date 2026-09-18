@@ -225,50 +225,37 @@ describe("formatUsedPercent", () => {
 });
 
 describe("formatResetCountdown", () => {
-  // Locale and zone are pinned so these can assert literal strings; computing
-  // the expectation through the same Intl call would assert nothing.
-  const FORMAT = { locales: "en-US", timeZone: "UTC" } as const;
   const NOW = new Date("2026-09-17T12:00:00Z");
   const ms = (iso: string): number => new Date(iso).getTime();
 
   it("counts down in minutes under an hour", () => {
-    expect(formatResetCountdown(ms("2026-09-17T12:16:00Z"), NOW, FORMAT)).toBe("in 16 min");
+    expect(formatResetCountdown(ms("2026-09-17T12:16:00Z"), NOW)).toBe("in 16 min");
   });
 
   it("rounds a sub-minute reset up rather than showing zero", () => {
-    expect(formatResetCountdown(ms("2026-09-17T12:00:20Z"), NOW, FORMAT)).toBe("in 1 min");
+    expect(formatResetCountdown(ms("2026-09-17T12:00:20Z"), NOW)).toBe("in 1 min");
   });
 
   it("counts down in whole hours under a day", () => {
-    expect(formatResetCountdown(ms("2026-09-17T15:00:00Z"), NOW, FORMAT)).toBe("in 3 h");
-    expect(formatResetCountdown(ms("2026-09-17T15:59:00Z"), NOW, FORMAT)).toBe("in 3 h");
+    expect(formatResetCountdown(ms("2026-09-17T15:00:00Z"), NOW)).toBe("in 3 h");
+    expect(formatResetCountdown(ms("2026-09-17T15:59:00Z"), NOW)).toBe("in 3 h");
   });
 
-  it("switches to weekday, date, and clock beyond a day", () => {
-    expect(formatResetCountdown(ms("2026-09-19T08:00:00Z"), NOW, FORMAT)).toBe(
-      "Sat, Sep 19, 8:00 AM",
-    );
+  it("counts down in whole days beyond a day", () => {
+    // Relative at every distance, so the weekly window's reset stays short
+    // enough to sit beside its label in the card column.
+    expect(formatResetCountdown(ms("2026-09-18T12:00:00Z"), NOW)).toBe("in 1 d");
+    expect(formatResetCountdown(ms("2026-09-22T12:00:00Z"), NOW)).toBe("in 5 d");
+    expect(formatResetCountdown(ms("2026-09-24T08:00:00Z"), NOW)).toBe("in 6 d");
   });
 
-  it("names the date for a reset just under a week out, where the weekday repeats", () => {
-    // Thursday noon to the following Thursday 8 AM is 6 d 20 h — under seven
-    // days, yet the weekday alone would say "Thu" and read as this morning.
-    expect(formatResetCountdown(ms("2026-09-24T08:00:00Z"), NOW, FORMAT)).toBe(
-      "Thu, Sep 24, 8:00 AM",
-    );
+  it("crosses from hours to days at 24 hours", () => {
+    expect(formatResetCountdown(ms("2026-09-18T11:59:00Z"), NOW)).toBe("in 23 h");
+    expect(formatResetCountdown(ms("2026-09-18T12:00:00Z"), NOW)).toBe("in 1 d");
   });
 
-  it("renders a passed reset as a clock time, never a negative countdown", () => {
-    expect(formatResetCountdown(ms("2026-09-17T09:30:00Z"), NOW, FORMAT)).toBe("9:30 AM");
-    expect(formatResetCountdown(NOW.getTime(), NOW, FORMAT)).toBe("12:00 PM");
-  });
-
-  it("honours the caller's zone", () => {
-    expect(
-      formatResetCountdown(ms("2026-09-19T08:00:00Z"), NOW, {
-        locales: "en-US",
-        timeZone: "America/Los_Angeles",
-      }),
-    ).toBe("Sat, Sep 19, 1:00 AM");
+  it("renders a passed reset as 'now', never a negative countdown", () => {
+    expect(formatResetCountdown(ms("2026-09-17T09:30:00Z"), NOW)).toBe("now");
+    expect(formatResetCountdown(NOW.getTime(), NOW)).toBe("now");
   });
 });

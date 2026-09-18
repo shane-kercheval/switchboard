@@ -36,7 +36,7 @@
   import { DRAG_SLOP_PX, dropIndexForPointer, movedOrder } from "$lib/agentReorder";
   import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
-  import { effortSupportFor, selectionIsValid } from "$lib/agentSelection";
+  import { claudeModelFamilyLabel, effortSupportFor, selectionIsValid } from "$lib/agentSelection";
   import { preferences } from "$lib/preferences.svelte";
   import {
     AGENTS_SIDEBAR_DEFAULT_WIDTH,
@@ -56,7 +56,13 @@
     type AgentSessionInfo,
   } from "$lib/api";
   import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
-  import { cn, formatTokens, relativeTime } from "$lib/utils";
+  import {
+    cn,
+    formatResetCountdown,
+    formatTokens,
+    formatUsedPercent,
+    relativeTime,
+  } from "$lib/utils";
   import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
@@ -696,97 +702,156 @@
     return undefined;
   }
 
-  /// Label for a Codex rate-limit window, from its `window_minutes` duration
-  /// (300 = the ~5-hour primary, 10080 = the weekly secondary). Unknown/absent
-  /// durations fall back to "quota" — which preserves the prior single-cell
-  /// copy "quota used: N%" for payloads that carry only a bare `used_percent`.
-  function codexWindowLabel(windowMinutes: unknown): string {
-    if (windowMinutes === 300) return "5-hour";
-    if (windowMinutes === 10080) return "weekly";
-    return "quota";
+  /// One usage window as the card draws it. `usedFraction` is 0–1 **used**,
+  /// converted here rather than at the meter: Codex reports 0–100 and Claude a
+  /// 0–1 fraction, and a primitive that accepted either would make every call
+  /// site's meaning ambiguous.
+  type UsageWindow = {
+    key: string;
+    label: string;
+    usedFraction: number;
+    resetsAtMs: number | null;
+    /// Set only when the harness itself reported passing a threshold — never a
+    /// percentage we pick, which would make the same occupancy alarming on one
+    /// harness and calm on the other.
+    surpassedThreshold?: number;
+  };
+
+  /// Shared across both harnesses (decision 10): the same window gets the same
+  /// words wherever it came from, so a user reading two cards side by side is
+  /// comparing quantities rather than decoding vocabularies.
+  const LABEL_FIVE_HOUR = "5-hour limit";
+  const LABEL_WEEKLY_ALL = "Weekly · all models";
+
+  /// Claude's windows in render order, each with its label. **One ordered list
+  /// rather than an order array plus a lookup map**, so a key cannot be added
+  /// without a label — the drift that pairing removes was previously covered by
+  /// a runtime guard that no input could reach. `null` marks the one window
+  /// whose label comes from the observed model (below).
+  ///
+  /// The CLI binary's own key list (`strings`, 2.1.274) also carries
+  /// `seven_day_cowork`, `seven_day_omelette`, and `seven_day_oauth_apps`. None
+  /// is a Claude Code window on any plan we can probe, and a junk label is
+  /// worse than a dropped window — iterating this list rather than the
+  /// payload's keys is what drops them. Extend here when a probe names one.
+  const CLAUDE_WINDOWS: ReadonlyArray<{ key: string; label: string | null }> = [
+    { key: "five_hour", label: LABEL_FIVE_HOUR },
+    { key: "seven_day", label: LABEL_WEEKLY_ALL },
+    { key: "seven_day_overage_included", label: null },
+    { key: "seven_day_opus", label: "Weekly · Opus" },
+    { key: "seven_day_sonnet", label: "Weekly · Sonnet" },
+  ];
+
+  /// `seven_day_overage_included` is the weekly cap for a server-side allowlist
+  /// of models that the payload never names. It arrives only on turns run
+  /// against one of those models, so the model that delivered the snapshot is a
+  /// truthful label for it — by family name, since the raw id is wider than the
+  /// column. After a reload there is no observed model (the sidecar
+  /// deliberately doesn't carry one) and the window says so rather than naming
+  /// a model it can't vouch for.
+  function modelWeeklyLabel(model: string | undefined): string {
+    return model === undefined || model === ""
+      ? "Weekly · model-specific"
+      : `Weekly · ${claudeModelFamilyLabel(model)}`;
   }
 
-  /// Defensive read of Codex's opaque `last_rate_limit` into its independent
-  /// windows (`primary` + `secondary`). Each is a usage gauge (`used_percent`)
-  /// with a duration (`window_minutes`) and optional reset (`resets_at`, unix
-  /// epoch seconds). Same reset-passed rule as the Claude reader: a window
-  /// whose reset is in the past is dropped (it has cycled, so the % is from a
-  /// stale window); a window with no `resets_at` is kept (can't prove it
-  /// stale — older Codex shapes and minimal fixtures omit it). Codex
-  /// rate-limit is session-file-backed (class B), so there's no snapshot-age
-  /// qualifier. Returns `[]` when nothing is displayable.
-  function codexRateLimitView(
-    payload: unknown,
-    nowMs: number,
-  ): Array<{ label: string; usedPercent: number; resetsAtMs: number | null }> {
-    if (typeof payload !== "object" || payload === null) return [];
-    const windows: Array<{ label: string; usedPercent: number; resetsAtMs: number | null }> = [];
-    for (const key of ["primary", "secondary"] as const) {
-      const w = (payload as Record<string, unknown>)[key];
-      if (typeof w !== "object" || w === null) continue;
-      const ww = w as { used_percent?: unknown; resets_at?: unknown; window_minutes?: unknown };
-      if (typeof ww.used_percent !== "number") continue;
-      let resetsAtMs: number | null = null;
-      if (typeof ww.resets_at === "number") {
-        const ms = ww.resets_at * 1000;
-        if (ms <= nowMs) continue; // reset-passed → window cycled, % is stale
-        resetsAtMs = ms;
-      }
-      windows.push({
-        label: codexWindowLabel(ww.window_minutes),
-        usedPercent: ww.used_percent,
-        resetsAtMs,
-      });
-    }
-    return windows;
-  }
-
-  /// Human label for Claude's primary rate-limit window, derived from the
-  /// payload's `rateLimitType` rather than hardcoded: the event tells us the
-  /// window kind (observed: `"five_hour"`; other plans/tiers may differ), so
-  /// we don't assert a duration the event could contradict. Unknown/absent
-  /// types fall back to a generic "rate limit".
+  /// Human label for Claude's *top-level* window, used only by the no-
+  /// `unifiedWindows` fallback below. Derived from `rateLimitType` rather than
+  /// hardcoded: the event tells us the window kind, so we don't assert a
+  /// duration it could contradict.
   function rateLimitLabel(rateLimitType: unknown): string {
-    return rateLimitType === "five_hour" ? "5-hour limit" : "rate limit";
+    return rateLimitType === "five_hour" ? LABEL_FIVE_HOUR : "rate limit";
   }
 
-  /// Defensive read of Claude's opaque `last_rate_limit` payload into the two
-  /// **independent** signals the Sidebar shows. Each is gated on its own reset
-  /// being in the *future*: a reset is an absolute timestamp, so it stays
-  /// accurate however old the snapshot is — right until `nowMs` passes it, at
-  /// which point the window has cycled and we no longer have its new reset, so
-  /// that signal is dropped (showing a past "resets at" would be plainly
-  /// wrong). This replaces an age-based staleness heuristic with a certainty.
+  /// Defensive read of Claude's opaque `last_rate_limit` payload.
   ///
-  /// - `window`: the primary rate-limit window (`resetsAt` + `rateLimitType`
-  ///   label) — emitted on every turn, **independent of overage**.
-  /// - `overage`: the "using credits" escalation (`isUsingOverage`), with its
-  ///   own credit/overage window (`overageResetsAt`, which can be days out so
-  ///   it lives in the tooltip, not the inline clock). A null overage reset
-  ///   ("flag set, no window time") is still shown — we can't prove it stale.
+  /// `unifiedWindows` is authoritative whenever it is present — it carries
+  /// every window the desktop app shows, each with a used fraction. The
+  /// top-level `resetsAt` / `rateLimitType` pair is a **fallback only**, for an
+  /// older CLI (or a future one that drops the field): it has no percentage, so
+  /// it renders as a bare reset line rather than a meter. A bar with no value
+  /// would be a blank bar, which the card's clean-hide convention forbids more
+  /// than it forbids a missing bar. The fallback is not dead code; the field is
+  /// undocumented and could vanish without notice.
   ///
-  /// Returns `null` when nothing is currently displayable.
-  function rateLimitView(
+  /// Every window is gated on its own reset being in the *future*. A reset is
+  /// an absolute timestamp, so it stays accurate however old the snapshot is —
+  /// right until `nowMs` passes it, at which point that window has cycled and
+  /// we don't have its new reset, so it drops while its siblings stay.
+  ///
+  /// `overage` is the separate "using credits" escalation (`isUsingOverage`),
+  /// about what is being *billed* rather than how full a window is. Its own
+  /// window can be days out, so it lives in the tooltip. A null overage reset
+  /// ("flag set, no window time") is still shown — we can't prove it stale.
+  ///
+  /// Returns `null` when nothing is displayable.
+  function claudeRateLimitView(
     payload: unknown,
     nowMs: number,
+    model: string | undefined,
   ): {
-    window: { label: string; resetsAtMs: number } | null;
+    windows: UsageWindow[];
+    fallback: { label: string; resetsAtMs: number } | null;
     overage: { resetsAtMs: number | null } | null;
   } | null {
     if (typeof payload !== "object" || payload === null) return null;
     const p = payload as {
+      status?: unknown;
       rateLimitType?: unknown;
+      surpassedThreshold?: unknown;
       resetsAt?: unknown;
       isUsingOverage?: unknown;
       overageResetsAt?: unknown;
+      unifiedWindows?: unknown;
     };
 
-    let window: { label: string; resetsAtMs: number } | null = null;
-    if (typeof p.resetsAt === "number") {
-      const resetsAtMs = p.resetsAt * 1000;
-      if (resetsAtMs > nowMs) {
-        window = { label: rateLimitLabel(p.rateLimitType), resetsAtMs };
+    // An **empty** container counts as absent: it reported nothing, so the
+    // top-level fallback is still the best available signal. A *non-empty*
+    // container whose entries were all dropped (reset-passed, unreadable
+    // fraction, or a key we deliberately exclude) stays authoritative and the
+    // cell clean-hides — those windows were filtered on purpose, and falling
+    // back there would override the per-window rules rather than fill a gap.
+    const unified = p.unifiedWindows;
+    const hasUnified =
+      typeof unified === "object" && unified !== null && Object.keys(unified).length > 0;
+    const windows: UsageWindow[] = [];
+    if (hasUnified) {
+      // The threshold flag names its window in `rateLimitType` and its level in
+      // `surpassedThreshold`. A turn can emit a second event carrying the
+      // superset, so last-write-wins on the payload is what makes this correct.
+      //
+      // A flag naming a window outside `CLAUDE_WINDOWS` is dropped with that
+      // window, losing the signal. Unobserved (the rendered keys cover every
+      // window any probe has seen) and deliberately not backfilled with a
+      // generic amber line — recorded under the plan's known limitations.
+      const flagged =
+        p.status === "allowed_warning" && typeof p.rateLimitType === "string"
+          ? p.rateLimitType
+          : undefined;
+      const threshold = typeof p.surpassedThreshold === "number" ? p.surpassedThreshold : undefined;
+      for (const { key, label } of CLAUDE_WINDOWS) {
+        const w = (unified as Record<string, unknown>)[key];
+        if (typeof w !== "object" || w === null) continue;
+        const ww = w as { utilization?: unknown; resetsAt?: unknown };
+        if (typeof ww.utilization !== "number") continue;
+        if (!(ww.utilization >= 0 && ww.utilization <= 1)) continue;
+        if (typeof ww.resetsAt !== "number") continue;
+        const resetsAtMs = ww.resetsAt * 1000;
+        if (resetsAtMs <= nowMs) continue;
+        windows.push({
+          key,
+          label: label ?? modelWeeklyLabel(model),
+          usedFraction: ww.utilization,
+          resetsAtMs,
+          surpassedThreshold: key === flagged ? threshold : undefined,
+        });
       }
+    }
+
+    let fallback: { label: string; resetsAtMs: number } | null = null;
+    if (!hasUnified && typeof p.resetsAt === "number") {
+      const resetsAtMs = p.resetsAt * 1000;
+      if (resetsAtMs > nowMs) fallback = { label: rateLimitLabel(p.rateLimitType), resetsAtMs };
     }
 
     let overage: { resetsAtMs: number | null } | null = null;
@@ -799,18 +864,54 @@
       }
     }
 
-    if (window === null && overage === null) return null;
-    return { window, overage };
+    if (windows.length === 0 && fallback === null && overage === null) return null;
+    return { windows, fallback, overage };
   }
 
-  /// Compact clock time for an inline window line (the 5-hour window resets
-  /// within hours, so same-day clock reads cleanly). Milliseconds since epoch.
-  /// Display-only — never parsed back or scheduled against (no auto-retry).
-  function formatResetTime(ms: number): string {
-    return new Date(ms).toLocaleTimeString(undefined, {
-      hour: "numeric",
-      minute: "2-digit",
-    });
+  /// Label for a Codex rate-limit window, from its `window_minutes` duration
+  /// (300 = the ~5-hour primary, 10080 = the weekly secondary) mapped onto the
+  /// shared strings above. Unknown/absent durations fall back to "Quota" — a
+  /// payload carrying only a bare `used_percent` still reads as a real gauge.
+  function codexWindowLabel(windowMinutes: unknown): string {
+    if (windowMinutes === 300) return LABEL_FIVE_HOUR;
+    if (windowMinutes === 10080) return LABEL_WEEKLY_ALL;
+    return "Quota";
+  }
+
+  /// Defensive read of Codex's opaque `last_rate_limit` into its independent
+  /// windows (`primary` + `secondary`). Same reset-passed rule as the Claude
+  /// reader; a window with no `resets_at` is kept (can't prove it stale — older
+  /// Codex shapes and minimal fixtures omit it). Codex rate-limit is
+  /// session-file-backed (class B, durable), so there's no snapshot-age
+  /// qualifier. Codex reports no threshold flag, so no window ever warns.
+  ///
+  /// `used_percent / 100` is left unrounded. Rounding at the source would make
+  /// the rendered percentage byte-match Codex's own TUI at half-percent values,
+  /// but nobody compares the two, and the bar and the number should be drawn
+  /// from one value rather than from a figure pre-rounded for a different
+  /// renderer. Returns `[]` when nothing is displayable.
+  function codexRateLimitView(payload: unknown, nowMs: number): UsageWindow[] {
+    if (typeof payload !== "object" || payload === null) return [];
+    const windows: UsageWindow[] = [];
+    for (const key of ["primary", "secondary"] as const) {
+      const w = (payload as Record<string, unknown>)[key];
+      if (typeof w !== "object" || w === null) continue;
+      const ww = w as { used_percent?: unknown; resets_at?: unknown; window_minutes?: unknown };
+      if (typeof ww.used_percent !== "number") continue;
+      let resetsAtMs: number | null = null;
+      if (typeof ww.resets_at === "number") {
+        const ms = ww.resets_at * 1000;
+        if (ms <= nowMs) continue; // reset-passed → window cycled, % is stale
+        resetsAtMs = ms;
+      }
+      windows.push({
+        key,
+        label: codexWindowLabel(ww.window_minutes),
+        usedFraction: ww.used_percent / 100,
+        resetsAtMs,
+      });
+    }
+    return windows;
   }
 
   /// Full date+time for the tooltip's reset windows — a window (esp. the
@@ -925,6 +1026,36 @@
      mechanical footnote to the first, not a second instruction. The armed
      button says only "Confirm compaction?"; at that point the user has already
      read this and is being asked one question. -->
+<!-- One meter per usage window, for both harnesses. The inline detail is the
+     countdown; the full reset date lives in the tooltip, where there is room
+     for it. -->
+{#snippet usageMeters(windows: UsageWindow[])}
+  {#each windows as w (w.key)}
+    <Meter
+      label={w.label}
+      value={w.usedFraction}
+      detail={w.resetsAtMs === null ? undefined : formatResetCountdown(w.resetsAtMs)}
+      tone={w.surpassedThreshold === undefined ? "neutral" : "warning"}
+      testid="agent-usage-window"
+    />
+  {/each}
+{/snippet}
+
+<!-- Tooltip rows for the same windows: the percentage spelled out, the full
+     reset date the inline countdown compresses, and the harness's own threshold
+     line when it flagged one. -->
+{#snippet usageWindowDetail(windows: UsageWindow[])}
+  {#each windows as w (w.key)}
+    <p>
+      {w.label}: {formatUsedPercent(w.usedFraction)} used{w.resetsAtMs === null
+        ? ""
+        : ` · resets ${formatResetDateTime(w.resetsAtMs)}`}{w.surpassedThreshold === undefined
+        ? ""
+        : ` · above ${formatUsedPercent(w.surpassedThreshold)} of this limit`}
+    </p>
+  {/each}
+{/snippet}
+
 {#snippet compactTooltipContent()}
   <div class="max-w-xs space-y-1 text-[13px]">
     <p class="font-medium">Compact the conversation</p>
@@ -1022,7 +1153,11 @@
              triggers — acceptable for a passive status cell. -->
         {@const rlView =
           agent.harness === "claude_code"
-            ? rateLimitView(runtime?.last_rate_limit, Date.now())
+            ? claudeRateLimitView(
+                runtime?.last_rate_limit,
+                Date.now(),
+                runtime?.last_rate_limit_model,
+              )
             : null}
         {@const overageAsOf = runtime?.last_rate_limit_as_of}
         {@const isCollapsed = collapsed[agent.id] ?? false}
@@ -1511,15 +1646,17 @@
                  one. Do not re-add it. The current overage *status* below stays
                  (Bucket-A "as of now" state). -->
             {#if rlView !== null}
-              <!-- Claude rate-limit surface — two independent signals, each
-                   shown only while its own reset is still in the future (a past
-                   "resets at" would be wrong, so it clean-hides instead). The
-                   primary window (neutral) is emitted on every turn, regardless
-                   of overage; the overage escalation (amber `warning` token) is
-                   layered on top only when billing to credits. One always-present
-                   tooltip carries full dates (a window can be days out) and the
-                   snapshot age when rehydrated. Survives restart via the
-                   metadata sidecar. -->
+              <!-- Claude usage windows — one meter per window the payload
+                   reports, each shown only while its own reset is still in the
+                   future (a past "resets at" would be wrong, so it clean-hides
+                   instead). A window the CLI itself flagged past a threshold
+                   fills amber. The overage escalation is a separate signal
+                   about billing, layered beneath the meters only when spending
+                   credits. One always-present tooltip carries full reset dates
+                   (a weekly window is days out, beyond the inline countdown),
+                   the threshold line, and the snapshot age when rehydrated.
+                   Stream-only, so it survives restart via the metadata
+                   sidecar. -->
               <Tooltip side="right">
                 {#snippet trigger(props)}
                   <!-- tabindex=0 so keyboard users can open the tooltip; a <div>
@@ -1529,12 +1666,15 @@
                   <div
                     {...props}
                     tabindex="0"
-                    class="mt-1.5 cursor-default space-y-0.5 text-xs"
+                    class="mt-1.5 cursor-default space-y-1 text-xs"
                     data-testid="agent-rate-limit-claude"
                   >
-                    {#if rlView.window !== null}
+                    {@render usageMeters(rlView.windows)}
+                    {#if rlView.fallback !== null}
                       <div class="text-fg" data-testid="agent-rate-window">
-                        {rlView.window.label} resets {formatResetTime(rlView.window.resetsAtMs)}
+                        {rlView.fallback.label} resets {formatResetCountdown(
+                          rlView.fallback.resetsAtMs,
+                        )}
                       </div>
                     {/if}
                     {#if rlView.overage !== null}
@@ -1548,9 +1688,12 @@
                   </div>
                 {/snippet}
                 <div class="max-w-xs space-y-1 text-[13px]" data-testid="agent-rate-detail">
-                  {#if rlView.window !== null}
+                  {@render usageWindowDetail(rlView.windows)}
+                  {#if rlView.fallback !== null}
                     <p>
-                      {rlView.window.label} resets {formatResetDateTime(rlView.window.resetsAtMs)}
+                      {rlView.fallback.label} resets {formatResetDateTime(
+                        rlView.fallback.resetsAtMs,
+                      )}
                     </p>
                   {/if}
                   {#if rlView.overage !== null}
@@ -1569,33 +1712,24 @@
               </Tooltip>
             {/if}
             {#if codexWindows.length > 0}
-              <!-- Codex rate-limit: one neutral gauge line per independent
-                   window (primary ~5-hour + secondary weekly), with full reset
-                   dates in the tooltip (the weekly window is days out, beyond a
-                   bare clock). Session-file-backed (class B, durable) — no
-                   snapshot-age qualifier, unlike Claude's stream-only payload. -->
+              <!-- Codex usage windows — the same meters with the same labels as
+                   Claude's. Session-file-backed (class B, durable), so no
+                   snapshot-age qualifier, and Codex reports no threshold flag,
+                   so no window here ever warns. -->
               <Tooltip side="right">
                 {#snippet trigger(props)}
                   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
                   <div
                     {...props}
                     tabindex="0"
-                    class="text-fg mt-1.5 cursor-default space-y-0.5 text-xs"
+                    class="mt-1.5 cursor-default space-y-1 text-xs"
                     data-testid="agent-rate-limit"
                   >
-                    {#each codexWindows as w, i (i)}
-                      <div>{w.label} used: {w.usedPercent.toFixed(0)}%</div>
-                    {/each}
+                    {@render usageMeters(codexWindows)}
                   </div>
                 {/snippet}
                 <div class="max-w-xs space-y-1 text-[13px]" data-testid="agent-rate-limit-detail">
-                  {#each codexWindows as w, i (i)}
-                    <p>
-                      {w.label}: {w.usedPercent.toFixed(0)}% used{w.resetsAtMs !== null
-                        ? ` · resets ${formatResetDateTime(w.resetsAtMs)}`
-                        : ""}
-                    </p>
-                  {/each}
+                  {@render usageWindowDetail(codexWindows)}
                 </div>
               </Tooltip>
             {/if}

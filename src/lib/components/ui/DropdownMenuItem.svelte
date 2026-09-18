@@ -15,6 +15,12 @@
     disabled?: boolean;
     closeOnSelect?: boolean;
     tooltip?: string;
+    /// Multi-line tooltip body, for an item whose explanation doesn't fit the
+    /// one-line `tooltip`. Takes precedence when both are set, so a caller can
+    /// keep `tooltip` as the plain-string fallback. Sharing one snippet with
+    /// another affordance for the same action is the point: two surfaces that
+    /// trigger one thing shouldn't describe it differently.
+    tooltipContent?: Snippet;
     class?: string;
     children: Snippet;
     [key: `data-${string}`]: string | undefined;
@@ -25,6 +31,7 @@
     disabled = false,
     closeOnSelect = true,
     tooltip,
+    tooltipContent,
     class: className,
     children,
     ...rest
@@ -44,7 +51,12 @@
   </Bits.Item>
 {/snippet}
 
-{#if tooltip}
+{#if tooltipContent}
+  <Tooltip side="left">
+    {#snippet trigger(props)}{@render item(props)}{/snippet}
+    {@render tooltipContent()}
+  </Tooltip>
+{:else if tooltip}
   <Tooltip label={tooltip} side="left">
     {#snippet trigger(props)}{@render item(props)}{/snippet}
   </Tooltip>

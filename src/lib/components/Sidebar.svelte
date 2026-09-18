@@ -842,6 +842,8 @@
       label={w.label}
       value={w.usedFraction}
       detail={w.resetsAtMs === null ? undefined : formatResetCountdown(w.resetsAtMs)}
+      separateDetail
+      alignPercentage
       tone={w.surpassedThreshold === undefined ? "neutral" : "warning"}
       testid="agent-usage-window"
     />

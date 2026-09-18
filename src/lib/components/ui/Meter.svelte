@@ -23,6 +23,10 @@
     value: number;
     /// Secondary right-hand text (e.g. "121k / 1M"), before the percentage.
     detail?: string;
+    /// Visually separate the detail from the percentage with a middle dot.
+    separateDetail?: boolean;
+    /// Reserve a right-aligned percentage column for comparable meter rows.
+    alignPercentage?: boolean;
     /// `warning` fills with the caution token. Reserved for a threshold the
     /// harness itself reports having passed — not a percentage we pick, which
     /// would make the same occupancy alarming on one harness and calm on
@@ -33,7 +37,16 @@
     class?: string;
   };
 
-  let { label, value, detail, tone = "neutral", testid, class: className }: Props = $props();
+  let {
+    label,
+    value,
+    detail,
+    separateDetail = false,
+    alignPercentage = false,
+    tone = "neutral",
+    testid,
+    class: className,
+  }: Props = $props();
 
   /// Only the fill clamps. The percentage text reports what the source said,
   /// including over 100% — a quota that says 103% used is telling the user
@@ -57,8 +70,11 @@
       <span class="ml-auto flex shrink-0 items-baseline gap-1.5 tabular-nums">
         {#if detail !== undefined}
           <span>{detail}</span>
+          {#if separateDetail}<span aria-hidden="true">·</span>{/if}
         {/if}
-        <span>{formatUsedPercent(value)}</span>
+        <span class={alignPercentage ? "min-w-[4ch] text-right" : undefined}
+          >{formatUsedPercent(value)}</span
+        >
       </span>
     </div>
     <div class="bg-active h-1 w-full overflow-hidden rounded">

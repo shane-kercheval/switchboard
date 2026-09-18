@@ -6,13 +6,19 @@ import Meter from "./Meter.svelte";
 describe("Meter", () => {
   it("renders the label, the detail, and the used percentage", () => {
     render(Meter, {
-      props: { label: "Context after last turn", value: 0.6, detail: "120k / 200k", testid: "m" },
+      props: {
+        label: "Context after last turn",
+        value: 0.6,
+        detail: "120k / 200k",
+        separateDetail: true,
+        alignPercentage: true,
+        testid: "m",
+      },
     });
 
     const meter = screen.getByTestId("m");
     expect(meter).toHaveTextContent("Context after last turn");
-    expect(meter).toHaveTextContent("120k / 200k");
-    expect(meter).toHaveTextContent("60%");
+    expect(meter).toHaveTextContent("120k / 200k · 60%");
   });
 
   it("omits the detail when the call site has none", () => {

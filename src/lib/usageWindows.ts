@@ -1,0 +1,220 @@
+/// Usage-window derivation for the agent card: each harness's opaque
+/// rate-limit payload read defensively into the one shape the meters render.
+///
+/// Lives outside `Sidebar.svelte` because it is pure — no reactive state, no
+/// component dependencies — so each rule can be tested directly instead of
+/// through a rendered agent card. The component keeps the markup, the tooltip
+/// content, and the per-harness gating.
+import { claudeModelFamilyLabel } from "$lib/agentSelection";
+
+/// One usage window as the card draws it. `usedFraction` is 0–1 **used**,
+/// converted here rather than at the meter: Codex reports 0–100 and Claude a
+/// 0–1 fraction, and a primitive that accepted either would make every call
+/// site's meaning ambiguous.
+export type UsageWindow = {
+  key: string;
+  label: string;
+  usedFraction: number;
+  resetsAtMs: number | null;
+  /// Set only when the harness itself reported passing a threshold — never a
+  /// percentage we pick, which would make the same occupancy alarming on one
+  /// harness and calm on the other.
+  surpassedThreshold?: number;
+};
+
+/// Shared across both harnesses (decision 10): the same window gets the same
+/// words wherever it came from, so a user reading two cards side by side is
+/// comparing quantities rather than decoding vocabularies.
+const LABEL_FIVE_HOUR = "5-hour limit";
+const LABEL_WEEKLY_ALL = "Weekly · all models";
+
+/// Claude's windows in render order, each with its label. **One ordered list
+/// rather than an order array plus a lookup map**, so a key cannot be added
+/// without a label — the drift that pairing removes was previously covered by
+/// a runtime guard that no input could reach. `null` marks the one window
+/// whose label comes from the observed model (below).
+///
+/// The CLI binary's own key list (`strings`, 2.1.274) also carries
+/// `seven_day_cowork`, `seven_day_omelette`, and `seven_day_oauth_apps`. None
+/// is a Claude Code window on any plan we can probe, and a junk label is
+/// worse than a dropped window — iterating this list rather than the
+/// payload's keys is what drops them. Extend here when a probe names one.
+const CLAUDE_WINDOWS: ReadonlyArray<{ key: string; label: string | null }> = [
+  { key: "five_hour", label: LABEL_FIVE_HOUR },
+  { key: "seven_day", label: LABEL_WEEKLY_ALL },
+  { key: "seven_day_overage_included", label: null },
+  { key: "seven_day_opus", label: "Weekly · Opus" },
+  { key: "seven_day_sonnet", label: "Weekly · Sonnet" },
+];
+
+/// `seven_day_overage_included` is the weekly cap for a server-side allowlist
+/// of models that the payload never names. It arrives only on turns run
+/// against one of those models, so the model that delivered the snapshot is a
+/// truthful label for it — by family name, since the raw id is wider than the
+/// column. After a reload there is no observed model (the sidecar
+/// deliberately doesn't carry one) and the window says so rather than naming
+/// a model it can't vouch for.
+function modelWeeklyLabel(model: string | undefined): string {
+  return model === undefined || model === ""
+    ? "Weekly · model-specific"
+    : `Weekly · ${claudeModelFamilyLabel(model)}`;
+}
+
+/// Human label for Claude's *top-level* window, used only by the no-
+/// `unifiedWindows` fallback below. Derived from `rateLimitType` rather than
+/// hardcoded: the event tells us the window kind, so we don't assert a
+/// duration it could contradict.
+function rateLimitLabel(rateLimitType: unknown): string {
+  return rateLimitType === "five_hour" ? LABEL_FIVE_HOUR : "rate limit";
+}
+
+/// Defensive read of Claude's opaque `last_rate_limit` payload.
+///
+/// `unifiedWindows` is authoritative whenever it is present — it carries
+/// every window the desktop app shows, each with a used fraction. The
+/// top-level `resetsAt` / `rateLimitType` pair is a **fallback only**, for an
+/// older CLI (or a future one that drops the field): it has no percentage, so
+/// it renders as a bare reset line rather than a meter. A bar with no value
+/// would be a blank bar, which the card's clean-hide convention forbids more
+/// than it forbids a missing bar. The fallback is not dead code; the field is
+/// undocumented and could vanish without notice.
+///
+/// Every window is gated on its own reset being in the *future*. A reset is
+/// an absolute timestamp, so it stays accurate however old the snapshot is —
+/// right until `nowMs` passes it, at which point that window has cycled and
+/// we don't have its new reset, so it drops while its siblings stay.
+///
+/// `overage` is the separate "using credits" escalation (`isUsingOverage`),
+/// about what is being *billed* rather than how full a window is. Its own
+/// window can be days out, so it lives in the tooltip. A null overage reset
+/// ("flag set, no window time") is still shown — we can't prove it stale.
+///
+/// Returns `null` when nothing is displayable.
+export function claudeRateLimitView(
+  payload: unknown,
+  nowMs: number,
+  model: string | undefined,
+): {
+  windows: UsageWindow[];
+  fallback: { label: string; resetsAtMs: number } | null;
+  overage: { resetsAtMs: number | null } | null;
+} | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const p = payload as {
+    status?: unknown;
+    rateLimitType?: unknown;
+    surpassedThreshold?: unknown;
+    resetsAt?: unknown;
+    isUsingOverage?: unknown;
+    overageResetsAt?: unknown;
+    unifiedWindows?: unknown;
+  };
+
+  // An **empty** container counts as absent: it reported nothing, so the
+  // top-level fallback is still the best available signal. A *non-empty*
+  // container whose entries were all dropped (reset-passed, unreadable
+  // fraction, or a key we deliberately exclude) stays authoritative and the
+  // cell clean-hides — those windows were filtered on purpose, and falling
+  // back there would override the per-window rules rather than fill a gap.
+  const unified = p.unifiedWindows;
+  const hasUnified =
+    typeof unified === "object" && unified !== null && Object.keys(unified).length > 0;
+  const windows: UsageWindow[] = [];
+  if (hasUnified) {
+    // The threshold flag names its window in `rateLimitType` and its level in
+    // `surpassedThreshold`. A turn can emit a second event carrying the
+    // superset, so last-write-wins on the payload is what makes this correct.
+    //
+    // A flag naming a window outside `CLAUDE_WINDOWS` is dropped with that
+    // window, losing the signal. Unobserved (the rendered keys cover every
+    // window any probe has seen) and deliberately not backfilled with a
+    // generic amber line — recorded under the plan's known limitations.
+    const flagged =
+      p.status === "allowed_warning" && typeof p.rateLimitType === "string"
+        ? p.rateLimitType
+        : undefined;
+    const threshold = typeof p.surpassedThreshold === "number" ? p.surpassedThreshold : undefined;
+    for (const { key, label } of CLAUDE_WINDOWS) {
+      const w = (unified as Record<string, unknown>)[key];
+      if (typeof w !== "object" || w === null) continue;
+      const ww = w as { utilization?: unknown; resetsAt?: unknown };
+      if (typeof ww.utilization !== "number") continue;
+      if (!(ww.utilization >= 0 && ww.utilization <= 1)) continue;
+      if (typeof ww.resetsAt !== "number") continue;
+      const resetsAtMs = ww.resetsAt * 1000;
+      if (resetsAtMs <= nowMs) continue;
+      windows.push({
+        key,
+        label: label ?? modelWeeklyLabel(model),
+        usedFraction: ww.utilization,
+        resetsAtMs,
+        surpassedThreshold: key === flagged ? threshold : undefined,
+      });
+    }
+  }
+
+  let fallback: { label: string; resetsAtMs: number } | null = null;
+  if (!hasUnified && typeof p.resetsAt === "number") {
+    const resetsAtMs = p.resetsAt * 1000;
+    if (resetsAtMs > nowMs) fallback = { label: rateLimitLabel(p.rateLimitType), resetsAtMs };
+  }
+
+  let overage: { resetsAtMs: number | null } | null = null;
+  if (p.isUsingOverage === true) {
+    if (typeof p.overageResetsAt === "number") {
+      const overageMs = p.overageResetsAt * 1000;
+      overage = overageMs > nowMs ? { resetsAtMs: overageMs } : null;
+    } else {
+      overage = { resetsAtMs: null };
+    }
+  }
+
+  if (windows.length === 0 && fallback === null && overage === null) return null;
+  return { windows, fallback, overage };
+}
+
+/// Label for a Codex rate-limit window, from its `window_minutes` duration
+/// (300 = the ~5-hour primary, 10080 = the weekly secondary) mapped onto the
+/// shared strings above. Unknown/absent durations fall back to "Quota" — a
+/// payload carrying only a bare `used_percent` still reads as a real gauge.
+function codexWindowLabel(windowMinutes: unknown): string {
+  if (windowMinutes === 300) return LABEL_FIVE_HOUR;
+  if (windowMinutes === 10080) return LABEL_WEEKLY_ALL;
+  return "Quota";
+}
+
+/// Defensive read of Codex's opaque `last_rate_limit` into its independent
+/// windows (`primary` + `secondary`). Same reset-passed rule as the Claude
+/// reader; a window with no `resets_at` is kept (can't prove it stale — older
+/// Codex shapes and minimal fixtures omit it). Codex rate-limit is
+/// session-file-backed (class B, durable), so there's no snapshot-age
+/// qualifier. Codex reports no threshold flag, so no window ever warns.
+///
+/// `used_percent / 100` is left unrounded. Rounding at the source would make
+/// the rendered percentage byte-match Codex's own TUI at half-percent values,
+/// but nobody compares the two, and the bar and the number should be drawn
+/// from one value rather than from a figure pre-rounded for a different
+/// renderer. Returns `[]` when nothing is displayable.
+export function codexRateLimitView(payload: unknown, nowMs: number): UsageWindow[] {
+  if (typeof payload !== "object" || payload === null) return [];
+  const windows: UsageWindow[] = [];
+  for (const key of ["primary", "secondary"] as const) {
+    const w = (payload as Record<string, unknown>)[key];
+    if (typeof w !== "object" || w === null) continue;
+    const ww = w as { used_percent?: unknown; resets_at?: unknown; window_minutes?: unknown };
+    if (typeof ww.used_percent !== "number") continue;
+    let resetsAtMs: number | null = null;
+    if (typeof ww.resets_at === "number") {
+      const ms = ww.resets_at * 1000;
+      if (ms <= nowMs) continue; // reset-passed → window cycled, % is stale
+      resetsAtMs = ms;
+    }
+    windows.push({
+      key,
+      label: codexWindowLabel(ww.window_minutes),
+      usedFraction: ww.used_percent / 100,
+      resetsAtMs,
+    });
+  }
+  return windows;
+}

@@ -1762,45 +1762,10 @@ describe("Sidebar Claude usage windows", () => {
     expect(screen.getByTestId("agent-rate-limit-claude")).not.toHaveTextContent("cowork");
   });
 
-  it.each([
-    ["a string utilization", "0.5"],
-    ["a utilization above 1", 1.5],
-    ["a negative utilization", -0.2],
-    ["a missing utilization", undefined],
-  ])("drops a window with %s", async (_case, utilization) => {
-    // An out-of-range fraction is not a nearly-full window, it is a window we
-    // cannot read — and a meter drawn from it would state a number the harness
-    // never sent.
-    await renderClaudeWithRateLimit(
-      {
-        status: "allowed",
-        unifiedWindows: {
-          five_hour: { utilization, resetsAt: epochFromNow(4 * 3600) },
-          seven_day: { utilization: 0.27, resetsAt: epochFromNow(5 * 86400) },
-        },
-      },
-      null,
-    );
-    const meters = screen.getAllByTestId("agent-usage-window");
-    expect(meters).toHaveLength(1);
-    expect(meters[0]).toHaveTextContent("Weekly · all models");
-  });
-
-  it("drops a window with no parseable reset", async () => {
-    // Every observed window carries `resetsAt`; without one there is no way to
-    // prove the percentage is from the current window rather than a cycled one.
-    await renderClaudeWithRateLimit(
-      {
-        status: "allowed",
-        unifiedWindows: {
-          five_hour: { utilization: 0.33 },
-          seven_day: { utilization: 0.27, resetsAt: epochFromNow(5 * 86400) },
-        },
-      },
-      null,
-    );
-    expect(screen.getAllByTestId("agent-usage-window")).toHaveLength(1);
-  });
+  // The input-validation matrix — malformed fractions, missing resets,
+  // non-object entries — moved to `usageWindows.test.ts`, which tests the
+  // derivation directly. A rendered card can only show those as an absent
+  // meter; what stays here is what only a render can prove.
 
   it("treats an empty window container as absent and falls back", async () => {
     // Nothing reported means the top-level pair is still the best signal

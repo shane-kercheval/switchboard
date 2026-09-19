@@ -5323,6 +5323,11 @@ pub struct AgentConversationMeta {
     /// sidecar (stream-only/class-C value); drives the UI staleness
     /// qualifier. `None` for live values and for class-B (durable) sources.
     pub last_rate_limit_as_of: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the harness measured `last_rate_limit`, for ordering this agent's
+    /// reading against other agents' readings of the same account-scoped quota.
+    /// Distinct from `last_rate_limit_as_of`, which is a staleness qualifier
+    /// shown to the user; see `LoadedTranscript::last_rate_limit_observed_at`.
+    pub last_rate_limit_observed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Capture time of `meta.inventory` when restored from the metadata
     /// sidecar. Same qualifier role as `last_rate_limit_as_of`: `None` means
     /// the inventory is live or re-read from a durable harness file.
@@ -6430,6 +6435,7 @@ fn merge_project_conversation(
             last_rate_limit: transcript.last_rate_limit,
             last_rate_limit_model: transcript.last_rate_limit_model,
             last_rate_limit_as_of: transcript.last_rate_limit_as_of,
+            last_rate_limit_observed_at: transcript.last_rate_limit_observed_at,
             meta_as_of: transcript.meta_as_of,
             last_context_report: transcript.last_context_report,
             last_context_report_at: transcript.last_context_report_at,

@@ -100,6 +100,22 @@ pub struct Enrichment {
     /// because the rate-limit shape is "opaque to consumers" per
     /// `docs/system-design.md`.
     pub rate_limits: Option<Value>,
+    /// The record-level timestamp of the line [`Self::rate_limits`] was taken
+    /// from, so a reading can be ordered against readings from other agents.
+    ///
+    /// Captured because the quota is **account-scoped**: every agent on this
+    /// harness reports the same account's windows, so the display picks the
+    /// newest reading across all of them and needs a comparable instant for
+    /// each. A live event can be stamped on arrival, but a reading recovered
+    /// from a rollout on project open cannot — the only record of when it was
+    /// measured is the line itself.
+    ///
+    /// Always set and cleared **together with** [`Self::rate_limits`]: a
+    /// reading whose age is unknown cannot be ordered, and a timestamp with no
+    /// reading describes nothing. `None` when the record carries no parseable
+    /// timestamp, which leaves the reading orderable only as "older than
+    /// anything stamped."
+    pub rate_limits_observed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// From `session_meta.payload.cli_version` (line 1). Used for
     /// `SessionMeta.harness_version`.
     pub cli_version: Option<String>,
@@ -532,15 +548,19 @@ fn absorb_session_meta(payload: &Value, enrichment: &mut Enrichment) -> HistoryM
     mode
 }
 
-/// The record-level timestamp of a `task_started` line — the freshness proof
-/// for cancel-path identity recovery ([`Enrichment::current_turn_started_at`]).
-/// Absent/unparseable reads as `None` — **fail-closed** (the freshness check
-/// rejects, no identity is recovered). Deliberately silent here: this parse
-/// runs on every enrichment read, where freshness is never consulted; the one
-/// consumer that consults it (the Codex cancel path) owns the
-/// missing-timestamp breadcrumb, so the warn fires exactly when missing data
-/// prevented an otherwise-possible recovery — never about values nothing read.
-fn task_started_timestamp(value: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+/// A rollout record's own `timestamp`, read by the two enrichment fields that
+/// need to know *when* something in the file happened:
+/// [`Enrichment::current_turn_started_at`] (the freshness proof for cancel-path
+/// identity recovery) and [`Enrichment::rate_limits_observed_at`] (the ordering
+/// key for a quota reading).
+///
+/// Absent/unparseable reads as `None` — **fail-closed** for both consumers: the
+/// freshness check rejects and no identity is recovered, and an unstamped
+/// reading loses to any stamped one. Deliberately silent here: this parse runs
+/// on every enrichment read, where neither value is necessarily consulted, so
+/// the consumer that needs a breadcrumb owns it and the warn fires exactly when
+/// missing data changed an outcome — never about values nothing read.
+fn record_timestamp(value: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
     value
         .get("timestamp")
         .and_then(Value::as_str)
@@ -711,7 +731,7 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         // When the file's current turn began — the freshness
                         // proof the cancel path's identity recovery compares
                         // against its dispatch instant (see the field doc).
-                        enrichment.current_turn_started_at = task_started_timestamp(&value);
+                        enrichment.current_turn_started_at = record_timestamp(&value);
                         // Turn-scoped for the same reason: the facet upgrade
                         // must never replay a *previous* turn's patches onto
                         // this turn's file_change rows.
@@ -736,6 +756,11 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                             && rate_limits_carry_window(rate_limits)
                         {
                             enrichment.rate_limits = Some(rate_limits.clone());
+                            // One unit with the reading above: overwritten on
+                            // every window-bearing record so the stamp always
+                            // describes the reading being kept, never an
+                            // earlier one that a later record superseded.
+                            enrichment.rate_limits_observed_at = record_timestamp(&value);
                         }
                         if let Some(usage) = p
                             .get("info")
@@ -1128,6 +1153,7 @@ pub(crate) fn parse_codex_transcript_content(content: &str, agent_id: AgentId) -
     // of truth for meta fields.
     let enrichment = parse_session_content(content);
     t.last_rate_limit.clone_from(&enrichment.rate_limits);
+    t.last_rate_limit_observed_at = enrichment.rate_limits_observed_at;
     // The rollout's own inventory only — the config loaders are layered on in
     // `load_codex_transcript`, which is the one place that knows the home and
     // working directories.
@@ -3941,6 +3967,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_stamps_the_rate_limit_reading_with_its_own_records_timestamp() {
+        // The reading and its stamp move together, so the stamp describes the
+        // reading that was kept rather than the last timestamp seen in the
+        // file. Here a *windowless* record follows the one that wins: it
+        // supersedes neither, so neither the percent nor the stamp advances.
+        let content = r#"
+{"type":"event_msg","timestamp":"2026-09-18T19:00:00.000Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0,"resets_at":1789845487}}}}
+{"type":"event_msg","timestamp":"2026-09-18T20:30:00.000Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":50.0,"resets_at":1789845487}}}}
+{"type":"event_msg","timestamp":"2026-09-18T20:31:00.000Z","payload":{"type":"token_count","rate_limits":{"limit_id":"premium","primary":null,"secondary":null}}}
+"#;
+        let enrichment = parse_session_content(content);
+        assert_eq!(
+            enrichment
+                .rate_limits
+                .as_ref()
+                .and_then(|r| r.pointer("/primary/used_percent")),
+            Some(&Value::from(50.0))
+        );
+        assert_eq!(
+            enrichment.rate_limits_observed_at,
+            Some(
+                "2026-09-18T20:30:00Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .expect("fixture timestamp parses")
+            ),
+            "the stamp must name the record the kept reading came from"
+        );
+    }
+
+    #[test]
+    fn parse_stamps_no_observation_time_when_the_record_carries_no_timestamp() {
+        // Orderable only as "older than anything stamped". The reading itself is
+        // still taken — an unknown measurement time is a reason to rank a
+        // reading last, never a reason to discard a real window.
+        let content = r#"
+{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0}}}}
+"#;
+        let enrichment = parse_session_content(content);
+        assert!(enrichment.rate_limits.is_some(), "the reading still stands");
+        assert_eq!(enrichment.rate_limits_observed_at, None);
+    }
+
+    #[test]
     fn parse_keeps_last_window_when_quota_exhaustion_reports_none() {
         // Verbatim shape from a rollout that hit its weekly cap: Codex switched
         // `limit_id` to "premium" and reported no window at all. Non-null, so
@@ -5277,6 +5346,18 @@ not valid json
                 .unwrap();
         let rl = result.last_rate_limit.unwrap();
         assert_eq!(rl["primary"]["used_percent"].as_f64(), Some(10.0));
+        // The measured instant rides out with the reading. Codex's reading is
+        // recovered from the file rather than received live, so this is the only
+        // thing that can order it against another agent's reading of the same
+        // account quota.
+        assert_eq!(
+            result.last_rate_limit_observed_at,
+            Some(
+                "2026-05-14T19:33:23Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap()
+            )
+        );
     }
 
     #[test]

@@ -1,5 +1,8 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
-import { claudeRateLimitView, codexRateLimitView, sameCodexUsageWindows } from "./usageWindows";
+import { claudeRateLimitView, codexAccountUsageView } from "./usageWindows";
 
 /// Input validation against each harness's opaque payload. These live here
 /// rather than in the Sidebar suite because they are about what the derivation
@@ -69,153 +72,239 @@ describe("claudeRateLimitView input validation", () => {
   });
 });
 
-describe("codexRateLimitView input validation", () => {
-  it("skips a window with a non-numeric percentage", () => {
-    const windows = codexRateLimitView(
-      { primary: { used_percent: "42", window_minutes: 300 }, secondary: { used_percent: 7.0 } },
-      NOW,
-    );
+/// The account read's payload, shaped as Codex returns it. Field names are
+/// camelCase here and snake_case in the rollout payload the old reader took —
+/// they are different protocols, not a style choice.
+///
+/// `limitName: null` on the account-wide bucket is not an oversight in the
+/// fixture: it is what every capture shows. Only the model reserve is named.
+function accountPayload(buckets: Record<string, unknown>, ordinaryUsageAllowed = true): unknown {
+  return { ordinaryUsageAllowed, rateLimitsByLimitId: buckets };
+}
+
+const ACCOUNT_BUCKET = {
+  limitId: "codex",
+  limitName: null,
+  normalModelSlug: null,
+  primary: { usedPercent: 42.0, windowDurationMins: 10080, resetsAt: future(86_400) },
+  rateLimitReachedType: null,
+};
+
+const RESERVE_BUCKET = {
+  limitId: "base_model_inference",
+  limitName: "gpt-reserve",
+  normalModelSlug: "gpt-5.6-luna",
+  primary: { usedPercent: 5, windowDurationMins: 10080, resetsAt: future(86_400) },
+  rateLimitReachedType: null,
+};
+
+describe("codexAccountUsageView selection", () => {
+  it("renders an account-wide bucket", () => {
+    const windows = codexAccountUsageView(accountPayload({ codex: ACCOUNT_BUCKET }), NOW);
     expect(windows).toHaveLength(1);
-    expect(windows[0]?.usedFraction).toBeCloseTo(0.07);
+    expect(windows[0]?.key).toBe("codex");
+    expect(windows[0]?.usedFraction).toBeCloseTo(0.42);
   });
 
-  it("keeps a window that reports no reset", () => {
-    // Older Codex shapes and minimal fixtures omit `resets_at`; without one we
-    // cannot prove the percentage is stale, so it is shown.
-    const windows = codexRateLimitView({ primary: { used_percent: 42.0 } }, NOW);
+  it("hides a model-specific reserve beside an account-wide quota", () => {
+    // The whole point of reading the account: the reserve is a real quota with
+    // real headroom, and showing it beside the allowance invites reading its
+    // 95% remaining as the number that governs ordinary work.
+    const windows = codexAccountUsageView(
+      accountPayload({ codex: ACCOUNT_BUCKET, base_model_inference: RESERVE_BUCKET }),
+      NOW,
+    );
+    expect(windows.map((w) => w.key)).toEqual(["codex"]);
+  });
+
+  it("skips a bucket that carries no `normalModelSlug` field at all", () => {
+    // Absence is not null. Were the field renamed upstream, treating absence as
+    // "no model" would promote every reserve into the account section and label
+    // it as an ordinary allowance — the exact defect this reader replaced,
+    // rebuilt in a new place. Rendering nothing is the safe direction.
+    const { normalModelSlug: _dropped, ...noSlug } = ACCOUNT_BUCKET;
+    expect(codexAccountUsageView(accountPayload({ codex: noSlug }), NOW)).toEqual([]);
+  });
+
+  it("labels an account-wide weekly quota in the harness-shared vocabulary", () => {
+    // The same string Claude's `seven_day` row uses. Both halves are read
+    // rather than assumed: the duration is stated by the payload, and "all
+    // models" is what passing the `normalModelSlug === null` filter *means*.
+    // The old reader's version of this label was an invention because it could
+    // not tell the account allowance from the model reserve; this one only ever
+    // labels buckets that are provably the former.
+    const windows = codexAccountUsageView(accountPayload({ codex: ACCOUNT_BUCKET }), NOW);
+    expect(windows[0]?.label).toBe("Weekly · all models");
+  });
+
+  it("labels an account-wide 5-hour quota with the shared string too", () => {
+    const fiveHour = {
+      ...ACCOUNT_BUCKET,
+      primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: future(1800) },
+    };
+    expect(codexAccountUsageView(accountPayload({ codex: fiveHour }), NOW)[0]?.label).toBe(
+      "5-hour limit",
+    );
+  });
+
+  it("falls back to Codex's own name for a duration we do not recognize", () => {
+    const odd = {
+      ...ACCOUNT_BUCKET,
+      limitName: "Monthly",
+      primary: { usedPercent: 12, windowDurationMins: 43_200, resetsAt: future(86_400) },
+    };
+    expect(codexAccountUsageView(accountPayload({ codex: odd }), NOW)[0]?.label).toBe("Monthly");
+  });
+
+  it("falls back to a neutral noun when there is nothing to name it with", () => {
+    // No recognized duration and no name: say less rather than invent either.
+    const bare = { ...ACCOUNT_BUCKET, primary: { usedPercent: 12, resetsAt: future(86_400) } };
+    expect(codexAccountUsageView(accountPayload({ codex: bare }), NOW)[0]?.label).toBe("Quota");
+  });
+});
+
+/// The reader run against the **real** captured response, rather than against
+/// fixtures shaped by hand from the same understanding that wrote the reader.
+///
+/// The capture is the one taken the moment the account's weekly window rolled
+/// over; it is checked in under the harness crate because that is where the
+/// Rust read's own tests consume it. Reading the same bytes from both sides is
+/// the point — a hand-built fixture agreeing with the code that reads it proves
+/// only that they were written together.
+describe("codexAccountUsageView against the recorded account response", () => {
+  const captured = JSON.parse(
+    readFileSync(
+      resolve(
+        process.cwd(),
+        "crates/harness/tests/fixtures/codex/account-rate-limits-healthy.jsonl",
+      ),
+      "utf8",
+    )
+      .split("\n")
+      .find((line) => line.includes('"id":1'))!,
+  ).result as { rateLimitsByLimitId: Record<string, { primary: { resetsAt: number } }> };
+
+  // An hour before the account-wide bucket's reset, so the reset-passed rule
+  // does not retire the capture as the recorded timestamps recede into the past.
+  const justBeforeReset = (captured.rateLimitsByLimitId.codex!.primary.resetsAt - 3600) * 1000;
+
+  it("renders the account-wide quota and hides the model reserve", () => {
+    const windows = codexAccountUsageView(captured, justBeforeReset);
+    expect(windows.map((w) => w.key)).toEqual(["codex"]);
+  });
+
+  it("reads the recovered account as healthy, labelled from its real window", () => {
+    // Properties of the real payload rather than of the fixture author: the
+    // account-wide bucket carries a 10080-minute window and `limitName: null`,
+    // so the shared label has to come from the duration; and a recovered window
+    // clears its exhaustion flag.
+    const [quota] = codexAccountUsageView(captured, justBeforeReset);
+    expect(quota?.label).toBe("Weekly · all models");
+    expect(quota?.limitReached).toBeUndefined();
+    expect(quota?.usedFraction).toBe(0);
+  });
+});
+
+describe("codexAccountUsageView input validation", () => {
+  it.each([
+    ["a non-object payload", "nope"],
+    ["null", null],
+    ["a payload with no bucket map", { ordinaryUsageAllowed: true }],
+    ["a null bucket map", { rateLimitsByLimitId: null }],
+    ["a non-object bucket map", { rateLimitsByLimitId: "nope" }],
+    ["an empty bucket map", { rateLimitsByLimitId: {} }],
+  ])("returns an empty list for %s", (_case, payload) => {
+    expect(codexAccountUsageView(payload, NOW)).toEqual([]);
+  });
+
+  it("skips a bucket whose window is absent", () => {
+    // Observed: `limit_id: "premium"` arrives with both windows null on a
+    // refused turn. A bar with no value is worse than no bar.
+    const windowless = { ...ACCOUNT_BUCKET, primary: null };
+    expect(codexAccountUsageView(accountPayload({ premium: windowless }), NOW)).toEqual([]);
+  });
+
+  it("skips a bucket whose percentage is not a number", () => {
+    const bad = { ...ACCOUNT_BUCKET, primary: { usedPercent: "42", resetsAt: future(86_400) } };
+    expect(codexAccountUsageView(accountPayload({ codex: bad }), NOW)).toEqual([]);
+  });
+
+  it("keeps a bucket that reports no reset", () => {
+    // Without a reset there is no way to prove the percentage stale, so it
+    // stands — the same rule the Claude reader follows.
+    const noReset = { ...ACCOUNT_BUCKET, primary: { usedPercent: 42.0 } };
+    const windows = codexAccountUsageView(accountPayload({ codex: noReset }), NOW);
     expect(windows).toHaveLength(1);
     expect(windows[0]?.resetsAtMs).toBeNull();
   });
 
-  it.each([
-    ["a non-object payload", "nope"],
-    ["null", null],
-    ["a payload with neither window", { credits: null }],
-  ])("returns an empty list for %s", (_case, payload) => {
-    expect(codexRateLimitView(payload, NOW)).toEqual([]);
-  });
-
-  it("draws the refused window full and flagged once the harness has refused a turn", () => {
-    // The snapshot still holds the last measurement — Codex records a
-    // windowless payload on the refused turn, which is kept out of it — so the
-    // refusal is the only thing that can say the window is actually used up.
-    const windows = codexRateLimitView(
-      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: future(86_400) } },
-      NOW,
-      true,
-    );
-    expect(windows).toHaveLength(1);
-    expect(windows[0]?.usedFraction).toBe(1);
-    expect(windows[0]?.limitReached).toBe(true);
-    expect(windows[0]?.label).toBe("Weekly · all models");
-  });
-
-  it("attributes a refusal to the most-used window and leaves the others measured", () => {
-    // Codex names no window, so flagging both would claim the weekly quota is
-    // gone when only the 5-hour one is — days of waiting for an hour of it.
-    const windows = codexRateLimitView(
-      {
-        primary: { used_percent: 99.0, window_minutes: 300, resets_at: future(1800) },
-        secondary: { used_percent: 30.0, window_minutes: 10080, resets_at: future(86_400) },
-      },
-      NOW,
-      true,
-    );
-    expect(windows.map((w) => [w.label, w.usedFraction, w.limitReached])).toEqual([
-      ["5-hour limit", 1, true],
-      ["Weekly · all models", 0.3, undefined],
-    ]);
-  });
-
-  it("attributes to the weekly window when that is the fuller one", () => {
-    // Same payload shape, opposite usage — the attribution follows the
-    // measurement rather than the key order.
-    const windows = codexRateLimitView(
-      {
-        primary: { used_percent: 12.0, window_minutes: 300, resets_at: future(1800) },
-        secondary: { used_percent: 97.0, window_minutes: 10080, resets_at: future(86_400) },
-      },
-      NOW,
-      true,
-    );
-    expect(windows.map((w) => [w.label, w.usedFraction, w.limitReached])).toEqual([
-      ["5-hour limit", 0.12, undefined],
-      ["Weekly · all models", 1, true],
-    ]);
-  });
-
-  it("leaves the measurement alone when no turn has been refused", () => {
-    const windows = codexRateLimitView(
-      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: future(86_400) } },
-      NOW,
-      false,
-    );
-    expect(windows[0]?.usedFraction).toBeCloseTo(0.93);
-    expect(windows[0]?.limitReached).toBeUndefined();
-  });
-
-  it("still drops a cycled window after a refusal — the refusal is as stale as the window", () => {
-    const windows = codexRateLimitView(
-      { primary: { used_percent: 100.0, window_minutes: 10080, resets_at: future(-60) } },
-      NOW,
-      true,
-    );
-    expect(windows).toEqual([]);
+  it("drops a bucket whose reset has passed while its siblings stay", () => {
+    const cycled = {
+      ...ACCOUNT_BUCKET,
+      limitId: "stale",
+      primary: { usedPercent: 100.0, resetsAt: future(-60) },
+    };
+    const live = { ...ACCOUNT_BUCKET, limitId: "live" };
+    const windows = codexAccountUsageView(accountPayload({ stale: cycled, live }), NOW);
+    expect(windows.map((w) => w.key)).toEqual(["live"]);
   });
 });
 
-describe("sameCodexUsageWindows", () => {
-  const weekly = {
-    primary: { used_percent: 93.0, window_minutes: 10080, resets_at: 1_789_845_487 },
-  };
-
-  it("matches a payload against itself, so a refusal survives its own turn end", () => {
-    expect(sameCodexUsageWindows(weekly, { ...weekly })).toBe(true);
-  });
-
-  it("ignores the measured percentage — only the window matters", () => {
-    const later = {
-      primary: { used_percent: 99.0, window_minutes: 10080, resets_at: 1_789_845_487 },
+describe("codexAccountUsageView exhaustion", () => {
+  it("draws a bucket as exhausted because Codex says so, without touching the measurement", () => {
+    // The measurement stands as measured. The reader this replaced painted its
+    // guessed window to 100%, because the per-turn payload recorded no
+    // measurement on a refusal and the stale number would have contradicted the
+    // refusal beside it. The account read reports both, so neither is invented.
+    const capped = {
+      ...ACCOUNT_BUCKET,
+      primary: { usedPercent: 100.0, windowDurationMins: 10080, resetsAt: future(86_400) },
+      rateLimitReachedType: "rate_limit_reached",
     };
-    expect(sameCodexUsageWindows(weekly, later)).toBe(true);
+    const windows = codexAccountUsageView(accountPayload({ codex: capped }, false), NOW);
+    expect(windows[0]?.limitReached).toBe(true);
+    expect(windows[0]?.usedFraction).toBe(1);
   });
 
-  it("is order-independent across the two window keys", () => {
-    const a = {
-      primary: { used_percent: 10, resets_at: 200 },
-      secondary: { used_percent: 20, resets_at: 100 },
+  it("flags only the bucket that reports itself exhausted", () => {
+    // The old reader had to guess which window a refusal belonged to, because
+    // Codex named none. Each bucket now states its own, so a spent 5-hour quota
+    // cannot condemn the weekly one.
+    const capped = {
+      ...ACCOUNT_BUCKET,
+      limitId: "five_hour",
+      primary: { usedPercent: 100.0, resetsAt: future(1800) },
+      rateLimitReachedType: "rate_limit_reached",
     };
-    const b = {
-      primary: { used_percent: 10, resets_at: 100 },
-      secondary: { used_percent: 20, resets_at: 200 },
+    const windows = codexAccountUsageView(
+      accountPayload({ five_hour: capped, weekly: { ...ACCOUNT_BUCKET, limitId: "weekly" } }),
+      NOW,
+    );
+    expect(windows.map((w) => [w.key, w.limitReached])).toEqual([
+      ["five_hour", true],
+      ["weekly", undefined],
+    ]);
+  });
+
+  it("ignores a stale exhaustion flag on a bucket reporting nothing spent", () => {
+    // A quota 0% spent and simultaneously exhausted is a contradiction, so the
+    // measurement wins and nothing is claimed. A probe against a recovered
+    // account found the flag clears on reset, so this guards a shape Codex does
+    // not currently produce — kept because it is free.
+    const contradictory = {
+      ...ACCOUNT_BUCKET,
+      primary: { usedPercent: 0, resetsAt: future(86_400) },
+      rateLimitReachedType: "rate_limit_reached",
     };
-    expect(sameCodexUsageWindows(a, b)).toBe(true);
+    const windows = codexAccountUsageView(accountPayload({ codex: contradictory }), NOW);
+    expect(windows[0]?.limitReached).toBeUndefined();
   });
 
-  it("separates a rolled window from the one before it", () => {
-    const rolled = {
-      primary: { used_percent: 2.0, window_minutes: 10080, resets_at: 1_790_375_461 },
-    };
-    expect(sameCodexUsageWindows(weekly, rolled)).toBe(false);
-  });
-
-  it("separates payloads that report a different number of windows", () => {
-    const both = { ...weekly, secondary: { used_percent: 4.0, resets_at: 1_790_000_000 } };
-    expect(sameCodexUsageWindows(weekly, both)).toBe(false);
-  });
-
-  it.each([
-    ["a window with no reset time", { primary: { used_percent: 93.0 } }],
-    ["a windowless payload", { limit_id: "premium", primary: null, secondary: null }],
-    ["a non-object", "nope"],
-    ["null", null],
-  ])("reports %s as not-the-same, in either position", (_case, indeterminate) => {
-    // Unknown counts as different: two reset-less windows are indistinguishable
-    // and the reset-passed gate can never retire one, so treating them as equal
-    // would strand a refusal on a window forever.
-    expect(sameCodexUsageWindows(weekly, indeterminate)).toBe(false);
-    expect(sameCodexUsageWindows(indeterminate, weekly)).toBe(false);
-    expect(sameCodexUsageWindows(indeterminate, indeterminate)).toBe(false);
+  it("reads a recovered account as healthy", () => {
+    // The shape captured the moment the weekly window rolled over: a new
+    // reset, nothing spent, and the flag back to null.
+    const windows = codexAccountUsageView(accountPayload({ codex: ACCOUNT_BUCKET }), NOW);
+    expect(windows[0]?.limitReached).toBeUndefined();
   });
 });
 

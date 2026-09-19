@@ -81,47 +81,6 @@ describe("observeUsage", () => {
   });
 });
 
-describe("the refusal verdict", () => {
-  function refusedOnWeekly(): void {
-    usage.observeUsage("codex", { payload: WEEKLY, observed_at: "2026-09-18T20:00:00Z" });
-    usage.recordUsageRefusal("codex");
-  }
-
-  it("survives a later reading of the same window", () => {
-    // The refused turn's own reading re-reports the window it was refused on, so
-    // the verdict has to outlive the sequence that set it.
-    refusedOnWeekly();
-    usage.observeUsage("codex", { payload: WEEKLY_LATER, observed_at: "2026-09-18T20:05:00Z" });
-    expect(usage.harnessUsage.codex?.limit_reached).toBe(true);
-  });
-
-  it("retires with the window it judged", () => {
-    refusedOnWeekly();
-    usage.observeUsage("codex", { payload: ROLLED, observed_at: "2026-09-25T09:00:00Z" });
-    expect(usage.harnessUsage.codex?.limit_reached).toBeUndefined();
-  });
-
-  it("is cleared by a completed turn and by nothing else", () => {
-    refusedOnWeekly();
-    usage.clearUsageRefusal("codex");
-    expect(usage.harnessUsage.codex?.limit_reached).toBeUndefined();
-  });
-
-  it("attaches to nothing when no reading is held", () => {
-    // A verdict is about a reading; with no measurement there is no window to
-    // mark, and inventing an entry would render a card with no meters.
-    usage.recordUsageRefusal("codex");
-    expect(usage.harnessUsage.codex).toBeUndefined();
-  });
-
-  it("does not re-persist when the verdict is already what it would be set to", () => {
-    refusedOnWeekly();
-    invokeMock.mockClear();
-    usage.recordUsageRefusal("codex");
-    expect(invokeMock).not.toHaveBeenCalled();
-  });
-});
-
 describe("loadPersistedUsage", () => {
   it("ranks the restored reading rather than applying it over a live one", async () => {
     usage.observeUsage("codex", { payload: WEEKLY_LATER, observed_at: "2026-09-18T20:05:00Z" });
@@ -150,10 +109,13 @@ describe("loadPersistedUsage", () => {
         : undefined,
     );
     await usage.loadPersistedUsage();
+    // The stale `limit_reached` is dropped rather than restored. A file written
+    // before the account read existed still carries the verdict that used to be
+    // held beside the reading; loading it would paint a quota as spent from a
+    // judgment nothing can retire, since nothing sets or clears the field now.
     expect(usage.harnessUsage.codex).toEqual({
       payload: WEEKLY,
       observed_at: "2026-09-18T19:00:00Z",
-      limit_reached: true,
       model: "gpt-5.6-sol",
     });
   });
@@ -297,8 +259,8 @@ describe("writing the file", () => {
 
     // Three more changes while the first write is still in flight.
     usage.observeUsage("codex", { payload: WEEKLY_LATER, observed_at: "2026-09-18T20:01:00Z" });
-    usage.recordUsageRefusal("codex");
-    usage.clearUsageRefusal("codex");
+    usage.observeUsage("codex", { payload: WEEKLY_LATER, observed_at: "2026-09-18T20:02:00Z" });
+    usage.nameUsageModel("codex", "gpt-5.6-terra");
     expect(write.calls()).toBe(1);
 
     write.release();

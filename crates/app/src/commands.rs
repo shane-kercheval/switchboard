@@ -6971,6 +6971,42 @@ pub fn account_usage_log_decision(
     }
 }
 
+/// Whether any agent the user has configured belongs to a harness that can
+/// report its account quota directly.
+///
+/// **Asked of the agents that exist, not of a harness this code already knows.**
+/// The gate's job is to decide whether the account read is warranted at all, and
+/// the honest form of that question is "does the user run a harness with this
+/// capability" — so the predicate is applied to each record's own `harness`
+/// field. Calling `HarnessKind::Codex.supports_account_usage_read()` at a site
+/// that already knows it means Codex would answer a question nobody asked and
+/// leave the predicate decorative.
+///
+/// Without this, a user who runs only Claude agents would still have a `codex`
+/// subprocess spawned on their behalf at startup and after every turn, failing
+/// every time with "binary not found" — work and a log line for a harness they
+/// do not use.
+///
+/// **An unreadable store answers "no".** The alternative is spawning a
+/// subprocess on the strength of a store read that just failed, and the cost of
+/// answering no is one skipped meter refresh: the gate is consulted per read,
+/// not once per session, so the next trigger asks again.
+fn any_configured_agent_reports_account_usage(state: &AppState) -> bool {
+    let Ok(entries) = indexed_projects(state) else {
+        return false;
+    };
+    entries.into_iter().any(|entry| {
+        state
+            .store
+            .read_project_registry(&entry)
+            .is_ok_and(|agents| {
+                agents
+                    .iter()
+                    .any(|agent| agent.harness.supports_account_usage_read())
+            })
+    })
+}
+
 /// Read the Codex account's metered quotas — every limit it holds, each named
 /// by Codex. `None` means "no reading available", never "something went wrong."
 ///
@@ -7007,6 +7043,9 @@ pub async fn read_codex_account_usage_impl(
     // startup beside the adapter choice; this is the one call that would
     // otherwise bypass it.
     if !state.spawns_real_harnesses {
+        return None;
+    }
+    if !any_configured_agent_reports_account_usage(state) {
         return None;
     }
     let outcome = switchboard_harness::read_account_usage(binary, timeout).await;
@@ -11615,14 +11654,22 @@ mod tests {
 
     /// Bare state for the account-usage tests: they touch no store, no project
     /// and no adapter — only the mock-mode flag and the remembered failure.
-    fn account_usage_state() -> AppState {
-        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-        AppState::new_for_test(
-            Arc::clone(&mock),
-            Arc::clone(&mock),
-            mock,
-            Arc::new(RecordingEmitter::default()) as Arc<dyn EventEmitter>,
-        )
+    /// A state holding exactly one configured agent, on `harness`.
+    ///
+    /// The harness is a parameter because the read is gated on what the user
+    /// actually runs: passing `ClaudeCode` here is how the "never spawns for a
+    /// user without Codex" case is exercised, and passing `Codex` is what lets
+    /// the failure-handling tests reach the read at all.
+    ///
+    /// The `TempDir` is returned rather than dropped: it backs the project the
+    /// agent lives in, and dropping it would empty the registry the gate reads.
+    fn account_usage_state(harness: HarnessKind) -> (TempDir, AppState) {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        create_agent_impl(&state, "a", harness, AgentSelection::default()).unwrap();
+        (tmp, state)
     }
 
     #[tokio::test]
@@ -11631,12 +11678,20 @@ mod tests {
         // newer number", so the caller keeps whatever reading it holds. If this
         // ever grows an error path, the meter gains a way to blank itself or
         // shout at the user over a refresh nobody asked for.
-        let state = account_usage_state().with_real_harnesses(true);
-        let tmp = TempDir::new().unwrap();
-        let absent = tmp.path().join("definitely-not-codex");
+        let (_tmp, state) = account_usage_state(HarnessKind::Codex);
+        let state = state.with_real_harnesses(true);
+        let dir = TempDir::new().unwrap();
+        let absent = dir.path().join("definitely-not-codex");
         let reading =
             read_codex_account_usage_impl(&state, &absent, std::time::Duration::from_secs(5)).await;
         assert!(reading.is_none());
+        // Asserted so this cannot start passing for the wrong reason: a gate
+        // that skipped the read entirely would also return `None`, and the
+        // point here is that the read *ran* and its failure collapsed.
+        assert_eq!(
+            *state.last_account_usage_failure.lock().unwrap(),
+            Some("binary-not-found")
+        );
     }
 
     #[tokio::test]
@@ -11645,7 +11700,7 @@ mod tests {
         // would stop a mock run from shelling out to the real CLI. `codex` is
         // passed by name deliberately: were the gate absent, this would resolve
         // and spawn the developer's own installed binary.
-        let state = account_usage_state();
+        let (_tmp, state) = account_usage_state(HarnessKind::Codex);
         assert!(!state.spawns_real_harnesses);
         let reading = read_codex_account_usage_impl(
             &state,
@@ -11702,14 +11757,37 @@ mod tests {
         // The defect keying on the rendered message caused: the silence variants
         // interpolate whatever the server printed, so one unchanging condition
         // produced a fresh string — and a fresh warning — on every refresh.
-        let state = account_usage_state().with_real_harnesses(true);
-        let tmp = TempDir::new().unwrap();
-        let absent = tmp.path().join("definitely-not-codex");
+        let (_tmp, state) = account_usage_state(HarnessKind::Codex);
+        let state = state.with_real_harnesses(true);
+        let dir = TempDir::new().unwrap();
+        let absent = dir.path().join("definitely-not-codex");
         for _ in 0..3 {
             read_codex_account_usage_impl(&state, &absent, std::time::Duration::from_secs(5)).await;
         }
         let last = *state.last_account_usage_failure.lock().unwrap();
         assert_eq!(last, Some("binary-not-found"));
+    }
+
+    #[tokio::test]
+    async fn no_codex_agent_means_no_codex_subprocess() {
+        // A Claude-only user should never have a `codex` spawned on their
+        // behalf. `codex` is passed by name so that, were the gate absent, this
+        // would resolve and run the developer's own installed binary — the read
+        // would then *succeed* against a real account and the assertion below
+        // would fail on a populated reading rather than passing by luck.
+        let (_tmp, state) = account_usage_state(HarnessKind::ClaudeCode);
+        let state = state.with_real_harnesses(true);
+        let reading = read_codex_account_usage_impl(
+            &state,
+            Path::new("codex"),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(reading.is_none());
+        // No read ran, so there is no failure to remember. This is what
+        // separates "skipped" from "ran and failed"; without it the assertion
+        // above is satisfied by either.
+        assert_eq!(*state.last_account_usage_failure.lock().unwrap(), None);
     }
 
     #[test]

@@ -476,9 +476,24 @@ Newest-wins by `observed_at` stays. `model` stays — Claude's model-gated weekl
 - `limit_reached` on the stored reading, and `recordUsageRefusal` / `clearUsageRefusal`.
 - `sameCodexUsageWindows`.
 - The `culprit.usedFraction = 1` painting in `codexRateLimitView`.
-- The `"Weekly · all models"` literal. **Do not reintroduce a duration-derived label** — that
-  invented claim is the first defect in this document. If a bucket cannot be named from the payload,
-  say less, not more.
+- ~~The `"Weekly · all models"` literal.~~ **Amended during M2 — the label stays, for Codex's
+  account-wide buckets, as the shared cross-harness string.**
+
+  The original instruction banned a duration-derived label because "Weekly · all models" was the
+  first defect in this document. That conflated two things. The defect was **asserting a scope we
+  could not check**: the rollout delivered one unnamed bucket, and calling it "all models" might
+  have been describing the Luna reserve. Neither half of the label is an assertion once the account
+  is read — the duration is stated by the payload (`windowDurationMins`), and "all models" is
+  precisely what passing the `normalModelSlug === null` filter *means*, since that filter is what
+  separates the account allowance from a model reserve.
+
+  Suppressing it cost real information and broke the shared vocabulary: Claude's `seven_day` row
+  already reads "Weekly · all models", and a plan carrying both a 5-hour and a weekly account limit
+  would have rendered two rows both labelled "Quota", separable only by their countdowns.
+
+  **The rule that survives** is the one the original instruction was reaching for: never invent a
+  scope the payload cannot support. A duration we do not recognize falls back to Codex's own
+  `limitName`, and a bucket with neither falls back to a neutral noun.
 
 **Exhaustion — implement this rule, which rests on a stated assumption.**
 

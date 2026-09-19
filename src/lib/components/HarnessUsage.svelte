@@ -15,7 +15,9 @@
   /// must not disappear with it. This panel is where every other piece of
   /// telemetry already lives.
   import { harnessUsage } from "$lib/state/harnessUsage.svelte";
-  import { claudeRateLimitView, codexRateLimitView, type UsageWindow } from "$lib/usageWindows";
+  import { claudeRateLimitView, codexAccountUsageView, type UsageWindow } from "$lib/usageWindows";
+  import { supportsAccountUsageRead } from "$lib/harnessCapabilities";
+  import { requestAccountUsageRefresh } from "$lib/state/accountUsage.svelte";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import {
     formatResetCountdown,
@@ -47,6 +49,25 @@
     measuredAt: string | undefined;
   };
 
+  /// **Opening the panel is the refresh.** This component is mounted only while
+  /// the sidebar is open on this mode, so mounting *is* the moment these meters
+  /// become visible.
+  ///
+  /// It covers a gap nothing else does. A blocked user's bucket renders fine
+  /// until its reset elapses, at which point the reset-passed rule drops it and
+  /// the section empties — exactly while they are watching it to see whether
+  /// they can work again. They are not ending turns, so the turn-end trigger
+  /// never fires and nothing else would refill it.
+  ///
+  /// Not window focus and not a timer: both fire when nobody is looking, and a
+  /// timer would keep a subprocess cadence running for a passive readout.
+  ///
+  /// Reads no reactive state, so it runs once per mount rather than on every
+  /// change to the rows below.
+  $effect(() => {
+    requestAccountUsageRefresh();
+  });
+
   const rows = $derived.by((): Row[] => {
     const now = Date.now();
     const built: Row[] = [];
@@ -54,8 +75,12 @@
       const reading = harnessUsage[harness];
       if (reading === undefined) continue;
       const measuredAt = reading.observed_at;
-      if (harness === "codex") {
-        const windows = codexRateLimitView(reading.payload, now, reading.limit_reached === true);
+      // Selected by capability rather than by name: this branch reads the
+      // account payload, which exists only for a harness Switchboard can ask
+      // directly. Matching on "codex" here would decide by harness name the one
+      // thing the capability mirror exists to decide.
+      if (supportsAccountUsageRead(harness)) {
+        const windows = codexAccountUsageView(reading.payload, now);
         if (windows.length > 0) {
           built.push({ harness, windows, overage: null, fallback: null, measuredAt });
         }

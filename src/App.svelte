@@ -111,6 +111,7 @@
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { loadPreferences, preferences } from "$lib/preferences.svelte";
   import { loadPersistedUsage } from "$lib/state/harnessUsage.svelte";
+  import { requestAccountUsageRefresh } from "$lib/state/accountUsage.svelte";
   import { isReadingMode, toggleReadingMode } from "$lib/state/readingMode.svelte";
   import GitView from "$lib/components/GitView.svelte";
   import {
@@ -470,6 +471,11 @@
     // before any project opens and before any turn runs. Each restored reading is
     // ranked rather than applied, so a live one that lands first still wins.
     void loadPersistedUsage();
+    // And ask the account directly, for a harness that can be asked. The
+    // restored reading above is only as fresh as the last turn that produced
+    // it; this one is current. Fire-and-forget beside the other startup probes
+    // — nothing blocks on it, and every failure is already "no reading".
+    requestAccountUsageRefresh();
     void loadWorkspace()
       .then(() => {
         // A closed sidebar is a legitimate device-local preference while the

@@ -23,13 +23,17 @@ export type UsageWindow = {
   /// Set on the window a refusal applies to, which is the one signal that draws a
   /// meter in the warning tone without the harness having reported a threshold.
   ///
-  /// **How it is established differs per harness, and so does its effect on
-  /// `usedFraction`.** Claude names the blocked window and reports its real
-  /// utilization in the same payload that refuses, so the measurement stands as
-  /// measured. Codex names no window and records no measurement on a refused turn,
-  /// so the window is inferred and drawn full — the last measurement may read 93%
-  /// while the harness has since said no, and a bar still reading 93% beside a
-  /// refusal says the meter is wrong. See each harness's reader for the detail.
+  /// **Both harnesses now state this themselves, and neither measurement is
+  /// overridden.** Claude names the blocked window in the same payload that
+  /// refuses; Codex names it per bucket in `rateLimitReachedType`. Each reports
+  /// that bucket's real utilization alongside, so the number stands as measured
+  /// and only the tone is added.
+  ///
+  /// It used to mean something weaker on Codex — a verdict carried beside the
+  /// reading, attributed by guess to the most-used window and drawn full,
+  /// because the per-turn payload named no window and recorded no measurement
+  /// on a refusal. Reading the account directly removed both the guess and the
+  /// painting.
   limitReached?: true;
 };
 
@@ -216,127 +220,125 @@ export function claudeRateLimitView(
   return { windows, fallback, overage };
 }
 
-/// Label for a Codex rate-limit window, from its `window_minutes` duration
-/// (300 = the ~5-hour primary, 10080 = the weekly secondary) mapped onto the
-/// shared strings above. Unknown/absent durations fall back to "Quota" — a
-/// payload carrying only a bare `used_percent` still reads as a real gauge.
-function codexWindowLabel(windowMinutes: unknown): string {
-  if (windowMinutes === 300) return LABEL_FIVE_HOUR;
-  if (windowMinutes === 10080) return LABEL_WEEKLY_ALL;
-  return "Quota";
-}
-
-/// Whether two Codex rate-limit payloads describe the **same windows**, used to
-/// decide whether a recorded refusal still applies to the snapshot on screen.
+/// Defensive read of Codex's **account quota** payload — the response of
+/// `account/rateLimits/read`, stored under its own wrapping as
+/// `{ordinaryUsageAllowed, rateLimitsByLimitId}`.
 ///
-/// The refusal (`HarnessUsageReading.limit_reached`) is a verdict about a
-/// particular window, not about the harness, and the reading is replaced
-/// independently of it — so without this the verdict can decorate a snapshot it
-/// was never about, drawing a freshly reset quota as spent.
+/// **This replaced a reader that could not tell which quota it held.** Codex's
+/// per-turn rollout reports one bucket under identical identifiers whichever
+/// limit it describes, so the old path had to assert a scope it could not check
+/// and paint a guessed window full on a refusal. Reading the account is what
+/// makes the scope knowable: each bucket declares its model association, and
+/// each states its own exhaustion.
 ///
-/// **Identity is the set of `resets_at` values**, which is what makes the
-/// asymmetry work: a refused turn's own enrichment re-emits the *same*
-/// pre-cap record (`enrichment.rate_limits` is the last window-*bearing*
-/// record in the file, and a refusal appends only windowless ones), so the
-/// refusal survives the `TurnEnd → RateLimitEvent` pair that set it, while a
-/// genuinely new window does not match and clears it.
+/// **Which buckets render: the account-wide ones, identified by having no
+/// associated model.** A bucket carrying a `normalModelSlug` is a
+/// model-specific reserve (the observed one is `gpt-reserve` on
+/// `gpt-5.6-luna`), and showing it beside an account allowance invites reading
+/// a reserve's headroom as the quota that governs ordinary work.
 ///
-/// **An indeterminate identity counts as different**, i.e. clears. A payload
-/// can render meters while reporting no reset time at all — `codexRateLimitView`
-/// keeps such a window deliberately, since staleness can't be proven without
-/// one — and there is no way to tell two reset-less windows apart. Treating
-/// unknown as "same" would let a stale verdict sit on a reset-less window
-/// forever, because the reset-passed gate can never retire it either. The cost
-/// is that on a payload reporting no reset times the refusal never takes
-/// effect; no Codex version we have observed omits them. This is the same
-/// direction taken everywhere else here: understating a quota is safer than
-/// telling someone to stop working.
-export function sameCodexUsageWindows(a: unknown, b: unknown): boolean {
-  const left = codexWindowIdentity(a);
-  return left !== null && left === codexWindowIdentity(b);
-}
-
-/// `resets_at` of every window-bearing key, sorted, or `null` when any of them
-/// is unreadable (see [`sameCodexUsageWindows`] for why unknown is not "same").
-function codexWindowIdentity(payload: unknown): string | null {
-  if (typeof payload !== "object" || payload === null) return null;
-  const resets: number[] = [];
-  for (const key of ["primary", "secondary"] as const) {
-    const w = (payload as Record<string, unknown>)[key];
-    if (typeof w !== "object" || w === null) continue;
-    const ww = w as { used_percent?: unknown; resets_at?: unknown };
-    if (typeof ww.used_percent !== "number") continue;
-    if (typeof ww.resets_at !== "number") return null;
-    resets.push(ww.resets_at);
-  }
-  return resets.length === 0 ? null : resets.sort((x, y) => x - y).join(",");
-}
-
-/// Defensive read of Codex's opaque `last_rate_limit` into its independent
-/// windows (`primary` + `secondary`). Same reset-passed rule as the Claude
-/// reader; a window with no `resets_at` is kept (can't prove it stale — older
-/// Codex shapes and minimal fixtures omit it). Codex rate-limit is
-/// session-file-backed (class B, durable), so there's no snapshot-age
-/// qualifier. Codex reports no threshold flag; the one way a window here
-/// warns is `limitReached`.
+/// Filtering on the model association rather than on `limitId === "codex"` is
+/// deliberate: the identifier is not guaranteed across plans, and this rule
+/// keeps working on a plan carrying both a 5-hour and a weekly account limit —
+/// which is how Claude's section already behaves.
 ///
-/// `limitReached` is the agent's last turn having been refused for the
-/// limit (`FailureKind.usage_limit`). The payload cannot say so itself: a
-/// refused turn records a *windowless* payload (kept out of the snapshot, see
-/// `session_file.rs::rate_limits_carry_window`), so the snapshot still holds
-/// the last measurement — 93%, say — while the harness has since said no.
-///
-/// **The refusal is attributed to one window, the most-used.** Codex reports
-/// that *a* limit was exceeded and never which (`rate_limit_reached_type` is
-/// null even on a 100% record), so flagging every surviving window would tell
-/// a user who exhausted a 5-hour quota that their weekly one is gone too —
-/// days of waiting claimed for an hour of it, which is a worse error than the
-/// stale measurement this flag exists to correct. The most-used window is the
-/// likeliest culprit, not provably the exhausted one: one large turn can push
-/// a short window past its limit from a low last reading while a weekly sits
-/// higher. That mis-picks between two windows rather than condemning both,
-/// and on a single-window payload it cannot mis-pick at all.
-///
-/// The reset-passed gate still applies first: once a window has cycled, the
-/// refusal is as stale as the measurement, and the window drops with it —
-/// which is also why the flag needs no expiry of its own.
-///
-/// `used_percent / 100` is left unrounded. Rounding at the source would make
-/// the rendered percentage byte-match Codex's own TUI at half-percent values,
-/// but nobody compares the two, and the bar and the number should be drawn
-/// from one value rather than from a figure pre-rounded for a different
-/// renderer. Returns `[]` when nothing is displayable.
-export function codexRateLimitView(
-  payload: unknown,
-  nowMs: number,
-  limitReached = false,
-): UsageWindow[] {
+/// **A bucket missing `normalModelSlug` entirely is skipped, not treated as
+/// account-wide.** Were the field renamed upstream, treating absence as "no
+/// model" would promote every reserve into the account section and label it as
+/// an ordinary allowance — reintroducing, in a new place, the exact defect this
+/// milestone removes. Skipping instead renders nothing, which is the direction
+/// taken throughout: say less rather than something wrong.
+export function codexAccountUsageView(payload: unknown, nowMs: number): UsageWindow[] {
   if (typeof payload !== "object" || payload === null) return [];
+  const buckets = (payload as { rateLimitsByLimitId?: unknown }).rateLimitsByLimitId;
+  if (typeof buckets !== "object" || buckets === null) return [];
   const windows: UsageWindow[] = [];
-  for (const key of ["primary", "secondary"] as const) {
-    const w = (payload as Record<string, unknown>)[key];
+  for (const [limitId, bucket] of Object.entries(buckets as Record<string, unknown>)) {
+    if (typeof bucket !== "object" || bucket === null) continue;
+    const b = bucket as {
+      limitName?: unknown;
+      normalModelSlug?: unknown;
+      primary?: unknown;
+      rateLimitReachedType?: unknown;
+    };
+    // Present *and* null — see the note above on why absence is not "null".
+    if (!("normalModelSlug" in b) || b.normalModelSlug !== null) continue;
+    const w = b.primary;
     if (typeof w !== "object" || w === null) continue;
-    const ww = w as { used_percent?: unknown; resets_at?: unknown; window_minutes?: unknown };
-    if (typeof ww.used_percent !== "number") continue;
+    const ww = w as { usedPercent?: unknown; resetsAt?: unknown; windowDurationMins?: unknown };
+    if (typeof ww.usedPercent !== "number") continue;
+    // A windowless bucket is a shape Codex actually emits (`limit_id:
+    // "premium"` arrives with both windows null on a refused turn), so it is
+    // skipped rather than rendered as a bar with no value.
     let resetsAtMs: number | null = null;
-    if (typeof ww.resets_at === "number") {
-      const ms = ww.resets_at * 1000;
-      if (ms <= nowMs) continue; // reset-passed → window cycled, % is stale
+    if (typeof ww.resetsAt === "number") {
+      const ms = ww.resetsAt * 1000;
+      // Reset passed → the window cycled and this percentage describes the
+      // window before it, so the bucket drops while its siblings stay.
+      if (ms <= nowMs) continue;
       resetsAtMs = ms;
     }
     windows.push({
-      key,
-      label: codexWindowLabel(ww.window_minutes),
-      usedFraction: ww.used_percent / 100,
+      key: limitId,
+      label: codexBucketLabel(ww.windowDurationMins, b.limitName),
+      usedFraction: ww.usedPercent / 100,
       resetsAtMs,
+      limitReached: isExhausted(b.rateLimitReachedType, ww.usedPercent) ? true : undefined,
     });
   }
-  if (limitReached && windows.length > 0) {
-    // First wins on a tie, so two equally-used windows attribute
-    // deterministically rather than by key order elsewhere in the payload.
-    const culprit = windows.reduce((a, b) => (b.usedFraction > a.usedFraction ? b : a));
-    culprit.usedFraction = 1;
-    culprit.limitReached = true;
-  }
   return windows;
+}
+
+/// Name an **account-wide** bucket, using the shared cross-harness vocabulary.
+///
+/// **This is the same string Claude's `seven_day` row uses, and that is the
+/// point.** A user reading the two harnesses' rows side by side should be
+/// comparing quantities, not decoding two vocabularies for one idea.
+///
+/// **Why "all models" is a reading of the data here and was an invention
+/// before.** The old rollout path received a single unnamed bucket and could not
+/// tell the account allowance from the model reserve, so calling it "all models"
+/// asserted something that might have been false — that was the original defect.
+/// This reader only ever labels buckets that passed the `normalModelSlug === null`
+/// filter, so the bucket in hand is *by construction* the one with no model
+/// association. The duration is likewise stated by the payload
+/// (`windowDurationMins`), not guessed. Both halves of the label are read rather
+/// than assumed.
+///
+/// Called only for account-wide buckets. Were model-scoped ones ever rendered,
+/// they would take `Weekly · <model>`, exactly as Claude's per-model rows do.
+///
+/// Falls back to Codex's own `limitName` for a duration we do not recognize —
+/// the account-wide bucket carries `limitName: null` in every capture, so this
+/// is for a future shape rather than today's — and to a neutral noun when there
+/// is nothing to go on. What it never does is invent a duration or a scope.
+function codexBucketLabel(windowDurationMins: unknown, limitName: unknown): string {
+  if (windowDurationMins === 10080) return LABEL_WEEKLY_ALL;
+  if (windowDurationMins === 300) return LABEL_FIVE_HOUR;
+  return typeof limitName === "string" && limitName !== "" ? limitName : "Quota";
+}
+
+/// Whether a bucket should draw as exhausted.
+///
+/// Codex states this itself in `rateLimitReachedType`, so the verdict is read
+/// rather than derived — no percentage threshold of ours decides it.
+///
+/// **The `usedPercent > 0` conjunct guards a stale flag on a refreshed window.**
+/// A probe against a recovered account (2026-09-19) found the flag clears on
+/// reset, so this currently guards a shape Codex does not produce; it stays
+/// because it is free and still covers the windowless bucket. Be honest about
+/// two things. It **infers recovery from a percentage**, which the protocol
+/// schema explicitly tells clients not to do — accepted knowingly as the
+/// narrowest guard against a failure mode we cannot rule out from one
+/// observation. And it errs toward **understating** a quota, which is this
+/// codebase's direction throughout: a meter that fails to shout is recoverable,
+/// one that falsely claims you are blocked is not.
+///
+/// Its coverage is narrow and worth stating: it only catches a read taken
+/// before any turn runs in the new window. One turn in, `usedPercent` is a few
+/// percent and a stale flag would sail through. Since a turn ending is itself
+/// what triggers a read, what this reliably protects is the read a *waiting*
+/// user is most likely to be looking at.
+function isExhausted(rateLimitReachedType: unknown, usedPercent: number): boolean {
+  return rateLimitReachedType !== null && rateLimitReachedType !== undefined && usedPercent > 0;
 }

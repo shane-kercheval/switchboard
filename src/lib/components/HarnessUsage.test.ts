@@ -177,12 +177,17 @@ describe("Claude rate-limit fallback (no unifiedWindows)", () => {
     // Claude-shaped payload filed under Codex yields nothing rather than
     // Claude's cells. The gate moved from "which agent card is this" to "which
     // entry is this", and it still has to hold.
-    await renderCodexWithRateLimit({
-      rateLimitType: "five_hour",
-      resetsAt: epochFromNow(4 * 3600),
-      isUsingOverage: true,
-      overageResetsAt: epochFromNow(6 * 86400),
+    usage.observeUsage("codex", {
+      payload: {
+        rateLimitType: "five_hour",
+        resetsAt: epochFromNow(4 * 3600),
+        isUsingOverage: true,
+        overageResetsAt: epochFromNow(6 * 86400),
+      },
+      observed_at: new Date().toISOString(),
     });
+    render(HarnessUsage);
+    await tick();
     expect(screen.queryByTestId("harness-usage-fallback")).toBeNull();
     expect(screen.queryByTestId("harness-usage-overage")).toBeNull();
     expect(screen.queryByTestId("harness-usage-codex")).toBeNull();
@@ -457,167 +462,238 @@ describe("Claude rate-limit tooltip", () => {
   });
 });
 
-async function renderCodexWithRateLimit(info: unknown, refused = false): Promise<void> {
-  usage.observeUsage("codex", { payload: info, observed_at: new Date().toISOString() });
-  if (refused) usage.recordUsageRefusal("codex");
+/// One bucket of the account read's response. Defaults describe the healthy
+/// account-wide shape every capture shows: **unnamed** (`limitName` is null on
+/// the account allowance; only the model reserve carries a name) and carrying no
+/// associated model, which is what marks it account-wide.
+function codexBucket(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    limitId: "codex",
+    limitName: null,
+    normalModelSlug: null,
+    primary: { usedPercent: 42.0, windowDurationMins: 10080, resetsAt: epochFromNow(86_400) },
+    rateLimitReachedType: null,
+    ...overrides,
+  };
+}
+
+/// The account read's payload, wrapped the way it is stored.
+function codexAccount(buckets: Record<string, unknown>): unknown {
+  return { ordinaryUsageAllowed: true, rateLimitsByLimitId: buckets };
+}
+
+async function renderCodexAccountUsage(buckets: Record<string, unknown>): Promise<void> {
+  usage.observeUsage("codex", {
+    payload: codexAccount(buckets),
+    observed_at: new Date().toISOString(),
+  });
   render(HarnessUsage);
   await tick();
 }
 
-/// Codex rate-limit windows — both independent windows (primary ~5-hour +
-/// secondary weekly) surfaced as gauge lines, each labeled from its
-/// `window_minutes` and gated reset-passed. The reset times (incl. the weekly
-/// window, days out) live in the tooltip. Class B (session-file-backed), so no
-/// snapshot-age line. Closes G8 (secondary window + reset times were dropped).
-describe("Codex rate-limit windows", () => {
-  it("renders both windows as meters carrying the harness-shared labels", async () => {
-    await renderCodexWithRateLimit({
-      primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
-      secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
-    });
+/// Codex account quotas — every metered limit the account holds, each named by
+/// Codex and stating its own exhaustion.
+///
+/// This replaced a cell fed by the per-turn rollout, which reported one bucket
+/// under identical identifiers whichever limit it described. That cell had to
+/// name a window from its duration and guess which window a refusal belonged
+/// to; both guesses are gone, and the tests that pinned them went with the
+/// behaviour.
+describe("Codex account quotas", () => {
+  it("renders an account-wide quota as a meter", async () => {
+    await renderCodexAccountUsage({ codex: codexBucket() });
     const meters = screen.getAllByTestId("harness-usage-window");
-    expect(meters).toHaveLength(2);
-    // window_minutes → the same strings the Claude cell uses, not
-    // "primary/secondary" and not a Codex-only vocabulary.
-    expect(meters[0]).toHaveTextContent("5-hour limit");
+    expect(meters).toHaveLength(1);
     expect(meters[0]).toHaveTextContent("42%");
-    expect(meters[1]).toHaveTextContent("Weekly · all models");
-    expect(meters[1]).toHaveTextContent("7%");
   });
 
-  it("renders a bare used_percent as a 'Quota' meter", async () => {
-    // A minimal payload — no duration to name the window — still reads as a
-    // real gauge rather than disappearing.
-    await renderCodexWithRateLimit({ primary: { used_percent: 42.5 } });
-    const meter = screen.getByTestId("harness-usage-window");
-    expect(meter).toHaveTextContent("Quota");
-    expect(meter).toHaveTextContent("43%");
+  it("names a quota from Codex's own field", async () => {
+    await renderCodexAccountUsage({ codex: codexBucket({ limitName: "Weekly" }) });
+    expect(screen.getByTestId("harness-usage-window")).toHaveTextContent("Weekly");
+  });
+
+  it("labels an unnamed account-wide quota in the harness-shared vocabulary", async () => {
+    // The same words Claude's weekly row uses, so the two harnesses' rows can be
+    // read side by side as quantities rather than as two vocabularies. The cell
+    // this replaced showed the same string for the wrong reason: it could not
+    // tell the account allowance from the model reserve, so "all models" was an
+    // assertion. Here it is what passing the account-wide filter means.
+    await renderCodexAccountUsage({ codex: codexBucket() });
+    expect(screen.getByTestId("harness-usage-window")).toHaveTextContent("Weekly · all models");
+  });
+
+  it("hides a model-specific reserve and shows the account-wide quota beside it", async () => {
+    // The live account reports exactly this pair. Showing the reserve invites
+    // reading its 95% headroom as the allowance governing ordinary work.
+    await renderCodexAccountUsage({
+      codex: codexBucket(),
+      base_model_inference: codexBucket({
+        limitId: "base_model_inference",
+        limitName: "gpt-reserve",
+        normalModelSlug: "gpt-5.6-luna",
+        primary: { usedPercent: 5, windowDurationMins: 10080, resetsAt: epochFromNow(86_400) },
+      }),
+    });
+    const meters = screen.getAllByTestId("harness-usage-window");
+    expect(meters).toHaveLength(1);
+    expect(meters[0]).toHaveTextContent("42%");
+    expect(screen.queryByText(/gpt-reserve/)).toBeNull();
+  });
+
+  it("renders two account-wide quotas when the plan carries both", async () => {
+    await renderCodexAccountUsage({
+      five_hour: codexBucket({
+        limitId: "five_hour",
+        primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: epochFromNow(1800) },
+      }),
+      weekly: codexBucket({ limitId: "weekly" }),
+    });
+    // Distinguished by their own window durations, with no name from Codex on
+    // either — which is the case a neutral "Quota" fallback would have rendered
+    // as two identical rows.
+    const meters = screen.getAllByTestId("harness-usage-window");
+    expect(meters).toHaveLength(2);
+    expect(meters[0]).toHaveTextContent("5-hour limit");
+    expect(meters[1]).toHaveTextContent("Weekly · all models");
   });
 
   it("converts Codex's 0-100 percentage to the meter's used fraction", async () => {
-    // The conversion happens at the derivation boundary so the meter only ever
-    // sees a 0-1 fraction; a missed division would fill the bar at 4200%.
-    await renderCodexWithRateLimit({
-      primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
-    });
+    // A missed division would fill the bar at 4200%.
+    await renderCodexAccountUsage({ codex: codexBucket() });
     expect(screen.getByTestId("harness-usage-window-fill")).toHaveStyle({ width: "42.0%" });
   });
 
-  it("hides a window whose reset has passed (reset-passed), keeps the live one", async () => {
-    await renderCodexWithRateLimit({
-      primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(-3600) },
-      secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
+  it("hides a quota whose reset has passed, keeps the live one", async () => {
+    await renderCodexAccountUsage({
+      stale: codexBucket({
+        limitId: "stale",
+        primary: { usedPercent: 99, windowDurationMins: 300, resetsAt: epochFromNow(-3600) },
+      }),
+      live: codexBucket({ limitId: "live" }),
     });
     const meters = screen.getAllByTestId("harness-usage-window");
     expect(meters).toHaveLength(1);
     expect(meters[0]).toHaveTextContent("Weekly · all models");
-    expect(meters[0]).toHaveTextContent("7%");
+  });
+
+  it("skips a windowless quota", async () => {
+    // Observed on a refused turn: a bucket arrives with its windows null. A bar
+    // with no value is worse than no bar.
+    await renderCodexAccountUsage({ premium: codexBucket({ primary: null }) });
+    expect(screen.queryByTestId("harness-usage")).toBeNull();
   });
 
   it("surfaces reset times in the tooltip, not the inline gauge", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
-      await renderCodexWithRateLimit({
-        primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
-        secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
-      });
+      await renderCodexAccountUsage({ codex: codexBucket() });
       await fireEvent.pointerEnter(screen.getByTestId("harness-usage-codex"));
       await vi.advanceTimersByTimeAsync(500);
       const detail = await waitFor(() => screen.getByTestId("harness-usage-detail-codex"));
-      expect(detail).toHaveTextContent(/5-hour limit\s+42% used\s+Resets/);
-      expect(detail).toHaveTextContent(/Weekly · all models\s+7% used\s+Resets/);
+      expect(detail).toHaveTextContent(/Weekly · all models\s+42% used\s+Resets/);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("draws the window full and amber after Codex refused the agent's last turn", async () => {
-    // The last measurement said 93%; the refusal says the window is used up.
-    // The bar shows the verdict, since that is the number the user just hit.
-    await renderCodexWithRateLimit(
-      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: epochFromNow(86_400) } },
-      true,
-    );
+  it("draws a quota amber when Codex reports it exhausted, without inflating the number", async () => {
+    // The bar shows what Codex measured. The cell this replaced overwrote the
+    // measurement with 100%, because the per-turn payload recorded no number on
+    // a refusal and the stale one would have contradicted the refusal beside it.
+    await renderCodexAccountUsage({
+      codex: codexBucket({
+        primary: { usedPercent: 97, windowDurationMins: 10080, resetsAt: epochFromNow(86_400) },
+        rateLimitReachedType: "rate_limit_reached",
+      }),
+    });
     const meter = screen.getByTestId("harness-usage-window");
-    expect(meter).toHaveTextContent("Weekly · all models");
-    expect(meter).toHaveTextContent("100%");
-    expect(screen.getByTestId("harness-usage-window-fill")).toHaveStyle({ width: "100.0%" });
+    expect(meter).toHaveTextContent("97%");
     expect(screen.getByTestId("harness-usage-window-fill")).toHaveClass("bg-warning");
   });
 
-  it("explains the full bar in the tooltip", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    try {
-      await renderCodexWithRateLimit(
-        { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: epochFromNow(86_400) } },
-        true,
-      );
-      await fireEvent.pointerEnter(screen.getByTestId("harness-usage-codex"));
-      await vi.advanceTimersByTimeAsync(500);
-      const detail = await waitFor(() => screen.getByTestId("harness-usage-detail-codex"));
-      expect(detail).toHaveTextContent("100% used");
-      // No sentence explaining the refusal: a full bar in the warning tone is
-      // the statement, and spelling it out underneath was over-explaining.
-      expect(screen.queryByTestId("harness-usage-refused")).toBeNull();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("leaves the measurement as it was when no refusal is standing", async () => {
-    await renderCodexWithRateLimit(
-      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: epochFromNow(86_400) } },
-      false,
-    );
-    expect(screen.getByTestId("harness-usage-window")).toHaveTextContent("93%");
-    expect(screen.getByTestId("harness-usage-window-fill")).not.toHaveClass("bg-warning");
-  });
-
-  it("marks only the most-used window, not every window the plan reports", async () => {
-    // Codex says *a* limit was hit, never which. Flagging both would tell a
-    // user who burned a 5-hour quota that their weekly one is gone too —
-    // days claimed for an hour.
-    await renderCodexWithRateLimit(
-      {
-        primary: { used_percent: 99.0, window_minutes: 300, resets_at: epochFromNow(1800) },
-        secondary: { used_percent: 30.0, window_minutes: 10080, resets_at: epochFromNow(86_400) },
-      },
-      true,
-    );
-    const meters = screen.getAllByTestId("harness-usage-window");
-    expect(meters).toHaveLength(2);
-    expect(meters[0]).toHaveTextContent("5-hour limit");
-    expect(meters[0]).toHaveTextContent("100%");
-    expect(meters[1]).toHaveTextContent("Weekly · all models");
-    expect(meters[1]).toHaveTextContent("30%");
+  it("flags only the quota that reports itself exhausted", async () => {
+    // Each bucket carries its own verdict, so a spent 5-hour quota cannot
+    // condemn the weekly one — days of waiting claimed for an hour of it, which
+    // is what the old most-used guess risked on every refusal.
+    await renderCodexAccountUsage({
+      five_hour: codexBucket({
+        limitId: "five_hour",
+        primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: epochFromNow(1800) },
+        rateLimitReachedType: "rate_limit_reached",
+      }),
+      weekly: codexBucket({
+        limitId: "weekly",
+        primary: { usedPercent: 30, windowDurationMins: 10080, resetsAt: epochFromNow(86_400) },
+      }),
+    });
     const fills = screen.getAllByTestId("harness-usage-window-fill");
+    expect(fills).toHaveLength(2);
     expect(fills[0]).toHaveClass("bg-warning");
     expect(fills[1]).not.toHaveClass("bg-warning");
   });
 
-  it("states the refusal inline, without waiting for a hover", async () => {
-    // This replaces a collapsed-card warning line that existed because the
-    // meters used to live on a card that could be collapsed. The section has no
-    // collapsed state, so the claim it protected — a refusal is legible without
-    // hovering — now belongs to the meter itself: full bar, warning tone, and the
-    // percentage in the row.
-    await renderCodexWithRateLimit(
-      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: epochFromNow(86_400) } },
-      true,
-    );
+  it("leaves a healthy quota in the neutral tone", async () => {
+    await renderCodexAccountUsage({ codex: codexBucket({ primary: { usedPercent: 93 } }) });
+    expect(screen.getByTestId("harness-usage-window")).toHaveTextContent("93%");
+    expect(screen.getByTestId("harness-usage-window-fill")).not.toHaveClass("bg-warning");
+  });
+
+  it("states exhaustion inline, without waiting for a hover", async () => {
+    // The section has no collapsed state, so the claim a warning line used to
+    // carry belongs to the meter itself: the percentage and the tone in the row.
+    await renderCodexAccountUsage({
+      codex: codexBucket({
+        primary: { usedPercent: 100, resetsAt: epochFromNow(86_400) },
+        rateLimitReachedType: "rate_limit_reached",
+      }),
+    });
     const meter = screen.getByTestId("harness-usage-window");
-    expect(meter).toHaveTextContent("Weekly · all models");
     expect(meter).toHaveTextContent("100%");
     expect(screen.getByTestId("harness-usage-window-fill")).toHaveClass("bg-warning");
   });
 
+  it("renders nothing for a Codex entry still holding the old rollout shape", async () => {
+    // An entry persisted before this cut carries `{primary, secondary}` at the
+    // top level with no bucket map. It is structurally unreadable by this view,
+    // which is the point: the old keys are not iterated as if they were buckets,
+    // so nothing renders a quota named "primary". The next read supersedes it.
+    usage.observeUsage("codex", {
+      payload: {
+        primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
+        secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
+      },
+      observed_at: new Date().toISOString(),
+    });
+    render(HarnessUsage);
+    await tick();
+    expect(screen.queryByTestId("harness-usage-codex")).toBeNull();
+    expect(screen.queryByText(/primary/i)).toBeNull();
+  });
+
+  it("renders a Claude entry beside an unreadable old-shape Codex one", async () => {
+    // The loader is harness-agnostic, so an unreadable Codex entry must not
+    // take the Claude row down with it.
+    usage.observeUsage("codex", {
+      payload: { primary: { used_percent: 42.0, resets_at: epochFromNow(3600) } },
+      observed_at: new Date().toISOString(),
+    });
+    usage.observeUsage("claude_code", {
+      payload: {
+        status: "allowed",
+        unifiedWindows: { five_hour: { utilization: 0.28, resetsAt: epochFromNow(3600) } },
+      },
+      observed_at: new Date().toISOString(),
+    });
+    render(HarnessUsage);
+    await tick();
+    expect(screen.queryByTestId("harness-usage-codex")).toBeNull();
+    expect(screen.getByTestId("harness-usage-claude_code")).toBeInTheDocument();
+  });
+
   it("Claude agent never shows the Codex gauge cell (Codex-gated)", async () => {
-    await renderClaudeWithRateLimit(
-      { primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) } },
-      null,
-    );
-    // Claude reads its own shape (isUsingOverage/resetsAt), not Codex's
-    // primary.used_percent — so the Codex gauge cell must not appear.
+    await renderClaudeWithRateLimit(codexAccount({ codex: codexBucket() }), null);
+    // Claude reads its own shape, not the account bucket map — so the Codex
+    // gauge cell must not appear.
     expect(screen.queryByTestId("harness-usage-codex")).toBeNull();
   });
 });
@@ -640,9 +716,7 @@ describe("HarnessUsage with nothing to report", () => {
     // A harness with no reading is absent rather than shown as empty or zero. A
     // zero meter would be a claim we cannot make: no reading is not 0% used.
     usage.observeUsage("codex", {
-      payload: {
-        primary: { used_percent: 12, window_minutes: 10080, resets_at: epochFromNow(86_400) },
-      },
+      payload: codexAccount({ codex: codexBucket({ primary: { usedPercent: 12 } }) }),
       observed_at: new Date().toISOString(),
     });
     render(HarnessUsage);
@@ -657,9 +731,9 @@ describe("HarnessUsage with nothing to report", () => {
     // meeting the empty case: the section disappears rather than showing a
     // harness label with no meter under it.
     usage.observeUsage("codex", {
-      payload: {
-        primary: { used_percent: 99, window_minutes: 10080, resets_at: epochFromNow(-60) },
-      },
+      payload: codexAccount({
+        codex: codexBucket({ primary: { usedPercent: 99, resetsAt: epochFromNow(-60) } }),
+      }),
       observed_at: new Date().toISOString(),
     });
     render(HarnessUsage);
@@ -686,9 +760,7 @@ describe("HarnessUsage for a reading with no measured instant", () => {
     // reading is still worth showing; its age is not knowable, so nothing is
     // said about it rather than a fabricated date being rendered.
     usage.observeUsage("codex", {
-      payload: {
-        primary: { used_percent: 41, window_minutes: 10080, resets_at: epochFromNow(86_400) },
-      },
+      payload: codexAccount({ codex: codexBucket({ primary: { usedPercent: 41 } }) }),
     });
     render(HarnessUsage);
     await tick();
@@ -708,9 +780,7 @@ describe("HarnessUsage percentage alignment", () => {
     // The rows read as one stacked list, so a full window on one harness has to
     // widen the column on the other or their detail text stops lining up.
     usage.observeUsage("codex", {
-      payload: {
-        primary: { used_percent: 100, window_minutes: 10080, resets_at: epochFromNow(86_400) },
-      },
+      payload: codexAccount({ codex: codexBucket({ primary: { usedPercent: 100 } }) }),
       observed_at: new Date().toISOString(),
     });
     usage.observeUsage("claude_code", {
@@ -729,9 +799,7 @@ describe("HarnessUsage percentage alignment", () => {
 
   it("does not indent a section that never reaches three digits", async () => {
     usage.observeUsage("codex", {
-      payload: {
-        primary: { used_percent: 93, window_minutes: 10080, resets_at: epochFromNow(86_400) },
-      },
+      payload: codexAccount({ codex: codexBucket({ primary: { usedPercent: 93 } }) }),
       observed_at: new Date().toISOString(),
     });
     render(HarnessUsage);

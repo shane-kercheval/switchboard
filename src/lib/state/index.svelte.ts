@@ -65,12 +65,12 @@ import {
 } from "./sendCompletion";
 import type { AgentRuntime, PendingSend, RuntimeMap, ToolCall, TranscriptMap, Turn } from "./types";
 import {
-  clearUsageRefusal,
   nameUsageModel,
   observeUsage,
-  recordUsageRefusal,
   _testing as usageTesting,
 } from "$lib/state/harnessUsage.svelte";
+import { requestAccountUsageRefresh } from "$lib/state/accountUsage.svelte";
+import { supportsAccountUsageRead } from "$lib/harnessCapabilities";
 
 /// Per-agent turn lists, keyed by `agent_id`. The unified-view renderer
 /// merges across all agents at render time:
@@ -429,6 +429,12 @@ export function applyAgentHydrate(
 function recordRestoredUsage(agentId: AgentId, hydrate: Required<Hydrate>): void {
   const harness = agentHarness.get(agentId);
   if (harness === undefined || hydrate.last_rate_limit == null) return;
+  // **A harness we can ask does not get restored from a rollout.** The account
+  // read returns every limit named; a restored Codex reading is the one-unnamed-
+  // bucket shape this work replaced, and it is stamped with the harness's own
+  // measurement instant, so it would routinely outrank a *correct* live reading
+  // and put the old shape back on screen at project open.
+  if (supportsAccountUsageRead(harness)) return;
   observeUsage(harness, {
     payload: hydrate.last_rate_limit,
     // The measured instant when the harness recorded one, else the snapshot's
@@ -982,6 +988,12 @@ function recordAccountUsage(agentId: AgentId, event: NormalizedEvent, receivedAt
   const harness = agentHarness.get(agentId);
   if (harness === undefined) return;
   if (event.type === "rate_limit_event") {
+    // Same cut as the restored path, and it has to happen here rather than
+    // waiting for the backend emission to go: this reading is stamped with
+    // *arrival* time, so it wins newest-wins against the account read every
+    // single turn. Leaving it connected would clean-hide the Codex section
+    // after every turn for as long as both paths coexist.
+    if (supportsAccountUsageRead(harness)) return;
     observeUsage(harness, {
       payload: event.info,
       // Arrival time, not a measured instant: a live reading is current by
@@ -1005,17 +1017,16 @@ function recordAccountUsage(agentId: AgentId, event: NormalizedEvent, receivedAt
     // than dropping the label, which is the alternative.
     nameUsageModel(harness, runtimes[agentId]?.current_turn_model);
   } else if (event.type === "turn_end") {
-    // **Terminal before reading.** `emit_terminal_with_enrichment` emits `TurnEnd`
-    // ahead of the post-terminal `RateLimitEvent`, so a refusal recorded here
-    // attaches to the reading that *preceded* the refused turn. It survives the
-    // event that immediately follows only because that event re-reports the same
-    // windows and `observeUsage` carries the verdict across a matching reading.
-    // Reordering those two emissions would silently retire every refusal.
-    if (event.outcome.status === "completed") {
-      clearUsageRefusal(harness);
-    } else if (event.outcome.status === "failed" && event.outcome.kind === "usage_limit") {
-      recordUsageRefusal(harness);
-    }
+    // **Every outcome triggers a refresh, not just a completed one.** A turn
+    // that failed or was cancelled still consumed whatever it ran before
+    // stopping, and a turn refused *for* the quota is the moment the number is
+    // most wrong on screen. The read costs no quota and no model call, so there
+    // is nothing to save by being selective.
+    //
+    // This replaced a pair of refusal bookkeepers that inferred exhaustion from
+    // the turn's outcome, because the per-turn payload could not say which quota
+    // had refused. Asking the account answers it directly.
+    if (supportsAccountUsageRead(harness)) requestAccountUsageRefresh();
   }
 }
 

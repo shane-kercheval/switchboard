@@ -13,7 +13,6 @@
 /// there is no second copy to disagree with this one.
 import { invoke } from "@tauri-apps/api/core";
 import type { HarnessKind } from "$lib/types";
-import { sameCodexUsageWindows } from "$lib/usageWindows";
 
 /// One harness account's newest reading.
 export type HarnessUsageReading = {
@@ -42,15 +41,6 @@ export type HarnessUsageReading = {
   /// Model of the turn that delivered the reading, which is what names Claude's
   /// model-gated weekly window — the payload never names it itself.
   model?: string;
-  /// Whether the harness is currently refusing work because a window in this
-  /// reading is exhausted.
-  ///
-  /// **Needed only for a harness whose payload cannot say so.** Codex records a
-  /// windowless payload on a refused turn and names no window, so the verdict has
-  /// to be carried beside the reading. Claude states it in the payload itself, so
-  /// nothing sets this for Claude and `usageWindows.ts` reads Claude's own
-  /// status instead.
-  limit_reached?: boolean;
 };
 
 /// Keyed by harness. Partial because a harness contributes an entry only once one
@@ -86,39 +76,17 @@ function isNewer(candidate: string | undefined, stored: string | undefined): boo
 
 /// Record a reading, keeping it only if nothing newer is already held.
 ///
-/// The refusal verdict is carried forward **only when the new reading describes
-/// the same windows**. A verdict is a judgment about a particular window, so a
-/// reading describing different windows retires it along with the window it
-/// judged. Without that, a stale verdict paints a freshly reset quota as spent,
-/// which the reset-passed gate cannot correct because the new window is current.
-/// A refused turn's own reading re-reports the same windows, which is what lets
-/// the verdict survive the sequence that set it.
+/// **Nothing is carried across readings.** A reading used to drag a separately
+/// recorded refusal verdict forward whenever it described the same windows,
+/// because Codex's per-turn payload could not say which quota had refused. Both
+/// harnesses now state exhaustion inside the payload, per window, so a reading
+/// is self-describing and superseding it retires its verdict with it.
 export function observeUsage(harness: HarnessKind, reading: HarnessUsageReading): void {
   const stored = harnessUsage[harness];
   // Nothing held yet takes the reading whatever its instant; ranking only decides
   // between two readings that both exist.
   if (stored !== undefined && !isNewer(reading.observed_at, stored.observed_at)) return;
-  const carried =
-    stored?.limit_reached === true && sameCodexUsageWindows(stored.payload, reading.payload);
-  harnessUsage[harness] = carried ? { ...reading, limit_reached: true } : reading;
-  persist();
-}
-
-/// Record that the harness refused a turn because a quota is exhausted.
-///
-/// Attaches to the reading already held rather than creating an entry: the
-/// verdict is *about* a reading, and a refusal with no measurement to attach to
-/// has no window to mark.
-///
-/// Usually there is one, because the reading that preceded the refusal is still
-/// the newest window-bearing record on disk. **Not always**: an agent whose
-/// rollout contains only the refused turn has no window-bearing record at all, so
-/// no reading was ever emitted and the refusal is dropped. That shows no meter
-/// rather than a wrong one, which is the direction this code takes throughout.
-export function recordUsageRefusal(harness: HarnessKind): void {
-  const stored = harnessUsage[harness];
-  if (stored === undefined || stored.limit_reached === true) return;
-  harnessUsage[harness] = { ...stored, limit_reached: true };
+  harnessUsage[harness] = reading;
   persist();
 }
 
@@ -134,20 +102,6 @@ export function nameUsageModel(harness: HarnessKind, model: string | undefined):
   const stored = harnessUsage[harness];
   if (stored === undefined || stored.model !== undefined) return;
   harnessUsage[harness] = { ...stored, model };
-  persist();
-}
-
-/// Clear the refusal verdict after a turn completes.
-///
-/// **Only a completed turn clears it.** A cancellation is the user's own doing
-/// and an unrelated failure is no evidence the quota moved, so neither is taken
-/// as proof the harness is serving work again. Clearing on either reproduces, on
-/// a slower clock, the flicker that came from deriving this from the last error.
-export function clearUsageRefusal(harness: HarnessKind): void {
-  const stored = harnessUsage[harness];
-  if (stored === undefined || stored.limit_reached !== true) return;
-  const { limit_reached: _limitReached, ...rest } = stored;
-  harnessUsage[harness] = rest;
   persist();
 }
 
@@ -195,7 +149,6 @@ function asReading(value: unknown): HarnessUsageReading | null {
     payload: v.payload,
     observed_at: typeof v.observed_at === "string" ? v.observed_at : undefined,
     model: typeof v.model === "string" ? v.model : undefined,
-    limit_reached: v.limit_reached === true ? true : undefined,
   };
 }
 

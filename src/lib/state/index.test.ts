@@ -36,6 +36,9 @@ async function loadState() {
 /// `_testing.reset()`, so no separate teardown here.
 const usage = await import("./harnessUsage.svelte");
 
+/// The self-refreshing account read, for asserting *whether* it was asked.
+const accountUsage = await import("./accountUsage.svelte");
+
 function agentRecord(
   id: string,
   name = "test",
@@ -208,6 +211,89 @@ describe("event routing", () => {
     // it describes belongs to the harness account this agent happens to use.
     expect(usage.harnessUsage.claude_code?.payload).toEqual({ primary: { used_percent: 30 } });
     expect(state.transcripts[AGENT_A]).toEqual([]);
+  });
+});
+
+/// The Codex quota cut. Codex's per-turn reading is replaced by an account read
+/// that names every limit; these pin that the old path is disconnected at both
+/// frontend entry points and that the new one is triggered.
+///
+/// **The cut has to happen with the replacement, not after the backend stops
+/// emitting.** A live Codex reading is stamped with *arrival* time, so it wins
+/// newest-wins against the account read on every single turn. Left connected, it
+/// would overwrite the account payload after every turn and the Codex section
+/// would clean-hide — worse than the bug being fixed.
+describe("Codex account usage", () => {
+  it("does not route a Codex rate-limit event into the store", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cx", "codex"));
+    fireTo(`agent:${AGENT_A}`, {
+      type: "rate_limit_event",
+      agent_id: AGENT_A,
+      info: { primary: { used_percent: 30 } },
+    });
+    expect(usage.harnessUsage.codex).toBeUndefined();
+  });
+
+  it("still routes a Claude rate-limit event", async () => {
+    // The cut is per harness, not a blanket disconnect: Claude has no account
+    // read, so its per-turn reading is the only reading it has.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_B, "cc", "claude_code"));
+    fireTo(`agent:${AGENT_B}`, {
+      type: "rate_limit_event",
+      agent_id: AGENT_B,
+      info: { primary: { used_percent: 30 } },
+    });
+    expect(usage.harnessUsage.claude_code?.payload).toEqual({ primary: { used_percent: 30 } });
+  });
+
+  it("asks the account for a reading when a Codex turn ends", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cx", "codex"));
+    invokeMock.mockClear();
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:05Z",
+    });
+    await accountUsage._testing.settled();
+    expect(invokeMock).toHaveBeenCalledWith("read_codex_account_usage", undefined);
+  });
+
+  it("asks after a failed turn too, not only a completed one", async () => {
+    // A turn refused *for* the quota is the moment the number on screen is most
+    // wrong, and a turn that failed partway still consumed what it ran. The read
+    // costs no quota and no model call, so there is nothing to save by being
+    // selective.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cx", "codex"));
+    invokeMock.mockClear();
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "failed", kind: "usage_limit", message: "nope" },
+      ended_at: "2026-05-15T00:00:05Z",
+    });
+    await accountUsage._testing.settled();
+    expect(invokeMock).toHaveBeenCalledWith("read_codex_account_usage", undefined);
+  });
+
+  it("does not ask when a Claude turn ends", async () => {
+    // Gated on the capability, not on the harness name — Claude has no account
+    // to ask, so a read here would spawn a Codex subprocess for a Claude turn.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_B, "cc", "claude_code"));
+    invokeMock.mockClear();
+    fireTo(`agent:${AGENT_B}`, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:05Z",
+    });
+    await accountUsage._testing.settled();
+    expect(invokeMock).not.toHaveBeenCalledWith("read_codex_account_usage", undefined);
   });
 });
 
@@ -1303,6 +1389,26 @@ describe("hydrateAgent", () => {
 
     await state.hydrateAgent(AGENT_A);
     expect(usage.harnessUsage.claude_code?.model).toBe("claude-fable-5-1");
+  });
+
+  it("does not restore a Codex reading from the rollout snapshot", async () => {
+    // The restored shape is the one-unnamed-bucket payload the account read
+    // replaces, and it is stamped with the harness's own measurement instant —
+    // so it would routinely outrank a *correct* live reading and put the old
+    // shape back on screen at project open.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cx", "codex"));
+
+    invokeMock.mockResolvedValueOnce({
+      turns: [],
+      meta: null,
+      last_rate_limit: { primary: { used_percent: 93, resets_at: 1_800_000_000 } },
+      last_rate_limit_observed_at: "2026-09-17T12:00:00Z",
+      warnings: [],
+    });
+
+    await state.hydrateAgent(AGENT_A);
+    expect(usage.harnessUsage.codex).toBeUndefined();
   });
 
   it("a live inventory that lands before hydration resolves never inherits the snapshot's age", async () => {

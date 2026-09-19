@@ -11,7 +11,7 @@ describe("Meter", () => {
         value: 0.6,
         detail: "120k / 200k",
         separateDetail: true,
-        alignPercentage: true,
+        percentDigits: 2,
         testid: "m",
       },
     });
@@ -79,5 +79,39 @@ describe("Meter", () => {
     // No test id in, none out — the fill is not separately addressable, which
     // keeps a call site from depending on an id it never declared.
     expect(document.querySelector("[data-testid$='-fill']")).toBeNull();
+  });
+});
+
+/// The percentage column is reserved for **digits only**, because the percent
+/// sign is wider than a digit even under `tabular-nums` and a `ch` reservation
+/// that included it could not be exact.
+describe("Meter percentage column", () => {
+  function percentBox(testid: string): HTMLElement {
+    const meter = screen.getByTestId(testid);
+    const box = meter.querySelector<HTMLElement>("[style*='min-width']");
+    if (box === null) throw new Error("expected a reserved percentage box");
+    return box;
+  }
+
+  it("reserves the requested number of digits and right-aligns within it", () => {
+    render(Meter, { props: { label: "Weekly", value: 0.7, percentDigits: 3, testid: "m" } });
+    const box = percentBox("m");
+    expect(box).toHaveStyle({ minWidth: "3ch" });
+    expect(box).toHaveClass("text-right");
+    expect(box).toHaveTextContent("70");
+  });
+
+  it("keeps the percent sign outside the reserved box", () => {
+    // Inside it, a three-digit value would overflow the reservation and drag the
+    // rest of the row left, which is the misalignment this shape removes.
+    render(Meter, { props: { label: "Weekly", value: 1, percentDigits: 3, testid: "m" } });
+    expect(percentBox("m")).toHaveTextContent("100");
+    expect(screen.getByTestId("m")).toHaveTextContent("100%");
+  });
+
+  it("reserves nothing when the call site is not aligning a group", () => {
+    render(Meter, { props: { label: "Weekly", value: 0.7, testid: "m" } });
+    expect(screen.getByTestId("m").querySelector("[style*='min-width']")).toBeNull();
+    expect(screen.getByTestId("m")).toHaveTextContent("70%");
   });
 });

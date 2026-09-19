@@ -9,7 +9,7 @@
   /// No tooltip inside: some call sites want one carrying reset dates or
   /// snapshot age, others want none, and a primitive that owned hover would
   /// force the question. Wrap it where you need it.
-  import { cn, formatUsedPercent } from "$lib/utils";
+  import { cn, formatUsedPercent, usedPercentDigits } from "$lib/utils";
 
   type Tone = "neutral" | "warning";
 
@@ -25,8 +25,19 @@
     detail?: string;
     /// Visually separate the detail from the percentage with a middle dot.
     separateDetail?: boolean;
-    /// Reserve a right-aligned percentage column for comparable meter rows.
-    alignPercentage?: boolean;
+    /// Reserve a right-aligned column this many **digits** wide for the
+    /// percentage, so a group of meters lines up. Absent means no reservation.
+    ///
+    /// **Digits, not characters, and supplied by the caller rather than assumed.**
+    /// The percent sign is wider than a digit even under `tabular-nums`, so a
+    /// reservation that includes it cannot be expressed exactly in `ch` — the
+    /// previous fixed four-character column fitted "70%" and was overflowed by
+    /// "100%", which pushed that row's detail text left of its neighbours'. The
+    /// sign is rendered outside the reserved box, leaving only tabular digits
+    /// inside, where `ch` is exact. The caller passes the widest digit count in
+    /// its group so a group that never reaches three digits is not indented for
+    /// a value it does not contain.
+    percentDigits?: number;
     /// `warning` fills with the caution token. Reserved for a threshold the
     /// harness itself reports having passed — not a percentage we pick, which
     /// would make the same occupancy alarming on one harness and calm on
@@ -42,7 +53,7 @@
     value,
     detail,
     separateDetail = false,
-    alignPercentage = false,
+    percentDigits,
     tone = "neutral",
     testid,
     class: className,
@@ -72,9 +83,18 @@
           <span>{detail}</span>
           {#if separateDetail}<span aria-hidden="true">·</span>{/if}
         {/if}
-        <span class={alignPercentage ? "min-w-[4ch] text-right" : undefined}
-          >{formatUsedPercent(value)}</span
-        >
+        {#if percentDigits === undefined}
+          <span>{formatUsedPercent(value)}</span>
+        {:else}
+          <!-- The width is computed per group, so it cannot be a Tailwind class:
+               Tailwind scans for whole class strings and never generates a
+               composed one. `inline-block` is what lets a min-width apply. -->
+          <span class="whitespace-nowrap"
+            ><span class="inline-block text-right" style:min-width="{percentDigits}ch"
+              >{usedPercentDigits(value)}</span
+            >%</span
+          >
+        {/if}
       </span>
     </div>
     <div class="bg-active h-1 w-full overflow-hidden rounded">

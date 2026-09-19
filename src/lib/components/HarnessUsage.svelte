@@ -22,6 +22,7 @@
     formatResetDateTime,
     formatUsedPercent,
     relativeTime,
+    usedPercentDigits,
   } from "$lib/utils";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Meter from "$lib/components/ui/Meter.svelte";
@@ -80,6 +81,23 @@
     }
     return built;
   });
+
+  /// Width of the percentage column, in digits, taken from the widest value
+  /// **across the whole section** rather than per harness. The rows read as one
+  /// stacked list, so a three-digit reading on one harness has to widen the
+  /// column on the other or their detail text stops lining up. Computed rather
+  /// than fixed at three so a section that never reaches 100% is not permanently
+  /// indented for a value it does not contain.
+  const percentDigits = $derived(
+    Math.max(
+      1,
+      ...rows.flatMap((row) =>
+        row.windows
+          .filter((w) => Number.isFinite(w.usedFraction))
+          .map((w) => usedPercentDigits(w.usedFraction).length),
+      ),
+    ),
+  );
 </script>
 
 {#if rows.length > 0}
@@ -115,7 +133,7 @@
                   value={w.usedFraction}
                   detail={w.resetsAtMs === null ? undefined : formatResetCountdown(w.resetsAtMs)}
                   separateDetail
-                  alignPercentage
+                  {percentDigits}
                   tone={w.surpassedThreshold === undefined && w.limitReached === undefined
                     ? "neutral"
                     : "warning"}

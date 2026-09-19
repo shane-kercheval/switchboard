@@ -696,3 +696,46 @@ describe("HarnessUsage for a reading with no measured instant", () => {
     expect(screen.queryByTestId("harness-usage-measured")).toBeNull();
   });
 });
+
+describe("HarnessUsage percentage alignment", () => {
+  function reservedWidths(): string[] {
+    return Array.from(document.querySelectorAll<HTMLElement>("[style*='min-width']")).map(
+      (el) => el.style.minWidth,
+    );
+  }
+
+  it("widens the column for every row once any reading reaches three digits", async () => {
+    // The rows read as one stacked list, so a full window on one harness has to
+    // widen the column on the other or their detail text stops lining up.
+    usage.observeUsage("codex", {
+      payload: {
+        primary: { used_percent: 100, window_minutes: 10080, resets_at: epochFromNow(86_400) },
+      },
+      observed_at: new Date().toISOString(),
+    });
+    usage.observeUsage("claude_code", {
+      payload: {
+        status: "allowed",
+        unifiedWindows: { five_hour: { utilization: 0.28, resetsAt: epochFromNow(3600) } },
+      },
+      observed_at: new Date().toISOString(),
+    });
+    render(HarnessUsage);
+    await tick();
+    const widths = reservedWidths();
+    expect(widths).toHaveLength(2);
+    expect(new Set(widths)).toEqual(new Set(["3ch"]));
+  });
+
+  it("does not indent a section that never reaches three digits", async () => {
+    usage.observeUsage("codex", {
+      payload: {
+        primary: { used_percent: 93, window_minutes: 10080, resets_at: epochFromNow(86_400) },
+      },
+      observed_at: new Date().toISOString(),
+    });
+    render(HarnessUsage);
+    await tick();
+    expect(reservedWidths()).toEqual(["2ch"]);
+  });
+});

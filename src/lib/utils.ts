@@ -174,12 +174,21 @@ export function formatTokens(n: number): string {
   return `${scaledCount(n / 1_000_000)}M`;
 }
 
+/// The digits of a used percentage, without the sign. Split out from
+/// [`formatUsedPercent`] so a column can be reserved for the **number** alone:
+/// `tabular-nums` equalises digit widths, so a `ch`-based reservation is exact
+/// for digits and wrong the moment the percent sign is inside it. Callers that
+/// align a column also use this to find the widest value in their group.
+export function usedPercentDigits(value: number): string {
+  return (value * 100).toFixed(0);
+}
+
 /// The one place a used fraction becomes a percentage string. `value` is 0–1
 /// **used** (never remaining — see `Meter`'s `value` doc). Deliberately not
 /// clamped: a source reporting over-100% usage is saying something true, and
 /// only the bar's fill width clamps.
 export function formatUsedPercent(value: number): string {
-  return `${(value * 100).toFixed(0)}%`;
+  return `${usedPercentDigits(value)}%`;
 }
 
 /// Full date and time for a usage window's reset, where a countdown is too

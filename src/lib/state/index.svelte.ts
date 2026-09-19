@@ -46,6 +46,7 @@ import type {
   AgentRecord,
   Attachment,
   FailureKind,
+  HarnessKind,
   Hydrate,
   MessageId,
   NormalizedEvent,
@@ -63,6 +64,12 @@ import {
   settleTurn,
 } from "./sendCompletion";
 import type { AgentRuntime, PendingSend, RuntimeMap, ToolCall, TranscriptMap, Turn } from "./types";
+import {
+  clearUsageRefusal,
+  nameUsageModel,
+  observeUsage,
+  recordUsageRefusal,
+} from "$lib/state/harnessUsage.svelte";
 
 /// Per-agent turn lists, keyed by `agent_id`. The unified-view renderer
 /// merges across all agents at render time:
@@ -214,6 +221,16 @@ export function setDispatchFailedHook(hook: DispatchFailedHook | undefined): () 
 // resources (channel handles).
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const listenerRegistry = new Map<AgentId, UnlistenFn>();
+
+/// Each registered agent's harness, so the account-scoped usage store can be
+/// keyed without this module importing the project roster (which imports *this*
+/// module — the cycle that lookup would create). Written at registration, dropped
+/// with the agent.
+//
+// Plain `Map` for the same reason as `listenerRegistry` — internal bookkeeping,
+// not reactive state.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const agentHarness = new Map<AgentId, HarnessKind>();
 
 /// In-flight `registerAgent` promises, keyed by `agent_id`. Without this
 /// map, two overlapping `registerAgent` calls for the same agent both
@@ -377,6 +394,7 @@ export function applyAgentHydrate(
     last_rate_limit: loaded.last_rate_limit ?? null,
     last_rate_limit_model: loaded.last_rate_limit_model ?? null,
     last_rate_limit_as_of: loaded.last_rate_limit_as_of ?? null,
+    last_rate_limit_observed_at: loaded.last_rate_limit_observed_at ?? null,
     meta_as_of: loaded.meta_as_of ?? null,
     last_context_report: loaded.last_context_report ?? null,
     last_context_report_at: loaded.last_context_report_at ?? null,
@@ -394,6 +412,33 @@ export function applyAgentHydrate(
   if (priorRuntime !== undefined) {
     runtimes[agentId] = runtimeReducer(priorRuntime, hydrate);
   }
+  recordRestoredUsage(agentId, hydrate);
+}
+
+/// Offer a restored reading to the account-scoped usage store.
+///
+/// **Ranked, not applied.** A reading recovered from disk is one candidate among
+/// every agent's on any harness, so it is handed to `observeUsage` and loses to
+/// anything newer already held — which is what stops reopening an older project
+/// from pulling the display backwards.
+///
+/// Depends on the agent being registered first, which the project-open path
+/// guarantees: it awaits every `registerAgent` before starting hydration. An
+/// unregistered agent contributes nothing rather than guessing a harness.
+function recordRestoredUsage(agentId: AgentId, hydrate: Required<Hydrate>): void {
+  const harness = agentHarness.get(agentId);
+  if (harness === undefined || hydrate.last_rate_limit == null) return;
+  const asOf = hydrate.last_rate_limit_as_of ?? undefined;
+  observeUsage(harness, {
+    payload: hydrate.last_rate_limit,
+    // The measured instant when the harness recorded one, else the snapshot's
+    // capture time. A reading with neither ranks at the epoch: unknown age loses
+    // to every stamped reading, which is the conservative direction — it can be
+    // superseded but never supersede.
+    observed_at: hydrate.last_rate_limit_observed_at ?? asOf ?? new Date(0).toISOString(),
+    model: hydrate.last_rate_limit_model ?? undefined,
+    as_of: asOf,
+  });
 }
 
 /// Initialize state for an agent and subscribe to its event channel.
@@ -427,6 +472,9 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
       if (!(agent.id in transcripts)) {
         setTranscript(agent.id, []);
       }
+      // Before the listener is attached: the first event through the channel
+      // already needs to know which harness account it is reporting on.
+      agentHarness.set(agent.id, agent.harness);
 
       const channel = `agent:${agent.id}`;
       try {
@@ -875,6 +923,7 @@ export function unregisterAgents(agentIds: AgentId[]): void {
     }
     pendingRegistrations.delete(agentId);
     hydrationAttempted.delete(agentId);
+    agentHarness.delete(agentId);
     clearHeartbeat(agentId);
     delete transcripts[agentId];
     delete runtimes[agentId];
@@ -918,6 +967,51 @@ function cancelledEntryFor(
   return (
     pending?.find((p) => p.message_id === messageId) ?? pending?.find((p) => p.send_id === sendId)
   );
+}
+
+/// Feed the account-scoped usage store from a live event.
+///
+/// Separate from `runtimeReducer` because what it updates is not this agent's
+/// state: a quota reading and a refusal are facts about the harness account, and
+/// every agent on that harness reports the same ones. Driven from the same
+/// boundary so the two cannot see different events.
+///
+/// `turn_end` moves the refusal verdict and `rate_limit_event` moves the reading.
+/// A cancellation and an unrelated failure move neither — see
+/// [`clearUsageRefusal`] for why neither counts as evidence the quota recovered.
+function recordAccountUsage(agentId: AgentId, event: NormalizedEvent, receivedAt: string): void {
+  const harness = agentHarness.get(agentId);
+  if (harness === undefined) return;
+  if (event.type === "rate_limit_event") {
+    observeUsage(harness, {
+      payload: event.info,
+      // Arrival time, not a measured instant: a live reading is current by
+      // construction, and this is what ranks it above anything restored from
+      // disk.
+      observed_at: receivedAt,
+      model: runtimes[agentId]?.current_turn_model,
+    });
+  } else if (event.type === "session_meta") {
+    // **Late model label.** Claude's per-model weekly window never names its own
+    // model, so the model of the turn that delivered the reading is what labels
+    // it — and a stream can emit the rate-limit event *before* its `init`, which
+    // is the recorded order on a compaction stream. The reading then lands
+    // unlabelled and this fills it once the model is known.
+    //
+    // Only ever fills a blank, and only from the reducer's `current_turn_model`
+    // (this turn's own `init`), never from `meta.model`, which survives across
+    // turns and would name the previous model. The narrow cost is that two agents
+    // interleaving inside the milliseconds between one turn's reading and its
+    // `init` could label a window with the other's model; that is strictly better
+    // than dropping the label, which is the alternative.
+    nameUsageModel(harness, runtimes[agentId]?.current_turn_model);
+  } else if (event.type === "turn_end") {
+    if (event.outcome.status === "completed") {
+      clearUsageRefusal(harness);
+    } else if (event.outcome.status === "failed" && event.outcome.kind === "usage_limit") {
+      recordUsageRefusal(harness);
+    }
+  }
 }
 
 function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
@@ -1028,6 +1122,7 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
     ),
   );
   runtimes[agentId] = runtimeReducer(priorRuntime, event);
+  recordAccountUsage(agentId, event, receivedAt);
   manageHeartbeat(agentId, event);
 
   // Deferred cancel: if this turn started for a send the user cancelled before
@@ -1128,6 +1223,7 @@ export const _testing = {
     listenerRegistry.clear();
     pendingRegistrations.clear();
     hydrationAttempted.clear();
+    agentHarness.clear();
     for (const heartbeat of heartbeats.values()) {
       clearTimeout(heartbeat.handle);
     }

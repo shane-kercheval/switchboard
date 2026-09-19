@@ -20,11 +20,16 @@ export type UsageWindow = {
   /// percentage we pick, which would make the same occupancy alarming on one
   /// harness and calm on the other.
   surpassedThreshold?: number;
-  /// Set on the one window a refusal is attributed to (see
-  /// `codexRateLimitView`). `usedFraction` is 1 when this is set: the last
-  /// *measurement* may have read 93%, but the harness's *verdict* on the next
-  /// request is the number the user just ran into, and a bar that still reads
-  /// 93% beside a refusal says the meter is wrong.
+  /// Set on the window a refusal applies to, which is the one signal that draws a
+  /// meter in the warning tone without the harness having reported a threshold.
+  ///
+  /// **How it is established differs per harness, and so does its effect on
+  /// `usedFraction`.** Claude names the blocked window and reports its real
+  /// utilization in the same payload that refuses, so the measurement stands as
+  /// measured. Codex names no window and records no measurement on a refused turn,
+  /// so the window is inferred and drawn full — the last measurement may read 93%
+  /// while the harness has since said no, and a bar still reading 93% beside a
+  /// refusal says the meter is wrong. See each harness's reader for the detail.
   limitReached?: true;
 };
 
@@ -140,6 +145,22 @@ export function claudeRateLimitView(
         ? p.rateLimitType
         : undefined;
     const threshold = typeof p.surpassedThreshold === "number" ? p.surpassedThreshold : undefined;
+    // **The wall, which is a different status from the warning.** At a warning
+    // Claude sends `allowed_warning` plus a numeric `surpassedThreshold`; at a
+    // refusal it sends `rejected` and no threshold at all, so the warning path
+    // above leaves every window unflagged and the meter draws a spent quota in
+    // the neutral tone. `rateLimitType` names the window that did the blocking in
+    // both cases.
+    //
+    // **Nothing here overrides the measurement**, unlike the Codex reader. Codex
+    // records a windowless payload on a refused turn, so its last number is
+    // stale and the refusal is the only truthful thing left; Claude reports the
+    // blocked window's own utilization in the same payload that refuses, so the
+    // number is already right and only the tone was missing. A window named here
+    // but outside `CLAUDE_WINDOWS` drops with its flag, exactly as a threshold
+    // warning does.
+    const refused =
+      p.status === "rejected" && typeof p.rateLimitType === "string" ? p.rateLimitType : undefined;
     for (const { key, label } of CLAUDE_WINDOWS) {
       const w = (unified as Record<string, unknown>)[key];
       if (typeof w !== "object" || w === null) continue;
@@ -155,6 +176,7 @@ export function claudeRateLimitView(
         usedFraction: ww.utilization,
         resetsAtMs,
         surpassedThreshold: key === flagged ? threshold : undefined,
+        limitReached: key === refused ? true : undefined,
       });
     }
   }

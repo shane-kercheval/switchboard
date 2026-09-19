@@ -218,3 +218,59 @@ describe("sameCodexUsageWindows", () => {
     expect(sameCodexUsageWindows(indeterminate, indeterminate)).toBe(false);
   });
 });
+
+/// Claude's hard wall, verbatim from a rollout that hit the Fable weekly cap on
+/// 2026-09-18. The account-wide windows still had room, which is why the refusal
+/// has to land on one window rather than on the harness.
+describe("claudeRateLimitView at the wall", () => {
+  const rejected = {
+    status: "rejected",
+    rateLimitType: "seven_day_overage_included",
+    isUsingOverage: false,
+    unifiedWindows: {
+      five_hour: { utilization: 0.28, resetsAt: future(3600) },
+      seven_day: { utilization: 0.7, resetsAt: future(5 * 86400) },
+      seven_day_overage_included: { utilization: 1, resetsAt: future(5 * 86400) },
+    },
+  };
+
+  it("flags the window the payload names and leaves its siblings measured", () => {
+    const view = claudeRateLimitView(rejected, NOW, "claude-fable-5-1");
+    expect(view?.windows.map((w) => [w.label, w.usedFraction, w.limitReached])).toEqual([
+      ["5-hour limit", 0.28, undefined],
+      ["Weekly · all models", 0.7, undefined],
+      ["Weekly · Fable", 1, true],
+    ]);
+  });
+
+  it("does not overwrite the measurement, unlike the Codex reader", () => {
+    // Claude reports the blocked window's real utilization in the same payload
+    // that refuses, so there is nothing to infer. A reading below the cap stays
+    // below it and is flagged, rather than being rounded up to a full bar.
+    const belowCap = {
+      ...rejected,
+      unifiedWindows: {
+        seven_day_overage_included: { utilization: 0.97, resetsAt: future(5 * 86400) },
+      },
+    };
+    const view = claudeRateLimitView(belowCap, NOW, "claude-fable-5-1");
+    expect(view?.windows[0]?.usedFraction).toBe(0.97);
+    expect(view?.windows[0]?.limitReached).toBe(true);
+  });
+
+  it("leaves every window unflagged while the status is allowed", () => {
+    const view = claudeRateLimitView({ ...rejected, status: "allowed" }, NOW, "claude-fable-5-1");
+    expect(view?.windows.every((w) => w.limitReached === undefined)).toBe(true);
+  });
+
+  it("flags nothing when the refusal names a window the reader drops", () => {
+    // Same rule the threshold warning already follows: an unrecognized key is
+    // dropped rather than labelled by guesswork, and its flag goes with it.
+    const view = claudeRateLimitView(
+      { ...rejected, rateLimitType: "seven_day_something_new" },
+      NOW,
+      "claude-fable-5-1",
+    );
+    expect(view?.windows.every((w) => w.limitReached === undefined)).toBe(true);
+  });
+});

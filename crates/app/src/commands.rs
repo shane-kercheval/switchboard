@@ -30,8 +30,11 @@ use uuid::Uuid;
 
 use crate::dispatch_context::ProjectDispatchContextFactory;
 use crate::error::AppError;
+use crate::harness_usage::HarnessUsage;
 use crate::preferences::{self, Preferences};
-use crate::state::{AppState, lock, persist_git_registry, persist_workspace};
+use crate::state::{
+    AppState, lock, persist_git_registry, persist_harness_usage, persist_workspace,
+};
 
 /// Returned by `pick_directory_impl` — gives the caller everything it needs
 /// to render the directory header (path) and project list in one round trip.
@@ -1574,6 +1577,30 @@ pub fn terminal_resume_argv(terminal_app: &str, command: &str) -> Result<Vec<Str
 #[must_use]
 pub fn reveal_in_finder_argv(path: &str) -> Vec<String> {
     vec!["open".to_owned(), "-R".to_owned(), path.to_owned()]
+}
+
+// --- Harness quota snapshots (usage.yaml) ------------------------------------
+
+/// Return the persisted quota snapshots, for seeding the frontend store at
+/// startup.
+#[must_use]
+pub fn get_harness_usage_impl(state: &AppState) -> HarnessUsage {
+    lock(&state.harness_usage).clone()
+}
+
+/// Replace the quota snapshots and persist them.
+///
+/// Whole-map replacement: the frontend owns the rule for which of several
+/// readings is newest, and re-deriving it here would be a second copy that could
+/// disagree with the one the user is looking at. Best-effort, like the
+/// registries — a failed write costs an empty usage section until the next turn
+/// reports a reading, and the in-memory value is updated either way.
+///
+/// The guard is released before the file write, matching the preferences path, so
+/// nothing reading snapshots waits on I/O.
+pub fn set_harness_usage_impl(state: &AppState, usage: HarnessUsage) {
+    *lock(&state.harness_usage) = usage;
+    persist_harness_usage(state);
 }
 
 // --- Preferences (config.yaml) ----------------------------------------------

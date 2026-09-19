@@ -182,6 +182,22 @@ export function formatUsedPercent(value: number): string {
   return `${(value * 100).toFixed(0)}%`;
 }
 
+/// Full date and time for a usage window's reset, where a countdown is too
+/// coarse — a weekly or overage window can be days out, so the tooltip carries
+/// the date the inline clock omits. Milliseconds since epoch, display-only.
+///
+/// Lives here rather than in a component because both the harness usage section
+/// and any future reset surface need the same rendering; it was a local function
+/// in the agent sidebar until the usage meters moved out of it.
+export function formatResetDateTime(ms: number): string {
+  return new Date(ms).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 /// Countdown to a future instant, for a usage window's reset: "in 16 min",
 /// "in 3 h", "in 5 d". Relative at **every** distance, because this renders
 /// inline in an agent-card column about 180px wide, where an absolute date

@@ -39,7 +39,6 @@
   import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
   import { effortSupportFor, selectionIsValid } from "$lib/agentSelection";
-  import { claudeRateLimitView, codexRateLimitView, type UsageWindow } from "$lib/usageWindows";
   import { preferences } from "$lib/preferences.svelte";
   import {
     AGENTS_SIDEBAR_DEFAULT_WIDTH,
@@ -59,13 +58,7 @@
     type AgentSessionInfo,
   } from "$lib/api";
   import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
-  import {
-    cn,
-    formatResetCountdown,
-    formatTokens,
-    formatUsedPercent,
-    relativeTime,
-  } from "$lib/utils";
+  import { cn, formatTokens } from "$lib/utils";
   import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
@@ -91,6 +84,7 @@
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import Meter from "$lib/components/ui/Meter.svelte";
   import AgentEnvironment from "$lib/components/AgentEnvironment.svelte";
+  import HarnessUsage from "$lib/components/HarnessUsage.svelte";
   import ContextBreakdown from "$lib/components/ContextBreakdown.svelte";
   import { ICON_BUTTON_CLASS, ICON_BUTTON_ON_PANEL_CLASS } from "$lib/components/ui/iconButton";
 
@@ -793,18 +787,6 @@
     return undefined;
   }
 
-  /// Full date+time for the tooltip's reset windows — a window (esp. the
-  /// overage window) can be days out, so the tooltip carries the date the
-  /// inline clock omits. Milliseconds since epoch. Display-only.
-  function formatResetDateTime(ms: number): string {
-    return new Date(ms).toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-    });
-  }
-
   function toggleCollapsed(agentId: AgentId): void {
     layout.setAgentCardCollapsed(
       projectId,
@@ -908,54 +890,6 @@
      mechanical footnote to the first, not a second instruction. The armed
      button says only "Confirm compaction?"; at that point the user has already
      read this and is being asked one question. -->
-<!-- One meter per usage window, for both harnesses. The inline detail is the
-     countdown; the full reset date lives in the tooltip, where there is room
-     for it. -->
-{#snippet usageMeters(windows: UsageWindow[])}
-  {#each windows as w (w.key)}
-    <Meter
-      label={w.label}
-      value={w.usedFraction}
-      detail={w.resetsAtMs === null ? undefined : formatResetCountdown(w.resetsAtMs)}
-      separateDetail
-      alignPercentage
-      tone={w.surpassedThreshold === undefined && w.limitReached === undefined
-        ? "neutral"
-        : "warning"}
-      testid="agent-usage-window"
-    />
-  {/each}
-{/snippet}
-
-<!-- Tooltip rows for the same windows: the percentage spelled out and the full
-     reset date the inline countdown compresses. The meter's amber tone carries
-     the harness's threshold warning without repeating its internal cutoff. -->
-{#snippet usageWindowDetail(windows: UsageWindow[])}
-  <div class="min-w-64 space-y-2.5">
-    {#each windows as w (w.key)}
-      <section class="space-y-1">
-        <div class="flex items-baseline gap-4">
-          <span class="min-w-0 font-medium">{w.label}</span>
-          <span class="ml-auto shrink-0 tabular-nums">{formatUsedPercent(w.usedFraction)} used</span
-          >
-        </div>
-        {#if w.resetsAtMs !== null}
-          <div class="text-primary-fg/70 grid grid-cols-[auto_1fr] gap-4 text-[12px]">
-            <span>Resets</span>
-            <span class="text-right tabular-nums">{formatResetDateTime(w.resetsAtMs)}</span>
-          </div>
-        {/if}
-        {#if w.limitReached}
-          <!-- Why the bar is amber and full: the harness's last measurement
-               was lower, and this is its verdict on the last message. -->
-          <p class="text-warning text-[12px]" data-testid="agent-usage-window-refused">
-            Limit reached — the last message was refused.
-          </p>
-        {/if}
-      </section>
-    {/each}
-  </div>
-{/snippet}
 
 {#snippet compactTooltipContent()}
   <div class="max-w-xs space-y-1 text-[13px]">
@@ -985,6 +919,7 @@
       draftWidth = null;
     }}
   />
+  <HarnessUsage />
   <SidebarSection title="Agents">
     {#snippet action()}
       <div class="flex items-center gap-0.5">
@@ -1046,36 +981,6 @@
       {#each displayAgents as agent (agent.id)}
         {@const runtime = runtimes[agent.id]}
         {@const context = contextOccupancy(agent.id)}
-        {@const codexWindows =
-          agent.harness === "codex"
-            ? codexRateLimitView(
-                runtime?.last_rate_limit,
-                Date.now(),
-                runtime?.usage_limit_reached === true,
-              )
-            : []}
-        <!-- `Date.now()` read once per render for the reset-in-the-future gate.
-             Non-reactive: a reset that elapses while the app sits open won't
-             auto-hide until the next render, which a new turn (or reopen)
-             triggers — acceptable for a passive status cell. -->
-        {@const rlView =
-          agent.harness === "claude_code"
-            ? claudeRateLimitView(
-                runtime?.last_rate_limit,
-                Date.now(),
-                runtime?.last_rate_limit_model,
-              )
-            : null}
-        {@const overageAsOf = runtime?.last_rate_limit_as_of}
-        <!-- The one window worth a line on a collapsed card. Claude flags at
-             most one: the payload names a single `rateLimitType`, and
-             `claudeRateLimitView` stamps the threshold on that window alone.
-             Codex flags the single window it attributes a refusal to. `find`
-             is the shape of that invariant — if a future CLI reports a threshold per
-             window, it is `usageWindows.ts` that has to change first. -->
-        {@const usageWarning = (rlView?.windows ?? codexWindows).find(
-          (window) => window.surpassedThreshold !== undefined || window.limitReached === true,
-        )}
         {@const agentSelection = selectionForAgent(agent)}
         {@const effortSupport = effortSupportFor(agent.harness, agent.model)}
         {@const emptySelection =
@@ -1694,19 +1599,6 @@
               {/if}
             </div>
           {/if}
-          {#if isCollapsed && (usageWarning !== undefined || (rlView?.overage ?? null) !== null)}
-            <div
-              class="text-warning mt-1.5 space-y-0.5 text-[11px]"
-              data-testid="agent-compact-warnings"
-            >
-              {#if usageWarning !== undefined}
-                <p>{usageWarning.label} · {formatUsedPercent(usageWarning.usedFraction)} used</p>
-              {/if}
-              {#if (rlView?.overage ?? null) !== null}
-                <p>⚡ using credits</p>
-              {/if}
-            </div>
-          {/if}
           {#if !isCollapsed}
             <!-- Per-turn cost is deliberately NOT shown on the card — it
                  renders inline per-message in the transcript (real-spend turns
@@ -1714,110 +1606,6 @@
                  old accumulating `$` figure read as a running total but wasn't
                  one. Do not re-add it. The current overage *status* below stays
                  (Bucket-A "as of now" state). -->
-            {#if rlView !== null}
-              <!-- Claude usage windows — one meter per window the payload
-                   reports, each shown only while its own reset is still in the
-                   future (a past "resets at" would be wrong, so it clean-hides
-                   instead). A window the CLI itself flagged past a threshold
-                   fills amber. The overage escalation is a separate signal
-                   about billing, layered beneath the meters only when spending
-                   credits. One always-present tooltip carries full reset dates
-                   (a weekly window is days out, beyond the inline countdown),
-                   and the snapshot age when rehydrated.
-                   Stream-only, so it survives restart via the metadata
-                   sidecar. -->
-              <div class="text-muted mt-2 text-[10px] font-medium tracking-wide uppercase">
-                Usage limits
-              </div>
-              <Tooltip side="right">
-                {#snippet trigger(props)}
-                  <!-- tabindex=0 so keyboard users can open the tooltip; a <div>
-                       (no click action) isn't focusable on its own. Mirrors the
-                       parse-warnings indicator. -->
-                  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-                  <div
-                    {...props}
-                    tabindex="0"
-                    class="mt-1.5 cursor-default space-y-1 text-xs"
-                    data-testid="agent-rate-limit-claude"
-                  >
-                    {@render usageMeters(rlView.windows)}
-                    {#if rlView.fallback !== null}
-                      <div class="text-fg" data-testid="agent-rate-window">
-                        {rlView.fallback.label} resets {formatResetCountdown(
-                          rlView.fallback.resetsAtMs,
-                        )}
-                      </div>
-                    {/if}
-                    {#if rlView.overage !== null}
-                      <!-- -ml-1 offsets the ⚡ glyph's left-side bearing so it
-                           aligns with the text column above (the emoji box
-                           carries a few px of transparent left padding). -->
-                      <div class="text-warning -ml-1" data-testid="agent-overage">
-                        ⚡ using credits
-                      </div>
-                    {/if}
-                  </div>
-                {/snippet}
-                <div class="space-y-2.5 text-[13px]" data-testid="agent-rate-detail">
-                  <p class="font-medium">Usage details</p>
-                  {@render usageWindowDetail(rlView.windows)}
-                  {#if rlView.fallback !== null}
-                    <div class="grid grid-cols-[auto_1fr] gap-4">
-                      <span>{rlView.fallback.label}</span>
-                      <span class="text-right tabular-nums">
-                        Resets {formatResetDateTime(rlView.fallback.resetsAtMs)}
-                      </span>
-                    </div>
-                  {/if}
-                  {#if rlView.overage !== null}
-                    <div class="text-warning border-primary-fg/20 border-t pt-2">
-                      <p class="font-medium">Spending usage credits</p>
-                      {#if rlView.overage.resetsAtMs !== null}
-                        <p class="mt-0.5 text-[12px]">
-                          Overage window resets {formatResetDateTime(rlView.overage.resetsAtMs)}
-                        </p>
-                      {/if}
-                    </div>
-                  {/if}
-                  {#if overageAsOf != null}
-                    <p
-                      class="text-primary-fg/70 border-primary-fg/20 border-t pt-2 text-[12px]"
-                      data-testid="agent-rate-snapshot"
-                    >
-                      Snapshot from {relativeTime(overageAsOf)} — send a message to refresh.
-                    </p>
-                  {/if}
-                </div>
-              </Tooltip>
-            {/if}
-            {#if codexWindows.length > 0}
-              <!-- Codex usage windows — the same meters with the same labels as
-                   Claude's. Session-file-backed (class B, durable), so no
-                   snapshot-age qualifier. Codex reports no threshold flag; a
-                   window here warns only when the agent's last turn was refused
-                   for the limit, and then it is drawn full. -->
-              <div class="text-muted mt-2 text-[10px] font-medium tracking-wide uppercase">
-                Usage limits
-              </div>
-              <Tooltip side="right">
-                {#snippet trigger(props)}
-                  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-                  <div
-                    {...props}
-                    tabindex="0"
-                    class="mt-1.5 cursor-default space-y-1 text-xs"
-                    data-testid="agent-rate-limit"
-                  >
-                    {@render usageMeters(codexWindows)}
-                  </div>
-                {/snippet}
-                <div class="space-y-2.5 text-[13px]" data-testid="agent-rate-limit-detail">
-                  <p class="font-medium">Usage details</p>
-                  {@render usageWindowDetail(codexWindows)}
-                </div>
-              </Tooltip>
-            {/if}
             <AgentEnvironment inventory={runtime?.meta?.inventory} asOf={runtime?.meta_as_of} />
           {/if}
           {#if removeError?.agentId === agent.id}

@@ -110,6 +110,7 @@
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { loadPreferences, preferences } from "$lib/preferences.svelte";
+  import { loadPersistedUsage } from "$lib/state/harnessUsage.svelte";
   import { isReadingMode, toggleReadingMode } from "$lib/state/readingMode.svelte";
   import GitView from "$lib/components/GitView.svelte";
   import {
@@ -465,6 +466,10 @@
     // before issuing any probe, and arms its own backstop for a lost event.
     void refreshHarnessAvailability();
     void loadPreferences();
+    // Quota readings persist user-globally, so the usage section is populated
+    // before any project opens and before any turn runs. Each restored reading is
+    // ranked rather than applied, so a live one that lands first still wins.
+    void loadPersistedUsage();
     void loadWorkspace()
       .then(() => {
         // A closed sidebar is a legitimate device-local preference while the

@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::git_registry::{self, GitRegistry};
+use crate::harness_usage::{self, HarnessUsage};
 use crate::notification::{Notifier, NullNotifier};
 use crate::preferences::{self, Preferences};
 use crate::workspace::{self, Workspace};
@@ -437,6 +438,17 @@ pub struct AppState {
     /// `persist_git_registry` is a no-op while this is `None`.
     pub git_registry_path: Option<PathBuf>,
 
+    /// User-global harness quota snapshots — the newest usage reading per harness
+    /// across every project (see `crate::harness_usage`). Opaque to the backend;
+    /// the frontend owns which reading wins. Defaults to empty; production
+    /// hydrates it from `usage.yaml` via [`AppState::with_harness_usage`].
+    pub harness_usage: Mutex<HarnessUsage>,
+
+    /// Resolved path of `usage.yaml`, with the same contract as
+    /// [`Self::git_registry_path`]: `None` disables persistence, either because
+    /// no path resolved or because the existing file couldn't be read.
+    pub harness_usage_path: Option<PathBuf>,
+
     /// User-global personal preferences (see `crate::preferences`). Backend-owned
     /// `config.yaml`; the first backend-persisted settings (theme stays
     /// frontend-only). Defaults until hydrated via [`AppState::with_preferences`].
@@ -533,6 +545,8 @@ impl AppState {
             workspace_path: None,
             git_registry: Mutex::new(GitRegistry::default()),
             git_registry_path: None,
+            harness_usage: Mutex::new(HarnessUsage::default()),
+            harness_usage_path: None,
             preferences: Arc::new(Mutex::new(Preferences::default())),
             preferences_path: None,
             prompts: PromptService::disabled(),
@@ -654,6 +668,17 @@ impl AppState {
         self
     }
 
+    /// Builder step that loads the harness quota snapshots from `path`. Same
+    /// persistability contract as [`with_git_registry`](Self::with_git_registry):
+    /// an unreadable existing file disables persistence so it is never clobbered.
+    #[must_use]
+    pub fn with_harness_usage(mut self, path: PathBuf) -> Self {
+        let outcome = harness_usage::load(&path);
+        self.harness_usage = Mutex::new(outcome.usage);
+        self.harness_usage_path = outcome.persistable.then_some(path);
+        self
+    }
+
     /// Builder step that loads personal preferences from `path` and records the
     /// path for later saves. Unlike the registries there is no persistability
     /// gate: preferences are written only on explicit user save, so a corrupt
@@ -701,6 +726,23 @@ pub(crate) fn persist_git_registry(state: &AppState) {
             path = %path.display(),
             error = %e,
             "failed to persist git-view registry"
+        );
+    }
+}
+
+/// Persist the harness quota snapshots if a `harness_usage_path` is configured.
+/// Best-effort, same as [`persist_git_registry`]: losing a snapshot costs an
+/// empty usage section until the next turn reports a reading.
+pub(crate) fn persist_harness_usage(state: &AppState) {
+    let Some(path) = state.harness_usage_path.as_ref() else {
+        return;
+    };
+    let snapshot = lock(&state.harness_usage).clone();
+    if let Err(e) = harness_usage::save(path, &snapshot) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to persist harness usage"
         );
     }
 }

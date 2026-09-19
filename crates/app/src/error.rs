@@ -389,6 +389,17 @@ pub enum AppError {
         source: std::io::Error,
     },
 
+    /// Persisting the user-global harness quota snapshots (`usage.yaml`) failed.
+    /// Best-effort like the registries above: losing a snapshot costs an empty
+    /// usage section until the next turn reports a reading, so callers log rather
+    /// than abort.
+    #[error("failed to persist harness usage at {path}: {source}")]
+    HarnessUsagePersist {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Persisting user preferences (`config.yaml`) failed. Unlike the registries
     /// this surfaces to the caller (the `set_preferences` command), since a
     /// failed explicit save is something the user just asked for and should hear

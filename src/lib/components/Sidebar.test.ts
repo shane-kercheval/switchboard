@@ -81,6 +81,14 @@ async function openAgentActions(index = 0): Promise<HTMLElement> {
   return menu;
 }
 
+/// A unix-epoch-seconds timestamp `deltaSeconds` from now — payloads use
+/// real-now-relative resets so the "is this window still in the future?" gate is
+/// exercised deterministically (a fixed epoch would drift past `now` and flip the
+/// test's meaning over time).
+function epochFromNow(deltaSeconds: number): number {
+  return Math.floor(Date.now() / 1000) + deltaSeconds;
+}
+
 const PROJECT_ID = "00000000-0000-7000-8000-0000000000ff";
 
 const CLAUDE_AGENT: AgentRecord = {
@@ -246,20 +254,17 @@ describe("Sidebar", () => {
 
     // Context remains visible in both full and compact card states.
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
-    expect(screen.getByTestId("agent-rate-limit-claude")).toBeInTheDocument();
     expect(screen.getByTestId("agent-meta")).toBeInTheDocument();
 
     await fireEvent.click(screen.getByTestId("sidebar-agent"));
     expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "true");
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
     expect(screen.getByTestId("agent-selection-default")).toBeInTheDocument();
-    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
     expect(screen.queryByTestId("agent-meta")).toBeNull();
 
     await openAgentActions();
     await fireEvent.click(await screen.findByTestId("agent-action-collapse"));
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
-    expect(screen.getByTestId("agent-rate-limit-claude")).toBeInTheDocument();
     expect(screen.getByTestId("agent-meta")).toBeInTheDocument();
 
     const card = screen.getByTestId("sidebar-agent");
@@ -306,7 +311,12 @@ describe("Sidebar", () => {
     selection.mockRestore();
   });
 
-  it("keeps actionable usage warnings visible in compact mode without environment alerts", async () => {
+  it("puts no quota cell on the agent card, whatever the runtime still carries", async () => {
+    // The card's usage block and its collapsed-card warning line are both gone:
+    // a quota belongs to the harness account, and drawing it per agent is what
+    // made sibling cards disagree. Pinned as an invariant because this is the
+    // third time this surface has been reworked — a re-added per-agent cell
+    // should fail here rather than ship.
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     const runtime = state.runtimes[CLAUDE_AGENT.id];
@@ -323,26 +333,16 @@ describe("Sidebar", () => {
           seven_day: { utilization: 0.91, resetsAt: epochFromNow(5 * 86400) },
         },
       },
-      meta: {
-        model: "claude-sonnet-4-6",
-        harness_version: "2.1.274",
-        inventory: { mcp_servers: [{ name: "gmail", status: "needs-auth" }] },
-      },
     };
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     expect(screen.queryByTestId("agent-compact-warnings")).toBeNull();
+    expect(screen.queryByTestId("agent-usage-window")).toBeNull();
+    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
+    expect(screen.queryByTestId("agent-overage")).toBeNull();
 
-    const toggle = screen.getByTestId("agent-collapse-toggle");
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    await fireEvent.click(toggle);
-
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    const warnings = screen.getByTestId("agent-compact-warnings");
-    expect(warnings).toHaveTextContent("Weekly · all models · 91% used");
-    expect(warnings).toHaveTextContent("using credits");
-    expect(warnings).not.toHaveTextContent("MCP");
-    expect(warnings).not.toHaveTextContent("need auth");
+    await fireEvent.click(screen.getByTestId("agent-collapse-toggle"));
+    expect(screen.queryByTestId("agent-compact-warnings")).toBeNull();
   });
 
   it("renders the harness icon and a hover-revealed actions menu trigger", async () => {
@@ -644,23 +644,6 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.queryByTestId("agent-cost")).toBeNull();
-  });
-
-  it("displays Codex rate-limit % from last_rate_limit", async () => {
-    const state = await loadState();
-    await state.registerAgent(CODEX_AGENT);
-    const runtime = state.runtimes[CODEX_AGENT.id];
-    if (runtime === undefined) throw new Error("unreachable");
-    state.runtimes[CODEX_AGENT.id] = {
-      ...runtime,
-      last_rate_limit: { primary: { used_percent: 42.5 } },
-    };
-
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
-
-    const cell = screen.getByTestId("agent-rate-limit");
-    expect(cell).toHaveTextContent("Quota");
-    expect(cell).toHaveTextContent("43%");
   });
 
   it("displays context-utilization bar from the latest agent turn's reconciled occupancy", async () => {
@@ -1628,608 +1611,6 @@ describe("Sidebar", () => {
   });
 });
 
-/// A unix-epoch-seconds timestamp `deltaSeconds` from now — payloads use
-/// real-now-relative resets so the "is this window still in the future?" gate
-/// is exercised deterministically (a fixed epoch would drift past `now` and
-/// flip the test's meaning over time).
-function epochFromNow(deltaSeconds: number): number {
-  return Math.floor(Date.now() / 1000) + deltaSeconds;
-}
-
-/// An ISO string `ms` before now — for the snapshot-age (`as_of`) tooltip line.
-function agoIso(ms: number): string {
-  return new Date(Date.now() - ms).toISOString();
-}
-
-async function renderClaudeWithRateLimit(
-  info: unknown,
-  asOf: string | null,
-  model?: string,
-): Promise<void> {
-  const state = await loadState();
-  await state.registerAgent(CLAUDE_AGENT);
-  const runtime = state.runtimes[CLAUDE_AGENT.id];
-  if (runtime === undefined) throw new Error("unreachable");
-  state.runtimes[CLAUDE_AGENT.id] = {
-    ...runtime,
-    last_rate_limit: info,
-    last_rate_limit_as_of: asOf,
-    last_rate_limit_model: model,
-  };
-  render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
-}
-
-/// The window keys the probe saw on a Fable turn, each with a used fraction and
-/// a future reset. The offsets carry deliberate slack from the hour and day
-/// boundaries: the countdown rounds up, so keeping each instant just below its
-/// displayed boundary prevents clock jitter from changing the assertion.
-function unifiedWindows(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    five_hour: { utilization: 0.33, resetsAt: epochFromNow(4 * 3600 - 60) },
-    seven_day: { utilization: 0.27, resetsAt: epochFromNow(5 * 86400 - 3600) },
-    ...overrides,
-  };
-}
-
-/// Claude rate-limit surface with **no `unifiedWindows`** — an older CLI, or a
-/// future one that drops the undocumented field. Every payload here exercises
-/// the fallback (a bare reset line, no percentage, because there is no
-/// percentage to show) plus the overage escalation, which is a separate signal
-/// orthogonal to which window shape arrived. Each is gated on its own reset
-/// being in the future (reset-passed → clean-hide). Exact clock/date text isn't
-/// asserted (jsdom locale/timezone dependent) — only the stable label/copy and
-/// presence/absence per the gating rules.
-describe("Sidebar Claude rate-limit fallback (no unifiedWindows)", () => {
-  it("shows the fallback window independent of overage (normal-quota turn)", async () => {
-    // No isUsingOverage — the window must still surface (the bug this fixed:
-    // the window used to be gated on overage).
-    await renderClaudeWithRateLimit(
-      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(4 * 3600) },
-      null,
-    );
-    const window = screen.getByTestId("agent-rate-window");
-    expect(window).toHaveTextContent("5-hour limit resets");
-    // Not overaging → no amber escalation.
-    expect(screen.queryByTestId("agent-overage")).toBeNull();
-  });
-
-  it("derives the fallback label from rateLimitType (unknown → generic)", async () => {
-    await renderClaudeWithRateLimit(
-      { status: "allowed", rateLimitType: "weekly", resetsAt: epochFromNow(4 * 3600) },
-      null,
-    );
-    // Unknown type falls back to the generic label, never a hardcoded "5-hour".
-    const window = screen.getByTestId("agent-rate-window");
-    expect(window).toHaveTextContent("rate limit resets");
-    expect(window).not.toHaveTextContent("5-hour");
-  });
-
-  it("hides the fallback window once its reset is in the past (reset-passed)", async () => {
-    // A past reset is known-stale (the window has cycled, we lack the new
-    // reset) — showing a past 'resets at' would be wrong, so it clean-hides.
-    await renderClaudeWithRateLimit(
-      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(-3600) },
-      null,
-    );
-    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
-    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
-  });
-
-  it("shows the amber overage escalation when overaging with a future overage window", async () => {
-    await renderClaudeWithRateLimit(
-      {
-        status: "rejected",
-        rateLimitType: "five_hour",
-        resetsAt: epochFromNow(4 * 3600),
-        isUsingOverage: true,
-        overageResetsAt: epochFromNow(6 * 86400),
-      },
-      null,
-    );
-    // Both signals present: neutral fallback line + amber escalation.
-    expect(screen.getByTestId("agent-rate-window")).toHaveTextContent("5-hour limit resets");
-    const overage = screen.getByTestId("agent-overage");
-    expect(overage).toHaveTextContent("using credits");
-    expect(overage).toHaveClass("text-warning");
-  });
-
-  it("drops the overage escalation once the overage window has passed", async () => {
-    // isUsingOverage true, but the overage window elapsed → the credit window
-    // has cycled, so the escalation is stale and hidden. The still-future
-    // fallback window stays.
-    await renderClaudeWithRateLimit(
-      {
-        status: "rejected",
-        rateLimitType: "five_hour",
-        resetsAt: epochFromNow(4 * 3600),
-        isUsingOverage: true,
-        overageResetsAt: epochFromNow(-3600),
-      },
-      null,
-    );
-    expect(screen.getByTestId("agent-rate-window")).toBeInTheDocument();
-    expect(screen.queryByTestId("agent-overage")).toBeNull();
-  });
-
-  it("overage flag with no overage window still shows (can't prove it stale)", async () => {
-    await renderClaudeWithRateLimit(
-      { isUsingOverage: true, resetsAt: epochFromNow(4 * 3600), rateLimitType: "five_hour" },
-      null,
-    );
-    expect(screen.getByTestId("agent-overage")).toHaveTextContent("using credits");
-  });
-
-  it("renders nothing when there is no usable rate-limit signal", async () => {
-    // Everything elapsed / absent → the whole cell clean-hides.
-    await renderClaudeWithRateLimit({ status: "allowed", resetsAt: epochFromNow(-3600) }, null);
-    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
-    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
-    expect(screen.queryByTestId("agent-overage")).toBeNull();
-  });
-
-  it("shows no meter and no percentage on the fallback path", async () => {
-    // The point of the fallback: the top-level pair carries a reset but no
-    // utilization, and a bar drawn without a value would read as 0% used.
-    await renderClaudeWithRateLimit(
-      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(4 * 3600) },
-      null,
-    );
-    expect(screen.queryAllByTestId("agent-usage-window")).toHaveLength(0);
-    expect(screen.getByTestId("agent-rate-limit-claude")).not.toHaveTextContent("%");
-  });
-
-  it("Codex agent never shows the Claude rate-limit cells (Claude-gated)", async () => {
-    const state = await loadState();
-    await state.registerAgent(CODEX_AGENT);
-    const runtime = state.runtimes[CODEX_AGENT.id];
-    if (runtime === undefined) throw new Error("unreachable");
-    state.runtimes[CODEX_AGENT.id] = {
-      ...runtime,
-      last_rate_limit: {
-        rateLimitType: "five_hour",
-        resetsAt: epochFromNow(4 * 3600),
-        isUsingOverage: true,
-        overageResetsAt: epochFromNow(6 * 86400),
-      },
-    };
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
-    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
-    expect(screen.queryByTestId("agent-overage")).toBeNull();
-  });
-});
-
-/// Claude usage windows — the primary path. `unifiedWindows` carries every
-/// window the desktop app shows, each with a 0-1 used fraction, and is
-/// authoritative whenever present.
-describe("Sidebar Claude usage windows", () => {
-  it("renders one meter per window, with the fraction as a percentage", async () => {
-    await renderClaudeWithRateLimit({ status: "allowed", unifiedWindows: unifiedWindows() }, null);
-
-    const meters = screen.getAllByTestId("agent-usage-window");
-    expect(meters).toHaveLength(2);
-    expect(meters[0]).toHaveTextContent("5-hour limit");
-    expect(meters[0]).toHaveTextContent("33%");
-    expect(meters[1]).toHaveTextContent("Weekly · all models");
-    expect(meters[1]).toHaveTextContent("27%");
-  });
-
-  it("shows each window's countdown to its own reset", async () => {
-    await renderClaudeWithRateLimit({ status: "allowed", unifiedWindows: unifiedWindows() }, null);
-
-    const meters = screen.getAllByTestId("agent-usage-window");
-    // Two windows resetting at different distances must not share one
-    // countdown; the 5-hour one is hours out and the weekly one days.
-    expect(meters[0]).toHaveTextContent("in 4 h");
-    expect(meters[1]).toHaveTextContent("in 5 d");
-  });
-
-  it("ignores the top-level fallback pair when unifiedWindows is present", async () => {
-    // `unifiedWindows` is authoritative, so the bare reset line must not
-    // double-render the same window beneath the meters.
-    await renderClaudeWithRateLimit(
-      {
-        status: "allowed",
-        rateLimitType: "five_hour",
-        resetsAt: epochFromNow(4 * 3600),
-        unifiedWindows: unifiedWindows(),
-      },
-      null,
-    );
-    expect(screen.getAllByTestId("agent-usage-window")).toHaveLength(2);
-    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
-  });
-
-  it("labels the per-model weekly window with the model that delivered it", async () => {
-    await renderClaudeWithRateLimit(
-      {
-        status: "allowed",
-        unifiedWindows: unifiedWindows({
-          seven_day_overage_included: { utilization: 0.79, resetsAt: epochFromNow(5 * 86400) },
-        }),
-      },
-      null,
-      "claude-fable-5-1",
-    );
-    const meters = screen.getAllByTestId("agent-usage-window");
-    expect(meters).toHaveLength(3);
-    // Order is fixed by the key list, not by object iteration order.
-    // The family name the user selected by, not the raw stream id — the label
-    // shares a column with a countdown and a percentage.
-    expect(meters[2]).toHaveTextContent("Weekly · Fable");
-    expect(meters[2]).toHaveTextContent("79%");
-  });
-
-  it("falls back to a generic per-model label for a legacy snapshot without a model", async () => {
-    await renderClaudeWithRateLimit(
-      {
-        status: "allowed",
-        unifiedWindows: unifiedWindows({
-          seven_day_overage_included: { utilization: 0.79, resetsAt: epochFromNow(5 * 86400) },
-        }),
-      },
-      null,
-      undefined,
-    );
-    const meters = screen.getAllByTestId("agent-usage-window");
-    expect(meters[2]).toHaveTextContent("Weekly · model-specific");
-  });
-
-  it("fills only the flagged window amber when the CLI reports a threshold", async () => {
-    await renderClaudeWithRateLimit(
-      {
-        status: "allowed_warning",
-        rateLimitType: "seven_day_overage_included",
-        surpassedThreshold: 0.75,
-        unifiedWindows: unifiedWindows({
-          seven_day_overage_included: { utilization: 0.79, resetsAt: epochFromNow(5 * 86400) },
-        }),
-      },
-      null,
-      "claude-fable-5-1",
-    );
-    const fills = screen.getAllByTestId("agent-usage-window-fill");
-    expect(fills).toHaveLength(3);
-    // The tone comes from the harness naming that window, not from a
-    // percentage we chose — the 5-hour window at 33% stays calm.
-    expect(fills[0]).toHaveClass("bg-fg");
-    expect(fills[1]).toHaveClass("bg-fg");
-    expect(fills[2]).toHaveClass("bg-warning");
-  });
-
-  it("drops a window whose reset has passed and keeps its siblings", async () => {
-    await renderClaudeWithRateLimit(
-      {
-        status: "allowed",
-        unifiedWindows: unifiedWindows({
-          five_hour: { utilization: 0.33, resetsAt: epochFromNow(-3600) },
-        }),
-      },
-      null,
-    );
-    const meters = screen.getAllByTestId("agent-usage-window");
-    expect(meters).toHaveLength(1);
-    expect(meters[0]).toHaveTextContent("Weekly · all models");
-  });
-
-  it("drops a window key it does not recognize", async () => {
-    // The CLI binary lists keys that are not Claude Code windows on any plan we
-    // can probe. A junk label is worse than a dropped window.
-    await renderClaudeWithRateLimit(
-      {
-        status: "allowed",
-        unifiedWindows: unifiedWindows({
-          seven_day_cowork: { utilization: 0.5, resetsAt: epochFromNow(5 * 86400) },
-        }),
-      },
-      null,
-    );
-    expect(screen.getAllByTestId("agent-usage-window")).toHaveLength(2);
-    expect(screen.getByTestId("agent-rate-limit-claude")).not.toHaveTextContent("cowork");
-  });
-
-  // The input-validation matrix — malformed fractions, missing resets,
-  // non-object entries — moved to `usageWindows.test.ts`, which tests the
-  // derivation directly. A rendered card can only show those as an absent
-  // meter; what stays here is what only a render can prove.
-
-  it("treats an empty window container as absent and falls back", async () => {
-    // Nothing reported means the top-level pair is still the best signal
-    // available; a blank cell would withhold a reset time we have.
-    await renderClaudeWithRateLimit(
-      {
-        status: "allowed",
-        rateLimitType: "five_hour",
-        resetsAt: epochFromNow(4 * 3600 + 60),
-        unifiedWindows: {},
-      },
-      null,
-    );
-    expect(screen.queryAllByTestId("agent-usage-window")).toHaveLength(0);
-    expect(screen.getByTestId("agent-rate-window")).toHaveTextContent("5-hour limit resets");
-  });
-
-  it("stays authoritative when a non-empty container's windows were all dropped", async () => {
-    // The windows were filtered on purpose — this one's reset has passed — so
-    // the container still spoke. Falling back to the top-level pair here would
-    // override the per-window rule rather than fill a gap.
-    await renderClaudeWithRateLimit(
-      {
-        status: "allowed",
-        rateLimitType: "five_hour",
-        resetsAt: epochFromNow(4 * 3600 + 60),
-        unifiedWindows: { five_hour: { utilization: 0.33, resetsAt: epochFromNow(-3600) } },
-      },
-      null,
-    );
-    expect(screen.queryAllByTestId("agent-usage-window")).toHaveLength(0);
-    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
-    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
-  });
-
-  it("keeps the overage escalation beneath the meters", async () => {
-    await renderClaudeWithRateLimit(
-      {
-        status: "allowed",
-        isUsingOverage: true,
-        overageResetsAt: epochFromNow(6 * 86400),
-        unifiedWindows: unifiedWindows(),
-      },
-      null,
-    );
-    expect(screen.getAllByTestId("agent-usage-window")).toHaveLength(2);
-    const overage = screen.getByTestId("agent-overage");
-    expect(overage).toHaveTextContent("using credits");
-    expect(overage).toHaveClass("text-warning");
-  });
-});
-
-/// Rate-limit tooltip content — always present when the cell shows, carrying
-/// full reset dates (a window can be days out, beyond the inline clock) plus
-/// both windows and the snapshot age when rehydrated. Mirrors the
-/// parse-warnings tooltip test's fake-timer + pointerEnter pattern.
-describe("Sidebar Claude rate-limit tooltip", () => {
-  beforeEach(() => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("surfaces the window + overage windows on hover; no snapshot line when live", async () => {
-    await renderClaudeWithRateLimit(
-      {
-        status: "rejected",
-        rateLimitType: "five_hour",
-        resetsAt: epochFromNow(4 * 3600),
-        isUsingOverage: true,
-        overageResetsAt: epochFromNow(6 * 86400),
-      },
-      null,
-    );
-    await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
-    await vi.advanceTimersByTimeAsync(500);
-    const detail = await waitFor(() => screen.getByTestId("agent-rate-detail"));
-    expect(detail).toHaveTextContent("5-hour limit");
-    expect(detail).toHaveTextContent("Resets");
-    // The overage window is surfaced here.
-    expect(detail).toHaveTextContent(/overage window resets/i);
-    // Live snapshot (as_of null) → no snapshot-age line.
-    expect(screen.queryByTestId("agent-rate-snapshot")).toBeNull();
-  });
-
-  it("spells out each window's percentage and full reset date on hover", async () => {
-    // The inline countdown is compressed to fit the card column; the tooltip is
-    // where the absolute date and the word "used" have room.
-    await renderClaudeWithRateLimit({ status: "allowed", unifiedWindows: unifiedWindows() }, null);
-    await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
-    await vi.advanceTimersByTimeAsync(500);
-    const detail = await waitFor(() => screen.getByTestId("agent-rate-detail"));
-    expect(detail).toHaveTextContent(/5-hour limit\s+33% used\s+Resets/);
-    expect(detail).toHaveTextContent(/Weekly · all models\s+27% used\s+Resets/);
-  });
-
-  it("does not expose the harness's internal warning threshold in the tooltip", async () => {
-    await renderClaudeWithRateLimit(
-      {
-        status: "allowed_warning",
-        rateLimitType: "seven_day",
-        surpassedThreshold: 0.75,
-        unifiedWindows: unifiedWindows({
-          seven_day: { utilization: 0.79, resetsAt: epochFromNow(5 * 86400 + 3600) },
-        }),
-      },
-      null,
-    );
-    await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
-    await vi.advanceTimersByTimeAsync(500);
-    const detail = await waitFor(() => screen.getByTestId("agent-rate-detail"));
-    expect(within(detail).getByText("Weekly · all models")).toBeInTheDocument();
-    expect(within(detail).queryByText("Warning threshold")).toBeNull();
-    expect(within(detail).queryByText("75%")).toBeNull();
-    expect(within(detail).getAllByText("Resets")).toHaveLength(2);
-  });
-
-  it("adds a snapshot-age + refresh line on hover when rehydrated (as_of set)", async () => {
-    await renderClaudeWithRateLimit(
-      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(4 * 3600) },
-      agoIso(3 * 60 * 60 * 1000),
-    );
-    await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
-    await vi.advanceTimersByTimeAsync(500);
-    await waitFor(() => screen.getByTestId("agent-rate-detail"));
-    const snapshot = screen.getByTestId("agent-rate-snapshot");
-    expect(snapshot).toHaveTextContent(/snapshot from .* ago/i);
-    expect(snapshot).toHaveTextContent(/refresh/i);
-  });
-});
-
-async function renderCodexWithRateLimit(info: unknown, refused = false): Promise<void> {
-  const state = await loadState();
-  await state.registerAgent(CODEX_AGENT);
-  const runtime = state.runtimes[CODEX_AGENT.id];
-  if (runtime === undefined) throw new Error("unreachable");
-  state.runtimes[CODEX_AGENT.id] = {
-    ...runtime,
-    last_rate_limit: info,
-    usage_limit_reached: refused,
-  };
-  render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
-}
-
-/// Codex rate-limit windows — both independent windows (primary ~5-hour +
-/// secondary weekly) surfaced as gauge lines, each labeled from its
-/// `window_minutes` and gated reset-passed. The reset times (incl. the weekly
-/// window, days out) live in the tooltip. Class B (session-file-backed), so no
-/// snapshot-age line. Closes G8 (secondary window + reset times were dropped).
-describe("Sidebar Codex rate-limit windows", () => {
-  it("renders both windows as meters carrying the harness-shared labels", async () => {
-    await renderCodexWithRateLimit({
-      primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
-      secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
-    });
-    const meters = screen.getAllByTestId("agent-usage-window");
-    expect(meters).toHaveLength(2);
-    // window_minutes → the same strings the Claude cell uses, not
-    // "primary/secondary" and not a Codex-only vocabulary.
-    expect(meters[0]).toHaveTextContent("5-hour limit");
-    expect(meters[0]).toHaveTextContent("42%");
-    expect(meters[1]).toHaveTextContent("Weekly · all models");
-    expect(meters[1]).toHaveTextContent("7%");
-  });
-
-  it("renders a bare used_percent as a 'Quota' meter", async () => {
-    // A minimal payload — no duration to name the window — still reads as a
-    // real gauge rather than disappearing.
-    await renderCodexWithRateLimit({ primary: { used_percent: 42.5 } });
-    const meter = screen.getByTestId("agent-usage-window");
-    expect(meter).toHaveTextContent("Quota");
-    expect(meter).toHaveTextContent("43%");
-  });
-
-  it("converts Codex's 0-100 percentage to the meter's used fraction", async () => {
-    // The conversion happens at the derivation boundary so the meter only ever
-    // sees a 0-1 fraction; a missed division would fill the bar at 4200%.
-    await renderCodexWithRateLimit({
-      primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
-    });
-    expect(screen.getByTestId("agent-usage-window-fill")).toHaveStyle({ width: "42.0%" });
-  });
-
-  it("hides a window whose reset has passed (reset-passed), keeps the live one", async () => {
-    await renderCodexWithRateLimit({
-      primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(-3600) },
-      secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
-    });
-    const meters = screen.getAllByTestId("agent-usage-window");
-    expect(meters).toHaveLength(1);
-    expect(meters[0]).toHaveTextContent("Weekly · all models");
-    expect(meters[0]).toHaveTextContent("7%");
-  });
-
-  it("surfaces reset times in the tooltip, not the inline gauge", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    try {
-      await renderCodexWithRateLimit({
-        primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
-        secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
-      });
-      await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit"));
-      await vi.advanceTimersByTimeAsync(500);
-      const detail = await waitFor(() => screen.getByTestId("agent-rate-limit-detail"));
-      expect(detail).toHaveTextContent(/5-hour limit\s+42% used\s+Resets/);
-      expect(detail).toHaveTextContent(/Weekly · all models\s+7% used\s+Resets/);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("draws the window full and amber after Codex refused the agent's last turn", async () => {
-    // The last measurement said 93%; the refusal says the window is used up.
-    // The bar shows the verdict, since that is the number the user just hit.
-    await renderCodexWithRateLimit(
-      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: epochFromNow(86_400) } },
-      true,
-    );
-    const meter = screen.getByTestId("agent-usage-window");
-    expect(meter).toHaveTextContent("Weekly · all models");
-    expect(meter).toHaveTextContent("100%");
-    expect(screen.getByTestId("agent-usage-window-fill")).toHaveStyle({ width: "100.0%" });
-    expect(screen.getByTestId("agent-usage-window-fill")).toHaveClass("bg-warning");
-  });
-
-  it("explains the full bar in the tooltip", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    try {
-      await renderCodexWithRateLimit(
-        { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: epochFromNow(86_400) } },
-        true,
-      );
-      await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit"));
-      await vi.advanceTimersByTimeAsync(500);
-      const detail = await waitFor(() => screen.getByTestId("agent-rate-limit-detail"));
-      expect(detail).toHaveTextContent("100% used");
-      expect(screen.getByTestId("agent-usage-window-refused")).toHaveTextContent(
-        "the last message was refused",
-      );
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("leaves the measurement as it was when no refusal is standing", async () => {
-    await renderCodexWithRateLimit(
-      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: epochFromNow(86_400) } },
-      false,
-    );
-    expect(screen.getByTestId("agent-usage-window")).toHaveTextContent("93%");
-    expect(screen.getByTestId("agent-usage-window-fill")).not.toHaveClass("bg-warning");
-  });
-
-  it("marks only the most-used window, not every window the plan reports", async () => {
-    // Codex says *a* limit was hit, never which. Flagging both would tell a
-    // user who burned a 5-hour quota that their weekly one is gone too —
-    // days claimed for an hour.
-    await renderCodexWithRateLimit(
-      {
-        primary: { used_percent: 99.0, window_minutes: 300, resets_at: epochFromNow(1800) },
-        secondary: { used_percent: 30.0, window_minutes: 10080, resets_at: epochFromNow(86_400) },
-      },
-      true,
-    );
-    const meters = screen.getAllByTestId("agent-usage-window");
-    expect(meters).toHaveLength(2);
-    expect(meters[0]).toHaveTextContent("5-hour limit");
-    expect(meters[0]).toHaveTextContent("100%");
-    expect(meters[1]).toHaveTextContent("Weekly · all models");
-    expect(meters[1]).toHaveTextContent("30%");
-    const fills = screen.getAllByTestId("agent-usage-window-fill");
-    expect(fills[0]).toHaveClass("bg-warning");
-    expect(fills[1]).not.toHaveClass("bg-warning");
-  });
-
-  it("surfaces the refused window on a collapsed card, like Claude's threshold warning", async () => {
-    await renderCodexWithRateLimit(
-      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: epochFromNow(86_400) } },
-      true,
-    );
-    expect(screen.queryByTestId("agent-compact-warnings")).toBeNull();
-    await fireEvent.click(screen.getByTestId("agent-collapse-toggle"));
-    expect(screen.getByTestId("agent-compact-warnings")).toHaveTextContent(
-      "Weekly · all models · 100% used",
-    );
-  });
-
-  it("Claude agent never shows the Codex gauge cell (Codex-gated)", async () => {
-    await renderClaudeWithRateLimit(
-      { primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) } },
-      null,
-    );
-    // Claude reads its own shape (isUsingOverage/resetsAt), not Codex's
-    // primary.used_percent — so the Codex gauge cell must not appear.
-    expect(screen.queryByTestId("agent-rate-limit")).toBeNull();
-  });
-});
-
 /// Clean-hide convention (G10): a metadata cell a harness can't report must
 /// render *nothing* — no empty label, no blank bar, no placeholder. These pin
 /// the capable-absence cases so a future "show — / n/a" regression fails here.
@@ -2261,10 +1642,6 @@ describe("Sidebar clean-hide for absent metadata", () => {
     await state.registerAgent(CLAUDE_AGENT);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     expect(screen.queryByTestId("agent-cost")).toBeNull();
-    expect(screen.queryByTestId("agent-rate-limit")).toBeNull();
-    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
-    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
-    expect(screen.queryByTestId("agent-overage")).toBeNull();
     expect(screen.queryByTestId("agent-context-bar")).toBeNull();
     expect(screen.queryByTestId("agent-meta")).toBeNull();
   });

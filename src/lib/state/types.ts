@@ -269,7 +269,7 @@ export type ContextReportRequest = {
 /// - `last_error`: runtime record of the most-recent failure, rendered in the
 ///   transcript as a failed agent turn. Read by no other surface — the one
 ///   consumer of a failure's *kind* is the `turn_end` reducer, which translates
-///   a `usage_limit` refusal into `usage_limit_reached` (below) and never hands
+///   a `usage_limit` refusal to the account-scoped usage store and never hands
 ///   `last_error` to the sidebar. Does NOT gate Send. Cleared when the next
 ///   turn starts.
 /// - `in_flight_turn_id`: heartbeat scope. The turn the timer is tracking.
@@ -366,73 +366,10 @@ export type AgentRuntime = {
   /// gate sendability. (A heartbeat timeout no longer sets this — a silent turn
   /// isn't a failure; see `quiet_since`.)
   last_error?: { message: string; kind: FailureKind };
-  /// Whether the harness is currently refusing this agent's work because a
-  /// usage window is exhausted. Read by the sidebar, which draws the agent's
-  /// most-used window full and amber while it is `true`.
-  ///
-  /// **This is a verdict about a window, not about an agent or a turn**, and
-  /// every rule below follows from that. Getting it wrong twice — a stale
-  /// verdict decorating a freshly reset window, and a reopen path that
-  /// disagreed with the live one — both came from designing around *when it
-  /// stops being true* instead of *what it is true of*. Resist a time-based
-  /// expiry here; the answer is always "which window did this judge."
-  ///
-  /// **Deliberately not derived from `last_error`.** Being out of quota
-  /// outlives a turn, and `last_error` is cleared at every `turn_start` — so a
-  /// card driven from it dropped back to the stale measurement for the few
-  /// seconds each retry took, then flipped amber again when the retry failed.
-  ///
-  /// Three things move it, and nothing else does:
-  /// - A `usage_limit` failure sets it.
-  /// - A **completed** turn clears it. A cancellation is the user's doing and
-  ///   an unrelated failure is no evidence the quota moved; clearing on either
-  ///   reproduces the `last_error` defect on a slower clock.
-  /// - A `rate_limit_event` describing **different windows** clears it, since
-  ///   the verdict retires with the window it judged (`sameCodexUsageWindows`).
-  ///   Without this the flag outlives its subject and paints a reset quota as
-  ///   spent, which the reset-passed gate cannot retire because that window is
-  ///   current.
-  ///
-  /// **Tri-state on purpose.** `undefined` is "no terminal observed yet", which
-  /// is what lets `hydrate` fill it from the journal without overwriting a
-  /// live verdict; a live terminal always writes a definite `true`/`false`.
-  ///
-  /// **Known residual — the reopen path has no window provenance.** The journal
-  /// records turn outcomes, never quota readings, so a flag restored by
-  /// `agentsStandingRefused` cannot be checked against the window it judged.
-  /// Reachable sequence: a turn gets far enough to read a *new* window and then
-  /// fails for an unrelated reason (so it does not clear the flag), and the app
-  /// closes before any further turn. The live session had already cleared the
-  /// flag by window identity; the replay cannot see that and restores it, so
-  /// the new window renders full. The next `rate_limit_event` of *any* kind
-  /// corrects it — the wrongness lasts until the next turn, not until the next
-  /// successful one.
-  ///
-  /// **Agent-scoped by accident, not design.** The quota belongs to the
-  /// account (one `codex login` per machine), so sibling agents on the same
-  /// harness can disagree on screen — one drawing full, another its own older
-  /// measurement — while both are equally refused. This belongs at harness
-  /// scope, and moves there with the usage meters when they leave the agent
-  /// card. Do not paper over it by OR-ing across agents: that assumes one quota
-  /// per account, which Codex's own unprobed `limit_id` / `individual_limit`
-  /// fields leave open, and it would turn one agent's refusal into a
-  /// project-wide false alarm if a quota can ever be narrower.
-  usage_limit_reached?: boolean;
   /// Populated by live `SessionMeta` events or by disk hydration of the
   /// agent's session file. Undefined on agents whose first dispatch
   /// hasn't happened yet.
   meta?: AgentMeta;
-  /// Most-recent `RateLimitEvent.info` payload. Opaque — the renderer reads
-  /// `primary.used_percent` (Codex) or `isUsingOverage` (Claude). Populated
-  /// by live events or by hydration from the metadata sidecar.
-  last_rate_limit?: unknown;
-  /// Capture time of `last_rate_limit` when it came from the metadata
-  /// sidecar on hydration (a stream-only/class-C value restored across
-  /// restart). ISO-8601 string. `null` once a live `rate_limit_event`
-  /// overwrites the in-memory value (it's no longer an on-disk snapshot)
-  /// and for class-B sources. Drives the UI "as of …" staleness qualifier:
-  /// the staleness check is `as_of != null && age(as_of) > threshold`.
-  last_rate_limit_as_of?: string | null;
   /// Capture time of `meta.inventory` when it came from the metadata sidecar
   /// on hydration (Claude's `system/init` is stream-only, class C). ISO-8601
   /// string; `null` once a live `session_meta` overwrites the in-memory value,
@@ -446,20 +383,17 @@ export type AgentRuntime = {
   /// When `last_context_report` was measured (ISO-8601).
   ///
   /// **Always set alongside the report, live or restored** — deliberately unlike
-  /// `last_rate_limit_as_of`, which is a disk-snapshot qualifier cleared by a
-  /// live event. Every turn refreshes a rate-limit payload, so a live one is
-  /// current by construction; nothing refreshes a breakdown, so a live one
-  /// starts aging the instant it lands and the panel must say when it was taken.
+  /// the quota reading's `as_of`, which is a snapshot qualifier the account-scoped
+  /// store drops for a live value. Every turn refreshes a quota reading, so a
+  /// live one is current by construction; nothing refreshes a breakdown, so a
+  /// live one starts aging the instant it lands and the panel must say when it
+  /// was taken.
   last_context_report_at?: string;
   /// The state of the report the user last asked for. Survives an ordinary send;
   /// see [`ContextReportRequest`] for why. One slot: the panel's button is
   /// disabled while a request is queued or running, so a second click cannot
   /// orphan the first request's correlation.
   context_report_request?: ContextReportRequest;
-  /// Model of the turn that delivered `last_rate_limit`, used to label Claude's
-  /// per-model weekly window (which the payload itself never names). Persisted
-  /// beside that exact payload so the association remains valid on reopen.
-  last_rate_limit_model?: string;
   /// Model reported by the **current turn's** `session_meta`, cleared at
   /// `turn_start`. Separate from `meta.model`, which survives across turns for
   /// its other consumers: only a same-turn observation may label a rate-limit
@@ -467,12 +401,6 @@ export type AgentRuntime = {
   /// (the recorded compaction order) and `meta` would then name the previous
   /// turn's model.
   current_turn_model?: string;
-  /// Set when `last_rate_limit` was stored before this turn's model was known,
-  /// so the `session_meta` still to come can supply the label. Cleared at
-  /// `turn_start` — a turn that dies before its `init` must not hand its
-  /// snapshot to the next turn's model — and never set by `hydrate`, whose
-  /// `meta.model` is first-model-wins and may predate the snapshot entirely.
-  last_rate_limit_awaiting_model?: true;
   /// Disk-rehydration lifecycle. Newly-created agents start at
   /// `"complete"` (nothing to hydrate); registered/attached agents pass
   /// through `"pending"` → `"loading"` → `"complete"`. Compose-bar Send

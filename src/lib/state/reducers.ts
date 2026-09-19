@@ -44,7 +44,6 @@ import type {
   SendId,
   TurnId,
 } from "$lib/types";
-import { sameCodexUsageWindows } from "$lib/usageWindows";
 import type {
   AgentRuntime,
   ContextReportRequest,
@@ -706,14 +705,11 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
           runtime.pending_sends,
           pickPendingIndex(runtime.pending_sends, input.message_id, input.send_id),
         ),
-        // Both model-attribution fields are per-turn and reset here. `meta`
-        // itself deliberately survives (other consumers read it across turns);
-        // what must not survive is the claim that its model describes *this*
-        // turn. Clearing the pending flag is what stops a turn that died before
-        // its `init` from handing its rate-limit snapshot to the next turn's
-        // model.
+        // Per-turn and reset here. `meta` itself deliberately survives (other
+        // consumers read it across turns); what must not survive is the claim
+        // that its model describes *this* turn — a turn that dies before its
+        // `init` must not lend its model to the next turn's quota reading.
         current_turn_model: undefined,
-        last_rate_limit_awaiting_model: undefined,
       };
 
     case "message_failed": {
@@ -770,15 +766,11 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // Completed and cancelled are not errors — leave `last_error` untouched
       // (AgentIdle clears in_flight_turn_id). Only a real failure surfaces it.
       //
-      // A **completed** turn does write one thing: it is the single piece of
-      // evidence that a usage window has room again, so it clears
-      // `usage_limit_reached`. Cancellation still returns early — the user
-      // stopping a turn says nothing about the quota (see the field's doc).
-      if (input.outcome.status === "cancelled") {
+      // A quota refusal is **not** recorded here: it is a fact about the harness
+      // account rather than this agent, so the live-event boundary routes it to
+      // the account-scoped store instead (`harnessUsage.svelte.ts`).
+      if (input.outcome.status === "cancelled" || input.outcome.status === "completed") {
         return runtime.quiet_since !== undefined ? { ...runtime, quiet_since: undefined } : runtime;
-      }
-      if (input.outcome.status === "completed") {
-        return { ...runtime, quiet_since: undefined, usage_limit_reached: false };
       }
       return {
         ...runtime,
@@ -787,10 +779,6 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
           message: input.outcome.message,
           kind: input.outcome.kind,
         },
-        // Only a quota refusal moves this; any other failure leaves the
-        // previous verdict standing, since it is no evidence either way.
-        usage_limit_reached:
-          input.outcome.kind === "usage_limit" ? true : runtime.usage_limit_reached,
       };
 
     case "agent_idle":
@@ -840,21 +828,13 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       return { ...runtime, quiet_since: undefined };
 
     case "session_meta": {
-      // An empty model carries no model info (see below), so it neither
-      // records a per-turn observation nor repairs a waiting snapshot.
+      // An empty model carries no model info (see below), so it records no
+      // per-turn observation. The label a late `init` repairs now lives on the
+      // account-scoped reading, patched at the event boundary rather than here.
       const observed = input.model !== "" ? input.model : undefined;
-      const repairs = observed !== undefined && runtime.last_rate_limit_awaiting_model === true;
       return {
         ...runtime,
         current_turn_model: observed ?? runtime.current_turn_model,
-        // Repair: this turn's rate-limit event landed before its `init` (the
-        // compaction stream emits them in that order), so the snapshot is
-        // already stored with no model. `init` names the model for the same
-        // turn, which is exactly the label that snapshot needs.
-        last_rate_limit_model: repairs ? observed : runtime.last_rate_limit_model,
-        last_rate_limit_awaiting_model: repairs
-          ? undefined
-          : runtime.last_rate_limit_awaiting_model,
         meta: {
           // Empty model means "no model info on this event," not "set the
           // model to blank." Antigravity only reports a model when the
@@ -878,47 +858,12 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
     }
 
     case "rate_limit_event":
-      // A live event overwrites the in-memory value; the `as_of` qualifier
-      // (the on-disk snapshot's age) is meaningless once live data lands, so
-      // clear it to null — never stamp `now`, which would spuriously age an
-      // actively-streaming session past the staleness threshold.
-      //
-      // The observed model is stamped beside the payload because Claude's
-      // per-model weekly window never names its own model: the event carries
-      // that window only on turns run against an allowlisted model, so the
-      // model of the turn that delivered the snapshot is a truthful label for
-      // it.
-      //
-      // Read from `current_turn_model` — the model *this* turn's `init`
-      // reported — and never from `meta.model`, which survives across turns.
-      // `meta` would name the previous model whenever the rate-limit event
-      // precedes the turn's `init`, which is the recorded order on a compaction
-      // stream: switch model, compact, and the new Fable window would read
-      // "Weekly · Sonnet". When no model has been observed for this turn the
-      // snapshot is stored without one (the window falls back to a generic
-      // label) and flagged for repair by the `init` still to come.
-      //
-      // Codex is unaffected by construction: its `session_meta` and
-      // `rate_limit_event` both arrive in the post-terminal enrichment, and its
-      // window view never reads this label.
-      return {
-        ...runtime,
-        last_rate_limit: input.info,
-        last_rate_limit_as_of: null,
-        last_rate_limit_model: runtime.current_turn_model,
-        last_rate_limit_awaiting_model: runtime.current_turn_model === undefined ? true : undefined,
-        // A recorded refusal is a verdict about the window it was measured
-        // against, and this replaces the snapshot underneath it — so a reading
-        // describing different windows retires the verdict with them. Without
-        // this the flag outlives its subject and paints a reset quota as spent.
-        // The refused turn's own event re-emits the same pre-cap record, so it
-        // does not trip this (see `sameCodexUsageWindows`).
-        usage_limit_reached:
-          runtime.usage_limit_reached === true &&
-          !sameCodexUsageWindows(runtime.last_rate_limit, input.info)
-            ? false
-            : runtime.usage_limit_reached,
-      };
+      // **Nothing per-agent to store.** The reading is a fact about the harness
+      // account, so it goes to `harnessUsage.svelte.ts` from the live-event
+      // boundary; keeping a copy here is what made N agent cards disagree about
+      // one account's quota. The event is still routed through this reducer so
+      // an unknown discriminant cannot fall through to a crash.
+      return runtime;
 
     case "context_report":
       // A live report replaces whatever was there **and keeps its own capture
@@ -934,13 +879,15 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       };
 
     case "hydrate": {
-      // **Fill-if-empty for scalars.** Live `session_meta` and
-      // `rate_limit_event` always overwrite; `hydrate.meta` /
-      // `hydrate.last_rate_limit` only fill when the runtime field is
-      // currently absent. Naturally handles a slow hydrate resolving
-      // after a live event already populated the same field — the late
-      // hydrate sees `Some(_)` and no-ops. Pinned by the
-      // `live_wins_over_subsequent_hydrate` test below.
+      // **Fill-if-empty for scalars.** A live `session_meta` always overwrites;
+      // `hydrate.meta` only fills when the runtime field is currently absent.
+      // Naturally handles a slow hydrate resolving after a live event already
+      // populated the same field — the late hydrate sees a value and no-ops.
+      // Pinned by the `live_wins_over_subsequent_hydrate` test below.
+      //
+      // The hydrated quota reading is **not** filled in here: it is account state,
+      // offered to `harnessUsage.svelte.ts` from `applyAgentHydrate` where it is
+      // ranked against every other agent's reading rather than stored per agent.
       const next: AgentRuntime = {
         ...runtime,
         hydration_status: "complete",
@@ -956,30 +903,12 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         // age a live inventory.
         next.meta_as_of = input.meta_as_of ?? null;
       }
-      if (next.last_rate_limit === undefined && input.last_rate_limit != null) {
-        // Fill `last_rate_limit` and its `as_of` together — they're one unit.
-        // Only when the runtime had no value: if a live event already
-        // populated it (and cleared `as_of` to null), this no-ops and the
-        // live value + its null `as_of` stay in place.
-        next.last_rate_limit = input.last_rate_limit;
-        next.last_rate_limit_model = input.last_rate_limit_model ?? undefined;
-        next.last_rate_limit_as_of = input.last_rate_limit_as_of ?? null;
-      }
       if (next.last_context_report === undefined && input.last_context_report != null) {
         // Same unit-of-two fill: a report and the moment it was taken. A live
         // event that already landed keeps both, so a slow hydrate cannot replace
         // a fresh measurement with an older one.
         next.last_context_report = input.last_context_report;
         next.last_context_report_at = input.last_context_report_at ?? undefined;
-      }
-      if (next.usage_limit_reached === undefined && input.usage_limit_reached != null) {
-        // Fill-if-empty with no `run_status` gate, unlike the failure text this
-        // replaced. That needed one because `turn_start` cleared `last_error`,
-        // re-opening the hole mid-turn and letting a stale *message* land under
-        // a live turn. Nothing clears this field at `turn_start`, and what it
-        // fills with — "as of the last observed terminal, the harness was
-        // refusing this agent" — is still true while a retry is in flight.
-        next.usage_limit_reached = input.usage_limit_reached;
       }
       return next;
     }

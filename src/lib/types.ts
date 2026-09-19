@@ -20,7 +20,7 @@ export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure" |
 // window is exhausted — typed from a structured signal (Codex's
 // `task_complete.error.codex_error_info`), never from the prose. Read once, by
 // the `turn_end` reducer, which translates it into
-// `AgentRuntime.usage_limit_reached`; that field is what draws the usage window
+// the account-scoped usage store; that store is what draws the usage window
 // full (see `usageWindows.ts::codexRateLimitView`).
 
 // Who initiated a cancellation. Carried on the `cancelled` outcome.
@@ -518,12 +518,6 @@ export type Hydrate = {
   /// runtime has none — live > disk, like `meta` and `last_rate_limit`.
   last_context_report?: ContextReport | null;
   last_context_report_at?: string | null;
-  /// Whether the harness was still refusing this agent for a usage limit when
-  /// the app last saw it — the project hydration works that out from the
-  /// journal (the per-agent path has no journal and sends nothing). Fills
-  /// `AgentRuntime.usage_limit_reached` only when the runtime has no reading
-  /// of its own; live > disk, like every other field here.
-  usage_limit_reached?: boolean | null;
 };
 
 export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;

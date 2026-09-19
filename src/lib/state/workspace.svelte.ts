@@ -1106,7 +1106,6 @@ export async function hydrateProject(
 
     // eslint-disable-next-line svelte/prefer-svelte-reactivity
     const metaByAgent = new Map(convo.agents.map((m) => [m.agent_id, m]));
-    const standingRefusals = agentsStandingRefused(convo.items);
     // eslint-disable-next-line svelte/prefer-svelte-reactivity
     const agentIds = new Set<AgentId>([
       ...turnsByAgent.keys(),
@@ -1144,10 +1143,6 @@ export async function hydrateProject(
       applyAgentHydrate(agentId, {
         turns: turnsByAgent.get(agentId) ?? [],
         ...meta,
-        // Always definite, never null: the journal is authoritative for this
-        // project's history, so "no standing refusal" is a reading rather than
-        // an absence of one.
-        usage_limit_reached: standingRefusals.has(agentId),
       });
     }
 
@@ -1176,80 +1171,6 @@ export async function hydrateProject(
     }
     return "failed";
   }
-}
-
-/// The agents the harness was still refusing for a usage limit when the app
-/// last saw them. Restores `AgentRuntime.usage_limit_reached` on reopen, so the
-/// card draws the same full window it drew before the restart.
-///
-/// **Replays the live rule rather than approximating it** (`reducers.ts`'s
-/// `turn_end` arm): a usage-limit failure sets the flag, a turn that *completed
-/// successfully* clears it, and nothing else moves it. An earlier version took
-/// the newest failure of any kind and asked whether it was a usage limit, which
-/// disagreed with the live rule exactly where it matters — a capped agent whose
-/// retry died on a network error read as refused before a restart and not after.
-///
-/// **"Completed successfully" comes from the journal, not from the turn's
-/// status.** A refused turn is `status: "complete"` on disk (Codex closes the
-/// turn on `task_complete` whatever its `error` says), so status alone cannot
-/// tell a success from a refusal. The journal records an outcome only for
-/// *non-completed* terminals, so a send with no outcome is the success signal —
-/// and this is also what excludes the refusal's own disk record without any
-/// timestamp comparison, since its send carries the refusal outcome.
-///
-/// Two deliberate directions, both understating rather than over-claiming,
-/// because a false "limit reached" tells the user to stop working:
-/// - A turn whose `send_id` could not be resolved (`null` — a declined
-///   anomalous link with no positional match) is treated as a success and
-///   clears the flag. It cannot be told apart from a later one.
-/// - Only `status: "complete"` clears. A truncated Codex turn reads as
-///   `failed` and an in-flight one as `streaming`; neither is evidence the
-///   quota moved.
-function agentsStandingRefused(items: readonly ConversationItem[]): Set<AgentId> {
-  // Function-local scratch, never observed reactively (see the hydration maps
-  // above for the same exemption).
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity
-  const settledBadly = new Set<string>();
-  for (const item of items) {
-    if (item.kind === "outcome") settledBadly.add(item.send_id);
-  }
-
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity
-  const refused = new Set<AgentId>();
-  for (const item of [...items].sort(byReplayOrder)) {
-    if (item.kind === "outcome") {
-      if (item.status === "failed" && item.failure_kind === "usage_limit") {
-        refused.add(item.agent_id);
-      }
-      continue;
-    }
-    if (item.kind !== "agent_turn" || item.status !== "complete") continue;
-    if (item.send_id != null && settledBadly.has(item.send_id)) continue;
-    refused.delete(item.agent_id);
-  }
-  return refused;
-}
-
-/// Sorted locally rather than trusting the backend's ordering, and on the same
-/// key it uses (`commands.rs::conversation_item_sort_key`) so a tie between an
-/// outcome and a turn at one instant resolves the same way here as it does in
-/// the rendered conversation, instead of falling to sort stability.
-function byReplayOrder(a: ConversationItem, b: ConversationItem): number {
-  const at = (item: ConversationItem): [number, number] => {
-    switch (item.kind) {
-      case "user_message":
-        return [Date.parse(item.at), 0];
-      case "agent_turn":
-        return [Date.parse(item.started_at), 1];
-      case "system_marker":
-        return [Date.parse(item.at), 2];
-      default:
-        return [Date.parse(item.at), 3];
-    }
-  };
-  const [aTime, aRank] = at(a);
-  const [bTime, bRank] = at(b);
-  return aTime - bTime || aRank - bRank;
 }
 
 /// On re-activation of an already-loaded project, re-read its conversation if a

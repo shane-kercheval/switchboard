@@ -31,6 +31,11 @@ async function loadState() {
   return await import("./index.svelte");
 }
 
+/// The account-scoped usage store, asserted directly where a quota reading used
+/// to be asserted on the agent runtime. Cleared by the state module's own
+/// `_testing.reset()`, so no separate teardown here.
+const usage = await import("./harnessUsage.svelte");
+
 function agentRecord(
   id: string,
   name = "test",
@@ -199,7 +204,9 @@ describe("event routing", () => {
       info: { primary: { used_percent: 30 } },
     });
     expect(state.runtimes[AGENT_A]?.meta?.model).toBe("claude-sonnet-4-6");
-    expect(state.runtimes[AGENT_A]?.last_rate_limit).toEqual({ primary: { used_percent: 30 } });
+    // The reading lands in the account-scoped store, not on the agent: the quota
+    // it describes belongs to the harness account this agent happens to use.
+    expect(usage.harnessUsage.claude_code?.payload).toEqual({ primary: { used_percent: 30 } });
     expect(state.transcripts[AGENT_A]).toEqual([]);
   });
 });
@@ -1277,7 +1284,7 @@ describe("hydrateAgent", () => {
     expect(state.runtimes[AGENT_A]?.meta_as_of).toBe("2026-09-17T12:00:00Z");
   });
 
-  it("carries the rate-limit model from the IPC reply to the runtime", async () => {
+  it("carries the rate-limit model from the IPC reply to the usage store", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
 
@@ -1295,7 +1302,7 @@ describe("hydrateAgent", () => {
     });
 
     await state.hydrateAgent(AGENT_A);
-    expect(state.runtimes[AGENT_A]?.last_rate_limit_model).toBe("claude-fable-5-1");
+    expect(usage.harnessUsage.claude_code?.model).toBe("claude-fable-5-1");
   });
 
   it("a live inventory that lands before hydration resolves never inherits the snapshot's age", async () => {

@@ -70,6 +70,8 @@ async function loadState() {
   return await import("$lib/state/index.svelte");
 }
 
+const usage = await import("$lib/state/harnessUsage.svelte");
+
 async function openAgentActions(index = 0): Promise<HTMLElement> {
   const triggers = await screen.findAllByTestId("agent-actions-trigger");
   const trigger = triggers.at(index);
@@ -237,12 +239,6 @@ describe("Sidebar", () => {
     if (runtime === undefined) throw new Error("unreachable");
     state.runtimes[CLAUDE_AGENT.id] = {
       ...runtime,
-      last_rate_limit: {
-        status: "allowed",
-        unifiedWindows: {
-          five_hour: { utilization: 0.25, resetsAt: epochFromNow(3600) },
-        },
-      },
       meta: {
         model: "claude-sonnet-4-6",
         harness_version: "2.1.274",
@@ -319,11 +315,10 @@ describe("Sidebar", () => {
     // should fail here rather than ship.
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    const runtime = state.runtimes[CLAUDE_AGENT.id];
-    if (runtime === undefined) throw new Error("unreachable");
-    state.runtimes[CLAUDE_AGENT.id] = {
-      ...runtime,
-      last_rate_limit: {
+    // A real reading is on record for this agent's harness, so the card has
+    // something it *could* draw and still must not.
+    usage.observeUsage("claude_code", {
+      payload: {
         status: "allowed_warning",
         rateLimitType: "seven_day",
         surpassedThreshold: 0.75,
@@ -333,7 +328,8 @@ describe("Sidebar", () => {
           seven_day: { utilization: 0.91, resetsAt: epochFromNow(5 * 86400) },
         },
       },
-    };
+      observed_at: new Date().toISOString(),
+    });
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     expect(screen.queryByTestId("agent-compact-warnings")).toBeNull();

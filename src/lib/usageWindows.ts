@@ -214,8 +214,8 @@ function codexWindowLabel(windowMinutes: unknown): string {
 /// Whether two Codex rate-limit payloads describe the **same windows**, used to
 /// decide whether a recorded refusal still applies to the snapshot on screen.
 ///
-/// The refusal (`AgentRuntime.usage_limit_reached`) is a verdict about a
-/// particular window, not about the agent, and `last_rate_limit` is replaced
+/// The refusal (`HarnessUsageReading.limit_reached`) is a verdict about a
+/// particular window, not about the harness, and the reading is replaced
 /// independently of it — so without this the verdict can decorate a snapshot it
 /// was never about, drawing a freshly reset quota as spent.
 ///

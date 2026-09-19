@@ -230,27 +230,40 @@ Settled here; the rationale must survive into code comments where marked.
    keys are not Claude Code windows on any plan we can probe; a junk label is worse than a dropped
    window. The full list is recorded in harness-behavior so a future probe can extend the map.
    *(Comment on the label map, naming the binary as the source.)*
-5. **The per-model window is labeled with the model that produced the snapshot — live only.** The
+5. **The per-model window is labeled with the model that produced the snapshot.** The
+   label uses the model's **family name** (`agentSelection.ts::claudeModelFamilyLabel`, e.g.
+   `claude-fable-5-1` → "Fable"), not the raw stream id: the id needs 136px against an 85px budget at
+   the default sidebar width, and the family name is the word the user selected the model by. The
    window arrives only on turns run on an allowlisted model, so the model of the turn that delivered
    the event is a truthful label. The `rate_limit_event` reducer records the runtime's observed model
-   beside the payload as `last_rate_limit_model`. The sidecar does not carry it; after a reload the
-   label is "Weekly · model-specific", and the snapshot line already says the value is old. A live
-   event overwrites both fields, so a stale label cannot outlive the next turn. *(Comment on the
-   reducer arm and the fallback label.)*
+   beside the payload as `last_rate_limit_model`. The sidecar carries the same-turn model beside the
+   exact payload, so the family label survives reload without borrowing the session's older model.
+   A legacy sidecar without that additive field falls back to "Weekly · model-specific". A live event
+   overwrites both fields. *(Comment on the reducer arm and the fallback label.)*
 6. **The CLI's threshold warning becomes the meter's warning tone.** `status: "allowed_warning"`
    names the window in `rateLimitType` and the threshold in `surpassedThreshold`; that meter fills
-   with the `warning` token and its tooltip gains "above N% of this limit". The second event of a
-   turn carries the superset, so last-write-wins is correct. `status: "rejected"` stays the failure
-   path (harness-behavior §1.4).
+   with the `warning` token. The tooltip does not repeat the harness's internal cutoff. The second
+   event of a turn carries the superset, so last-write-wins is correct. `status: "rejected"` stays
+   the failure path (harness-behavior §1.4).
 7. **The overage escalation and the snapshot-age line are unchanged.** "⚡ using credits" is about
    what is being billed, not how full a window is; it stays beneath the meters. The rehydrated
    "snapshot from …" line stays: Claude's payload is stream-only, and a days-old weekly percentage is
    exactly its case. `overageStatus` / `overageDisabledReason` are not rendered.
 8. **Reset-passed hides a meter, per window.** A window whose `resetsAt` is in the past is dropped;
    the others still render. No dim, no age threshold.
-9. **Reset text is relative when near, absolute when far.** "Resets in 16 min" / "Resets in 3 h"
-   under 24 hours; "Resets Sun 8:00 AM" beyond. Full date and time in the tooltip. Computed at render
-   from `Date.now()`, not on a timer — recorded as a known limitation.
+9. **Inline reset text is relative at every distance; the absolute date lives in the tooltip.**
+   "in 16 min" / "in 3 h" / "in 5 d" beside the meter; the full date and time on hover. Computed at
+   render from `Date.now()`, not on a timer — recorded as a known limitation.
+
+   Two earlier drafts of this decision put an absolute form inline ("Resets Sun 8:00 AM", then
+   "Resets Sat, Sep 19, 8:00 AM" once a bare weekday was found ambiguous six days out). **Both are
+   superseded**, and the reason is measured rather than argued: the meter's label, its reset text and
+   its percentage share a column ~177px wide at the default sidebar width, and an absolute date takes
+   ~100px of it — it crowded the label it belonged to off the card. A relative countdown is compact
+   at every distance, and rendering no weekday retires the ambiguity the second draft existed to fix.
+   `utils.ts::formatResetCountdown` is therefore pure arithmetic with no locale or time-zone
+   formatting; the cells' tooltips carry the absolute date via `formatResetDateTime`, where there is
+   room for it.
 10. **Both harnesses use the same label strings for the same window.** Codex `primary` (300 min) and
     `secondary` (10080 min) are "5-hour limit" and "Weekly · all models"; its bare `used_percent`
     fallback is a meter labeled "Quota". *(Comment where the Codex labels are derived.)*
@@ -307,16 +320,19 @@ for the user (telemetry flags, internal capability strings).
     snapshot set: a stale status is fine when it says it is stale. Codex's is re-read from the
     rollout (class B) and never persisted. *(Comment on the sidecar field, citing G14; comment on
     the source enum, citing `RateLimitSource`.)*
-14. **The two chips become an "Environment" disclosure row on the card.** Collapsed: one line of
-    counts with the only status that matters called out — "MCP 7 · 2 need auth · Agents 6 · Plugins
-    1 · Skills 30 · Memory 1". Expanded: sections in that order — MCP servers (name, `StatusDot`,
-    source), custom agents (names), plugins (name @ version), memory paths (basename, full path on
-    hover), skills, tools, and slash commands — each of the last three a count line ("Tools · 109")
-    that expands to the full sorted list — and a final settings line (permission mode, output
-    style). Uses `ExpandCollapseIcon` at both levels; per-agent collapsed state, default collapsed,
-    ephemeral like the card's other disclosure. Status vocabulary: `connected` →
-    the idle/neutral dot, `needs-auth` and anything else → the warning dot with the raw status as its
-    label — the set is unknown beyond the two observed, so unknown statuses must show, not hide.
+14. **The two chips become an "Environment" disclosure on an expanded card.** A collapsed card
+    keeps the model, effort, context meter, and critical quota warnings visible, but omits
+    Environment entirely: authentication warnings are common for configured servers a user does not
+    rely on and do not justify making every compact card taller. Expanding the card reveals one
+    trigger row. It shows "View details" when the inventory is healthy, "N need auth" for the
+    `needs-auth` status actually observed, and "N need attention" for any other non-connected
+    status, with both counts when both apply. The complete inventory opens in a bounded, named
+    popover so long lists never extend the card. Its sections include MCP servers (name, `StatusDot`,
+    source), plugins (name @ version), memory paths (basename, full path on hover), skills, tools,
+    slash commands, custom agents, and settings (permission mode, output style); the long lists use
+    nested disclosures. Status vocabulary: `connected` → the healthy green dot, `needs-auth` and
+    anything else → the warning dot with the raw status as its label — the set is unknown beyond the
+    two observed, so unknown statuses must show, not hide.
     A Codex card renders the same row from the subset it has: MCP servers (config names, no status
     dot — "configured" is not a runtime status and must not render as one), skills with
     descriptions from the rollout, approved commands behind a count line, and the settings line.
@@ -353,10 +369,13 @@ for the user (telemetry flags, internal capability strings).
     done | failed | cancelled, error? }`, set on dispatch and advanced by `turn_start`, `turn_end`,
     `message_failed`, `message_cancelled`, and `failSendStart`. **It is cleared only by the next
     report dispatch, never by an ordinary send** — otherwise a failure message would vanish the
-    moment the user sent a message. One slot: the panel's button is disabled while a request is
-    queued or running, so a second click cannot orphan the first request's correlation. The dialog
-    renders the request state beside the previous report, which is retained. *(Comment on the
-    pending-kind branch and on the request record's clear rule.)*
+    moment the user sent a message. One slot: the panel opener does not dispatch while a request is
+    already queued or running, so closing and reopening the dialog cannot orphan the first request's
+    correlation. **While a request is in flight the panel shows only the spinner**, withholding any
+    previous report: rendering old numbers and swapping them seconds later reads as the panel
+    changing its mind. A *settled* failure is the opposite case and keeps the previous report —
+    nothing further is coming to replace it. *(Comment on the pending-kind branch and on the request
+    record's clear rule.)*
 18. **`ContextReport` is deserialized from the structured object; the markdown is the fallback.**
     Live, from `assistant.context_usage`; on disk, from `contextUsage`. Categories keep the CLI's
     `kind`; every item row keeps its exact integer tokens. Only when the object is absent (an older
@@ -382,16 +401,28 @@ for the user (telemetry flags, internal capability strings).
     caveat record that precedes the command is treated by `is_meta_continuation` as a mid-turn
     continuation; the fixture test must show it neither extends the preceding agent turn nor pulls
     the following turn backward. *(Comment on the routing branch, naming `commandRun` as the key.)*
-20. **UI: a panel opened from the context meter's chevron, and from the agent menu ("Context
-    breakdown…").** `Dialog`, titled "Context breakdown · <agent>". Header: the context meter with
+20. **UI: a panel opened from the context meter's icon, and from the agent menu ("Context
+    breakdown…").** `Dialog`, titled "Context breakdown · <agent>". **Opening is the refresh**:
+    every entry point dispatches a fresh report, so the panel carries **no Refresh or Analyze
+    button** — the spinner says one is on its way, and re-opening is how the user asks for another,
+    including after a failure. A button would only name the action the open already performed, and
+    the report costs nothing (it runs locally and bills no tokens).
+
+    **Both entry points are disabled while the agent is busy.** A report shares the per-agent FIFO
+    with sends, so on a busy agent it waits out the in-flight turn *and* every queued send — and
+    since opening is what dispatches, the panel would be a featureless spinner for that whole time.
+    Refusing at the door keeps the wait to the ~1s an idle report takes, which is the wait the
+    spinner-only panel is designed around, and keeps a maintenance turn from taking queue position
+    ahead of the user's work. The one exception is the agent's *own* report: the dispatch makes the
+    agent busy, so an in-flight `context_report_request` keeps the entry points live or the user
+    would be locked out of the panel their report is filling (re-opening rides that run and
+    dispatches nothing). Header: the context meter with
     model and "as of". Body: one meter per category, in the CLI's order, label left, "<tokens> ·
     <percent>" right; deferred-tool rows show tokens only (the CLI reports no percentage). Below,
-    collapsible sections — MCP tools grouped by server with per-server totals (the flat 80-row
-    table is unreadable), custom agents, memory files, skills — each `ExpandCollapseIcon`, collapsed
-    by default. Footer: "Refresh" (runs the report; while the agent is busy the button reads
-    "Queued — runs after the current turn"), and a "Raw report" disclosure. Empty state when no
-    report exists: one sentence and an "Analyze context" button. Row-level meters reuse the primitive
-    with no detail text where the CLI gives none.
+    collapsible sections — MCP tools grouped by server with per-server totals (the flat 80-row table
+    is unreadable), custom agents, memory files, skills — each `ExpandCollapseIcon`, collapsed by
+    default, followed by a "Raw report" disclosure. Row-level meters reuse the primitive with no
+    detail text where the CLI gives none.
 
 ## Required reading before implementing
 
@@ -434,10 +465,14 @@ for the user (telemetry flags, internal capability strings).
 One component draws every "how full is this" gauge in the app, and the context bar is its first
 user.
 
-- The context bar reads "Context after last turn" left, "121.1k / 1M" and "12%" right, bar beneath —
-  same position and clean-hide rules as today.
-- A reset-time helper renders "in 16 min" / "in 3 h" / "Sun 8:00 AM" from a future instant,
-  deterministically under test.
+- The context bar reads "Context used" left, "121k / 1M" and "12%" right, bar beneath — same
+  position and clean-hide rules as today. Label shortened from "Context after last turn" during M1:
+  measured in WebKit, the full phrase needs 115px against an 85px budget at the default 240px
+  sidebar, so it rendered clipped to "Context after l…". The "as of the last completed turn"
+  qualifier moves to the row's tooltip when M2 adds one. Token density is `k`/`M` via
+  `utils.ts::formatTokens`, which rounds to whole thousands above 10k — hence "121k", not "121.1k".
+- A reset-time helper renders "in 16 min" / "in 3 h" / "in 5 d" from a future instant,
+  deterministically under test. (M2 revised this to relative-only — see decision 9.)
 - Nothing about the rate-limit cells or the chips changes yet.
 
 ### Implementation Outline
@@ -480,8 +515,8 @@ the same way.
 - Claude: "5-hour limit", "Weekly · all models", and — after a turn on a per-model-capped model —
   "Weekly · <that model>", each a meter with "Resets in …" and the used percentage.
 - A window the CLI flags as past its warning threshold fills amber.
-- Hover shows each window's full reset date and time, the threshold line when flagged, the overage
-  window when billing to credits, and after a restart the "snapshot from …" line.
+- Hover shows each window's full reset date and time, the overage window when billing to credits,
+  and after a restart the "snapshot from …" line.
 - A window whose reset has passed disappears; the others stay. "⚡ using credits" still appears
   beneath the meters when overaging.
 - An older or changed CLI that sends no `unifiedWindows` shows a single meter for the top-level
@@ -493,7 +528,8 @@ the same way.
 ### Implementation Outline
 
 **Runtime state (decision 5).** `AgentRuntime.last_rate_limit_model?: string`, stamped by the
-`rate_limit_event` arm from the runtime's observed model; `hydrate` leaves it absent.
+`rate_limit_event` arm from the runtime's observed model and restored by `hydrate` when the metadata
+sidecar carries the model paired with that snapshot.
 
 **Derivation (`Sidebar.svelte`).** Replace `rateLimitView`'s single `window` with a list in the
 meter's shape read from `unifiedWindows` in decision 4's order, with the label map and the
@@ -503,8 +539,8 @@ or `resetsAt` not a number → skip; reset-passed → skip. Warning tone from th
 `codexRateLimitView` keeps its logic and adopts the shared labels.
 
 **Rendering.** Both cells render their list through the primitive, then (Claude) the amber overage
-line, then the tooltip content as today plus the threshold line. A shared snippet for the two
-near-identical cells is at the implementer's discretion.
+line, then the tooltip content. A shared snippet for the two near-identical cells is at the
+implementer's discretion.
 
 **Live drift guard.** `live_claude_rate_limit_carries_unified_windows`, one "ack" turn:
 `unifiedWindows.five_hour` and `.seven_day` each with number `utilization` in `[0, 1]` and number
@@ -513,9 +549,9 @@ near-identical cells is at the implementer's discretion.
 ### Definition of Done
 
 `Sidebar.test.ts`: two windows → two meters, fraction → percent (`0.27` → "27%"), reset text present;
-three windows with `meta.model` seeded → third meter "Weekly · <model>", generic label after
-`hydrate` without a model; `allowed_warning` on `seven_day_overage_included` → that meter warning
-tone + tooltip threshold line, others neutral; reset-passed on `five_hour` → only the weekly meter;
+three windows with `meta.model` seeded → third meter "Weekly · <model>", generic label for a legacy
+snapshot hydrated without a model; `allowed_warning` on `seven_day_overage_included` → that meter warning
+tone, no tooltip threshold line, others neutral; reset-passed on `five_hour` → only the weekly meter;
 overage → amber line beneath the meters + tooltip window; no `unifiedWindows` → one meter, no
 percentage (the existing Claude tests are this coverage — retitle any whose name reads as the primary
 path); unknown key `seven_day_cowork` beside the known two → exactly two meters; malformed
@@ -531,18 +567,15 @@ does not overwrite it. Rust: the live test passes on `make test-live-claude`.
 
 The card says what the agent has loaded and whether it is usable, not just how many.
 
-- A Claude card's chip row becomes one collapsed line: "MCP 7 · 2 need auth · Agents 6 · Plugins 1 ·
-  Skills 30 · Memory 1". Expanding lists each MCP server with a status dot and source, the agents,
-  the plugins with versions, the memory paths, and — each behind its own count line that expands to
-  the full list — the skills, the 109 tools, and the 98 slash commands, then a settings line
-  (permission mode, output style).
+- An expanded Claude card shows a compact Environment trigger. It carries only actionable status;
+  the full counts and inventory open in a bounded popover instead of changing card height.
 - A server that reports anything other than `connected` shows as a warning with the status as its
-  label; the collapsed line counts them.
+  label in the expanded card and popover. Collapsed cards omit Environment status.
 - After a restart the list is what the last turn loaded, marked "as of <time>"; an agent that has
   never run shows the registry from the config loader as today, with no status.
-- A Codex card shows the same row from its rollout: skills with descriptions, the approved-command
-  allowlist behind a count, and a settings line (sandbox, approval policy, personality, shell,
-  timezone); MCP servers as configured names without a status dot.
+- A Codex card shows the same disclosure from its rollout: skills with descriptions, the
+  approved-command allowlist behind a count, and settings (sandbox, approval policy, personality,
+  shell, timezone); MCP servers appear as configured names without a status dot.
 - Antigravity cards show whatever subset their harness reports; empty sections never render.
 
 ### Implementation Outline
@@ -570,9 +603,9 @@ applies the same rule and stamps `meta_as_of`. `codex/skills.rs` is unchanged ap
 doc recording that it is the pre-first-turn fallback and incomplete by design. Schema version bumps
 only if the file's existing fields change shape; an additive optional field does not need one.
 
-**UI (decision 14).** Replace the chips with the disclosure row. Reuse the card's collapsed-state
-pattern for the per-agent expanded flag. `StatusDot` for status, `Tooltip` with the supplemental
-delay for full memory paths. Keep `agent-meta` as the outer test id.
+**UI (decision 14).** Replace the chips with an expanded-card trigger and bounded `Popover`.
+`StatusDot` communicates server status; `Tooltip` with the supplemental delay exposes full memory
+paths. Keep `agent-meta` as the outer test id.
 
 ### Definition of Done
 
@@ -589,10 +622,11 @@ delay for full memory paths. Keep `agent-meta` as the outer test id.
   win and `as_of` is set; never-dispatched agent → loader, no `as_of`. Dispatcher: a
   `SessionFileBacked` meta is not persisted.
 - Sidecar round-trip test for the inventory snapshot; a sidecar without it reads as absent.
-- `Sidebar.test.ts`: collapsed line text with counts and the needs-auth count; expanded sections
-  present/absent by data; `needs-auth` → warning dot with label; unknown status string → warning dot
-  with that string; "as of" shown only when rehydrated; a Codex agent renders its sections with no
-  status dot on MCP rows; an agent with an empty inventory renders no environment row.
+- `Sidebar.test.ts`: collapsed cards omit Environment while retaining model, effort, context, and
+  critical quota warnings; expanded cards expose the Environment trigger and full popover;
+  `needs-auth` → warning dot with label; unknown status string → warning dot with that string; "as
+  of" shown only when rehydrated; a Codex agent renders its sections with no status dot on MCP rows;
+  an agent with an empty inventory renders no environment row.
 - Existing chip tests updated to the new row.
 - **Live drift guards — the milestone reads eight undocumented fields across two harnesses and has
   none today.** `live_claude_session_meta_carries_inventory`: one "ack" turn, asserts `system/init`
@@ -614,10 +648,15 @@ delay for full memory paths. Keep `agent-meta` as the outer test id.
 
 The user can see what is occupying a Claude agent's context window, per category and per item.
 
-- The context meter on a Claude card shows a chevron; clicking it (or "Context breakdown…" in the
-  agent menu) opens the panel. First open shows an empty state with "Analyze context".
-- Running it on an idle agent fills the panel in about a second. On a busy agent the button says it
-  is queued and the panel fills when the current turn finishes.
+- The context meter on a Claude card shows a breakdown icon; clicking it (or "Context breakdown…"
+  in the agent menu) opens the panel and starts a fresh analysis every time. The panel has no
+  button: re-opening it is how a newer breakdown is requested.
+- The breakdown icon and menu item are disabled while the agent is working, so the report is never
+  queued behind a turn; they stay live while the agent's own report runs, and re-opening then shows
+  that run's spinner rather than starting a second.
+- Running it on an idle agent fills the panel in about a second, showing only the spinner until it
+  lands — a previous breakdown stays hidden rather than being swapped out under the reader. A
+  failed analysis says why, beside the last report it managed to take; re-opening retries it.
 - The panel shows the model, used/window tokens, a meter per category in the CLI's order, and
   collapsible per-item sections: MCP tools grouped by server, custom agents, memory files, skills.
 - No row appears in the transcript for the report — live or after reopening the project.
@@ -714,8 +753,8 @@ Small; compress accordingly.
     space-prefix rule and its rationale intact — the report action bypasses it by construction like
     compaction.
   - §1.4 Claude row and §3 "Rate-limit / quota" cell: `unifiedWindows`, the `allowed_warning`
-    second event, the full key list and which render, the per-model window's model-gating and
-    live-only label; fix "5-hour + weekly `overageResetsAt`" (it is the overage credit window).
+    second event, the full key list and which render, and the per-model window's model-gating;
+    fix "5-hour + weekly `overageResetsAt`" (it is the overage credit window).
   - §3 metadata table: the inventory fields now surfaced and persisted; G14 → ✅ closed with the
     as-of convention named; a new row for the context breakdown (Claude ✅ on demand; Codex /
     Antigravity ❌ — same hazard as §3.9).
@@ -748,16 +787,60 @@ counter", "weekly `overageResetsAt`", or the §0 claim that `/context` emits no 
   after a Fable turn disappears after a Sonnet turn on the same agent, even though the limit is
   still in force; retaining it live would not survive a reload (the sidecar persists the raw event),
   so it is not retained.
-- The per-model window's model label is live-only; after reload it reads "Weekly · model-specific".
+- A legacy metadata sidecar without the additive model field reads "Weekly · model-specific" until
+  the next live event refreshes the snapshot.
 - Which models the per-model window covers is a server-side allowlist the stream never names.
+- **A threshold warning naming a window we do not render is dropped along with the window.** The
+  amber tone is attached to the flagged window, so if `rateLimitType` names a key outside the
+  rendered set (`seven_day_cowork` and its siblings), the CLI's "near a cap" signal is lost. Not
+  observed in any probe — the rendered keys cover every window seen across Claude 2.1.263–2.1.274 —
+  so this is unobserved rather than impossible. Deliberately not filled with a generic amber line:
+  the probe that would reveal such a plan is the same one that would supply the window's real label,
+  at which point it renders properly and a generic line is dead code.
 - The context report's structured object is undocumented; the markdown fallback and raw-text safety
   net cover its absence, and the live test is the tripwire.
 - Each report writes three records into the agent's session file; the CLI's own TUI shows them on
   resume. Same trade compaction makes.
+- **Only Switchboard-dispatched reports are captured; a `/context` run in the resumed terminal is
+  not.** The routing sits behind the existing `entrypoint == "sdk-cli"` gate, and a probe of the
+  interactive TUI (claude 2.1.274) shows why moving it would make things worse rather than better.
+  The terminal *does* write a `commandRun: {"command": "context"}` record — so the gate, not the
+  key, is what excludes it — but that record's content is the terminal's own coloured rendering
+  (ANSI escapes and box-drawing glyphs), not the markdown table, and it carries **no `contextUsage`
+  object at all**. Decoding it would produce `unparsed` plus a panel full of escape codes. The
+  readable markdown exists on a *separate* record — `user`, `isMeta: true`, child of the command
+  record by `parentUuid` — which `is_meta_continuation` currently skips cleanly (verified: it does
+  not leak into the preceding agent turn). Capturing it would therefore need cross-record pairing,
+  which is exactly what keying on the self-describing record was chosen to avoid, plus a carve-out
+  in that guard, for a report that could only ever be the rounded markdown one.
 - Memory *files* are named only by the report; `init` gives the memory directory.
 - Codex: no runtime tool or MCP status exists in the stream or rollout; MCP rows show configured
   names only, and pre-first-turn skills come from an incomplete scanner labelled as configured. The
   blocked-state fields are recorded, not rendered, until observed populated.
+- **`world_state` is snapshot-plus-delta, and the reader folds per key.** A `full: false` record
+  carries only the keys that changed, so a last-record-wins read would erase `host_skills` the
+  moment any delta landed (measured: 77 of 1,222 local rollouts carry more than one record, one
+  carried 28). Recorded because the fold is the non-obvious part — the single-record probe the plan
+  was written from shows none of it.
+- **The `host_skills` scrape can degrade silently in one direction.** A body with the expected
+  headings but reworded entry lines yields an empty list plus a warning, which renders as no Skills
+  section — indistinguishable on the card from an account with no skills. The live guard is what
+  makes this loud; there is no in-app signal, deliberately, because an error row on a display-only
+  registry would be worse than an absent section.
+- **`is_first_dispatch_after_attach` and its `AppState::needs_session_meta` bookkeeping are now
+  inert.** Their only consumer was Codex's first-turn `SessionMeta` gate, which this milestone
+  removed. They are documented as inert rather than deleted: the removal touches the app layer's
+  attach flow and a documented lock ordering, which is its own change and carries its own risk.
+- **The Environment row's lists are keyed by index, never by name.** A recorded Claude `init`
+  (`tool-vocabulary.jsonl`) lists `deep-research` twice among 21 skills, and Svelte throws on a
+  duplicate `{#each}` key in production as well as dev, with no error boundary in the app to catch
+  it. The rows are replaced wholesale on every event and carry no per-item state, so a name key
+  bought nothing; duplicates are preserved rather than merged so the count matches what the harness said.
+- **An absent `init` key yields `None`, not the "empty defaults" this milestone's Definition of Done
+  first said.** The two readings differ only for a list that has a config-file fallback, and there
+  `None` is clearly right: an older CLI that never emitted `mcp_servers` must fall back to the
+  registry, while `Some([])` would claim an authoritative zero and blank the section. The DoD wording
+  predates decision 12's `Option` semantics; decision 12 governs.
 
 ## Out of scope (deliberately)
 

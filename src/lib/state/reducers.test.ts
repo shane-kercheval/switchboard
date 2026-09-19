@@ -1893,15 +1893,65 @@ describe("runtimeReducer", () => {
       agent_id: AGENT_A,
       model: "claude-sonnet-4-6",
       harness_version: "2.1.140",
-      tools: ["Bash", "Read"],
-      mcp_servers: [{ name: "tiddly", status: "connected" }],
-      skills: ["debug"],
+      inventory: {
+        tools: ["Bash", "Read"],
+        mcp_servers: [{ name: "tiddly", status: "connected" }],
+        skills: [{ name: "debug" }],
+      },
       raw: {},
     };
     const r = runtimeReducer(fresh(), ev);
     expect(r.meta?.model).toBe("claude-sonnet-4-6");
-    expect(r.meta?.tools).toEqual(["Bash", "Read"]);
-    expect(r.meta?.mcp_servers).toEqual([{ name: "tiddly", status: "connected" }]);
+    expect(r.meta?.inventory.tools).toEqual(["Bash", "Read"]);
+    expect(r.meta?.inventory.mcp_servers).toEqual([{ name: "tiddly", status: "connected" }]);
+    expect(r.meta?.inventory.skills).toEqual([{ name: "debug" }]);
+  });
+
+  it("session_meta replaces the whole inventory rather than merging", () => {
+    // What the harness reports is what it has loaded *now*. Keeping a list it
+    // stopped reporting would draw a registry the agent no longer has.
+    let r = runtimeReducer(fresh(), {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "m",
+      harness_version: "v",
+      inventory: { agents: ["Explore"], skills: [{ name: "dataviz" }] },
+      raw: {},
+    });
+    r = runtimeReducer(r, {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "m",
+      harness_version: "v",
+      inventory: { agents: ["Explore", "Plan"] },
+      raw: {},
+    });
+    expect(r.meta?.inventory.agents).toEqual(["Explore", "Plan"]);
+    expect(r.meta?.inventory.skills).toBeUndefined();
+  });
+
+  it("a live session_meta clears the snapshot staleness qualifier", () => {
+    // A live inventory is not a snapshot, so "as of" is meaningless — and
+    // must be nulled rather than stamped `now`, which would age an actively
+    // streaming agent past the staleness threshold.
+    const hydrated = runtimeReducer(fresh(), {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      meta: { model: "m", harness_version: "v", inventory: { agents: ["Explore"] } },
+      meta_as_of: "2026-09-17T12:00:00Z",
+    });
+    expect(hydrated.meta_as_of).toBe("2026-09-17T12:00:00Z");
+
+    const live = runtimeReducer(hydrated, {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "m",
+      harness_version: "v",
+      inventory: { agents: ["Explore"] },
+      raw: {},
+    });
+    expect(live.meta_as_of).toBeNull();
   });
 
   it("session_meta with empty model keeps the previously-shown model", () => {
@@ -1912,9 +1962,7 @@ describe("runtimeReducer", () => {
       agent_id: AGENT_A,
       model: "gemini-3.5-flash",
       harness_version: "1.0.0",
-      tools: [],
-      mcp_servers: [],
-      skills: [],
+      inventory: {},
       raw: {},
     });
     expect(r.meta?.model).toBe("gemini-3.5-flash");
@@ -1924,21 +1972,10 @@ describe("runtimeReducer", () => {
       agent_id: AGENT_A,
       model: "",
       harness_version: "1.0.0",
-      tools: [],
-      mcp_servers: [],
-      skills: [],
+      inventory: {},
       raw: {},
     });
     expect(r.meta?.model).toBe("gemini-3.5-flash");
-  });
-
-  it("rate_limit_event populates last_rate_limit", () => {
-    const r = runtimeReducer(fresh(), {
-      type: "rate_limit_event",
-      agent_id: AGENT_A,
-      info: { primary: { used_percent: 42.0 } },
-    });
-    expect(r.last_rate_limit).toEqual({ primary: { used_percent: 42.0 } });
   });
 
   it("ignores unknown wire-format variants without crashing", () => {
@@ -1955,9 +1992,11 @@ describe("runtimeReducer", () => {
       meta: {
         model: "claude-sonnet-4-6",
         harness_version: "2.1.140",
-        tools: ["Bash"],
-        mcp_servers: [{ name: "srv", status: "configured" }],
-        skills: ["debug"],
+        inventory: {
+          tools: ["Bash"],
+          mcp_servers: [{ name: "srv", status: "configured" }],
+          skills: [{ name: "debug" }],
+        },
       },
     });
     expect(r.hydration_status).toBe("complete");
@@ -1971,9 +2010,7 @@ describe("runtimeReducer", () => {
       agent_id: AGENT_A,
       model: "live-model",
       harness_version: "live-version",
-      tools: [],
-      mcp_servers: [],
-      skills: [],
+      inventory: {},
       raw: {},
     });
     // Subsequent hydrate carries a different model — must NOT overwrite.
@@ -1984,67 +2021,64 @@ describe("runtimeReducer", () => {
       meta: {
         model: "disk-model",
         harness_version: "disk-version",
-        tools: [],
-        mcp_servers: [],
-        skills: [],
+        inventory: {},
       },
     });
     expect(r.meta?.model).toBe("live-model");
   });
 
-  it("hydrate fills last_rate_limit + its as_of when currently empty", () => {
+  it("hydrate fills last_context_report and the moment it was measured", () => {
     const r = runtimeReducer(fresh(), {
       type: "hydrate",
       agent_id: AGENT_A,
       turns: [],
-      last_rate_limit: { primary: { used_percent: 10.0 } },
-      last_rate_limit_as_of: "2026-05-27T18:42:11Z",
+      last_context_report: { raw: "## Context Usage", max_tokens: 200_000 },
+      last_context_report_at: "2026-09-18T15:48:31Z",
     });
-    expect(r.last_rate_limit).toEqual({ primary: { used_percent: 10.0 } });
-    // The capture time rides along with the value it qualifies.
-    expect(r.last_rate_limit_as_of).toBe("2026-05-27T18:42:11Z");
+    expect(r.last_context_report).toEqual({ raw: "## Context Usage", max_tokens: 200_000 });
+    expect(r.last_context_report_at).toBe("2026-09-18T15:48:31Z");
   });
 
-  it("live rate_limit_event after a stale hydrate clears as_of to null (stale → live)", () => {
-    // Hydrate restores a stale on-disk snapshot with its capture time.
+  it("a live context_report replaces a hydrated one and carries its own time", () => {
+    // Deliberately unlike `rate_limit_event`, which clears its qualifier on a
+    // live value. Nothing refreshes a breakdown, so a live one is "measured just
+    // now" rather than "current from now on" — dropping the time here is what
+    // would let it go stale unannounced.
     let r = runtimeReducer(fresh(), {
       type: "hydrate",
       agent_id: AGENT_A,
       turns: [],
-      last_rate_limit: { primary: { used_percent: 10.0 } },
-      last_rate_limit_as_of: "2026-05-27T18:42:11Z",
+      last_context_report: { raw: "old", max_tokens: 200_000 },
+      last_context_report_at: "2026-09-18T15:48:31Z",
     });
-    expect(r.last_rate_limit_as_of).toBe("2026-05-27T18:42:11Z");
-    // A live event overwrites the value and must drop the staleness qualifier
-    // — the in-memory value is now live, not an aged on-disk snapshot.
     r = runtimeReducer(r, {
-      type: "rate_limit_event",
+      type: "context_report",
       agent_id: AGENT_A,
-      info: { primary: { used_percent: 99.0 } },
+      report: { raw: "new", max_tokens: 1_000_000 },
+      at: "2026-09-18T18:00:00Z",
     });
-    expect(r.last_rate_limit).toEqual({ primary: { used_percent: 99.0 } });
-    expect(r.last_rate_limit_as_of).toBeNull();
+    expect(r.last_context_report).toEqual({ raw: "new", max_tokens: 1_000_000 });
+    expect(r.last_context_report_at).toBe("2026-09-18T18:00:00Z");
   });
 
-  it("hydrate after a fresh live event leaves the live value + null as_of in place", () => {
-    // Live event sets the value and clears as_of.
+  it("hydrate after a live context_report leaves the live value and its own time", () => {
+    // Fill-if-empty: a slow project load must not replace a fresh measurement
+    // with an older one, nor re-date it.
     let r = runtimeReducer(fresh(), {
-      type: "rate_limit_event",
+      type: "context_report",
       agent_id: AGENT_A,
-      info: { primary: { used_percent: 99.0 } },
+      report: { raw: "live", max_tokens: 1_000_000 },
+      at: "2026-09-18T18:00:00Z",
     });
-    expect(r.last_rate_limit_as_of).toBeNull();
-    // A late hydrate carrying a stale snapshot must NOT override the live
-    // value, and must not reintroduce a stale `as_of` (fill-if-empty).
     r = runtimeReducer(r, {
       type: "hydrate",
       agent_id: AGENT_A,
       turns: [],
-      last_rate_limit: { primary: { used_percent: 10.0 } },
-      last_rate_limit_as_of: "2026-05-27T18:42:11Z",
+      last_context_report: { raw: "disk", max_tokens: 200_000 },
+      last_context_report_at: "2026-09-18T15:48:31Z",
     });
-    expect(r.last_rate_limit).toEqual({ primary: { used_percent: 99.0 } });
-    expect(r.last_rate_limit_as_of).toBeNull();
+    expect(r.last_context_report).toEqual({ raw: "live", max_tokens: 1_000_000 });
+    expect(r.last_context_report_at).toBe("2026-09-18T18:00:00Z");
   });
 
   it("hydrate sets hydration_status=complete even with no payload", () => {

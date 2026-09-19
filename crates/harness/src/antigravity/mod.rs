@@ -84,7 +84,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::adapter::{DispatchError, DispatchOptions, EventStream, HarnessAdapter};
-use crate::events::{AdapterEvent, FailureKind, McpServerStatus, TurnId, TurnOutcome};
+use crate::events::{
+    AdapterEvent, FailureKind, McpServerStatus, SessionInventory, SessionMetaSource, SkillEntry,
+    TurnId, TurnOutcome,
+};
 
 use parser::{
     AntigravityParserState, TranscriptRecord, first_error_line, is_auth_failure_line,
@@ -1086,10 +1089,18 @@ async fn run_producer(ctx: ProducerCtx) {
         agent_id,
         model: model.map(|(name, _)| name).unwrap_or_default(),
         harness_version,
-        tools: Vec::new(),
-        mcp_servers,
-        skills,
+        inventory: SessionInventory {
+            mcp_servers: Some(mcp_servers),
+            skills: Some(skills.into_iter().map(SkillEntry::from_name).collect()),
+            // Antigravity announces no tools, agents, plugins, memory paths,
+            // commands, allowlist or run settings — `None`, not empty, so the
+            // card draws no section rather than an authoritative zero.
+            ..SessionInventory::default()
+        },
         raw: serde_json::Value::Null,
+        // Both lists come from the config loaders, which re-read on every load
+        // — nothing here needs caching for restart continuity.
+        source: SessionMetaSource::SessionFileBacked,
     });
 }
 

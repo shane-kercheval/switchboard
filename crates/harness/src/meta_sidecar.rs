@@ -43,6 +43,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use switchboard_core::AgentId;
 
+use crate::events::SessionInventory;
+
 /// Current on-disk schema version. Bumped only on a breaking shape change;
 /// an unrecognized version reads as empty (best-effort, forward-compatible).
 const SCHEMA_VERSION: u32 = 1;
@@ -55,6 +57,12 @@ pub struct RateLimitSnapshot {
     /// Opaque payload, exactly as received from the harness's
     /// `rate_limit_event` (Claude's `isUsingOverage` / `resetsAt` / etc.).
     pub payload: serde_json::Value,
+    /// Model reported by the same turn that delivered this payload. Claude's
+    /// model-specific weekly window does not repeat the model in the rate-limit
+    /// object, so keeping it beside the snapshot preserves the exact label on
+    /// reopen. Legacy snapshots omit it and retain the generic fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Wall-clock time this snapshot was captured (ISO-8601 UTC on disk).
     pub captured_at: DateTime<Utc>,
 }
@@ -87,6 +95,23 @@ pub struct ContextWindowSnapshot {
     pub captured_at: DateTime<Utc>,
 }
 
+/// One persisted snapshot of the harness's environment inventory — the
+/// registries, allowlists and run settings it reported having loaded.
+///
+/// Stream-only for Claude: `system/init` carries the whole inventory and the
+/// session file records none of it, so without this the card falls back to the
+/// config-file registries — which say what is *configured*, with no connection
+/// status — until the agent's next turn. Closes G14 in
+/// `docs/harness-behavior.md` by the convention [`RateLimitSnapshot`] set: a
+/// stale inventory is acceptable precisely because `captured_at` lets the card
+/// say it is stale.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InventorySnapshot {
+    pub inventory: SessionInventory,
+    /// Wall-clock time this snapshot was captured (ISO-8601 UTC on disk).
+    pub captured_at: DateTime<Utc>,
+}
+
 /// The metadata sidecar file contents. Fields are optional so the schema can
 /// grow additively (a new class-C field is a new `Option` field, not a
 /// breaking change — `schema_version` is bumped only on a breaking shape
@@ -98,6 +123,8 @@ pub struct MetaSidecar {
     pub rate_limit: Option<RateLimitSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<ContextWindowSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<InventorySnapshot>,
 }
 
 impl Default for MetaSidecar {
@@ -106,6 +133,7 @@ impl Default for MetaSidecar {
             schema_version: SCHEMA_VERSION,
             rate_limit: None,
             context_window: None,
+            inventory: None,
         }
     }
 }
@@ -183,12 +211,14 @@ pub enum MetaSidecarError {
 pub fn write_rate_limit(
     path: &Path,
     payload: serde_json::Value,
+    model: Option<String>,
     captured_at: DateTime<Utc>,
 ) -> Result<(), MetaSidecarError> {
     let mut sidecar = read(path).unwrap_or_default();
     sidecar.schema_version = SCHEMA_VERSION;
     sidecar.rate_limit = Some(RateLimitSnapshot {
         payload,
+        model,
         captured_at,
     });
     persist(path, &sidecar)
@@ -211,6 +241,22 @@ pub fn write_context_window(
         context_window,
         model: Some(model),
         message_id: Some(message_id),
+        captured_at,
+    });
+    persist(path, &sidecar)
+}
+
+/// Persist the latest inventory snapshot (last-write-wins for that field).
+/// Preserves the other snapshots alongside it, like every other writer here.
+pub fn write_inventory(
+    path: &Path,
+    inventory: SessionInventory,
+    captured_at: DateTime<Utc>,
+) -> Result<(), MetaSidecarError> {
+    let mut sidecar = read(path).unwrap_or_default();
+    sidecar.schema_version = SCHEMA_VERSION;
+    sidecar.inventory = Some(InventorySnapshot {
+        inventory,
         captured_at,
     });
     persist(path, &sidecar)
@@ -262,6 +308,78 @@ mod tests {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
+    fn sample_inventory() -> SessionInventory {
+        SessionInventory {
+            mcp_servers: Some(vec![crate::events::McpServerStatus {
+                name: "tiddly".to_owned(),
+                status: "needs-auth".to_owned(),
+                source: Some("claudeai".to_owned()),
+            }]),
+            // An explicit empty list: the harness said "zero plugins", which
+            // must survive the round trip distinguishably from "unreported".
+            plugins: Some(vec![]),
+            settings: Some(vec![crate::events::SettingPair {
+                label: "Permission mode".to_owned(),
+                value: "bypassPermissions".to_owned(),
+            }]),
+            ..SessionInventory::default()
+        }
+    }
+
+    #[test]
+    fn inventory_snapshot_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("a.meta.json");
+        let captured = ts("2026-09-17T12:00:00Z");
+        write_inventory(&path, sample_inventory(), captured).unwrap();
+
+        let snapshot = read(&path).unwrap().inventory.expect("inventory persisted");
+        assert_eq!(snapshot.inventory, sample_inventory());
+        assert_eq!(snapshot.captured_at, captured);
+        assert_eq!(
+            snapshot.inventory.plugins,
+            Some(vec![]),
+            "an explicit empty list must not read back as unreported"
+        );
+        assert_eq!(
+            snapshot.inventory.agents, None,
+            "an unreported list must not read back as empty"
+        );
+    }
+
+    #[test]
+    fn a_sidecar_without_an_inventory_reads_as_absent() {
+        // Every existing sidecar on disk is one of these — the field is
+        // additive, so the schema version deliberately does not move.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("a.meta.json");
+        write_rate_limit(
+            &path,
+            serde_json::json!({"x": 1}),
+            None,
+            ts("2026-09-17T12:00:00Z"),
+        )
+        .unwrap();
+        let sidecar = read(&path).unwrap();
+        assert!(sidecar.inventory.is_none());
+        assert!(sidecar.rate_limit.is_some(), "the other field still reads");
+    }
+
+    #[test]
+    fn writing_an_inventory_preserves_the_other_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("a.meta.json");
+        let at = ts("2026-09-17T12:00:00Z");
+        write_rate_limit(&path, serde_json::json!({"isUsingOverage": true}), None, at).unwrap();
+        write_context_window(&path, 200_000, "m".to_owned(), "msg_1".to_owned(), at).unwrap();
+        write_inventory(&path, sample_inventory(), at).unwrap();
+
+        let sidecar = read(&path).unwrap();
+        assert!(sidecar.rate_limit.is_some(), "rate limit survived");
+        assert!(sidecar.context_window.is_some(), "window survived");
+        assert!(sidecar.inventory.is_some());
+    }
+
     #[test]
     fn meta_sidecar_path_matches_canonical_layout() {
         // The caller supplies the project root; this crate only knows the
@@ -303,11 +421,18 @@ mod tests {
         let path = tmp.path().join("agent.meta.json");
         let payload = serde_json::json!({"isUsingOverage": true, "resetsAt": 1_778_701_800u64});
         let captured = ts("2026-05-27T18:42:11Z");
-        write_rate_limit(&path, payload.clone(), captured).unwrap();
+        write_rate_limit(
+            &path,
+            payload.clone(),
+            Some("claude-fable-5-1".to_owned()),
+            captured,
+        )
+        .unwrap();
 
         let read_back = read(&path).expect("sidecar present after write");
         let rl = read_back.rate_limit.expect("rate_limit populated");
         assert_eq!(rl.payload, payload);
+        assert_eq!(rl.model.as_deref(), Some("claude-fable-5-1"));
         assert_eq!(rl.captured_at, captured);
         assert_eq!(read_back.schema_version, SCHEMA_VERSION);
     }
@@ -327,6 +452,7 @@ mod tests {
         write_rate_limit(
             &path,
             serde_json::json!({"a": 1}),
+            None,
             ts("2026-05-27T00:00:00Z"),
         )
         .unwrap();
@@ -340,12 +466,14 @@ mod tests {
         write_rate_limit(
             &path,
             serde_json::json!({"v": 1}),
+            None,
             ts("2026-05-27T00:00:00Z"),
         )
         .unwrap();
         write_rate_limit(
             &path,
             serde_json::json!({"v": 2}),
+            None,
             ts("2026-05-27T01:00:00Z"),
         )
         .unwrap();
@@ -387,6 +515,7 @@ mod tests {
         write_rate_limit(
             &path,
             serde_json::json!({"isUsingOverage": true}),
+            None,
             ts("2026-05-31T12:00:00Z"),
         )
         .unwrap();
@@ -458,6 +587,7 @@ mod tests {
         write_rate_limit(
             &path,
             serde_json::json!({"good": true}),
+            None,
             ts("2026-05-27T00:00:00Z"),
         )
         .unwrap();

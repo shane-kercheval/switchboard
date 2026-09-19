@@ -549,6 +549,76 @@ describe("project staleness refresh", () => {
     return turns.map((t) => (t.role === "agent" ? t.hydration_key : undefined)).filter(Boolean);
   }
 
+  it("carries each agent's last context breakdown and its age through project hydration", async () => {
+    // Reopening a project is the *only* way a report gets back on screen after
+    // a restart, and this is the seam it crosses. The markers themselves are
+    // routed to the project overlay and never reach a per-agent turn list, so
+    // if this field is dropped here the panel is empty on every reopen with no
+    // other symptom.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend([agent(AGENT_1, PROJECT_1)]);
+    conversation = {
+      items: [],
+      agents: [
+        {
+          agent_id: AGENT_1,
+          meta: null,
+          last_rate_limit: null,
+          last_context_report: {
+            model: "claude-fable-5-1",
+            total_tokens: 25_081,
+            max_tokens: 1_000_000,
+            raw: "## Context Usage",
+          },
+          last_context_report_at: "2026-09-18T15:48:31Z",
+          warnings: [],
+          load_error: null,
+        },
+      ],
+    };
+
+    expect(await ws.activateProject(PROJECT_1)).toBe("activated");
+    await vi.waitFor(() =>
+      expect(state.runtimes[AGENT_1]?.last_context_report_at).toBe("2026-09-18T15:48:31Z"),
+    );
+    expect(state.runtimes[AGENT_1]?.last_context_report?.max_tokens).toBe(1_000_000);
+  });
+
+  it("carries each agent's inventory capture time through project hydration", async () => {
+    // The project-scoped path enumerates the per-agent meta fields by hand
+    // when it feeds `applyAgentHydrate`, so a field the backend adds reaches
+    // the runtime only if it is named there too. Same seam, other caller.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend([agent(AGENT_1, PROJECT_1)]);
+    conversation = {
+      items: [],
+      agents: [
+        {
+          agent_id: AGENT_1,
+          meta: {
+            model: "claude-fable-5-1",
+            harness_version: "",
+            inventory: { mcp_servers: [{ name: "gmail", status: "needs-auth" }] },
+          },
+          last_rate_limit: null,
+          meta_as_of: "2026-09-17T12:00:00Z",
+          warnings: [],
+          load_error: null,
+        },
+      ],
+    };
+
+    expect(await ws.activateProject(PROJECT_1)).toBe("activated");
+    await vi.waitFor(() =>
+      expect(state.runtimes[AGENT_1]?.meta_as_of).toBe("2026-09-17T12:00:00Z"),
+    );
+    expect(state.runtimes[AGENT_1]?.meta?.inventory.mcp_servers).toEqual([
+      { name: "gmail", status: "needs-auth" },
+    ]);
+  });
+
   it("re-reads on reactivation when a refresh-capable file advanced; the new turn appears exactly once", async () => {
     const ws = await loadWorkspaceState();
     const state = await loadAgentState();

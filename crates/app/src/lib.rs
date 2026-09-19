@@ -8,6 +8,7 @@ mod dispatch_context;
 mod emitter;
 mod error;
 mod git_registry;
+mod harness_usage;
 mod journal;
 mod lifecycle;
 mod locator_sink;
@@ -322,22 +323,23 @@ use crate::commands::{
     check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
     check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
     commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, compact_agent_impl,
-    copy_builtin_prompt_impl, create_agent_impl, create_project_impl, delete_project_impl,
-    editor_open_argv, existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl,
-    fork_agent_impl, forward_message_impl, forward_prompt_impl, get_preferences_impl,
-    get_prompt_source_impl, harness_adapter_for, install_status_for_adapter, list_agents_impl,
-    list_mcp_providers_impl, list_message_pins_impl, list_projects_impl, list_prompts_impl,
-    list_tracked_repos_from_inputs, load_project_conversation_impl, load_transcript_impl,
-    migrate_message_pin_impl, open_branch_comparison_file_difftool_impl,
-    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
-    parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
-    read_tracked_repo_from_inputs, recheck_harness_installs_impl, reclaim_project_attachments_impl,
-    remove_agent_impl, remove_mcp_provider_impl, remove_message_pins_impl,
-    remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl, rename_project_impl,
-    render_prompt_impl, reorder_agents_impl, resolve_saved_prompt_fresh_impl,
-    resolve_saved_prompt_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
-    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
-    set_active_project_impl, set_agent_selection_impl, set_message_pin_impl, set_preferences_impl,
+    context_report_agent_impl, copy_builtin_prompt_impl, create_agent_impl, create_project_impl,
+    delete_project_impl, editor_open_argv, existing_attachment_paths_impl, fetch_repo_impl,
+    file_diff_impl, fork_agent_impl, forward_message_impl, forward_prompt_impl,
+    get_harness_usage_impl, get_preferences_impl, get_prompt_source_impl, harness_adapter_for,
+    install_status_for_adapter, list_agents_impl, list_mcp_providers_impl, list_message_pins_impl,
+    list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
+    load_project_conversation_impl, load_transcript_impl, migrate_message_pin_impl,
+    open_branch_comparison_file_difftool_impl, open_commit_file_difftool_impl, open_project_impl,
+    open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
+    project_session_fingerprints_impl, read_tracked_repo_from_inputs,
+    recheck_harness_installs_impl, reclaim_project_attachments_impl, remove_agent_impl,
+    remove_mcp_provider_impl, remove_message_pins_impl, remove_queued_message_impl,
+    remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
+    reorder_agents_impl, resolve_saved_prompt_fresh_impl, resolve_saved_prompt_impl,
+    resume_agent_in_terminal_impl, reveal_in_finder_argv, search_project_files_in_root,
+    search_project_files_root_impl, send_message_impl, set_active_project_impl,
+    set_agent_selection_impl, set_harness_usage_impl, set_message_pin_impl, set_preferences_impl,
     set_project_archived_impl, set_project_directory_impl, set_visible_project_impl,
     sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
     spawn_prompt_resolution_change_notifications, stage_attachment_impl, sync_prompts_and_notify,
@@ -345,6 +347,7 @@ use crate::commands::{
     tracked_repos_inputs, tracked_roots, validate_external_url, workspace_status_impl,
 };
 use crate::error::AppError;
+use crate::harness_usage::HarnessUsage;
 use crate::preferences::Preferences;
 use crate::state::AppState;
 use crate::workflow_commands::{
@@ -929,6 +932,23 @@ async fn get_preferences(state: State<'_, AppState>) -> Result<Preferences, Stri
     Ok(get_preferences_impl(state.inner()))
 }
 
+/// The persisted quota snapshots, read once at startup to seed the frontend
+/// store. Live readings reach the frontend on the normal event stream, so this is
+/// only the across-restart half.
+#[tauri::command]
+async fn get_harness_usage(state: State<'_, AppState>) -> Result<HarnessUsage, String> {
+    Ok(get_harness_usage_impl(state.inner()))
+}
+
+/// Replace the persisted snapshots with the frontend's map. Whole-map, because
+/// the frontend owns the rule for which reading wins and a per-key merge here
+/// would be a second copy of it.
+#[tauri::command]
+async fn set_harness_usage(state: State<'_, AppState>, usage: HarnessUsage) -> Result<(), String> {
+    set_harness_usage_impl(state.inner(), usage);
+    Ok(())
+}
+
 #[tauri::command]
 async fn set_preferences(
     state: State<'_, AppState>,
@@ -1171,6 +1191,25 @@ async fn compact_agent(
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     let message_id = compact_agent_impl(state.inner(), id, sid, &home)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(message_id.to_string())
+}
+
+#[tauri::command]
+async fn context_report_agent(
+    state: State<'_, AppState>,
+    agent_id: String,
+    send_id: String,
+) -> Result<String, String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    // Minted by the frontend, like a send's, so a queued report can be cancelled
+    // through `cancel_send` before any `TurnStart` carries the id back.
+    let sid = parse_uuid(&send_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let message_id = context_report_agent_impl(state.inner(), id, sid, &home)
         .await
         .map_err(|e| e.to_string())?;
     Ok(message_id.to_string())
@@ -1907,6 +1946,14 @@ fn git_registry_config_path() -> Option<std::path::PathBuf> {
     config_dir().map(|dir| dir.join("git-view.yaml"))
 }
 
+/// The harness quota snapshots (`usage.yaml`) — a sibling of `workspace.yaml` in
+/// the same user-global config dir. User-global rather than per-project because a
+/// quota belongs to the account the harness is logged into, so the newest reading
+/// is the same fact whichever project is open (see `crate::harness_usage`).
+fn harness_usage_config_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join("usage.yaml"))
+}
+
 /// Personal preferences live in `config.yaml` — the **shared** personal-config
 /// file that also holds the prompt providers. Each subsystem round-trips the
 /// others' keys on write (see `preferences::save`), so they coexist in one file.
@@ -1996,6 +2043,12 @@ fn with_persistence_paths(state: AppState) -> AppState {
     // `git-view.yaml` — the Git-view tracked-repo registry.
     let state = if let Some(path) = git_registry_config_path() {
         state.with_git_registry(path)
+    } else {
+        state
+    };
+    // `usage.yaml` — the newest harness quota reading per harness.
+    let state = if let Some(path) = harness_usage_config_path() {
+        state.with_harness_usage(path)
     } else {
         state
     };
@@ -2343,6 +2396,8 @@ pub fn run() {
             open_branch_comparison_file_difftool,
             get_preferences,
             set_preferences,
+            get_harness_usage,
+            set_harness_usage,
             notification_availability,
             set_visible_project,
             notify,
@@ -2391,6 +2446,7 @@ pub fn run() {
             search_project_files,
             send_message,
             compact_agent,
+            context_report_agent,
             stage_attachment,
             existing_attachment_paths,
             remove_queued_message,

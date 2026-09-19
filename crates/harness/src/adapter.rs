@@ -89,15 +89,15 @@ pub struct DispatchOptions {
     /// "first turn" heuristic — `prior.is_none()` — would otherwise
     /// misclassify the dispatch as a resume).
     ///
-    /// Adapters that need to re-emit per-session metadata react to this:
-    /// the Codex adapter forces `SessionMeta` emission, ensuring the
-    /// sidebar's MCP/skills/model registry populates on the first
-    /// post-attach turn instead of staying empty until some other code
-    /// path fires.
-    ///
-    /// Adapters with no first-dispatch-conditional behavior (Claude Code)
-    /// ignore this field — Claude emits `SessionMeta` from its
-    /// `system/init` stream event on every dispatch regardless.
+    /// **No adapter reads this today.** Its one consumer was the Codex
+    /// adapter's first-turn gate on `SessionMeta`, which existed because the
+    /// inventory was emitted once per session and a post-attach dispatch would
+    /// have been misread as a resume. Codex now emits `SessionMeta` after
+    /// every turn — the inventory changes between turns and the card must show
+    /// the current one — so there is no first dispatch to distinguish, and
+    /// Claude never had one (its `system/init` arrives on every dispatch).
+    /// The field and its `AppState::needs_session_meta` bookkeeping are
+    /// retained but inert; they can be retired independently of any adapter.
     pub is_first_dispatch_after_attach: bool,
 
     /// Whether this turn should get browser tools, from the user-global
@@ -143,8 +143,7 @@ pub trait HarnessAdapter: Send + Sync {
     ///
     /// `options` carries caller-side conditions (see [`DispatchOptions`]),
     /// including `options.cancel_token`, which the dispatcher fires to request
-    /// cancellation of this turn. Normal sends pass `DispatchOptions::default()`;
-    /// the attach-existing-session flow sets `is_first_dispatch_after_attach`.
+    /// cancellation of this turn. Normal sends pass `DispatchOptions::default()`.
     async fn dispatch(
         &self,
         agent: &AgentRecord,
@@ -183,6 +182,32 @@ pub trait HarnessAdapter: Send + Sync {
         Err(DispatchError::UnsupportedOperation {
             harness: agent.harness,
             operation: "manual context compaction",
+        })
+    }
+
+    /// Ask the harness for a **breakdown of what is occupying this agent's
+    /// context window** and stream the result. Same `cwd` and stream contracts
+    /// as [`Self::dispatch`] and [`Self::compact`].
+    ///
+    /// A distinct operation for the same reason compaction is one: it carries
+    /// no prompt, journals nothing, and its result is a structured report rather
+    /// than an answer. It differs from compaction in costing nothing — the CLI
+    /// answers it locally, with no model call.
+    ///
+    /// The default implementation refuses with
+    /// [`DispatchError::UnsupportedOperation`]; see
+    /// `HarnessKind::supports_context_report` for which harnesses that covers
+    /// and why a `/context` *prompt* is not an acceptable substitute.
+    async fn context_report(
+        &self,
+        agent: &AgentRecord,
+        _cwd: &Path,
+        _turn_id: TurnId,
+        _options: DispatchOptions,
+    ) -> Result<EventStream, DispatchError> {
+        Err(DispatchError::UnsupportedOperation {
+            harness: agent.harness,
+            operation: "context breakdown",
         })
     }
 

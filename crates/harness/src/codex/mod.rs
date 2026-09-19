@@ -31,6 +31,7 @@ pub(crate) mod facets;
 pub mod parser;
 pub mod session_file;
 pub mod skills;
+pub(crate) mod world_state;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -210,7 +211,6 @@ impl HarnessAdapter for CodexAdapter {
         // post-attach dispatch would be misclassified as a resume and
         // SessionMeta would never fire for the attached agent's sidebar.
         // Caller signals "treat this as first turn" via DispatchOptions.
-        let force_session_meta = options.is_first_dispatch_after_attach;
 
         tokio::spawn(run_producer(
             child,
@@ -222,7 +222,6 @@ impl HarnessAdapter for CodexAdapter {
             prior,
             home_dir,
             cwd.to_owned(),
-            force_session_meta,
             options.cancel_token,
             dispatched_at,
         ));
@@ -327,7 +326,6 @@ async fn run_producer(
     prior: Option<CodexLocator>,
     home_dir: PathBuf,
     cwd: PathBuf,
-    force_session_meta: bool,
     cancel_token: CancellationToken,
     dispatched_at: chrono::DateTime<Utc>,
 ) {
@@ -505,12 +503,6 @@ async fn run_producer(
                             if matches!(outcome, TurnOutcome::Completed) {
                                 terminal_was_completed = true;
                             }
-                            // First-turn gate. Normal case: no prior locator.
-                            // Attach-flow case: prior is Some but the caller
-                            // explicitly signals "treat as first turn" via
-                            // DispatchOptions, so the sidebar's MCP/skills/model
-                            // registry populates on the first post-attach dispatch.
-                            let is_first_turn = prior.is_none() || force_session_meta;
                             // Enrichment locates the rollout file from the
                             // effective locator: the resume locator (`prior`) or
                             // the one just captured this dispatch.
@@ -525,7 +517,6 @@ async fn run_producer(
                                 outcome,
                                 ended_at,
                                 usage,
-                                is_first_turn,
                                 &live_edit_calls,
                             )
                             .await;
@@ -692,6 +683,45 @@ async fn run_producer(
     }
 }
 
+/// Re-type a failed outcome from the rollout's own classification of the turn.
+///
+/// The stream's `turn.failed` carries only prose, so the parser can type a
+/// failure only where the text is unmistakable (auth). The rollout's
+/// `task_complete.error.codex_error_info` is Codex's enum for the same
+/// failure, read from the same enrichment pass that fills everything else —
+/// so this is where a quota rejection becomes `UsageLimit` rather than a
+/// generic `HarnessError` that reads "You've hit your usage limit" only to a
+/// human. The message is kept verbatim: it carries the reset time and the
+/// credits link, which is what the user acts on.
+///
+/// Only a `HarnessError` is re-typed. An `AdapterFailure` is ours, not the
+/// harness's, and an `AuthFailure` was already typed from a stronger signal;
+/// neither should be overwritten by a file that may describe a different
+/// turn (the no-locator path, a flush race). `Completed` and `Cancelled` pass
+/// through untouched.
+///
+/// **The match is deliberately narrow.** `CodexErrorInfo` has siblings that
+/// look quota-shaped — `rate_limit_exceeded` above all — and none has been
+/// observed, so none is mapped: if that one is a transient throttle rather
+/// than an exhausted window, drawing a full meter for a seconds-long wait
+/// would be a fresh wrong number. See the gap-register entry in
+/// `docs/harness-behavior.md`; one probe against an exhausted short window
+/// settles it.
+fn classify_outcome(outcome: TurnOutcome, enrichment: &Enrichment) -> TurnOutcome {
+    match outcome {
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } if enrichment.current_turn_error_info.as_deref() == Some("usage_limit_exceeded") => {
+            TurnOutcome::Failed {
+                kind: FailureKind::UsageLimit,
+                message,
+            }
+        }
+        other => other,
+    }
+}
+
 /// Run the post-terminal enrichment cycle for a parser-emitted `TurnEnd`:
 ///
 /// 1. Locate the rollout file from the passed-in locator (`thread_id` +
@@ -703,20 +733,15 @@ async fn run_producer(
 ///    numbers (see [`apply_per_turn_usage`]) and the enriched
 ///    `context_window` overlays `usage.context_window`; if `usage` was
 ///    `None` we don't fabricate a `TurnUsage` from enrichment alone
-///    (preserves the strict "None means unparseable" contract).
+///    (preserves the strict "None means unparseable" contract). A failed
+///    outcome is re-typed from the rollout's own classification first
+///    (see [`classify_outcome`]).
 /// 4. Emit `RateLimitEvent` if rate-limit info was extracted.
-/// 5. Emit `SessionMeta` if this is the first turn AND the enrichment
-///    yielded a model or `cli_version`.
+/// 5. Emit `SessionMeta` if the enrichment yielded a model or `cli_version`.
 ///
 /// All steps degrade gracefully — a missing locator or session-file absence
 /// emits a non-enriched `TurnEnd` only, and the post-terminal derived events
 /// are simply skipped.
-///
-/// `is_first_turn` is computed by the caller as `prior.is_none() ||
-/// options.is_first_dispatch_after_attach` — the attach flow writes the locator
-/// onto the record at attach time, so the `prior.is_none()` heuristic alone
-/// would misclassify a post-attach dispatch as a resume and skip the
-/// load-bearing `SessionMeta` emission that populates the sidebar.
 #[allow(clippy::too_many_arguments)]
 async fn emit_terminal_with_enrichment(
     tx: &tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
@@ -728,7 +753,6 @@ async fn emit_terminal_with_enrichment(
     outcome: TurnOutcome,
     ended_at: chrono::DateTime<Utc>,
     usage: Option<TurnUsage>,
-    is_first_turn: bool,
     live_edit_calls: &[(String, Vec<String>)],
 ) {
     // Step 1: locate the rollout file from the locator (resume locator, or the
@@ -764,7 +788,7 @@ async fn emit_terminal_with_enrichment(
         .map(|_| crate::events::ContextWindowSource::SessionFileBacked);
     let _ = tx.send(AdapterEvent::TurnEnd {
         turn_id,
-        outcome,
+        outcome: classify_outcome(outcome, &enrichment),
         ended_at,
         usage: enriched_usage,
         context_window_source,
@@ -798,29 +822,41 @@ async fn emit_terminal_with_enrichment(
         });
     }
 
-    // Step 5: emit SessionMeta (first turn only). Loads MCP + skills
-    // registries fresh on every emission per the plan's "no caching layer"
-    // policy.
-    if is_first_turn {
-        // Loads both ~/.codex/config.toml and <cwd>/.codex/config.toml
-        // unconditionally — Codex's trust-list gate is deliberately
-        // skipped; see `config.rs` module doc for rationale (display-only
-        // surface, not a security boundary).
-        let mcp_servers = config::load_mcp_servers(home_dir, cwd);
-        let skills_list = skills::load_skills(home_dir, cwd);
-        if let Some(fields) =
-            session_file::build_session_meta_fields(&enrichment, mcp_servers, skills_list)
-        {
-            let _ = tx.send(AdapterEvent::SessionMeta {
-                agent_id,
-                model: fields.model,
-                harness_version: fields.harness_version,
-                tools: Vec::new(),
-                mcp_servers: fields.mcp_servers,
-                skills: fields.skills,
-                raw: fields.raw,
-            });
-        }
+    // Step 5: emit SessionMeta after **every** turn, not only the first. The
+    // rollout's inventory — the skills Codex loaded, the approved-command
+    // allowlist, the run settings — changes between turns (a new skill
+    // installed, a command approved, the sandbox widened), and the card has to
+    // show what the agent has *now*. Re-emitting is free of side effects: the
+    // reducer replaces the whole record, and both registries below already
+    // re-read from disk on every emission per `config.rs`'s no-caching policy.
+    //
+    // This also retires the attach-flow's `force_session_meta` special case,
+    // which existed only because the old first-turn gate misread a post-attach
+    // dispatch as a resume and skipped the emission the sidebar needed.
+    //
+    // Loads both ~/.codex/config.toml and <cwd>/.codex/config.toml
+    // unconditionally — Codex's trust-list gate is deliberately skipped; see
+    // `config.rs` module doc for rationale (display-only surface, not a
+    // security boundary).
+    let mcp_servers = config::load_mcp_servers(home_dir, cwd);
+    let scanned_skills = skills::load_skills(home_dir, cwd)
+        .into_iter()
+        .map(crate::events::SkillEntry::from_name)
+        .collect();
+    if let Some(fields) =
+        session_file::build_session_meta_fields(&enrichment, mcp_servers, scanned_skills)
+    {
+        let _ = tx.send(AdapterEvent::SessionMeta {
+            agent_id,
+            model: fields.model,
+            harness_version: fields.harness_version,
+            inventory: fields.inventory,
+            raw: fields.raw,
+            // Read back out of Codex's own rollout on every load (class B), so
+            // the dispatcher must not cache it — a cached copy could only go
+            // stale against a file that is already durable.
+            source: crate::events::SessionMetaSource::SessionFileBacked,
+        });
     }
 }
 
@@ -1433,7 +1469,6 @@ mod tests {
             TurnOutcome::Completed,
             Utc::now(),
             None,
-            false,
             &live_edit_calls,
         )
         .await;
@@ -1455,6 +1490,53 @@ mod tests {
         };
         assert_eq!(files[0].path, "/tmp/old.txt");
         assert_eq!(files[0].moved_to.as_deref(), Some("/tmp/new.txt"));
+    }
+
+    #[test]
+    fn classify_outcome_types_a_quota_rejection_from_the_rollouts_verdict() {
+        let quota = Enrichment {
+            current_turn_error_info: Some("usage_limit_exceeded".to_owned()),
+            ..Enrichment::default()
+        };
+        let message = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 19th, 2026 12:18 PM.";
+        let failed = |kind: FailureKind| TurnOutcome::Failed {
+            kind,
+            message: message.to_owned(),
+        };
+
+        // The generic failure the stream parser produced becomes typed, with
+        // the harness's own text intact — the reset time lives in it.
+        assert_eq!(
+            classify_outcome(failed(FailureKind::HarnessError), &quota),
+            failed(FailureKind::UsageLimit)
+        );
+        // Stronger or non-harness classifications are not overwritten.
+        assert_eq!(
+            classify_outcome(failed(FailureKind::AuthFailure), &quota),
+            failed(FailureKind::AuthFailure)
+        );
+        assert_eq!(
+            classify_outcome(failed(FailureKind::AdapterFailure), &quota),
+            failed(FailureKind::AdapterFailure)
+        );
+        assert_eq!(
+            classify_outcome(TurnOutcome::Completed, &quota),
+            TurnOutcome::Completed
+        );
+
+        // Another classification, or none, leaves the generic kind alone.
+        let other = Enrichment {
+            current_turn_error_info: Some("context_window_exceeded".to_owned()),
+            ..Enrichment::default()
+        };
+        assert_eq!(
+            classify_outcome(failed(FailureKind::HarnessError), &other),
+            failed(FailureKind::HarnessError)
+        );
+        assert_eq!(
+            classify_outcome(failed(FailureKind::HarnessError), &Enrichment::default()),
+            failed(FailureKind::HarnessError)
+        );
     }
 
     /// The offline twin of `live_codex_apply_patch_emits_edit_facet` for the
@@ -1496,7 +1578,6 @@ mod tests {
             TurnOutcome::Completed,
             Utc::now(),
             None,
-            false,
             &live_edit_calls,
         )
         .await;
@@ -1570,7 +1651,6 @@ mod tests {
             TurnOutcome::Completed,
             Utc::now(),
             None,
-            false,
             &live_edit_calls,
         )
         .await;
@@ -1661,7 +1741,6 @@ mod tests {
             TurnOutcome::Completed,
             Utc::now(),
             None,
-            false,
             &live_edit_calls,
         )
         .await;
@@ -1732,7 +1811,6 @@ mod tests {
             TurnOutcome::Completed,
             Utc::now(),
             None,
-            false,
             &live_edit_calls,
         )
         .await;

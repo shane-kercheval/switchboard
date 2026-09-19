@@ -125,8 +125,8 @@ use switchboard_core::{
 };
 use switchboard_harness::{
     AdapterEvent, CancelSource, ContentKind, ContextWindowSource, DispatchOptions, EventStream,
-    FailureKind, HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, TurnId, TurnOutcome,
-    TurnSpend,
+    FailureKind, HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, SessionInventory,
+    SessionMetaSource, TurnId, TurnOutcome, TurnSpend,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -264,6 +264,12 @@ enum WorkPayload {
     /// Carries no prompt and no attachments — it is not something the user said,
     /// and nothing about it is journaled.
     Compact,
+    /// Ask the harness what is occupying the agent's context window. Like
+    /// `Compact` it carries no prompt and journals nothing; unlike it, it costs
+    /// nothing and changes nothing — but it still writes to the session file, so
+    /// it must serialize with turns under the same lock and therefore runs
+    /// through the actor rather than beside it.
+    ContextReport,
 }
 
 impl WorkPayload {
@@ -271,6 +277,7 @@ impl WorkPayload {
         match self {
             Self::Send { .. } => TurnKind::Send,
             Self::Compact => TurnKind::Compaction,
+            Self::ContextReport => TurnKind::ContextReport,
         }
     }
 }
@@ -278,14 +285,21 @@ impl WorkPayload {
 /// What a turn is doing — the classification an observer can read without the
 /// work item's payload.
 ///
-/// A compaction is a real turn through the actor: it queues, streams, cancels,
-/// and terminates exactly like a send. It is simply **not conversational** — no
-/// prompt, nothing journaled, no forwardable text — so every place that must
-/// tell the two apart branches on this rather than on the presence of a prompt.
+/// The maintenance kinds are real turns through the actor: they queue, stream,
+/// cancel, and terminate exactly like a send. They are simply **not
+/// conversational** — no prompt, nothing journaled, no forwardable text — so
+/// every place that must tell them apart from a send branches on this rather
+/// than on the presence of a prompt.
+///
+/// `Compaction` and `ContextReport` behave identically everywhere in the
+/// dispatcher; they are separate variants because an observer needs to say
+/// which one an agent is busy with, and because a single "maintenance" variant
+/// would make that unanswerable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnKind {
     Send,
     Compaction,
+    ContextReport,
 }
 
 /// The model/effort-dependent part of an agent record captured for one send.
@@ -759,6 +773,7 @@ pub trait MetadataCache: Send + Sync {
         &self,
         agent_id: AgentId,
         info: serde_json::Value,
+        model: Option<String>,
         captured_at: DateTime<Utc>,
     );
 
@@ -773,6 +788,18 @@ pub trait MetadataCache: Send + Sync {
         context_window: u32,
         model: String,
         message_id: String,
+        captured_at: DateTime<Utc>,
+    );
+
+    /// Persist the latest environment-inventory snapshot for `agent_id`.
+    /// Last-write-wins. Stream-only for Claude (`system/init` carries the
+    /// registries, the session file records none of them), so it must be
+    /// cached for the card to show what the last turn loaded rather than
+    /// falling back to the status-less config registries after a restart.
+    fn record_inventory(
+        &self,
+        agent_id: AgentId,
+        inventory: SessionInventory,
         captured_at: DateTime<Utc>,
     );
 
@@ -799,8 +826,16 @@ pub trait MetadataCache: Send + Sync {
 pub struct NoopMetadataCache;
 
 impl MetadataCache for NoopMetadataCache {
-    fn record_rate_limit(&self, _: AgentId, _: serde_json::Value, _: DateTime<Utc>) {}
+    fn record_rate_limit(
+        &self,
+        _: AgentId,
+        _: serde_json::Value,
+        _: Option<String>,
+        _: DateTime<Utc>,
+    ) {
+    }
     fn record_context_window(&self, _: AgentId, _: u32, _: String, _: String, _: DateTime<Utc>) {}
+    fn record_inventory(&self, _: AgentId, _: SessionInventory, _: DateTime<Utc>) {}
     fn record_turn_spend(
         &self,
         _: AgentId,
@@ -1117,6 +1152,39 @@ impl Dispatcher {
             message_id: Uuid::now_v7(),
             send_id,
             payload: WorkPayload::Compact,
+            selection,
+            completion: None,
+        };
+        self.enqueue(agent_id, item, factory)
+    }
+
+    /// Accept a **context breakdown** for `agent_id`: ask the harness what is
+    /// occupying its context window. Every property of
+    /// [`Self::compact_agent`] holds here — always enqueues, runs through the
+    /// same actor in the same FIFO position, journals nothing, produces no
+    /// forwardable text, has no awaitable variant, and cancels through
+    /// [`Self::cancel_send`] by `send_id` while queued.
+    ///
+    /// It goes through the actor **even though it changes nothing**, because it
+    /// still writes three records to the harness's session file: the only writer
+    /// of that file must stay the per-agent actor, or a report interleaves with
+    /// a turn under the session lock.
+    ///
+    /// Callers must gate on `HarnessKind::supports_context_report` first.
+    pub fn context_report_agent(
+        &self,
+        agent_id: AgentId,
+        send_id: SendId,
+        factory: &Arc<dyn DispatchContextFactory>,
+    ) -> MessageId {
+        // Snapshotted for the same reason a compaction's is: the report measures
+        // the window of the model that will run, so it must carry the selection
+        // the user had when they asked.
+        let selection = factory.selection_snapshot();
+        let item = WorkItem {
+            message_id: Uuid::now_v7(),
+            send_id,
+            payload: WorkPayload::ContextReport,
             selection,
             completion: None,
         };
@@ -1949,6 +2017,11 @@ async fn run_turn(
         // call. `options` rides through unchanged — the cancel token is what
         // makes a compaction cancellable like any other turn.
         WorkPayload::Compact => adapter.compact(&agent, &cwd, turn_id, options).await,
+        // Same reasoning as the compaction above, and the same hazard: a
+        // `/context` *prompt* on a harness without the local interception is
+        // answered by the model with an invented breakdown, so the refusal has
+        // to live in the type of the call rather than in a string.
+        WorkPayload::ContextReport => adapter.context_report(&agent, &cwd, turn_id, options).await,
     };
 
     let stream = match launched {
@@ -1970,7 +2043,7 @@ async fn run_turn(
                     journal.record_outcome(turn_id, agent_id, &outcome, started_at, Utc::now());
                     Some(item.send_id)
                 }
-                TurnKind::Compaction => None,
+                TurnKind::Compaction | TurnKind::ContextReport => None,
             };
             emit_message_failed(
                 emitter.as_ref(),
@@ -2063,7 +2136,7 @@ async fn drain_turn(
     // Current-turn waiters bound to a *compaction*, held here rather than in
     // `awaiters` — they are answered at stream drain, not at the terminal. See
     // where they are drained, below the loop.
-    let mut compaction_waiters: Vec<oneshot::Sender<CurrentTurnWait>> = Vec::new();
+    let mut maintenance_waiters: Vec<oneshot::Sender<CurrentTurnWait>> = Vec::new();
     let mut terminal_seen = false;
     // The terminal outcome + captured text, stashed once observed so a
     // `WaitForCurrentTurn` arriving *after* the terminal but before the stream
@@ -2104,6 +2177,13 @@ async fn drain_turn(
     // Antigravity's post-exit drain emits content + `SessionMeta` after the
     // capture). We keep looping only to service commands and let the child exit.
     let mut force_failed = false;
+    // A rate-limit payload and the model that names its model-specific window
+    // arrive as separate events. Keep their same-turn association here so the
+    // metadata sidecar can restore the exact label after restart. Either event
+    // may arrive first (compaction currently emits rate limit before init), so
+    // a later model observation repairs the just-written snapshot.
+    let mut rate_limit_model: Option<String> = None;
+    let mut stream_rate_limit_payload: Option<serde_json::Value> = None;
 
     loop {
         tokio::select! {
@@ -2323,6 +2403,21 @@ async fn drain_turn(
                     awaiters.fire(outcome, &text);
                     terminal = Some((outcome.clone(), text));
                 }
+                if let AdapterEvent::TurnEnd { model: Some(model), .. }
+                    | AdapterEvent::SessionMeta { model, .. } = &event
+                    && !model.is_empty()
+                    && rate_limit_model.as_deref() != Some(model.as_str())
+                {
+                    rate_limit_model = Some(model.clone());
+                    if let Some(payload) = &stream_rate_limit_payload {
+                        metadata.record_rate_limit(
+                            agent_id,
+                            payload.clone(),
+                            rate_limit_model.clone(),
+                            Utc::now(),
+                        );
+                    }
+                }
                 // Persist stream-only (class-C) rate-limit snapshots so they
                 // survive an app restart. The gate is on the event's `source`,
                 // not the harness — keeping the dispatcher harness-agnostic.
@@ -2332,7 +2427,25 @@ async fn drain_turn(
                 if let AdapterEvent::RateLimitEvent { agent_id: a, info, source } = &event
                     && *source == RateLimitSource::StreamOnly
                 {
-                    metadata.record_rate_limit(*a, info.clone(), Utc::now());
+                    stream_rate_limit_payload = Some(info.clone());
+                    metadata.record_rate_limit(
+                        *a,
+                        info.clone(),
+                        rate_limit_model.clone(),
+                        Utc::now(),
+                    );
+                }
+                // Persist the stream-only environment inventory, on the same
+                // source-gated and harness-agnostic terms as the two snapshots
+                // around it: Claude's `system/init` (class C) is cached so the
+                // card can show what the last turn actually loaded, while
+                // Codex's rollout-derived inventory (class B) is re-read from
+                // the harness's own file on every load and must not be
+                // shadow-cached.
+                if let AdapterEvent::SessionMeta { agent_id: a, inventory, source, .. } = &event
+                    && *source == SessionMetaSource::StreamOnly
+                {
+                    metadata.record_inventory(*a, inventory.clone(), Utc::now());
                 }
                 // Persist the stream-only context window so the context bar
                 // survives restart. Same source-gated, harness-agnostic posture
@@ -2452,7 +2565,9 @@ async fn drain_turn(
                         // Registered mid-compaction *or* arriving after its
                         // terminal — either way it is held and answered `Idle` at
                         // stream drain (see below the loop), never here.
-                        TurnKind::Compaction => compaction_waiters.push(reply),
+                        TurnKind::Compaction | TurnKind::ContextReport => {
+                            maintenance_waiters.push(reply);
+                        }
                         // Mid-turn: register to fire at this turn's terminal. If
                         // the terminal already passed (we're draining post-terminal
                         // enrichment), answer immediately with the stashed outcome
@@ -2478,7 +2593,7 @@ async fn drain_turn(
                         // the terminal. Same boundary its waiters resolve at.
                         let running = match kind {
                             TurnKind::Send => terminal.is_none(),
-                            TurnKind::Compaction => true,
+                            TurnKind::Compaction | TurnKind::ContextReport => true,
                         };
                         let _ = reply.send(running.then_some(kind));
                     }
@@ -2586,7 +2701,7 @@ async fn drain_turn(
     // session file, and an adapter ends its stream only once it has reaped the
     // process — so this is the first moment that file is settled. Holds for every
     // outcome alike: completed, failed, and cancelled.
-    for reply in compaction_waiters {
+    for reply in maintenance_waiters {
         let _ = reply.send(CurrentTurnWait::Idle);
     }
 

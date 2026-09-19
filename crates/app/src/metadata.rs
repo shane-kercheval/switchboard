@@ -46,6 +46,7 @@ impl MetadataCache for ProjectMetadataCache {
         &self,
         agent_id: AgentId,
         info: serde_json::Value,
+        model: Option<String>,
         captured_at: DateTime<Utc>,
     ) {
         // The cache is per-agent (one instance per dispatch context); the
@@ -74,6 +75,7 @@ impl MetadataCache for ProjectMetadataCache {
         if let Err(e) = switchboard_harness::meta_sidecar::write_rate_limit(
             &self.sidecar_path,
             info,
+            model,
             captured_at,
         ) {
             tracing::warn!(
@@ -119,6 +121,40 @@ impl MetadataCache for ProjectMetadataCache {
                 agent_id = %self.agent_id,
                 error = %e,
                 "failed to persist context-window snapshot to metadata sidecar — restart continuity degraded; turn unaffected"
+            );
+        }
+    }
+
+    fn record_inventory(
+        &self,
+        agent_id: AgentId,
+        inventory: switchboard_harness::SessionInventory,
+        captured_at: DateTime<Utc>,
+    ) {
+        // Same per-agent wiring guard as the snapshots above: skip rather than
+        // persist another agent's environment under this one.
+        debug_assert_eq!(
+            agent_id, self.agent_id,
+            "metadata cache built for {} received event for {agent_id}",
+            self.agent_id
+        );
+        if agent_id != self.agent_id {
+            tracing::warn!(
+                expected = %self.agent_id,
+                got = %agent_id,
+                "metadata cache agent_id mismatch — skipping inventory write to avoid persisting another agent's data"
+            );
+            return;
+        }
+        if let Err(e) = switchboard_harness::meta_sidecar::write_inventory(
+            &self.sidecar_path,
+            inventory,
+            captured_at,
+        ) {
+            tracing::warn!(
+                agent_id = %self.agent_id,
+                error = %e,
+                "failed to persist inventory snapshot to metadata sidecar — restart continuity degraded; turn unaffected"
             );
         }
     }

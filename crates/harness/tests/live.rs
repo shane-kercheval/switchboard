@@ -217,7 +217,7 @@ async fn live_claude_basic_turn_completes() {
         AdapterEvent::SessionMeta {
             model,
             harness_version,
-            tools,
+            inventory,
             ..
         } => {
             assert!(!model.is_empty(), "SessionMeta.model must be non-empty");
@@ -226,8 +226,8 @@ async fn live_claude_basic_turn_completes() {
                 "SessionMeta.harness_version must be non-empty"
             );
             assert!(
-                !tools.is_empty(),
-                "SessionMeta.tools must list at least Claude's builtin tools"
+                inventory.tools.as_ref().is_some_and(|t| !t.is_empty()),
+                "SessionMeta.inventory.tools must list at least Claude's builtin tools"
             );
         }
         _ => unreachable!(),
@@ -487,6 +487,194 @@ async fn live_claude_rate_limit_precedes_result() {
 
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_rate_limit_carries_unified_windows() {
+    // The agent card draws a meter per usage window from `unifiedWindows`, a
+    // field that appears in no published Claude Code documentation — it was
+    // found by probing 2.1.274. A fixture test replays the shape we recorded
+    // and would keep passing forever after the CLI stopped sending it; only a
+    // live test notices. If this fails, the card silently degrades to the
+    // no-percentage fallback (a bare reset line) and nobody finds out from the
+    // offline suite.
+    //
+    // Shape, not values: `utilization` is whatever the account has spent. The
+    // per-model window (`seven_day_overage_included`) is deliberately NOT
+    // asserted — it arrives only on turns run against a server-side allowlist
+    // of models, so its presence is plan- and model-dependent and would make
+    // this test fail for reasons that aren't drift.
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Reply with only the word ack.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let payloads: Vec<&serde_json::Value> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::RateLimitEvent { info, .. } => Some(info),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !payloads.is_empty(),
+        "Claude must emit a rate_limit_event every turn"
+    );
+
+    // The **last** payload, not the first: the reducer overwrites
+    // `last_rate_limit` on every event, so the last one is what the card draws
+    // and what the sidecar persists. A turn can emit more than one (the second
+    // carries the threshold warning plus a superset of windows), and a release
+    // that sent good windows first and degraded ones second would leave the
+    // card on its no-percentage fallback while a first-match assertion still
+    // passed.
+    let unified = payloads
+        .last()
+        .and_then(|info| info.get("unifiedWindows"))
+        .and_then(serde_json::Value::as_object)
+        .expect(
+            "rate_limit_event must carry a `unifiedWindows` object — the per-window usage meters \
+             read it, and without it the card falls back to a reset line with no percentage",
+        );
+
+    for key in ["five_hour", "seven_day"] {
+        let window = unified
+            .get(key)
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| panic!("`unifiedWindows` must carry a `{key}` object"));
+        let utilization = window
+            .get("utilization")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("`{key}.utilization` must be a number"));
+        assert!(
+            (0.0..=1.0).contains(&utilization),
+            "`{key}.utilization` must be a 0-1 fraction used, got {utilization} — the meter reads \
+             it as a fraction and would render a wrong percentage if this became 0-100"
+        );
+        // `is_number`, not `as_i64`: the frontend gate is `typeof === "number"`,
+        // so a release that started sending a float would still render. A
+        // stricter assertion here would fail for a shape the card handles.
+        assert!(
+            window
+                .get("resetsAt")
+                .is_some_and(serde_json::Value::is_number),
+            "`{key}.resetsAt` must be a number (unix seconds) — the window is dropped without it"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_session_meta_carries_inventory() {
+    // The Environment row reads eight `system/init` keys that appear in no
+    // published Claude Code documentation — `agents`, `plugins`,
+    // `memory_paths`, `slash_commands`, and `source` on an MCP entry were all
+    // found by probing 2.1.274. A fixture replays the shape we recorded and
+    // would keep passing forever after the CLI renamed or dropped any of them;
+    // only a live test notices.
+    //
+    // The failure mode this guards is quiet: a dropped key reads as `None`,
+    // which means "the harness did not report it" and clean-hides the
+    // section. The card would simply stop showing the agent's plugins, and
+    // the offline suite would stay green.
+    //
+    // **Shape and presence, never counts or names** — every value here is
+    // account-specific (a developer with no plugins installed is not drift).
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Reply with only the word ack.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let inventory = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::SessionMeta { inventory, .. } => Some(inventory),
+            _ => None,
+        })
+        .expect("Claude must emit SessionMeta from system/init on every dispatch");
+
+    for (key, reported) in [
+        ("agents", inventory.agents.is_some()),
+        ("plugins", inventory.plugins.is_some()),
+        ("memory_paths", inventory.memory_paths.is_some()),
+        ("slash_commands", inventory.slash_commands.is_some()),
+        ("skills", inventory.skills.is_some()),
+        ("tools", inventory.tools.is_some()),
+    ] {
+        assert!(
+            reported,
+            "`system/init` must still carry `{key}` — absent means the card silently stops \
+             rendering that section, with nothing in the offline suite to notice"
+        );
+    }
+
+    // A plugin renders as "name @ version", so a version that stopped
+    // arriving would degrade the row to a bare name. Asserted only when the
+    // account has a plugin at all.
+    if let Some(plugin) = inventory.plugins.as_deref().and_then(<[_]>::first) {
+        assert!(
+            !plugin.name.is_empty(),
+            "a plugin entry must carry a non-empty `name`"
+        );
+        assert!(
+            plugin.version.is_some(),
+            "a plugin entry must still carry `version` — the row renders `name @ version`"
+        );
+    }
+
+    // `source` is per-entry and undocumented; the row shows it beside the
+    // server name. Asserted on at least one entry rather than all, since
+    // nothing says every scope reports it.
+    let servers = inventory
+        .mcp_servers
+        .as_deref()
+        .expect("`system/init` must still carry `mcp_servers`");
+    if !servers.is_empty() {
+        assert!(
+            servers.iter().any(|s| s.source.is_some()),
+            "at least one MCP entry must still carry `source`: {servers:?}"
+        );
+        assert!(
+            servers.iter().all(|s| !s.status.is_empty()),
+            "every MCP entry must carry a `status` — the status dot and the needs-auth count in \
+             the collapsed line both read it: {servers:?}"
+        );
+    }
+
+    // `memory_paths` is a **map** of kind → path, not a list. If it ever
+    // became an array the parser's `as_object` read would yield `None` and
+    // the Memory section would vanish; the presence assertion above already
+    // covers that, and this pins that the values are paths rather than, say,
+    // objects.
+    if let Some(path) = inventory.memory_paths.as_deref().and_then(<[_]>::first) {
+        assert!(
+            path.starts_with('/'),
+            "`memory_paths` values must be absolute paths, got {path:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_thinking_emits_liveness() {
     // While the model reasons, the CLI streams `thinking_delta` /
     // `signature_delta`. On a redacting model the thinking text is empty and
@@ -571,9 +759,14 @@ fn session_meta_mcp_names(events: &[AdapterEvent]) -> Vec<String> {
     events
         .iter()
         .find_map(|e| match e {
-            AdapterEvent::SessionMeta { mcp_servers, .. } => {
-                Some(mcp_servers.iter().map(|s| s.name.clone()).collect())
-            }
+            AdapterEvent::SessionMeta { inventory, .. } => Some(
+                inventory
+                    .mcp_servers
+                    .iter()
+                    .flatten()
+                    .map(|s| s.name.clone())
+                    .collect(),
+            ),
             _ => None,
         })
         .unwrap_or_default()
@@ -649,7 +842,7 @@ async fn live_claude_chrome_flag_toggles_browser_tools() {
     let tools = on
         .iter()
         .find_map(|e| match e {
-            AdapterEvent::SessionMeta { tools, .. } => Some(tools.clone()),
+            AdapterEvent::SessionMeta { inventory, .. } => inventory.tools.clone(),
             _ => None,
         })
         .unwrap_or_default();
@@ -1798,6 +1991,137 @@ fn codex_capture(events: &[AdapterEvent]) -> Option<(String, chrono::NaiveDate)>
 
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
+#[allow(clippy::too_many_lines)]
+async fn live_codex_world_state_yields_inventory() {
+    // **The most fragile read in the whole card.** Codex writes its loaded
+    // skills as a *markdown block* meant for the model to read
+    // (`world_state.state.host_skills.body`) — name, description and a
+    // root-relative path per line, with the roots in a table above. There is
+    // no structured alternative: neither Codex's `--json` stream nor its
+    // config files name the skills it actually loaded. A fixture proves our
+    // parser handles the shape we recorded; only this notices when OpenAI
+    // rewords the block.
+    //
+    // **Two turns on one session**, because the second is what a fixture
+    // physically cannot test: `SessionMeta` used to be emitted on the first
+    // turn only, and the inventory changes between turns (a skill installed,
+    // a command approved). The gate is gone, and only a real resume proves it.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = CodexAdapter::new();
+    let agent = live_codex_agent();
+
+    let turn1 = Uuid::now_v7();
+    let stream1 = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Reply with the single word 'ack' and nothing else.",
+            turn1,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("first dispatch should succeed");
+    let events1: Vec<AdapterEvent> = stream1.collect().await;
+
+    let inventory = events1
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::SessionMeta { inventory, .. } => Some(inventory),
+            _ => None,
+        })
+        .expect("Codex must emit SessionMeta after its enrichment read");
+
+    // Shape, never names or counts: which skills a developer has installed is
+    // account state, not a contract.
+    let skills = inventory
+        .skills
+        .as_deref()
+        .expect("the rollout's `host_skills` block must still yield skills");
+    assert!(
+        !skills.is_empty(),
+        "`host_skills` parsed to zero skills — the markdown format has almost certainly moved; \
+         the card's Skills section is now empty and nothing offline would notice"
+    );
+    assert!(
+        skills
+            .iter()
+            .all(|s| s.description.as_ref().is_some_and(|d| !d.is_empty())),
+        "every `host_skills` entry must still carry a non-empty description — the `name: \
+         description` separator is what a reword would break: {skills:?}"
+    );
+    assert!(
+        skills
+            .iter()
+            .any(|s| s.path.as_deref().is_some_and(|p| p.starts_with('/'))),
+        "at least one skill path must expand to an absolute path via the roots table — a short \
+         path everywhere means the `### Skill roots` heading moved: {skills:?}"
+    );
+
+    // The settings line and the approved-command allowlist come out of
+    // `turn_context` and `world_state.permissions`, both undocumented.
+    let settings = inventory
+        .settings
+        .as_deref()
+        .expect("`turn_context` + `world_state.environments` must still yield settings pairs");
+    let labels: Vec<&str> = settings.iter().map(|p| p.label.as_str()).collect();
+    for expected in ["Sandbox", "Approval policy", "Shell", "Timezone"] {
+        assert!(
+            labels.contains(&expected),
+            "the settings line must still carry `{expected}`; got {labels:?}"
+        );
+    }
+    assert!(
+        inventory.approved_commands.is_some(),
+        "`world_state.permissions.approved_command_prefixes` must still be reported — absent \
+         hides the allowlist section entirely"
+    );
+
+    // Turn 2 (resume): the gate removal. A once-per-session emission would
+    // leave this turn with no `SessionMeta` at all, and the card frozen on
+    // the agent's first-turn environment.
+    let (thread_id, partition_date) =
+        codex_capture(&events1).expect("first dispatch emits a captured Codex locator");
+    let resumed_agent = AgentRecord {
+        session_locator: Some(SessionLocator::Codex {
+            thread_id,
+            partition_date,
+        }),
+        ..agent.clone()
+    };
+    let turn2 = Uuid::now_v7();
+    let stream2 = adapter
+        .dispatch(
+            &resumed_agent,
+            tmp.path(),
+            "Reply with the single word 'ack' and nothing else.",
+            turn2,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("resume dispatch should succeed");
+    let events2: Vec<AdapterEvent> = stream2.collect().await;
+
+    let resumed_inventory = events2
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::SessionMeta { inventory, .. } => Some(inventory),
+            _ => None,
+        })
+        .expect(
+            "Codex must emit SessionMeta on a RESUME turn too — the inventory changes between \
+             turns, and a first-turn-only emission freezes the card on turn one's environment",
+        );
+    assert!(
+        resumed_inventory
+            .skills
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()),
+        "the resume turn's inventory must be read fresh from the rollout, not left empty"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
 // One cohesive end-to-end assertion sequence (completion + enrichment ordering
 // + rate-limit/SessionMeta shape + sidecar); splitting it across helpers would
 // scatter a single turn's drift-detection checks for no real gain.
@@ -1947,7 +2271,7 @@ async fn live_codex_basic_turn_completes() {
         AdapterEvent::SessionMeta {
             model,
             harness_version,
-            tools,
+            inventory,
             ..
         } => {
             assert!(!model.is_empty(), "model must be set from turn_context");
@@ -1955,7 +2279,10 @@ async fn live_codex_basic_turn_completes() {
                 !harness_version.is_empty(),
                 "harness_version must be set from session_meta.cli_version"
             );
-            assert!(tools.is_empty(), "tools is vec![] for Codex");
+            assert!(
+                inventory.tools.is_none(),
+                "Codex reports no tool inventory anywhere — absent, not empty"
+            );
         }
         _ => unreachable!(),
     }
@@ -2614,15 +2941,13 @@ async fn live_antigravity_basic_turn_completes() {
         .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
         .expect("Antigravity must emit SessionMeta post-terminal");
     match session_meta {
-        AdapterEvent::SessionMeta {
-            tools,
-            mcp_servers,
-            skills,
-            ..
-        } => {
-            assert!(tools.is_empty(), "Antigravity SessionMeta.tools is vec![]");
-            let _: &Vec<_> = mcp_servers;
-            let _: &Vec<_> = skills;
+        AdapterEvent::SessionMeta { inventory, .. } => {
+            assert!(
+                inventory.tools.is_none(),
+                "Antigravity announces no tool inventory — absent, not empty"
+            );
+            let _: &Option<Vec<_>> = &inventory.mcp_servers;
+            let _: &Option<Vec<_>> = &inventory.skills;
         }
         other => panic!("expected SessionMeta, got {other:?}"),
     }
@@ -4209,4 +4534,113 @@ async fn live_claude_compact_refusal_surfaces_as_a_failed_turn() {
     );
     assert_eq!(*stable_message_id, None);
     assert_eq!(*first_message_id, None);
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_context_report_parses() {
+    // The breakdown panel reads `assistant.context_usage`, a structured object
+    // that appears in no published Claude Code documentation — it was found by
+    // re-probing 2.1.274 with Switchboard's exact argv. A fixture replays the
+    // shape we recorded and would keep passing forever after the CLI renamed a
+    // key or dropped the object.
+    //
+    // **The failure mode this guards is a quiet downgrade, not a crash.** With
+    // the object gone the decoder falls back to scraping the printed markdown,
+    // which still produces a panel — one whose every token count is the CLI's
+    // rounded figure (`4k`, `~30`) rather than the exact one. So this asserts
+    // the *structured* path ran, which is the only thing that distinguishes the
+    // two.
+    //
+    // Costs one extra local command and no model call: `/context` is
+    // intercepted by the CLI (`total_cost_usd: 0`, empty `modelUsage`).
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+
+    // A report needs a session to measure, and fails closed without one.
+    let warmup = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Reply with the single word 'ack'",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let _: Vec<AdapterEvent> = warmup.collect().await;
+
+    let turn_id = Uuid::now_v7();
+    let stream = adapter
+        .context_report(
+            &agent,
+            Path::new("/tmp"),
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("a context report should launch against the session the warmup created");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let report = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::ContextReport { report, .. } => Some(report),
+            _ => None,
+        })
+        .expect("a `/context` run must emit exactly one ContextReport: {events:?}");
+
+    assert!(
+        !report.unparsed,
+        "neither decoder could read the report — the CLI's output shape has moved: {}",
+        report.raw
+    );
+    assert!(
+        report
+            .categories
+            .iter()
+            .all(|category| !category.approximate)
+            && report.skills.iter().all(|skill| !skill.approximate),
+        "every count is exact only on the structured path; an approximate one means \
+         `context_usage` is gone and the markdown scraper ran instead: {report:?}"
+    );
+    assert!(
+        report.max_tokens.is_some_and(|max| max > 0),
+        "`raw_max_tokens` must still arrive — without it the panel has no scale and \
+         renders no meters at all: {report:?}"
+    );
+    assert!(
+        report.total_tokens.is_some_and(|used| used > 0),
+        "`total_tokens` must still arrive: {report:?}"
+    );
+    assert!(
+        !report.categories.is_empty(),
+        "`categories` is the breakdown itself; an empty list is an empty panel: {report:?}"
+    );
+    assert!(
+        report
+            .categories
+            .iter()
+            .all(|category| !category.name.is_empty()),
+        "every category renders under its own name: {report:?}"
+    );
+
+    // The report is swallowed whole: nothing downstream should have to know
+    // that its markdown is not an answer.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::ContentChunk { .. })),
+        "the printed table must not reach the transcript as content: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "the report turn must complete: {events:?}"
+    );
 }

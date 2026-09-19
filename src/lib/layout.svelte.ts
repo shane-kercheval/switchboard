@@ -1,14 +1,15 @@
-import type { ProjectId } from "$lib/types";
+import type { AgentId, ProjectId } from "$lib/types";
 
 /// Persisted app-layout preferences: sidebar widths + collapse state, the Git
 /// view's repository-pane width, and the diff panel's file-list width.
 ///
 /// **Device-local, with explicit project-scoped preferences.** Sidebar widths
 /// and open state express facts about the device and mean the same thing in
-/// every project. The selected right-sidebar content and Pins ordering are
-/// keyed by project, however: switching projects restores how that project's
-/// right sidebar was last used. (Transcript pane *fractions* are also
-/// per-project because pane membership is; see `state/transcriptPanes.svelte.ts`.)
+/// every project. The selected right-sidebar content, Pins ordering, and
+/// collapsed agent cards are keyed by project, however: switching projects
+/// restores how that project's right sidebar was last used. (Transcript pane
+/// *fractions* are also per-project because pane membership is; see
+/// `state/transcriptPanes.svelte.ts`.)
 ///
 /// Like the theme (`theme.svelte.ts`), this lives in `localStorage` rather than
 /// the git-trackable `config.yaml`: layout is a device-local appearance
@@ -26,10 +27,10 @@ import type { ProjectId } from "$lib/types";
 const STORAGE_KEY = "switchboard-layout";
 const STORAGE_VERSION = 1;
 
-/// Defaults match the pre-resizable Tailwind widths (`w-72` / `w-60`) so an
-/// untouched install looks identical.
+/// Defaults are sized for each rail's content. The agent rail is wider than
+/// its original `w-60` now that cards carry context and usage meters.
 export const PROJECTS_SIDEBAR_DEFAULT_WIDTH = 288;
-export const AGENTS_SIDEBAR_DEFAULT_WIDTH = 240;
+export const AGENTS_SIDEBAR_DEFAULT_WIDTH = 280;
 export const PINS_SIDEBAR_DEFAULT_WIDTH = 360;
 export const GIT_REPO_DEFAULT_WIDTH = 360;
 export const DIFF_FILE_LIST_DEFAULT_WIDTH = 256;
@@ -85,6 +86,13 @@ export type PinsSortMode = "pinned_at" | "message_at";
 type ProjectLayoutPreferences = {
   rightSidebarMode?: RightSidebarMode;
   pinsSortMode?: PinsSortMode;
+  /// Agents whose detail card is **expanded**, inverting what this once stored.
+  /// A card defaults to collapsed, so absence is the default state and the list
+  /// records the exceptions — which is also why the retired `collapsedAgentIds`
+  /// key is simply ignored rather than migrated: reading it would preserve a
+  /// "collapsed" set that is now the default anyway, and the one-time cost is
+  /// that a user's previous per-card expansions are forgotten.
+  expandedAgentIds?: AgentId[];
 };
 
 type LayoutState = {
@@ -117,16 +125,42 @@ function parsePinsSortMode(value: unknown): PinsSortMode | undefined {
   return undefined;
 }
 
+/// Collapsed-card ids are a set in meaning but a list on disk (JSON has no set),
+/// so both the parse path and the collapse-all path funnel through one dedupe.
+///
+/// `indexOf`, not a `Set`: `svelte/prefer-svelte-reactivity` rejects holding a
+/// built-in `Set` in a `.svelte.ts` module, and the input here is one project's
+/// agent roster — tens of entries at the outside, both callers run on a user
+/// gesture or a single storage read.
+function uniqueAgentIds(ids: readonly AgentId[]): AgentId[] {
+  return ids.filter((id, index) => ids.indexOf(id) === index);
+}
+
+function parseAgentIds(value: unknown): AgentId[] | undefined {
+  if (!Array.isArray(value) || !value.every((id) => typeof id === "string")) return undefined;
+  return uniqueAgentIds(value);
+}
+
 function parseProjectPreferences(value: unknown): Record<ProjectId, ProjectLayoutPreferences> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(
     Object.entries(value).flatMap(([projectId, stored]) => {
       if (projectId.length === 0 || stored === null || typeof stored !== "object") return [];
-      const raw = stored as { rightSidebarMode?: unknown; pinsSortMode?: unknown };
+      const raw = stored as {
+        rightSidebarMode?: unknown;
+        pinsSortMode?: unknown;
+        expandedAgentIds?: unknown;
+      };
       const rightSidebarMode = parseRightSidebarMode(raw.rightSidebarMode);
       const pinsSortMode = parsePinsSortMode(raw.pinsSortMode);
-      if (rightSidebarMode === undefined && pinsSortMode === undefined) return [];
-      return [[projectId, { rightSidebarMode, pinsSortMode }]];
+      const expandedAgentIds = parseAgentIds(raw.expandedAgentIds);
+      if (
+        rightSidebarMode === undefined &&
+        pinsSortMode === undefined &&
+        expandedAgentIds === undefined
+      )
+        return [];
+      return [[projectId, { rightSidebarMode, pinsSortMode, expandedAgentIds }]];
     }),
   );
 }
@@ -250,6 +284,45 @@ export const layout = {
     state.projectPreferences[projectId] = {
       ...state.projectPreferences[projectId],
       pinsSortMode: mode,
+    };
+    persist();
+  },
+  /// **Collapsed is the default.** The roster is a scannable list of who is in
+  /// the project and what each one is doing; the detail behind a card is opened
+  /// on demand. Quota used to be the one thing a collapsed card hid that a user
+  /// wanted at a glance, and it no longer lives there.
+  agentCardCollapsedFor(projectId: ProjectId, agentId: AgentId): boolean {
+    return !(state.projectPreferences[projectId]?.expandedAgentIds?.includes(agentId) ?? false);
+  },
+  setAgentCardCollapsed(projectId: ProjectId, agentId: AgentId, collapsed: boolean): void {
+    const current = state.projectPreferences[projectId]?.expandedAgentIds ?? [];
+    const expandedAgentIds = collapsed
+      ? current.filter((id) => id !== agentId)
+      : current.includes(agentId)
+        ? current
+        : [...current, agentId];
+    state.projectPreferences[projectId] = {
+      ...state.projectPreferences[projectId],
+      expandedAgentIds,
+    };
+    persist();
+  },
+  setAllAgentCardsCollapsed(projectId: ProjectId, agentIds: AgentId[], collapsed: boolean): void {
+    state.projectPreferences[projectId] = {
+      ...state.projectPreferences[projectId],
+      expandedAgentIds: collapsed ? [] : uniqueAgentIds(agentIds),
+    };
+    persist();
+  },
+  /// Drop a deleted agent's card state. Without this the list grows for the
+  /// life of the project: agent ids are never reused, so an entry for a removed
+  /// agent can never match again and nothing else would ever clear it.
+  removeAgentCardState(projectId: ProjectId, agentId: AgentId): void {
+    const current = state.projectPreferences[projectId]?.expandedAgentIds;
+    if (current === undefined || !current.includes(agentId)) return;
+    state.projectPreferences[projectId] = {
+      ...state.projectPreferences[projectId],
+      expandedAgentIds: current.filter((id) => id !== agentId),
     };
     persist();
   },

@@ -150,3 +150,91 @@ export function relativeTime(iso: string, now: Date = new Date()): string {
   if (weeks < 5) return `${weeks}w ago`;
   return new Date(iso).toLocaleDateString();
 }
+
+/// One rounding rule for every magnitude of a scaled count: one decimal below
+/// 10, whole numbers above, and never a rendered trailing zero — `1`, `2.3`,
+/// `23`. Integer math rather than `toFixed` precisely so `1` does not become
+/// `1.0`.
+function scaledCount(value: number): number {
+  return value < 10 ? Math.round(value * 10) / 10 : Math.round(value);
+}
+
+// Token counts at card and transcript density: `990`, `1k`, `2.3k`, `121k`,
+// `1.3M`. Shared by the compaction summary's before/after pair and the context
+// meter's "used / window" detail so one context size never reads two ways in
+// the same window. Deliberately lossy: these are display strings, and a card
+// column is too narrow to spend on digits nobody reads.
+/// `M` is the largest suffix. The tier is picked from the *rounded* value, not
+/// the raw one: rounding first and choosing after is what keeps 999,600 from
+/// rendering as `1000k` — the reading the `M` suffix exists to avoid.
+export function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  const thousands = scaledCount(n / 1000);
+  if (thousands < 1000) return `${thousands}k`;
+  return `${scaledCount(n / 1_000_000)}M`;
+}
+
+/// The digits of a used percentage, without the sign. Split out from
+/// [`formatUsedPercent`] so a column can be reserved for the **number** alone:
+/// `tabular-nums` equalises digit widths, so a `ch`-based reservation is exact
+/// for digits and wrong the moment the percent sign is inside it. Callers that
+/// align a column also use this to find the widest value in their group.
+export function usedPercentDigits(value: number): string {
+  return (value * 100).toFixed(0);
+}
+
+/// The one place a used fraction becomes a percentage string. `value` is 0–1
+/// **used** (never remaining — see `Meter`'s `value` doc). Deliberately not
+/// clamped: a source reporting over-100% usage is saying something true, and
+/// only the bar's fill width clamps.
+export function formatUsedPercent(value: number): string {
+  return `${usedPercentDigits(value)}%`;
+}
+
+/// Full date and time for a usage window's reset, where a countdown is too
+/// coarse — a weekly or overage window can be days out, so the tooltip carries
+/// the date the inline clock omits. Milliseconds since epoch, display-only.
+///
+/// Lives here rather than in a component because both the harness usage section
+/// and any future reset surface need the same rendering; it was a local function
+/// in the agent sidebar until the usage meters moved out of it.
+export function formatResetDateTime(ms: number): string {
+  return new Date(ms).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+/// Countdown to a future instant, for a usage window's reset: "in 16 min",
+/// "in 3 h", "in 5 d". Relative at **every** distance, because this renders
+/// inline in an agent-card column about 180px wide, where an absolute date
+/// ("Tue, Sep 22, 9:01 PM") crowds out the window label it belongs to. The
+/// absolute form is not lost: the cells' tooltips carry the full reset date,
+/// which is where there is room for it. Rendering no weekday also retires the
+/// ambiguity an earlier draft had to work around — a bare weekday six days out
+/// names today and reads as this morning.
+///
+/// `now` is injectable so tests stay deterministic. An instant that is not in
+/// the future renders "now" rather than a negative countdown; callers drop a
+/// window whose reset has passed, so that is a floor under a state which
+/// shouldn't render, not a case worth its own copy.
+export function formatResetCountdown(resetsAtMs: number, now: Date = new Date()): string {
+  const remainingMs = resetsAtMs - now.getTime();
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return "now";
+  // Rounded, not floored or ceiled. Flooring understated a long wait (41 hours
+  // read "in 1 d"); ceiling overstated a short one by nearly a whole unit (61
+  // minutes read "in 2 h", which sends the user away for an hour longer than
+  // the window needs). Rounding is wrong by at most half a unit in either
+  // direction, and this number is acted on — it decides whether to wait out a
+  // quota or switch agents. Sub-minute waits floor at "in 1 min" so an
+  // imminent reset never reads "in 0 min", which looks like a stuck counter.
+  // Escalate a rounded 60 minutes / 24 hours to the next unit so the boundary
+  // still reads naturally.
+  const minutes = Math.max(1, Math.round(remainingMs / 60_000));
+  if (minutes < 60) return `in ${minutes} min`;
+  const hours = Math.round(remainingMs / 3_600_000);
+  if (hours < 24) return `in ${hours} h`;
+  return `in ${Math.round(remainingMs / 86_400_000)} d`;
+}

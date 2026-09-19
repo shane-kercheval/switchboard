@@ -32,6 +32,7 @@ const agentSessionInfoMock = vi.fn();
 const openSessionFileMock = vi.fn();
 const resumeAgentInTerminalMock = vi.fn<(id: string) => Promise<void>>();
 const compactAgentMock = vi.fn<(agentId: string, sendId: string) => Promise<string>>();
+const contextReportAgentMock = vi.fn<(agentId: string, sendId: string) => Promise<string>>();
 vi.mock("$lib/api", () => ({
   agentSessionInfo: (id: string) => agentSessionInfoMock(id),
   openSessionFile: async (id: string) => {
@@ -42,6 +43,7 @@ vi.mock("$lib/api", () => ({
   cancelSend: vi.fn(),
   cancelTurn: vi.fn(),
   compactAgent: (agentId: string, sendId: string) => compactAgentMock(agentId, sendId),
+  contextReportAgent: (agentId: string, sendId: string) => contextReportAgentMock(agentId, sendId),
   loadTranscript: vi.fn(),
 }));
 
@@ -68,6 +70,15 @@ async function loadState() {
   return await import("$lib/state/index.svelte");
 }
 
+const usage = await import("$lib/state/harnessUsage.svelte");
+
+/// Open an agent's detail card. Cards default to collapsed, so a test asserting
+/// anything behind one says so explicitly rather than relying on the default.
+async function expandCard(agentId: string): Promise<void> {
+  const { layout } = await import("$lib/layout.svelte");
+  layout.setAgentCardCollapsed(PROJECT_ID, agentId, false);
+}
+
 async function openAgentActions(index = 0): Promise<HTMLElement> {
   const triggers = await screen.findAllByTestId("agent-actions-trigger");
   const trigger = triggers.at(index);
@@ -77,6 +88,14 @@ async function openAgentActions(index = 0): Promise<HTMLElement> {
   const menu = menus.at(-1);
   if (menu === undefined) throw new Error("expected agent actions menu");
   return menu;
+}
+
+/// A unix-epoch-seconds timestamp `deltaSeconds` from now — payloads use
+/// real-now-relative resets so the "is this window still in the future?" gate is
+/// exercised deterministically (a fixed epoch would drift past `now` and flip the
+/// test's meaning over time).
+function epochFromNow(deltaSeconds: number): number {
+  return Math.floor(Date.now() / 1000) + deltaSeconds;
 }
 
 const PROJECT_ID = "00000000-0000-7000-8000-0000000000ff";
@@ -133,6 +152,8 @@ beforeEach(() => {
   copyTextMock.mockResolvedValue(undefined);
   compactAgentMock.mockReset();
   compactAgentMock.mockResolvedValue("00000000-0000-7000-8000-00000000c003");
+  contextReportAgentMock.mockReset();
+  contextReportAgentMock.mockResolvedValue("00000000-0000-7000-8000-00000000d0aa");
 });
 
 beforeEach(async () => {
@@ -141,6 +162,7 @@ beforeEach(async () => {
   // state under the still-mounted previous component.
   (await import("$lib/state/transcriptPanes.svelte"))._testing.reset();
   (await import("$lib/state/recipientSelection.svelte"))._testing.reset();
+  (await import("$lib/layout.svelte"))._testing.reset();
 });
 
 afterEach(async () => {
@@ -164,6 +186,8 @@ describe("Sidebar", () => {
     const icons = screen.getAllByTestId("agent-harness-icon");
     expect(icons[0]).toHaveAttribute("alt", "Claude");
     expect(icons[1]).toHaveAttribute("alt", "Codex");
+    expect(icons[0]!.parentElement).toHaveClass("rounded-full", "overflow-hidden");
+    expect(screen.getAllByTestId("sidebar-agent")[0]).toHaveClass("rounded-lg");
   });
 
   it("outlines only the agents selected to receive the draft", async () => {
@@ -218,28 +242,73 @@ describe("Sidebar", () => {
         },
       },
     ];
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      meta: {
+        model: "claude-sonnet-4-6",
+        harness_version: "2.1.274",
+        inventory: { skills: [{ name: "debug" }] },
+      },
+    };
 
+    // Collapsed is the default, so the card is opened before the toggle is
+    // exercised in the other direction.
+    await expandCard(CLAUDE_AGENT.id);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    // Expanded by default → details (the context bar) are visible.
+    // Context remains visible in both full and compact card states.
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-meta")).toBeInTheDocument();
 
     await fireEvent.click(screen.getByTestId("sidebar-agent"));
-    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "true");
+    expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-selection-default")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-meta")).toBeNull();
 
     await openAgentActions();
     await fireEvent.click(await screen.findByTestId("agent-action-collapse"));
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-meta")).toBeInTheDocument();
 
     const card = screen.getByTestId("sidebar-agent");
     card.focus();
     await fireEvent.keyDown(card, { key: " " });
-    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+    expect(card).toHaveAttribute("data-collapsed", "true");
+    expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
+  });
+
+  it("restores each project's collapsed cards after switching projects and reloading", async () => {
+    const state = await loadState();
+    const { _testing: layoutTesting } = await import("$lib/layout.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+
+    const first = render(Sidebar, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] },
+    });
+    // Expanding is the per-project exception the store records; the default it
+    // departs from is collapsed.
+    await fireEvent.click(screen.getByTestId("agent-collapse-toggle"));
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "false");
+    first.unmount();
+
+    const otherProject = render(Sidebar, {
+      props: { projectId: "project-b", agents: [CLAUDE_AGENT] },
+    });
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "true");
+    otherProject.unmount();
+
+    layoutTesting.reloadFromStorage();
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "false");
   });
 
   it("does not collapse the card when a click completes text selection", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
+    await expandCard(CLAUDE_AGENT.id);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     const selection = vi.spyOn(window, "getSelection").mockReturnValue({
       isCollapsed: false,
@@ -251,6 +320,40 @@ describe("Sidebar", () => {
     selection.mockRestore();
   });
 
+  it("puts no quota cell on the agent card, whatever the runtime still carries", async () => {
+    // The card's usage block and its collapsed-card warning line are both gone:
+    // a quota belongs to the harness account, and drawing it per agent is what
+    // made sibling cards disagree. Pinned as an invariant because this is the
+    // third time this surface has been reworked — a re-added per-agent cell
+    // should fail here rather than ship.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    // A real reading is on record for this agent's harness, so the card has
+    // something it *could* draw and still must not.
+    usage.observeUsage("claude_code", {
+      payload: {
+        status: "allowed_warning",
+        rateLimitType: "seven_day",
+        surpassedThreshold: 0.75,
+        isUsingOverage: true,
+        overageResetsAt: epochFromNow(6 * 86400),
+        unifiedWindows: {
+          seven_day: { utilization: 0.91, resetsAt: epochFromNow(5 * 86400) },
+        },
+      },
+      observed_at: new Date().toISOString(),
+    });
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    expect(screen.queryByTestId("agent-compact-warnings")).toBeNull();
+    expect(screen.queryByTestId("agent-usage-window")).toBeNull();
+    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
+    expect(screen.queryByTestId("agent-overage")).toBeNull();
+
+    await fireEvent.click(screen.getByTestId("agent-collapse-toggle"));
+    expect(screen.queryByTestId("agent-compact-warnings")).toBeNull();
+  });
+
   it("renders the harness icon and a hover-revealed actions menu trigger", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
@@ -259,14 +362,15 @@ describe("Sidebar", () => {
       resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
     });
 
+    await expandCard(CLAUDE_AGENT.id);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("agent-harness-icon")).toBeInTheDocument();
     const trigger = screen.getByTestId("agent-actions-trigger");
-    // `hidden`, not `opacity-0`: a transparent icon still reserves its width,
-    // and that gutter is what truncated names. Reveal is display-based.
-    expect(trigger).toHaveClass("hidden");
-    expect(trigger).toHaveClass("group-hover:inline-flex");
+    // Collapsed to zero width rather than merely invisible: an invisible button
+    // still reserves its gutter, and that gutter was clipping agent names.
+    expect(trigger).toHaveClass("w-0");
+    expect(trigger).toHaveClass("group-hover:w-[26px]");
 
     const menu = await openAgentActions();
     expect(await screen.findByTestId("agent-action-resume")).toBeInTheDocument();
@@ -279,13 +383,14 @@ describe("Sidebar", () => {
     ).toEqual([
       "Rename",
       "Collapse",
+      "Context breakdown…",
       "Compact context",
       "Resume in terminal",
       "Open session file",
       "Model settings…",
       "Delete agent",
     ]);
-    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(7);
+    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(8);
   });
 
   it("shows only currently available menu actions", async () => {
@@ -485,7 +590,7 @@ describe("Sidebar", () => {
     expect(screen.getByTestId("sidebar-agent")).toBeInTheDocument();
   });
 
-  it("collapse-all hides every agent's details; toggling again restores them", async () => {
+  it("expand-all opens every agent's details; toggling again collapses them", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
@@ -512,15 +617,23 @@ describe("Sidebar", () => {
 
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
 
+    // Cards start collapsed, so the control offers the opposite action first.
     const toggleAll = screen.getByTestId("sidebar-toggle-all");
-    expect(toggleAll).toHaveAccessibleName("Collapse all agents");
-    await fireEvent.click(toggleAll);
-    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
     expect(toggleAll).toHaveAccessibleName("Expand all agents");
-
     await fireEvent.click(toggleAll);
+    expect(
+      screen.getAllByTestId("sidebar-agent").every((card) => card.dataset.collapsed === "false"),
+    ).toBe(true);
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
     expect(toggleAll).toHaveAccessibleName("Collapse all agents");
+
+    await fireEvent.click(toggleAll);
+    expect(
+      screen.getAllByTestId("sidebar-agent").every((card) => card.dataset.collapsed === "true"),
+    ).toBe(true);
+    // Context stays visible in both states — the one cell collapsing keeps.
+    expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
+    expect(toggleAll).toHaveAccessibleName("Expand all agents");
   });
 
   it("does not render a per-agent cost total on the card (cost moved to the message)", async () => {
@@ -546,21 +659,6 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.queryByTestId("agent-cost")).toBeNull();
-  });
-
-  it("displays Codex rate-limit % from last_rate_limit", async () => {
-    const state = await loadState();
-    await state.registerAgent(CODEX_AGENT);
-    const runtime = state.runtimes[CODEX_AGENT.id];
-    if (runtime === undefined) throw new Error("unreachable");
-    state.runtimes[CODEX_AGENT.id] = {
-      ...runtime,
-      last_rate_limit: { primary: { used_percent: 42.5 } },
-    };
-
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
-
-    expect(screen.getByTestId("agent-rate-limit")).toHaveTextContent("quota used: 43%");
   });
 
   it("displays context-utilization bar from the latest agent turn's reconciled occupancy", async () => {
@@ -806,7 +904,7 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("agent-context-bar")).toBeNull();
   });
 
-  it("renders MCP/skills metadata without replacing selected model intent", async () => {
+  it("renders the environment inventory without replacing selected model intent", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     const runtime = state.runtimes[CLAUDE_AGENT.id];
@@ -816,22 +914,97 @@ describe("Sidebar", () => {
       meta: {
         model: "claude-sonnet-4-6",
         harness_version: "2.1.140",
-        tools: ["Bash", "Read"],
-        mcp_servers: [{ name: "tiddly", status: "connected" }],
-        skills: ["debug"],
+        inventory: {
+          tools: ["Bash", "Read"],
+          mcp_servers: [{ name: "tiddly", status: "connected" }],
+          skills: [{ name: "debug" }],
+        },
       },
     };
 
+    await expandCard(CLAUDE_AGENT.id);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
       "Harness/session default",
     );
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
-    expect(screen.getByTestId("agent-mcp-chip")).toHaveTextContent("1");
-    expect(screen.getByTestId("agent-skills-chip")).toHaveTextContent("1");
-    expect(screen.getByTestId("agent-mcp-chip")).toHaveClass("cursor-default");
-    expect(screen.getByTestId("agent-skills-chip")).toHaveClass("cursor-default");
+    expect(screen.getByTestId("agent-env-trigger-summary")).toHaveTextContent("View details");
+  });
+
+  // --- Environment row wiring ------------------------------------------------
+  //
+  // The row's own behavior — the summary trigger, the status dots, the
+  // count-line expansions — is covered in `AgentEnvironment.test.ts`. These
+  // pin the wiring: which runtime fields the card feeds it, and that it
+  // clean-hides for an agent with nothing to show.
+
+  it("hides the environment row for an agent that reported no inventory", async () => {
+    // A fresh agent that has never run: nothing loaded, so no row at all
+    // rather than a disclosure that opens onto nothing.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.queryByTestId("agent-meta")).toBeNull();
+  });
+
+  it("feeds the environment row the rehydrated snapshot time", async () => {
+    // Claude's inventory is stream-only, so after a restart the card shows
+    // what the last turn loaded and says so.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      meta: {
+        model: "claude-fable-5-1",
+        harness_version: "2.1.274",
+        inventory: { agents: ["Explore"] },
+      },
+      meta_as_of: "2026-09-17T12:00:00Z",
+    };
+
+    await expandCard(CLAUDE_AGENT.id);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await fireEvent.click(screen.getByTestId("agent-env-toggle"));
+
+    expect(screen.getByTestId("agent-env-as-of")).toHaveTextContent(/^as of /);
+  });
+
+  it("renders a Codex card's rollout inventory with no status dot", async () => {
+    // Codex records no MCP status anywhere, so its servers come from
+    // `config.toml` — a configured name is not a runtime status and must not
+    // render as one.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    const runtime = state.runtimes[CODEX_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CODEX_AGENT.id] = {
+      ...runtime,
+      meta: {
+        model: "gpt-5.6-terra",
+        harness_version: "0.154.0",
+        inventory: {
+          mcp_servers: [{ name: "tiddly", status: "configured" }],
+          skills: [{ name: "build-report", description: "Build reports." }],
+          approved_commands: ["ls"],
+          settings: [{ label: "Sandbox", value: "read-only" }],
+        },
+      },
+    };
+
+    await expandCard(CODEX_AGENT.id);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+    await fireEvent.click(screen.getByTestId("agent-env-toggle"));
+
+    expect(screen.getByTestId("agent-env-mcp")).toHaveTextContent("tiddly");
+    expect(screen.queryByTestId("agent-env-mcp-dot")).toBeNull();
+    expect(screen.getByTestId("agent-env-list-approved_commands")).toBeInTheDocument();
+    const settings = screen.getByTestId("agent-env-settings");
+    expect(within(settings).getByText("Sandbox")).toBeInTheDocument();
+    expect(within(settings).getByText("read-only")).toBeInTheDocument();
   });
 
   // --- Model / effort: change actions + intent display -----------------------
@@ -1352,9 +1525,7 @@ describe("Sidebar", () => {
       meta: {
         model: "claude-opus-4-8",
         harness_version: "2.1.140",
-        tools: [],
-        mcp_servers: [],
-        skills: [],
+        inventory: {},
       },
     };
 
@@ -1380,9 +1551,7 @@ describe("Sidebar", () => {
       meta: {
         model: "claude-sonnet-4-6",
         harness_version: "2.1.140",
-        tools: [],
-        mcp_servers: [],
-        skills: [],
+        inventory: {},
       },
     };
 
@@ -1425,9 +1594,10 @@ describe("Sidebar", () => {
 
     expect(screen.getByTestId("agent-effort-chip")).toHaveTextContent("High");
     expect(screen.getByTestId("agent-effort-chip").tagName).toBe("SPAN");
+    expect(screen.getByTestId("agent-effort-chip")).toHaveClass("rounded-full");
   });
 
-  it("gives the name the full row until hover: shared-prefix names stay distinguishable at rest", async () => {
+  it("reserves stable action slots for shared-prefix names", async () => {
     const state = await loadState();
     const a = {
       ...CLAUDE_AGENT,
@@ -1445,272 +1615,17 @@ describe("Sidebar", () => {
 
     const names = screen.getAllByTestId("agent-name").map((el) => el.textContent?.trim());
     expect(names).toEqual(["gpt-5-5-minimal", "gpt-5-5-minimal-2"]);
-    // The room comes from the action icons being `hidden` (display: none —
-    // zero width) until hover/focus, rather than `opacity-0` (invisible but
-    // still reserving a two-icon gutter). The name truncates only while the
-    // icons are revealed.
+    // Hidden controls take no width, so shared-prefix names get the whole
+    // column to differ in. `tests/browser/sidebar-reorder.browser.test.ts`
+    // measures the geometry; this only pins the class contract jsdom can see.
     for (const toggle of screen.getAllByTestId("agent-visibility-toggle")) {
-      expect(toggle).toHaveClass("hidden");
+      expect(toggle).toHaveClass("w-0");
+      expect(toggle).toHaveClass("group-hover:w-[26px]");
     }
     for (const trigger of screen.getAllByTestId("agent-actions-trigger")) {
-      expect(trigger).toHaveClass("hidden");
+      expect(trigger).toHaveClass("w-0");
+      expect(trigger).toHaveClass("group-hover:w-[26px]");
     }
-  });
-});
-
-/// A unix-epoch-seconds timestamp `deltaSeconds` from now — payloads use
-/// real-now-relative resets so the "is this window still in the future?" gate
-/// is exercised deterministically (a fixed epoch would drift past `now` and
-/// flip the test's meaning over time).
-function epochFromNow(deltaSeconds: number): number {
-  return Math.floor(Date.now() / 1000) + deltaSeconds;
-}
-
-/// An ISO string `ms` before now — for the snapshot-age (`as_of`) tooltip line.
-function agoIso(ms: number): string {
-  return new Date(Date.now() - ms).toISOString();
-}
-
-async function renderClaudeWithRateLimit(info: unknown, asOf: string | null): Promise<void> {
-  const state = await loadState();
-  await state.registerAgent(CLAUDE_AGENT);
-  const runtime = state.runtimes[CLAUDE_AGENT.id];
-  if (runtime === undefined) throw new Error("unreachable");
-  state.runtimes[CLAUDE_AGENT.id] = {
-    ...runtime,
-    last_rate_limit: info,
-    last_rate_limit_as_of: asOf,
-  };
-  render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
-}
-
-/// Claude rate-limit surface — two independent signals (the always-present
-/// primary window + the overage escalation), each gated on its own reset being
-/// in the future (reset-passed → clean-hide). Exact clock/date text isn't
-/// asserted (jsdom locale/timezone dependent) — only the stable label/copy and
-/// presence/absence per the gating rules.
-describe("Sidebar Claude rate-limit surface", () => {
-  it("shows the primary window independent of overage (normal-quota turn)", async () => {
-    // No isUsingOverage — the 5-hour window must still surface (the bug we're
-    // fixing: the window used to be gated on overage).
-    await renderClaudeWithRateLimit(
-      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(4 * 3600) },
-      null,
-    );
-    const window = screen.getByTestId("agent-rate-window");
-    expect(window).toHaveTextContent("5-hour limit resets");
-    // Not overaging → no amber escalation.
-    expect(screen.queryByTestId("agent-overage")).toBeNull();
-  });
-
-  it("derives the window label from rateLimitType (unknown → generic)", async () => {
-    await renderClaudeWithRateLimit(
-      { status: "allowed", rateLimitType: "weekly", resetsAt: epochFromNow(4 * 3600) },
-      null,
-    );
-    // Unknown type falls back to the generic label, never a hardcoded "5-hour".
-    const window = screen.getByTestId("agent-rate-window");
-    expect(window).toHaveTextContent("rate limit resets");
-    expect(window).not.toHaveTextContent("5-hour");
-  });
-
-  it("hides the primary window once its reset is in the past (reset-passed)", async () => {
-    // A past reset is known-stale (the window has cycled, we lack the new
-    // reset) — showing a past 'resets at' would be wrong, so it clean-hides.
-    await renderClaudeWithRateLimit(
-      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(-3600) },
-      null,
-    );
-    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
-    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
-  });
-
-  it("shows the amber overage escalation when overaging with a future overage window", async () => {
-    await renderClaudeWithRateLimit(
-      {
-        status: "rejected",
-        rateLimitType: "five_hour",
-        resetsAt: epochFromNow(4 * 3600),
-        isUsingOverage: true,
-        overageResetsAt: epochFromNow(6 * 86400),
-      },
-      null,
-    );
-    // Both signals present: neutral window + amber escalation.
-    expect(screen.getByTestId("agent-rate-window")).toHaveTextContent("5-hour limit resets");
-    const overage = screen.getByTestId("agent-overage");
-    expect(overage).toHaveTextContent("using credits");
-    expect(overage).toHaveClass("text-warning");
-  });
-
-  it("drops the overage escalation once the overage window has passed", async () => {
-    // isUsingOverage true, but the overage window elapsed → the credit window
-    // has cycled, so the escalation is stale and hidden. The still-future
-    // primary window stays.
-    await renderClaudeWithRateLimit(
-      {
-        status: "rejected",
-        rateLimitType: "five_hour",
-        resetsAt: epochFromNow(4 * 3600),
-        isUsingOverage: true,
-        overageResetsAt: epochFromNow(-3600),
-      },
-      null,
-    );
-    expect(screen.getByTestId("agent-rate-window")).toBeInTheDocument();
-    expect(screen.queryByTestId("agent-overage")).toBeNull();
-  });
-
-  it("overage flag with no overage window still shows (can't prove it stale)", async () => {
-    await renderClaudeWithRateLimit(
-      { isUsingOverage: true, resetsAt: epochFromNow(4 * 3600), rateLimitType: "five_hour" },
-      null,
-    );
-    expect(screen.getByTestId("agent-overage")).toHaveTextContent("using credits");
-  });
-
-  it("renders nothing when there is no usable rate-limit signal", async () => {
-    // Everything elapsed / absent → the whole cell clean-hides.
-    await renderClaudeWithRateLimit({ status: "allowed", resetsAt: epochFromNow(-3600) }, null);
-    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
-    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
-    expect(screen.queryByTestId("agent-overage")).toBeNull();
-  });
-
-  it("Codex agent never shows the Claude rate-limit cells (Claude-gated)", async () => {
-    const state = await loadState();
-    await state.registerAgent(CODEX_AGENT);
-    const runtime = state.runtimes[CODEX_AGENT.id];
-    if (runtime === undefined) throw new Error("unreachable");
-    state.runtimes[CODEX_AGENT.id] = {
-      ...runtime,
-      last_rate_limit: {
-        rateLimitType: "five_hour",
-        resetsAt: epochFromNow(4 * 3600),
-        isUsingOverage: true,
-        overageResetsAt: epochFromNow(6 * 86400),
-      },
-    };
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
-    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
-    expect(screen.queryByTestId("agent-overage")).toBeNull();
-  });
-});
-
-/// Rate-limit tooltip content — always present when the cell shows, carrying
-/// full reset dates (a window can be days out, beyond the inline clock) plus
-/// both windows and the snapshot age when rehydrated. Mirrors the
-/// parse-warnings tooltip test's fake-timer + pointerEnter pattern.
-describe("Sidebar Claude rate-limit tooltip", () => {
-  beforeEach(() => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("surfaces the window + overage windows on hover; no snapshot line when live", async () => {
-    await renderClaudeWithRateLimit(
-      {
-        status: "rejected",
-        rateLimitType: "five_hour",
-        resetsAt: epochFromNow(4 * 3600),
-        isUsingOverage: true,
-        overageResetsAt: epochFromNow(6 * 86400),
-      },
-      null,
-    );
-    await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
-    await vi.advanceTimersByTimeAsync(500);
-    const detail = await waitFor(() => screen.getByTestId("agent-rate-detail"));
-    expect(detail).toHaveTextContent("5-hour limit resets");
-    // The overage window is surfaced here.
-    expect(detail).toHaveTextContent("overage window resets");
-    // Live snapshot (as_of null) → no snapshot-age line.
-    expect(screen.queryByTestId("agent-rate-snapshot")).toBeNull();
-  });
-
-  it("adds a snapshot-age + refresh line on hover when rehydrated (as_of set)", async () => {
-    await renderClaudeWithRateLimit(
-      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(4 * 3600) },
-      agoIso(3 * 60 * 60 * 1000),
-    );
-    await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
-    await vi.advanceTimersByTimeAsync(500);
-    await waitFor(() => screen.getByTestId("agent-rate-detail"));
-    const snapshot = screen.getByTestId("agent-rate-snapshot");
-    expect(snapshot).toHaveTextContent(/snapshot from .* ago/i);
-    expect(snapshot).toHaveTextContent(/refresh/i);
-  });
-});
-
-async function renderCodexWithRateLimit(info: unknown): Promise<void> {
-  const state = await loadState();
-  await state.registerAgent(CODEX_AGENT);
-  const runtime = state.runtimes[CODEX_AGENT.id];
-  if (runtime === undefined) throw new Error("unreachable");
-  state.runtimes[CODEX_AGENT.id] = { ...runtime, last_rate_limit: info };
-  render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
-}
-
-/// Codex rate-limit windows — both independent windows (primary ~5-hour +
-/// secondary weekly) surfaced as gauge lines, each labeled from its
-/// `window_minutes` and gated reset-passed. The reset times (incl. the weekly
-/// window, days out) live in the tooltip. Class B (session-file-backed), so no
-/// snapshot-age line. Closes G8 (secondary window + reset times were dropped).
-describe("Sidebar Codex rate-limit windows", () => {
-  it("renders both windows with duration-derived labels", async () => {
-    await renderCodexWithRateLimit({
-      primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
-      secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
-    });
-    const cell = screen.getByTestId("agent-rate-limit");
-    // window_minutes → human label, not "primary/secondary".
-    expect(cell).toHaveTextContent("5-hour used: 42%");
-    expect(cell).toHaveTextContent("weekly used: 7%");
-  });
-
-  it("bare used_percent (no window_minutes) keeps the legacy 'quota used' copy", async () => {
-    // Backward-compatible fallback: a minimal payload still reads cleanly.
-    await renderCodexWithRateLimit({ primary: { used_percent: 42.5 } });
-    expect(screen.getByTestId("agent-rate-limit")).toHaveTextContent("quota used: 43%");
-  });
-
-  it("hides a window whose reset has passed (reset-passed), keeps the live one", async () => {
-    await renderCodexWithRateLimit({
-      primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(-3600) },
-      secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
-    });
-    const cell = screen.getByTestId("agent-rate-limit");
-    expect(cell).not.toHaveTextContent("5-hour");
-    expect(cell).toHaveTextContent("weekly used: 7%");
-  });
-
-  it("surfaces reset times in the tooltip, not the inline gauge", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    try {
-      await renderCodexWithRateLimit({
-        primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
-        secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
-      });
-      await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit"));
-      await vi.advanceTimersByTimeAsync(500);
-      const detail = await waitFor(() => screen.getByTestId("agent-rate-limit-detail"));
-      expect(detail).toHaveTextContent(/5-hour: 42% used · resets/);
-      expect(detail).toHaveTextContent(/weekly: 7% used · resets/);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("Claude agent never shows the Codex gauge cell (Codex-gated)", async () => {
-    await renderClaudeWithRateLimit(
-      { primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) } },
-      null,
-    );
-    // Claude reads its own shape (isUsingOverage/resetsAt), not Codex's
-    // primary.used_percent — so the Codex gauge cell must not appear.
-    expect(screen.queryByTestId("agent-rate-limit")).toBeNull();
   });
 });
 
@@ -1745,10 +1660,6 @@ describe("Sidebar clean-hide for absent metadata", () => {
     await state.registerAgent(CLAUDE_AGENT);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     expect(screen.queryByTestId("agent-cost")).toBeNull();
-    expect(screen.queryByTestId("agent-rate-limit")).toBeNull();
-    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
-    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
-    expect(screen.queryByTestId("agent-overage")).toBeNull();
     expect(screen.queryByTestId("agent-context-bar")).toBeNull();
     expect(screen.queryByTestId("agent-meta")).toBeNull();
   });
@@ -1783,9 +1694,7 @@ describe("Sidebar agent-scoped event tolerance", () => {
       agent_id: CLAUDE_AGENT.id,
       model: "claude-sonnet-4-6",
       harness_version: "2.1.140",
-      tools: [],
-      mcp_servers: [],
-      skills: [],
+      inventory: {},
       raw: {},
     };
     const runtime = state.runtimes[CLAUDE_AGENT.id];
@@ -1795,9 +1704,7 @@ describe("Sidebar agent-scoped event tolerance", () => {
       meta: {
         model: meta.model,
         harness_version: meta.harness_version,
-        tools: meta.tools,
-        mcp_servers: meta.mcp_servers,
-        skills: meta.skills,
+        inventory: meta.inventory,
       },
     };
     // Runtime metadata never becomes future-send intent.
@@ -1835,6 +1742,7 @@ describe("Sidebar inline rename", () => {
   it("double-clicking the name text enters rename without changing collapse state", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
+    await expandCard(CLAUDE_AGENT.id);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     const name = screen.getByTestId("agent-name");
     expect(name).not.toHaveAttribute("title");
@@ -2112,9 +2020,10 @@ describe("Sidebar — agent reordering", () => {
   it("a plain drag-grip click does not toggle the card", async () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
     const card = screen.getAllByTestId("sidebar-agent")[0]!;
-    expect(card).toHaveAttribute("data-collapsed", "false");
+    // Whatever the card started as, the grip must leave it there.
+    expect(card).toHaveAttribute("data-collapsed", "true");
     await fireEvent.click(grip(0));
-    expect(card).toHaveAttribute("data-collapsed", "false");
+    expect(card).toHaveAttribute("data-collapsed", "true");
   });
 
   it("Alt+ArrowDown with focus inside a card moves that agent down", async () => {
@@ -2325,9 +2234,10 @@ describe("compact context action", () => {
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent(
-      "context after last turn: 10%",
-    );
+    const bar = screen.getByTestId("agent-context-bar");
+    expect(bar).toHaveTextContent("Context");
+    expect(bar).toHaveTextContent("20k / 200k");
+    expect(bar).toHaveTextContent("10%");
   });
 
   it("leaves the bar unchanged after a compaction that carried no usage", async () => {
@@ -2368,9 +2278,183 @@ describe("compact context action", () => {
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent(
-      "context after last turn: 60%",
+    const bar = screen.getByTestId("agent-context-bar");
+    expect(bar).toHaveTextContent("120k / 200k");
+    expect(bar).toHaveTextContent("60%");
+  });
+});
+
+describe("context breakdown", () => {
+  function seedContextBar(state: Awaited<ReturnType<typeof loadState>>, agent: AgentRecord): void {
+    state.transcripts[agent.id] = [
+      {
+        role: "agent",
+        turn_id: `turn-1-${agent.id}`,
+        agent_id: agent.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          context_input_tokens: 120_000,
+          context_tokens_after_turn: 120_000,
+          context_window: 200_000,
+        },
+      },
+    ];
+  }
+
+  it("offers the chevron beside the meter it explains, for a Claude agent", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const bar = await screen.findByTestId("agent-context-bar");
+    expect(within(bar).getByTestId("agent-context-breakdown-button")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["codex", CODEX_AGENT],
+    ["antigravity", ANTIGRAVITY_AGENT],
+  ])("withholds the chevron and the menu item from a %s agent", async (_harness, agent) => {
+    // Both harnesses report context, so the bar renders and only the
+    // affordances must be absent — which is what makes this a gate test rather
+    // than an absent-bar test. What stands behind the gate is a `/context`
+    // prompt answered with invented figures.
+    const state = await loadState();
+    await state.registerAgent(agent);
+    seedContextBar(state, agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    const bar = await screen.findByTestId("agent-context-bar");
+    expect(within(bar).queryByTestId("agent-context-breakdown-button")).toBeNull();
+    const menu = await openAgentActions();
+    expect(within(menu).queryByTestId("agent-action-context-breakdown")).toBeNull();
+  });
+
+  it("opens the panel and refreshes immediately from the context icon", async () => {
+    // Opening is the refresh: the panel has no button, so every open asks the
+    // harness for a current breakdown and the spinner reports the wait.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("expected a runtime");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      last_context_report: {
+        model: "claude-fable-5-1",
+        total_tokens: 48_000,
+        max_tokens: 200_000,
+        categories: [{ name: "Messages", tokens: 48_000, kind: "used" }],
+        raw: "## Context Usage",
+      },
+    };
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    await fireEvent.click(await screen.findByTestId("agent-context-breakdown-button"));
+
+    const panel = await screen.findByTestId("context-breakdown");
+    expect(within(panel).getByTestId("context-breakdown-loading")).toHaveTextContent(
+      "Context refresh queued…",
     );
+    // The agent's previous breakdown is withheld until the new one lands, so
+    // the panel never shows numbers it is about to swap out.
+    expect(within(panel).queryByTestId("context-breakdown-usage")).toBeNull();
+    expect(contextReportAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, expect.any(String));
+  });
+
+  it("refuses a breakdown while the agent is busy, from both entry points", async () => {
+    // Opening is what dispatches, and a report shares the agent's FIFO with
+    // sends — so on a busy agent the panel would be a bare spinner until the
+    // in-flight turn and every queued send finished.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("expected a runtime");
+    state.runtimes[CLAUDE_AGENT.id] = { ...runtime, run_status: "processing" };
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(await screen.findByTestId("agent-context-breakdown-button")).toBeDisabled();
+    const menu = await openAgentActions();
+    expect(within(menu).getByTestId("agent-action-context-breakdown")).toHaveAttribute(
+      "data-disabled",
+    );
+    expect(contextReportAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("stays available for an agent that has no dispatch state yet", async () => {
+    // `run_status` is the dispatch lifecycle, so its absence means idle, not
+    // busy — an agent just restored on project open has never dispatched.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    delete state.runtimes[CLAUDE_AGENT.id];
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(await screen.findByTestId("agent-context-breakdown-button")).toBeEnabled();
+  });
+
+  it("still opens while this agent's own report is the thing occupying it", async () => {
+    // The dispatch itself makes the agent busy, so gating on idle alone would
+    // strand the user outside the panel their own report is filling.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("expected a runtime");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      run_status: "processing",
+      context_report_request: { send_id: "already-running", phase: "running" },
+    };
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const button = await screen.findByTestId("agent-context-breakdown-button");
+    expect(button).toBeEnabled();
+    await fireEvent.click(button);
+
+    expect(await screen.findByTestId("context-breakdown-loading")).toBeInTheDocument();
+    // Riding the run already in flight, not starting a second one.
+    expect(contextReportAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("opens and starts the initial analysis immediately from the agent menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const menu = await openAgentActions();
+    await fireEvent.click(within(menu).getByTestId("agent-action-context-breakdown"));
+
+    expect(await screen.findByTestId("context-breakdown-loading")).toHaveTextContent(
+      "Context analysis queued…",
+    );
+    expect(contextReportAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, expect.any(String));
+  });
+
+  it("does not dispatch a second report when reopening one already in flight", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("expected a runtime");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      context_report_request: { send_id: "already-running", phase: "running" },
+    };
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const menu = await openAgentActions();
+    await fireEvent.click(within(menu).getByTestId("agent-action-context-breakdown"));
+
+    expect(await screen.findByTestId("context-breakdown-loading")).toBeInTheDocument();
+    expect(contextReportAgentMock).not.toHaveBeenCalled();
   });
 });
 

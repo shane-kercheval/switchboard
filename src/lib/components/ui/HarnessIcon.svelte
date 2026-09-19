@@ -27,20 +27,23 @@
   };
 
   const SCALE_CLASS: Record<HarnessKind, string> = {
-    claude_code: "scale-95",
-    codex: "scale-110",
-    antigravity: "scale-110",
+    claude_code: "scale-105",
+    codex: "scale-125",
+    antigravity: "scale-125",
   };
 </script>
 
-<img
-  src={ICON_SRC[harness]}
-  alt={HARNESS_LABEL[harness]}
-  data-testid={testid}
+<span
   class={cn(
-    "shrink-0 rounded-[5px] object-contain",
+    "bg-panel relative shrink-0 [transform:translateZ(0)] overflow-hidden rounded-full [clip-path:circle(50%)]",
     SIZE_CLASS[size],
-    SCALE_CLASS[harness],
     className,
   )}
-/>
+>
+  <img
+    src={ICON_SRC[harness]}
+    alt={HARNESS_LABEL[harness]}
+    data-testid={testid}
+    class={cn("absolute inset-0 h-full w-full object-cover", SCALE_CLASS[harness])}
+  />
+</span>

@@ -84,6 +84,9 @@
       result.selection.effort;
     return `${base} — effort becomes ${effortLabel}`;
   }
+
+  const CHIP_CLASS =
+    "bg-panel text-muted inline-flex min-w-0 items-center rounded-full px-2 py-0.5 text-[11px] leading-4";
 </script>
 
 {#if presentation === "static"}
@@ -96,7 +99,7 @@
     {#snippet trigger(props)}
       <span
         {...props}
-        class="bg-panel text-muted inline-flex min-w-0 cursor-default items-center rounded px-1.5 py-0.5 text-[11px] leading-4"
+        class={cn(CHIP_CLASS, "cursor-default")}
         aria-label={`Current ${axisName}: ${label(current)}`}
         data-testid={`agent-${axis}-chip`}
       >
@@ -121,7 +124,8 @@
         {...props}
         type="button"
         class={cn(
-          "bg-panel text-muted hover:bg-hover hover:text-fg inline-flex min-w-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] leading-4 transition-colors",
+          CHIP_CLASS,
+          "hover:bg-hover hover:text-fg gap-1 transition-colors",
           busy && "cursor-default opacity-60",
           result?.ok === false && "cursor-not-allowed opacity-60",
         )}
@@ -140,7 +144,8 @@
 {:else}
   <DropdownMenu
     triggerClass={cn(
-      "bg-panel text-muted hover:bg-hover hover:text-fg inline-flex min-w-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] leading-4 transition-colors",
+      CHIP_CLASS,
+      "hover:bg-hover hover:text-fg gap-1 transition-colors",
       busy && "pointer-events-none opacity-60",
     )}
     triggerLabel={`Current ${axisName}: ${label(current)}. Choose ${axisName}.`}

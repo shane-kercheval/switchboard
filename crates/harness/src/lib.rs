@@ -13,6 +13,7 @@ pub mod adapter;
 pub mod antigravity;
 pub mod claude_code;
 pub mod codex;
+pub mod context_report;
 pub mod events;
 pub mod facets;
 pub mod forward;
@@ -34,10 +35,11 @@ pub use codex::CodexAdapter;
 pub use codex::session_file::{
     AttachLookupError, find_codex_session_file_for_attach, load_codex_transcript,
 };
+pub use context_report::{ContextCategory, ContextItem, ContextReport};
 pub use events::{
     AdapterEvent, CancelSource, ContentKind, ContextWindowSource, FailureKind, McpServerStatus,
-    MessageId, NormalizedEvent, RateLimitSource, ToolKind, TurnId, TurnOutcome, TurnSpend,
-    TurnUsage,
+    MessageId, NormalizedEvent, PluginEntry, RateLimitSource, SessionInventory, SessionMetaSource,
+    SettingPair, SkillEntry, ToolKind, TurnId, TurnOutcome, TurnSpend, TurnUsage,
 };
 pub use facets::{
     EditChange, EditPair, EditedFile, McpMutation, McpMutationField, TodoItem, ToolFacet,

@@ -65,7 +65,8 @@ use serde_json::Value;
 use switchboard_core::AgentId;
 use uuid::Uuid;
 
-use crate::events::{ContentKind, TurnId, TurnUsage};
+use crate::context_report;
+use crate::events::{ContentKind, SessionInventory, SkillEntry, TurnId, TurnUsage};
 use crate::parser::classify_claude_tool_kind;
 use crate::transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, SystemMarker, Turn,
@@ -95,8 +96,8 @@ pub fn load_claude_transcript(
         return Ok(LoadedTranscript {
             meta: Some(merge_meta_with_loaders(
                 None,
-                load_mcp_servers(home_dir, cwd),
-                load_skills(home_dir, cwd),
+                Some(load_mcp_servers(home_dir, cwd)),
+                Some(loaded_skill_entries(home_dir, cwd)),
             )),
             ..LoadedTranscript::default()
         });
@@ -124,10 +125,19 @@ pub fn load_claude_transcript(
     let mut transcript = state.finalize();
     transcript.meta = Some(merge_meta_with_loaders(
         transcript.meta.take(),
-        load_mcp_servers(home_dir, cwd),
-        load_skills(home_dir, cwd),
+        Some(load_mcp_servers(home_dir, cwd)),
+        Some(loaded_skill_entries(home_dir, cwd)),
     ));
     Ok(transcript)
+}
+
+/// The skills-directory scan as inventory entries. The scanner knows only
+/// names — `system/init` is the only source of a Claude skill's description.
+fn loaded_skill_entries(home_dir: &Path, cwd: &Path) -> Vec<SkillEntry> {
+    load_skills(home_dir, cwd)
+        .into_iter()
+        .map(SkillEntry::from_name)
+        .collect()
 }
 
 fn resolve_session_path(home_dir: &Path, cwd: &Path, session_id: Uuid) -> Option<PathBuf> {
@@ -326,6 +336,11 @@ fn is_bare_slash_command_record(record: &Value, text: &str) -> bool {
         && KNOWN_BOOKKEEPING_SLASH_COMMANDS.contains(&text.trim())
 }
 
+/// The `commandRun.command` value a `/context` run stamps on its output
+/// record. Bare, with no leading slash — the CLI records the command's name,
+/// not the text the user typed.
+const CONTEXT_COMMAND: &str = "context";
+
 fn extract_local_command_output(content: &str) -> Option<&str> {
     for (open, close) in [
         ("<local-command-stdout>", "</local-command-stdout>"),
@@ -512,6 +527,37 @@ impl ReconstructionState {
             return;
         }
         let timestamp = parse_timestamp(record).unwrap_or_else(Utc::now);
+
+        // A `/context` breakdown, routed **before** the pairing logic below and
+        // keyed on `commandRun.command` — the record's own statement of which
+        // command produced it. Keying on the self-describing field rather than
+        // on a pending input is what makes the routing independent of the two
+        // housekeeping `user` records that precede it: they never open a pending
+        // command, so without this the output record would reach the pairing
+        // branch, be reported as an orphan, and be discarded.
+        //
+        // The report is a marker, never an agent turn, because it is not
+        // conversation — see [`SystemMarker::ContextReport`].
+        if record
+            .get("commandRun")
+            .and_then(|run| run.get("command"))
+            .and_then(Value::as_str)
+            == Some(CONTEXT_COMMAND)
+        {
+            self.finish_pending_local_command();
+            self.close_current_agent(TurnStatus::Complete);
+            self.flush_deferred_as_warnings();
+            let raw = extract_local_command_output(content).unwrap_or(content);
+            self.turns.push(Turn::System {
+                turn_id: Uuid::now_v7(),
+                agent_id: self.agent_id,
+                started_at: timestamp,
+                marker: SystemMarker::ContextReport {
+                    report: context_report::decode(record.get("contextUsage"), raw),
+                },
+            });
+            return;
+        }
 
         if let Some(output) = extract_local_command_output(content) {
             let parent_uuid = record.get("parentUuid").and_then(Value::as_str);
@@ -1052,20 +1098,22 @@ impl ReconstructionState {
                 "provenance-less user prompts beginning with '/' not matched as known bookkeeping commands (expected for genuine path/slash prompts; investigate only alongside an observed send↔turn duplicate)"
             );
         }
+        // Claude's session file records no environment inventory — `system/init`
+        // is live-only (class C) — so every list stays `None` and the loaders,
+        // then the sidecar overlay, may fill them.
         let meta = self.first_model.map(|model| SessionMetaInfo {
             model,
             harness_version: String::new(),
-            tools: vec![],
-            mcp_servers: vec![],
-            skills: vec![],
+            inventory: SessionInventory::default(),
         });
-        LoadedTranscript {
+        let mut loaded = LoadedTranscript {
             turns: self.turns,
             meta,
-            last_rate_limit: None,
-            last_rate_limit_as_of: None,
             warnings: self.warnings,
-        }
+            ..LoadedTranscript::default()
+        };
+        loaded.project_latest_context_report();
+        loaded
     }
 }
 
@@ -2995,6 +3043,231 @@ mod tests {
                 Turn::User { text, .. } if text.trim_start().starts_with("/compact")
             )),
             "a manual compaction writes no prompt record; none may be invented"
+        );
+    }
+
+    /// A real session recorded from claude 2.1.274 (sanitized): an "ack" turn,
+    /// a Switchboard-shaped `-p "/context"` dispatch, then a "done" turn. The
+    /// report's three records sit between two completed turns precisely so this
+    /// fixture can show it disturbs neither.
+    const CONTEXT_REPORT_FIXTURE: &str =
+        include_str!("../../tests/fixtures/claude/context-report.session.jsonl");
+
+    fn load_context_report_fixture(body: &str) -> Vec<Turn> {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        stage_session_file(home.path(), cwd.path(), session_id, body);
+        let loaded = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+        assert!(
+            loaded.warnings.is_empty(),
+            "a `/context` report is a recognized record, not a parse anomaly: {:?}",
+            loaded.warnings
+        );
+        loaded.turns
+    }
+
+    fn context_reports(turns: &[Turn]) -> Vec<&crate::context_report::ContextReport> {
+        turns
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::System {
+                    marker: SystemMarker::ContextReport { report },
+                    ..
+                } => Some(report),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_context_report_hydrates_one_marker_and_no_agent_turn() {
+        let turns = load_context_report_fixture(CONTEXT_REPORT_FIXTURE);
+
+        let reports = context_reports(&turns);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].max_tokens, Some(1_000_000));
+        assert_eq!(reports[0].categories.len(), 11);
+        assert!(!reports[0].unparsed);
+        // The structured object, not the printed table: the table rounds this
+        // skill to `< 20` and the object carries its real count.
+        assert_eq!(reports[0].skills[1].name, "deep-research");
+        assert_eq!(reports[0].skills[1].tokens, 16);
+        assert!(
+            reports[0].skills.iter().all(|skill| !skill.approximate),
+            "nothing from the object is approximate; a flagged row means the markdown path ran"
+        );
+
+        // The two turns either side, and nothing in between: the report must not
+        // reach the pairing branch that would fabricate a third agent turn from
+        // its markdown.
+        let agent_text: Vec<String> = turns
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::Agent { items, .. } => Some(
+                    items
+                        .iter()
+                        .filter_map(|item| match item {
+                            TurnItem::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(agent_text, vec!["ack".to_owned(), "done".to_owned()]);
+    }
+
+    #[test]
+    fn a_context_report_neither_extends_the_turn_before_it_nor_pulls_the_one_after() {
+        let turns = load_context_report_fixture(CONTEXT_REPORT_FIXTURE);
+
+        // The `isMeta` caveat record that precedes the command is a mid-turn
+        // continuation, so a regression here reads as the "ack" turn swallowing
+        // the report and the "done" turn merging backward into it.
+        let shape: Vec<&str> = turns
+            .iter()
+            .map(|turn| match turn {
+                Turn::User { .. } => "user",
+                Turn::Agent { .. } => "agent",
+                Turn::System { .. } => "system",
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            ["user", "agent", "system", "user", "agent"],
+            "turns: {turns:#?}"
+        );
+    }
+
+    #[test]
+    fn a_context_report_is_not_the_agents_latest_answer() {
+        let turns = load_context_report_fixture(CONTEXT_REPORT_FIXTURE);
+
+        let latest = crate::forward::latest_completed_agent_text(&turns);
+        assert_eq!(
+            latest.as_deref(),
+            Some("done"),
+            "forwarding must never pick up a context report as the agent's reply"
+        );
+    }
+
+    #[test]
+    fn a_context_report_without_the_structured_object_still_routes_via_the_markdown() {
+        // An older CLI that predates `contextUsage`. The routing keys on
+        // `commandRun`, so the record is recognized either way — the report is
+        // just decoded from the printed table instead.
+        let stripped: String = CONTEXT_REPORT_FIXTURE
+            .lines()
+            .map(|line| {
+                let Ok(mut record) = serde_json::from_str::<Value>(line) else {
+                    return line.to_owned();
+                };
+                if let Some(object) = record.as_object_mut() {
+                    object.remove("contextUsage");
+                }
+                record.to_string()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        let turns = load_context_report_fixture(&stripped);
+
+        let reports = context_reports(&turns);
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].unparsed);
+        assert_eq!(reports[0].max_tokens, Some(1_000_000));
+        assert_eq!(reports[0].categories.len(), 11);
+        assert!(
+            reports[0].skills.iter().any(|skill| skill.approximate),
+            "the markdown path ran, so its rounded counts must say so"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_context_report_still_renders_its_raw_text() {
+        let turns = load_context_report_fixture(
+            &json!({
+                "type": "system",
+                "subtype": "local_command",
+                "entrypoint": "sdk-cli",
+                "commandRun": {"command": "context", "args": ""},
+                "content": "<local-command-stdout>nothing we can read</local-command-stdout>",
+                "timestamp": "2026-09-18T15:48:31.451Z",
+                "uuid": "output-id",
+                "parentUuid": "command-id",
+            })
+            .to_string(),
+        );
+
+        let reports = context_reports(&turns);
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].unparsed);
+        assert_eq!(reports[0].raw, "nothing we can read");
+    }
+
+    #[test]
+    fn a_context_report_lands_after_the_turn_it_interrupts_not_before_it() {
+        // A report arriving while an agent turn is still open must close that
+        // turn before pushing its marker. Without that, the marker is appended
+        // first and the finished turn lands *after* it — the transcript then
+        // shows the breakdown preceding the answer that came before it.
+        let turns = load_turns(&[
+            user_record("first", "2026-09-18T15:48:00Z"),
+            assistant_text_record("1", "claude-fable-5-1", "2026-09-18T15:48:01Z"),
+            json!({
+                "type": "system",
+                "subtype": "local_command",
+                "entrypoint": "sdk-cli",
+                "commandRun": {"command": "context", "args": ""},
+                "contextUsage": {"raw_max_tokens": 1_000_000, "total_tokens": 10,
+                                 "categories": [{"name": "Messages", "tokens": 10, "kind": "used"}]},
+                "content": "<local-command-stdout>## Context Usage</local-command-stdout>",
+                "timestamp": "2026-09-18T15:48:02Z",
+                "uuid": "output-id",
+                "parentUuid": "command-id",
+            }),
+        ]);
+
+        let shape: Vec<&str> = turns
+            .iter()
+            .map(|turn| match turn {
+                Turn::User { .. } => "user",
+                Turn::Agent { .. } => "agent",
+                Turn::System { .. } => "system",
+            })
+            .collect();
+        assert_eq!(shape, ["user", "agent", "system"], "turns: {turns:#?}");
+    }
+
+    #[test]
+    fn an_unrelated_sdk_cli_local_command_still_pairs_into_a_completed_turn() {
+        // The routing branch returns early only for `/context`; every other
+        // local command keeps the pairing path that reconstructs it as a turn.
+        let turns = load_turns(&[
+            local_command_record(
+                "/plugin",
+                "input-id",
+                None,
+                "sdk-cli",
+                "2026-08-06T19:00:00Z",
+            ),
+            local_command_record(
+                "<local-command-stdout>/plugin isn't available here.</local-command-stdout>",
+                "output-id",
+                Some("input-id"),
+                "sdk-cli",
+                "2026-08-06T19:00:01Z",
+            ),
+        ]);
+
+        assert!(
+            matches!(turns.as_slice(), [Turn::Agent { items, .. }]
+                if matches!(items.as_slice(), [TurnItem::Text { text, .. }]
+                    if text == "/plugin isn't available here.")),
+            "turns: {turns:#?}"
         );
     }
 

@@ -748,9 +748,9 @@ fn assert_meta_structure(transcript: &switchboard_harness::LoadedTranscript) {
     // Registries are environment-dependent (developer's own MCP config /
     // skills directory). We pin the structural contract — the fields
     // deserialize as readable vectors — not the contents.
-    let _: &Vec<_> = &meta.mcp_servers;
-    let _: &Vec<_> = &meta.skills;
-    let _: &Vec<_> = &meta.tools;
+    let _: &Option<Vec<_>> = &meta.inventory.mcp_servers;
+    let _: &Option<Vec<_>> = &meta.inventory.skills;
+    let _: &Option<Vec<_>> = &meta.inventory.tools;
 }
 
 /// Two dispatches against one Antigravity conversation must hydrate as two

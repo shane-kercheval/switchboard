@@ -2647,6 +2647,10 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
     expect(overage).toBeInTheDocument();
     expect(overage).toHaveAttribute("tabindex", "0");
     expect(overage.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    const nativeMatches = overage.matches.bind(overage);
+    vi.spyOn(overage, "matches").mockImplementation((selector: string) =>
+      selector === ":focus-visible" ? true : nativeMatches(selector),
+    );
 
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {

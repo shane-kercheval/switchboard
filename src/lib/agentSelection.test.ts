@@ -9,6 +9,7 @@ import {
   EFFORT_OPTIONS,
   MODEL_OPTIONS,
   activatableEffortValues,
+  claudeModelFamilyLabel,
   defaultAgentName,
   defaultAgentNameForSelection,
   effortIsRequired,
@@ -283,5 +284,27 @@ describe("default agent naming", () => {
       );
     });
     expect(new Set(names).size).toBe(names.length);
+  });
+});
+
+describe("claudeModelFamilyLabel", () => {
+  it("maps an observed model id to the family name the picker uses", () => {
+    // The stream reports full ids; the picker is keyed by family alias, and the
+    // card should name the model with the word the user selected it by.
+    expect(claudeModelFamilyLabel("claude-fable-5-1")).toBe("Fable");
+    expect(claudeModelFamilyLabel("claude-opus-5")).toBe("Opus");
+    expect(claudeModelFamilyLabel("claude-sonnet-5")).toBe("Sonnet");
+    expect(claudeModelFamilyLabel("claude-haiku-4-5-20251001")).toBe("Haiku");
+  });
+
+  it("returns an unrecognized id verbatim", () => {
+    // Long, but never a guess: a future family gets its real id until the
+    // picker learns the name.
+    expect(claudeModelFamilyLabel("claude-zephyr-7")).toBe("claude-zephyr-7");
+  });
+
+  it("matches whole segments, not substrings", () => {
+    // "opus" inside another token is not the Opus family.
+    expect(claudeModelFamilyLabel("claude-opusculum-1")).toBe("claude-opusculum-1");
   });
 });

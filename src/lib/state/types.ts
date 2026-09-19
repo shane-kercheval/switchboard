@@ -15,11 +15,12 @@ import type {
   AgentId,
   Attachment,
   ContentKind,
+  ContextReport,
   FailureKind,
-  McpServerStatus,
   MessageId,
   ParseWarning,
   SendId,
+  SessionInventory,
   ToolFacet,
   ToolKind,
   TurnId,
@@ -227,8 +228,33 @@ export type PendingSend = {
   /// Travels with `queued_at`: a compaction has no user turn to take a timestamp
   /// from, so the queued row needs its own to sit in the right place in the
   /// timeline. Both are absent for a send.
-  kind?: "compaction";
+  ///
+  /// `"context_report"` marks a queued context breakdown, which is in this list
+  /// for the same correlation reason but renders **nothing** — not queued, not
+  /// running, not on reload. A report is not conversation, so the unified view
+  /// skips it entirely rather than showing a row (see `pendingKind`).
+  kind?: "compaction" | "context_report";
   queued_at?: string;
+};
+
+/// One in-flight or finished context-report request.
+///
+/// A report has **no transcript row**, so it has no place for a failure to show
+/// — a failed compaction is visible because its row is; the sidebar deliberately
+/// renders no `last_error`. This record is where a report's outcome lives
+/// instead, and the panel renders it beside the previous report.
+///
+/// **Cleared only by the next report dispatch, never by an ordinary send.** If a
+/// send cleared it, a failure message would vanish the moment the user typed
+/// anything, which is exactly when they would be looking for it.
+export type ContextReportRequest = {
+  send_id: SendId;
+  message_id?: MessageId;
+  /// The turn once one started — the correlation a cancel or a late failure
+  /// uses.
+  turn_id?: TurnId;
+  phase: "queued" | "running" | "done" | "failed" | "cancelled";
+  error?: string;
 };
 
 /// Per-agent operational state.
@@ -240,11 +266,12 @@ export type PendingSend = {
 ///   when combined with `hydration_status`. After a failed turn, the agent
 ///   IS sendable again — `run_status` flips back to `"idle"` on `AgentIdle`
 ///   regardless of whether the turn succeeded or failed.
-/// - `last_error`: runtime record of the most-recent failure. Failures are
-///   rendered in the transcript (a failed agent turn), not in the sidebar, so
-///   this is not a display surface today; it is kept for devtools/logging and
-///   future retry UX. Does NOT gate Send. Cleared on the next successful
-///   `turn_end`.
+/// - `last_error`: runtime record of the most-recent failure, rendered in the
+///   transcript as a failed agent turn. Read by no other surface — the one
+///   consumer of a failure's *kind* is the `turn_end` reducer, which translates
+///   a `usage_limit` refusal to the account-scoped usage store and never hands
+///   `last_error` to the sidebar. Does NOT gate Send. Cleared when the next
+///   turn starts.
 /// - `in_flight_turn_id`: heartbeat scope. The turn the timer is tracking.
 ///
 /// Conflating these (e.g., a status enum with `"errored"`) would force the
@@ -343,17 +370,37 @@ export type AgentRuntime = {
   /// agent's session file. Undefined on agents whose first dispatch
   /// hasn't happened yet.
   meta?: AgentMeta;
-  /// Most-recent `RateLimitEvent.info` payload. Opaque — the renderer reads
-  /// `primary.used_percent` (Codex) or `isUsingOverage` (Claude). Populated
-  /// by live events or by hydration from the metadata sidecar.
-  last_rate_limit?: unknown;
-  /// Capture time of `last_rate_limit` when it came from the metadata
-  /// sidecar on hydration (a stream-only/class-C value restored across
-  /// restart). ISO-8601 string. `null` once a live `rate_limit_event`
-  /// overwrites the in-memory value (it's no longer an on-disk snapshot)
-  /// and for class-B sources. Drives the UI "as of …" staleness qualifier:
-  /// the staleness check is `as_of != null && age(as_of) > threshold`.
-  last_rate_limit_as_of?: string | null;
+  /// Capture time of `meta.inventory` when it came from the metadata sidecar
+  /// on hydration (Claude's `system/init` is stream-only, class C). ISO-8601
+  /// string; `null` once a live `session_meta` overwrites the in-memory value,
+  /// and absent for a harness that re-reads its inventory from a durable file.
+  /// Drives the card's "as of …" qualifier on the environment row.
+  meta_as_of?: string | null;
+  /// The most recent `/context` breakdown for this agent — from a live
+  /// `context_report` event, or from the latest `context_report` marker in the
+  /// session file on hydrate. Absent until one has been run.
+  last_context_report?: ContextReport;
+  /// When `last_context_report` was measured (ISO-8601).
+  ///
+  /// **Always set alongside the report, live or restored** — deliberately unlike
+  /// the quota reading's `as_of`, which is a snapshot qualifier the account-scoped
+  /// store drops for a live value. Every turn refreshes a quota reading, so a
+  /// live one is current by construction; nothing refreshes a breakdown, so a
+  /// live one starts aging the instant it lands and the panel must say when it
+  /// was taken.
+  last_context_report_at?: string;
+  /// The state of the report the user last asked for. Survives an ordinary send;
+  /// see [`ContextReportRequest`] for why. One slot: the panel's button is
+  /// disabled while a request is queued or running, so a second click cannot
+  /// orphan the first request's correlation.
+  context_report_request?: ContextReportRequest;
+  /// Model reported by the **current turn's** `session_meta`, cleared at
+  /// `turn_start`. Separate from `meta.model`, which survives across turns for
+  /// its other consumers: only a same-turn observation may label a rate-limit
+  /// snapshot, because a stream can emit the rate-limit event before its `init`
+  /// (the recorded compaction order) and `meta` would then name the previous
+  /// turn's model.
+  current_turn_model?: string;
   /// Disk-rehydration lifecycle. Newly-created agents start at
   /// `"complete"` (nothing to hydrate); registered/attached agents pass
   /// through `"pending"` → `"loading"` → `"complete"`. Compose-bar Send
@@ -380,9 +427,10 @@ export type AgentRuntime = {
 export type AgentMeta = {
   model: string;
   harness_version: string;
-  tools: string[];
-  mcp_servers: McpServerStatus[];
-  skills: string[];
+  /// What the harness reports having loaded. See `SessionInventory` in
+  /// `src/lib/types.ts` for why an absent list and an empty one mean
+  /// different things.
+  inventory: SessionInventory;
 };
 
 /// Per-agent turn lists, keyed by `agent_id`. Render-time merge produces the

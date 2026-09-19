@@ -11,11 +11,17 @@ export type ActivationFailureKind = "project_not_loaded" | "project_locked" | "o
 export type ActivationCommandError = { type: ActivationFailureKind | string; message: string };
 export type ActivationFailure = { type: ActivationFailureKind; message: string };
 
-export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure";
+export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure" | "usage_limit";
 // Future: "timeout" — added if/when an active per-turn timeout lands.
 // `auth_failure` is detected via stream events: Claude's
 // `assistant.error == "authentication_failed"` and Codex's
 // `turn.failed.error` containing `"401 Unauthorized"`.
+// `usage_limit` is the harness refusing the turn because a subscription
+// window is exhausted — typed from a structured signal (Codex's
+// `task_complete.error.codex_error_info`), never from the prose. Read once, by
+// the `turn_end` reducer, which translates it into
+// the account-scoped usage store; that store is what draws the usage window
+// full (see `usageWindows.ts::codexRateLimitView`).
 
 // Who initiated a cancellation. Carried on the `cancelled` outcome.
 export type CancelSource = "user" | "workflow" | "shutdown";
@@ -121,7 +127,40 @@ export type EditPair = { old: string; new: string };
 // task id for status-only updates (Claude `TaskUpdate` carries no text).
 export type TodoItem = { content: string; status: string };
 
-export type McpServerStatus = { name: string; status: string };
+// `status` and `source` are the harness's own vocabularies (opaque strings),
+// so a new value on either never breaks deserialization. `source` names the
+// config scope that registered the server ("user" / "claudeai" / …) when the
+// harness says; the config loaders report none.
+export type McpServerStatus = { name: string; status: string; source?: string };
+
+// One skill the harness has loaded. Claude's `system/init` supplies names
+// only; Codex's rollout supplies all three.
+export type SkillEntry = { name: string; description?: string; path?: string };
+
+export type PluginEntry = { name: string; version?: string; source?: string };
+
+// One of the harness's run settings, as a display pair — the two wired
+// harnesses share no setting names, and the card renders them identically.
+export type SettingPair = { label: string; value: string };
+
+// What the harness reports having loaded for a session.
+//
+// **Every list is optional, and the distinction is load-bearing.** Absent
+// means the harness did not report the list at all; an empty array means it
+// reported an empty one. Only the absent case may be filled from a config
+// registry (the Rust side does that merge), and only the absent case renders
+// no section on the card — an empty array is an authoritative zero.
+export type SessionInventory = {
+  tools?: string[];
+  mcp_servers?: McpServerStatus[];
+  skills?: SkillEntry[];
+  agents?: string[];
+  plugins?: PluginEntry[];
+  memory_paths?: string[];
+  slash_commands?: string[];
+  approved_commands?: string[];
+  settings?: SettingPair[];
+};
 
 // Per-turn usage carried on `turn_end.usage`. `total_cost_usd` is Claude
 // Code only (subscription auth has no dollar number for Codex). Tokens are
@@ -278,14 +317,16 @@ export type NormalizedEvent =
       hydration_key?: string | null;
     }
   | { type: "rate_limit_event"; agent_id: AgentId; info: unknown }
+  // The `/context` breakdown for one agent, from a report run. Agent-scoped:
+  // it describes the agent's window, not the maintenance turn that measured
+  // it, so it lands on runtime state rather than in the transcript.
+  | { type: "context_report"; agent_id: AgentId; report: ContextReport; at: string }
   | {
       type: "session_meta";
       agent_id: AgentId;
       model: string;
       harness_version: string;
-      tools: string[];
-      mcp_servers: McpServerStatus[];
-      skills: string[];
+      inventory: SessionInventory;
       raw: unknown;
     }
   // Emitted by the dispatcher as the last event on the per-agent channel
@@ -351,12 +392,40 @@ export type LoadedTranscript = {
   turns: LoadedTurn[];
   meta?: SessionMetaInfo | null;
   last_rate_limit?: unknown;
+  /// Model captured with a stream-only rate-limit snapshot. This keeps a
+  /// model-specific quota label exact across app restarts.
+  last_rate_limit_model?: string | null;
   /// Capture time of `last_rate_limit` when restored from the per-agent
   /// metadata sidecar (a stream-only/class-C value, e.g. Claude's overage
   /// signal, that would otherwise be lost on restart). ISO-8601 string.
   /// `null` for live values and for class-B (already-durable) sources;
   /// drives the UI "as of …" staleness qualifier.
   last_rate_limit_as_of?: string | null;
+  /// When the harness **measured** `last_rate_limit`, for ranking this agent's
+  /// reading against other agents' readings of the same account-scoped quota.
+  /// ISO-8601.
+  ///
+  /// Distinct from `last_rate_limit_as_of`, which is a staleness qualifier shown
+  /// to the user and deliberately absent for a durable source. This is an
+  /// ordering key, needed precisely for the durable case: a reading recovered
+  /// from a harness's own session file has no arrival time, so without the
+  /// measured instant several restored readings are indistinguishable and
+  /// "newest wins" cannot pick between them.
+  last_rate_limit_observed_at?: string | null;
+  /// Capture time of `meta.inventory` when restored from the metadata sidecar
+  /// (ISO-8601). Same role as `last_rate_limit_as_of`: `null`/absent means the
+  /// inventory is live or re-read from a durable harness file, so the card
+  /// presents it without an "as of" qualifier.
+  meta_as_of?: string | null;
+  /// The newest `/context` breakdown recorded in this agent's session file, and
+  /// when the harness took it (ISO-8601). Projected by the loader because the
+  /// markers themselves never reach a per-agent turn list — `load_transcript`
+  /// filters `role: "system"` out before the IPC. Unlike the `*_as_of` fields
+  /// above this is carried by every report, live ones included: nothing
+  /// refreshes a breakdown, so a report with no time attached is a number the
+  /// user cannot interpret.
+  last_context_report?: ContextReport | null;
+  last_context_report_at?: string | null;
   warnings: ParseWarning[];
 };
 
@@ -365,9 +434,7 @@ export type ParseWarning = { line_number: number; reason: string };
 export type SessionMetaInfo = {
   model: string;
   harness_version: string;
-  tools: string[];
-  mcp_servers: McpServerStatus[];
-  skills: string[];
+  inventory: SessionInventory;
 };
 
 // Wire shape of `crate::transcript::Turn` — matches the in-state `Turn`
@@ -433,10 +500,24 @@ export type Hydrate = {
   turns: LoadedTurn[];
   meta?: SessionMetaInfo | null;
   last_rate_limit?: unknown;
+  /// Model captured with `last_rate_limit` in the metadata sidecar.
+  last_rate_limit_model?: string | null;
   /// Capture time of `last_rate_limit` from the metadata sidecar (see
   /// `LoadedTranscript.last_rate_limit_as_of`). `null` when the value is
   /// live or class-B.
   last_rate_limit_as_of?: string | null;
+  /// When the harness measured `last_rate_limit` (see
+  /// `LoadedTranscript.last_rate_limit_observed_at`). The ordering key for the
+  /// account-scoped usage store, not a staleness qualifier.
+  last_rate_limit_observed_at?: string | null;
+  /// Capture time of `meta.inventory` from the metadata sidecar (see
+  /// `LoadedTranscript.meta_as_of`).
+  meta_as_of?: string | null;
+  /// The newest `/context` breakdown from this agent's session file, and when
+  /// the harness took it. Fills `AgentRuntime.last_context_report` only when the
+  /// runtime has none — live > disk, like `meta` and `last_rate_limit`.
+  last_context_report?: ContextReport | null;
+  last_context_report_at?: string | null;
 };
 
 export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
@@ -876,6 +957,10 @@ export type ConversationItem =
       agent_id: AgentId;
       status: OutcomeStatus;
       reason?: string | null;
+      // The `FailureKind` wire string of a failed outcome, untyped on the wire
+      // so a kind journaled by a newer build still arrives; narrowed where it
+      // is consumed. Absent for a cancellation or an older journal record.
+      failure_kind?: string | null;
       at: string;
     }
   | {
@@ -898,7 +983,57 @@ export type ConversationItem =
 // the user sees it ran, but non-correlating.
 export type SystemMarker =
   | { marker_kind: "compaction"; summary: string }
-  | { marker_kind: "slash_command"; command: string };
+  | { marker_kind: "slash_command"; command: string }
+  // A `/context` run recorded in the session file. Renders nothing — a report is
+  // not conversation — and exists so a reopened project can fill the breakdown
+  // panel from the latest one, stamped "as of" the marker's time.
+  | { marker_kind: "context_report"; report: ContextReport };
+
+// Mirror of Rust `ContextReport` (`crates/harness/src/context_report.rs`).
+//
+// Every optional list is `skip_serializing_if = "Vec::is_empty"` on the Rust
+// side, so an absent key means an empty list rather than an unknown one — the
+// opposite of `SessionInventory`'s `Option<Vec<_>>`, and deliberately: a report
+// is a single measurement of one moment, with no config loader to merge against.
+export type ContextReport = {
+  model?: string | null;
+  // Tokens occupied and the window's size. Absent when neither decoder found
+  // them; the panel then shows the raw text alone.
+  total_tokens?: number | null;
+  max_tokens?: number | null;
+  // In the CLI's own order. **No percentage field** — every percentage the
+  // panel shows is `tokens / max_tokens`, the same arithmetic the CLI does.
+  categories?: ContextCategory[];
+  // `detail` is the MCP server; the panel groups on it.
+  mcp_tools?: ContextItem[];
+  // `name` is the file's full path, `detail` its type.
+  memory_files?: ContextItem[];
+  agents?: ContextItem[];
+  skills?: ContextItem[];
+  // The markdown the CLI printed, verbatim and always present.
+  raw: string;
+  // Neither decoder could read the report. The panel shows `raw` and says so.
+  unparsed?: boolean;
+};
+
+export type ContextCategory = {
+  name: string;
+  tokens: number;
+  // The CLI's own classification — observed `used`, `deferred`, `buffer`,
+  // `free`. Opaque on purpose: an unrecognized kind must still render under its
+  // own name rather than be assigned a meaning.
+  kind?: string;
+  approximate?: boolean;
+};
+
+export type ContextItem = {
+  name: string;
+  detail?: string | null;
+  tokens: number;
+  // The CLI rounded this count (`~30`, `< 20`) and the exact value is lost.
+  // Only the markdown fallback sets it.
+  approximate?: boolean;
+};
 
 // Per-agent metadata carried alongside the merged items. `warnings` and
 // `load_error` are agent-scoped: one agent's transcript failing to load leaves
@@ -908,10 +1043,19 @@ export type AgentConversationMeta = {
   agent_id: AgentId;
   meta?: SessionMetaInfo | null;
   last_rate_limit?: unknown;
+  /// Model captured with `last_rate_limit` in the metadata sidecar.
+  last_rate_limit_model?: string | null;
   /// Capture time of `last_rate_limit` from the metadata sidecar (ISO-8601);
   /// `null`/absent for live or class-B sources. See
   /// `LoadedTranscript.last_rate_limit_as_of`.
   last_rate_limit_as_of?: string | null;
+  /// Capture time of `meta.inventory` from the metadata sidecar. See
+  /// `LoadedTranscript.meta_as_of`.
+  meta_as_of?: string | null;
+  /// The newest `/context` breakdown from this agent's session file, and when
+  /// the harness took it. See `LoadedTranscript.last_context_report`.
+  last_context_report?: ContextReport | null;
+  last_context_report_at?: string | null;
   warnings: ParseWarning[];
   load_error?: string | null;
 };

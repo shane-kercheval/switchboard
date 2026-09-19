@@ -334,6 +334,10 @@ describe("ProjectsSidebar — supplemental directory tooltip", () => {
     await renderWith([projectIn(PROJECT_1, "alpha", "/work/alpha")]);
     const select = rowSelectButton();
     expect(select.querySelector('[tabindex="0"]')).toBeNull();
+    const nativeMatches = select.matches.bind(select);
+    vi.spyOn(select, "matches").mockImplementation((selector: string) =>
+      selector === ":focus-visible" ? true : nativeMatches(selector),
+    );
 
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {

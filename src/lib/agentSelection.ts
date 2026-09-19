@@ -100,6 +100,22 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   ],
 };
 
+/// Short display name for an *observed* Claude model id, for places too narrow
+/// for the full id — the per-model weekly usage window's label on the agent
+/// card. The stream reports ids like `claude-fable-5-1`, while the picker above
+/// is keyed by family alias, so a hyphen-delimited segment match maps one onto
+/// the other and the card names the model with the same word the user selected
+/// it by. Segment match rather than substring so a family name can't be found
+/// inside an unrelated token. An unrecognized id falls through verbatim: long,
+/// but never wrong, and the cell's tooltip has room for it.
+export function claudeModelFamilyLabel(modelId: string): string {
+  const segments = new Set(modelId.split("-"));
+  for (const option of MODEL_OPTIONS.claude_code) {
+    if (segments.has(option.value)) return option.label;
+  }
+  return modelId;
+}
+
 /// How the **model** picker renders per harness — the single source of truth
 /// both the create form and the sidebar change-model dialog read, so the two
 /// can't drift. Segmented (a toggle) for the short curated lists; a dropdown

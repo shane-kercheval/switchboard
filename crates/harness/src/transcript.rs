@@ -23,7 +23,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use switchboard_core::AgentId;
 
-use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnSpend, TurnUsage};
+use crate::events::{
+    ContentKind, McpServerStatus, SessionInventory, SkillEntry, ToolKind, TurnId, TurnSpend,
+    TurnUsage,
+};
 
 /// Origin of a reconstructed user prompt. The conversation merge uses it to
 /// decide whether the journal already owns this prompt (suppress the harness
@@ -73,6 +76,17 @@ pub enum SystemMarker {
     /// stops a bare `/compact` from masquerading as a correlating `Turn::User`
     /// and desyncing the send↔turn join. `command` is the verbatim command text.
     SlashCommand { command: String },
+    /// A `/context` breakdown the harness ran on this session. Carried as a
+    /// marker rather than an agent turn because a report is not conversation:
+    /// the transcript renders nothing for it, and the frontend reads the latest
+    /// one per agent to fill the breakdown panel after a reopen.
+    ///
+    /// Routing it here is also what keeps a report out of the *answer* path —
+    /// left as an agent turn it would become the newest completed text and so
+    /// the thing [`crate::forward::latest_completed_agent_text`] forwards.
+    ContextReport {
+        report: crate::context_report::ContextReport,
+    },
 }
 
 /// One reconstructed turn. Discriminated by `role` matching the event-vocabulary
@@ -258,6 +272,10 @@ pub struct LoadedTranscript {
     pub turns: Vec<Turn>,
     pub meta: Option<SessionMetaInfo>,
     pub last_rate_limit: Option<serde_json::Value>,
+    /// Model captured with `last_rate_limit` when the app restores a
+    /// stream-only snapshot. `None` for harness-file-backed values and legacy
+    /// sidecars that predate model persistence.
+    pub last_rate_limit_model: Option<String>,
     /// Capture time of `last_rate_limit` when it was restored from the
     /// per-agent metadata sidecar (a stream-only/class-C value that would
     /// otherwise be lost on restart). Drives the UI's "as of …" staleness
@@ -270,7 +288,69 @@ pub struct LoadedTranscript {
     /// class-B value (e.g. Codex's session-file rate-limit) carries `None`
     /// here because it's already durable and needs no staleness qualifier.
     pub last_rate_limit_as_of: Option<DateTime<Utc>>,
+    /// When the harness actually measured [`Self::last_rate_limit`], for
+    /// ordering this agent's reading against other agents' readings of the same
+    /// account-scoped quota.
+    ///
+    /// **Distinct from [`Self::last_rate_limit_as_of`]**, which is a staleness
+    /// *qualifier* the UI shows the user and which is deliberately `None` for a
+    /// durable source. This is an *ordering key*, needed precisely for the
+    /// durable case: a harness whose reading is recovered from its own session
+    /// file carries no arrival time, so without the measured instant several
+    /// agents' readings are indistinguishable and "newest wins" cannot pick.
+    ///
+    /// `None` from any loader whose reading is stream-only, where the consumer
+    /// stamps arrival instead, and for a record carrying no parseable timestamp.
+    pub last_rate_limit_observed_at: Option<DateTime<Utc>>,
+    /// Capture time of `meta.inventory` when it was restored from the
+    /// per-agent metadata sidecar. Same role and same caveats as
+    /// [`Self::last_rate_limit_as_of`]: **always `None` from the per-harness
+    /// loaders**, set only by the app-layer overlay, and `None` for a class-B
+    /// inventory (Codex re-reads its rollout on every load, so there is
+    /// nothing stale to qualify).
+    pub meta_as_of: Option<DateTime<Utc>>,
+    /// The most recent `/context` breakdown recorded in this session file, and
+    /// the moment the harness took it.
+    ///
+    /// Named `_at` rather than `_as_of` deliberately, because it is **not** the
+    /// same kind of field as the two above. Those qualify a value restored from
+    /// the sidecar and are cleared the moment a live one arrives; this one is
+    /// carried by every report, live ones included. A rate-limit payload is
+    /// refreshed by every turn, so a live value is current by construction — a
+    /// breakdown is a measurement of one instant that nothing updates, and each
+    /// turn after it makes it more wrong.
+    ///
+    /// Filled by the loader rather than the app-layer overlay: a report is class
+    /// B, durable in the harness's own file, so its time is the marker's own
+    /// timestamp. It is projected out of the turns rather than left for the
+    /// consumer to find, because the markers are routed to the project-level
+    /// overlay and never reach a per-agent turn list.
+    pub last_context_report: Option<crate::context_report::ContextReport>,
+    pub last_context_report_at: Option<DateTime<Utc>>,
     pub warnings: Vec<ParseWarning>,
+}
+
+impl LoadedTranscript {
+    /// Fill [`Self::last_context_report`] and its timestamp from the newest
+    /// `ContextReport` marker among the turns.
+    ///
+    /// Newest by position, not by timestamp: the turns are already in the order
+    /// the harness wrote them, and a file whose clock jumped backwards should
+    /// still show the report that was taken last.
+    pub(crate) fn project_latest_context_report(&mut self) {
+        let latest = self.turns.iter().rev().find_map(|turn| match turn {
+            Turn::System {
+                marker: SystemMarker::ContextReport { report },
+                started_at,
+                ..
+            } => Some((report.clone(), *started_at)),
+            _ => None,
+        });
+        if let Some((report, at)) = latest {
+            self.last_context_report = Some(report);
+            self.last_context_report_at = Some(at);
+        }
+    }
 }
 
 /// Session-scope metadata reconstructed from the session file + harness
@@ -281,13 +361,11 @@ pub struct LoadedTranscript {
 /// `harness_version` may be empty on Claude (no on-disk analog of Codex's
 /// `cli_version`); consumers tolerate empty strings as "absent" per the
 /// existing live-path convention in `parse_system_event`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SessionMetaInfo {
     pub model: String,
     pub harness_version: String,
-    pub tools: Vec<String>,
-    pub mcp_servers: Vec<McpServerStatus>,
-    pub skills: Vec<String>,
+    pub inventory: SessionInventory,
 }
 
 /// One per-line parse issue inside an otherwise-readable session file.
@@ -329,31 +407,38 @@ pub enum LoadTranscriptError {
     AmbiguousSessionFile,
 }
 
-/// Compose a `SessionMetaInfo` from parser-extracted fields (`model`,
-/// `harness_version`) and config-loader output (`mcp_servers`, `skills`).
-/// Used by both per-harness `load_*_transcript` entry points to keep the
-/// two-source merge identical across harnesses.
+/// Compose a `SessionMetaInfo` from parser-extracted fields and config-loader
+/// output. Used by every per-harness `load_*_transcript` entry point to keep
+/// the two-source merge identical across harnesses.
 ///
-/// Parser-extracted fields are preserved verbatim. Config-loader output
-/// is layered on top of whatever the parser found. `tools` is always empty
-/// (no tools registry on disk for either harness; the live `system/init`
-/// event is the only populator).
+/// **Replace, not fill: a list the parser supplied wins outright, including an
+/// empty one, and the loaders fill only a list the parser left `None`.** There
+/// are no loader-side appends. This is the opposite of the rate-limit
+/// overlay's fill-if-empty rule, deliberately: the loaders read config
+/// registries, which say what is *configured* and carry no status, while the
+/// parser's lists say what the harness actually *loaded*. A session whose
+/// `init` reported zero MCP servers has none connected, and topping that up
+/// from `.mcp.json` would draw servers on the card that the agent cannot call.
+///
+/// Both loader arguments are themselves optional so a harness with no registry
+/// of that kind (Claude has no on-disk skills status; Codex has no tool
+/// inventory at all) passes `None` rather than an empty list that would read as
+/// an authoritative zero.
 #[must_use]
 pub fn merge_meta_with_loaders(
     parser_meta: Option<SessionMetaInfo>,
-    mcp_servers: Vec<McpServerStatus>,
-    skills: Vec<String>,
+    mcp_servers: Option<Vec<McpServerStatus>>,
+    skills: Option<Vec<SkillEntry>>,
 ) -> SessionMetaInfo {
-    let (model, harness_version) = parser_meta
-        .map(|m| (m.model, m.harness_version))
-        .unwrap_or_default();
-    SessionMetaInfo {
-        model,
-        harness_version,
-        tools: vec![],
+    let mut meta = parser_meta.unwrap_or_default();
+    let mut merged = SessionInventory {
         mcp_servers,
         skills,
-    }
+        ..SessionInventory::default()
+    };
+    merged.overlay(std::mem::take(&mut meta.inventory));
+    meta.inventory = merged;
+    meta
 }
 
 #[cfg(test)]
@@ -510,34 +595,85 @@ mod tests {
         );
     }
 
+    fn server(name: &str, status: &str) -> McpServerStatus {
+        McpServerStatus {
+            name: name.to_owned(),
+            status: status.to_owned(),
+            source: None,
+        }
+    }
+
     #[test]
-    fn merge_meta_with_loaders_uses_parser_fields_and_layers_loader_output() {
+    fn merge_meta_with_loaders_keeps_parser_scalars_and_fills_absent_lists() {
         let parser_meta = Some(SessionMetaInfo {
             model: "gpt-5.4".to_owned(),
             harness_version: "0.130.0".to_owned(),
-            tools: vec!["should_be_dropped".to_owned()],
-            mcp_servers: vec![],
-            skills: vec![],
+            inventory: SessionInventory::default(),
         });
-        let mcp = vec![McpServerStatus {
-            name: "tiddly".to_owned(),
-            status: "configured".to_owned(),
-        }];
-        let skills = vec!["debug".to_owned()];
-        let merged = merge_meta_with_loaders(parser_meta, mcp.clone(), skills.clone());
+        let mcp = vec![server("tiddly", "configured")];
+        let skills = vec![SkillEntry::from_name("debug".to_owned())];
+        let merged = merge_meta_with_loaders(parser_meta, Some(mcp.clone()), Some(skills.clone()));
         assert_eq!(merged.model, "gpt-5.4");
         assert_eq!(merged.harness_version, "0.130.0");
-        assert!(merged.tools.is_empty(), "tools always empty");
-        assert_eq!(merged.mcp_servers, mcp);
-        assert_eq!(merged.skills, skills);
+        assert_eq!(merged.inventory.mcp_servers, Some(mcp));
+        assert_eq!(merged.inventory.skills, Some(skills));
+    }
+
+    #[test]
+    fn a_runtime_empty_list_beats_a_non_empty_loader_list() {
+        // The load-bearing case for the `Option` semantics: a harness that
+        // reported zero MCP servers has none connected, and topping the list
+        // up from a config file would draw servers the agent cannot call.
+        let parser_meta = Some(SessionMetaInfo {
+            inventory: SessionInventory {
+                mcp_servers: Some(vec![]),
+                skills: Some(vec![]),
+                ..SessionInventory::default()
+            },
+            ..SessionMetaInfo::default()
+        });
+        let merged = merge_meta_with_loaders(
+            parser_meta,
+            Some(vec![server("tiddly", "configured")]),
+            Some(vec![SkillEntry::from_name("debug".to_owned())]),
+        );
+        assert_eq!(merged.inventory.mcp_servers, Some(vec![]));
+        assert_eq!(merged.inventory.skills, Some(vec![]));
+    }
+
+    #[test]
+    fn a_runtime_list_replaces_the_loader_list_without_appending() {
+        let parser_meta = Some(SessionMetaInfo {
+            inventory: SessionInventory {
+                mcp_servers: Some(vec![server("tiddly", "needs-auth")]),
+                ..SessionInventory::default()
+            },
+            ..SessionMetaInfo::default()
+        });
+        let merged = merge_meta_with_loaders(
+            parser_meta,
+            Some(vec![
+                server("tiddly", "configured"),
+                server("loader-only", "configured"),
+            ]),
+            None,
+        );
+        // Not a union: the loader-only entry is gone and the colliding entry
+        // keeps the runtime's real status, not the config file's placeholder.
+        assert_eq!(
+            merged.inventory.mcp_servers,
+            Some(vec![server("tiddly", "needs-auth")])
+        );
     }
 
     #[test]
     fn merge_meta_with_loaders_handles_no_parser_contribution() {
-        let merged = merge_meta_with_loaders(None, vec![], vec![]);
+        let merged = merge_meta_with_loaders(None, None, None);
         assert!(merged.model.is_empty());
         assert!(merged.harness_version.is_empty());
-        assert!(merged.mcp_servers.is_empty());
-        assert!(merged.skills.is_empty());
+        assert!(
+            merged.inventory.is_empty(),
+            "nothing reported anything — every list stays absent"
+        );
     }
 }

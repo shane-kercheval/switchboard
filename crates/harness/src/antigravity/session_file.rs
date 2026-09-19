@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 use switchboard_core::AgentId;
 use uuid::Uuid;
 
-use crate::events::{ContentKind, TurnId};
+use crate::events::{ContentKind, SessionInventory, SkillEntry, TurnId};
 use crate::transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
     TurnStatus, merge_meta_with_loaders,
@@ -57,8 +57,13 @@ pub fn load_antigravity_transcript(
 ) -> Result<LoadedTranscript, LoadTranscriptError> {
     // Display-only registries, loaded once and layered onto whatever turns
     // (if any) the transcript yields.
-    let mcp_servers = super::config::load_mcp_servers(home_dir, cwd);
-    let skills = super::skills::load_skills(home_dir, cwd);
+    let mcp_servers = Some(super::config::load_mcp_servers(home_dir, cwd));
+    let skills = Some(
+        super::skills::load_skills(home_dir, cwd)
+            .into_iter()
+            .map(SkillEntry::from_name)
+            .collect(),
+    );
 
     let Some(conversation_id) = conversation_id else {
         return Ok(LoadedTranscript {
@@ -509,13 +514,14 @@ impl Reconstruction {
             meta: Some(SessionMetaInfo {
                 model: self.model.unwrap_or_default(),
                 harness_version: String::new(),
-                tools: vec![],
-                mcp_servers: vec![],
-                skills: vec![],
+                // Antigravity's transcript carries no inventory; every list
+                // stays `None` so the loaders may fill them.
+                inventory: SessionInventory::default(),
             }),
-            last_rate_limit: None,
-            last_rate_limit_as_of: None,
             warnings: self.warnings,
+            // Antigravity records no `/context` breakdown — the marker's only
+            // producer is the Claude parser.
+            ..LoadedTranscript::default()
         }
     }
 }

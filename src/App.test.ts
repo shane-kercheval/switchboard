@@ -1206,7 +1206,7 @@ describe("App", () => {
     // (sideways or vertically) once the real layout mounts for the next
     // loading state.
     expect(screen.getByTestId("project-loading-sidebar-shell")).toBeInTheDocument();
-    expect(screen.getByTestId("project-loading-sidebar-shell")).toHaveStyle({ width: "240px" });
+    expect(screen.getByTestId("project-loading-sidebar-shell")).toHaveStyle({ width: "280px" });
     expect(screen.getByTestId("project-loading-compose-shell")).toBeInTheDocument();
 
     releaseOpen();

@@ -6,6 +6,9 @@ import {
   currentIsoTimestamp,
   formatDuration,
   formatHomePath,
+  formatResetCountdown,
+  formatTokens,
+  formatUsedPercent,
   isIsoTimestampAfter,
   isIsoTimestampBefore,
   relativeTime,
@@ -162,5 +165,124 @@ describe("relativeTime", () => {
 describe("currentIsoTimestamp", () => {
   it("accepts an injected clock for deterministic callers", () => {
     expect(currentIsoTimestamp(new Date("2026-05-25T12:00:00Z"))).toBe("2026-05-25T12:00:00.000Z");
+  });
+});
+
+describe("formatTokens", () => {
+  it("renders exact counts below a thousand", () => {
+    expect(formatTokens(0)).toBe("0");
+    expect(formatTokens(990)).toBe("990");
+  });
+
+  it("renders one decimal below 10k and whole thousands above", () => {
+    expect(formatTokens(1000)).toBe("1k");
+    expect(formatTokens(2340)).toBe("2.3k");
+    expect(formatTokens(23_400)).toBe("23k");
+    expect(formatTokens(121_100)).toBe("121k");
+    expect(formatTokens(200_000)).toBe("200k");
+  });
+
+  it("promotes to millions when the rounded thousands reach 1000", () => {
+    // The tier has to be picked after rounding, not before: 999,500 scales to
+    // 999.5, which rounds to 1000 and would print "1000k" — the exact reading
+    // the M suffix exists to avoid. Both sides of the hand-off are pinned.
+    expect(formatTokens(999_499)).toBe("999k");
+    expect(formatTokens(999_500)).toBe("1M");
+    expect(formatTokens(999_999)).toBe("1M");
+  });
+
+  it("applies the same rounding rule in millions as in thousands", () => {
+    expect(formatTokens(1_000_000)).toBe("1M");
+    expect(formatTokens(1_250_000)).toBe("1.3M");
+    expect(formatTokens(12_000_000)).toBe("12M");
+  });
+});
+
+describe("formatUsedPercent", () => {
+  it("rounds to a whole percent", () => {
+    expect(formatUsedPercent(0)).toBe("0%");
+    expect(formatUsedPercent(0.1)).toBe("10%");
+    expect(formatUsedPercent(0.666)).toBe("67%");
+  });
+
+  it("reports over-full usage rather than clamping", () => {
+    // Only a bar's fill clamps; a quota that says 103% used is stating a fact.
+    expect(formatUsedPercent(1.03)).toBe("103%");
+  });
+
+  it("matches the Codex rate-limit cell's rounding for whole-percent sources", () => {
+    // That cell rendered `usedPercent.toFixed(0)` off a 0-100 number; the meter
+    // takes a 0-1 fraction. Parity holds for whole percents, which is what the
+    // claim is limited to: dividing by 100 and multiplying back is not exact,
+    // so a source of 28.5 renders "29" directly and "28" through the fraction
+    // (28.5 / 100 * 100 is 28.499999999999996). Not asserted here — when the
+    // Codex windows move onto the meter, that conversion picks its own rounding
+    // and this should not have frozen the by-product of the current one.
+    for (const usedPercent of [0, 7, 42, 99, 100]) {
+      expect(formatUsedPercent(usedPercent / 100)).toBe(`${usedPercent}%`);
+    }
+  });
+});
+
+describe("formatResetCountdown", () => {
+  const NOW = new Date("2026-09-17T12:00:00Z");
+  const ms = (iso: string): number => new Date(iso).getTime();
+
+  it("counts down in minutes under an hour", () => {
+    expect(formatResetCountdown(ms("2026-09-17T12:16:00Z"), NOW)).toBe("in 16 min");
+  });
+
+  it("rounds a sub-minute reset up rather than showing zero", () => {
+    expect(formatResetCountdown(ms("2026-09-17T12:00:20Z"), NOW)).toBe("in 1 min");
+  });
+
+  it("rounds partial hours to the nearer hour, in both directions", () => {
+    expect(formatResetCountdown(ms("2026-09-17T15:00:00Z"), NOW)).toBe("in 3 h");
+    expect(formatResetCountdown(ms("2026-09-17T15:59:00Z"), NOW)).toBe("in 4 h");
+    // The case ceiling got wrong: just past the hour is "in 1 h", not "in 2 h"
+    // — overstating by an hour sends the user away from a window that is
+    // nearly clear.
+    expect(formatResetCountdown(ms("2026-09-17T13:01:00Z"), NOW)).toBe("in 1 h");
+    expect(formatResetCountdown(ms("2026-09-17T13:40:00Z"), NOW)).toBe("in 2 h");
+  });
+
+  it("rounds partial days to the nearer day, in both directions", () => {
+    // Relative at every distance, so the weekly window's reset stays short
+    // enough to sit beside its label in the card column.
+    expect(formatResetCountdown(ms("2026-09-18T12:00:00Z"), NOW)).toBe("in 1 d");
+    expect(formatResetCountdown(ms("2026-09-22T12:00:00Z"), NOW)).toBe("in 5 d");
+    expect(formatResetCountdown(ms("2026-09-19T05:00:00Z"), NOW)).toBe("in 2 d");
+    expect(formatResetCountdown(ms("2026-09-24T08:00:00Z"), NOW)).toBe("in 7 d");
+    // Just past a day is "in 1 d", not "in 2 d".
+    expect(formatResetCountdown(ms("2026-09-18T13:00:00Z"), NOW)).toBe("in 1 d");
+  });
+
+  it("flips 1 d to 2 d at the 36-hour midpoint", () => {
+    // The day tier's decision point, pinned because it is the one a reader
+    // checks against the word "rounds": 36h is the midpoint between one day
+    // and two, and a value sitting exactly on it rounds away from zero.
+    expect(formatResetCountdown(ms("2026-09-18T23:59:00Z"), NOW)).toBe("in 1 d");
+    expect(formatResetCountdown(ms("2026-09-19T00:00:00Z"), NOW)).toBe("in 2 d");
+    // And the tier's lower edge: days only start once hours round to 24, so
+    // anything under ~23.5h is still reported in hours rather than as "1 d".
+    expect(formatResetCountdown(ms("2026-09-18T11:00:00Z"), NOW)).toBe("in 23 h");
+    expect(formatResetCountdown(ms("2026-09-18T11:29:00Z"), NOW)).toBe("in 23 h");
+  });
+
+  it("never renders a zero unit at a unit boundary", () => {
+    // `minutes` escalates at a rounded 60 and `hours` at a rounded 24, so the
+    // next unit down must never itself round to zero.
+    expect(formatResetCountdown(ms("2026-09-17T12:59:31Z"), NOW)).toBe("in 1 h");
+    expect(formatResetCountdown(ms("2026-09-18T11:31:00Z"), NOW)).toBe("in 1 d");
+  });
+
+  it("crosses from hours to days at 24 hours", () => {
+    expect(formatResetCountdown(ms("2026-09-18T11:59:00Z"), NOW)).toBe("in 1 d");
+    expect(formatResetCountdown(ms("2026-09-18T12:00:00Z"), NOW)).toBe("in 1 d");
+  });
+
+  it("renders a passed reset as 'now', never a negative countdown", () => {
+    expect(formatResetCountdown(ms("2026-09-17T09:30:00Z"), NOW)).toBe("now");
+    expect(formatResetCountdown(NOW.getTime(), NOW)).toBe("now");
   });
 });

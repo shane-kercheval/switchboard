@@ -26,6 +26,7 @@ import { render } from "vitest-browser-svelte";
 import SidebarHost from "./SidebarHost.svelte";
 import { PROJECT_ID, ALICE } from "./fixtures";
 import { setRecipients, _testing as selectionState } from "$lib/state/recipientSelection.svelte";
+import { layout } from "$lib/layout.svelte";
 import type { AgentRecord } from "$lib/types";
 
 // Two extra agents to give the roster a real layout to measure against.
@@ -57,10 +58,14 @@ const CAROL: AgentRecord = {
 
 const THREE_AGENTS = [ALICE, BOB, CAROL];
 
+const LONG_ALICE: AgentRecord = { ...ALICE, name: "shared-agent-a" };
+const LONG_BOB: AgentRecord = { ...BOB, name: "shared-agent-b" };
+
 beforeEach(() => {
   reorderAgentsMock.mockReset();
   reorderAgentsMock.mockResolvedValue(undefined);
   selectionState.reset();
+  layout.agentsSidebarWidth = 280;
 });
 
 test("selected recipients keep a thin accent outline at rest and on hover", async () => {
@@ -106,28 +111,112 @@ test("the clickable card surface gains an outline and icon controls retain disti
 // CSS visibility — what jsdom physically cannot exercise
 // ---------------------------------------------------------------------------
 
-// The grip is display:none by default, so it reserves no empty slot. Hover
-// reveals it at the far right and intentionally shifts the harness icon left.
-test("drag grip is unreserved by default and appears at the far right on hover", async () => {
+// Hover controls give their width back when hidden: the card's header reserves
+// no gutter for them, so the name owns the full column until they are revealed.
+// This pins both halves — nothing reserved at rest, and revealing the cluster
+// stays inside the card rather than pushing the identity icon out of it.
+test("hover controls reserve no width at rest and stay inside the card when revealed", async () => {
   render(SidebarHost, { projectId: PROJECT_ID, agents: THREE_AGENTS });
 
-  // All three grips start hidden (Tailwind `hidden` = display:none).
   for (let i = 0; i < 3; i++) {
     await expect.element(page.getByTestId("agent-drag-grip").nth(i)).not.toBeVisible();
   }
 
   const card = page.getByTestId("sidebar-agent").nth(0);
+  const name = page.getByTestId("agent-name").nth(0).element() as HTMLElement;
   const harness = page.getByTestId("agent-harness-icon").nth(0).element() as HTMLElement;
-  const harnessXBeforeHover = harness.getBoundingClientRect().x;
-  await card.hover();
+  const eye = page.getByTestId("agent-visibility-toggle").nth(0).element() as HTMLElement;
+  const actions = page.getByTestId("agent-actions-trigger").nth(0).element() as HTMLElement;
 
+  // At rest the three hidden controls are literally zero-width, so the gap the
+  // name leaves is slack it did not need — not a gutter held for them.
+  for (const control of [eye, actions]) {
+    expect(control.getBoundingClientRect().width).toBe(0);
+  }
+  // The name's column, not the text span: a short name sizes its span to
+  // content, so the column is where the reclaimed width actually shows up.
+  const nameColumn = name.parentElement;
+  if (nameColumn === null) throw new Error("expected the name to sit in a column");
+  const restingColumnWidth = nameColumn.getBoundingClientRect().width;
+  const restingHarnessX = harness.getBoundingClientRect().x;
+
+  await card.hover();
   await expect.element(page.getByTestId("agent-drag-grip").nth(0)).toBeVisible();
-  expect(
-    (page.getByTestId("agent-drag-grip").nth(0).element() as HTMLElement).getBoundingClientRect().x,
-  ).toBeGreaterThan(harness.getBoundingClientRect().x);
-  expect(harness.getBoundingClientRect().x).toBeLessThan(harnessXBeforeHover);
+  await expect.poll(() => eye.getBoundingClientRect().width).toBeGreaterThan(20);
+
+  // Revealing them costs the name width — the trade this design makes, and the
+  // reason the name carries a tooltip — but the cluster stays ordered and
+  // wholly inside the card.
+  const gripRect = (
+    page.getByTestId("agent-drag-grip").nth(0).element() as HTMLElement
+  ).getBoundingClientRect();
+  expect(gripRect.x).toBeGreaterThanOrEqual(harness.getBoundingClientRect().right);
+  expect(card.element().getBoundingClientRect().right - gripRect.right).toBeGreaterThanOrEqual(8);
+  expect(harness.getBoundingClientRect().x).toBeLessThan(restingHarnessX);
+  expect(nameColumn.getBoundingClientRect().width).toBeLessThan(restingColumnWidth);
   // Other cards' grips are unaffected.
   await expect.element(page.getByTestId("agent-drag-grip").nth(1)).not.toBeVisible();
+});
+
+// The gutter used to cost the name 59px at the default width while it was
+// clipped by 39px. Reclaiming it is the whole point, so pin the outcome: a
+// realistic long name reads in full at rest.
+test("a long agent name reads in full at the default width once nothing is reserved", async () => {
+  await page.viewport(1600, 900);
+  layout.agentsSidebarWidth = 280;
+  const longName = "claude-fable-claude-fable";
+  render(SidebarHost, {
+    projectId: PROJECT_ID,
+    agents: [{ ...ALICE, name: longName }, BOB],
+  });
+
+  const name = page.getByTestId("agent-name").first();
+  await expect.element(name).toHaveAttribute("data-truncated", "false");
+  const el = name.element() as HTMLElement;
+  expect(el.scrollWidth - el.clientWidth).toBe(0);
+  expect(el.textContent?.trim()).toBe(longName);
+});
+
+// The reserved action gutter is what narrows this column, so these record the
+// price it charges: at which widths a realistic name clips, and that the full
+// value is recoverable at every one of them. `data-truncated` is the component's
+// own measurement, so the assertion tracks what actually drives the tooltip
+// rather than re-deriving it here.
+test.each([
+  { width: 280, truncated: "false" },
+  { width: 240, truncated: "true" },
+  { width: 200, truncated: "true" },
+])("the full agent name remains available at a $width px sidebar", async ({ width, truncated }) => {
+  await page.viewport(1600, 900);
+  layout.agentsSidebarWidth = width;
+  render(SidebarHost, { projectId: PROJECT_ID, agents: [LONG_ALICE, LONG_BOB, CAROL] });
+
+  const card = page.getByTestId("sidebar-agent").first();
+  const name = page.getByTestId("agent-name").first();
+  await expect.element(name).toHaveAttribute("data-truncated", truncated);
+  const nameElement = name.element() as HTMLElement;
+  expect(nameElement.scrollWidth - nameElement.clientWidth > 1).toBe(truncated === "true");
+  // Keyboard users never reach the hover tooltip (it is not focusable), so the
+  // card's own accessible name has to carry the full value.
+  await expect.element(card).toHaveAccessibleName(/shared-agent-a/);
+});
+
+test("a clipped agent name reveals its full value on hover; a fitting one stays quiet", async () => {
+  await page.viewport(1600, 900);
+  layout.agentsSidebarWidth = 200;
+  render(SidebarHost, { projectId: PROJECT_ID, agents: [LONG_ALICE, LONG_BOB, CAROL] });
+
+  const clipped = page.getByTestId("agent-name").first();
+  await expect.element(clipped).toHaveAttribute("data-truncated", "true");
+  await clipped.hover();
+  await expect.element(page.getByTestId("tooltip-content")).toHaveTextContent("shared-agent-a");
+
+  // CAROL's name fits even at the floor, so hovering it must not raise a
+  // tooltip that only repeats text already on screen.
+  const fitting = page.getByTestId("agent-name").nth(2);
+  await expect.element(fitting).toHaveAttribute("data-truncated", "false");
+  await fitting.hover();
+  await expect.poll(() => document.querySelector('[data-testid="tooltip-content"]')).toBeNull();
 });
 
 test("pointer focus does not pin a card's hover controls after the pointer leaves", async () => {
@@ -156,6 +245,9 @@ test("keyboard focus reveals the card controls and keeps them visible within the
   expect(firstCard.element().matches(":focus-visible")).toBe(true);
   await expect.element(page.getByTestId("agent-actions-trigger").nth(0)).toBeVisible();
 
+  const collapse = page.getByTestId("agent-collapse-toggle").nth(0).element() as HTMLElement;
+  collapse.focus();
+  expect(document.activeElement).toBe(collapse);
   await userEvent.tab();
   expect(document.activeElement).toBe(page.getByTestId("agent-visibility-toggle").nth(0).element());
   await expect.element(page.getByTestId("agent-actions-trigger").nth(0)).toBeVisible();

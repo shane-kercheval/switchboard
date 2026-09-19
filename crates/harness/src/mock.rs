@@ -101,12 +101,25 @@ pub enum MockScenario {
     /// requiring a subprocess.
     CodexPostTerminalEnrichment,
 
-    /// Emits `ContentChunk → TurnEnd(Completed) → RateLimitEvent` with the
-    /// given [`RateLimitSource`]. The vehicle for the dispatcher's
-    /// metadata-persistence durability-gate test: run once with `StreamOnly`
-    /// (must persist) and once with `SessionFileBacked` (must not), asserting
-    /// the injected `MetadataCache`.
+    /// Emits `ContentChunk → TurnEnd(Completed) → RateLimitEvent → SessionMeta`
+    /// with matching durability sources. The vehicle for the dispatcher's
+    /// rate-limit persistence gate and its rate-before-model repair: run once
+    /// with `StreamOnly` (must persist, then pair the model) and once with
+    /// `SessionFileBacked` (must not), asserting the injected `MetadataCache`.
     RateLimitWithSource(crate::events::RateLimitSource),
+
+    /// Emits Claude's ordinary ordering: `SessionMeta → RateLimitEvent →
+    /// TurnEnd(Completed)`, with the same model on the metadata and terminal.
+    /// The dispatcher should persist the complete snapshot once rather than
+    /// rewriting it when the terminal repeats the already-known model.
+    RateLimitAfterModel,
+
+    /// Emits `ContentChunk → TurnEnd(Completed) → SessionMeta` whose
+    /// inventory names one MCP server, tagged with the given
+    /// [`SessionMetaSource`]. The inventory counterpart of
+    /// [`Self::RateLimitWithSource`]: run once with `StreamOnly` (must
+    /// persist) and once with `SessionFileBacked` (must not).
+    SessionMetaWithSource(crate::events::SessionMetaSource),
 
     /// Emits `ContentChunk → TurnEnd(Completed)` whose `usage` carries the given
     /// context occupancy and `context_window`, tagged with the given
@@ -236,6 +249,23 @@ pub enum MockScenario {
         end_stream: std::sync::Arc<tokio::sync::Notify>,
         fail: bool,
     },
+
+    /// A **context report** stream (served by
+    /// [`MockHarnessAdapter::context_report`], never by `dispatch`):
+    /// `ContextReport → TurnEnd(Completed)`. No content chunks and no usage — a
+    /// report streams no answer and makes no model call.
+    ReportsContext,
+
+    /// A **context report** stream that ends `Liveness → TurnEnd(Failed {
+    /// HarnessError })` — the CLI failing to produce a report at all. Distinct
+    /// from an *unreadable* report, which completes successfully carrying raw
+    /// text (that path is the parser's, not the dispatcher's).
+    ContextReportFails,
+
+    /// A **context report** stream that emits one `Liveness`, then awaits the
+    /// cancellation token and ends without a terminal — the report mirror of
+    /// [`Self::CompactionAwaitsCancellation`].
+    ContextReportAwaitsCancellation,
 }
 
 impl MockScenario {
@@ -251,6 +281,46 @@ impl MockScenario {
                 | Self::CompactionAwaitsCancellation
                 | Self::CompactionOnSignals { .. }
         )
+    }
+
+    /// Whether this scenario scripts a **context report** stream rather than a
+    /// send. Same mis-wiring guard as [`Self::is_compaction`].
+    fn is_context_report(&self) -> bool {
+        matches!(
+            self,
+            Self::ReportsContext | Self::ContextReportFails | Self::ContextReportAwaitsCancellation
+        )
+    }
+}
+
+/// The report a mock context report carries: enough structure for a consumer to
+/// render a panel, and deliberately exact (no `approximate` rows) — the mock
+/// stands in for the structured path, which is the one production prefers.
+fn mock_context_report() -> crate::context_report::ContextReport {
+    crate::context_report::ContextReport {
+        model: Some("mock-model".to_owned()),
+        total_tokens: Some(48_000),
+        max_tokens: Some(200_000),
+        categories: vec![
+            crate::context_report::ContextCategory {
+                name: "System prompt".to_owned(),
+                tokens: 4_000,
+                kind: "used".to_owned(),
+                approximate: false,
+            },
+            crate::context_report::ContextCategory {
+                name: "Messages".to_owned(),
+                tokens: 44_000,
+                kind: "used".to_owned(),
+                approximate: false,
+            },
+        ],
+        mcp_tools: Vec::new(),
+        memory_files: Vec::new(),
+        agents: Vec::new(),
+        skills: Vec::new(),
+        raw: "## Context Usage".to_owned(),
+        unparsed: false,
     }
 }
 
@@ -292,6 +362,31 @@ fn compaction_terminal(turn_id: TurnId, fail: bool) -> AdapterEvent {
         usage: (!fail).then(compaction_usage),
         context_window_source: None,
         // A compaction makes no assistant call, so it has neither key.
+        stable_message_id: None,
+        first_message_id: None,
+        spend: None,
+        model: None,
+        effort: None,
+    }
+}
+
+/// The terminal a mock context report ends on. Carries **no usage**: the report
+/// makes no model call, so a zero-valued usage record would make the newest
+/// usage-bearing turn a free one with no context window.
+fn context_report_terminal(turn_id: TurnId, fail: bool) -> AdapterEvent {
+    AdapterEvent::TurnEnd {
+        turn_id,
+        outcome: if fail {
+            TurnOutcome::Failed {
+                kind: crate::events::FailureKind::HarnessError,
+                message: "the harness could not produce a context report".to_owned(),
+            }
+        } else {
+            TurnOutcome::Completed
+        },
+        ended_at: Utc::now(),
+        usage: None,
+        context_window_source: None,
         stable_message_id: None,
         first_message_id: None,
         spend: None,
@@ -352,6 +447,12 @@ impl HarnessAdapter for MockHarnessAdapter {
             return Err(DispatchError::UnsupportedOperation {
                 harness: agent.harness,
                 operation: "a send against a compaction-only mock scenario",
+            });
+        }
+        if self.scenario.is_context_report() {
+            return Err(DispatchError::UnsupportedOperation {
+                harness: agent.harness,
+                operation: "a send against a context-report-only mock scenario",
             });
         }
 
@@ -597,13 +698,17 @@ impl HarnessAdapter for MockHarnessAdapter {
                         agent_id,
                         model: "gpt-test".to_owned(),
                         harness_version: "0.130.0".to_owned(),
-                        tools: vec![],
-                        mcp_servers: vec![crate::events::McpServerStatus {
-                            name: "fs".to_owned(),
-                            status: "connected".to_owned(),
-                        }],
-                        skills: vec![],
+                        inventory: crate::events::SessionInventory {
+                            mcp_servers: Some(vec![crate::events::McpServerStatus {
+                                name: "fs".to_owned(),
+                                status: "connected".to_owned(),
+                                source: None,
+                            }]),
+                            skills: Some(vec![]),
+                            ..crate::events::SessionInventory::default()
+                        },
                         raw: serde_json::Value::Null,
+                        source: crate::events::SessionMetaSource::SessionFileBacked,
                     });
                 });
             }
@@ -629,6 +734,89 @@ impl HarnessAdapter for MockHarnessAdapter {
                     let _ = tx.send(AdapterEvent::RateLimitEvent {
                         agent_id,
                         info: serde_json::json!({"primary": {"used_percent": 42.0}}),
+                        source,
+                    });
+                    let meta_source = if source == crate::events::RateLimitSource::StreamOnly {
+                        crate::events::SessionMetaSource::StreamOnly
+                    } else {
+                        crate::events::SessionMetaSource::SessionFileBacked
+                    };
+                    let _ = tx.send(AdapterEvent::SessionMeta {
+                        agent_id,
+                        model: "mock-fable".to_owned(),
+                        harness_version: "test".to_owned(),
+                        inventory: crate::events::SessionInventory::default(),
+                        raw: serde_json::Value::Null,
+                        source: meta_source,
+                    });
+                });
+            }
+            MockScenario::RateLimitAfterModel => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::SessionMeta {
+                        agent_id,
+                        model: "mock-fable".to_owned(),
+                        harness_version: "test".to_owned(),
+                        inventory: crate::events::SessionInventory::default(),
+                        raw: serde_json::Value::Null,
+                        source: crate::events::SessionMetaSource::StreamOnly,
+                    });
+                    let _ = tx.send(AdapterEvent::RateLimitEvent {
+                        agent_id,
+                        info: serde_json::json!({"primary": {"used_percent": 42.0}}),
+                        source: crate::events::RateLimitSource::StreamOnly,
+                    });
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        first_message_id: None,
+                        spend: None,
+                        model: Some("mock-fable".to_owned()),
+                        effort: None,
+                    });
+                });
+            }
+            MockScenario::SessionMetaWithSource(source) => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        first_message_id: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                    });
+                    let _ = tx.send(AdapterEvent::SessionMeta {
+                        agent_id,
+                        model: "test-model".to_owned(),
+                        harness_version: "0.0.0".to_owned(),
+                        inventory: crate::events::SessionInventory {
+                            mcp_servers: Some(vec![crate::events::McpServerStatus {
+                                name: "tiddly".to_owned(),
+                                status: "needs-auth".to_owned(),
+                                source: None,
+                            }]),
+                            ..crate::events::SessionInventory::default()
+                        },
+                        raw: serde_json::Value::Null,
                         source,
                     });
                 });
@@ -916,7 +1104,10 @@ impl HarnessAdapter for MockHarnessAdapter {
             | MockScenario::CompactsSuccessfully
             | MockScenario::CompactionFails
             | MockScenario::CompactionAwaitsCancellation
-            | MockScenario::CompactionOnSignals { .. } => {
+            | MockScenario::CompactionOnSignals { .. }
+            | MockScenario::ReportsContext
+            | MockScenario::ContextReportFails
+            | MockScenario::ContextReportAwaitsCancellation => {
                 // Handled by the early returns above.
                 unreachable!()
             }
@@ -975,6 +1166,56 @@ impl HarnessAdapter for MockHarnessAdapter {
                 return Err(DispatchError::UnsupportedOperation {
                     harness: agent.harness,
                     operation: "manual context compaction",
+                });
+            }
+        }
+
+        Ok(Box::pin(UnboundedReceiverStream::new(rx)))
+    }
+
+    async fn context_report(
+        &self,
+        agent: &AgentRecord,
+        _cwd: &Path,
+        turn_id: TurnId,
+        options: crate::DispatchOptions,
+    ) -> Result<EventStream, DispatchError> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent_id = agent.id;
+
+        match self.scenario {
+            MockScenario::ReportsContext => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContextReport {
+                        agent_id,
+                        report: mock_context_report(),
+                        at: Utc::now(),
+                    });
+                    let _ = tx.send(context_report_terminal(turn_id, false));
+                });
+            }
+            MockScenario::ContextReportFails => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::Liveness { turn_id });
+                    let _ = tx.send(context_report_terminal(turn_id, true));
+                });
+            }
+            MockScenario::ContextReportAwaitsCancellation => {
+                let cancel_token = options.cancel_token.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::Liveness { turn_id });
+                    // Park until cancelled, then end the stream with no terminal
+                    // event — the dispatcher synthesizes Cancelled.
+                    cancel_token.cancelled().await;
+                });
+            }
+            // Same reasoning as `compact` above: overriding the method replaces
+            // the trait's refusing default, so reproduce it for every scenario
+            // that does not script a report.
+            _ => {
+                return Err(DispatchError::UnsupportedOperation {
+                    harness: agent.harness,
+                    operation: "context breakdown",
                 });
             }
         }

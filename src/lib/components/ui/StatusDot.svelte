@@ -2,27 +2,40 @@
   /// Small filled dot signalling run state, token-driven so it themes in light
   /// and dark. Used where a label would be too heavy (e.g. the "background
   /// activity" indicator on a non-active project row).
+  ///
+  /// `"success"` and `"warning"` are accepted alongside the run statuses for
+  /// healthy and caution states that are not themselves agent run states. They
+  /// stay outside `BadgeStatus` so environment health does not expand the
+  /// run-state vocabulary; warning also keeps its independent semantic token,
+  /// so re-tuning run colors cannot alter caution states.
   import { cn } from "$lib/utils";
   import type { BadgeStatus } from "$lib/status";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
 
   type Props = {
-    status: BadgeStatus;
+    status: BadgeStatus | "success" | "warning";
     /// When set, the dot is the sole status signal: exposes an accessible name
     /// + tooltip. When omitted, the dot is decorative (a sibling text label
     /// carries the meaning) and is hidden from assistive tech.
     label?: string;
+    /// Whether a labelled dot joins the Tab order. Keep this false when the
+    /// dot sits inside a focus-managed surface such as a popover; its label
+    /// remains exposed to assistive technology and its tooltip still opens on
+    /// hover.
+    focusable?: boolean;
     testid?: string;
     class?: string;
   };
 
-  let { status, label, testid, class: className }: Props = $props();
+  let { status, label, focusable = true, testid, class: className }: Props = $props();
 
-  const DOT: Record<BadgeStatus, string> = {
+  const DOT: Record<BadgeStatus | "success" | "warning", string> = {
     idle: "bg-status-idle",
     processing: "bg-status-processing",
     failed: "bg-status-failed",
     cancelled: "bg-status-cancelled",
+    success: "bg-accent",
+    warning: "bg-warning",
   };
 </script>
 
@@ -38,7 +51,7 @@
 {/snippet}
 
 {#if label}
-  <Tooltip {label}>{#snippet trigger(props)}{@render dot(props)}{/snippet}</Tooltip>
+  <Tooltip {label} {focusable}>{#snippet trigger(props)}{@render dot(props)}{/snippet}</Tooltip>
 {:else}
   {@render dot()}
 {/if}

@@ -44,7 +44,14 @@ import type {
   SendId,
   TurnId,
 } from "$lib/types";
-import type { AgentRuntime, PendingSend, ToolCall, Turn, TurnItem } from "./types";
+import type {
+  AgentRuntime,
+  ContextReportRequest,
+  PendingSend,
+  ToolCall,
+  Turn,
+  TurnItem,
+} from "./types";
 
 export function transcriptReducer(
   turns: Turn[],
@@ -65,10 +72,21 @@ export function transcriptReducer(
   // lookup, for the three events that consume an entry (`turn_start`,
   // `message_failed`, `message_cancelled`) — a compaction renders as its own row,
   // or as no row at all, where a send renders a response.
-  pendingKind?: "compaction",
+  //
+  // A `"context_report"` entry renders **nothing on every one of those three
+  // paths**. A report is not conversation, so it has no row at any phase — which
+  // is exactly why its outcome has to live somewhere else
+  // (`AgentRuntime.context_report_request`), and why "no row" cannot be relaxed
+  // to "no row unless it failed."
+  pendingKind?: "compaction" | "context_report",
 ): Turn[] {
   switch (input.type) {
     case "turn_start": {
+      // A context report never becomes a turn. Guarded in each of the three
+      // arms rather than once at the top of the function, because `pendingKind`
+      // is only supplied for these three events today — a single early return
+      // would start silently dropping content the moment that changed.
+      if (pendingKind === "context_report") return turns;
       // Defense-in-depth: duplicate turn_start (dispatcher bug, late retry
       // delivery) must not append a second agent turn with the same id —
       // the unified-view's `{#each ... (turn_id)}` keyed render would
@@ -159,7 +177,9 @@ export function transcriptReducer(
       // without a row. Nothing ran, and there is no user message for a
       // "cancelled" row to sit under — unlike a cancelled queued send, whose row
       // renders beneath the prompt the user did type.
-      if (pendingKind === "compaction") return turns;
+      // A report adds nothing on this path either — its cancellation shows in
+      // the panel, which is the only place it was ever visible.
+      if (pendingKind === "compaction" || pendingKind === "context_report") return turns;
       const turn_id = `cancelled-${input.message_id}`;
       if (findTurn(turns, turn_id) !== undefined) return turns;
       return [
@@ -192,6 +212,10 @@ export function transcriptReducer(
       // Idempotent on the derived `turn_id` (the failed turn itself carries
       // `sendId`, so a re-delivery is skipped by this same guard).
       if (sendId === undefined) return turns;
+      // A failed report has no row to fail in. This is the case that forces
+      // `AgentRuntime.context_report_request` to exist: the failure has to be
+      // legible somewhere, and the panel is the only surface it has.
+      if (pendingKind === "context_report") return turns;
       if (turns.some((t) => t.role === "agent" && t.send_id === sendId)) return turns;
       return appendFailedTurnImpl(
         turns,
@@ -585,7 +609,74 @@ function loadedItemToItem(item: LoadedTurnItem): TurnItem {
   };
 }
 
+/// Advance `runtime.context_report_request` for the four events that can move
+/// it, and return the runtime unchanged when this event is not the request's.
+///
+/// **Correlation is by the request's own ids, not by a pending-send lookup.**
+/// The pending entry is consumed by `turn_start`, so by `turn_end` there is
+/// nothing left to ask what the turn was — and the whole reason this record
+/// exists is that a report has no transcript row to carry that answer.
+///
+/// `send_id` is matched alongside `message_id` because of the pre-receipt race:
+/// `turn_start` can arrive before the `context_report_agent` IPC resolves, so
+/// the request may not know its own `message_id` yet.
+///
+/// A pre-start **failure** has neither id available — the dispatcher journals
+/// nothing for a maintenance turn, so its `message_failed` carries
+/// `send_id: null` — and is therefore matched through the queued work item
+/// instead. Getting that wrong strands the request at `queued` forever: the
+/// panel's button is disabled while a request is in flight, and that button is
+/// the only way to start another one.
+function advanceContextReportRequest(runtime: AgentRuntime, input: ReducerInput): AgentRuntime {
+  const request = runtime.context_report_request;
+  if (request === undefined) return runtime;
+  const settled = (next: ContextReportRequest): AgentRuntime => ({
+    ...runtime,
+    context_report_request: next,
+  });
+  switch (input.type) {
+    case "turn_start":
+      if (
+        request.phase !== "queued" ||
+        (input.message_id !== request.message_id && input.send_id !== request.send_id)
+      ) {
+        return runtime;
+      }
+      return settled({ ...request, phase: "running", turn_id: input.turn_id });
+    case "turn_end":
+      if (request.turn_id !== input.turn_id) return runtime;
+      if (input.outcome.status === "completed") return settled({ ...request, phase: "done" });
+      if (input.outcome.status === "cancelled") return settled({ ...request, phase: "cancelled" });
+      return settled({ ...request, phase: "failed", error: input.outcome.message });
+    case "message_failed": {
+      if (input.message_id === request.message_id) {
+        return settled({ ...request, phase: "failed", error: input.error });
+      }
+      // No id match: resolve the entry this failure is about the same way the
+      // runtime's own `message_failed` arm does, and claim it when that entry is
+      // this request's. Safe to read here because this function runs *before*
+      // that arm removes it.
+      const index = pickPendingIndex(
+        runtime.pending_sends,
+        input.message_id,
+        input.send_id ?? undefined,
+      );
+      const entry = index >= 0 ? runtime.pending_sends?.[index] : undefined;
+      if (entry?.kind !== "context_report" || entry.send_id !== request.send_id) return runtime;
+      return settled({ ...request, phase: "failed", error: input.error });
+    }
+    case "message_cancelled":
+      if (input.message_id !== request.message_id && input.send_id !== request.send_id) {
+        return runtime;
+      }
+      return settled({ ...request, phase: "cancelled" });
+    default:
+      return runtime;
+  }
+}
+
 export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): AgentRuntime {
+  runtime = advanceContextReportRequest(runtime, input);
   switch (input.type) {
     case "turn_start":
       // Backend-confirmed dispatch: `starting → processing`. The
@@ -614,6 +705,11 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
           runtime.pending_sends,
           pickPendingIndex(runtime.pending_sends, input.message_id, input.send_id),
         ),
+        // Per-turn and reset here. `meta` itself deliberately survives (other
+        // consumers read it across turns); what must not survive is the claim
+        // that its model describes *this* turn — a turn that dies before its
+        // `init` must not lend its model to the next turn's quota reading.
+        current_turn_model: undefined,
       };
 
     case "message_failed": {
@@ -667,10 +763,13 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // on the per-agent channel (Codex). `AgentIdle` is the signal for
       // "dispatcher will accept a new send." This is the load-bearing
       // distinction that makes the compose-bar gate correct for Codex.
-      // Completed and cancelled are not errors — leave runtime untouched
-      // (AgentIdle clears in_flight_turn_id). Only a real failure surfaces
-      // last_error.
-      if (input.outcome.status === "completed" || input.outcome.status === "cancelled") {
+      // Completed and cancelled are not errors — leave `last_error` untouched
+      // (AgentIdle clears in_flight_turn_id). Only a real failure surfaces it.
+      //
+      // A quota refusal is **not** recorded here: it is a fact about the harness
+      // account rather than this agent, so the live-event boundary routes it to
+      // the account-scoped store instead (`harnessUsage.svelte.ts`).
+      if (input.outcome.status === "cancelled" || input.outcome.status === "completed") {
         return runtime.quiet_since !== undefined ? { ...runtime, quiet_since: undefined } : runtime;
       }
       return {
@@ -728,9 +827,14 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       }
       return { ...runtime, quiet_since: undefined };
 
-    case "session_meta":
+    case "session_meta": {
+      // An empty model carries no model info (see below), so it records no
+      // per-turn observation. The label a late `init` repairs now lives on the
+      // account-scoped reading, patched at the event boundary rather than here.
+      const observed = input.model !== "" ? input.model : undefined;
       return {
         ...runtime,
+        current_turn_model: observed ?? runtime.current_turn_model,
         meta: {
           // Empty model means "no model info on this event," not "set the
           // model to blank." Antigravity only reports a model when the
@@ -740,27 +844,50 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
           // model, so this is a no-op for them.
           model: input.model !== "" ? input.model : (runtime.meta?.model ?? ""),
           harness_version: input.harness_version,
-          tools: input.tools,
-          mcp_servers: input.mcp_servers,
-          skills: input.skills,
+          // The whole inventory is replaced, never merged with the previous
+          // event's: what the harness reports is what it has loaded *now*, and
+          // keeping a list it stopped reporting would show a registry the
+          // agent no longer has.
+          inventory: input.inventory,
         },
+        // A live event is not a snapshot, so the staleness qualifier is
+        // meaningless — cleared to null exactly as `rate_limit_event` clears
+        // its own, never stamped `now`.
+        meta_as_of: null,
       };
+    }
 
     case "rate_limit_event":
-      // A live event overwrites the in-memory value; the `as_of` qualifier
-      // (the on-disk snapshot's age) is meaningless once live data lands, so
-      // clear it to null — never stamp `now`, which would spuriously age an
-      // actively-streaming session past the staleness threshold.
-      return { ...runtime, last_rate_limit: input.info, last_rate_limit_as_of: null };
+      // **Nothing per-agent to store.** The reading is a fact about the harness
+      // account, so it goes to `harnessUsage.svelte.ts` from the live-event
+      // boundary; keeping a copy here is what made N agent cards disagree about
+      // one account's quota. The event is still routed through this reducer so
+      // an unknown discriminant cannot fall through to a crash.
+      return runtime;
+
+    case "context_report":
+      // A live report replaces whatever was there **and keeps its own capture
+      // time** rather than clearing it the way a live rate-limit event clears
+      // its qualifier. Nothing refreshes a breakdown, so "live" here means
+      // "measured just now", not "current from now on". The request this answers
+      // is advanced by `turn_end`, not here: the event arrives before the
+      // terminal, and a request is not done until the turn is.
+      return {
+        ...runtime,
+        last_context_report: input.report,
+        last_context_report_at: input.at,
+      };
 
     case "hydrate": {
-      // **Fill-if-empty for scalars.** Live `session_meta` and
-      // `rate_limit_event` always overwrite; `hydrate.meta` /
-      // `hydrate.last_rate_limit` only fill when the runtime field is
-      // currently absent. Naturally handles a slow hydrate resolving
-      // after a live event already populated the same field — the late
-      // hydrate sees `Some(_)` and no-ops. Pinned by the
-      // `live_wins_over_subsequent_hydrate` test below.
+      // **Fill-if-empty for scalars.** A live `session_meta` always overwrites;
+      // `hydrate.meta` only fills when the runtime field is currently absent.
+      // Naturally handles a slow hydrate resolving after a live event already
+      // populated the same field — the late hydrate sees a value and no-ops.
+      // Pinned by the `live_wins_over_subsequent_hydrate` test below.
+      //
+      // The hydrated quota reading is **not** filled in here: it is account state,
+      // offered to `harnessUsage.svelte.ts` from `applyAgentHydrate` where it is
+      // ranked against every other agent's reading rather than stored per agent.
       const next: AgentRuntime = {
         ...runtime,
         hydration_status: "complete",
@@ -769,18 +896,19 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         next.meta = {
           model: input.meta.model,
           harness_version: input.meta.harness_version,
-          tools: input.meta.tools,
-          mcp_servers: input.meta.mcp_servers,
-          skills: input.meta.skills,
+          inventory: input.meta.inventory,
         };
+        // Carried beside the meta it qualifies and only when the meta is
+        // actually taken: an "as of" without the snapshot it describes would
+        // age a live inventory.
+        next.meta_as_of = input.meta_as_of ?? null;
       }
-      if (next.last_rate_limit === undefined && input.last_rate_limit != null) {
-        // Fill `last_rate_limit` and its `as_of` together — they're one unit.
-        // Only when the runtime had no value: if a live event already
-        // populated it (and cleared `as_of` to null), this no-ops and the
-        // live value + its null `as_of` stay in place.
-        next.last_rate_limit = input.last_rate_limit;
-        next.last_rate_limit_as_of = input.last_rate_limit_as_of ?? null;
+      if (next.last_context_report === undefined && input.last_context_report != null) {
+        // Same unit-of-two fill: a report and the moment it was taken. A live
+        // event that already landed keeps both, so a slow hydrate cannot replace
+        // a fresh measurement with an older one.
+        next.last_context_report = input.last_context_report;
+        next.last_context_report_at = input.last_context_report_at ?? undefined;
       }
       return next;
     }

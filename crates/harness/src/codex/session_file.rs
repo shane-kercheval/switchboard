@@ -6,8 +6,8 @@
 //! the **only** source for:
 //! - `event_msg/task_started.payload.model_context_window` →
 //!   `TurnEnd.usage.context_window` (per-turn).
-//! - `event_msg/token_count.rate_limits` (non-null variant only) →
-//!   `RateLimitEvent.info` (per-turn).
+//! - `event_msg/token_count.rate_limits` (window-bearing records only — see
+//!   [`rate_limits_carry_window`]) → `RateLimitEvent.info` (per-turn).
 //! - `event_msg/token_count.info.last_token_usage` → per-turn token usage
 //!   overlaid onto `TurnEnd.usage`. The stream's `turn.completed.usage` is
 //!   **not** per-turn — codex-rs populates it from the thread-cumulative
@@ -64,7 +64,10 @@ use serde_json::Value;
 use switchboard_core::AgentId;
 use uuid::Uuid;
 
-use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnUsage};
+use crate::events::{
+    ContentKind, McpServerStatus, SessionInventory, SettingPair, SkillEntry, ToolKind, TurnId,
+    TurnUsage,
+};
 use crate::transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
     TurnStatus, merge_meta_with_loaders,
@@ -72,6 +75,7 @@ use crate::transcript::{
 
 use super::config::load_mcp_servers;
 use super::skills::load_skills;
+use super::world_state::{self, WorldState};
 
 /// Per-attempt backoff between session-file read tries. Codex writes the
 /// session file synchronously per `docs/research/archive/codex-cli-observed.md`; by
@@ -90,11 +94,28 @@ pub struct Enrichment {
     /// From the last `event_msg/task_started` record in the file. Used to
     /// fill `TurnEnd.usage.context_window`.
     pub context_window: Option<u32>,
-    /// From the last `event_msg/token_count` record with non-null
-    /// `rate_limits`. Used as `RateLimitEvent.info`. Carried as raw JSON
+    /// From the last `event_msg/token_count` record whose `rate_limits`
+    /// actually carries a window (see [`rate_limits_carry_window`] — non-null
+    /// is not enough). Used as `RateLimitEvent.info`. Carried as raw JSON
     /// because the rate-limit shape is "opaque to consumers" per
     /// `docs/system-design.md`.
     pub rate_limits: Option<Value>,
+    /// The record-level timestamp of the line [`Self::rate_limits`] was taken
+    /// from, so a reading can be ordered against readings from other agents.
+    ///
+    /// Captured because the quota is **account-scoped**: every agent on this
+    /// harness reports the same account's windows, so the display picks the
+    /// newest reading across all of them and needs a comparable instant for
+    /// each. A live event can be stamped on arrival, but a reading recovered
+    /// from a rollout on project open cannot — the only record of when it was
+    /// measured is the line itself.
+    ///
+    /// Always set and cleared **together with** [`Self::rate_limits`]: a
+    /// reading whose age is unknown cannot be ordered, and a timestamp with no
+    /// reading describes nothing. `None` when the record carries no parseable
+    /// timestamp, which leaves the reading orderable only as "older than
+    /// anything stamped."
+    pub rate_limits_observed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// From `session_meta.payload.cli_version` (line 1). Used for
     /// `SessionMeta.harness_version`.
     pub cli_version: Option<String>,
@@ -133,6 +154,15 @@ pub struct Enrichment {
     /// or the record carries no parseable timestamp (warned — a format change
     /// there would otherwise silently retire cancel-path identity recovery).
     pub current_turn_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The **current turn's** `task_complete.error.codex_error_info` — Codex's
+    /// own classification of why the turn ended badly (`usage_limit_exceeded`,
+    /// `context_window_exceeded`, …; the binary's `CodexErrorInfo` enum). The
+    /// adapter uses it to type the terminal outcome without matching prose.
+    /// Turn-scoped (reset at each `task_started`) for the same reason as
+    /// [`Self::per_turn_usage`]: a turn that ended cleanly must never inherit
+    /// the previous turn's verdict. `None` when the turn's `task_complete`
+    /// carried no `error`, or none with a string `codex_error_info`.
+    pub current_turn_error_info: Option<String>,
     /// The full `session_meta` line as JSON, with
     /// `payload.base_instructions.text` replaced by a sentinel. Used as
     /// `SessionMeta.raw`. `None` if line 1 isn't a `session_meta` record.
@@ -148,6 +178,20 @@ pub struct Enrichment {
     /// `context_window` is left `None` here; the adapter overlays it
     /// separately from the `task_started`-derived [`Self::context_window`].
     pub per_turn_usage: Option<TurnUsage>,
+    /// The skills Codex loaded, parsed out of `world_state.state.host_skills`
+    /// — a markdown block written for the model, and the only source that
+    /// exists (see `world_state` module docs). `None` when the rollout carries
+    /// no `world_state`, which is what an older Codex writes; the config-file
+    /// scanner then fills the list instead.
+    pub skills: Option<Vec<SkillEntry>>,
+    /// The user's approved-command allowlist from
+    /// `world_state.state.permissions.approved_command_prefixes`, each argv
+    /// prefix joined into one command line.
+    pub approved_commands: Option<Vec<String>>,
+    /// Codex's run settings as display pairs — sandbox, approval policy,
+    /// personality, shell, timezone — from the last `turn_context` and the
+    /// accumulated `world_state`.
+    pub settings: Option<Vec<SettingPair>>,
     /// The **current turn's** content-bearing `Edit` facets, in record order —
     /// mode-selected single source: legacy `apply_patch` calls /
     /// `patch_apply_end` events on legacy rollouts, `item_completed/FileChange`
@@ -504,21 +548,61 @@ fn absorb_session_meta(payload: &Value, enrichment: &mut Enrichment) -> HistoryM
     mode
 }
 
-/// The record-level timestamp of a `task_started` line — the freshness proof
-/// for cancel-path identity recovery ([`Enrichment::current_turn_started_at`]).
-/// Absent/unparseable reads as `None` — **fail-closed** (the freshness check
-/// rejects, no identity is recovered). Deliberately silent here: this parse
-/// runs on every enrichment read, where freshness is never consulted; the one
-/// consumer that consults it (the Codex cancel path) owns the
-/// missing-timestamp breadcrumb, so the warn fires exactly when missing data
-/// prevented an otherwise-possible recovery — never about values nothing read.
-fn task_started_timestamp(value: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+/// A rollout record's own `timestamp`, read by the two enrichment fields that
+/// need to know *when* something in the file happened:
+/// [`Enrichment::current_turn_started_at`] (the freshness proof for cancel-path
+/// identity recovery) and [`Enrichment::rate_limits_observed_at`] (the ordering
+/// key for a quota reading).
+///
+/// Absent/unparseable reads as `None` — **fail-closed** for both consumers: the
+/// freshness check rejects and no identity is recovered, and an unstamped
+/// reading loses to any stamped one. Deliberately silent here: this parse runs
+/// on every enrichment read, where neither value is necessarily consulted, so
+/// the consumer that needs a breadcrumb owns it and the warn fires exactly when
+/// missing data changed an outcome — never about values nothing read.
+fn record_timestamp(value: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
     value
         .get("timestamp")
         .and_then(Value::as_str)
         .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
 }
 
+/// Whether a `token_count.rate_limits` value carries a usage window, and so
+/// may supersede the previously captured one.
+///
+/// **Non-null is not enough.** On quota exhaustion Codex keeps emitting
+/// `rate_limits`, but switches it to a different limit that reports no window
+/// at all — observed `{"limit_id":"premium","primary":null,"secondary":null,
+/// "credits":{"has_credits":false,"balance":"0"},…}`, arriving 78 seconds
+/// after the same session read `primary.used_percent: 100.0`. Treating that as
+/// a snapshot erased the last real reading, so the meters vanished at exactly
+/// the moment the number mattered — and permanently for a session whose last
+/// such record was windowless. It is not a measurement of a window; it says
+/// nothing about one. So it is skipped, and the last real reading stands until
+/// its own `resets_at` passes.
+///
+/// Names `primary` / `secondary` deliberately, mirroring the frontend's
+/// `codexRateLimitView` key-for-key: the invariant worth holding is that
+/// anything captured here is something that reader can render, so the two
+/// cannot disagree about what "has a window" means. A key-agnostic scan for
+/// any nested `used_percent` would be more rename-tolerant but would also
+/// accept a window the reader ignores (`individual_limit` is unread and its
+/// shape unobserved), reintroducing the same silent-erase. If Codex ever
+/// renames these keys, this captures nothing and the card holds the last good
+/// reading until it expires, which is the safe direction to fail.
+fn rate_limits_carry_window(rate_limits: &Value) -> bool {
+    ["primary", "secondary"].iter().any(|key| {
+        rate_limits
+            .get(key)
+            .and_then(|window| window.get("used_percent"))
+            .is_some_and(Value::is_number)
+    })
+}
+
+// One pass over the rollout feeding a dozen independent last-wins /
+// turn-scoped fields; splitting it would mean threading the same accumulators
+// through helpers for no readability gain.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn parse_session_content(content: &str) -> Enrichment {
     let mut enrichment = Enrichment::default();
@@ -531,6 +615,15 @@ pub fn parse_session_content(content: &str) -> Enrichment {
     // Running shell cwd (turn_context precedes the turn's tool records) —
     // resolves relative apply_patch paths; observed paths are absolute.
     let mut current_cwd: Option<std::path::PathBuf> = None;
+    // Folded across every `world_state` record rather than taken from the last
+    // one — those records are snapshot-plus-delta (see the `world_state`
+    // module doc), so the last is routinely a one-key update.
+    let mut world = WorldState::default();
+    // The last `turn_context` payload, kept whole for the settings projection.
+    // Last-wins for the same reason the per-turn model is: these are the
+    // *current* turn's selections, and the card describes the agent as it
+    // stands now.
+    let mut last_turn_context: Option<Value> = None;
 
     for (idx, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
@@ -584,6 +677,12 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         .get("cwd")
                         .and_then(Value::as_str)
                         .map(std::path::PathBuf::from);
+                    last_turn_context = Some(p.clone());
+                }
+            }
+            "world_state" => {
+                if let Some(p) = payload {
+                    world.absorb(p);
                 }
             }
             // Gated like the reconstruction path's text arms: patch facets
@@ -632,21 +731,36 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         // When the file's current turn began — the freshness
                         // proof the cancel path's identity recovery compares
                         // against its dispatch instant (see the field doc).
-                        enrichment.current_turn_started_at = task_started_timestamp(&value);
+                        enrichment.current_turn_started_at = record_timestamp(&value);
                         // Turn-scoped for the same reason: the facet upgrade
                         // must never replay a *previous* turn's patches onto
                         // this turn's file_change rows.
                         enrichment.patch_facets.clear();
                         patch_call_ids.clear();
+                        // Turn-scoped verdict, same rule: a clean turn must
+                        // never read as the previous turn's failure.
+                        enrichment.current_turn_error_info = None;
+                    }
+                    "task_complete" => {
+                        enrichment.current_turn_error_info = p
+                            .get("error")
+                            .and_then(|e| e.get("codex_error_info"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
                     }
                     "token_count" => {
                         // Two variants share this type; each feeds a different
                         // enrichment field and either may be null on a given
                         // record. Last-record-wins for both, independently.
                         if let Some(rate_limits) = p.get("rate_limits")
-                            && !rate_limits.is_null()
+                            && rate_limits_carry_window(rate_limits)
                         {
                             enrichment.rate_limits = Some(rate_limits.clone());
+                            // One unit with the reading above: overwritten on
+                            // every window-bearing record so the stamp always
+                            // describes the reading being kept, never an
+                            // earlier one that a later record superseded.
+                            enrichment.rate_limits_observed_at = record_timestamp(&value);
                         }
                         if let Some(usage) = p
                             .get("info")
@@ -667,6 +781,12 @@ pub fn parse_session_content(content: &str) -> Enrichment {
             }
             _ => {}
         }
+    }
+
+    if !world.is_empty() {
+        enrichment.skills = world.skills();
+        enrichment.approved_commands = world.approved_commands();
+        enrichment.settings = world_state::settings(&world, last_turn_context.as_ref());
     }
 
     enrichment
@@ -884,7 +1004,7 @@ pub async fn load_with_retry(
 pub fn build_session_meta_fields(
     enrichment: &Enrichment,
     mcp_servers: Vec<McpServerStatus>,
-    skills: Vec<String>,
+    scanned_skills: Vec<SkillEntry>,
 ) -> Option<SessionMetaFields> {
     if enrichment.model.is_none() && enrichment.cli_version.is_none() {
         return None;
@@ -892,21 +1012,48 @@ pub fn build_session_meta_fields(
     Some(SessionMetaFields {
         model: enrichment.model.clone().unwrap_or_default(),
         harness_version: enrichment.cli_version.clone().unwrap_or_default(),
-        mcp_servers,
-        skills,
+        inventory: enrichment.inventory(Some(mcp_servers), Some(scanned_skills)),
         raw: enrichment.session_meta_raw.clone().unwrap_or(Value::Null),
     })
 }
 
 /// Fields ready to plug into [`crate::events::AdapterEvent::SessionMeta`].
-/// `tools` is always `vec![]` for Codex — no equivalent registry source on
-/// disk; kept implicit on the adapter side rather than carried here.
 pub struct SessionMetaFields {
     pub model: String,
     pub harness_version: String,
-    pub mcp_servers: Vec<McpServerStatus>,
-    pub skills: Vec<String>,
+    pub inventory: SessionInventory,
     pub raw: Value,
+}
+
+impl Enrichment {
+    /// Project the rollout-derived inventory, letting the config loaders fill
+    /// only what the rollout did not report — the same replace-not-fill rule
+    /// [`crate::transcript::merge_meta_with_loaders`] applies on reload, so a
+    /// live `SessionMeta` and a reloaded one agree.
+    ///
+    /// MCP servers have no rollout source at all (Codex records its loaded
+    /// servers nowhere — not the stream, not the rollout), so they are always
+    /// the loader's, carrying the `"configured"` status that says so. `tools`
+    /// stays `None` for the same absence: claiming zero tools would be a
+    /// statement Codex never made.
+    #[must_use]
+    pub fn inventory(
+        &self,
+        mcp_servers: Option<Vec<McpServerStatus>>,
+        scanned_skills: Option<Vec<SkillEntry>>,
+    ) -> SessionInventory {
+        SessionInventory {
+            tools: None,
+            mcp_servers,
+            skills: self.skills.clone().or(scanned_skills),
+            agents: None,
+            plugins: None,
+            memory_paths: None,
+            slash_commands: None,
+            approved_commands: self.approved_commands.clone(),
+            settings: self.settings.clone(),
+        }
+    }
 }
 
 /// Load a Codex session file and project it into a
@@ -943,8 +1090,8 @@ pub fn load_codex_transcript(
         return Ok(LoadedTranscript {
             meta: Some(merge_meta_with_loaders(
                 None,
-                load_mcp_servers(home_dir, cwd),
-                load_skills(home_dir, cwd),
+                Some(load_mcp_servers(home_dir, cwd)),
+                Some(scanned_skill_entries(home_dir, cwd)),
             )),
             ..LoadedTranscript::default()
         });
@@ -960,10 +1107,22 @@ pub fn load_codex_transcript(
     let mut transcript = parse_codex_transcript_content(&content, agent_id);
     transcript.meta = Some(merge_meta_with_loaders(
         transcript.meta.take(),
-        load_mcp_servers(home_dir, cwd),
-        load_skills(home_dir, cwd),
+        Some(load_mcp_servers(home_dir, cwd)),
+        Some(scanned_skill_entries(home_dir, cwd)),
     ));
     Ok(transcript)
+}
+
+/// The skills-directory scan as inventory entries — the pre-first-turn
+/// fallback only. Once the agent has run, the rollout's `host_skills` block is
+/// the authority and replaces this outright (`merge_meta_with_loaders`),
+/// because the scanner reads only the two documented roots and Codex loads
+/// more (see `skills.rs`).
+fn scanned_skill_entries(home_dir: &Path, cwd: &Path) -> Vec<SkillEntry> {
+    load_skills(home_dir, cwd)
+        .into_iter()
+        .map(SkillEntry::from_name)
+        .collect()
 }
 
 /// Parse Codex session-file content into a `LoadedTranscript` (no FS access).
@@ -993,13 +1152,15 @@ pub(crate) fn parse_codex_transcript_content(content: &str, agent_id: AgentId) -
     // rate_limits, then merge into our LoadedTranscript shape. Single source
     // of truth for meta fields.
     let enrichment = parse_session_content(content);
-    t.last_rate_limit = enrichment.rate_limits;
+    t.last_rate_limit.clone_from(&enrichment.rate_limits);
+    t.last_rate_limit_observed_at = enrichment.rate_limits_observed_at;
+    // The rollout's own inventory only — the config loaders are layered on in
+    // `load_codex_transcript`, which is the one place that knows the home and
+    // working directories.
     t.meta = Some(SessionMetaInfo {
-        model: enrichment.model.unwrap_or_default(),
-        harness_version: enrichment.cli_version.unwrap_or_default(),
-        tools: vec![],
-        mcp_servers: vec![],
-        skills: vec![],
+        model: enrichment.model.clone().unwrap_or_default(),
+        harness_version: enrichment.cli_version.clone().unwrap_or_default(),
+        inventory: enrichment.inventory(None, None),
     });
     t
 }
@@ -2763,9 +2924,10 @@ impl CodexReconstruction {
         LoadedTranscript {
             turns: self.turns,
             meta: None,
-            last_rate_limit: None,
-            last_rate_limit_as_of: None,
             warnings: self.warnings,
+            // Codex records no `/context` breakdown — the marker's only producer
+            // is the Claude parser.
+            ..LoadedTranscript::default()
         }
     }
 }
@@ -3352,6 +3514,213 @@ mod tests {
         snapshots
     }
 
+    /// The recorded `world_state` rollout (codex 0.154.0 — the version is in
+    /// the fixture's own `session_meta.cli_version`). The real block carries
+    /// ~30 skills across 7 roots and a 4.7 KB allowlist; the fixture keeps
+    /// three skills spanning two roots and three commands.
+    fn world_state_fixture() -> Enrichment {
+        let content = std::fs::read_to_string(fixture_path("world-state.session.jsonl")).unwrap();
+        parse_session_content(&content)
+    }
+
+    #[test]
+    fn world_state_fixture_yields_skills_with_descriptions_and_expanded_paths() {
+        let skills = world_state_fixture().skills.expect("host_skills parsed");
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["imagegen", "skill-creator", "data-analytics:build-report"]
+        );
+        assert!(
+            skills.iter().all(|s| s.description.is_some()),
+            "every recorded entry carries a description: {skills:?}"
+        );
+        assert_eq!(
+            skills[2].path.as_deref(),
+            Some(
+                "/Users/example/.codex/plugins/cache/openai-curated-remote/data-analytics/1.0.9/skills/build-report/SKILL.md"
+            ),
+            "the root abbreviation must expand to the absolute path"
+        );
+    }
+
+    #[test]
+    fn world_state_fixture_yields_the_settings_pairs() {
+        let settings = world_state_fixture().settings.expect("settings parsed");
+        let rendered: Vec<(&str, &str)> = settings
+            .iter()
+            .map(|p| (p.label.as_str(), p.value.as_str()))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("Sandbox", "read-only"),
+                ("Approval policy", "never"),
+                ("Personality", "pragmatic"),
+                ("Shell", "zsh"),
+                ("Timezone", "America/Los_Angeles"),
+            ]
+        );
+    }
+
+    #[test]
+    fn world_state_fixture_yields_the_approved_command_allowlist() {
+        assert_eq!(
+            world_state_fixture().approved_commands,
+            Some(vec![
+                "brew install clerk/stable/clerk".to_owned(),
+                "clerk whoami".to_owned(),
+                "ls".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_rollout_without_world_state_reports_no_inventory() {
+        // An older Codex writes no `world_state` record at all. Every list
+        // must stay absent so the config-file scanner can still fill what it
+        // can — `Some([])` here would blank the card's sections instead.
+        let content = std::fs::read_to_string(fixture_path("rate-limits.session.jsonl")).unwrap();
+        let enrichment = parse_session_content(&content);
+        assert_eq!(enrichment.skills, None);
+        assert_eq!(enrichment.approved_commands, None);
+        assert_eq!(enrichment.settings, None);
+        assert!(
+            enrichment.inventory(None, None).is_empty(),
+            "no runtime source reported anything"
+        );
+    }
+
+    #[test]
+    fn the_rollout_skills_replace_the_scanned_ones() {
+        // Decision: once the agent has run, the rollout is the authority. The
+        // directory scanner reads only the two documented roots while Codex
+        // loads more, so appending the scan to the rollout's list would show
+        // skills as loaded that Codex never mentioned.
+        let inventory = world_state_fixture().inventory(
+            None,
+            Some(vec![SkillEntry::from_name("scanned-only".to_owned())]),
+        );
+        let names: Vec<&str> = inventory
+            .skills
+            .as_deref()
+            .expect("skills present")
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"scanned-only"),
+            "the scan must not append to the rollout's list: {names:?}"
+        );
+        assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn the_scanned_skills_fill_in_when_the_rollout_reports_none() {
+        let content = std::fs::read_to_string(fixture_path("rate-limits.session.jsonl")).unwrap();
+        let inventory = parse_session_content(&content).inventory(
+            None,
+            Some(vec![SkillEntry::from_name("scanned-only".to_owned())]),
+        );
+        assert_eq!(
+            inventory.skills,
+            Some(vec![SkillEntry::from_name("scanned-only".to_owned())])
+        );
+    }
+
+    #[test]
+    fn load_codex_transcript_prefers_the_rollout_skills_over_the_scanner() {
+        // The one place the two sources actually meet on disk. The scanner
+        // directory is deliberately **disjoint** from the rollout's skills: a
+        // union would be visible as four entries, and appending would show
+        // `scanner-only` as loaded when Codex never mentioned it.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let session_id = "00000000-0000-7000-8000-000000000001";
+
+        let skill_dir = home.path().join(".agents/skills/scanner-only");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# scanner-only").unwrap();
+        // Prove the scanner can see it, so a pass below is precedence rather
+        // than a mis-staged directory.
+        assert_eq!(
+            load_skills(home.path(), cwd.path()),
+            vec!["scanner-only".to_owned()],
+            "the staged scanner directory must be readable"
+        );
+
+        let dir = session_directory(home.path(), date);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(
+            fixture_path("world-state.session.jsonl"),
+            dir.join(format!("rollout-2026-01-01T00-00-00-{session_id}.jsonl")),
+        )
+        .unwrap();
+
+        let loaded = load_codex_transcript(
+            home.path(),
+            cwd.path(),
+            session_id,
+            Some(date),
+            Uuid::now_v7(),
+        )
+        .unwrap();
+        let inventory = loaded.meta.expect("meta present").inventory;
+        let names: Vec<&str> = inventory
+            .skills
+            .as_deref()
+            .expect("skills present")
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["imagegen", "skill-creator", "data-analytics:build-report"],
+            "the rollout is the authority once the agent has run"
+        );
+        // The MCP list is the one with no rollout source at all, so the config
+        // loader still fills it — with the status that says so.
+        assert!(
+            inventory
+                .mcp_servers
+                .as_ref()
+                .is_some_and(|servers| servers.iter().all(|s| s.status == "configured")),
+            "MCP servers stay loader-backed: {:?}",
+            inventory.mcp_servers
+        );
+    }
+
+    #[test]
+    fn load_codex_transcript_falls_back_to_the_scanner_before_the_first_turn() {
+        // A never-dispatched agent has no rollout at all, so the scanner is
+        // what the card shows — labelled as configured, not loaded.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let skill_dir = home.path().join(".agents/skills/scanner-only");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# scanner-only").unwrap();
+
+        let loaded =
+            load_codex_transcript(home.path(), cwd.path(), "", None, Uuid::now_v7()).unwrap();
+        let inventory = loaded.meta.expect("meta present").inventory;
+        assert_eq!(
+            inventory.skills,
+            Some(vec![SkillEntry::from_name("scanner-only".to_owned())])
+        );
+        assert!(
+            loaded.meta_as_of.is_none(),
+            "the loaders are re-read every open — nothing to age"
+        );
+    }
+
+    #[test]
+    fn codex_never_claims_a_tool_inventory() {
+        // Codex records its tools nowhere — not the stream, not the rollout.
+        // `None` says that; `Some([])` would claim it loaded zero tools.
+        assert_eq!(world_state_fixture().inventory(None, None).tools, None);
+    }
+
     #[test]
     fn parse_rate_limits_fixture_extracts_all_four_fields() {
         let content = std::fs::read_to_string(fixture_path("rate-limits.session.jsonl")).unwrap();
@@ -3594,6 +3963,140 @@ mod tests {
         assert_eq!(
             rate_limits.pointer("/primary/used_percent"),
             Some(&Value::from(50.0))
+        );
+    }
+
+    #[test]
+    fn parse_stamps_the_rate_limit_reading_with_its_own_records_timestamp() {
+        // The reading and its stamp move together, so the stamp describes the
+        // reading that was kept rather than the last timestamp seen in the
+        // file. Here a *windowless* record follows the one that wins: it
+        // supersedes neither, so neither the percent nor the stamp advances.
+        let content = r#"
+{"type":"event_msg","timestamp":"2026-09-18T19:00:00.000Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0,"resets_at":1789845487}}}}
+{"type":"event_msg","timestamp":"2026-09-18T20:30:00.000Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":50.0,"resets_at":1789845487}}}}
+{"type":"event_msg","timestamp":"2026-09-18T20:31:00.000Z","payload":{"type":"token_count","rate_limits":{"limit_id":"premium","primary":null,"secondary":null}}}
+"#;
+        let enrichment = parse_session_content(content);
+        assert_eq!(
+            enrichment
+                .rate_limits
+                .as_ref()
+                .and_then(|r| r.pointer("/primary/used_percent")),
+            Some(&Value::from(50.0))
+        );
+        assert_eq!(
+            enrichment.rate_limits_observed_at,
+            Some(
+                "2026-09-18T20:30:00Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .expect("fixture timestamp parses")
+            ),
+            "the stamp must name the record the kept reading came from"
+        );
+    }
+
+    #[test]
+    fn parse_stamps_no_observation_time_when_the_record_carries_no_timestamp() {
+        // Orderable only as "older than anything stamped". The reading itself is
+        // still taken — an unknown measurement time is a reason to rank a
+        // reading last, never a reason to discard a real window.
+        let content = r#"
+{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0}}}}
+"#;
+        let enrichment = parse_session_content(content);
+        assert!(enrichment.rate_limits.is_some(), "the reading still stands");
+        assert_eq!(enrichment.rate_limits_observed_at, None);
+    }
+
+    #[test]
+    fn parse_keeps_last_window_when_quota_exhaustion_reports_none() {
+        // Verbatim shape from a rollout that hit its weekly cap: Codex switched
+        // `limit_id` to "premium" and reported no window at all. Non-null, so
+        // the old guard took it and the card lost every meter at the moment the
+        // number mattered. The 100% reading has to stand.
+        let content = r#"
+{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":100.0,"window_minutes":10080,"resets_at":1789845487},"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":"prolite","rate_limit_reached_type":null}}}
+{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"premium","limit_name":null,"primary":null,"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}
+"#;
+        let enrichment = parse_session_content(content);
+        let rate_limits = enrichment.rate_limits.expect("rate_limits captured");
+        assert_eq!(
+            rate_limits.pointer("/primary/used_percent"),
+            Some(&Value::from(100.0)),
+            "a windowless payload must not supersede the last real window"
+        );
+    }
+
+    #[test]
+    fn parse_captures_no_rate_limits_when_every_record_is_windowless() {
+        // The same shape with no good predecessor: nothing to hold, so nothing
+        // is claimed. Reachable — a session whose last activity was hitting the
+        // cap ends on exactly this record, and it is all the reload path sees.
+        let content = r#"
+{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"premium","primary":null,"secondary":null,"credits":{"has_credits":false,"balance":"0"}}}}
+"#;
+        let enrichment = parse_session_content(content);
+        assert!(
+            enrichment.rate_limits.is_none(),
+            "a payload with no window is not a snapshot of one"
+        );
+    }
+
+    #[test]
+    fn parse_captures_the_current_turns_error_info_and_resets_it_per_turn() {
+        // Verbatim from a rollout: a turn rejected at the weekly cap ends on a
+        // `task_complete` whose `error` carries Codex's own classification. The
+        // next turn's `task_started` must clear it — a turn that completes
+        // cleanly cannot inherit the previous one's verdict.
+        let rejected = r#"
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1","last_agent_message":null,"error":{"message":"You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 19th, 2026 12:18 PM.","codex_error_info":"usage_limit_exceeded"}}}
+"#;
+        assert_eq!(
+            parse_session_content(rejected)
+                .current_turn_error_info
+                .as_deref(),
+            Some("usage_limit_exceeded")
+        );
+
+        let then_clean = format!(
+            "{rejected}\n{}\n{}\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t-2"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-2","last_agent_message":"ok"}}"#,
+        );
+        assert_eq!(
+            parse_session_content(&then_clean).current_turn_error_info,
+            None,
+            "a clean turn must not inherit the previous turn's error info"
+        );
+
+        // A `task_complete` with an `error` but no string classification reads
+        // as unclassified, not as a stale value.
+        let unclassified = r#"
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1","error":{"message":"boom"}}}
+"#;
+        assert_eq!(
+            parse_session_content(unclassified).current_turn_error_info,
+            None
+        );
+    }
+
+    #[test]
+    fn parse_takes_a_secondary_only_window() {
+        // The guard reads both keys, not just `primary`: which window a plan
+        // reports is plan-dependent (on `prolite` `secondary` is null and
+        // `primary` is the weekly one), so requiring `primary` would drop a
+        // shape the frontend renders fine.
+        let content = r#"
+{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":null,"secondary":{"used_percent":7.0,"window_minutes":10080,"resets_at":1800600000}}}}
+"#;
+        let enrichment = parse_session_content(content);
+        let rate_limits = enrichment.rate_limits.expect("rate_limits captured");
+        assert_eq!(
+            rate_limits.pointer("/secondary/used_percent"),
+            Some(&Value::from(7.0))
         );
     }
 
@@ -4843,6 +5346,77 @@ not valid json
                 .unwrap();
         let rl = result.last_rate_limit.unwrap();
         assert_eq!(rl["primary"]["used_percent"].as_f64(), Some(10.0));
+        // The measured instant rides out with the reading. Codex's reading is
+        // recovered from the file rather than received live, so this is the only
+        // thing that can order it against another agent's reading of the same
+        // account quota.
+        assert_eq!(
+            result.last_rate_limit_observed_at,
+            Some(
+                "2026-05-14T19:33:23Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn load_codex_transcript_keeps_the_last_window_past_a_quota_exhausted_record() {
+        // The reload path, which is where this was permanent: on project open
+        // the file is all we have, so a trailing windowless record used to be
+        // the whole answer and the agent came back with no usage limits at all.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3366";
+        let windowed = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:23Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": null,
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": 1_789_845_487_i64 },
+                    "secondary": null,
+                    "plan_type": "prolite",
+                }
+            }
+        });
+        let exhausted = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:24Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": null,
+                "rate_limits": {
+                    "limit_id": "premium",
+                    "primary": null,
+                    "secondary": null,
+                    "credits": { "has_credits": false, "unlimited": false, "balance": "0" },
+                    "plan_type": null,
+                }
+            }
+        });
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.6-sol", "2026-05-14T19:33:20Z"),
+            user_message("hi", "2026-05-14T19:33:21Z"),
+            agent_message("ok", "2026-05-14T19:33:22Z"),
+            windowed,
+            exhausted,
+            task_complete(session_id, "2026-05-14T19:33:25Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let rl = result
+            .last_rate_limit
+            .expect("the real window survives a trailing windowless record");
+        assert_eq!(rl["primary"]["used_percent"].as_f64(), Some(100.0));
     }
 
     #[test]

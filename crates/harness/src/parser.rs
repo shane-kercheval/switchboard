@@ -1546,7 +1546,21 @@ fn strip_local_command_stdout(text: &str) -> Option<&str> {
 }
 
 fn parse_rate_limit_event(obj: &Value, agent_id: AgentId, state: &mut ParserState) -> ParseOutcome {
-    let info = obj.get("rate_limit_info").cloned().unwrap_or(Value::Null);
+    // No payload, no event. `rate_limit_info` is the whole content of this
+    // record, and the runtime field it feeds is last-write-wins: emitting a
+    // `Null` for a record that carried nothing would erase the last real
+    // snapshot from memory *and* overwrite the metadata sidecar that exists to
+    // survive restart — losing every window over a record that reported no
+    // window. Only reachable if the CLI stops carrying the field, which is
+    // precisely when silently discarding good data is worst. Skipping leaves
+    // the previous snapshot standing; each window still self-expires at its own
+    // reset.
+    let Some(info) = obj.get("rate_limit_info").cloned().filter(|v| !v.is_null()) else {
+        tracing::warn!(
+            "Claude rate_limit_event carried no rate_limit_info — keeping the previous snapshot; CLI version may have changed"
+        );
+        return ParseOutcome::Skip;
+    };
 
     // Stash the overage state so the terminal `result` can stamp this turn's
     // `TurnSpend`. `isUsingOverage` is the real-spend signal for Claude (the
@@ -2648,6 +2662,25 @@ mod tests {
                 assert_eq!(source, crate::events::RateLimitSource::StreamOnly);
             }
             _ => panic!("expected RateLimitEvent"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_event_without_a_payload_emits_nothing() {
+        // The payload is the whole record, and the runtime field it feeds is
+        // last-write-wins over a metadata sidecar that exists to survive
+        // restart — so an empty record must not be lifted into an event that
+        // erases the last real snapshot. Skipping keeps it.
+        let mut state = ParserState::default();
+        for line in [
+            r#"{"type":"rate_limit_event"}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":null}"#,
+        ] {
+            let outcome = parse_line(line, tid(), aid(), &mut state);
+            assert!(
+                matches!(outcome, ParseOutcome::Skip),
+                "a payload-less rate_limit_event must not emit an event: {line}"
+            );
         }
     }
 

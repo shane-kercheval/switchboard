@@ -683,6 +683,45 @@ async fn run_producer(
     }
 }
 
+/// Re-type a failed outcome from the rollout's own classification of the turn.
+///
+/// The stream's `turn.failed` carries only prose, so the parser can type a
+/// failure only where the text is unmistakable (auth). The rollout's
+/// `task_complete.error.codex_error_info` is Codex's enum for the same
+/// failure, read from the same enrichment pass that fills everything else —
+/// so this is where a quota rejection becomes `UsageLimit` rather than a
+/// generic `HarnessError` that reads "You've hit your usage limit" only to a
+/// human. The message is kept verbatim: it carries the reset time and the
+/// credits link, which is what the user acts on.
+///
+/// Only a `HarnessError` is re-typed. An `AdapterFailure` is ours, not the
+/// harness's, and an `AuthFailure` was already typed from a stronger signal;
+/// neither should be overwritten by a file that may describe a different
+/// turn (the no-locator path, a flush race). `Completed` and `Cancelled` pass
+/// through untouched.
+///
+/// **The match is deliberately narrow.** `CodexErrorInfo` has siblings that
+/// look quota-shaped — `rate_limit_exceeded` above all — and none has been
+/// observed, so none is mapped: if that one is a transient throttle rather
+/// than an exhausted window, drawing a full meter for a seconds-long wait
+/// would be a fresh wrong number. See the gap-register entry in
+/// `docs/harness-behavior.md`; one probe against an exhausted short window
+/// settles it.
+fn classify_outcome(outcome: TurnOutcome, enrichment: &Enrichment) -> TurnOutcome {
+    match outcome {
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } if enrichment.current_turn_error_info.as_deref() == Some("usage_limit_exceeded") => {
+            TurnOutcome::Failed {
+                kind: FailureKind::UsageLimit,
+                message,
+            }
+        }
+        other => other,
+    }
+}
+
 /// Run the post-terminal enrichment cycle for a parser-emitted `TurnEnd`:
 ///
 /// 1. Locate the rollout file from the passed-in locator (`thread_id` +
@@ -694,7 +733,9 @@ async fn run_producer(
 ///    numbers (see [`apply_per_turn_usage`]) and the enriched
 ///    `context_window` overlays `usage.context_window`; if `usage` was
 ///    `None` we don't fabricate a `TurnUsage` from enrichment alone
-///    (preserves the strict "None means unparseable" contract).
+///    (preserves the strict "None means unparseable" contract). A failed
+///    outcome is re-typed from the rollout's own classification first
+///    (see [`classify_outcome`]).
 /// 4. Emit `RateLimitEvent` if rate-limit info was extracted.
 /// 5. Emit `SessionMeta` if the enrichment yielded a model or `cli_version`.
 ///
@@ -747,7 +788,7 @@ async fn emit_terminal_with_enrichment(
         .map(|_| crate::events::ContextWindowSource::SessionFileBacked);
     let _ = tx.send(AdapterEvent::TurnEnd {
         turn_id,
-        outcome,
+        outcome: classify_outcome(outcome, &enrichment),
         ended_at,
         usage: enriched_usage,
         context_window_source,
@@ -1449,6 +1490,53 @@ mod tests {
         };
         assert_eq!(files[0].path, "/tmp/old.txt");
         assert_eq!(files[0].moved_to.as_deref(), Some("/tmp/new.txt"));
+    }
+
+    #[test]
+    fn classify_outcome_types_a_quota_rejection_from_the_rollouts_verdict() {
+        let quota = Enrichment {
+            current_turn_error_info: Some("usage_limit_exceeded".to_owned()),
+            ..Enrichment::default()
+        };
+        let message = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 19th, 2026 12:18 PM.";
+        let failed = |kind: FailureKind| TurnOutcome::Failed {
+            kind,
+            message: message.to_owned(),
+        };
+
+        // The generic failure the stream parser produced becomes typed, with
+        // the harness's own text intact — the reset time lives in it.
+        assert_eq!(
+            classify_outcome(failed(FailureKind::HarnessError), &quota),
+            failed(FailureKind::UsageLimit)
+        );
+        // Stronger or non-harness classifications are not overwritten.
+        assert_eq!(
+            classify_outcome(failed(FailureKind::AuthFailure), &quota),
+            failed(FailureKind::AuthFailure)
+        );
+        assert_eq!(
+            classify_outcome(failed(FailureKind::AdapterFailure), &quota),
+            failed(FailureKind::AdapterFailure)
+        );
+        assert_eq!(
+            classify_outcome(TurnOutcome::Completed, &quota),
+            TurnOutcome::Completed
+        );
+
+        // Another classification, or none, leaves the generic kind alone.
+        let other = Enrichment {
+            current_turn_error_info: Some("context_window_exceeded".to_owned()),
+            ..Enrichment::default()
+        };
+        assert_eq!(
+            classify_outcome(failed(FailureKind::HarnessError), &other),
+            failed(FailureKind::HarnessError)
+        );
+        assert_eq!(
+            classify_outcome(failed(FailureKind::HarnessError), &Enrichment::default()),
+            failed(FailureKind::HarnessError)
+        );
     }
 
     /// The offline twin of `live_codex_apply_patch_emits_edit_facet` for the

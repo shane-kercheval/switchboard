@@ -266,11 +266,11 @@ export type ContextReportRequest = {
 ///   when combined with `hydration_status`. After a failed turn, the agent
 ///   IS sendable again — `run_status` flips back to `"idle"` on `AgentIdle`
 ///   regardless of whether the turn succeeded or failed.
-/// - `last_error`: runtime record of the most-recent failure. Failures are
-///   rendered in the transcript (a failed agent turn), not in the sidebar, so
-///   this is not a display surface today; it is kept for devtools/logging and
-///   future retry UX. Does NOT gate Send. Cleared on the next successful
-///   `turn_end`.
+/// - `last_error`: runtime record of the most-recent failure. The failure
+///   itself is rendered in the transcript (a failed agent turn); the sidebar
+///   reads only its *kind*, to draw a usage window as full after a
+///   `usage_limit` refusal. Does NOT gate Send. Cleared when the next turn
+///   starts.
 /// - `in_flight_turn_id`: heartbeat scope. The turn the timer is tracking.
 ///
 /// Conflating these (e.g., a status enum with `"errored"`) would force the
@@ -365,6 +365,30 @@ export type AgentRuntime = {
   /// gate sendability. (A heartbeat timeout no longer sets this — a silent turn
   /// isn't a failure; see `quiet_since`.)
   last_error?: { message: string; kind: FailureKind };
+  /// Whether the harness is currently refusing this agent's work because a
+  /// usage window is exhausted. Read by the sidebar, which draws the agent's
+  /// most-used window full and amber while it is `true`.
+  ///
+  /// **Deliberately not derived from `last_error`.** Being out of quota is a
+  /// fact about the account that outlives a turn, and `last_error` is cleared
+  /// at every `turn_start` — so a card driven from it dropped back to the
+  /// stale measurement for the few seconds each retry took, then flipped
+  /// amber again when the retry was refused.
+  ///
+  /// **Only a *completed* turn clears it.** A cancellation is the user's
+  /// doing and an unrelated failure (a network error mid-retry) is no
+  /// evidence the quota moved; clearing on either would reproduce the same
+  /// defect on a slower clock. Nothing else needs to: a window whose reset has
+  /// passed is dropped by `codexRateLimitView`, so a stale `true` has nothing
+  /// left to decorate. The residual is narrow and self-correcting — a quota
+  /// that has genuinely reset still reads "limit reached" if the first turn
+  /// after the reset fails for an unrelated reason, until the next turn
+  /// completes.
+  ///
+  /// **Tri-state on purpose.** `undefined` is "no terminal observed yet", which
+  /// is what lets `hydrate` fill it from the journal without overwriting a
+  /// live verdict; a live terminal always writes a definite `true`/`false`.
+  usage_limit_reached?: boolean;
   /// Populated by live `SessionMeta` events or by disk hydration of the
   /// agent's session file. Undefined on agents whose first dispatch
   /// hasn't happened yet.

@@ -1106,6 +1106,7 @@ export async function hydrateProject(
 
     // eslint-disable-next-line svelte/prefer-svelte-reactivity
     const metaByAgent = new Map(convo.agents.map((m) => [m.agent_id, m]));
+    const standingRefusals = agentsStandingRefused(convo.items);
     // eslint-disable-next-line svelte/prefer-svelte-reactivity
     const agentIds = new Set<AgentId>([
       ...turnsByAgent.keys(),
@@ -1140,7 +1141,14 @@ export async function hydrateProject(
       // extra `AgentConversationMeta` keys (`agent_id`, `warnings`,
       // `load_error`) ride along inert — the builder reads only the fields it
       // declares, and supplies the authoritative agent id itself.
-      applyAgentHydrate(agentId, { turns: turnsByAgent.get(agentId) ?? [], ...meta });
+      applyAgentHydrate(agentId, {
+        turns: turnsByAgent.get(agentId) ?? [],
+        ...meta,
+        // Always definite, never null: the journal is authoritative for this
+        // project's history, so "no standing refusal" is a reading rather than
+        // an absence of one.
+        usage_limit_reached: standingRefusals.has(agentId),
+      });
     }
 
     conversations[projectId] = { items: overlay, status: "complete" };
@@ -1168,6 +1176,56 @@ export async function hydrateProject(
     }
     return "failed";
   }
+}
+
+/// The agents whose newest journaled outcome is a usage-limit refusal with no
+/// turn run since — i.e. the ones the harness was still refusing when the app
+/// last saw them. Restores `AgentRuntime.usage_limit_reached` on reopen, so
+/// the card draws the same full window it drew before the restart.
+///
+/// "Run since" is decided by identity first and time second. The refused turn
+/// usually *does* exist in the harness file — Codex writes
+/// `task_started … task_complete{error}` for a turn it rejected — and that
+/// record's start is a couple of seconds after the journal's dispatch instant,
+/// so a pure timestamp comparison would read the failure's own turn as a newer
+/// one and drop it. A turn sharing the failure's `send_id` is therefore the
+/// failure itself, not something after it; only a *different* turn that
+/// started later counts.
+///
+/// **Known degradation, chosen deliberately:** a turn whose `send_id` could not
+/// be resolved (`null` — a declined anomalous link with no positional match)
+/// cannot be told apart from a later one, so the timestamp rule discards the
+/// refusal and the card reverts to the last measurement. That is the safe
+/// direction: the opposite error would claim "limit reached" for an agent that
+/// has since worked, telling the user to stop when they need not.
+///
+/// A `failure_kind` this build doesn't know reads as *not* a usage limit,
+/// which is also the safe direction — an unrecognized future kind leaves the
+/// measurement alone rather than drawing a window full on a guess.
+function agentsStandingRefused(items: readonly ConversationItem[]): Set<AgentId> {
+  type Failure = { at: number; sendId: string; refused: boolean };
+  // Function-local scratch, never observed reactively (see the hydration
+  // maps above for the same exemption).
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const newest = new Map<AgentId, Failure>();
+  for (const item of items) {
+    if (item.kind !== "outcome" || item.status !== "failed") continue;
+    const at = Date.parse(item.at);
+    const prior = newest.get(item.agent_id);
+    if (prior !== undefined && prior.at >= at) continue;
+    newest.set(item.agent_id, {
+      at,
+      sendId: item.send_id,
+      refused: item.failure_kind === "usage_limit",
+    });
+  }
+  for (const item of items) {
+    if (item.kind !== "agent_turn") continue;
+    const failure = newest.get(item.agent_id);
+    if (failure === undefined || item.send_id === failure.sendId) continue;
+    if (Date.parse(item.started_at) > failure.at) newest.delete(item.agent_id);
+  }
+  return new Set([...newest].filter(([, f]) => f.refused).map(([agentId]) => agentId));
 }
 
 /// On re-activation of an already-loaded project, re-read its conversation if a

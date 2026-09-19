@@ -919,7 +919,9 @@
       detail={w.resetsAtMs === null ? undefined : formatResetCountdown(w.resetsAtMs)}
       separateDetail
       alignPercentage
-      tone={w.surpassedThreshold === undefined ? "neutral" : "warning"}
+      tone={w.surpassedThreshold === undefined && w.limitReached === undefined
+        ? "neutral"
+        : "warning"}
       testid="agent-usage-window"
     />
   {/each}
@@ -942,6 +944,13 @@
             <span>Resets</span>
             <span class="text-right tabular-nums">{formatResetDateTime(w.resetsAtMs)}</span>
           </div>
+        {/if}
+        {#if w.limitReached}
+          <!-- Why the bar is amber and full: the harness's last measurement
+               was lower, and this is its verdict on the last message. -->
+          <p class="text-warning text-[12px]" data-testid="agent-usage-window-refused">
+            Limit reached — the last message was refused.
+          </p>
         {/if}
       </section>
     {/each}
@@ -1038,7 +1047,13 @@
         {@const runtime = runtimes[agent.id]}
         {@const context = contextOccupancy(agent.id)}
         {@const codexWindows =
-          agent.harness === "codex" ? codexRateLimitView(runtime?.last_rate_limit, Date.now()) : []}
+          agent.harness === "codex"
+            ? codexRateLimitView(
+                runtime?.last_rate_limit,
+                Date.now(),
+                runtime?.usage_limit_reached === true,
+              )
+            : []}
         <!-- `Date.now()` read once per render for the reset-in-the-future gate.
              Non-reactive: a reset that elapses while the app sits open won't
              auto-hide until the next render, which a new turn (or reopen)
@@ -1052,13 +1067,14 @@
               )
             : null}
         {@const overageAsOf = runtime?.last_rate_limit_as_of}
-        <!-- At most one window is ever flagged: the payload names a single
-             `rateLimitType`, and `claudeRateLimitView` stamps the threshold on
-             that window alone. `find` is the shape of that invariant — if a
-             future CLI reports a threshold per window, it is `usageWindows.ts`
-             that has to change first. -->
-        {@const usageWarning = rlView?.windows.find(
-          (window) => window.surpassedThreshold !== undefined,
+        <!-- The one window worth a line on a collapsed card. Claude flags at
+             most one: the payload names a single `rateLimitType`, and
+             `claudeRateLimitView` stamps the threshold on that window alone.
+             Codex flags the single window it attributes a refusal to. `find`
+             is the shape of that invariant — if a future CLI reports a threshold per
+             window, it is `usageWindows.ts` that has to change first. -->
+        {@const usageWarning = (rlView?.windows ?? codexWindows).find(
+          (window) => window.surpassedThreshold !== undefined || window.limitReached === true,
         )}
         {@const agentSelection = selectionForAgent(agent)}
         {@const effortSupport = effortSupportFor(agent.harness, agent.model)}
@@ -1778,8 +1794,9 @@
             {#if codexWindows.length > 0}
               <!-- Codex usage windows — the same meters with the same labels as
                    Claude's. Session-file-backed (class B, durable), so no
-                   snapshot-age qualifier, and Codex reports no threshold flag,
-                   so no window here ever warns. -->
+                   snapshot-age qualifier. Codex reports no threshold flag; a
+                   window here warns only when the agent's last turn was refused
+                   for the limit, and then it is drawn full. -->
               <div class="text-muted mt-2 text-[10px] font-medium tracking-wide uppercase">
                 Usage limits
               </div>

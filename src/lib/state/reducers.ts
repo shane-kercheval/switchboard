@@ -766,11 +766,18 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // on the per-agent channel (Codex). `AgentIdle` is the signal for
       // "dispatcher will accept a new send." This is the load-bearing
       // distinction that makes the compose-bar gate correct for Codex.
-      // Completed and cancelled are not errors — leave runtime untouched
-      // (AgentIdle clears in_flight_turn_id). Only a real failure surfaces
-      // last_error.
-      if (input.outcome.status === "completed" || input.outcome.status === "cancelled") {
+      // Completed and cancelled are not errors — leave `last_error` untouched
+      // (AgentIdle clears in_flight_turn_id). Only a real failure surfaces it.
+      //
+      // A **completed** turn does write one thing: it is the single piece of
+      // evidence that a usage window has room again, so it clears
+      // `usage_limit_reached`. Cancellation still returns early — the user
+      // stopping a turn says nothing about the quota (see the field's doc).
+      if (input.outcome.status === "cancelled") {
         return runtime.quiet_since !== undefined ? { ...runtime, quiet_since: undefined } : runtime;
+      }
+      if (input.outcome.status === "completed") {
+        return { ...runtime, quiet_since: undefined, usage_limit_reached: false };
       }
       return {
         ...runtime,
@@ -779,6 +786,10 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
           message: input.outcome.message,
           kind: input.outcome.kind,
         },
+        // Only a quota refusal moves this; any other failure leaves the
+        // previous verdict standing, since it is no evidence either way.
+        usage_limit_reached:
+          input.outcome.kind === "usage_limit" ? true : runtime.usage_limit_reached,
       };
 
     case "agent_idle":
@@ -948,6 +959,15 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         // a fresh measurement with an older one.
         next.last_context_report = input.last_context_report;
         next.last_context_report_at = input.last_context_report_at ?? undefined;
+      }
+      if (next.usage_limit_reached === undefined && input.usage_limit_reached != null) {
+        // Fill-if-empty with no `run_status` gate, unlike the failure text this
+        // replaced. That needed one because `turn_start` cleared `last_error`,
+        // re-opening the hole mid-turn and letting a stale *message* land under
+        // a live turn. Nothing clears this field at `turn_start`, and what it
+        // fills with — "as of the last observed terminal, the harness was
+        // refusing this agent" — is still true while a retry is in flight.
+        next.usage_limit_reached = input.usage_limit_reached;
       }
       return next;
     }

@@ -20,6 +20,12 @@ export type UsageWindow = {
   /// percentage we pick, which would make the same occupancy alarming on one
   /// harness and calm on the other.
   surpassedThreshold?: number;
+  /// Set on the one window a refusal is attributed to (see
+  /// `codexRateLimitView`). `usedFraction` is 1 when this is set: the last
+  /// *measurement* may have read 93%, but the harness's *verdict* on the next
+  /// request is the number the user just ran into, and a bar that still reads
+  /// 93% beside a refusal says the meter is wrong.
+  limitReached?: true;
 };
 
 /// Shared across both harnesses (decision 10): the same window gets the same
@@ -188,14 +194,40 @@ function codexWindowLabel(windowMinutes: unknown): string {
 /// reader; a window with no `resets_at` is kept (can't prove it stale — older
 /// Codex shapes and minimal fixtures omit it). Codex rate-limit is
 /// session-file-backed (class B, durable), so there's no snapshot-age
-/// qualifier. Codex reports no threshold flag, so no window ever warns.
+/// qualifier. Codex reports no threshold flag; the one way a window here
+/// warns is `limitReached`.
+///
+/// `limitReached` is the agent's last turn having been refused for the
+/// limit (`FailureKind.usage_limit`). The payload cannot say so itself: a
+/// refused turn records a *windowless* payload (kept out of the snapshot, see
+/// `session_file.rs::rate_limits_carry_window`), so the snapshot still holds
+/// the last measurement — 93%, say — while the harness has since said no.
+///
+/// **The refusal is attributed to one window, the most-used.** Codex reports
+/// that *a* limit was exceeded and never which (`rate_limit_reached_type` is
+/// null even on a 100% record), so flagging every surviving window would tell
+/// a user who exhausted a 5-hour quota that their weekly one is gone too —
+/// days of waiting claimed for an hour of it, which is a worse error than the
+/// stale measurement this flag exists to correct. The most-used window is the
+/// likeliest culprit, not provably the exhausted one: one large turn can push
+/// a short window past its limit from a low last reading while a weekly sits
+/// higher. That mis-picks between two windows rather than condemning both,
+/// and on a single-window payload it cannot mis-pick at all.
+///
+/// The reset-passed gate still applies first: once a window has cycled, the
+/// refusal is as stale as the measurement, and the window drops with it —
+/// which is also why the flag needs no expiry of its own.
 ///
 /// `used_percent / 100` is left unrounded. Rounding at the source would make
 /// the rendered percentage byte-match Codex's own TUI at half-percent values,
 /// but nobody compares the two, and the bar and the number should be drawn
 /// from one value rather than from a figure pre-rounded for a different
 /// renderer. Returns `[]` when nothing is displayable.
-export function codexRateLimitView(payload: unknown, nowMs: number): UsageWindow[] {
+export function codexRateLimitView(
+  payload: unknown,
+  nowMs: number,
+  limitReached = false,
+): UsageWindow[] {
   if (typeof payload !== "object" || payload === null) return [];
   const windows: UsageWindow[] = [];
   for (const key of ["primary", "secondary"] as const) {
@@ -215,6 +247,13 @@ export function codexRateLimitView(payload: unknown, nowMs: number): UsageWindow
       usedFraction: ww.used_percent / 100,
       resetsAtMs,
     });
+  }
+  if (limitReached && windows.length > 0) {
+    // First wins on a tie, so two equally-used windows attribute
+    // deterministically rather than by key order elsewhere in the payload.
+    const culprit = windows.reduce((a, b) => (b.usedFraction > a.usedFraction ? b : a));
+    culprit.usedFraction = 1;
+    culprit.limitReached = true;
   }
   return windows;
 }

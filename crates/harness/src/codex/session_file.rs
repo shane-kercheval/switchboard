@@ -6,8 +6,8 @@
 //! the **only** source for:
 //! - `event_msg/task_started.payload.model_context_window` →
 //!   `TurnEnd.usage.context_window` (per-turn).
-//! - `event_msg/token_count.rate_limits` (non-null variant only) →
-//!   `RateLimitEvent.info` (per-turn).
+//! - `event_msg/token_count.rate_limits` (window-bearing records only — see
+//!   [`rate_limits_carry_window`]) → `RateLimitEvent.info` (per-turn).
 //! - `event_msg/token_count.info.last_token_usage` → per-turn token usage
 //!   overlaid onto `TurnEnd.usage`. The stream's `turn.completed.usage` is
 //!   **not** per-turn — codex-rs populates it from the thread-cumulative
@@ -94,8 +94,9 @@ pub struct Enrichment {
     /// From the last `event_msg/task_started` record in the file. Used to
     /// fill `TurnEnd.usage.context_window`.
     pub context_window: Option<u32>,
-    /// From the last `event_msg/token_count` record with non-null
-    /// `rate_limits`. Used as `RateLimitEvent.info`. Carried as raw JSON
+    /// From the last `event_msg/token_count` record whose `rate_limits`
+    /// actually carries a window (see [`rate_limits_carry_window`] — non-null
+    /// is not enough). Used as `RateLimitEvent.info`. Carried as raw JSON
     /// because the rate-limit shape is "opaque to consumers" per
     /// `docs/system-design.md`.
     pub rate_limits: Option<Value>,
@@ -137,6 +138,15 @@ pub struct Enrichment {
     /// or the record carries no parseable timestamp (warned — a format change
     /// there would otherwise silently retire cancel-path identity recovery).
     pub current_turn_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The **current turn's** `task_complete.error.codex_error_info` — Codex's
+    /// own classification of why the turn ended badly (`usage_limit_exceeded`,
+    /// `context_window_exceeded`, …; the binary's `CodexErrorInfo` enum). The
+    /// adapter uses it to type the terminal outcome without matching prose.
+    /// Turn-scoped (reset at each `task_started`) for the same reason as
+    /// [`Self::per_turn_usage`]: a turn that ended cleanly must never inherit
+    /// the previous turn's verdict. `None` when the turn's `task_complete`
+    /// carried no `error`, or none with a string `codex_error_info`.
+    pub current_turn_error_info: Option<String>,
     /// The full `session_meta` line as JSON, with
     /// `payload.base_instructions.text` replaced by a sentinel. Used as
     /// `SessionMeta.raw`. `None` if line 1 isn't a `session_meta` record.
@@ -537,6 +547,38 @@ fn task_started_timestamp(value: &Value) -> Option<chrono::DateTime<chrono::Utc>
         .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
 }
 
+/// Whether a `token_count.rate_limits` value carries a usage window, and so
+/// may supersede the previously captured one.
+///
+/// **Non-null is not enough.** On quota exhaustion Codex keeps emitting
+/// `rate_limits`, but switches it to a different limit that reports no window
+/// at all — observed `{"limit_id":"premium","primary":null,"secondary":null,
+/// "credits":{"has_credits":false,"balance":"0"},…}`, arriving 78 seconds
+/// after the same session read `primary.used_percent: 100.0`. Treating that as
+/// a snapshot erased the last real reading, so the meters vanished at exactly
+/// the moment the number mattered — and permanently for a session whose last
+/// such record was windowless. It is not a measurement of a window; it says
+/// nothing about one. So it is skipped, and the last real reading stands until
+/// its own `resets_at` passes.
+///
+/// Names `primary` / `secondary` deliberately, mirroring the frontend's
+/// `codexRateLimitView` key-for-key: the invariant worth holding is that
+/// anything captured here is something that reader can render, so the two
+/// cannot disagree about what "has a window" means. A key-agnostic scan for
+/// any nested `used_percent` would be more rename-tolerant but would also
+/// accept a window the reader ignores (`individual_limit` is unread and its
+/// shape unobserved), reintroducing the same silent-erase. If Codex ever
+/// renames these keys, this captures nothing and the card holds the last good
+/// reading until it expires, which is the safe direction to fail.
+fn rate_limits_carry_window(rate_limits: &Value) -> bool {
+    ["primary", "secondary"].iter().any(|key| {
+        rate_limits
+            .get(key)
+            .and_then(|window| window.get("used_percent"))
+            .is_some_and(Value::is_number)
+    })
+}
+
 // One pass over the rollout feeding a dozen independent last-wins /
 // turn-scoped fields; splitting it would mean threading the same accumulators
 // through helpers for no readability gain.
@@ -675,13 +717,23 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         // this turn's file_change rows.
                         enrichment.patch_facets.clear();
                         patch_call_ids.clear();
+                        // Turn-scoped verdict, same rule: a clean turn must
+                        // never read as the previous turn's failure.
+                        enrichment.current_turn_error_info = None;
+                    }
+                    "task_complete" => {
+                        enrichment.current_turn_error_info = p
+                            .get("error")
+                            .and_then(|e| e.get("codex_error_info"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
                     }
                     "token_count" => {
                         // Two variants share this type; each feeds a different
                         // enrichment field and either may be null on a given
                         // record. Last-record-wins for both, independently.
                         if let Some(rate_limits) = p.get("rate_limits")
-                            && !rate_limits.is_null()
+                            && rate_limits_carry_window(rate_limits)
                         {
                             enrichment.rate_limits = Some(rate_limits.clone());
                         }
@@ -3889,6 +3941,97 @@ mod tests {
     }
 
     #[test]
+    fn parse_keeps_last_window_when_quota_exhaustion_reports_none() {
+        // Verbatim shape from a rollout that hit its weekly cap: Codex switched
+        // `limit_id` to "premium" and reported no window at all. Non-null, so
+        // the old guard took it and the card lost every meter at the moment the
+        // number mattered. The 100% reading has to stand.
+        let content = r#"
+{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":100.0,"window_minutes":10080,"resets_at":1789845487},"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":"prolite","rate_limit_reached_type":null}}}
+{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"premium","limit_name":null,"primary":null,"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}
+"#;
+        let enrichment = parse_session_content(content);
+        let rate_limits = enrichment.rate_limits.expect("rate_limits captured");
+        assert_eq!(
+            rate_limits.pointer("/primary/used_percent"),
+            Some(&Value::from(100.0)),
+            "a windowless payload must not supersede the last real window"
+        );
+    }
+
+    #[test]
+    fn parse_captures_no_rate_limits_when_every_record_is_windowless() {
+        // The same shape with no good predecessor: nothing to hold, so nothing
+        // is claimed. Reachable — a session whose last activity was hitting the
+        // cap ends on exactly this record, and it is all the reload path sees.
+        let content = r#"
+{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"premium","primary":null,"secondary":null,"credits":{"has_credits":false,"balance":"0"}}}}
+"#;
+        let enrichment = parse_session_content(content);
+        assert!(
+            enrichment.rate_limits.is_none(),
+            "a payload with no window is not a snapshot of one"
+        );
+    }
+
+    #[test]
+    fn parse_captures_the_current_turns_error_info_and_resets_it_per_turn() {
+        // Verbatim from a rollout: a turn rejected at the weekly cap ends on a
+        // `task_complete` whose `error` carries Codex's own classification. The
+        // next turn's `task_started` must clear it — a turn that completes
+        // cleanly cannot inherit the previous one's verdict.
+        let rejected = r#"
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1","last_agent_message":null,"error":{"message":"You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 19th, 2026 12:18 PM.","codex_error_info":"usage_limit_exceeded"}}}
+"#;
+        assert_eq!(
+            parse_session_content(rejected)
+                .current_turn_error_info
+                .as_deref(),
+            Some("usage_limit_exceeded")
+        );
+
+        let then_clean = format!(
+            "{rejected}\n{}\n{}\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t-2"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-2","last_agent_message":"ok"}}"#,
+        );
+        assert_eq!(
+            parse_session_content(&then_clean).current_turn_error_info,
+            None,
+            "a clean turn must not inherit the previous turn's error info"
+        );
+
+        // A `task_complete` with an `error` but no string classification reads
+        // as unclassified, not as a stale value.
+        let unclassified = r#"
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"t-1"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t-1","error":{"message":"boom"}}}
+"#;
+        assert_eq!(
+            parse_session_content(unclassified).current_turn_error_info,
+            None
+        );
+    }
+
+    #[test]
+    fn parse_takes_a_secondary_only_window() {
+        // The guard reads both keys, not just `primary`: which window a plan
+        // reports is plan-dependent (on `prolite` `secondary` is null and
+        // `primary` is the weekly one), so requiring `primary` would drop a
+        // shape the frontend renders fine.
+        let content = r#"
+{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":null,"secondary":{"used_percent":7.0,"window_minutes":10080,"resets_at":1800600000}}}}
+"#;
+        let enrichment = parse_session_content(content);
+        let rate_limits = enrichment.rate_limits.expect("rate_limits captured");
+        assert_eq!(
+            rate_limits.pointer("/secondary/used_percent"),
+            Some(&Value::from(7.0))
+        );
+    }
+
+    #[test]
     fn parse_strips_base_instructions_text_from_raw() {
         let content = r#"
 {"type":"session_meta","payload":{"cli_version":"0.130.0","base_instructions":{"text":"this is a very long system prompt that would bloat IPC"}}}
@@ -5134,6 +5277,65 @@ not valid json
                 .unwrap();
         let rl = result.last_rate_limit.unwrap();
         assert_eq!(rl["primary"]["used_percent"].as_f64(), Some(10.0));
+    }
+
+    #[test]
+    fn load_codex_transcript_keeps_the_last_window_past_a_quota_exhausted_record() {
+        // The reload path, which is where this was permanent: on project open
+        // the file is all we have, so a trailing windowless record used to be
+        // the whole answer and the agent came back with no usage limits at all.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3366";
+        let windowed = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:23Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": null,
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": 1_789_845_487_i64 },
+                    "secondary": null,
+                    "plan_type": "prolite",
+                }
+            }
+        });
+        let exhausted = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:24Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": null,
+                "rate_limits": {
+                    "limit_id": "premium",
+                    "primary": null,
+                    "secondary": null,
+                    "credits": { "has_credits": false, "unlimited": false, "balance": "0" },
+                    "plan_type": null,
+                }
+            }
+        });
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.6-sol", "2026-05-14T19:33:20Z"),
+            user_message("hi", "2026-05-14T19:33:21Z"),
+            agent_message("ok", "2026-05-14T19:33:22Z"),
+            windowed,
+            exhausted,
+            task_complete(session_id, "2026-05-14T19:33:25Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let rl = result
+            .last_rate_limit
+            .expect("the real window survives a trailing windowless record");
+        assert_eq!(rl["primary"]["used_percent"].as_f64(), Some(100.0));
     }
 
     #[test]

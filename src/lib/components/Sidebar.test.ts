@@ -2063,12 +2063,16 @@ describe("Sidebar Claude rate-limit tooltip", () => {
   });
 });
 
-async function renderCodexWithRateLimit(info: unknown): Promise<void> {
+async function renderCodexWithRateLimit(info: unknown, refused = false): Promise<void> {
   const state = await loadState();
   await state.registerAgent(CODEX_AGENT);
   const runtime = state.runtimes[CODEX_AGENT.id];
   if (runtime === undefined) throw new Error("unreachable");
-  state.runtimes[CODEX_AGENT.id] = { ...runtime, last_rate_limit: info };
+  state.runtimes[CODEX_AGENT.id] = {
+    ...runtime,
+    last_rate_limit: info,
+    usage_limit_reached: refused,
+  };
   render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 }
 
@@ -2137,6 +2141,82 @@ describe("Sidebar Codex rate-limit windows", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("draws the window full and amber after Codex refused the agent's last turn", async () => {
+    // The last measurement said 93%; the refusal says the window is used up.
+    // The bar shows the verdict, since that is the number the user just hit.
+    await renderCodexWithRateLimit(
+      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: epochFromNow(86_400) } },
+      true,
+    );
+    const meter = screen.getByTestId("agent-usage-window");
+    expect(meter).toHaveTextContent("Weekly · all models");
+    expect(meter).toHaveTextContent("100%");
+    expect(screen.getByTestId("agent-usage-window-fill")).toHaveStyle({ width: "100.0%" });
+    expect(screen.getByTestId("agent-usage-window-fill")).toHaveClass("bg-warning");
+  });
+
+  it("explains the full bar in the tooltip", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderCodexWithRateLimit(
+        { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: epochFromNow(86_400) } },
+        true,
+      );
+      await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit"));
+      await vi.advanceTimersByTimeAsync(500);
+      const detail = await waitFor(() => screen.getByTestId("agent-rate-limit-detail"));
+      expect(detail).toHaveTextContent("100% used");
+      expect(screen.getByTestId("agent-usage-window-refused")).toHaveTextContent(
+        "the last message was refused",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves the measurement as it was when no refusal is standing", async () => {
+    await renderCodexWithRateLimit(
+      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: epochFromNow(86_400) } },
+      false,
+    );
+    expect(screen.getByTestId("agent-usage-window")).toHaveTextContent("93%");
+    expect(screen.getByTestId("agent-usage-window-fill")).not.toHaveClass("bg-warning");
+  });
+
+  it("marks only the most-used window, not every window the plan reports", async () => {
+    // Codex says *a* limit was hit, never which. Flagging both would tell a
+    // user who burned a 5-hour quota that their weekly one is gone too —
+    // days claimed for an hour.
+    await renderCodexWithRateLimit(
+      {
+        primary: { used_percent: 99.0, window_minutes: 300, resets_at: epochFromNow(1800) },
+        secondary: { used_percent: 30.0, window_minutes: 10080, resets_at: epochFromNow(86_400) },
+      },
+      true,
+    );
+    const meters = screen.getAllByTestId("agent-usage-window");
+    expect(meters).toHaveLength(2);
+    expect(meters[0]).toHaveTextContent("5-hour limit");
+    expect(meters[0]).toHaveTextContent("100%");
+    expect(meters[1]).toHaveTextContent("Weekly · all models");
+    expect(meters[1]).toHaveTextContent("30%");
+    const fills = screen.getAllByTestId("agent-usage-window-fill");
+    expect(fills[0]).toHaveClass("bg-warning");
+    expect(fills[1]).not.toHaveClass("bg-warning");
+  });
+
+  it("surfaces the refused window on a collapsed card, like Claude's threshold warning", async () => {
+    await renderCodexWithRateLimit(
+      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: epochFromNow(86_400) } },
+      true,
+    );
+    expect(screen.queryByTestId("agent-compact-warnings")).toBeNull();
+    await fireEvent.click(screen.getByTestId("agent-collapse-toggle"));
+    expect(screen.getByTestId("agent-compact-warnings")).toHaveTextContent(
+      "Weekly · all models · 100% used",
+    );
   });
 
   it("Claude agent never shows the Codex gauge cell (Codex-gated)", async () => {

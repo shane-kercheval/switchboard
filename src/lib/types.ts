@@ -11,11 +11,16 @@ export type ActivationFailureKind = "project_not_loaded" | "project_locked" | "o
 export type ActivationCommandError = { type: ActivationFailureKind | string; message: string };
 export type ActivationFailure = { type: ActivationFailureKind; message: string };
 
-export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure";
+export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure" | "usage_limit";
 // Future: "timeout" — added if/when an active per-turn timeout lands.
 // `auth_failure` is detected via stream events: Claude's
 // `assistant.error == "authentication_failed"` and Codex's
 // `turn.failed.error` containing `"401 Unauthorized"`.
+// `usage_limit` is the harness refusing the turn because a subscription
+// window is exhausted — typed from a structured signal (Codex's
+// `task_complete.error.codex_error_info`), never from the prose. The sidebar
+// reads it to draw that agent's usage window as full (see
+// `usageWindows.ts::codexRateLimitView`).
 
 // Who initiated a cancellation. Carried on the `cancelled` outcome.
 export type CancelSource = "user" | "workflow" | "shutdown";
@@ -497,6 +502,12 @@ export type Hydrate = {
   /// runtime has none — live > disk, like `meta` and `last_rate_limit`.
   last_context_report?: ContextReport | null;
   last_context_report_at?: string | null;
+  /// Whether the harness was still refusing this agent for a usage limit when
+  /// the app last saw it — the project hydration works that out from the
+  /// journal (the per-agent path has no journal and sends nothing). Fills
+  /// `AgentRuntime.usage_limit_reached` only when the runtime has no reading
+  /// of its own; live > disk, like every other field here.
+  usage_limit_reached?: boolean | null;
 };
 
 export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
@@ -936,6 +947,10 @@ export type ConversationItem =
       agent_id: AgentId;
       status: OutcomeStatus;
       reason?: string | null;
+      // The `FailureKind` wire string of a failed outcome, untyped on the wire
+      // so a kind journaled by a newer build still arrives; narrowed where it
+      // is consumed. Absent for a cancellation or an older journal record.
+      failure_kind?: string | null;
       at: string;
     }
   | {

@@ -94,4 +94,72 @@ describe("codexRateLimitView input validation", () => {
   ])("returns an empty list for %s", (_case, payload) => {
     expect(codexRateLimitView(payload, NOW)).toEqual([]);
   });
+
+  it("draws the refused window full and flagged once the harness has refused a turn", () => {
+    // The snapshot still holds the last measurement — Codex records a
+    // windowless payload on the refused turn, which is kept out of it — so the
+    // refusal is the only thing that can say the window is actually used up.
+    const windows = codexRateLimitView(
+      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: future(86_400) } },
+      NOW,
+      true,
+    );
+    expect(windows).toHaveLength(1);
+    expect(windows[0]?.usedFraction).toBe(1);
+    expect(windows[0]?.limitReached).toBe(true);
+    expect(windows[0]?.label).toBe("Weekly · all models");
+  });
+
+  it("attributes a refusal to the most-used window and leaves the others measured", () => {
+    // Codex names no window, so flagging both would claim the weekly quota is
+    // gone when only the 5-hour one is — days of waiting for an hour of it.
+    const windows = codexRateLimitView(
+      {
+        primary: { used_percent: 99.0, window_minutes: 300, resets_at: future(1800) },
+        secondary: { used_percent: 30.0, window_minutes: 10080, resets_at: future(86_400) },
+      },
+      NOW,
+      true,
+    );
+    expect(windows.map((w) => [w.label, w.usedFraction, w.limitReached])).toEqual([
+      ["5-hour limit", 1, true],
+      ["Weekly · all models", 0.3, undefined],
+    ]);
+  });
+
+  it("attributes to the weekly window when that is the fuller one", () => {
+    // Same payload shape, opposite usage — the attribution follows the
+    // measurement rather than the key order.
+    const windows = codexRateLimitView(
+      {
+        primary: { used_percent: 12.0, window_minutes: 300, resets_at: future(1800) },
+        secondary: { used_percent: 97.0, window_minutes: 10080, resets_at: future(86_400) },
+      },
+      NOW,
+      true,
+    );
+    expect(windows.map((w) => [w.label, w.usedFraction, w.limitReached])).toEqual([
+      ["5-hour limit", 0.12, undefined],
+      ["Weekly · all models", 1, true],
+    ]);
+  });
+
+  it("leaves the measurement alone when no turn has been refused", () => {
+    const windows = codexRateLimitView(
+      { primary: { used_percent: 93.0, window_minutes: 10080, resets_at: future(86_400) } },
+      NOW,
+      false,
+    );
+    expect(windows[0]?.usedFraction).toBeCloseTo(0.93);
+    expect(windows[0]?.limitReached).toBeUndefined();
+  });
+
+  it("still drops a cycled window after a refusal — the refusal is as stale as the window", () => {
+    const windows = codexRateLimitView(
+      { primary: { used_percent: 100.0, window_minutes: 10080, resets_at: future(-60) } },
+      NOW,
+      true,
+    );
+    expect(windows).toEqual([]);
+  });
 });

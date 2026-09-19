@@ -380,6 +380,7 @@ export function applyAgentHydrate(
     meta_as_of: loaded.meta_as_of ?? null,
     last_context_report: loaded.last_context_report ?? null,
     last_context_report_at: loaded.last_context_report_at ?? null,
+    usage_limit_reached: loaded.usage_limit_reached ?? null,
   };
   const priorTurns = transcripts[agentId] ?? [];
   // Pass the in-flight turn_id so a refresh re-read can't supersede an

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ConversationItem, NormalizedEvent, ReducerInput } from "$lib/types";
+import type { ConversationItem, NormalizedEvent, ReducerInput, TurnOutcome } from "$lib/types";
 import { _internal, freshRuntime, runtimeReducer, transcriptReducer } from "./reducers";
 import { buildUnifiedRows, groupRenderBlocks } from "./unified";
 import type { AgentRuntime, TextChunk, ToolCall, Turn } from "./types";
@@ -2144,6 +2144,81 @@ describe("runtimeReducer", () => {
     });
     expect(r.hydration_status).toBe("complete");
     expect(r.meta?.model).toBe("claude-sonnet-4-6");
+  });
+
+  function terminal(runtime: AgentRuntime, outcome: TurnOutcome): AgentRuntime {
+    return runtimeReducer(runtime, {
+      type: "turn_end",
+      turn_id: "t-1",
+      outcome,
+      ended_at: "2026-09-18T22:30:05Z",
+      usage: null,
+    });
+  }
+
+  const REFUSAL: TurnOutcome = {
+    status: "failed",
+    kind: "usage_limit",
+    message: "You've hit your usage limit.",
+  };
+
+  it("records a quota refusal and keeps it across the retry that follows", () => {
+    // The card draws the usage window full from this. Sending again is not
+    // evidence the quota moved, so the flag must survive `turn_start` —
+    // otherwise the window drops to its stale measurement for the length of
+    // every retry.
+    const refused = terminal(fresh(), REFUSAL);
+    expect(refused.usage_limit_reached).toBe(true);
+
+    const retrying = runtimeReducer(refused, {
+      type: "turn_start",
+      turn_id: "t-2",
+      started_at: "2026-09-18T22:31:00Z",
+      message_id: "m-2",
+      send_id: "s-2",
+    });
+    expect(retrying.usage_limit_reached).toBe(true);
+  });
+
+  it("clears the refusal only when a turn actually completes", () => {
+    const refused = terminal(fresh(), REFUSAL);
+    expect(terminal(refused, { status: "completed" }).usage_limit_reached).toBe(false);
+  });
+
+  it.each([
+    ["a cancellation — the user stopped it", { status: "cancelled", source: "user" } as const],
+    [
+      "an unrelated failure — no evidence the quota moved",
+      { status: "failed", kind: "adapter_failure", message: "crash" } as const,
+    ],
+  ])("keeps the refusal through %s", (_case, outcome) => {
+    const refused = terminal(fresh(), REFUSAL);
+    expect(terminal(refused, outcome).usage_limit_reached).toBe(true);
+  });
+
+  it("hydrate restores a refusal onto a runtime with no reading of its own", () => {
+    // The live value dies with the process; this is how the full window comes
+    // back after a reopen.
+    const r = runtimeReducer(fresh(), {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      usage_limit_reached: true,
+    });
+    expect(r.usage_limit_reached).toBe(true);
+  });
+
+  it("hydrate does NOT overwrite a reading the live path already took", () => {
+    // Definite `false` from a completed turn, not absence — which is exactly
+    // what stops a slow hydrate from reinstating a refusal that has cleared.
+    const cleared = terminal(fresh(), { status: "completed" });
+    const r = runtimeReducer(cleared, {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      usage_limit_reached: true,
+    });
+    expect(r.usage_limit_reached).toBe(false);
   });
 
   it("hydrate does NOT overwrite meta that a prior live event already populated", () => {

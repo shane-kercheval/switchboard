@@ -5263,6 +5263,12 @@ pub enum ConversationItem {
         agent_id: AgentId,
         status: OutcomeStatus,
         reason: Option<String>,
+        /// The failure's `FailureKind` wire string (`"usage_limit"`,
+        /// `"auth_failure"`, …), so a reopened project can restore the typed
+        /// verdict the live path had — the sidebar draws a usage window as
+        /// full from it. `None` for a cancellation. Not `kind`: that is this
+        /// enum's serde tag.
+        failure_kind: Option<String>,
         at: chrono::DateTime<chrono::Utc>,
     },
     /// A harness-recorded inter-turn event (e.g. compaction), sourced from the
@@ -6210,13 +6216,14 @@ fn merge_project_conversation(
                 started_at,
                 ..
             } => {
-                let (status, reason) = parse_outcome(&outcome);
+                let (status, reason, failure_kind) = parse_outcome(&outcome);
                 items.push(ConversationItem::Outcome {
                     turn_id,
                     send_id,
                     agent_id,
                     status,
                     reason,
+                    failure_kind,
                     at: started_at,
                 });
             }
@@ -6466,30 +6473,27 @@ fn conversation_item_sort_key(item: &ConversationItem) -> (chrono::DateTime<chro
     (conversation_item_timestamp(item), rank)
 }
 
-/// Parse the opaque journal outcome value into the rendered status + reason.
-/// The value is the terminal outcome's wire shape, e.g.
+/// Parse the opaque journal outcome value into the rendered status, reason,
+/// and failure kind. The value is the terminal outcome's wire shape, e.g.
 /// `{"status":"cancelled","source":"user"}` or
 /// `{"status":"failed","kind":"harness_error","message":"…"}`. Anything other
 /// than an explicit `cancelled` reads as `failed` (the conservative default for
 /// a non-completed terminal we couldn't classify). `reason` is the `message`
-/// for failures, the `source` for cancellations — `None` if absent.
-fn parse_outcome(outcome: &serde_json::Value) -> (OutcomeStatus, Option<String>) {
-    let status_str = outcome.get("status").and_then(serde_json::Value::as_str);
-    match status_str {
-        Some("cancelled") => (
-            OutcomeStatus::Cancelled,
-            outcome
-                .get("source")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-        ),
-        _ => (
-            OutcomeStatus::Failed,
-            outcome
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-        ),
+/// for failures, the `source` for cancellations — `None` if absent. `kind` is
+/// the failure's `FailureKind` wire string, passed through untyped so a kind
+/// journaled by a newer build still reaches the frontend (which compares
+/// against literals and ignores what it doesn't know); `None` for a
+/// cancellation or an older record without one.
+fn parse_outcome(outcome: &serde_json::Value) -> (OutcomeStatus, Option<String>, Option<String>) {
+    let field = |key: &str| {
+        outcome
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    match field("status").as_deref() {
+        Some("cancelled") => (OutcomeStatus::Cancelled, field("source"), None),
+        _ => (OutcomeStatus::Failed, field("message"), field("kind")),
     }
 }
 
@@ -21733,19 +21737,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_outcome_classifies_status_and_reason() {
-        let (s, r) = parse_outcome(&serde_json::json!({"status": "cancelled", "source": "user"}));
+    fn parse_outcome_classifies_status_reason_and_kind() {
+        let (s, r, k) =
+            parse_outcome(&serde_json::json!({"status": "cancelled", "source": "user"}));
         assert_eq!(s, OutcomeStatus::Cancelled);
         assert_eq!(r.as_deref(), Some("user"));
+        assert_eq!(k, None, "a cancellation has no failure kind");
 
-        let (s, r) = parse_outcome(&serde_json::json!({"status": "failed", "message": "boom"}));
+        let (s, r, k) = parse_outcome(&serde_json::json!({
+            "status": "failed", "kind": "usage_limit", "message": "boom"
+        }));
         assert_eq!(s, OutcomeStatus::Failed);
         assert_eq!(r.as_deref(), Some("boom"));
+        assert_eq!(k.as_deref(), Some("usage_limit"));
 
-        // Missing detail → None; an unknown status falls back to Failed.
-        let (s, r) = parse_outcome(&serde_json::json!({"status": "weird"}));
+        // Missing detail → None; an unknown status falls back to Failed. An
+        // older record with no kind reads as unclassified, not as an error.
+        let (s, r, k) = parse_outcome(&serde_json::json!({"status": "weird"}));
         assert_eq!(s, OutcomeStatus::Failed);
         assert_eq!(r, None);
+        assert_eq!(k, None);
     }
 
     // ---- load_project_conversation_impl: command-level wiring ----

@@ -954,6 +954,20 @@ pub enum FailureKind {
     /// reactive auth means "discovered on send, fixed by signing in, then
     /// sending again."
     AuthFailure,
+    /// The harness refused or cut short the turn because a subscription usage
+    /// window is exhausted. The message is the harness's own text, kept
+    /// verbatim because it carries what the user acts on (the reset time, the
+    /// credits link). Detected per-adapter from a *structured* signal, never
+    /// by matching the prose: Codex stamps
+    /// `task_complete.error.codex_error_info == "usage_limit_exceeded"` in its
+    /// rollout, read at post-terminal enrichment. Claude's hard wall has not
+    /// been observed (only its soft overage path), and Antigravity's
+    /// `RESOURCE_EXHAUSTED` is still surfaced as text — both stay
+    /// `HarnessError` until a probe records their shape. The sidebar reads
+    /// this kind to draw the agent's usage window as full: the harness's last
+    /// *measurement* may read 93%, but its *verdict* on the next request is
+    /// what the user just hit.
+    UsageLimit,
 }
 
 #[cfg(test)]
@@ -1211,6 +1225,29 @@ mod tests {
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["kind"], "adapter_failure");
+    }
+
+    #[test]
+    fn usage_limit_kind_wire_shape() {
+        // The journal stores this string and the frontend compares against it,
+        // so the wire name is a contract in both directions.
+        let event = NormalizedEvent::TurnEnd {
+            turn_id: fresh_turn_id(),
+            outcome: TurnOutcome::Failed {
+                kind: FailureKind::UsageLimit,
+                message: "You've hit your usage limit.".to_owned(),
+            },
+            ended_at: fresh_time(),
+            usage: None,
+            spend: None,
+            model: None,
+            effort: None,
+            hydration_key: None,
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["outcome"]["kind"], "usage_limit");
+        let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, event);
     }
 
     #[test]

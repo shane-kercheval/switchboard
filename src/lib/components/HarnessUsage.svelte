@@ -123,7 +123,12 @@
               class="cursor-default space-y-1 rounded-md px-1 py-0.5 text-xs"
               data-testid={`harness-usage-${row.harness}`}
             >
-              <div class="flex items-center gap-1.5">
+              <!-- `mb-2` against the list's own `space-y-1`: adjacent margins
+                   collapse in block flow, so the effective gap under the name is
+                   8px rather than the 4px between meters. That is what makes the
+                   name read as a heading for the rows beneath it instead of as
+                   another row in the same rhythm. -->
+              <div class="mb-2 flex items-center gap-1.5">
                 <HarnessIcon harness={row.harness} size="sm" class="h-3.5 w-3.5" />
                 <span class="text-fg text-[11px] font-medium">{HARNESS_LABEL[row.harness]}</span>
               </div>

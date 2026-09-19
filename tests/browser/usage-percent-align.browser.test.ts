@@ -100,3 +100,34 @@ test("a section that never reaches three digits is not indented for one", async 
   const wide = detailLeftEdges().at(-1)!;
   expect(narrow).toBeGreaterThan(wide);
 });
+
+test("the harness name sits further from its meters than the meters do from each other", async () => {
+  // The gap is a bottom margin on the name that collapses against the list's own
+  // top margins, so it is 8px rather than the sum of the two. Switching the list
+  // to a flex gap would stop the collapse and silently change this, which is why
+  // it is measured rather than assumed from the classes.
+  observeUsage("claude_code", {
+    payload: {
+      status: "allowed",
+      unifiedWindows: {
+        five_hour: { utilization: 0.28, resetsAt: future(3 * 3600) },
+        seven_day: { utilization: 0.7, resetsAt: future(5 * 86400) },
+      },
+    },
+    observed_at: new Date().toISOString(),
+  });
+  render(SidebarHost, { projectId: PROJECT_ID, agents: [ALICE] });
+  await expect.poll(() => detailLeftEdges().length).toBe(2);
+
+  const card = document.querySelector("[data-testid='harness-usage-claude_code']");
+  if (card === null) throw new Error("expected the Claude row");
+  const name = card.querySelector("div.flex.items-center");
+  if (name === null) throw new Error("expected the harness name row");
+  const meters = Array.from(card.querySelectorAll("[data-testid='harness-usage-window']"));
+  const [first, second] = meters.map((m) => m.getBoundingClientRect());
+  if (first === undefined || second === undefined) throw new Error("expected two meters");
+
+  const underName = first.top - name.getBoundingClientRect().bottom;
+  const betweenMeters = second.top - first.bottom;
+  expect(underName).toBeGreaterThan(betweenMeters);
+});

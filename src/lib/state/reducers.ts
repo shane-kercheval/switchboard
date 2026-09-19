@@ -44,6 +44,7 @@ import type {
   SendId,
   TurnId,
 } from "$lib/types";
+import { sameCodexUsageWindows } from "$lib/usageWindows";
 import type {
   AgentRuntime,
   ContextReportRequest,
@@ -906,6 +907,17 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         last_rate_limit_as_of: null,
         last_rate_limit_model: runtime.current_turn_model,
         last_rate_limit_awaiting_model: runtime.current_turn_model === undefined ? true : undefined,
+        // A recorded refusal is a verdict about the window it was measured
+        // against, and this replaces the snapshot underneath it — so a reading
+        // describing different windows retires the verdict with them. Without
+        // this the flag outlives its subject and paints a reset quota as spent.
+        // The refused turn's own event re-emits the same pre-cap record, so it
+        // does not trip this (see `sameCodexUsageWindows`).
+        usage_limit_reached:
+          runtime.usage_limit_reached === true &&
+          !sameCodexUsageWindows(runtime.last_rate_limit, input.info)
+            ? false
+            : runtime.usage_limit_reached,
       };
 
     case "context_report":

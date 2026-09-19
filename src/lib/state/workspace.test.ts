@@ -633,6 +633,60 @@ describe("project staleness refresh", () => {
     expect(state.runtimes[recoveredAgent]?.usage_limit_reached).toBe(false);
   });
 
+  it("keeps the refusal when the retry after it died for an unrelated reason", async () => {
+    // The live rule preserves a refusal through a non-quota failure — that is
+    // no evidence the quota moved — so the reopen replay must too, or the card
+    // reads differently before and after a restart.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend([agent(AGENT_1, PROJECT_1)]);
+    conversation = {
+      items: [
+        {
+          kind: "outcome",
+          status: "failed",
+          reason: "You've hit your usage limit.",
+          failure_kind: "usage_limit",
+          turn_id: "t-r",
+          send_id: "s-r",
+          agent_id: AGENT_1,
+          at: "2026-09-18T22:30:00Z",
+        },
+        {
+          kind: "outcome",
+          status: "failed",
+          reason: "stream disconnected",
+          failure_kind: "adapter_failure",
+          turn_id: "t-n",
+          send_id: "s-n",
+          agent_id: AGENT_1,
+          at: "2026-09-18T22:35:00Z",
+        },
+        // The network-failed retry's own disk record — `status: "complete"`,
+        // because Codex closes a turn on `task_complete` whatever its error.
+        // Its send carries an outcome, so it is not a success.
+        {
+          kind: "agent_turn",
+          turn_id: "t-n-disk",
+          agent_id: AGENT_1,
+          send_id: "s-n",
+          started_at: "2026-09-18T22:35:02Z",
+          ended_at: "2026-09-18T22:35:04Z",
+          status: "complete",
+          items: [],
+          model: null,
+          effort: null,
+        },
+      ],
+      agents: [
+        { agent_id: AGENT_1, meta: null, last_rate_limit: null, warnings: [], load_error: null },
+      ],
+    };
+
+    expect(await ws.activateProject(PROJECT_1)).toBe("activated");
+    await vi.waitFor(() => expect(state.runtimes[AGENT_1]?.usage_limit_reached).toBe(true));
+  });
+
   it("reads an unknown journaled failure kind as not-a-usage-limit, leaving the meter alone", async () => {
     // A kind a newer build journals must not draw a window full on a guess;
     // the measurement stands until this build learns the kind.

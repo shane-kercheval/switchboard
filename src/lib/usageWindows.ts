@@ -189,6 +189,52 @@ function codexWindowLabel(windowMinutes: unknown): string {
   return "Quota";
 }
 
+/// Whether two Codex rate-limit payloads describe the **same windows**, used to
+/// decide whether a recorded refusal still applies to the snapshot on screen.
+///
+/// The refusal (`AgentRuntime.usage_limit_reached`) is a verdict about a
+/// particular window, not about the agent, and `last_rate_limit` is replaced
+/// independently of it — so without this the verdict can decorate a snapshot it
+/// was never about, drawing a freshly reset quota as spent.
+///
+/// **Identity is the set of `resets_at` values**, which is what makes the
+/// asymmetry work: a refused turn's own enrichment re-emits the *same*
+/// pre-cap record (`enrichment.rate_limits` is the last window-*bearing*
+/// record in the file, and a refusal appends only windowless ones), so the
+/// refusal survives the `TurnEnd → RateLimitEvent` pair that set it, while a
+/// genuinely new window does not match and clears it.
+///
+/// **An indeterminate identity counts as different**, i.e. clears. A payload
+/// can render meters while reporting no reset time at all — `codexRateLimitView`
+/// keeps such a window deliberately, since staleness can't be proven without
+/// one — and there is no way to tell two reset-less windows apart. Treating
+/// unknown as "same" would let a stale verdict sit on a reset-less window
+/// forever, because the reset-passed gate can never retire it either. The cost
+/// is that on a payload reporting no reset times the refusal never takes
+/// effect; no Codex version we have observed omits them. This is the same
+/// direction taken everywhere else here: understating a quota is safer than
+/// telling someone to stop working.
+export function sameCodexUsageWindows(a: unknown, b: unknown): boolean {
+  const left = codexWindowIdentity(a);
+  return left !== null && left === codexWindowIdentity(b);
+}
+
+/// `resets_at` of every window-bearing key, sorted, or `null` when any of them
+/// is unreadable (see [`sameCodexUsageWindows`] for why unknown is not "same").
+function codexWindowIdentity(payload: unknown): string | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const resets: number[] = [];
+  for (const key of ["primary", "secondary"] as const) {
+    const w = (payload as Record<string, unknown>)[key];
+    if (typeof w !== "object" || w === null) continue;
+    const ww = w as { used_percent?: unknown; resets_at?: unknown };
+    if (typeof ww.used_percent !== "number") continue;
+    if (typeof ww.resets_at !== "number") return null;
+    resets.push(ww.resets_at);
+  }
+  return resets.length === 0 ? null : resets.sort((x, y) => x - y).join(",");
+}
+
 /// Defensive read of Codex's opaque `last_rate_limit` into its independent
 /// windows (`primary` + `secondary`). Same reset-passed rule as the Claude
 /// reader; a window with no `resets_at` is kept (can't prove it stale — older

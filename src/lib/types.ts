@@ -18,9 +18,10 @@ export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure" |
 // `turn.failed.error` containing `"401 Unauthorized"`.
 // `usage_limit` is the harness refusing the turn because a subscription
 // window is exhausted — typed from a structured signal (Codex's
-// `task_complete.error.codex_error_info`), never from the prose. The sidebar
-// reads it to draw that agent's usage window as full (see
-// `usageWindows.ts::codexRateLimitView`).
+// `task_complete.error.codex_error_info`), never from the prose. Read once, by
+// the `turn_end` reducer, which translates it into
+// `AgentRuntime.usage_limit_reached`; that field is what draws the usage window
+// full (see `usageWindows.ts::codexRateLimitView`).
 
 // Who initiated a cancellation. Carried on the `cancelled` outcome.
 export type CancelSource = "user" | "workflow" | "shutdown";

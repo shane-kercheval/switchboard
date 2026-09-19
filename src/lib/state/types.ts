@@ -266,11 +266,12 @@ export type ContextReportRequest = {
 ///   when combined with `hydration_status`. After a failed turn, the agent
 ///   IS sendable again — `run_status` flips back to `"idle"` on `AgentIdle`
 ///   regardless of whether the turn succeeded or failed.
-/// - `last_error`: runtime record of the most-recent failure. The failure
-///   itself is rendered in the transcript (a failed agent turn); the sidebar
-///   reads only its *kind*, to draw a usage window as full after a
-///   `usage_limit` refusal. Does NOT gate Send. Cleared when the next turn
-///   starts.
+/// - `last_error`: runtime record of the most-recent failure, rendered in the
+///   transcript as a failed agent turn. Read by no other surface — the one
+///   consumer of a failure's *kind* is the `turn_end` reducer, which translates
+///   a `usage_limit` refusal into `usage_limit_reached` (below) and never hands
+///   `last_error` to the sidebar. Does NOT gate Send. Cleared when the next
+///   turn starts.
 /// - `in_flight_turn_id`: heartbeat scope. The turn the timer is tracking.
 ///
 /// Conflating these (e.g., a status enum with `"errored"`) would force the
@@ -369,25 +370,53 @@ export type AgentRuntime = {
   /// usage window is exhausted. Read by the sidebar, which draws the agent's
   /// most-used window full and amber while it is `true`.
   ///
-  /// **Deliberately not derived from `last_error`.** Being out of quota is a
-  /// fact about the account that outlives a turn, and `last_error` is cleared
-  /// at every `turn_start` — so a card driven from it dropped back to the
-  /// stale measurement for the few seconds each retry took, then flipped
-  /// amber again when the retry was refused.
+  /// **This is a verdict about a window, not about an agent or a turn**, and
+  /// every rule below follows from that. Getting it wrong twice — a stale
+  /// verdict decorating a freshly reset window, and a reopen path that
+  /// disagreed with the live one — both came from designing around *when it
+  /// stops being true* instead of *what it is true of*. Resist a time-based
+  /// expiry here; the answer is always "which window did this judge."
   ///
-  /// **Only a *completed* turn clears it.** A cancellation is the user's
-  /// doing and an unrelated failure (a network error mid-retry) is no
-  /// evidence the quota moved; clearing on either would reproduce the same
-  /// defect on a slower clock. Nothing else needs to: a window whose reset has
-  /// passed is dropped by `codexRateLimitView`, so a stale `true` has nothing
-  /// left to decorate. The residual is narrow and self-correcting — a quota
-  /// that has genuinely reset still reads "limit reached" if the first turn
-  /// after the reset fails for an unrelated reason, until the next turn
-  /// completes.
+  /// **Deliberately not derived from `last_error`.** Being out of quota
+  /// outlives a turn, and `last_error` is cleared at every `turn_start` — so a
+  /// card driven from it dropped back to the stale measurement for the few
+  /// seconds each retry took, then flipped amber again when the retry failed.
+  ///
+  /// Three things move it, and nothing else does:
+  /// - A `usage_limit` failure sets it.
+  /// - A **completed** turn clears it. A cancellation is the user's doing and
+  ///   an unrelated failure is no evidence the quota moved; clearing on either
+  ///   reproduces the `last_error` defect on a slower clock.
+  /// - A `rate_limit_event` describing **different windows** clears it, since
+  ///   the verdict retires with the window it judged (`sameCodexUsageWindows`).
+  ///   Without this the flag outlives its subject and paints a reset quota as
+  ///   spent, which the reset-passed gate cannot retire because that window is
+  ///   current.
   ///
   /// **Tri-state on purpose.** `undefined` is "no terminal observed yet", which
   /// is what lets `hydrate` fill it from the journal without overwriting a
   /// live verdict; a live terminal always writes a definite `true`/`false`.
+  ///
+  /// **Known residual — the reopen path has no window provenance.** The journal
+  /// records turn outcomes, never quota readings, so a flag restored by
+  /// `agentsStandingRefused` cannot be checked against the window it judged.
+  /// Reachable sequence: a turn gets far enough to read a *new* window and then
+  /// fails for an unrelated reason (so it does not clear the flag), and the app
+  /// closes before any further turn. The live session had already cleared the
+  /// flag by window identity; the replay cannot see that and restores it, so
+  /// the new window renders full. The next `rate_limit_event` of *any* kind
+  /// corrects it — the wrongness lasts until the next turn, not until the next
+  /// successful one.
+  ///
+  /// **Agent-scoped by accident, not design.** The quota belongs to the
+  /// account (one `codex login` per machine), so sibling agents on the same
+  /// harness can disagree on screen — one drawing full, another its own older
+  /// measurement — while both are equally refused. This belongs at harness
+  /// scope, and moves there with the usage meters when they leave the agent
+  /// card. Do not paper over it by OR-ing across agents: that assumes one quota
+  /// per account, which Codex's own unprobed `limit_id` / `individual_limit`
+  /// fields leave open, and it would turn one agent's refusal into a
+  /// project-wide false alarm if a quota can ever be narrower.
   usage_limit_reached?: boolean;
   /// Populated by live `SessionMeta` events or by disk hydration of the
   /// agent's session file. Undefined on agents whose first dispatch

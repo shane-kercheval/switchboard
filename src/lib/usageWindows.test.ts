@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { claudeRateLimitView, codexRateLimitView } from "./usageWindows";
+import { claudeRateLimitView, codexRateLimitView, sameCodexUsageWindows } from "./usageWindows";
 
 /// Input validation against each harness's opaque payload. These live here
 /// rather than in the Sidebar suite because they are about what the derivation
@@ -161,5 +161,60 @@ describe("codexRateLimitView input validation", () => {
       true,
     );
     expect(windows).toEqual([]);
+  });
+});
+
+describe("sameCodexUsageWindows", () => {
+  const weekly = {
+    primary: { used_percent: 93.0, window_minutes: 10080, resets_at: 1_789_845_487 },
+  };
+
+  it("matches a payload against itself, so a refusal survives its own turn end", () => {
+    expect(sameCodexUsageWindows(weekly, { ...weekly })).toBe(true);
+  });
+
+  it("ignores the measured percentage — only the window matters", () => {
+    const later = {
+      primary: { used_percent: 99.0, window_minutes: 10080, resets_at: 1_789_845_487 },
+    };
+    expect(sameCodexUsageWindows(weekly, later)).toBe(true);
+  });
+
+  it("is order-independent across the two window keys", () => {
+    const a = {
+      primary: { used_percent: 10, resets_at: 200 },
+      secondary: { used_percent: 20, resets_at: 100 },
+    };
+    const b = {
+      primary: { used_percent: 10, resets_at: 100 },
+      secondary: { used_percent: 20, resets_at: 200 },
+    };
+    expect(sameCodexUsageWindows(a, b)).toBe(true);
+  });
+
+  it("separates a rolled window from the one before it", () => {
+    const rolled = {
+      primary: { used_percent: 2.0, window_minutes: 10080, resets_at: 1_790_375_461 },
+    };
+    expect(sameCodexUsageWindows(weekly, rolled)).toBe(false);
+  });
+
+  it("separates payloads that report a different number of windows", () => {
+    const both = { ...weekly, secondary: { used_percent: 4.0, resets_at: 1_790_000_000 } };
+    expect(sameCodexUsageWindows(weekly, both)).toBe(false);
+  });
+
+  it.each([
+    ["a window with no reset time", { primary: { used_percent: 93.0 } }],
+    ["a windowless payload", { limit_id: "premium", primary: null, secondary: null }],
+    ["a non-object", "nope"],
+    ["null", null],
+  ])("reports %s as not-the-same, in either position", (_case, indeterminate) => {
+    // Unknown counts as different: two reset-less windows are indistinguishable
+    // and the reset-passed gate can never retire one, so treating them as equal
+    // would strand a refusal on a window forever.
+    expect(sameCodexUsageWindows(weekly, indeterminate)).toBe(false);
+    expect(sameCodexUsageWindows(indeterminate, weekly)).toBe(false);
+    expect(sameCodexUsageWindows(indeterminate, indeterminate)).toBe(false);
   });
 });

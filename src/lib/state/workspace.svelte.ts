@@ -1178,54 +1178,78 @@ export async function hydrateProject(
   }
 }
 
-/// The agents whose newest journaled outcome is a usage-limit refusal with no
-/// turn run since — i.e. the ones the harness was still refusing when the app
-/// last saw them. Restores `AgentRuntime.usage_limit_reached` on reopen, so
-/// the card draws the same full window it drew before the restart.
+/// The agents the harness was still refusing for a usage limit when the app
+/// last saw them. Restores `AgentRuntime.usage_limit_reached` on reopen, so the
+/// card draws the same full window it drew before the restart.
 ///
-/// "Run since" is decided by identity first and time second. The refused turn
-/// usually *does* exist in the harness file — Codex writes
-/// `task_started … task_complete{error}` for a turn it rejected — and that
-/// record's start is a couple of seconds after the journal's dispatch instant,
-/// so a pure timestamp comparison would read the failure's own turn as a newer
-/// one and drop it. A turn sharing the failure's `send_id` is therefore the
-/// failure itself, not something after it; only a *different* turn that
-/// started later counts.
+/// **Replays the live rule rather than approximating it** (`reducers.ts`'s
+/// `turn_end` arm): a usage-limit failure sets the flag, a turn that *completed
+/// successfully* clears it, and nothing else moves it. An earlier version took
+/// the newest failure of any kind and asked whether it was a usage limit, which
+/// disagreed with the live rule exactly where it matters — a capped agent whose
+/// retry died on a network error read as refused before a restart and not after.
 ///
-/// **Known degradation, chosen deliberately:** a turn whose `send_id` could not
-/// be resolved (`null` — a declined anomalous link with no positional match)
-/// cannot be told apart from a later one, so the timestamp rule discards the
-/// refusal and the card reverts to the last measurement. That is the safe
-/// direction: the opposite error would claim "limit reached" for an agent that
-/// has since worked, telling the user to stop when they need not.
+/// **"Completed successfully" comes from the journal, not from the turn's
+/// status.** A refused turn is `status: "complete"` on disk (Codex closes the
+/// turn on `task_complete` whatever its `error` says), so status alone cannot
+/// tell a success from a refusal. The journal records an outcome only for
+/// *non-completed* terminals, so a send with no outcome is the success signal —
+/// and this is also what excludes the refusal's own disk record without any
+/// timestamp comparison, since its send carries the refusal outcome.
 ///
-/// A `failure_kind` this build doesn't know reads as *not* a usage limit,
-/// which is also the safe direction — an unrecognized future kind leaves the
-/// measurement alone rather than drawing a window full on a guess.
+/// Two deliberate directions, both understating rather than over-claiming,
+/// because a false "limit reached" tells the user to stop working:
+/// - A turn whose `send_id` could not be resolved (`null` — a declined
+///   anomalous link with no positional match) is treated as a success and
+///   clears the flag. It cannot be told apart from a later one.
+/// - Only `status: "complete"` clears. A truncated Codex turn reads as
+///   `failed` and an in-flight one as `streaming`; neither is evidence the
+///   quota moved.
 function agentsStandingRefused(items: readonly ConversationItem[]): Set<AgentId> {
-  type Failure = { at: number; sendId: string; refused: boolean };
-  // Function-local scratch, never observed reactively (see the hydration
-  // maps above for the same exemption).
+  // Function-local scratch, never observed reactively (see the hydration maps
+  // above for the same exemption).
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
-  const newest = new Map<AgentId, Failure>();
+  const settledBadly = new Set<string>();
   for (const item of items) {
-    if (item.kind !== "outcome" || item.status !== "failed") continue;
-    const at = Date.parse(item.at);
-    const prior = newest.get(item.agent_id);
-    if (prior !== undefined && prior.at >= at) continue;
-    newest.set(item.agent_id, {
-      at,
-      sendId: item.send_id,
-      refused: item.failure_kind === "usage_limit",
-    });
+    if (item.kind === "outcome") settledBadly.add(item.send_id);
   }
-  for (const item of items) {
-    if (item.kind !== "agent_turn") continue;
-    const failure = newest.get(item.agent_id);
-    if (failure === undefined || item.send_id === failure.sendId) continue;
-    if (Date.parse(item.started_at) > failure.at) newest.delete(item.agent_id);
+
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const refused = new Set<AgentId>();
+  for (const item of [...items].sort(byReplayOrder)) {
+    if (item.kind === "outcome") {
+      if (item.status === "failed" && item.failure_kind === "usage_limit") {
+        refused.add(item.agent_id);
+      }
+      continue;
+    }
+    if (item.kind !== "agent_turn" || item.status !== "complete") continue;
+    if (item.send_id != null && settledBadly.has(item.send_id)) continue;
+    refused.delete(item.agent_id);
   }
-  return new Set([...newest].filter(([, f]) => f.refused).map(([agentId]) => agentId));
+  return refused;
+}
+
+/// Sorted locally rather than trusting the backend's ordering, and on the same
+/// key it uses (`commands.rs::conversation_item_sort_key`) so a tie between an
+/// outcome and a turn at one instant resolves the same way here as it does in
+/// the rendered conversation, instead of falling to sort stability.
+function byReplayOrder(a: ConversationItem, b: ConversationItem): number {
+  const at = (item: ConversationItem): [number, number] => {
+    switch (item.kind) {
+      case "user_message":
+        return [Date.parse(item.at), 0];
+      case "agent_turn":
+        return [Date.parse(item.started_at), 1];
+      case "system_marker":
+        return [Date.parse(item.at), 2];
+      default:
+        return [Date.parse(item.at), 3];
+    }
+  };
+  const [aTime, aRank] = at(a);
+  const [bTime, bRank] = at(b);
+  return aTime - bTime || aRank - bRank;
 }
 
 /// On re-activation of an already-loaded project, re-read its conversation if a

@@ -2196,6 +2196,67 @@ describe("runtimeReducer", () => {
     expect(terminal(refused, outcome).usage_limit_reached).toBe(true);
   });
 
+  it("keeps the refusal when the refused turn's own rate-limit event follows it", () => {
+    // Codex re-emits the last window-*bearing* record at every turn end, and a
+    // refusal appends only windowless ones — so the event that follows the
+    // refusal describes the same window and must not retire the verdict it
+    // just recorded.
+    const window = {
+      primary: { used_percent: 93.0, window_minutes: 10080, resets_at: 1_789_845_487 },
+    };
+    const refused = terminal({ ...fresh(), last_rate_limit: window }, REFUSAL);
+    const afterEvent = runtimeReducer(refused, {
+      type: "rate_limit_event",
+      agent_id: AGENT_A,
+      info: window,
+    });
+    expect(afterEvent.usage_limit_reached).toBe(true);
+  });
+
+  it("retires the refusal when a reading for a different window arrives", () => {
+    // The quota rolled. Without this the verdict outlives the window it judged
+    // and paints the fresh one as spent — which the reset-passed gate cannot
+    // undo, because that window is current.
+    const old = {
+      primary: { used_percent: 93.0, window_minutes: 10080, resets_at: 1_789_845_487 },
+    };
+    const fresher = {
+      primary: { used_percent: 2.0, window_minutes: 10080, resets_at: 1_790_375_461 },
+    };
+    const refused = terminal({ ...fresh(), last_rate_limit: old }, REFUSAL);
+    const afterEvent = runtimeReducer(refused, {
+      type: "rate_limit_event",
+      agent_id: AGENT_A,
+      info: fresher,
+    });
+    expect(afterEvent.usage_limit_reached).toBe(false);
+  });
+
+  it("retires the refusal when the new reading carries no reset time to compare", () => {
+    // Two reset-less windows cannot be told apart, and the reset-passed gate
+    // can never retire one either — so an unresolvable identity clears, which
+    // understates the quota rather than stranding a verdict on it.
+    const window = {
+      primary: { used_percent: 93.0, window_minutes: 10080, resets_at: 1_789_845_487 },
+    };
+    const refused = terminal({ ...fresh(), last_rate_limit: window }, REFUSAL);
+    const afterEvent = runtimeReducer(refused, {
+      type: "rate_limit_event",
+      agent_id: AGENT_A,
+      info: { primary: { used_percent: 93.0, window_minutes: 10080 } },
+    });
+    expect(afterEvent.usage_limit_reached).toBe(false);
+  });
+
+  it("leaves a runtime with no standing refusal alone on a rate-limit event", () => {
+    const afterEvent = runtimeReducer(fresh(), {
+      type: "rate_limit_event",
+      agent_id: AGENT_A,
+      info: { primary: { used_percent: 2.0, window_minutes: 10080, resets_at: 1_790_375_461 } },
+    });
+    expect(afterEvent.usage_limit_reached).toBeUndefined();
+  });
+
   it("hydrate restores a refusal onto a runtime with no reading of its own", () => {
     // The live value dies with the process; this is how the full window comes
     // back after a reopen.

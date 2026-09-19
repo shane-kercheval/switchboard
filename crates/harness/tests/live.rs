@@ -4669,7 +4669,9 @@ async fn live_claude_context_report_parses() {
 /// Closing stdin after writing the requests — the obvious move, since we send
 /// nothing else — makes `codex app-server` shut down *before* answering:
 /// measured on 0.154.0, three runs closing stdin produced no response and three
-/// leaving it open answered every time. `fake_codex` replays a recording and
+/// leaving it open answered every time; re-probed across the 0.155.1 bump at
+/// 20 closed (none answered) and 25 open (all answered). `fake_codex` replays a
+/// recording and
 /// would answer either way, so a regression that closed stdin passes the whole
 /// hermetic suite and fails only here. No separate test for it: it exercises
 /// the identical production call, so a second one would isolate nothing.

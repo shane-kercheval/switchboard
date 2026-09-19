@@ -96,6 +96,39 @@ async fn reads_every_account_bucket_from_the_recorded_response() {
 }
 
 #[tokio::test]
+async fn a_recovered_account_clears_the_exhaustion_flag_rather_than_leaving_it_set() {
+    // Captured from the real CLI the moment the account's weekly window rolled
+    // over, which is why it is worth a fixture: the exhausted shape can be
+    // produced on demand by spending quota, and this one cannot be produced at
+    // all until a reset happens to land.
+    //
+    // It answers the question the meter's "exhausted" rule rests on. A bucket
+    // that has recovered reports `usedPercent: 0` against a *new* `resetsAt`
+    // and drops `rateLimitReachedType` back to null — the flag tracks the live
+    // window rather than latching on the account. Were it sticky, a recovered
+    // quota would keep rendering as blocked until the app forgot it.
+    let dir = tempfile::TempDir::new().unwrap();
+    let shim = recorded_shim(dir.path(), "account-rate-limits-healthy");
+
+    let usage = read_account_usage(&shim, AMPLE).await.expect("a reading");
+
+    assert_eq!(usage.ordinary_usage_allowed, Some(true));
+
+    let codex = &usage.rate_limits_by_limit_id["codex"];
+    assert_eq!(codex["rateLimitReachedType"], serde_json::Value::Null);
+    assert_eq!(codex["primary"]["usedPercent"], 0);
+    // Present and distinct from the exhausted capture's window: recovery is a
+    // new window, not the old one with its counter zeroed.
+    assert_eq!(codex["primary"]["resetsAt"], 1_790_453_566_i64);
+
+    // The reserve bucket is untouched by the account-wide reset — it carries
+    // its own window, so a recovery on one limit says nothing about the other.
+    let reserve = &usage.rate_limits_by_limit_id["base_model_inference"];
+    assert_eq!(reserve["primary"]["usedPercent"], 5);
+    assert_eq!(reserve["rateLimitReachedType"], serde_json::Value::Null);
+}
+
+#[tokio::test]
 async fn the_answer_is_found_behind_unrelated_server_traffic() {
     // The recorded stream carries the `initialize` response and an unsolicited
     // `remoteControl/status/changed` notification ahead of the answer. Reading

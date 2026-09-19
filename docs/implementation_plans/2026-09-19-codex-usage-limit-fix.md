@@ -9,7 +9,8 @@ model-gated weekly window unless that model ran, so a later turn deletes a cap t
 **Status:** planned, not started. Revised 2026-09-19 after two review rounds and a live probe.
 **Depends on:** PR #105 (`agent-card-metadata`), landed as `9c544df`. This plan deletes some of what
 that PR added; see M4.
-**Codex CLI at time of writing:** 0.154.0.
+**Codex CLI:** captured against 0.154.0; **revalidated against 0.155.1** on 2026-09-19 (schema,
+wire shape, and every measured behavior below re-checked — see "Revalidation against 0.155.1").
 
 ## The problem
 
@@ -80,16 +81,66 @@ rateLimitsByLimitId: "Multi-bucket view keyed by metered limit_id (for example, 
 Measured properties of the call, cold spawn, no daemon:
 
 - **Median 2.07s** end to end including process start; min 0.51s, p90 5.63s, max 8.28s over 25
-  cold-spawn trials. An earlier revision of this plan recorded "0.5–0.9s" from a two-sample probe —
-  that was the fast tail, and it was wrong by roughly an order of magnitude at the other end. The
-  call reaches OpenAI's backend, so it carries network latency. This is why
-  `ACCOUNT_USAGE_TIMEOUT` is 30s rather than the 15s an earlier draft assumed, and why M2's
-  coalescing is load-bearing rather than defensive: a multi-second read will routinely still be in
-  flight when the next turn ends.
+  cold-spawn trials, measured **on a rate-limited account**. An earlier revision of this plan
+  recorded "0.5–0.9s" from a two-sample probe — that was the fast tail, and it was wrong by roughly
+  an order of magnitude at the other end. The call reaches OpenAI's backend, so it carries network
+  latency. This is why `ACCOUNT_USAGE_TIMEOUT` is 30s rather than the 15s an earlier draft assumed,
+  and why M2's coalescing is load-bearing rather than defensive: a multi-second read will routinely
+  still be in flight when the next turn ends.
+
+  **A re-measurement on a recovered account is far faster — and does not license lowering the
+  bound.** 25 fresh cold-spawn trials on 0.155.1 with quota available: min 0.51s, median 0.59s, p90
+  0.94s, max 1.28s. The fast end is identical to the capped run; the entire difference is the tail.
+  Two variables changed between the runs (CLI version *and* account state), so the improvement
+  cannot be attributed to either — but the hypothesis that fits the shape is that the slow tail
+  belongs to the capped state, where the response additionally carries a populated `rateLimitUpsell`
+  banner and the backend has reset-credit work to do. If that is what it is, **the slow case is
+  exactly the case the meter exists for**, and sizing the timeout from the healthy distribution
+  would make it fire precisely when a user is capped and looking. The bound stays 30s.
 - Costs **no quota**, requires **no model call**.
 - **Works while rate-limited** — this is how the data was captured.
 - The `initialized` notification is **not** required.
 - Leaves **no orphan process** when the child is killed.
+
+### Revalidation against 0.155.1
+
+The capture above was taken on 0.154.0. Codex moved to **0.155.1** and every assumption this plan
+rests on was re-checked against it on 2026-09-19 rather than assumed to survive. Nothing broke.
+
+**Protocol surface — unchanged.** Regenerated the schema (`codex app-server
+generate-json-schema`). `initialize` and `account/rateLimits/read` both still exist among the 102
+client request methods. `InitializeParams` still requires only `clientInfo` (with `capabilities`
+optional), so the handshake we send still validates. On the response, `rateLimits` is still the sole
+`required` property, `rateLimitsByLimitId` is still an optional *and* nullable map of `limit_id` →
+snapshot, and `ordinaryUsageAllowed` is still a nullable boolean. `GetAccountRateLimitsParams` still
+carries both `excludeResetCreditDetails` and `supportsLunaReserve` with unchanged meanings, so the
+decision to set the first and not the second stands.
+
+**Wire shape — identical key set.** The 0.155.1 response has the same top-level keys as the 0.154.0
+capture (`accountId`, `ordinaryUsageAllowed`, `rateLimitResetCredits`, `rateLimitUpsell`,
+`rateLimits`, `rateLimitsByLimitId`) and the same per-bucket keys, down to `credits`, `planType`,
+`individualLimit`, and `spendControlReached`. The two captures differ **only** in account state. This
+is worth stating precisely because it is the one thing a version bump could have broken silently:
+the read stores buckets as opaque JSON, so a renamed field would not fail to parse — it would render
+as "unknown" forever.
+
+**Behavioral claims — re-measured, not re-asserted.** Each of these is a claim some comment in
+`account_usage.rs` makes as a measured fact, so each was re-run:
+
+- **Closing stdin still kills the read: 0/20 answered.** Holding it open: 25/25. The single most
+  surprising property of this protocol is still true, and still undocumented.
+- **The `initialized` notification is still not required** — the probe omits it and gets an answer.
+- **The interleaved `remoteControl/status/changed` notification still arrives** between the handshake
+  reply and the answer, so matching by JSON-RPC id rather than line position is still load-bearing.
+- **Still works while rate-limited, and now confirmed to work while healthy.**
+- **`codex app-server` still writes nothing to stderr on a clean read.**
+
+**One shape worth flagging for M2, unchanged but easy to misread.** The account-wide `codex` bucket
+carries `limitName: null` and `normalModelSlug: null`; only the reserve bucket
+(`base_model_inference`) is named, as `"gpt-reserve"` / `"gpt-5.6-luna"`. The buckets are named by
+their **map key**, not by `limitName`. M2's filter keys off `normalModelSlug` being null to mean
+"account-wide", which is exactly right — but any UI tempted to *display* `limitName` would show
+nothing for the one quota users actually care about.
 
 ### Product decision: show only account-wide quotas
 
@@ -285,19 +336,27 @@ in use: an existing `codex` entry in `usage.yaml`, a configured Codex agent, or 
 `check_codex_auth_impl` already performs. The turn-end trigger needs no gate; a Codex turn is itself
 the evidence.
 
-**The one unprobed behavior behind M2's rendering rule.** Every capture to date has
-`ordinaryUsageAllowed: false`. The question that matters is narrow, and it is **not** "record the
-healthy shape" generally:
+**The behavior behind M2's rendering rule — now probed, and the assumption held.** The question was
+narrow, and it was **not** "record the healthy shape" generally:
 
 > Does a **refreshed** bucket — new `resetsAt` in the future, `usedPercent: 0` — still carry a
 > leftover `rateLimitReachedType`?
 
 A window-scoped exhaustion cannot go stale *within* its window (capped stays capped until reset),
 and once the reset passes M2's reset-passed rule drops the bucket along with its flag. The refreshed
-bucket is the only residual.
+bucket was the only residual.
 
-**Do not wait for this probe to implement.** M2 ships the assumed-safe rule stated there, and the
-probe runs as a pre-PR gate (see "Pre-PR verification" below) to confirm or replace it.
+**Answered on 2026-09-19, when the account's weekly window rolled over: the flag clears.** The
+recovered `codex` bucket reports `usedPercent: 0` against a new `resetsAt` with
+`rateLimitReachedType: null`, and `ordinaryUsageAllowed` flips to `true`. The flag tracks the live
+window rather than latching on the account, so a recovered quota stops rendering as blocked on its
+own. The capture is pinned as `account-rate-limits-healthy.jsonl` and asserted by
+`a_recovered_account_clears_the_exhaustion_flag_rather_than_leaving_it_set` — it took a real reset to
+obtain and cannot be reproduced on demand, unlike the exhausted shape.
+
+**So M2's `usedPercent > 0` conjunct is redundant rather than load-bearing.** Keep it: it costs
+nothing, and it still guards the one shape we have seen only once (a windowless bucket). This
+paragraph is what lets a future reader delete it deliberately instead of inheriting it as folklore.
 
 Other unprobed items — logged-out and offline responses, bucket sets on plans other than `prolite` —
 are handled as generic failures and recorded in M5 rather than designed for.
@@ -430,11 +489,13 @@ Newest-wins by `observed_at` stays. `model` stays — Claude's model-gated weekl
 line — with the reserve hidden there is no sibling for it to disambiguate, and the spent bar already
 carries the message.
 
-The `usedPercent > 0` conjunct is the guard for M1's unprobed refreshed-bucket question, and it is
+The `usedPercent > 0` conjunct was written as the guard for the refreshed-bucket question, and it is
 deliberately *not* a threshold: a quota that is 0% spent and simultaneously exhausted is a
 contradiction, so when the flag and the measurement disagree we trust the measurement and claim
-nothing. No arbitrary percentage is invented, and the rule needs no revision if the probe comes back
-clean.
+nothing. No arbitrary percentage is invented. **The probe has since come back clean** — a recovered
+bucket clears its flag (see M1 above), so the conjunct now guards a shape Codex does not currently
+produce. It stays because it is free and still covers the windowless bucket; it is no longer the
+thing standing between a recovered account and a false "blocked".
 
 Two things to be honest about in the code comment, not only here. This **infers recovery from a
 percentage**, which the schema's own wording tells clients not to do ("must not infer recovery from
@@ -849,35 +910,33 @@ describe the interactive CLI.
    the reserve hidden — often render nothing while appearing to work.
 3. **A new spawn category.** No session-lock contention; it touches no session. It can spawn while
    turns run and shares PATH-resolution machinery. Bounded by M2's coalescing and M1's gating.
-4. **The refreshed-bucket question ships unprobed.** M2's rule assumes a safe answer rather than
-   waiting for one. The failure mode if the assumption is wrong is bounded and in the safe
-   direction — an exhausted quota could render neutral rather than a healthy one rendering blocked.
-   Closed by the pre-PR gate below.
+4. ~~**The refreshed-bucket question ships unprobed.**~~ **Closed 2026-09-19.** The account's weekly
+   window rolled over and the probe ran: a recovered bucket clears `rateLimitReachedType` and flips
+   `ordinaryUsageAllowed` to `true`, which is the assumption M2's rule was written against. No rule
+   change; the observation is recorded in M1 and pinned by a fixture test.
 
 ---
 
 ## Pre-PR verification
 
-**Run before opening the PR, not before implementing.** Both items need a real account state that
-cannot be conjured on demand, which is why they gate the PR rather than the work.
+**Both gates are discharged as of 2026-09-19.** Each needed a real account state that could not be
+conjured on demand, which is why they gated the PR rather than the work; the account's weekly window
+reset and both ran together.
 
-1. **The refreshed-bucket probe.** Call `account/rateLimits/read` when a previously exhausted bucket
-   has reset, and check whether `rateLimitReachedType` is still non-null on a bucket now reporting
-   `usedPercent: 0` with a future `resetsAt`.
+1. **The refreshed-bucket probe — run, assumption held.** A recovered `codex` bucket reports
+   `usedPercent: 0` against a new `resetsAt` with `rateLimitReachedType: null`, and
+   `ordinaryUsageAllowed` reads `true`. That is the "flag clears on reset" branch: the
+   `usedPercent > 0` conjunct is redundant but harmless and stays. The capture is checked in as
+   `account-rate-limits-healthy.jsonl` rather than described only in prose, because the exhausted
+   shape can be reproduced by spending quota and this one cannot be reproduced at all.
 
-   - **Flag clears on reset** → the `usedPercent > 0` conjunct is redundant but harmless. Keep it
-     (it costs nothing and guards a shape we have still only seen once), and record the result in
-     the gap register so the next reader knows it was answered rather than assumed.
-   - **Flag persists** → the conjunct is load-bearing. Record that plainly and add a fixture test
-     pinning the refreshed-bucket shape, because at that point the flag alone is known-wrong and a
-     future simplification would reintroduce the bug.
+   The same read also settles the open question about `ordinaryUsageAllowed`: it is non-null on a
+   *healthy* account, not only on a capped one, so the live test's `is_some()` assertion is now
+   confirmed in both states rather than in one.
 
-   Either way the answer replaces the assumption in M2's code comment with an observation, and
-   **record what `rateLimitReachedType` actually does on recovery even if the rule does not change**
-   — that observation is what lets a future reader delete the conjunct deliberately rather than
-   inherit it as folklore.
+2. **`make test-live-codex` — passed 18/18** on 0.155.1: the account usage read plus the
+   pre-existing adapter coverage (dispatch, resume, `apply_patch`, hydration, tool use, transcript
+   load, cancel, attachments, auth check).
 
-2. **`make test-live-codex`.** Required by `AGENTS.md` before merging adapter-touching changes, and
-   it needs quota to be available — the same reset that enables item 1.
-
-Record both outcomes in M5's gap-register entries rather than leaving them in the PR description.
+Carry both outcomes into M5's gap-register entries; they are recorded here so the answer is not lost
+if that milestone is reordered.

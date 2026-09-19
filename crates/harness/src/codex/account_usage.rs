@@ -31,6 +31,13 @@
 //! empirically, and a single observation of it is an anecdote. Re-measure that
 //! way before changing any number these comments cite.
 //!
+//! **Re-measure on a CLI bump, too.** These numbers came from Codex 0.154.0 and
+//! were re-run against 0.155.1: the protocol, the response's key set and every
+//! behavioral claim below held, and only the latency distribution moved. A bump
+//! cannot be assumed safe by reading a changelog, because this read stores the
+//! payload as opaque JSON — a renamed field would not fail to parse, it would
+//! quietly read as "unknown" forever. The live test is what catches that.
+//!
 //! **Accepted exposure.** `codex app-server` is marked `[experimental]` in the
 //! CLI's own help, and the protocol is not covered by the published Codex
 //! documentation — the authority is the schema the installed binary emits via
@@ -61,12 +68,24 @@ use tokio_util::sync::CancellationToken;
 /// Production bound for an account usage read.
 ///
 /// **Sized from a measured distribution, not from a best case.** 25 cold-spawn
-/// calls on 0.154.0: min 0.51s, median 2.07s, p90 5.63s, max 8.28s. An earlier
-/// draft of this constant cited "0.5–0.9s" — that was the fast tail of a
-/// two-sample probe, and building a bound on it would have left roughly 1.8x
-/// headroom over an already-observed value. The spread is real work: the call
-/// reaches `OpenAI`'s backend, so it carries network latency, and the read runs
-/// after every Codex turn, which is when the machine is least idle.
+/// calls on 0.154.0, on a **rate-limited** account: min 0.51s, median 2.07s,
+/// p90 5.63s, max 8.28s. An earlier draft of this constant cited "0.5–0.9s" —
+/// that was the fast tail of a two-sample probe, and building a bound on it
+/// would have left roughly 1.8x headroom over an already-observed value. The
+/// spread is real work: the call reaches `OpenAI`'s backend, so it carries
+/// network latency, and the read runs after every Codex turn, which is when the
+/// machine is least idle.
+///
+/// **A recovered account is much faster, and that is not a reason to lower
+/// this.** 25 further trials on 0.155.1 with quota available: min 0.51s, median
+/// 0.59s, p90 0.94s, max 1.28s. The fast end is unchanged and the whole
+/// difference is in the tail. Two things differed between the runs — the CLI
+/// version and the account state — so neither can be credited, but the shape
+/// fits the capped state doing more backend work (that response also carries a
+/// populated upsell banner and available reset credits). If that is the cause,
+/// **the slow case is the case this feature exists to report**, and a bound
+/// sized from the healthy numbers would expire exactly when a capped user is
+/// looking at the meter.
 ///
 /// Generous on purpose. Exceeding it costs a refresh that the next turn
 /// repeats for free; too tight a bound turns ordinary network variance into a
@@ -497,8 +516,10 @@ async fn converse(
     // rather than incidental tidiness. Closing it after the write — the obvious
     // move, since we send nothing else — makes the server shut down *before*
     // answering: on 0.154.0, 20 runs closing stdin produced no `id:1` response
-    // and 20 runs leaving it open answered every time. The child is reaped by
-    // the caller's kill, not by EOF on its input.
+    // and 20 runs leaving it open answered every time. Re-probed on 0.155.1
+    // after the CLI bump — still 0 of 20 closed, 25 of 25 open — so this is a
+    // property of the protocol rather than a bug of one release. The child is
+    // reaped by the caller's kill, not by EOF on its input.
     //
     // The same behavior is the app's shutdown guarantee, which is easy to miss
     // because it reads here purely as a hazard: when Switchboard exits, our end

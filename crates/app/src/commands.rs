@@ -6925,6 +6925,70 @@ pub fn check_codex_auth_impl(home_dir: &Path) -> Result<(), AppError> {
     }
 }
 
+/// Read the Codex account's metered quotas — every limit it holds, each named
+/// by Codex. `None` means "no reading available", never "something went wrong."
+///
+/// **Returns `Option`, not `Result`, and that is the contract rather than
+/// laziness.** This is a background refresh of a meter: the caller's only
+/// sensible response to any failure is to keep showing the reading it already
+/// has. Handing the frontend an error would invite it to render one, and a
+/// banner saying the quota read failed is noise about a number the user did not
+/// ask to be updated. Every failure mode — no binary, failed spawn, timeout,
+/// logged out, a protocol that moved — collapses here, logged once at `warn`
+/// with the reason intact.
+///
+/// **Repeated failures are logged once, not once per turn.** Almost every way
+/// this read fails is a steady state rather than a blip — no Codex installed,
+/// logged out, offline, or a Codex too old to report named quotas — and the
+/// read runs at startup and after every Codex turn. Logging unconditionally
+/// would emit the same line forever and bury the transient failures that
+/// actually carry information, so the reason is remembered on `state` and a
+/// warning is emitted only when it changes. Recovery is logged too, at `info`:
+/// "it started working again" is the other half of the story and is otherwise
+/// invisible.
+///
+/// `binary` and `timeout` are parameters rather than constants read inside, for
+/// the same testability reason as [`check_codex_auth_impl`]'s `home_dir`: the
+/// Tauri shim supplies the production values.
+///
+/// The read itself is documented in `crates/harness/src/codex/account_usage.rs`
+/// — including why it lives in that crate and what the experimental-protocol
+/// exposure costs.
+pub async fn read_codex_account_usage_impl(
+    state: &AppState,
+    binary: &Path,
+    timeout: std::time::Duration,
+) -> Option<switchboard_harness::CodexAccountUsage> {
+    // Mock mode means "this process spawns no harness CLIs". Resolved at
+    // startup beside the adapter choice; this is the one call that would
+    // otherwise bypass it.
+    if !state.spawns_real_harnesses {
+        return None;
+    }
+    let outcome = switchboard_harness::read_account_usage(binary, timeout).await;
+    let reason = match &outcome {
+        Ok(_) => None,
+        Err(error) => Some(error.to_string()),
+    };
+    let mut last = match state.last_account_usage_failure.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if *last != reason {
+        match &reason {
+            Some(reason) => {
+                tracing::warn!(%reason, "codex account usage read produced no reading");
+            }
+            None if last.is_some() => {
+                tracing::info!("codex account usage read recovered");
+            }
+            None => {}
+        }
+        *last = reason;
+    }
+    outcome.ok()
+}
+
 /// Install status of a harness CLI, for the getting-started surface.
 /// A missing binary is `installed: false` with no version — *data*, not an
 /// error path (unlike `check_*_binary`, which gates agent creation and so
@@ -11499,6 +11563,70 @@ mod tests {
     fn check_codex_binary_with_mock_adapter_returns_ok() {
         let (_tmp, state, _) = fresh_state_with_mock();
         assert!(check_codex_binary_impl(&state).is_ok());
+    }
+
+    /// Bare state for the account-usage tests: they touch no store, no project
+    /// and no adapter — only the mock-mode flag and the remembered failure.
+    fn account_usage_state() -> AppState {
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        AppState::new_for_test(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            mock,
+            Arc::new(RecordingEmitter::default()) as Arc<dyn EventEmitter>,
+        )
+    }
+
+    #[tokio::test]
+    async fn codex_account_usage_collapses_a_missing_binary_to_no_reading() {
+        // The contract the `Option` return exists for: every failure is "no
+        // newer number", so the caller keeps whatever reading it holds. If this
+        // ever grows an error path, the meter gains a way to blank itself or
+        // shout at the user over a refresh nobody asked for.
+        let state = account_usage_state().with_real_harnesses(true);
+        let tmp = TempDir::new().unwrap();
+        let absent = tmp.path().join("definitely-not-codex");
+        let reading =
+            read_codex_account_usage_impl(&state, &absent, std::time::Duration::from_secs(5)).await;
+        assert!(reading.is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_account_usage_does_not_spawn_in_mock_mode() {
+        // This is the one call that bypasses the adapter layer, so nothing else
+        // would stop a mock run from shelling out to the real CLI. `codex` is
+        // passed by name deliberately: were the gate absent, this would resolve
+        // and spawn the developer's own installed binary.
+        let state = account_usage_state();
+        assert!(!state.spawns_real_harnesses);
+        let reading = read_codex_account_usage_impl(
+            &state,
+            Path::new("codex"),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(reading.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_repeated_account_usage_failure_is_recorded_once() {
+        // The read runs after every Codex turn and nearly all of its failures
+        // are steady states (no binary, logged out, offline, a Codex too old).
+        // Logging each one would emit the same line forever and bury the
+        // transient failures that carry information, so the remembered reason
+        // is what suppresses the repeat.
+        let state = account_usage_state().with_real_harnesses(true);
+        let tmp = TempDir::new().unwrap();
+        let absent = tmp.path().join("definitely-not-codex");
+        for _ in 0..3 {
+            read_codex_account_usage_impl(&state, &absent, std::time::Duration::from_secs(5)).await;
+        }
+        let last = state.last_account_usage_failure.lock().unwrap();
+        assert_eq!(
+            last.as_deref(),
+            Some("codex binary not found"),
+            "the reason must be retained so the next identical failure stays quiet"
+        );
     }
 
     #[test]

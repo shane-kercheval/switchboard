@@ -13,6 +13,18 @@
 //! the real CLI calls the prompt arg" as the fixture path; the real CLIs
 //! just disagree about where that arg lives.
 //!
+//! **`app-server` mode needs no separate branch.** The account usage read
+//! (`codex::account_usage`) invokes `codex app-server` and speaks JSON-RPC over
+//! the pipes; a fake for it only has to emit a recorded response stream, which
+//! is what this binary already does. `fake_codex app-server <fixture-path>`
+//! lands the fixture in the last-argv slot and replays it — the same mechanism,
+//! not a special case. Since the real call passes no fixture argument, tests
+//! point it at a tiny `sh` shim that appends one (see
+//! `tests/codex_account_usage.rs`); a `$FAKE_CODEX_…` environment variable
+//! would have to be set process-wide, which is neither parallel-safe nor
+//! `unsafe`-free in edition 2024. The reader matches on JSON-RPC id, so it does
+//! not care that this binary never reads the requests it is "answering."
+//!
 //! Each non-empty, non-comment line of the fixture is written to stdout
 //! verbatim.
 //!

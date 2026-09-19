@@ -332,19 +332,20 @@ use crate::commands::{
     load_project_conversation_impl, load_transcript_impl, migrate_message_pin_impl,
     open_branch_comparison_file_difftool_impl, open_commit_file_difftool_impl, open_project_impl,
     open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
-    project_session_fingerprints_impl, read_tracked_repo_from_inputs,
-    recheck_harness_installs_impl, reclaim_project_attachments_impl, remove_agent_impl,
-    remove_mcp_provider_impl, remove_message_pins_impl, remove_queued_message_impl,
-    remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
-    reorder_agents_impl, resolve_saved_prompt_fresh_impl, resolve_saved_prompt_impl,
-    resume_agent_in_terminal_impl, reveal_in_finder_argv, search_project_files_in_root,
-    search_project_files_root_impl, send_message_impl, set_active_project_impl,
-    set_agent_selection_impl, set_harness_usage_impl, set_message_pin_impl, set_preferences_impl,
-    set_project_archived_impl, set_project_directory_impl, set_visible_project_impl,
-    sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
-    spawn_prompt_resolution_change_notifications, stage_attachment_impl, sync_prompts_and_notify,
-    terminal_open_argv, test_mcp_connection_impl, test_saved_mcp_provider_impl,
-    tracked_repos_inputs, tracked_roots, validate_external_url, workspace_status_impl,
+    project_session_fingerprints_impl, read_codex_account_usage_impl,
+    read_tracked_repo_from_inputs, recheck_harness_installs_impl, reclaim_project_attachments_impl,
+    remove_agent_impl, remove_mcp_provider_impl, remove_message_pins_impl,
+    remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl, rename_project_impl,
+    render_prompt_impl, reorder_agents_impl, resolve_saved_prompt_fresh_impl,
+    resolve_saved_prompt_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
+    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
+    set_active_project_impl, set_agent_selection_impl, set_harness_usage_impl,
+    set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
+    set_project_directory_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
+    sign_out_mcp_provider_impl, spawn_prompt_resolution_change_notifications,
+    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
+    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
+    workspace_status_impl,
 };
 use crate::error::AppError;
 use crate::harness_usage::HarnessUsage;
@@ -447,6 +448,29 @@ async fn check_codex_auth() -> Result<(), String> {
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     check_codex_auth_impl(&home).map_err(|e| e.to_string())
+}
+
+/// The Codex account's metered quotas. `None` is "no reading available".
+///
+/// **`Ok` always.** A background meter refresh has no failure the frontend
+/// could act on, so every failure mode collapses to `None` and the `Err` arm is
+/// unreachable by construction. It exists only because Tauri requires an async
+/// command taking a reference — here `State` — to return a `Result`; the
+/// meaningful signature is `Option`. See [`read_codex_account_usage_impl`],
+/// which also owns the mock-mode gate and the log de-duplication.
+///
+/// The binary name matches `CodexAdapter::new()`'s: production resolves `codex`
+/// on the login-shell PATH, and there is no configured override to honour.
+#[tauri::command]
+async fn read_codex_account_usage(
+    state: State<'_, AppState>,
+) -> Result<Option<switchboard_harness::CodexAccountUsage>, String> {
+    Ok(read_codex_account_usage_impl(
+        state.inner(),
+        std::path::Path::new("codex"),
+        switchboard_harness::ACCOUNT_USAGE_TIMEOUT,
+    )
+    .await)
 }
 
 #[tauri::command]
@@ -1829,7 +1853,12 @@ impl EventEmitter for AppHandleEmitter {
 /// - `"mock"` → all three adapters = `MockHarnessAdapter`.
 /// - Any other value → panic (silent fall-through to default would be a footgun).
 ///
-/// Returns `(claude_adapter, codex_adapter, antigravity_adapter)`.
+/// Returns `(claude_adapter, codex_adapter, antigravity_adapter,
+/// spawns_real_harnesses)`. The flag rides along rather than being re-derived
+/// later so the "is this a mock run" decision exists exactly once: the adapter
+/// choice enforces it for every ordinary harness call, and the flag is what
+/// lets the one adapter-bypassing call — the Codex account usage read — obey
+/// the same answer instead of asking the environment again.
 /// All are constructed under "claude"/unset because the `match agent.harness`
 /// routing in `send_message_impl` may dispatch to any at runtime; no
 /// adapter's constructor performs a binary check, so missing CLIs only
@@ -1843,17 +1872,19 @@ fn build_adapters() -> (
     Arc<dyn HarnessAdapter>,
     Arc<dyn HarnessAdapter>,
     Arc<dyn HarnessAdapter>,
+    bool,
 ) {
     match std::env::var("SWITCHBOARD_HARNESS").as_deref() {
         Ok("mock") => {
             tracing::info!("SWITCHBOARD_HARNESS=mock — using MockHarnessAdapter for all harnesses");
             let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-            (Arc::clone(&mock), Arc::clone(&mock), mock)
+            (Arc::clone(&mock), Arc::clone(&mock), mock, false)
         }
         Ok("claude") | Err(_) => (
             Arc::new(ClaudeCodeAdapter::new()),
             Arc::new(CodexAdapter::new()),
             Arc::new(AntigravityAdapter::new()),
+            true,
         ),
         Ok(other) => panic!(
             "invalid SWITCHBOARD_HARNESS={other:?}; expected one of: claude, mock (or unset for default)"
@@ -2185,7 +2216,8 @@ pub fn run() {
         let _ = build_log_subscriber(env_filter, std::io::stdout).try_init();
     }
 
-    let (claude_adapter, codex_adapter, antigravity_adapter) = build_adapters();
+    let (claude_adapter, codex_adapter, antigravity_adapter, spawns_real_harnesses) =
+        build_adapters();
 
     // In release builds, enforce single-instance: a second launch focuses the
     // existing window instead of spawning a rival process, keeping one
@@ -2287,6 +2319,7 @@ pub fn run() {
                 store,
                 lock_root,
             );
+            let state = state.with_real_harnesses(spawns_real_harnesses);
             // Attach all user-global persistence locations (workspace.yaml,
             // git-view.yaml, config.yaml) — see `with_persistence_paths`.
             let state = with_persistence_paths(state);
@@ -2365,6 +2398,7 @@ pub fn run() {
             check_claude_binary,
             check_codex_binary,
             check_codex_auth,
+            read_codex_account_usage,
             check_antigravity_binary,
             check_antigravity_auth,
             check_claude_auth,

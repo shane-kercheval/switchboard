@@ -79,7 +79,13 @@ rateLimitsByLimitId: "Multi-bucket view keyed by metered limit_id (for example, 
 
 Measured properties of the call, cold spawn, no daemon:
 
-- **0.5–0.9s** end to end including process start.
+- **Median 2.07s** end to end including process start; min 0.51s, p90 5.63s, max 8.28s over 25
+  cold-spawn trials. An earlier revision of this plan recorded "0.5–0.9s" from a two-sample probe —
+  that was the fast tail, and it was wrong by roughly an order of magnitude at the other end. The
+  call reaches OpenAI's backend, so it carries network latency. This is why
+  `ACCOUNT_USAGE_TIMEOUT` is 30s rather than the 15s an earlier draft assumed, and why M2's
+  coalescing is load-bearing rather than defensive: a multi-second read will routinely still be in
+  flight when the next turn ends.
 - Costs **no quota**, requires **no model call**.
 - **Works while rate-limited** — this is how the data was captured.
 - The `initialized` notification is **not** required.
@@ -183,8 +189,10 @@ bucket of N cannot show the account-wide quota when the reserve is the one repor
 reserve now hidden, such a reading would render *nothing* while looking like a working path.
 Restart continuity is already covered by the persisted store.
 
-**Deliberately not built:** a manual refresh button. The call is sub-second and free, so the app
-keeps itself current rather than asking the user to press something. Matches the convention in
+**Deliberately not built:** a manual refresh button. The call is free and fires on its own, so the
+app keeps itself current rather than asking the user to press something. Note the reason is
+*automatic*, not *fast* — the measured median is ~2s and the tail reaches 8s, which is fine for
+fire-and-forget work and would be poor for a button the user watches. Matches the convention in
 `ContextBreakdown.svelte:10` ("opening is the refresh"). Do not add one.
 
 ### Non-goals
@@ -343,6 +351,24 @@ Visibility matters for a specific reason: a blocked user's bucket renders fine u
 ending turns, so nothing else would refresh. Not window focus, not a timer. This is the same
 "opening is the refresh" rule cited above.
 
+**Wire `HarnessKind::supports_account_usage_read` to a real caller here.** M1 landed the predicate
+with none, which is normal for a milestone that ships before its consumer but is exactly how a
+predicate becomes permanently decorative. Two callers, and the first must not be a formality:
+
+- **Backend — the startup gate.** It decides whether Codex is in use at all, so it should ask the
+  predicate of each configured agent's harness rather than matching on `HarnessKind::Codex`. Calling
+  `HarnessKind::Codex.supports_account_usage_read()` at a site that already knows it is Codex would
+  satisfy the letter of this and nothing else; do not do that.
+- **Frontend — the mirror.** Add `supportsAccountUsageRead` to `src/lib/harnessCapabilities.ts`
+  beside `supportsManualCompaction` / `supportsContextReport`, and gate which harness sections a
+  self-refreshing account read may serve. The mirror is the established two-sided pattern; a
+  backend-only predicate leaves the UI deciding by harness name.
+
+**The command stays Codex-named and takes no `harness` parameter.** Reviewed and rejected: it speaks
+a protocol only Codex has, so a harness argument would build a dispatcher with one arm and a
+signature that promises a generality no second harness can supply. The capability gate belongs at
+the caller, which is what the predicate is for.
+
 Fire-and-forget; never on a turn's critical path.
 
 **Coalescing — drain semantics, not dedupe.** Mirror `harnessUsage.svelte.ts::persist` (`:222`)
@@ -442,6 +468,8 @@ with no surface reading it after this milestone.
   follow-up.
 - Reset-passed behavior preserved: a bucket whose reset has elapsed drops while siblings stay.
 - Grep confirms no `limit_reached` remains in the store, the view, or `usage.yaml`.
+- `supports_account_usage_read` has a non-tautological backend caller and a
+  `harnessCapabilities.ts` mirror, per the call-sites section above.
 
 ---
 

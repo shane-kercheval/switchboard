@@ -26,6 +26,7 @@
 //! without it, clap aborts with `unexpected argument '- '` and the turn fails
 //! before any model call (verified against codex-cli 0.136.0).
 
+pub mod account_usage;
 pub mod config;
 pub(crate) mod facets;
 pub mod parser;

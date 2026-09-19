@@ -4644,3 +4644,102 @@ async fn live_claude_context_report_parses() {
         "the report turn must complete: {events:?}"
     );
 }
+
+/// The drift detector for `account/rateLimits/read`.
+///
+/// **This is the primary mitigation for reading an undocumented, explicitly
+/// experimental protocol.** `codex app-server` is marked `[experimental]` in
+/// the CLI's own help and is absent from the published Codex documentation, so
+/// its method names and response shapes can move without a version bump.
+/// Nothing in the fixture suite would notice; everything there replays a stream
+/// we recorded ourselves.
+///
+/// It asserts **structure, never values**. Which quotas an account holds, how
+/// spent they are and when they reset all depend on the developer's plan and
+/// the hour of the day — pinning any of those would make this fail for reasons
+/// that have nothing to do with drift. What must stay true is that the account
+/// can be *asked*, that the answer is keyed by limit id, and that each bucket
+/// carries the fields the meter is built on.
+///
+/// Costs no quota and makes no model call, and succeeds while the account is
+/// rate-limited — so unlike its neighbours here it can be run freely, including
+/// when the rest of the Codex live suite is blocked.
+///
+/// **It also pins the one transport behavior no replay fake can model.**
+/// Closing stdin after writing the requests — the obvious move, since we send
+/// nothing else — makes `codex app-server` shut down *before* answering:
+/// measured on 0.154.0, three runs closing stdin produced no response and three
+/// leaving it open answered every time. `fake_codex` replays a recording and
+/// would answer either way, so a regression that closed stdin passes the whole
+/// hermetic suite and fails only here. No separate test for it: it exercises
+/// the identical production call, so a second one would isolate nothing.
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_account_usage_read_returns_named_buckets() {
+    let usage = switchboard_harness::read_account_usage(
+        Path::new("codex"),
+        switchboard_harness::ACCOUNT_USAGE_TIMEOUT,
+    )
+    .await
+    .expect("codex should answer account/rateLimits/read");
+
+    assert!(
+        !usage.rate_limits_by_limit_id.is_empty(),
+        "an authenticated account should report at least one metered limit; got {usage:?}"
+    );
+
+    for (limit_id, bucket) in &usage.rate_limits_by_limit_id {
+        assert!(
+            bucket.is_object(),
+            "bucket {limit_id} should be an object: {bucket}"
+        );
+        // The field M2 filters on to tell an account-wide allowance from a
+        // model-specific reserve. It is legitimately `null` on the account-wide
+        // buckets — what matters is that the key still exists, because its
+        // *absence* would silently turn every bucket into an account-wide one.
+        assert!(
+            bucket.get("normalModelSlug").is_some(),
+            "bucket {limit_id} should carry `normalModelSlug` (null is fine): {bucket}"
+        );
+        // Exhaustion comes from the harness, never from our own arithmetic.
+        assert!(
+            bucket.get("rateLimitReachedType").is_some(),
+            "bucket {limit_id} should carry `rateLimitReachedType`: {bucket}"
+        );
+        let window = bucket
+            .get("primary")
+            .unwrap_or_else(|| panic!("bucket {limit_id} should carry a `primary` window"));
+        // A windowless bucket is a shape we have seen (`limit_id: "premium"`
+        // arrives with both windows null on a refused turn), so `null` here is
+        // tolerated — the meter skips those. A missing *key* is not.
+        if !window.is_null() {
+            assert!(
+                window
+                    .get("usedPercent")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some(),
+                "window on {limit_id} should carry a numeric `usedPercent`: {window}"
+            );
+            assert!(
+                window.get("resetsAt").is_some(),
+                "window on {limit_id} should carry `resetsAt`: {window}"
+            );
+            assert!(
+                window.get("windowDurationMins").is_some(),
+                "window on {limit_id} should carry `windowDurationMins`: {window}"
+            );
+        }
+    }
+
+    // Asserted rather than merely typed. `lift_usage` collapses "absent" and
+    // "null" into `None`, which is right for rendering and useless for drift
+    // detection: were the field renamed, every read would report "unknown"
+    // forever and a type-shaped check would pass. A failure here means one of
+    // two things worth knowing — the field moved, or a real account genuinely
+    // returns null, which would itself be news since the exhaustion rule
+    // assumes otherwise.
+    assert!(
+        usage.ordinary_usage_allowed.is_some(),
+        "the account-level usage gate should carry a value: {usage:?}"
+    );
+}

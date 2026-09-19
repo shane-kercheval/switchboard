@@ -354,9 +354,11 @@ own. The capture is pinned as `account-rate-limits-healthy.jsonl` and asserted b
 `a_recovered_account_clears_the_exhaustion_flag_rather_than_leaving_it_set` — it took a real reset to
 obtain and cannot be reproduced on demand, unlike the exhausted shape.
 
-**So M2's `usedPercent > 0` conjunct is redundant rather than load-bearing.** Keep it: it costs
-nothing, and it still guards the one shape we have seen only once (a windowless bucket). This
-paragraph is what lets a future reader delete it deliberately instead of inheriting it as folklore.
+**So M2's `usedPercent > 0` conjunct is redundant rather than load-bearing** — and it was
+subsequently **deleted**, for a second reason this probe did not reach: four of the five
+`rateLimitReachedType` values are workspace facts, where a low percentage is exactly what to expect,
+so the conjunct suppressed precisely the restrictions it could never have been about. The exhaustion
+rule that shipped is stated once in M2; do not restore a percentage guard from this paragraph.
 
 Other unprobed items — logged-out and offline responses, bucket sets on plans other than `prolite` —
 are handled as generic failures and recorded in M5 rather than designed for.
@@ -497,20 +499,54 @@ Newest-wins by `observed_at` stays. `model` stays — Claude's model-gated weekl
 
 **Exhaustion — implement this rule, which rests on a stated assumption.**
 
-> A bucket draws as exhausted when its `rateLimitReachedType` is non-null **and** its `usedPercent`
-> is greater than zero.
+> A **window** draws as exhausted when its bucket reports `rateLimitReachedType:
+> "rate_limit_reached"` **and** that bucket declares exactly one window.
 
-`ordinaryUsageAllowed` is carried as data and may corroborate, but is **not** rendered as its own
-line — with the reserve hidden there is no sibling for it to disambiguate, and the spent bar already
-carries the message.
+**Amended during M2, twice, after reading the protocol enum and the bucket type.** The rule as
+originally written was wrong in three ways:
 
-The `usedPercent > 0` conjunct was written as the guard for the refreshed-bucket question, and it is
-deliberately *not* a threshold: a quota that is 0% spent and simultaneously exhausted is a
-contradiction, so when the flag and the measurement disagree we trust the measurement and claim
-nothing. No arbitrary percentage is invented. **The probe has since come back clean** — a recovered
-bucket clears its flag (see M1 above), so the conjunct now guards a shape Codex does not currently
-produce. It stays because it is free and still covers the windowless bucket; it is no longer the
-thing standing between a recovered account and a false "blocked".
+- **`rateLimitReachedType` is not a boolean.** Four of its five values —
+  `workspace_owner_credits_depleted`, `workspace_member_credits_depleted`,
+  `workspace_owner_usage_limit_reached`, `workspace_member_usage_limit_reached` — are workspace facts
+  that say nothing about any window's consumption. Marking a bar for one would tell a user whose
+  *workspace* ran out of credits that their weekly quota is exhausted, on a bar reading 42%. Those
+  four set the account-level statement instead.
+- **A bucket is not a window.** `RateLimitSnapshot` carries `primary` *and* `secondary`, so a bucket
+  can hold two windows of the same limit and its refusal names neither. Attributing it to one is the
+  guess this milestone deletes, so a bucket declaring two windows marks neither. The count is of
+  windows **declared**, not rendered — a bucket whose second window expired still declared two.
+- **The `usedPercent > 0` conjunct was deleted.** It vetoed the flag whenever usage read zero, which
+  holds only for consumption refusals; for the four workspace values a low percentage is exactly
+  what to expect, so the guard suppressed precisely the restrictions it could never have been about.
+  The refreshed-bucket probe (M1) separately showed the flag clears on reset by itself, so nothing
+  needs a percentage to retire it.
+
+~~`ordinaryUsageAllowed` is carried as data and may corroborate, but is **not** rendered as its own
+line.~~ **Reversed during M2: it is rendered, and it is load-bearing.** Once the exhaustion rule
+stops guessing, there are blocked states with no bar to carry the message — every workspace
+restriction, and every two-window bucket. Without the line a user blocked by workspace credits sees
+a full set of calm meters, which is the original bug report with a different cause.
+
+**The gate has three states and they are not interchangeable.** `ordinaryUsageAllowed` is the
+backend's permission for ordinary usage, validated against the active account, so when it speaks it
+is the authority: an explicit `false` states the restriction, and an explicit `true` rules one out
+*whatever a bucket reports* — that contradiction is logged rather than resolved in silence. Only
+when the field is `null` or absent does a bucket-level restriction stand in for it.
+
+**Which bucket-level restrictions stand in.** The four `workspace_*` kinds count from any bucket,
+reserve included, because a workspace fact is not a property of the quota that reported it. A
+consumption refusal on a *model-scoped* bucket is deliberately dropped — a spent reserve does not
+restrict ordinary work — as is an unrecognised kind reported there. A restriction a rendered bar
+already carries does not also set the line.
+
+It renders **even when no window survives**, since the shapes that produce a restriction most often
+are the ones that leave nothing to draw. It says *ordinary usage* is restricted rather than that
+Codex is unavailable, which is accurate for a consumption refusal; no model is named and no remedy
+is offered, per the product decision above.
+
+~~The `usedPercent > 0` conjunct…~~ **Superseded — deleted, and not to be restored.** The rationale
+that once lived here argued a quota cannot be both unspent and exhausted, which is true only of a
+consumption refusal. The rule that shipped is the one stated above.
 
 Two things to be honest about in the code comment, not only here. This **infers recovery from a
 percentage**, which the schema's own wording tells clients not to do ("must not infer recovery from
@@ -524,6 +560,15 @@ taken *before any turn runs in the new window*. One turn in, `usedPercent` is a 
 stale flag sails through, rendering a nearly-empty bar in the warning tone. Since a turn ending is
 itself what triggers a read, that is the common case rather than the rare one. What the guard
 reliably protects is the read a *waiting* user is most likely to be looking at.
+
+**No render clock — the panel does not update itself while open, and that is a decision.** Nothing
+in the component reacts to time passing, so a countdown keeps the text it had when its reading
+landed and a window whose reset elapses does not drop until something triggers a refresh. A `$state`
+clock ticking on an interval would fix both. It was considered and declined: the reading is dated
+for the user ("Measured … ago"), and a stale countdown beside a stated measurement time is legible
+rather than misleading. **The cost to know**: a user waiting out a reset with the panel open sees
+the numbers from their last refresh, and the trigger they cannot reach while blocked is the one that
+would update them. Revisit with M3, which already reworks per-window timestamps.
 
 **Staleness copy — do nothing here.** `HarnessUsage.svelte:214` currently reads "Measured
 {relativeTime} — **send a message to refresh**", which becomes false for Codex once the app refreshes
@@ -940,8 +985,8 @@ reset and both ran together.
 
 1. **The refreshed-bucket probe — run, assumption held.** A recovered `codex` bucket reports
    `usedPercent: 0` against a new `resetsAt` with `rateLimitReachedType: null`, and
-   `ordinaryUsageAllowed` reads `true`. That is the "flag clears on reset" branch: the
-   `usedPercent > 0` conjunct is redundant but harmless and stays. The capture is checked in as
+   `ordinaryUsageAllowed` reads `true`. That is the "flag clears on reset" branch, which made the
+   `usedPercent > 0` conjunct redundant; M2 then deleted it outright. The capture is checked in as
    `account-rate-limits-healthy.jsonl` rather than described only in prose, because the exhausted
    shape can be reproduced by spending quota and this one cannot be reproduced at all.
 

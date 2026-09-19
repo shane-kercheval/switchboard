@@ -11,6 +11,7 @@
 /// owns *when* the read runs and how concurrent requests collapse.
 import { invoke } from "@tauri-apps/api/core";
 import { observeUsage } from "$lib/state/harnessUsage.svelte";
+import { codexAccountUsageView } from "$lib/usageWindows";
 import type { HarnessKind } from "$lib/types";
 
 /// The harness this read speaks for.
@@ -55,11 +56,26 @@ export function requestAccountUsageRefresh(): void {
   requestedSinceRead = true;
   if (readInFlight !== null) return;
   readInFlight = (async () => {
-    while (requestedSinceRead) {
-      requestedSinceRead = false;
-      await readOnce();
+    try {
+      while (requestedSinceRead) {
+        requestedSinceRead = false;
+        // Caught per pass, not around the loop. A throw while handling one
+        // response must not abandon a request that arrived during it, and
+        // nothing awaits this promise in production, so an escaping rejection
+        // would be invisible as well as fatal.
+        try {
+          await readOnce();
+        } catch (e) {
+          console.warn("codex account usage read failed", e);
+        }
+      }
+    } finally {
+      // Structural rather than contingent: the slot is released whatever
+      // happens above. Holding it forever is the permanent-freeze failure this
+      // module's bound exists to prevent, and a throw is a far cheaper way to
+      // reach it than a wedged server.
+      readInFlight = null;
     }
-    readInFlight = null;
   })();
 }
 
@@ -79,10 +95,47 @@ async function readOnce(): Promise<void> {
     return;
   }
   if (usage === null || usage === undefined) return;
+  reportDiagnostics(usage);
   observeUsage(ACCOUNT_USAGE_HARNESS, {
     payload: usage,
     observed_at: new Date().toISOString(),
   });
+}
+
+/// Conditions last reported, so a standing one logs once.
+let lastDiagnostics = "";
+
+/// Log what the reading could not be read as, once per distinct condition.
+///
+/// **Here rather than in the reader**, which is pure and runs inside a
+/// `$derived`: a warning there would re-fire on every recompute. Deduplicated
+/// the way the backend's failure log is, because the conditions worth reporting
+/// are steady states — a field the server stopped emitting stays absent on every
+/// refresh — and an unsuppressed line would bury the transient ones.
+///
+/// **An empty reading is not itself a condition.** An account whose only quota
+/// is a model reserve legitimately renders nothing, and so does one whose
+/// windows have all cycled. Only a structural failure to read a bucket is
+/// reported, which is what separates "nothing to show" from "we could not tell".
+function reportDiagnostics(usage: unknown): void {
+  // `nowMs` is passed but cannot matter: see the invariant on
+  // `CodexAccountDiagnostic`. A test pins it.
+  const { diagnostics } = codexAccountUsageView(usage, Date.now());
+  const summary = diagnostics
+    .map((d) => ("slot" in d ? `${d.kind}:${d.limitId}.${d.slot}` : `${d.kind}:${d.limitId}`))
+    .sort()
+    .join(",");
+  if (summary === lastDiagnostics) return;
+  const cleared = summary === "" && lastDiagnostics !== "";
+  lastDiagnostics = summary;
+  if (summary !== "") {
+    console.warn(`codex account usage: unreadable response (${summary})`);
+  } else if (cleared) {
+    // The other half of the story, and otherwise invisible: without it the log
+    // shows a condition that appears never to have ended. Matches the backend's
+    // failure log, which logs its recovery for the same reason.
+    console.info("codex account usage: response is readable again");
+  }
 }
 
 /// Test-only. Named under `_testing` so no production caller can await a
@@ -97,5 +150,6 @@ export const _testing = {
   reset(): void {
     readInFlight = null;
     requestedSinceRead = false;
+    lastDiagnostics = "";
   },
 };

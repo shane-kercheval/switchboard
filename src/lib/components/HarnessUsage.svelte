@@ -43,24 +43,34 @@
     overage: { resetsAtMs: number | null } | null;
     /// Bare reset line for a Claude payload with no window map at all.
     fallback: { label: string; resetsAtMs: number } | null;
+    /// The harness states that ordinary work is currently restricted.
+    ///
+    /// Separate from a window's `limitReached` because it belongs to no single
+    /// window: most of Codex's restriction kinds are workspace facts, and a
+    /// bucket declaring two windows never says which of them refused. This is
+    /// where a refusal that cannot be attributed is stated without guessing.
+    blocked: boolean;
     /// When the harness measured the reading, for the age line. Absent when the
     /// reading carries no instant, in which case no age is claimed rather than a
     /// fabricated one being shown.
     measuredAt: string | undefined;
   };
 
-  /// **Opening the panel is the refresh.** This component is mounted only while
-  /// the sidebar is open on this mode, so mounting *is* the moment these meters
-  /// become visible.
+  /// **Opening the panel refreshes it**, and that is the whole claim. This
+  /// component is mounted only while the sidebar is open on this mode, so
+  /// mounting is the moment these meters become visible.
   ///
-  /// It covers a gap nothing else does. A blocked user's bucket renders fine
-  /// until its reset elapses, at which point the reset-passed rule drops it and
-  /// the section empties — exactly while they are watching it to see whether
-  /// they can work again. They are not ending turns, so the turn-end trigger
-  /// never fires and nothing else would refill it.
+  /// **Nothing here reacts to time passing, deliberately.** The rows derive
+  /// from the stored reading alone, so while the panel stays open a countdown
+  /// keeps whatever text it had when the reading landed and a window whose
+  /// reset elapses does not drop. A clock that re-derived on an interval would
+  /// fix both; it was considered and declined, because the reading is dated for
+  /// the user ("Measured … ago") and a stale countdown beside a stated
+  /// measurement time is legible rather than misleading.
   ///
-  /// Not window focus and not a timer: both fire when nobody is looking, and a
-  /// timer would keep a subprocess cadence running for a passive readout.
+  /// The consequence to know: a user waiting out a reset with the panel open
+  /// sees the numbers from their last refresh until something triggers another
+  /// one, and ending a turn is the trigger they cannot reach while blocked.
   ///
   /// Reads no reactive state, so it runs once per mount rather than on every
   /// change to the rows below.
@@ -80,9 +90,22 @@
       // directly. Matching on "codex" here would decide by harness name the one
       // thing the capability mirror exists to decide.
       if (supportsAccountUsageRead(harness)) {
-        const windows = codexAccountUsageView(reading.payload, now);
-        if (windows.length > 0) {
-          built.push({ harness, windows, overage: null, fallback: null, measuredAt });
+        const view = codexAccountUsageView(reading.payload, now);
+        // **Renders on the statement alone, with no meters.** The restriction
+        // is the fact the user most needs, and the shapes that produce it most
+        // often are exactly the ones that leave nothing to draw: a workspace
+        // restriction against expired windows, or a bucket reporting no window
+        // at all. Requiring a meter would hide the harness's own explicit
+        // answer in the cases it matters most.
+        if (view.windows.length > 0 || view.blocked) {
+          built.push({
+            harness,
+            windows: view.windows,
+            overage: null,
+            fallback: null,
+            blocked: view.blocked,
+            measuredAt,
+          });
         }
         continue;
       }
@@ -96,6 +119,9 @@
             windows: view.windows,
             overage: view.overage,
             fallback: view.fallback,
+            // Claude states a refusal per window, so it needs no account-level
+            // line; `claudeRateLimitView` flags the blocked window itself.
+            blocked: false,
             measuredAt,
           });
         }
@@ -175,6 +201,11 @@
                   {row.fallback.label} resets {formatResetCountdown(row.fallback.resetsAtMs)}
                 </div>
               {/if}
+              {#if row.blocked}
+                <div class="text-warning" data-testid="harness-usage-blocked">
+                  Ordinary usage restricted
+                </div>
+              {/if}
               {#if row.overage !== null}
                 <!-- -ml-1 offsets the glyph's left-side bearing so it aligns
                      with the text column above. -->
@@ -211,6 +242,16 @@
                 <span class="text-right tabular-nums">
                   Resets {formatResetDateTime(row.fallback.resetsAtMs)}
                 </span>
+              </div>
+            {/if}
+            {#if row.blocked}
+              <!-- Says *ordinary* usage, not that Codex is unavailable: the
+                   reserve model is a separate allowance and may still serve. -->
+              <div class="text-warning border-primary-fg/20 border-t pt-2">
+                <p class="font-medium">Ordinary usage restricted</p>
+                <p class="mt-0.5 text-[12px]">
+                  Codex reports that it is not currently serving ordinary requests on this account.
+                </p>
               </div>
             {/if}
             {#if row.overage !== null}

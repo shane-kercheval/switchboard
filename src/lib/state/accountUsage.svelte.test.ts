@@ -98,6 +98,169 @@ describe("coalescing", () => {
   });
 });
 
+describe("surviving a failure while handling a response", () => {
+  /// A response that is delivered successfully and then throws while being
+  /// handled — the case the `invoke` try/catch does not cover, and the only way
+  /// the drain loop can be left holding its slot.
+  function throwsWhenRead(): unknown {
+    return {
+      get rateLimitsByLimitId(): never {
+        throw new Error("boom");
+      },
+    };
+  }
+
+  it("releases the slot after a throw rather than freezing the meter for the session", async () => {
+    // Held, the slot stops every later read for the life of the process — the
+    // same permanent freeze the backend's timeout exists to prevent, reached
+    // far more cheaply. The next request must still get through.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invokeMock.mockResolvedValueOnce(throwsWhenRead());
+    accountUsage.requestAccountUsageRefresh();
+    await accountUsage._testing.settled();
+
+    invokeMock.mockResolvedValue({ ordinaryUsageAllowed: true, rateLimitsByLimitId: {} });
+    accountUsage.requestAccountUsageRefresh();
+    await accountUsage._testing.settled();
+    expect(usage.harnessUsage.codex?.payload).toEqual({
+      ordinaryUsageAllowed: true,
+      rateLimitsByLimitId: {},
+    });
+    warn.mockRestore();
+  });
+
+  it("still runs a request that arrived during a failed read", async () => {
+    // The follow-up flag is set while the failing read is in flight. Catching
+    // around the whole loop instead of per pass would drop that request
+    // silently, losing a refresh the user's turn asked for.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let calls = 0;
+    let release = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      release = () => resolve();
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd !== "read_codex_account_usage") return undefined;
+      calls += 1;
+      if (calls === 1) {
+        await gate;
+        return throwsWhenRead();
+      }
+      return { ordinaryUsageAllowed: true, rateLimitsByLimitId: {} };
+    });
+
+    accountUsage.requestAccountUsageRefresh();
+    await vi.waitFor(() => expect(calls).toBe(1));
+    accountUsage.requestAccountUsageRefresh();
+    release();
+    await accountUsage._testing.settled();
+
+    expect(calls).toBe(2);
+    expect(usage.harnessUsage.codex?.payload).toEqual({
+      ordinaryUsageAllowed: true,
+      rateLimitsByLimitId: {},
+    });
+    warn.mockRestore();
+  });
+});
+
+describe("reporting a response we could not read", () => {
+  const unreadable = {
+    ordinaryUsageAllowed: true,
+    // No `normalModelSlug`: a valid payload from a server that stopped
+    // emitting nulls, and the one condition that empties the panel silently.
+    rateLimitsByLimitId: { codex: { limitId: "codex", primary: { usedPercent: 42 } } },
+  };
+
+  it("warns once for a condition that persists across reads", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invokeMock.mockResolvedValue(unreadable);
+    for (let i = 0; i < 3; i += 1) {
+      accountUsage.requestAccountUsageRefresh();
+      await accountUsage._testing.settled();
+    }
+    expect(
+      warn.mock.calls.filter((c) => String(c[0]).includes("unreadable response")),
+    ).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it("warns again after an intervening readable response", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invokeMock.mockResolvedValue(unreadable);
+    accountUsage.requestAccountUsageRefresh();
+    await accountUsage._testing.settled();
+
+    invokeMock.mockResolvedValue({ ordinaryUsageAllowed: true, rateLimitsByLimitId: {} });
+    accountUsage.requestAccountUsageRefresh();
+    await accountUsage._testing.settled();
+
+    invokeMock.mockResolvedValue(unreadable);
+    accountUsage.requestAccountUsageRefresh();
+    await accountUsage._testing.settled();
+    expect(
+      warn.mock.calls.filter((c) => String(c[0]).includes("unreadable response")),
+    ).toHaveLength(2);
+    warn.mockRestore();
+  });
+
+  it("names the window that could not be read, not just the quota", async () => {
+    // A quota has two windows; "something in `codex` was unreadable" does not
+    // tell a reader which one, and two unreadable windows would otherwise log
+    // the identical entry twice.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invokeMock.mockResolvedValue({
+      rateLimitsByLimitId: {
+        codex: {
+          normalModelSlug: null,
+          primary: { usedPercent: "nope" },
+          secondary: { usedPercent: "nope" },
+        },
+      },
+    });
+    accountUsage.requestAccountUsageRefresh();
+    await accountUsage._testing.settled();
+    const line = String(warn.mock.calls.find((c) => String(c[0]).includes("unreadable"))?.[0]);
+    expect(line).toContain("codex.primary");
+    expect(line).toContain("codex.secondary");
+    warn.mockRestore();
+  });
+
+  it("says so when a standing condition clears", async () => {
+    // Otherwise the log shows a problem that appears never to have ended. The
+    // backend's failure log reports its recovery for the same reason.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    invokeMock.mockResolvedValue(unreadable);
+    accountUsage.requestAccountUsageRefresh();
+    await accountUsage._testing.settled();
+    expect(info).not.toHaveBeenCalled();
+
+    invokeMock.mockResolvedValue({ ordinaryUsageAllowed: true, rateLimitsByLimitId: {} });
+    accountUsage.requestAccountUsageRefresh();
+    await accountUsage._testing.settled();
+    expect(info.mock.calls.filter((c) => String(c[0]).includes("readable again"))).toHaveLength(1);
+    warn.mockRestore();
+    info.mockRestore();
+  });
+
+  it("says nothing about an account whose only quota is a model reserve", async () => {
+    // Legitimately empty, not drift. Warning here would fire on every refresh
+    // for a user whose setup is perfectly normal.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invokeMock.mockResolvedValue({
+      ordinaryUsageAllowed: true,
+      rateLimitsByLimitId: {
+        base_model_inference: { normalModelSlug: "gpt-5.6-luna", primary: { usedPercent: 5 } },
+      },
+    });
+    accountUsage.requestAccountUsageRefresh();
+    await accountUsage._testing.settled();
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes("unreadable response"))).toEqual([]);
+    warn.mockRestore();
+  });
+});
+
 describe("handing the reading to the store", () => {
   it("stores the response under its own wrapping, not a flattened bucket map", async () => {
     // The wrapping is what carries `ordinaryUsageAllowed` through the persisted

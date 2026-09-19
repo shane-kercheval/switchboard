@@ -135,6 +135,14 @@ export async function loadPersistedUsage(): Promise<void> {
 /// Defensive read of one persisted entry. The file is machine-written, but it is
 /// also user-editable and forward-compatible by design, so an entry that does not
 /// carry the two fields every consumer needs is dropped rather than rendered.
+/// **An entry written before the Codex account read is kept, not migrated.**
+/// It is tolerated because the two payload shapes cannot be confused: the old
+/// one is the rollout's `rate_limits` object and structurally cannot carry
+/// `rateLimitsByLimitId`, so the account view reads it as nothing and the
+/// section renders empty until a fresh read supersedes it on arrival-time
+/// ranking. That is normally the startup refresh, but it depends on the read
+/// succeeding — offline, or with no Codex installed, the stale entry simply
+/// keeps rendering nothing. No version check or shape sniff is needed anywhere.
 function asReading(value: unknown): HarnessUsageReading | null {
   if (typeof value !== "object" || value === null) return null;
   const v = value as Record<string, unknown>;

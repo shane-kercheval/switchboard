@@ -6991,6 +6991,13 @@ pub fn account_usage_log_decision(
 /// subprocess on the strength of a store read that just failed, and the cost of
 /// answering no is one skipped meter refresh: the gate is consulted per read,
 /// not once per session, so the next trigger asks again.
+///
+/// **Deliberately uncached, including on the Codex turn-end path.** Finding a
+/// match short-circuits the remaining projects but still reads a registry from
+/// disk, so this is not free on any call. Caching it would be: a remembered
+/// "no" would suppress the meter for a user who creates their first Codex agent
+/// mid-session, and invalidating correctly costs more machinery than the scan
+/// costs to repeat a handful of times per session.
 fn any_configured_agent_reports_account_usage(state: &AppState) -> bool {
     let Ok(entries) = indexed_projects(state) else {
         return false;

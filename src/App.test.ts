@@ -655,6 +655,24 @@ describe("App", () => {
     expect(screen.queryByTestId(/^banner-auth_missing-/)).not.toBeInTheDocument();
   });
 
+  it("asks Codex for the account's quotas at startup", async () => {
+    // One of three refresh triggers, and the only one that populates the meters
+    // before any turn has run — without it the usage section stays empty until
+    // the user's first Codex turn ends. Deleting the call in `App.svelte` used to
+    // break nothing in the suite.
+    //
+    // Mounted on the welcome state deliberately: no project is open, so the
+    // usage panel never mounts and its own mount-time trigger cannot satisfy
+    // this assertion in place of the startup one.
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
+    await waitFor(() => {
+      const reads = invokeMock.mock.calls.filter(([c]) => c === "read_codex_account_usage");
+      expect(reads.length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByTestId("harness-usage")).not.toBeInTheDocument();
+  });
+
   it("re-probes when the backend reports the login-shell PATH resolved", async () => {
     // The linchpin of the non-blocking PATH design: nothing waits for the shell,
     // so the first probes can be answered from an interim PATH. This event is

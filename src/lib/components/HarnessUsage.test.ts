@@ -9,6 +9,8 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 const usage = await import("$lib/state/harnessUsage.svelte");
+const accountUsage = await import("$lib/state/accountUsage.svelte");
+const { invoke } = await import("@tauri-apps/api/core");
 
 /// Rendering claims for the account-scoped usage section: meter counts, labels,
 /// order, tone, the tooltip's absolute dates, and every clean-hide rule. What the
@@ -21,6 +23,11 @@ const usage = await import("$lib/state/harnessUsage.svelte");
 /// rendering it.
 beforeEach(() => {
   usage._testing.reset();
+  // Mounting fires a refresh, so a read left in flight by an earlier test would
+  // make the next mount skip its own — the coalescing working as designed, and
+  // a source of order-dependent tests if not cleared.
+  accountUsage._testing.reset();
+  vi.mocked(invoke).mockClear();
 });
 
 /// A unix-epoch-seconds timestamp `deltaSeconds` from now — payloads use
@@ -482,9 +489,12 @@ function codexAccount(buckets: Record<string, unknown>): unknown {
   return { ordinaryUsageAllowed: true, rateLimitsByLimitId: buckets };
 }
 
-async function renderCodexAccountUsage(buckets: Record<string, unknown>): Promise<void> {
+async function renderCodexAccountUsage(
+  buckets: Record<string, unknown>,
+  ordinaryUsageAllowed = true,
+): Promise<void> {
   usage.observeUsage("codex", {
-    payload: codexAccount(buckets),
+    payload: { ordinaryUsageAllowed, rateLimitsByLimitId: buckets },
     observed_at: new Date().toISOString(),
   });
   render(HarnessUsage);
@@ -688,6 +698,71 @@ describe("Codex account quotas", () => {
     await tick();
     expect(screen.queryByTestId("harness-usage-codex")).toBeNull();
     expect(screen.getByTestId("harness-usage-claude_code")).toBeInTheDocument();
+  });
+
+  it("renders both windows of a single bucket as separate meters", async () => {
+    // A bucket holds up to two windows for the same limit. Rendering only the
+    // first drops the second quota from the panel entirely.
+    await renderCodexAccountUsage({
+      codex: codexBucket({
+        primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: epochFromNow(1800) },
+        secondary: { usedPercent: 70, windowDurationMins: 10080, resetsAt: epochFromNow(86_400) },
+      }),
+    });
+    const meters = screen.getAllByTestId("harness-usage-window");
+    expect(meters).toHaveLength(2);
+    expect(meters[0]).toHaveTextContent("5-hour limit");
+    expect(meters[1]).toHaveTextContent("Weekly · all models");
+  });
+
+  it("states an account-level restriction beside the meters", async () => {
+    await renderCodexAccountUsage({ codex: codexBucket() }, false);
+    expect(screen.getByTestId("harness-usage-blocked")).toBeInTheDocument();
+    expect(screen.getByTestId("harness-usage-window")).toBeInTheDocument();
+  });
+
+  it("states an account-level restriction even when no meter survives", async () => {
+    // The shapes that produce a restriction most often leave nothing to draw —
+    // a workspace limit against windows that have all cycled. Hiding the row
+    // for want of a meter would suppress the harness's own explicit answer at
+    // the moment it matters most.
+    await renderCodexAccountUsage(
+      {
+        codex: codexBucket({
+          primary: { usedPercent: 100, windowDurationMins: 10080, resetsAt: epochFromNow(-60) },
+        }),
+      },
+      false,
+    );
+    expect(screen.getByTestId("harness-usage-codex")).toBeInTheDocument();
+    expect(screen.getByTestId("harness-usage-blocked")).toBeInTheDocument();
+    expect(screen.queryByTestId("harness-usage-window")).toBeNull();
+  });
+
+  it("says nothing about restriction on a healthy account", async () => {
+    await renderCodexAccountUsage({ codex: codexBucket() });
+    expect(screen.queryByTestId("harness-usage-blocked")).toBeNull();
+  });
+
+  it("leaves every bar neutral when a workspace restriction is in force", async () => {
+    // A workspace credit problem is not a statement about any window's
+    // consumption, so no bar turns amber for it; the account line carries it.
+    await renderCodexAccountUsage(
+      { codex: codexBucket({ rateLimitReachedType: "workspace_owner_credits_depleted" }) },
+      false,
+    );
+    expect(screen.getByTestId("harness-usage-window-fill")).not.toHaveClass("bg-warning");
+    expect(screen.getByTestId("harness-usage-blocked")).toBeInTheDocument();
+  });
+
+  it("asks the account for a fresh reading when the panel mounts", async () => {
+    // One of only three refresh triggers, and the only one that fires while the
+    // app is already running without a turn ending. Deleting it would leave a
+    // user who reopens the panel looking at whatever was last read, and until
+    // this assertion existed nothing in the suite noticed its absence.
+    render(HarnessUsage);
+    await tick();
+    expect(invoke).toHaveBeenCalledWith("read_codex_account_usage");
   });
 
   it("Claude agent never shows the Codex gauge cell (Codex-gated)", async () => {

@@ -119,9 +119,20 @@ function parsePinsSortMode(value: unknown): PinsSortMode | undefined {
   return undefined;
 }
 
+/// Collapsed-card ids are a set in meaning but a list on disk (JSON has no set),
+/// so both the parse path and the collapse-all path funnel through one dedupe.
+///
+/// `indexOf`, not a `Set`: `svelte/prefer-svelte-reactivity` rejects holding a
+/// built-in `Set` in a `.svelte.ts` module, and the input here is one project's
+/// agent roster — tens of entries at the outside, both callers run on a user
+/// gesture or a single storage read.
+function uniqueAgentIds(ids: readonly AgentId[]): AgentId[] {
+  return ids.filter((id, index) => ids.indexOf(id) === index);
+}
+
 function parseAgentIds(value: unknown): AgentId[] | undefined {
   if (!Array.isArray(value) || !value.every((id) => typeof id === "string")) return undefined;
-  return [...new Set(value)];
+  return uniqueAgentIds(value);
 }
 
 function parseProjectPreferences(value: unknown): Record<ProjectId, ProjectLayoutPreferences> {
@@ -289,9 +300,19 @@ export const layout = {
   setAllAgentCardsCollapsed(projectId: ProjectId, agentIds: AgentId[], collapsed: boolean): void {
     state.projectPreferences[projectId] = {
       ...state.projectPreferences[projectId],
-      collapsedAgentIds: collapsed
-        ? agentIds.filter((id, index) => agentIds.indexOf(id) === index)
-        : [],
+      collapsedAgentIds: collapsed ? uniqueAgentIds(agentIds) : [],
+    };
+    persist();
+  },
+  /// Drop a deleted agent's collapse state. Without this the list grows for the
+  /// life of the project: agent ids are never reused, so an entry for a removed
+  /// agent can never match again and nothing else would ever clear it.
+  removeAgentCardState(projectId: ProjectId, agentId: AgentId): void {
+    const current = state.projectPreferences[projectId]?.collapsedAgentIds;
+    if (current === undefined || !current.includes(agentId)) return;
+    state.projectPreferences[projectId] = {
+      ...state.projectPreferences[projectId],
+      collapsedAgentIds: current.filter((id) => id !== agentId),
     };
     persist();
   },

@@ -13,12 +13,19 @@
 
   type Props = {
     inventory: SessionInventory | undefined;
+    /// Capture time of a rehydrated inventory (ISO-8601). When set, the list
+    /// is what the agent's last turn loaded rather than what it has now, and
+    /// the popover says so — the convention the rate-limit snapshot set: a
+    /// stale reading is fine as long as it admits to being one.
     asOf?: string | null;
   };
 
   let { inventory, asOf }: Props = $props();
 
   const view = $derived(environmentView(inventory));
+  /// Which count-line lists are open. Ephemeral, like the card's own
+  /// disclosure — a sidebar that remembered every expansion across reloads
+  /// would reopen a 109-row list on project open.
   let openLists = $state<Record<string, boolean>>({});
 
   function formatAsOf(iso: string): string {
@@ -51,7 +58,7 @@
           class={view.attentionSummary === null
             ? "text-muted ml-auto min-w-0 truncate"
             : "text-warning ml-auto min-w-0 truncate"}
-          data-testid="agent-env-summary"
+          data-testid="agent-env-trigger-summary"
         >
           {view.attentionSummary ?? "View details"}
         </span>
@@ -72,6 +79,14 @@
         </p>
       </div>
 
+      <!-- The harness-supplied lists below are keyed by index, never by
+           name. They are replaced wholesale on every event and hold no
+           per-row state, so a name key buys no reconciliation — and it
+           imposes a uniqueness the sources cannot honor: a recorded Claude
+           `init` lists `deep-research` twice, and a user copying a bundled
+           skill to customize it is the ordinary way two entries share a
+           name. Svelte throws on a duplicate key in production as well as
+           dev, with no error boundary here to catch it. -->
       <div class="mt-3 space-y-3">
         {#if view.servers !== null}
           <section data-testid="agent-env-mcp">
@@ -80,6 +95,11 @@
               {#each view.servers as server, i (i)}
                 <div class={ROW}>
                   {#if server.tone !== undefined}
+                    <!-- The dot is the sole signal only when the status is
+                         plain `connected`, and then its accessible name is that
+                         status — the sibling text carries the server's name,
+                         not its health. Otherwise the raw status renders beside
+                         it as visible text and the dot is decorative. -->
                     <StatusDot
                       status={server.tone}
                       label={server.statusLabel === undefined ? server.status : undefined}
@@ -121,6 +141,8 @@
             <h4 class={SECTION_LABEL}>Memory · {view.memory.length}</h4>
             <div class="mt-1 space-y-0.5">
               {#each view.memory as entry, i (i)}
+                <!-- The basename alone is ambiguous across scopes, so the full
+                     path is on hover rather than wrapped into the popover. -->
                 <Tooltip
                   label={entry.path}
                   delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}

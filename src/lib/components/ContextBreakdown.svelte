@@ -7,10 +7,19 @@
   /// question you actually act on, because the answer is usually a tool list
   /// nobody chose to load.
   ///
-  /// The opener dispatches a fresh report before this renders. While that report
-  /// is queued or running, the panel gives the request the whole content area;
-  /// after it settles, the last good report remains available even if the
-  /// refresh failed.
+  /// **Opening is the refresh.** Every entry point dispatches a fresh report,
+  /// so the panel carries no Refresh or Analyze button: the spinner says a
+  /// report is on its way, and re-opening is how you ask for another one —
+  /// including after a failure. A button would only name an action the open
+  /// already performed.
+  ///
+  /// **While a report is in flight the panel shows only the spinner**, even
+  /// when the agent has a previous breakdown. Rendering the old numbers first
+  /// and swapping them a few seconds later reads as the panel changing its
+  /// mind; one loading state that resolves once is calmer than a correct value
+  /// that arrives twice. A *settled* failure keeps the previous report, which
+  /// is a different case — nothing further is coming to replace it (see
+  /// `dispatchContextReport`).
   import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";

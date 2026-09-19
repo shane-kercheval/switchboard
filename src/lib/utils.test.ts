@@ -236,18 +236,44 @@ describe("formatResetCountdown", () => {
     expect(formatResetCountdown(ms("2026-09-17T12:00:20Z"), NOW)).toBe("in 1 min");
   });
 
-  it("rounds partial hours up so the countdown never understates the wait", () => {
+  it("rounds partial hours to the nearer hour, in both directions", () => {
     expect(formatResetCountdown(ms("2026-09-17T15:00:00Z"), NOW)).toBe("in 3 h");
     expect(formatResetCountdown(ms("2026-09-17T15:59:00Z"), NOW)).toBe("in 4 h");
+    // The case ceiling got wrong: just past the hour is "in 1 h", not "in 2 h"
+    // — overstating by an hour sends the user away from a window that is
+    // nearly clear.
+    expect(formatResetCountdown(ms("2026-09-17T13:01:00Z"), NOW)).toBe("in 1 h");
+    expect(formatResetCountdown(ms("2026-09-17T13:40:00Z"), NOW)).toBe("in 2 h");
   });
 
-  it("rounds partial days up so the countdown never understates the wait", () => {
+  it("rounds partial days to the nearer day, in both directions", () => {
     // Relative at every distance, so the weekly window's reset stays short
     // enough to sit beside its label in the card column.
     expect(formatResetCountdown(ms("2026-09-18T12:00:00Z"), NOW)).toBe("in 1 d");
     expect(formatResetCountdown(ms("2026-09-22T12:00:00Z"), NOW)).toBe("in 5 d");
     expect(formatResetCountdown(ms("2026-09-19T05:00:00Z"), NOW)).toBe("in 2 d");
     expect(formatResetCountdown(ms("2026-09-24T08:00:00Z"), NOW)).toBe("in 7 d");
+    // Just past a day is "in 1 d", not "in 2 d".
+    expect(formatResetCountdown(ms("2026-09-18T13:00:00Z"), NOW)).toBe("in 1 d");
+  });
+
+  it("flips 1 d to 2 d at the 36-hour midpoint", () => {
+    // The day tier's decision point, pinned because it is the one a reader
+    // checks against the word "rounds": 36h is the midpoint between one day
+    // and two, and a value sitting exactly on it rounds away from zero.
+    expect(formatResetCountdown(ms("2026-09-18T23:59:00Z"), NOW)).toBe("in 1 d");
+    expect(formatResetCountdown(ms("2026-09-19T00:00:00Z"), NOW)).toBe("in 2 d");
+    // And the tier's lower edge: days only start once hours round to 24, so
+    // anything under ~23.5h is still reported in hours rather than as "1 d".
+    expect(formatResetCountdown(ms("2026-09-18T11:00:00Z"), NOW)).toBe("in 23 h");
+    expect(formatResetCountdown(ms("2026-09-18T11:29:00Z"), NOW)).toBe("in 23 h");
+  });
+
+  it("never renders a zero unit at a unit boundary", () => {
+    // `minutes` escalates at a rounded 60 and `hours` at a rounded 24, so the
+    // next unit down must never itself round to zero.
+    expect(formatResetCountdown(ms("2026-09-17T12:59:31Z"), NOW)).toBe("in 1 h");
+    expect(formatResetCountdown(ms("2026-09-18T11:31:00Z"), NOW)).toBe("in 1 d");
   });
 
   it("crosses from hours to days at 24 hours", () => {

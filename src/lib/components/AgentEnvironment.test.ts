@@ -40,7 +40,7 @@ describe("AgentEnvironment", () => {
     render(AgentEnvironment, { props: { inventory: CLAUDE } });
 
     expect(screen.getByTestId("agent-env-toggle")).toHaveTextContent("Environment");
-    expect(screen.getByTestId("agent-env-summary")).toHaveTextContent("1 need auth");
+    expect(screen.getByTestId("agent-env-trigger-summary")).toHaveTextContent("1 need auth");
     expect(screen.queryByTestId("agent-env-detail")).toBeNull();
 
     await expand();

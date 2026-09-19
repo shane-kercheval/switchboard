@@ -214,6 +214,17 @@ describe("layout store", () => {
     expect(layout.agentCardCollapsedFor("p-a", "agent-a")).toBe(true);
   });
 
+  it("drops a deleted agent's collapse state", () => {
+    layout.setAgentCardCollapsed("p-a", "agent-a", true);
+    layout.setAgentCardCollapsed("p-a", "agent-b", true);
+
+    layout.removeAgentCardState("p-a", "agent-a");
+    _testing.reloadFromStorage();
+
+    expect(layout.agentCardCollapsedFor("p-a", "agent-a")).toBe(false);
+    expect(layout.agentCardCollapsedFor("p-a", "agent-b")).toBe(true);
+  });
+
   it("degrades a corrupt blob to defaults", () => {
     localStorage.setItem(STORAGE_KEY, "{not json");
     _testing.reloadFromStorage();

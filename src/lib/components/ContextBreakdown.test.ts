@@ -41,7 +41,9 @@ function mount(overrides: Overrides = {}): void {
 }
 
 describe("ContextBreakdown", () => {
-  it("shows the settled empty state when no report is available", () => {
+  it("shows the settled empty state, with no action to press", () => {
+    // Opening the panel is what asks for a report, so there is no button here
+    // naming an action the open already performed.
     mount();
     expect(screen.getByTestId("context-breakdown-empty")).toBeInTheDocument();
     expect(screen.queryByTestId("context-breakdown-refresh")).not.toBeInTheDocument();
@@ -103,12 +105,15 @@ describe("ContextBreakdown", () => {
     expect(screen.queryByTestId("context-breakdown-empty")).not.toBeInTheDocument();
   });
 
-  it("shows a spinner instead of the stale report while a refresh is running", () => {
+  it("shows only the spinner while a refresh runs, not the report it will replace", () => {
+    // Showing the old numbers and swapping them seconds later reads as the
+    // panel changing its mind; one loading state that resolves once is calmer.
     mount({ report: REPORT, request: { send_id: "s", phase: "running" } });
     expect(screen.getByTestId("context-breakdown-loading")).toHaveTextContent(
       "Refreshing context…",
     );
     expect(screen.queryByTestId("context-breakdown-usage")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("context-breakdown-raw-toggle")).not.toBeInTheDocument();
   });
 
   it("names a failure and keeps the previous report beside it", () => {
@@ -154,5 +159,16 @@ describe("ContextBreakdown", () => {
     expect(row).not.toHaveAttribute("title");
     // The primitive marks its trigger; a native `title` would leave it bare.
     expect(row).toHaveAttribute("data-tooltip-trigger");
+  });
+
+  it("names a failure that produced no report, without offering a button", () => {
+    // Re-opening the panel is the retry, so a failure carries its reason and
+    // nothing to press.
+    mount({ request: { send_id: "s", phase: "failed", error: "no session yet" } });
+    expect(screen.getByTestId("context-breakdown-empty")).toBeInTheDocument();
+    expect(screen.getByTestId("context-breakdown-request-note")).toHaveTextContent(
+      "no session yet",
+    );
+    expect(screen.queryByTestId("context-breakdown-refresh")).not.toBeInTheDocument();
   });
 });

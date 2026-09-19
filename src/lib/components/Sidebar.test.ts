@@ -357,8 +357,10 @@ describe("Sidebar", () => {
 
     expect(screen.getByTestId("agent-harness-icon")).toBeInTheDocument();
     const trigger = screen.getByTestId("agent-actions-trigger");
-    expect(trigger).toHaveClass("invisible");
-    expect(trigger).toHaveClass("group-hover:visible");
+    // Collapsed to zero width rather than merely invisible: an invisible button
+    // still reserves its gutter, and that gutter was clipping agent names.
+    expect(trigger).toHaveClass("w-0");
+    expect(trigger).toHaveClass("group-hover:w-[26px]");
 
     const menu = await openAgentActions();
     expect(await screen.findByTestId("agent-action-resume")).toBeInTheDocument();
@@ -928,7 +930,7 @@ describe("Sidebar", () => {
       "Harness/session default",
     );
     expect(screen.queryByTestId("agent-observed-model")).toBeNull();
-    expect(screen.getByTestId("agent-env-summary")).toHaveTextContent("View details");
+    expect(screen.getByTestId("agent-env-trigger-summary")).toHaveTextContent("View details");
   });
 
   // --- Environment row wiring ------------------------------------------------
@@ -1612,13 +1614,16 @@ describe("Sidebar", () => {
 
     const names = screen.getAllByTestId("agent-name").map((el) => el.textContent?.trim());
     expect(names).toEqual(["gpt-5-5-minimal", "gpt-5-5-minimal-2"]);
-    // The action gutter stays reserved so revealing controls never moves the
-    // harness icon or reflows the header.
+    // Hidden controls take no width, so shared-prefix names get the whole
+    // column to differ in. `tests/browser/sidebar-reorder.browser.test.ts`
+    // measures the geometry; this only pins the class contract jsdom can see.
     for (const toggle of screen.getAllByTestId("agent-visibility-toggle")) {
-      expect(toggle).toHaveClass("invisible");
+      expect(toggle).toHaveClass("w-0");
+      expect(toggle).toHaveClass("group-hover:w-[26px]");
     }
     for (const trigger of screen.getAllByTestId("agent-actions-trigger")) {
-      expect(trigger).toHaveClass("invisible");
+      expect(trigger).toHaveClass("w-0");
+      expect(trigger).toHaveClass("group-hover:w-[26px]");
     }
   });
 });
@@ -2854,6 +2859,8 @@ describe("context breakdown", () => {
   });
 
   it("opens the panel and refreshes immediately from the context icon", async () => {
+    // Opening is the refresh: the panel has no button, so every open asks the
+    // harness for a current breakdown and the spinner reports the wait.
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     seedContextBar(state, CLAUDE_AGENT);
@@ -2877,8 +2884,69 @@ describe("context breakdown", () => {
     expect(within(panel).getByTestId("context-breakdown-loading")).toHaveTextContent(
       "Context refresh queued…",
     );
+    // The agent's previous breakdown is withheld until the new one lands, so
+    // the panel never shows numbers it is about to swap out.
     expect(within(panel).queryByTestId("context-breakdown-usage")).toBeNull();
     expect(contextReportAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, expect.any(String));
+  });
+
+  it("refuses a breakdown while the agent is busy, from both entry points", async () => {
+    // Opening is what dispatches, and a report shares the agent's FIFO with
+    // sends — so on a busy agent the panel would be a bare spinner until the
+    // in-flight turn and every queued send finished.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("expected a runtime");
+    state.runtimes[CLAUDE_AGENT.id] = { ...runtime, run_status: "processing" };
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(await screen.findByTestId("agent-context-breakdown-button")).toBeDisabled();
+    const menu = await openAgentActions();
+    expect(within(menu).getByTestId("agent-action-context-breakdown")).toHaveAttribute(
+      "data-disabled",
+    );
+    expect(contextReportAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("stays available for an agent that has no dispatch state yet", async () => {
+    // `run_status` is the dispatch lifecycle, so its absence means idle, not
+    // busy — an agent just restored on project open has never dispatched.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    delete state.runtimes[CLAUDE_AGENT.id];
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(await screen.findByTestId("agent-context-breakdown-button")).toBeEnabled();
+  });
+
+  it("still opens while this agent's own report is the thing occupying it", async () => {
+    // The dispatch itself makes the agent busy, so gating on idle alone would
+    // strand the user outside the panel their own report is filling.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedContextBar(state, CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("expected a runtime");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      run_status: "processing",
+      context_report_request: { send_id: "already-running", phase: "running" },
+    };
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const button = await screen.findByTestId("agent-context-breakdown-button");
+    expect(button).toBeEnabled();
+    await fireEvent.click(button);
+
+    expect(await screen.findByTestId("context-breakdown-loading")).toBeInTheDocument();
+    // Riding the run already in flight, not starting a second one.
+    expect(contextReportAgentMock).not.toHaveBeenCalled();
   });
 
   it("opens and starts the initial analysis immediately from the agent menu", async () => {

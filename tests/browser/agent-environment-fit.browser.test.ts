@@ -28,16 +28,31 @@ function overflow(testid: string): number {
   return el.scrollWidth - el.clientWidth;
 }
 
-function lineCount(testid: string): number {
+/// How many lines of its own text the row's **content box** occupies. Padding
+/// and border are subtracted rather than absorbed into the ratio: measuring the
+/// padded box left only ~1% of headroom under a `< 1.5` threshold, so restyling
+/// the row's spacing would have failed a test whose name is about wrapping.
+/// One line reads 1.0 here and a wrapped row reads 2.0, so the threshold sits
+/// midway between the two states it distinguishes.
+function contentLineCount(testid: string): number {
   const el = page.getByTestId(testid).element() as HTMLElement;
-  return el.getBoundingClientRect().height / Number.parseFloat(getComputedStyle(el).lineHeight);
+  const style = getComputedStyle(el);
+  const vertical =
+    Number.parseFloat(style.paddingTop) +
+    Number.parseFloat(style.paddingBottom) +
+    Number.parseFloat(style.borderTopWidth) +
+    Number.parseFloat(style.borderBottomWidth);
+  const contentHeight = el.getBoundingClientRect().height - vertical;
+  return contentHeight / Number.parseFloat(style.lineHeight);
 }
 
 test("the card trigger stays to one line and shows only actionable status", async () => {
   render(AgentEnvironmentHost, { props: { width: DEFAULT_WIDTH, inventory: BUSY } });
 
-  await expect.element(page.getByTestId("agent-env-summary")).toHaveTextContent("2 need auth");
-  expect(lineCount("agent-env-toggle")).toBeLessThan(1.5);
+  await expect
+    .element(page.getByTestId("agent-env-trigger-summary"))
+    .toHaveTextContent("2 need auth");
+  expect(contentLineCount("agent-env-toggle")).toBeLessThan(1.5);
   expect(overflow("agent-env-toggle")).toBeLessThanOrEqual(1);
 });
 
@@ -56,7 +71,7 @@ test("both kinds of MCP trouble remain available without wrapping the card", asy
   await expect
     .element(row)
     .toHaveAccessibleName("Environment details, 2 need auth · 1 need attention");
-  expect(lineCount("agent-env-toggle")).toBeLessThan(1.5);
+  expect(contentLineCount("agent-env-toggle")).toBeLessThan(1.5);
   expect(overflow("agent-env-toggle")).toBeLessThanOrEqual(1);
 });
 
@@ -112,6 +127,6 @@ test("the trigger remains a single contained row at the minimum sidebar width", 
   render(AgentEnvironmentHost, { props: { width: MIN_WIDTH, inventory: BUSY } });
 
   await expect.element(page.getByTestId("agent-env-toggle")).toBeInTheDocument();
-  expect(lineCount("agent-env-toggle")).toBeLessThan(1.5);
+  expect(contentLineCount("agent-env-toggle")).toBeLessThan(1.5);
   expect(overflow("agent-env-toggle")).toBeLessThanOrEqual(1);
 });

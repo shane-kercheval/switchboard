@@ -85,7 +85,7 @@
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
-  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
+  import TruncatedText from "$lib/components/ui/TruncatedText.svelte";
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
@@ -434,6 +434,37 @@
     };
   }
 
+  // --- Hover-revealed card controls ---------------------------------------
+  // These give their width back when hidden rather than standing as an
+  // invisible gutter. Measured in WebKit at the 280px default: the gutter held
+  // 59px of empty space beside a name clipped by 39px, so reserving it cost
+  // more room than the name was short — and the card's most-read text lost to
+  // controls that were not on screen. Reclaiming it fits names that previously
+  // could not fit at any sidebar width.
+  //
+  // Width and margin transition, so revealing the cluster slides the harness
+  // icon rather than snapping it; that motion is what the reserved gutter was
+  // trading the name's width to avoid. Same treatment the pane-member chips
+  // use for their remove control.
+  //
+  // The reveal conditions have to be spelled out per variant: Tailwind scans
+  // for literal class strings, so a composed `${variant}:w-[26px]` would never
+  // be generated.
+  const CONTROL_COLLAPSED =
+    "pointer-events-none w-0 overflow-hidden opacity-0 transition-[width,margin,opacity]";
+  const CONTROL_REVEAL_ICON_BUTTON = [
+    "group-hover:pointer-events-auto group-hover:ml-0.5 group-hover:w-[26px] group-hover:opacity-100",
+    "group-focus-visible:pointer-events-auto group-focus-visible:ml-0.5 group-focus-visible:w-[26px] group-focus-visible:opacity-100",
+    "group-has-[:focus-visible]:pointer-events-auto group-has-[:focus-visible]:ml-0.5 group-has-[:focus-visible]:w-[26px] group-has-[:focus-visible]:opacity-100",
+    "group-has-[[data-state=open]]:pointer-events-auto group-has-[[data-state=open]]:ml-0.5 group-has-[[data-state=open]]:w-[26px] group-has-[[data-state=open]]:opacity-100",
+  ].join(" ");
+  const CONTROL_REVEAL_GRIP = [
+    "group-hover:pointer-events-auto group-hover:ml-0.5 group-hover:w-3 group-hover:opacity-100",
+    "group-focus-visible:pointer-events-auto group-focus-visible:ml-0.5 group-focus-visible:w-3 group-focus-visible:opacity-100",
+    "group-has-[:focus-visible]:pointer-events-auto group-has-[:focus-visible]:ml-0.5 group-has-[:focus-visible]:w-3 group-has-[:focus-visible]:opacity-100",
+    "group-has-[[data-state=open]]:pointer-events-auto group-has-[[data-state=open]]:ml-0.5 group-has-[[data-state=open]]:w-3 group-has-[[data-state=open]]:opacity-100",
+  ].join(" ");
+
   // --- Roster reordering -------------------------------------------------
   // Roster order is the canonical display order app-wide (these cards, the
   // compose chips and their ⌘1..9 numbering, pane columns), so all reorder
@@ -630,6 +661,7 @@
     removeError = null;
     try {
       await removeAgent(agent.id);
+      layout.removeAgentCardState(projectId, agent.id);
       if (removeConfirmAgentId === agent.id) removeConfirmAgentId = null;
     } catch (err) {
       removeConfirmAgentId = null;
@@ -675,13 +707,43 @@
     breakdownAgentId === null ? undefined : agents.find((a) => a.id === breakdownAgentId),
   );
 
-  /// Open first so feedback is immediate, then dispatch unless this agent
-  /// already has a report queued or running. The guard preserves the request's
-  /// single correlation slot if the dialog is closed and reopened mid-run.
+  /// Whether this agent's own context report is the thing occupying it. The
+  /// entry points below gate on the agent being idle, which would otherwise
+  /// lock the user out of the panel their own report is filling: the dispatch
+  /// makes the agent busy, so closing the dialog mid-run would leave no way
+  /// back to the spinner.
+  function contextReportInFlight(agentId: AgentId): boolean {
+    const phase = runtimes[agentId]?.context_report_request?.phase;
+    return phase === "queued" || phase === "running";
+  }
+
+  /// A breakdown can only be asked for while the agent is idle. The report
+  /// goes through the same per-agent FIFO as sends, so on a busy agent it
+  /// waits out the in-flight turn *and* every queued send — leaving the panel
+  /// a featureless spinner for minutes, since opening is what dispatches.
+  /// Refusing at the entry point keeps the wait to the ~1s an idle report
+  /// takes, which is the wait the spinner-only panel was designed around.
+  ///
+  /// An agent with no runtime yet reads as idle, not busy: `run_status` is the
+  /// dispatch lifecycle, so its absence means nothing has ever been dispatched.
+  /// Defaulting the other way would disable the breakdown on exactly the agents
+  /// most likely to be asked about — the ones just restored on project open.
+  function canOpenContextBreakdown(agentId: AgentId): boolean {
+    return (runtimes[agentId]?.run_status ?? "idle") === "idle" || contextReportInFlight(agentId);
+  }
+
+  /// Open first so feedback is immediate, then dispatch. **Opening is the
+  /// refresh** — the panel carries no button, so every entry point asks for a
+  /// current breakdown, and re-opening is how the user asks for another one
+  /// (including after a failure). Cheap enough to do unconditionally: the
+  /// report runs locally and bills nothing.
+  ///
+  /// The one exception is a request already queued or running, which would
+  /// orphan the first request's correlation — that slot is single-occupancy, so
+  /// closing and reopening mid-run rides the run already in flight.
   function openContextBreakdown(agentId: AgentId): void {
     breakdownAgentId = agentId;
-    const phase = runtimes[agentId]?.context_report_request?.phase;
-    if (phase === "queued" || phase === "running") return;
+    if (contextReportInFlight(agentId)) return;
     void startContextReport(agentId);
   }
 
@@ -990,6 +1052,11 @@
               )
             : null}
         {@const overageAsOf = runtime?.last_rate_limit_as_of}
+        <!-- At most one window is ever flagged: the payload names a single
+             `rateLimitType`, and `claudeRateLimitView` stamps the threshold on
+             that window alone. `find` is the shape of that invariant — if a
+             future CLI reports a threshold per window, it is `usageWindows.ts`
+             that has to change first. -->
         {@const usageWarning = rlView?.windows.find(
           (window) => window.surpassedThreshold !== undefined,
         )}
@@ -1097,23 +1164,27 @@
                   <ChevronDown size={13} strokeWidth={1.8} aria-hidden="true" />
                 {/if}
               </button>
-              <Tooltip
-                label={agent.name}
-                delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
-                focusable={false}
-              >
-                {#snippet trigger(props)}
-                  <div {...props} class="flex min-h-7 min-w-0 flex-1 items-center text-left">
-                    <span
-                      class="text-fg cursor-text truncate text-[13px] font-semibold"
-                      data-testid="agent-name"
-                    >
-                      {agent.name}
-                    </span>
-                  </div>
-                {/snippet}
-              </Tooltip>
-              <div class="flex shrink-0 items-center gap-0.5">
+              <!-- The reserved action gutter narrows this column, so a long
+                   name clips and needs a recovery path. `TruncatedText` is that
+                   path and only that path: it measures actual clipping, so a
+                   name that fits raises no tooltip repeating text the user can
+                   already read. Keyboard users get the full name from the
+                   card's own `aria-label`, which is why the tooltip is not
+                   focusable. `data-testid` stays on the text span itself —
+                   `cardClickToggles` and double-click-to-rename both resolve
+                   through `closest('[data-testid="agent-name"]')`. -->
+              <div class="flex min-h-7 min-w-0 flex-1 items-center text-left">
+                <TruncatedText
+                  text={agent.name}
+                  class="text-fg cursor-text text-[13px] font-semibold"
+                  testid="agent-name"
+                />
+              </div>
+              <!-- No `gap`: a flex gap is charged for a zero-width child too,
+                   which would leave a residual gutter exactly like the one this
+                   cluster stopped reserving. Each control carries its own
+                   `ml-0.5`, applied only when it is revealed. -->
+              <div class="flex shrink-0 items-center">
                 <Tooltip
                   label={agentHidden ? `Show ${agent.name}` : `Hide ${agent.name} (⌥-click: solo)`}
                   delayDuration={800}
@@ -1127,16 +1198,12 @@
                         ICON_BUTTON_CLASS,
                         "shrink-0",
                         // The eye stays visible while the agent is hidden (it's
-                        // the state indicator); otherwise it appears on hover
-                        // like the actions trigger. `invisible` preserves the
-                        // action gutter so revealing controls never shifts the
-                        // harness identity or reflows the header. This gutter
-                        // previously truncated names without a recovery path;
-                        // the wider default and full-name tooltip above now
-                        // make that trade explicit and keep names discoverable.
+                        // the state indicator, and a hidden agent's card must
+                        // say so without being hovered); otherwise it collapses
+                        // to nothing like the rest of the cluster.
                         agentHidden
-                          ? "text-muted"
-                          : "invisible group-hover:visible group-focus-visible:visible group-has-[:focus-visible]:visible group-has-[[data-state=open]]:visible",
+                          ? "text-muted ml-0.5"
+                          : cn(CONTROL_COLLAPSED, CONTROL_REVEAL_ICON_BUTTON),
                       )}
                       aria-label={agentHidden ? `Show ${agent.name}` : `Hide ${agent.name}`}
                       aria-pressed={agentHidden}
@@ -1155,7 +1222,8 @@
                   triggerClass={cn(
                     ICON_BUTTON_CLASS,
                     "shrink-0",
-                    "invisible group-focus-visible:visible group-has-[:focus-visible]:visible group-hover:visible data-[state=open]:visible",
+                    CONTROL_COLLAPSED,
+                    CONTROL_REVEAL_ICON_BUTTON,
                   )}
                   triggerLabel={`Actions for ${agent.name}`}
                   triggerTestid="agent-actions-trigger"
@@ -1226,8 +1294,13 @@
                       </DropdownMenuItem>
                     {/if}
                     {#if supportsContextReport(agent.harness)}
+                      <!-- Gated on the same rule as the card's icon: the menu
+                           is a second door to one action, and a report queued
+                           from here would sit behind the agent's backlog just
+                           the same. -->
                       <DropdownMenuItem
                         onSelect={() => openContextBreakdown(agent.id)}
+                        disabled={!canOpenContextBreakdown(agent.id)}
                         class="gap-2"
                         data-testid="agent-action-context-breakdown"
                       >
@@ -1365,14 +1438,22 @@
                     {/if}
                   {/if}
                 </DropdownMenu>
-                <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
+                <HarnessIcon
+                  harness={agent.harness}
+                  size="md"
+                  class="ml-0.5"
+                  testid="agent-harness-icon"
+                />
                 {#if agents.length > 1}
                   <span
                     class={cn(
                       "text-muted flex h-4 w-3 shrink-0 cursor-grab touch-none items-center justify-center active:cursor-grabbing",
+                      // A grip mid-drag stays put: collapsing the control the
+                      // pointer is holding would yank the card out from under
+                      // the gesture.
                       dragState?.agentId === agent.id
-                        ? "visible"
-                        : "invisible group-hover:visible group-focus-visible:visible group-has-[:focus-visible]:visible group-has-[[data-state=open]]:visible",
+                        ? "ml-0.5"
+                        : cn(CONTROL_COLLAPSED, CONTROL_REVEAL_GRIP),
                     )}
                     data-testid="agent-drag-grip"
                     data-agent-card-control
@@ -1503,13 +1584,24 @@
               {#if supportsContextReport(agent.harness)}
                 <!-- The meter says how full; this asks for a fresh breakdown
                      and opens the result panel immediately. -->
-                <Tooltip label="Context breakdown" side="top">
+                {@const breakdownAvailable = canOpenContextBreakdown(agent.id)}
+                <Tooltip
+                  label={breakdownAvailable
+                    ? "Context breakdown"
+                    : "Context breakdown — available when the agent is idle"}
+                  side="top"
+                >
                   {#snippet trigger(props)}
                     <button
                       {...props}
                       type="button"
-                      class={cn(ICON_BUTTON_CLASS, "-mb-0.5 h-5 w-5")}
+                      class={cn(
+                        ICON_BUTTON_CLASS,
+                        "-mb-0.5 h-5 w-5",
+                        "disabled:opacity-40 disabled:hover:bg-transparent",
+                      )}
                       aria-label="Context breakdown"
+                      disabled={!breakdownAvailable}
                       data-testid="agent-context-breakdown-button"
                       onclick={() => openContextBreakdown(agent.id)}
                     >
@@ -1594,7 +1686,7 @@
               {#if usageWarning !== undefined}
                 <p>{usageWarning.label} · {formatUsedPercent(usageWarning.usedFraction)} used</p>
               {/if}
-              {#if rlView?.overage !== null && rlView?.overage !== undefined}
+              {#if (rlView?.overage ?? null) !== null}
                 <p>⚡ using credits</p>
               {/if}
             </div>

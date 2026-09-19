@@ -369,11 +369,13 @@ for the user (telemetry flags, internal capability strings).
     done | failed | cancelled, error? }`, set on dispatch and advanced by `turn_start`, `turn_end`,
     `message_failed`, `message_cancelled`, and `failSendStart`. **It is cleared only by the next
     report dispatch, never by an ordinary send** — otherwise a failure message would vanish the
-    moment the user sent a message. One slot: the panel opener does not dispatch when a request is
+    moment the user sent a message. One slot: the panel opener does not dispatch while a request is
     already queued or running, so closing and reopening the dialog cannot orphan the first request's
-    correlation. The dialog replaces its contents with a spinner while the request is in flight;
-    after it settles, the previous report is retained if the refresh failed. *(Comment on the
-    pending-kind branch and on the request record's clear rule.)*
+    correlation. **While a request is in flight the panel shows only the spinner**, withholding any
+    previous report: rendering old numbers and swapping them seconds later reads as the panel
+    changing its mind. A *settled* failure is the opposite case and keeps the previous report —
+    nothing further is coming to replace it. *(Comment on the pending-kind branch and on the request
+    record's clear rule.)*
 18. **`ContextReport` is deserialized from the structured object; the markdown is the fallback.**
     Live, from `assistant.context_usage`; on disk, from `contextUsage`. Categories keep the CLI's
     `kind`; every item row keeps its exact integer tokens. Only when the object is absent (an older
@@ -400,13 +402,25 @@ for the user (telemetry flags, internal capability strings).
     continuation; the fixture test must show it neither extends the preceding agent turn nor pulls
     the following turn backward. *(Comment on the routing branch, naming `commandRun` as the key.)*
 20. **UI: a panel opened from the context meter's icon, and from the agent menu ("Context
-    breakdown…").** Either entry point immediately dispatches a fresh report and opens the `Dialog`,
-    titled "Context breakdown · <agent>"; the content area shows a spinner while the initial analysis
-    or refresh is queued or running. After it settles, the header shows the context meter with model
-    and "as of". Body: one meter per category, in the CLI's order, label left, "<tokens> · <percent>"
-    right; deferred-tool rows show tokens only (the CLI reports no percentage). Below, collapsible
-    sections — MCP tools grouped by server with per-server totals (the flat 80-row table is
-    unreadable), custom agents, memory files, skills — each `ExpandCollapseIcon`, collapsed by
+    breakdown…").** `Dialog`, titled "Context breakdown · <agent>". **Opening is the refresh**:
+    every entry point dispatches a fresh report, so the panel carries **no Refresh or Analyze
+    button** — the spinner says one is on its way, and re-opening is how the user asks for another,
+    including after a failure. A button would only name the action the open already performed, and
+    the report costs nothing (it runs locally and bills no tokens).
+
+    **Both entry points are disabled while the agent is busy.** A report shares the per-agent FIFO
+    with sends, so on a busy agent it waits out the in-flight turn *and* every queued send — and
+    since opening is what dispatches, the panel would be a featureless spinner for that whole time.
+    Refusing at the door keeps the wait to the ~1s an idle report takes, which is the wait the
+    spinner-only panel is designed around, and keeps a maintenance turn from taking queue position
+    ahead of the user's work. The one exception is the agent's *own* report: the dispatch makes the
+    agent busy, so an in-flight `context_report_request` keeps the entry points live or the user
+    would be locked out of the panel their report is filling (re-opening rides that run and
+    dispatches nothing). Header: the context meter with
+    model and "as of". Body: one meter per category, in the CLI's order, label left, "<tokens> ·
+    <percent>" right; deferred-tool rows show tokens only (the CLI reports no percentage). Below,
+    collapsible sections — MCP tools grouped by server with per-server totals (the flat 80-row table
+    is unreadable), custom agents, memory files, skills — each `ExpandCollapseIcon`, collapsed by
     default, followed by a "Raw report" disclosure. Row-level meters reuse the primitive with no
     detail text where the CLI gives none.
 
@@ -635,9 +649,14 @@ paths. Keep `agent-meta` as the outer test id.
 The user can see what is occupying a Claude agent's context window, per category and per item.
 
 - The context meter on a Claude card shows a breakdown icon; clicking it (or "Context breakdown…"
-  in the agent menu) opens the panel and starts an analysis immediately.
-- Running it on an idle agent fills the panel in about a second. On a busy agent the panel shows a
-  queued spinner and fills when the current turn finishes.
+  in the agent menu) opens the panel and starts a fresh analysis every time. The panel has no
+  button: re-opening it is how a newer breakdown is requested.
+- The breakdown icon and menu item are disabled while the agent is working, so the report is never
+  queued behind a turn; they stay live while the agent's own report runs, and re-opening then shows
+  that run's spinner rather than starting a second.
+- Running it on an idle agent fills the panel in about a second, showing only the spinner until it
+  lands — a previous breakdown stays hidden rather than being swapped out under the reader. A
+  failed analysis says why, beside the last report it managed to take; re-opening retries it.
 - The panel shows the model, used/window tokens, a meter per category in the CLI's order, and
   collapsible per-item sections: MCP tools grouped by server, custom agents, memory files, skills.
 - No row appears in the transcript for the report — live or after reopening the project.

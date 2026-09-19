@@ -41,13 +41,12 @@ function agoIso(ms: number): string {
 /// account, so nothing here needs a roster to render it.
 async function renderClaudeWithRateLimit(
   info: unknown,
-  asOf: string | null,
+  measuredAt: string | null,
   model?: string,
 ): Promise<void> {
   usage.observeUsage("claude_code", {
     payload: info,
-    observed_at: new Date().toISOString(),
-    as_of: asOf ?? undefined,
+    observed_at: measuredAt ?? new Date().toISOString(),
     model,
   });
   render(HarnessUsage);
@@ -405,8 +404,8 @@ describe("Claude rate-limit tooltip", () => {
     expect(detail).toHaveTextContent("Resets");
     // The overage window is surfaced here.
     expect(detail).toHaveTextContent(/overage window resets/i);
-    // Live snapshot (as_of null) → no snapshot-age line.
-    expect(screen.queryByTestId("harness-usage-snapshot")).toBeNull();
+    // Every reading dates itself, including a live one.
+    expect(screen.getByTestId("harness-usage-measured")).toHaveTextContent(/measured/i);
   });
 
   it("spells out each window's percentage and full reset date on hover", async () => {
@@ -441,7 +440,10 @@ describe("Claude rate-limit tooltip", () => {
     expect(within(detail).getAllByText("Resets")).toHaveLength(2);
   });
 
-  it("adds a snapshot-age + refresh line on hover when rehydrated (as_of set)", async () => {
+  it("dates the reading and says how to refresh it", async () => {
+    // The age line is unconditional and harness-agnostic, because an
+    // account-level reading is only as fresh as the last turn any agent ran —
+    // a durable session-file reading can itself be days old.
     await renderClaudeWithRateLimit(
       { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(4 * 3600) },
       agoIso(3 * 60 * 60 * 1000),
@@ -449,9 +451,9 @@ describe("Claude rate-limit tooltip", () => {
     await fireEvent.pointerEnter(screen.getByTestId("harness-usage-claude_code"));
     await vi.advanceTimersByTimeAsync(500);
     await waitFor(() => screen.getByTestId("harness-usage-detail-claude_code"));
-    const snapshot = screen.getByTestId("harness-usage-snapshot");
-    expect(snapshot).toHaveTextContent(/snapshot from .* ago/i);
-    expect(snapshot).toHaveTextContent(/refresh/i);
+    const measured = screen.getByTestId("harness-usage-measured");
+    expect(measured).toHaveTextContent(/measured .* ago/i);
+    expect(measured).toHaveTextContent(/refresh/i);
   });
 });
 
@@ -554,9 +556,9 @@ describe("Codex rate-limit windows", () => {
       await vi.advanceTimersByTimeAsync(500);
       const detail = await waitFor(() => screen.getByTestId("harness-usage-detail-codex"));
       expect(detail).toHaveTextContent("100% used");
-      expect(screen.getByTestId("harness-usage-refused")).toHaveTextContent(
-        "the last message was refused",
-      );
+      // No sentence explaining the refusal: a full bar in the warning tone is
+      // the statement, and spelling it out underneath was over-explaining.
+      expect(screen.queryByTestId("harness-usage-refused")).toBeNull();
     } finally {
       vi.useRealTimers();
     }
@@ -617,5 +619,63 @@ describe("Codex rate-limit windows", () => {
     // Claude reads its own shape (isUsingOverage/resetsAt), not Codex's
     // primary.used_percent — so the Codex gauge cell must not appear.
     expect(screen.queryByTestId("harness-usage-codex")).toBeNull();
+  });
+});
+
+/// What a fresh install shows, and what each partial state shows. These are the
+/// states a new user sees first and the only ones nobody exercises by accident,
+/// so they are pinned rather than eyeballed.
+describe("HarnessUsage with nothing to report", () => {
+  it("renders nothing at all before any harness has reported a reading", async () => {
+    // Not an empty section with a header: the whole block is absent, so a fresh
+    // install shows the agent roster with no space taken by a heading that has
+    // nothing under it. Same clean-hide rule the card cells follow.
+    render(HarnessUsage);
+    await tick();
+    expect(screen.queryByTestId("harness-usage")).toBeNull();
+    expect(screen.queryByText(/usage limits/i)).toBeNull();
+  });
+
+  it("shows only the harnesses that have reported, not a row per installed harness", async () => {
+    // A harness with no reading is absent rather than shown as empty or zero. A
+    // zero meter would be a claim we cannot make: no reading is not 0% used.
+    usage.observeUsage("codex", {
+      payload: {
+        primary: { used_percent: 12, window_minutes: 10080, resets_at: epochFromNow(86_400) },
+      },
+      observed_at: new Date().toISOString(),
+    });
+    render(HarnessUsage);
+    await tick();
+    expect(screen.getByTestId("harness-usage-codex")).toBeInTheDocument();
+    expect(screen.queryByTestId("harness-usage-claude_code")).toBeNull();
+    expect(screen.getAllByTestId("harness-usage-window")).toHaveLength(1);
+  });
+
+  it("drops a harness whose only window has already reset, back to rendering nothing", async () => {
+    // A reading exists but says nothing current, which is the reset-passed rule
+    // meeting the empty case: the section disappears rather than showing a
+    // harness label with no meter under it.
+    usage.observeUsage("codex", {
+      payload: {
+        primary: { used_percent: 99, window_minutes: 10080, resets_at: epochFromNow(-60) },
+      },
+      observed_at: new Date().toISOString(),
+    });
+    render(HarnessUsage);
+    await tick();
+    expect(screen.queryByTestId("harness-usage")).toBeNull();
+  });
+
+  it("renders nothing for a harness that reports no quota at all", async () => {
+    // Antigravity emits no rate-limit signal by decision. An entry filed under it
+    // must not produce a labelled row with an empty body.
+    usage.observeUsage("antigravity", {
+      payload: { primary: { used_percent: 50 } },
+      observed_at: new Date().toISOString(),
+    });
+    render(HarnessUsage);
+    await tick();
+    expect(screen.queryByTestId("harness-usage")).toBeNull();
   });
 });

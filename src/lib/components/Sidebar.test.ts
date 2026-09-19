@@ -72,6 +72,13 @@ async function loadState() {
 
 const usage = await import("$lib/state/harnessUsage.svelte");
 
+/// Open an agent's detail card. Cards default to collapsed, so a test asserting
+/// anything behind one says so explicitly rather than relying on the default.
+async function expandCard(agentId: string): Promise<void> {
+  const { layout } = await import("$lib/layout.svelte");
+  layout.setAgentCardCollapsed(PROJECT_ID, agentId, false);
+}
+
 async function openAgentActions(index = 0): Promise<HTMLElement> {
   const triggers = await screen.findAllByTestId("agent-actions-trigger");
   const trigger = triggers.at(index);
@@ -246,6 +253,9 @@ describe("Sidebar", () => {
       },
     };
 
+    // Collapsed is the default, so the card is opened before the toggle is
+    // exercised in the other direction.
+    await expandCard(CLAUDE_AGENT.id);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     // Context remains visible in both full and compact card states.
@@ -278,24 +288,27 @@ describe("Sidebar", () => {
     const first = render(Sidebar, {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] },
     });
+    // Expanding is the per-project exception the store records; the default it
+    // departs from is collapsed.
     await fireEvent.click(screen.getByTestId("agent-collapse-toggle"));
-    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "true");
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "false");
     first.unmount();
 
     const otherProject = render(Sidebar, {
       props: { projectId: "project-b", agents: [CLAUDE_AGENT] },
     });
-    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "false");
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "true");
     otherProject.unmount();
 
     layoutTesting.reloadFromStorage();
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
-    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "true");
+    expect(screen.getByTestId("sidebar-agent")).toHaveAttribute("data-collapsed", "false");
   });
 
   it("does not collapse the card when a click completes text selection", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
+    await expandCard(CLAUDE_AGENT.id);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     const selection = vi.spyOn(window, "getSelection").mockReturnValue({
       isCollapsed: false,
@@ -349,6 +362,7 @@ describe("Sidebar", () => {
       resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
     });
 
+    await expandCard(CLAUDE_AGENT.id);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("agent-harness-icon")).toBeInTheDocument();
@@ -576,7 +590,7 @@ describe("Sidebar", () => {
     expect(screen.getByTestId("sidebar-agent")).toBeInTheDocument();
   });
 
-  it("collapse-all hides every agent's details; toggling again restores them", async () => {
+  it("expand-all opens every agent's details; toggling again collapses them", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
@@ -603,18 +617,23 @@ describe("Sidebar", () => {
 
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
 
+    // Cards start collapsed, so the control offers the opposite action first.
     const toggleAll = screen.getByTestId("sidebar-toggle-all");
+    expect(toggleAll).toHaveAccessibleName("Expand all agents");
+    await fireEvent.click(toggleAll);
+    expect(
+      screen.getAllByTestId("sidebar-agent").every((card) => card.dataset.collapsed === "false"),
+    ).toBe(true);
+    expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
     expect(toggleAll).toHaveAccessibleName("Collapse all agents");
+
     await fireEvent.click(toggleAll);
     expect(
       screen.getAllByTestId("sidebar-agent").every((card) => card.dataset.collapsed === "true"),
     ).toBe(true);
+    // Context stays visible in both states — the one cell collapsing keeps.
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
     expect(toggleAll).toHaveAccessibleName("Expand all agents");
-
-    await fireEvent.click(toggleAll);
-    expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
-    expect(toggleAll).toHaveAccessibleName("Collapse all agents");
   });
 
   it("does not render a per-agent cost total on the card (cost moved to the message)", async () => {
@@ -903,6 +922,7 @@ describe("Sidebar", () => {
       },
     };
 
+    await expandCard(CLAUDE_AGENT.id);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("agent-selection-default")).toHaveTextContent(
@@ -946,6 +966,7 @@ describe("Sidebar", () => {
       meta_as_of: "2026-09-17T12:00:00Z",
     };
 
+    await expandCard(CLAUDE_AGENT.id);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     await fireEvent.click(screen.getByTestId("agent-env-toggle"));
 
@@ -974,6 +995,7 @@ describe("Sidebar", () => {
       },
     };
 
+    await expandCard(CODEX_AGENT.id);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
     await fireEvent.click(screen.getByTestId("agent-env-toggle"));
 
@@ -1720,6 +1742,7 @@ describe("Sidebar inline rename", () => {
   it("double-clicking the name text enters rename without changing collapse state", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
+    await expandCard(CLAUDE_AGENT.id);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     const name = screen.getByTestId("agent-name");
     expect(name).not.toHaveAttribute("title");
@@ -1997,9 +2020,10 @@ describe("Sidebar — agent reordering", () => {
   it("a plain drag-grip click does not toggle the card", async () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
     const card = screen.getAllByTestId("sidebar-agent")[0]!;
-    expect(card).toHaveAttribute("data-collapsed", "false");
+    // Whatever the card started as, the grip must leave it there.
+    expect(card).toHaveAttribute("data-collapsed", "true");
     await fireEvent.click(grip(0));
-    expect(card).toHaveAttribute("data-collapsed", "false");
+    expect(card).toHaveAttribute("data-collapsed", "true");
   });
 
   it("Alt+ArrowDown with focus inside a card moves that agent down", async () => {

@@ -428,16 +428,17 @@ export function applyAgentHydrate(
 function recordRestoredUsage(agentId: AgentId, hydrate: Required<Hydrate>): void {
   const harness = agentHarness.get(agentId);
   if (harness === undefined || hydrate.last_rate_limit == null) return;
-  const asOf = hydrate.last_rate_limit_as_of ?? undefined;
   observeUsage(harness, {
     payload: hydrate.last_rate_limit,
     // The measured instant when the harness recorded one, else the snapshot's
     // capture time. A reading with neither ranks at the epoch: unknown age loses
     // to every stamped reading, which is the conservative direction — it can be
     // superseded but never supersede.
-    observed_at: hydrate.last_rate_limit_observed_at ?? asOf ?? new Date(0).toISOString(),
+    observed_at:
+      hydrate.last_rate_limit_observed_at ??
+      hydrate.last_rate_limit_as_of ??
+      new Date(0).toISOString(),
     model: hydrate.last_rate_limit_model ?? undefined,
-    as_of: asOf,
   });
 }
 

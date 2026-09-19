@@ -26,17 +26,15 @@ export type HarnessUsageReading = {
   /// harness measured it, which is the only thing that can order several agents'
   /// restored readings against each other.
   ///
-  /// Distinct from [`as_of`](#as_of), which is a staleness qualifier shown to the
-  /// user and deliberately absent for a durable source. A reading needs both: one
-  /// to be ranked, one to be labelled.
+  /// **Also what dates the reading for the user.** There used to be a second
+  /// field for that, set only when a reading came from a stream-only snapshot, on
+  /// the theory that a session-file-backed reading needs no staleness qualifier
+  /// because it is durable. Durable was mistaken for current: the file is re-read
+  /// on every open but can itself be days old. One instant answers both questions.
   observed_at: string;
   /// Model of the turn that delivered the reading, which is what names Claude's
   /// model-gated weekly window — the payload never names it itself.
   model?: string;
-  /// Set only when the reading was restored from a snapshot rather than received
-  /// live, so the UI can say how old it is. Absent for live and for
-  /// session-file-backed readings, which are current by construction.
-  as_of?: string;
   /// Whether the harness is currently refusing work because a window in this
   /// reading is exhausted.
   ///
@@ -156,7 +154,6 @@ function asReading(value: unknown): HarnessUsageReading | null {
     payload: v.payload,
     observed_at: v.observed_at,
     model: typeof v.model === "string" ? v.model : undefined,
-    as_of: typeof v.as_of === "string" ? v.as_of : undefined,
     limit_reached: v.limit_reached === true ? true : undefined,
   };
 }

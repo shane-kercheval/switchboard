@@ -40,9 +40,9 @@
     overage: { resetsAtMs: number | null } | null;
     /// Bare reset line for a Claude payload with no window map at all.
     fallback: { label: string; resetsAtMs: number } | null;
-    /// Set only for a reading restored from a snapshot, so the row can say how
-    /// old it is instead of presenting it as live.
-    asOf: string | undefined;
+    /// When the harness measured the reading, for the age line. Always present:
+    /// every reading is ranked by this instant, so every reading can date itself.
+    measuredAt: string;
   };
 
   const rows = $derived.by((): Row[] => {
@@ -51,11 +51,11 @@
     for (const harness of ALL_HARNESSES) {
       const reading = harnessUsage[harness];
       if (reading === undefined) continue;
-      const asOf = reading.as_of;
+      const measuredAt = reading.observed_at;
       if (harness === "codex") {
         const windows = codexRateLimitView(reading.payload, now, reading.limit_reached === true);
         if (windows.length > 0) {
-          built.push({ harness, windows, overage: null, fallback: null, asOf });
+          built.push({ harness, windows, overage: null, fallback: null, measuredAt });
         }
         continue;
       }
@@ -69,7 +69,7 @@
             windows: view.windows,
             overage: view.overage,
             fallback: view.fallback,
-            asOf,
+            measuredAt,
           });
         }
         continue;
@@ -154,11 +154,6 @@
                     <span class="text-right tabular-nums">{formatResetDateTime(w.resetsAtMs)}</span>
                   </div>
                 {/if}
-                {#if w.limitReached}
-                  <p class="text-warning text-[12px]" data-testid="harness-usage-refused">
-                    Limit reached — the last message was refused.
-                  </p>
-                {/if}
               </section>
             {/each}
             {#if row.fallback !== null}
@@ -179,14 +174,18 @@
                 {/if}
               </div>
             {/if}
-            <p class="text-primary-fg/70 border-primary-fg/20 border-t pt-2 text-[12px]">
-              Counts every agent on this harness, in every project.
+            <!-- Shown for every harness and every reading, not just a restored
+                 stream-only snapshot. A session-file-backed reading is durable,
+                 which was mistaken for current: it is re-read on every open but
+                 the file itself can be days old, and an account-level reading is
+                 only as fresh as the last turn *any* agent ran. Age is the
+                 question a reader actually has, so it is always answered. -->
+            <p
+              class="text-primary-fg/70 border-primary-fg/20 border-t pt-2 text-[12px]"
+              data-testid="harness-usage-measured"
+            >
+              Measured {relativeTime(row.measuredAt)} — send a message to refresh.
             </p>
-            {#if row.asOf !== undefined}
-              <p class="text-primary-fg/70 text-[12px]" data-testid="harness-usage-snapshot">
-                Snapshot from {relativeTime(row.asOf)} — send a message to refresh.
-              </p>
-            {/if}
           </div>
         </Tooltip>
       {/each}

@@ -86,7 +86,13 @@ export type PinsSortMode = "pinned_at" | "message_at";
 type ProjectLayoutPreferences = {
   rightSidebarMode?: RightSidebarMode;
   pinsSortMode?: PinsSortMode;
-  collapsedAgentIds?: AgentId[];
+  /// Agents whose detail card is **expanded**, inverting what this once stored.
+  /// A card defaults to collapsed, so absence is the default state and the list
+  /// records the exceptions — which is also why the retired `collapsedAgentIds`
+  /// key is simply ignored rather than migrated: reading it would preserve a
+  /// "collapsed" set that is now the default anyway, and the one-time cost is
+  /// that a user's previous per-card expansions are forgotten.
+  expandedAgentIds?: AgentId[];
 };
 
 type LayoutState = {
@@ -143,18 +149,18 @@ function parseProjectPreferences(value: unknown): Record<ProjectId, ProjectLayou
       const raw = stored as {
         rightSidebarMode?: unknown;
         pinsSortMode?: unknown;
-        collapsedAgentIds?: unknown;
+        expandedAgentIds?: unknown;
       };
       const rightSidebarMode = parseRightSidebarMode(raw.rightSidebarMode);
       const pinsSortMode = parsePinsSortMode(raw.pinsSortMode);
-      const collapsedAgentIds = parseAgentIds(raw.collapsedAgentIds);
+      const expandedAgentIds = parseAgentIds(raw.expandedAgentIds);
       if (
         rightSidebarMode === undefined &&
         pinsSortMode === undefined &&
-        collapsedAgentIds === undefined
+        expandedAgentIds === undefined
       )
         return [];
-      return [[projectId, { rightSidebarMode, pinsSortMode, collapsedAgentIds }]];
+      return [[projectId, { rightSidebarMode, pinsSortMode, expandedAgentIds }]];
     }),
   );
 }
@@ -281,38 +287,42 @@ export const layout = {
     };
     persist();
   },
+  /// **Collapsed is the default.** The roster is a scannable list of who is in
+  /// the project and what each one is doing; the detail behind a card is opened
+  /// on demand. Quota used to be the one thing a collapsed card hid that a user
+  /// wanted at a glance, and it no longer lives there.
   agentCardCollapsedFor(projectId: ProjectId, agentId: AgentId): boolean {
-    return state.projectPreferences[projectId]?.collapsedAgentIds?.includes(agentId) ?? false;
+    return !(state.projectPreferences[projectId]?.expandedAgentIds?.includes(agentId) ?? false);
   },
   setAgentCardCollapsed(projectId: ProjectId, agentId: AgentId, collapsed: boolean): void {
-    const current = state.projectPreferences[projectId]?.collapsedAgentIds ?? [];
-    const collapsedAgentIds = collapsed
-      ? current.includes(agentId)
+    const current = state.projectPreferences[projectId]?.expandedAgentIds ?? [];
+    const expandedAgentIds = collapsed
+      ? current.filter((id) => id !== agentId)
+      : current.includes(agentId)
         ? current
-        : [...current, agentId]
-      : current.filter((id) => id !== agentId);
+        : [...current, agentId];
     state.projectPreferences[projectId] = {
       ...state.projectPreferences[projectId],
-      collapsedAgentIds,
+      expandedAgentIds,
     };
     persist();
   },
   setAllAgentCardsCollapsed(projectId: ProjectId, agentIds: AgentId[], collapsed: boolean): void {
     state.projectPreferences[projectId] = {
       ...state.projectPreferences[projectId],
-      collapsedAgentIds: collapsed ? uniqueAgentIds(agentIds) : [],
+      expandedAgentIds: collapsed ? [] : uniqueAgentIds(agentIds),
     };
     persist();
   },
-  /// Drop a deleted agent's collapse state. Without this the list grows for the
+  /// Drop a deleted agent's card state. Without this the list grows for the
   /// life of the project: agent ids are never reused, so an entry for a removed
   /// agent can never match again and nothing else would ever clear it.
   removeAgentCardState(projectId: ProjectId, agentId: AgentId): void {
-    const current = state.projectPreferences[projectId]?.collapsedAgentIds;
+    const current = state.projectPreferences[projectId]?.expandedAgentIds;
     if (current === undefined || !current.includes(agentId)) return;
     state.projectPreferences[projectId] = {
       ...state.projectPreferences[projectId],
-      collapsedAgentIds: current.filter((id) => id !== agentId),
+      expandedAgentIds: current.filter((id) => id !== agentId),
     };
     persist();
   },

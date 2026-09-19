@@ -56,7 +56,6 @@ describe("observeUsage", () => {
       payload: WEEKLY,
       observed_at: "2026-09-18T20:00:00Z",
       model: "gpt-5.6-sol",
-      as_of: "2026-09-18T20:00:00Z",
     });
     usage.observeUsage("codex", { payload: ROLLED, observed_at: "2026-09-18T21:00:00Z" });
     expect(usage.harnessUsage.codex).toEqual({
@@ -144,7 +143,6 @@ describe("loadPersistedUsage", () => {
                 payload: WEEKLY,
                 observed_at: "2026-09-18T19:00:00Z",
                 limit_reached: true,
-                as_of: "2026-09-18T19:00:00Z",
                 model: "gpt-5.6-sol",
               },
             },
@@ -156,7 +154,6 @@ describe("loadPersistedUsage", () => {
       payload: WEEKLY,
       observed_at: "2026-09-18T19:00:00Z",
       limit_reached: true,
-      as_of: "2026-09-18T19:00:00Z",
       model: "gpt-5.6-sol",
     });
   });

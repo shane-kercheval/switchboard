@@ -156,7 +156,7 @@
           <button
             type="button"
             onclick={() => (openSections[section.key] = !sectionOpen)}
-            class="text-muted hover:text-fg flex w-full items-center gap-1.5 text-left"
+            class="text-muted hover:text-fg hover:bg-hover -mx-1 flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left transition-colors"
             aria-expanded={sectionOpen}
             data-testid="context-breakdown-toggle-{section.key}"
           >
@@ -218,7 +218,7 @@
         <button
           type="button"
           onclick={() => (rawOpen = !rawOpen)}
-          class="text-muted hover:text-fg flex items-center gap-1 text-[11px]"
+          class="text-muted hover:text-fg hover:bg-hover -mr-1 flex cursor-pointer items-center gap-1 rounded px-1 py-0.5 text-[11px] transition-colors"
           aria-expanded={rawOpen}
           data-testid="context-breakdown-raw-toggle"
         >

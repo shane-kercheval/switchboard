@@ -40,9 +40,10 @@
     overage: { resetsAtMs: number | null } | null;
     /// Bare reset line for a Claude payload with no window map at all.
     fallback: { label: string; resetsAtMs: number } | null;
-    /// When the harness measured the reading, for the age line. Always present:
-    /// every reading is ranked by this instant, so every reading can date itself.
-    measuredAt: string;
+    /// When the harness measured the reading, for the age line. Absent when the
+    /// reading carries no instant, in which case no age is claimed rather than a
+    /// fabricated one being shown.
+    measuredAt: string | undefined;
   };
 
   const rows = $derived.by((): Row[] => {
@@ -174,18 +175,22 @@
                 {/if}
               </div>
             {/if}
-            <!-- Shown for every harness and every reading, not just a restored
-                 stream-only snapshot. A session-file-backed reading is durable,
-                 which was mistaken for current: it is re-read on every open but
-                 the file itself can be days old, and an account-level reading is
-                 only as fresh as the last turn *any* agent ran. Age is the
-                 question a reader actually has, so it is always answered. -->
-            <p
-              class="text-primary-fg/70 border-primary-fg/20 border-t pt-2 text-[12px]"
-              data-testid="harness-usage-measured"
-            >
-              Measured {relativeTime(row.measuredAt)} — send a message to refresh.
-            </p>
+            <!-- Shown for every harness, not just a restored stream-only
+                 snapshot. A session-file-backed reading is durable, which was
+                 mistaken for current: it is re-read on every open but the file
+                 itself can be days old, and an account-level reading is only as
+                 fresh as the last turn *any* agent ran.
+                 Omitted entirely when the reading carries no instant — the
+                 clean-hide rule the rest of this surface follows, and the reason
+                 the ordering key is nullable rather than sentinel-filled. -->
+            {#if row.measuredAt !== undefined}
+              <p
+                class="text-primary-fg/70 border-primary-fg/20 border-t pt-2 text-[12px]"
+                data-testid="harness-usage-measured"
+              >
+                Measured {relativeTime(row.measuredAt)} — send a message to refresh.
+              </p>
+            {/if}
           </div>
         </Tooltip>
       {/each}

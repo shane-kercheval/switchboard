@@ -274,3 +274,38 @@ describe("claudeRateLimitView at the wall", () => {
     expect(view?.windows.every((w) => w.limitReached === undefined)).toBe(true);
   });
 });
+
+describe("claudeRateLimitView on an overage turn", () => {
+  /// `rejected` is the same status the hard wall uses, but an overage turn is
+  /// *served*: the quota is spent and Anthropic bills credits for work it still
+  /// does. Recorded shape, harness-behavior.md §1.4.
+  const overaging = {
+    status: "rejected",
+    rateLimitType: "seven_day",
+    isUsingOverage: true,
+    overageResetsAt: future(6 * 86400),
+    unifiedWindows: {
+      five_hour: { utilization: 0.3, resetsAt: future(3600) },
+      seven_day: { utilization: 1, resetsAt: future(5 * 86400) },
+    },
+  };
+
+  it("leaves the spent window unflagged, so the tone stays neutral", () => {
+    // Flagging it would keep the card permanently amber for anyone routinely in
+    // overage, and make a genuine refusal indistinguishable from being billed.
+    const view = claudeRateLimitView(overaging, NOW, undefined);
+    expect(view?.windows.every((w) => w.limitReached === undefined)).toBe(true);
+  });
+
+  it("still reports the credits escalation, which is the signal for this state", () => {
+    const view = claudeRateLimitView(overaging, NOW, undefined);
+    expect(view?.overage).not.toBeNull();
+  });
+
+  it("flags the window again once the same status arrives without overage", () => {
+    // The discriminator is the overage flag, not the status: the captured wall
+    // carries `isUsingOverage: false`.
+    const view = claudeRateLimitView({ ...overaging, isUsingOverage: false }, NOW, undefined);
+    expect(view?.windows.find((w) => w.key === "seven_day")?.limitReached).toBe(true);
+  });
+});

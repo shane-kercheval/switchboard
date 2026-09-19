@@ -152,6 +152,19 @@ export function claudeRateLimitView(
     // the neutral tone. `rateLimitType` names the window that did the blocking in
     // both cases.
     //
+    // **`rejected` is overloaded and does not mean blocked on its own.** An
+    // **overage** turn carries the same status (§1.4: `isUsingOverage:true` plus
+    // `status:"rejected"` plus `overageResetsAt`) and is *served* — the quota is
+    // spent and Anthropic is billing credits for the work it is still doing.
+    // Flagging that window would sit the card permanently in the warning tone for
+    // anyone routinely in overage, and make the one state where work is actually
+    // refused indistinguishable from the state where it is not. The escalation
+    // beneath the meters already says what is happening there.
+    //
+    // The one captured wall (2026-09-18, the Fable weekly cap) reports
+    // `isUsingOverage: false` with overage disabled at the org level, so the two
+    // states separate on this field in the only observation we have.
+    //
     // **Nothing here overrides the measurement**, unlike the Codex reader. Codex
     // records a windowless payload on a refused turn, so its last number is
     // stale and the refusal is the only truthful thing left; Claude reports the
@@ -160,7 +173,9 @@ export function claudeRateLimitView(
     // but outside `CLAUDE_WINDOWS` drops with its flag, exactly as a threshold
     // warning does.
     const refused =
-      p.status === "rejected" && typeof p.rateLimitType === "string" ? p.rateLimitType : undefined;
+      p.status === "rejected" && p.isUsingOverage !== true && typeof p.rateLimitType === "string"
+        ? p.rateLimitType
+        : undefined;
     for (const { key, label } of CLAUDE_WINDOWS) {
       const w = (unified as Record<string, unknown>)[key];
       if (typeof w !== "object" || w === null) continue;

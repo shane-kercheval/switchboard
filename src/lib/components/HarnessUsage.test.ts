@@ -679,3 +679,20 @@ describe("HarnessUsage with nothing to report", () => {
     expect(screen.queryByTestId("harness-usage")).toBeNull();
   });
 });
+
+describe("HarnessUsage for a reading with no measured instant", () => {
+  it("renders the meters but claims no age", async () => {
+    // A Codex record whose line carried no parseable timestamp produces this. The
+    // reading is still worth showing; its age is not knowable, so nothing is
+    // said about it rather than a fabricated date being rendered.
+    usage.observeUsage("codex", {
+      payload: {
+        primary: { used_percent: 41, window_minutes: 10080, resets_at: epochFromNow(86_400) },
+      },
+    });
+    render(HarnessUsage);
+    await tick();
+    expect(screen.getByTestId("harness-usage-window")).toHaveTextContent("41%");
+    expect(screen.queryByTestId("harness-usage-measured")).toBeNull();
+  });
+});

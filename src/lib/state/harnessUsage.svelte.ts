@@ -31,7 +31,14 @@ export type HarnessUsageReading = {
   /// the theory that a session-file-backed reading needs no staleness qualifier
   /// because it is durable. Durable was mistaken for current: the file is re-read
   /// on every open but can itself be days old. One instant answers both questions.
-  observed_at: string;
+  ///
+  /// **Optional, because a reading can genuinely have no measured instant**: a
+  /// Codex `token_count` record whose line carries no parseable timestamp yields
+  /// one, and the reading is still worth keeping. Such a reading ranks below
+  /// every stamped one and renders with no age line at all, rather than being
+  /// given a fabricated instant that would sort correctly and then be shown to
+  /// the user as a date in 1970.
+  observed_at?: string;
   /// Model of the turn that delivered the reading, which is what names Claude's
   /// model-gated weekly window — the payload never names it itself.
   model?: string;
@@ -52,12 +59,29 @@ export type HarnessUsageReading = {
 export const harnessUsage = $state<Partial<Record<HarnessKind, HarnessUsageReading>>>({});
 
 /// Whether `candidate` describes a strictly later observation than `stored`.
-/// Ties keep what is already held: two readings stamped the same instant are
-/// equally true, and replacing on a tie would churn the persisted file for no
-/// gain.
-function isNewer(candidate: string, stored: string | undefined): boolean {
-  if (stored === undefined) return true;
-  return candidate > stored;
+///
+/// **Compared as instants, never as text.** The producers disagree on fractional
+/// precision — chrono emits none for a whole second and six digits otherwise,
+/// `toISOString` always emits three — and both shapes are present in one
+/// `usage.yaml`. Lexically `"…898649Z"` loses to `"…898Z"` because a digit sorts
+/// below `Z`, so a more precise stamp would always lose to a coarser one from the
+/// same millisecond.
+///
+/// **An absent or unparseable instant ranks last**, so a reading whose age is
+/// unknown can be superseded but never supersedes. Two such readings tie, and a
+/// tie keeps what is already held: the first unstamped reading therefore stands
+/// until a stamped one arrives, which is arbitrary but stable, and neither of two
+/// undateable readings has a claim over the other.
+///
+/// Presumes a reading is already held. The *first* reading for a harness is taken
+/// unconditionally by the caller, dated or not — otherwise an undated reading
+/// could never land at all, since it does not rank above nothing.
+function isNewer(candidate: string | undefined, stored: string | undefined): boolean {
+  const a = candidate === undefined ? Number.NaN : Date.parse(candidate);
+  const b = stored === undefined ? Number.NaN : Date.parse(stored);
+  if (Number.isNaN(a)) return false;
+  if (Number.isNaN(b)) return true;
+  return a > b;
 }
 
 /// Record a reading, keeping it only if nothing newer is already held.
@@ -71,24 +95,31 @@ function isNewer(candidate: string, stored: string | undefined): boolean {
 /// the verdict survive the sequence that set it.
 export function observeUsage(harness: HarnessKind, reading: HarnessUsageReading): void {
   const stored = harnessUsage[harness];
-  if (!isNewer(reading.observed_at, stored?.observed_at)) return;
+  // Nothing held yet takes the reading whatever its instant; ranking only decides
+  // between two readings that both exist.
+  if (stored !== undefined && !isNewer(reading.observed_at, stored.observed_at)) return;
   const carried =
     stored?.limit_reached === true && sameCodexUsageWindows(stored.payload, reading.payload);
   harnessUsage[harness] = carried ? { ...reading, limit_reached: true } : reading;
-  void persist();
+  persist();
 }
 
 /// Record that the harness refused a turn because a quota is exhausted.
 ///
 /// Attaches to the reading already held rather than creating an entry: the
 /// verdict is *about* a reading, and a refusal with no measurement to attach to
-/// has no window to mark. A refused Codex turn always has one, since the reading
-/// that preceded the refusal is still the newest window-bearing one on disk.
+/// has no window to mark.
+///
+/// Usually there is one, because the reading that preceded the refusal is still
+/// the newest window-bearing record on disk. **Not always**: an agent whose
+/// rollout contains only the refused turn has no window-bearing record at all, so
+/// no reading was ever emitted and the refusal is dropped. That shows no meter
+/// rather than a wrong one, which is the direction this code takes throughout.
 export function recordUsageRefusal(harness: HarnessKind): void {
   const stored = harnessUsage[harness];
   if (stored === undefined || stored.limit_reached === true) return;
   harnessUsage[harness] = { ...stored, limit_reached: true };
-  void persist();
+  persist();
 }
 
 /// Fill in the model that delivered the newest reading, once it is known.
@@ -103,7 +134,7 @@ export function nameUsageModel(harness: HarnessKind, model: string | undefined):
   const stored = harnessUsage[harness];
   if (stored === undefined || stored.model !== undefined) return;
   harnessUsage[harness] = { ...stored, model };
-  void persist();
+  persist();
 }
 
 /// Clear the refusal verdict after a turn completes.
@@ -117,12 +148,17 @@ export function clearUsageRefusal(harness: HarnessKind): void {
   if (stored === undefined || stored.limit_reached !== true) return;
   const { limit_reached: _limitReached, ...rest } = stored;
   harnessUsage[harness] = rest;
-  void persist();
+  persist();
 }
 
-/// Seed the store from the persisted file at startup. Fill-if-empty per harness,
-/// so a live reading that arrived while this was in flight is never replaced by
-/// the older value from disk.
+/// Seed the store from the persisted file at startup.
+///
+/// Each restored entry is **ranked, not filled in**: it goes through the same
+/// newest-wins rule as a live reading, so it supersedes what is in memory when it
+/// is genuinely newer and loses when it is not. That is wanted in both
+/// directions — a reading persisted yesterday should beat a rollout stamp from
+/// two days ago, and a live reading that landed while this was in flight should
+/// not be replaced by an older one from disk.
 export async function loadPersistedUsage(): Promise<void> {
   let stored: { harnesses?: Record<string, unknown> };
   try {
@@ -148,25 +184,58 @@ export async function loadPersistedUsage(): Promise<void> {
 function asReading(value: unknown): HarnessUsageReading | null {
   if (typeof value !== "object" || value === null) return null;
   const v = value as Record<string, unknown>;
-  if (typeof v.observed_at !== "string") return null;
   if (v.payload === undefined) return null;
+  // An **absent** instant is a shape we write ourselves, so the entry is kept and
+  // ranks last. A **present but non-string** one is not: the value is emitted
+  // unquoted, so its survival as a string depends on the YAML reader not
+  // resolving plain scalars to a timestamp type, and if that ever changes the
+  // entry should disappear loudly rather than quietly demote itself to unranked.
+  if (v.observed_at !== undefined && typeof v.observed_at !== "string") return null;
   return {
     payload: v.payload,
-    observed_at: v.observed_at,
+    observed_at: typeof v.observed_at === "string" ? v.observed_at : undefined,
     model: typeof v.model === "string" ? v.model : undefined,
     limit_reached: v.limit_reached === true ? true : undefined,
   };
 }
 
-/// Write the whole map back. Whole-map because the backend holds no rule of its
-/// own to merge with; failures are swallowed for the same reason a missing file
-/// is tolerated.
-async function persist(): Promise<void> {
-  try {
-    await invoke("set_harness_usage", { usage: { harnesses: { ...harnessUsage } } });
-  } catch (e) {
-    console.warn("could not persist harness usage", e);
-  }
+/// Whether a write is in flight, and whether the map changed while it was.
+/// Module-level rather than passed around because the invariant they encode is
+/// about the file, which is a single shared resource.
+let writeInFlight: Promise<void> | null = null;
+let mapChangedSinceWrite = false;
+
+/// Request that the file be brought up to date with the map.
+///
+/// **At most one write is in flight, and it always carries current state.**
+/// Writes used to be fired independently per change, which let two land out of
+/// order and leave the file holding the older map — invisible until a restart,
+/// and healed by the next turn, but a hazard that costs more to carry in the head
+/// than the drain loop costs to read. Requests arriving during a write set a flag
+/// instead of queueing, so a burst collapses to one further write rather than one
+/// per change.
+///
+/// Whole-map every time, because the backend holds no rule of its own to merge
+/// with. Failures are swallowed for the same reason a missing file is tolerated:
+/// a lost write costs an empty usage section until the next turn reports a
+/// reading, never a broken operation.
+function persist(): void {
+  mapChangedSinceWrite = true;
+  if (writeInFlight !== null) return;
+  writeInFlight = (async () => {
+    while (mapChangedSinceWrite) {
+      mapChangedSinceWrite = false;
+      try {
+        // Read inside the loop, never snapshotted at request time, so the write
+        // carries the map as it stands now rather than as it stood when the
+        // change that triggered this was made.
+        await invoke("set_harness_usage", { usage: { harnesses: { ...harnessUsage } } });
+      } catch (e) {
+        console.warn("could not persist harness usage", e);
+      }
+    }
+    writeInFlight = null;
+  })();
 }
 
 /// Test-only reset. Named under `_testing` so a production caller grepping for

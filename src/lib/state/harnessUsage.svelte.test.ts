@@ -158,8 +158,22 @@ describe("loadPersistedUsage", () => {
     });
   });
 
+  it("keeps an entry with no observation time, ranked below anything stamped", async () => {
+    // Undated is a shape this module writes itself, so it round-trips rather than
+    // being discarded, and it loses to every stamped reading.
+    invokeMock.mockImplementation(async (cmd) =>
+      cmd === "get_harness_usage" ? { harnesses: { codex: { payload: WEEKLY } } } : undefined,
+    );
+    await usage.loadPersistedUsage();
+    expect(usage.harnessUsage.codex?.payload).toEqual(WEEKLY);
+    expect(usage.harnessUsage.codex?.observed_at).toBeUndefined();
+
+    usage.observeUsage("codex", { payload: ROLLED, observed_at: "2026-09-18T19:00:00Z" });
+    expect(usage.harnessUsage.codex?.payload).toEqual(ROLLED);
+  });
+
   it.each([
-    ["no observation time", { payload: WEEKLY }],
+    ["a non-string observation time", { payload: WEEKLY, observed_at: 1_789_845_487 }],
     ["no payload", { observed_at: "2026-09-18T19:00:00Z" }],
     ["a non-object entry", "nope"],
     ["null", null],
@@ -209,5 +223,116 @@ describe("nameUsageModel", () => {
   it("does nothing when no reading is held", () => {
     usage.nameUsageModel("claude_code", "claude-fable-5-1");
     expect(usage.harnessUsage.claude_code).toBeUndefined();
+  });
+});
+
+describe("ordering readings by instant rather than by text", () => {
+  /// The producers disagree on fractional precision and both shapes reach one
+  /// file: chrono emits six digits or none, `toISOString` always emits three.
+  /// Compared as text, a digit sorts below `Z`, so the more precise stamp loses.
+  it("prefers the later reading when precision differs within a second", () => {
+    usage.observeUsage("codex", { payload: WEEKLY, observed_at: "2026-09-19T03:51:13.898649Z" });
+    usage.observeUsage("codex", { payload: ROLLED, observed_at: "2026-09-19T03:51:13.899Z" });
+    expect(usage.harnessUsage.codex?.payload).toEqual(ROLLED);
+  });
+
+  it("keeps the held reading when the coarser stamp is the older one", () => {
+    usage.observeUsage("codex", { payload: WEEKLY, observed_at: "2026-09-19T03:51:13.899Z" });
+    usage.observeUsage("codex", { payload: ROLLED, observed_at: "2026-09-19T03:51:13.898649Z" });
+    expect(usage.harnessUsage.codex?.payload).toEqual(WEEKLY);
+  });
+
+  it("prefers a sub-second stamp over a whole-second one in the same second", () => {
+    // The `Z`-versus-`.` case: lexically the whole second wins, which is wrong.
+    usage.observeUsage("codex", { payload: WEEKLY, observed_at: "2026-09-19T03:51:13Z" });
+    usage.observeUsage("codex", { payload: ROLLED, observed_at: "2026-09-19T03:51:13.500Z" });
+    expect(usage.harnessUsage.codex?.payload).toEqual(ROLLED);
+  });
+
+  it("lets any stamped reading supersede an undated one", () => {
+    usage.observeUsage("codex", { payload: WEEKLY });
+    usage.observeUsage("codex", { payload: ROLLED, observed_at: "1999-01-01T00:00:00Z" });
+    expect(usage.harnessUsage.codex?.payload).toEqual(ROLLED);
+  });
+
+  it("never lets an undated reading supersede a stamped one", () => {
+    usage.observeUsage("codex", { payload: WEEKLY, observed_at: "1999-01-01T00:00:00Z" });
+    usage.observeUsage("codex", { payload: ROLLED });
+    expect(usage.harnessUsage.codex?.payload).toEqual(WEEKLY);
+  });
+
+  it("keeps the first of two undated readings, since neither can claim to be later", () => {
+    usage.observeUsage("codex", { payload: WEEKLY });
+    usage.observeUsage("codex", { payload: ROLLED });
+    expect(usage.harnessUsage.codex?.payload).toEqual(WEEKLY);
+  });
+
+  it("treats an unparseable instant as undated rather than trusting it", () => {
+    usage.observeUsage("codex", { payload: WEEKLY, observed_at: "not a date" });
+    usage.observeUsage("codex", { payload: ROLLED, observed_at: "1999-01-01T00:00:00Z" });
+    expect(usage.harnessUsage.codex?.payload).toEqual(ROLLED);
+  });
+});
+
+describe("writing the file", () => {
+  /// A write that never settles until released, so a burst can be observed while
+  /// the first one is still in flight.
+  function heldWrite(): { release: () => void; calls: () => number } {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let calls = 0;
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd !== "set_harness_usage") return undefined;
+      calls += 1;
+      await gate;
+      return undefined;
+    });
+    return { release, calls: () => calls };
+  }
+
+  it("collapses a burst into one further write rather than one per change", async () => {
+    const write = heldWrite();
+    usage.observeUsage("codex", { payload: WEEKLY, observed_at: "2026-09-18T20:00:00Z" });
+    await vi.waitFor(() => expect(write.calls()).toBe(1));
+
+    // Three more changes while the first write is still in flight.
+    usage.observeUsage("codex", { payload: WEEKLY_LATER, observed_at: "2026-09-18T20:01:00Z" });
+    usage.recordUsageRefusal("codex");
+    usage.clearUsageRefusal("codex");
+    expect(write.calls()).toBe(1);
+
+    write.release();
+    await vi.waitFor(() => expect(write.calls()).toBe(2));
+  });
+
+  it("writes the map as it stands when the write runs, not when it was requested", async () => {
+    const write = heldWrite();
+    usage.observeUsage("codex", { payload: WEEKLY, observed_at: "2026-09-18T20:00:00Z" });
+    await vi.waitFor(() => expect(write.calls()).toBe(1));
+    usage.observeUsage("codex", { payload: ROLLED, observed_at: "2026-09-18T21:00:00Z" });
+    write.release();
+
+    await vi.waitFor(() => expect(write.calls()).toBe(2));
+    const last = invokeMock.mock.calls.at(-1);
+    expect(
+      (last?.[1] as { usage: { harnesses: { codex: { payload: unknown } } } }).usage.harnesses.codex
+        .payload,
+    ).toEqual(ROLLED);
+  });
+
+  it("keeps writing after a failed write rather than wedging the file", async () => {
+    // A rejected write must not leave the in-flight marker set, or every later
+    // change would be silently dropped for the life of the session.
+    invokeMock.mockRejectedValueOnce(new Error("disk full"));
+    usage.observeUsage("codex", { payload: WEEKLY, observed_at: "2026-09-18T20:00:00Z" });
+    await vi.waitFor(() =>
+      expect(invokeMock.mock.calls.filter((c) => c[0] === "set_harness_usage")).toHaveLength(1),
+    );
+
+    invokeMock.mockResolvedValue(undefined);
+    usage.observeUsage("codex", { payload: ROLLED, observed_at: "2026-09-18T21:00:00Z" });
+    await vi.waitFor(() =>
+      expect(invokeMock.mock.calls.filter((c) => c[0] === "set_harness_usage")).toHaveLength(2),
+    );
   });
 });

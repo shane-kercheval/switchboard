@@ -151,8 +151,9 @@ export function setTranscript(agentId: AgentId, turns: Turn[]): void {
 }
 
 /// Per-agent operational state, keyed by `agent_id`. Powers the sidebar
-/// (run_status, last_error, meta, last_rate_limit, hydration_status) and
-/// the compose-bar Send gate.
+/// (run_status, last_error, meta, hydration_status) and the compose-bar Send
+/// gate. Quota is **not** here: it is account state, held per harness in
+/// `harnessUsage.svelte.ts`.
 export const runtimes = $state<RuntimeMap>({});
 
 /// Display-only "working" predicate for passive activity indicators. A send
@@ -431,13 +432,10 @@ function recordRestoredUsage(agentId: AgentId, hydrate: Required<Hydrate>): void
   observeUsage(harness, {
     payload: hydrate.last_rate_limit,
     // The measured instant when the harness recorded one, else the snapshot's
-    // capture time. A reading with neither ranks at the epoch: unknown age loses
-    // to every stamped reading, which is the conservative direction — it can be
-    // superseded but never supersede.
-    observed_at:
-      hydrate.last_rate_limit_observed_at ??
-      hydrate.last_rate_limit_as_of ??
-      new Date(0).toISOString(),
+    // capture time. A reading with neither stays **undated** rather than being
+    // given a sentinel: `isNewer` ranks an absent instant last on its own, and a
+    // sentinel would sort correctly and then be rendered to the user as a date.
+    observed_at: hydrate.last_rate_limit_observed_at ?? hydrate.last_rate_limit_as_of ?? undefined,
     model: hydrate.last_rate_limit_model ?? undefined,
   });
 }
@@ -1007,6 +1005,12 @@ function recordAccountUsage(agentId: AgentId, event: NormalizedEvent, receivedAt
     // than dropping the label, which is the alternative.
     nameUsageModel(harness, runtimes[agentId]?.current_turn_model);
   } else if (event.type === "turn_end") {
+    // **Terminal before reading.** `emit_terminal_with_enrichment` emits `TurnEnd`
+    // ahead of the post-terminal `RateLimitEvent`, so a refusal recorded here
+    // attaches to the reading that *preceded* the refused turn. It survives the
+    // event that immediately follows only because that event re-reports the same
+    // windows and `observeUsage` carries the verdict across a matching reading.
+    // Reordering those two emissions would silently retire every refusal.
     if (event.outcome.status === "completed") {
       clearUsageRefusal(harness);
     } else if (event.outcome.status === "failed" && event.outcome.kind === "usage_limit") {

@@ -1,8 +1,14 @@
-# Codex usage limits: read the account, stop inferring it
+# Usage limits: read the account, stop inferring it
+
+Two defects with one root cause — **we assumed every quota reading tells the whole story, and
+neither harness's does.** Codex reports one unnamed quota per turn, so we showed whichever one the
+last turn mentioned (M1, M2, M4). Claude reports a complete-looking payload that silently omits the
+model-gated weekly window unless that model ran, so a later turn deletes a cap that is still in force
+(M3). The fixes differ because the data differs; M3 carries the table that explains why.
 
 **Status:** planned, not started. Revised 2026-09-19 after two review rounds and a live probe.
 **Depends on:** PR #105 (`agent-card-metadata`), landed as `9c544df`. This plan deletes some of what
-that PR added; see M3.
+that PR added; see M4.
 **Codex CLI at time of writing:** 0.154.0.
 
 ## The problem
@@ -94,7 +100,20 @@ weekly allowance is spent, which is true and complete.
 
 **`GPT-Reserve` is not added to the model picker.** See the probe results below — it is a real,
 dispatchable catalog model, so this is a decision rather than a limitation. The terminal is the
-documented answer for finishing a task while capped, and M4 records that for users.
+answer for finishing a task while capped, and M5 records that for users.
+
+**No explanatory sentence is added to the card either**, and the reason is evidence rather than
+taste. Both reviewers argued for one, on the grounds that a bare 100% bar states a true-but-incomplete
+story and leaves the user with no remedy. That argument is sound but its premise was wrong: the
+interactive Codex CLI **already tells the user they are out and offers the reserve model**, confirmed
+by the engineer doing exactly that and finishing the task. The explanation exists at the moment it
+applies, from the vendor, with the switch attached. Duplicating it on the card would add a second
+voice on a surface whose job is the number.
+
+Note this also means the earlier probe result — that unpinned `codex exec` is refused — does **not**
+generalise to the interactive CLI, which handles the fallback itself. Both surfaces the probe touched
+were `codex_exec`; no interactive session exists in the corpus. Record that scope limit in M5 rather
+than letting the probe table imply the terminal is a dead end.
 
 ### Live probe results (2026-09-19, ordinary quota spent)
 
@@ -133,8 +152,9 @@ defeat an automatic fallback to the reserve, making this a dispatch bug rather t
   `gpt-5.6-luna` appears against both a reserve bucket and a windowless `premium` record — so the
   rollout remains unusable as a source, but for the accurate reason: it can only ever carry one
   bucket of N, and one-of-N is what made the meter wrong regardless of naming.
-- Claude has no equivalent command (`claude --help` has no usage/status subcommand) and needs none —
-  its `rate_limit_event` already names every window in one payload.
+- Claude has no equivalent command (`claude --help` has no usage/status subcommand). It needs none
+  for *naming* — its windows are stably keyed — but **its readings are not complete**, which is M3:
+  a payload omits the model-gated weekly window unless that turn ran on the gated model.
 - A Claude `/context` run does **not** emit a `rate_limit_event`, so it is not a free refresh path
   (checked against `crates/harness/tests/fixtures/claude/context-report.stream.jsonl`).
 
@@ -169,16 +189,18 @@ keeps itself current rather than asking the user to press something. Matches the
 
 ### Non-goals
 
-- **Claude is untouched.** Its stream payload is already complete. The asymmetry is intentional.
+- **Claude's ingestion source is untouched.** Its stream payload names every window it reports, so
+  no new call is added for it. What M3 changes is how readings are *combined*, not where they come
+  from.
 - **The model reserve is not rendered**, and `GPT-Reserve` is not added to the picker. Decided, not
   deferred.
 - **`rateLimitUpsell` is not rendered.** It is entirely about the reserve; it is `dismissible` with
   `ctas` including "Add Credits", making it a vendor marketing surface; and its `description`
   carries a `{time}` placeholder, so rendering it means maintaining a template renderer for copy
-  that can change without a version bump and would have no drift test. Its shape is recorded in M4.
+  that can change without a version bump and would have no drift test. Its shape is recorded in M5.
 - **`rateLimitResetCredits` is not rendered.** The account currently holds an unconsumed free reset;
   spending one is a real action with real consequences and deserves its own decision. Shape recorded
-  in M4.
+  in M5.
 - **No periodic polling timer.**
 
 ### Conventions this work establishes, for reuse by later milestones
@@ -270,7 +292,7 @@ bucket is the only residual.
 probe runs as a pre-PR gate (see "Pre-PR verification" below) to confirm or replace it.
 
 Other unprobed items — logged-out and offline responses, bucket sets on plans other than `prolite` —
-are handled as generic failures and recorded in M4 rather than designed for.
+are handled as generic failures and recorded in M5 rather than designed for.
 
 ### Definition of Done
 
@@ -307,11 +329,11 @@ Make the meter show the user's ordinary weekly allowance, correctly.
 
 ### Implementation Outline
 
-**Ingestion cut happens here, not in M3.** This is load-bearing sequencing. `recordAccountUsage`
+**Ingestion cut happens here, not in the deletion milestone.** This is load-bearing sequencing. `recordAccountUsage`
 (`src/lib/state/index.svelte.ts:982`) routes every Codex `rate_limit_event` into `observeUsage`
 stamped with **arrival time**, so it wins newest-wins over the account read every time;
 `recordRestoredUsage` (`:429`) does the same on project open; `codex/mod.rs:821` still emits after
-each `TurnEnd` until M3. If the frontend cut waits for M3, the Codex section clean-hides after every
+each `TurnEnd` until M4. If the frontend cut waits for M4, the Codex section clean-hides after every
 turn and every project open for the whole duration of M2 — worse than the bug being fixed. **Both
 frontend entry points stop routing Codex to the store as part of this milestone.**
 
@@ -382,11 +404,22 @@ failure mode we cannot yet rule out. And it errs toward **understating** a quota
 direction this codebase takes throughout: a meter that fails to shout is recoverable, one that
 falsely claims you are blocked is not.
 
-**Staleness copy.** `HarnessUsage.svelte:214` reads "Measured {relativeTime} — **send a message to
-refresh**." That instruction becomes false for Codex once the app refreshes itself, and the value's
-meaning shifts too: for Codex `observed_at` stops meaning "when the harness measured it" (a rollout
-stamp that could be days old, which is why the line exists) and becomes "when we last asked". Make
-the line per-harness — Claude keeps the imperative, Codex states the measured instant alone.
+**State its coverage honestly: it does not make the probe optional.** The guard only catches a read
+taken *before any turn runs in the new window*. One turn in, `usedPercent` is a few percent and a
+stale flag sails through, rendering a nearly-empty bar in the warning tone. Since a turn ending is
+itself what triggers a read, that is the common case rather than the rare one. What the guard
+reliably protects is the read a *waiting* user is most likely to be looking at.
+
+**Staleness copy — do nothing here.** `HarnessUsage.svelte:214` currently reads "Measured
+{relativeTime} — **send a message to refresh**", which becomes false for Codex once the app refreshes
+itself. **Leave it untouched anyway.** M3 removes the imperative for *both* harnesses and moves the
+timestamp per-window, so a per-harness variant built here is exactly the throwaway intermediate shape
+this instruction exists to prevent. These milestones are commits in one PR, not separate review
+units, so there is no user-visible window in which the Codex line is wrong.
+
+**Do not touch `asReading`** beyond removing `limit_reached`. M3 extends its whitelist for
+per-window provenance; splitting that across two milestones is how the gate-lost-on-restart class of
+bug happens.
 
 **What stays.** `FailureKind::UsageLimit` remains, but **not** for the reason the previous revision
 gave. `docs/harness-behavior.md:96` states that `error_kind` never changes how a failed turn renders
@@ -412,7 +445,227 @@ with no surface reading it after this milestone.
 
 ---
 
-## M3 — Delete the Codex rollout rate-limit path
+## M3 — Keep Claude's windows until they reset, and date each one
+
+### Goal & Outcome
+
+Stop a reading that does not mention a window from deleting that window.
+
+- A Claude window stays on screen until **its own reset passes**, rather than until some later turn
+  happens not to mention it.
+- A user who hits the model-gated weekly cap on Fable and then works on Opus still sees the Fable
+  cap, because it is still in force.
+- Each window's tooltip states when **that window** was last measured, since after merging they no
+  longer share one instant.
+- No window is ever shown with a number from a reading that did not contain it.
+
+### Implementation Outline
+
+**The defect.** Claude's `unifiedWindows` is *partial*: it omits `seven_day_overage_included` unless
+the turn ran on the gated model. The store replaces whole readings, so an Opus turn silently deletes
+a Fable cap that is still blocking work. Verified on this machine — two installs, same account, same
+moment:
+
+```yaml
+# last turn Opus                      # last turn Fable
+model: claude-opus-5                  model: claude-fable-5-1
+unifiedWindows:                       unifiedWindows:
+  five_hour: 0.07                       five_hour: 0.28
+  seven_day: 0.73                       seven_day: 0.70
+  # Fable cap absent                    seven_day_overage_included: 1
+```
+
+This is **not** an agent- or model-based filter in our code — `claudeRateLimitView` walks a fixed key
+allowlist that already includes the gated window and renders whatever the payload holds. The loss is
+purely the whole-reading replacement.
+
+**Why the fix is the opposite of the Codex rule, and why that is not a contradiction.** The governing
+question is whether a new reading is *complete*, and whether its parts are *identifiable*:
+
+| Reading | Complete? | Identity carried *in the reading*? | Correct policy |
+| --- | --- | --- | --- |
+| Codex via `account/rateLimits/read` | yes | yes — `limit_id` | replace; nothing is missing |
+| Claude `rate_limit_event` | **no** | yes — the key *is* the identity | **merge per key** |
+| Codex via rollout | no | **no** — inferable only from a neighbouring record, by an unestablished rule | neither works; replace the source (M1/M2) |
+
+**The second column is deliberately "carried in the reading", not "knowable".** An earlier draft said
+the rollout's parts were simply unidentifiable, and that is too strong: `turn_context.model`
+co-varies with the bucket at the one observed transition and `gpt-reserve` matches the API's
+`limitName` exactly. A future reader who checks the table against a rollout will find that model
+slug and conclude the table is wrong — which is the "fix one harness to match the other" outcome it
+exists to prevent. The honest claim is that identity would have to be *reconstructed* from an
+adjacent record by a rule that is not established (`gpt-5.6-luna` appears against both a reserve
+bucket and a windowless `premium` record).
+
+Note also that the rollout fails the **first** column regardless: one bucket of N can never be a
+complete reading, so even perfect naming would not rescue it. That argument is unaffected by how the
+identity question resolves, and it is the one to lean on.
+
+One premise worth flagging rather than asserting: "Codex via API · complete: yes" rests on a single
+capture on one plan, and M1 itself records that bucket sets on other plans are unknown. The schema's
+wording ("multi-bucket view keyed by metered `limit_id`") makes it a contract claim rather than an
+observation, which is fair — but it is the only cell with **no detection if its premise is wrong**,
+since `replace` silently drops a bucket that stops appearing.
+
+State this table in the code, not only in this plan — it is the thing that stops a future reader
+"fixing" one harness to match the other.
+
+**Store provenance, never a verdict.** Per window key, store the vendor's own window object
+**verbatim** plus the context of the reading that delivered it — `observed_at`, `model`, and the
+account-level trio that window's flags are derived from (`status`, `rateLimitType`,
+`surpassedThreshold`). Account-level fields for the *card* (`isUsingOverage`, `overageResetsAt`,
+fallback) come from the newest reading only and are stored separately.
+
+`claudeRateLimitView` then derives each window's flags at render from that window's own delivering
+context, exactly as it does today. **Nothing in the store is a conclusion.**
+
+This is not a stylistic preference. Today every displayed number is re-derived from verbatim payloads
+at render, so an interpretation bug is corrected *retroactively* for data already on disk — and this
+plan exists because of two interpretation bugs. Computing flags at ingest would freeze a bad
+judgement into `usage.yaml` until each window resets. Storing slices of vendor data plus who
+delivered them keeps that property, keeps convention 2 literal rather than caveated, and leaves the
+store's only new knowledge as "which keys exist", which merging inherently requires.
+
+It also removes a seam: with flags derived at render for both harnesses, there is one mechanism
+behind the visual rather than Codex deriving and Claude storing.
+
+**Why retaining a window's flags is safe here, and was not for Codex.** A retained window keeps the
+threshold and refusal judgement that was true when it was observed, because those are judgements
+about *that window* and remain true until it resets. Structurally this is the carry-forward M2
+deletes for Codex, and the difference is not merely that the key is stable:
+
+- Claude's `status` is **account-level**, so an `allowed` reading delivered by an Opus turn is
+  evidence about the windows that turn touched — not about the Fable cap. Retention is the reading
+  that *doesn't* over-generalise.
+- Every Claude window carries a numeric `resetsAt` or `claudeRateLimitView` drops it, so unlike
+  Codex there is no reset-less window a flag can sit on indefinitely.
+- The two-event refused-turn ordering recorded at `harness-behavior.md:695` survives merging intact
+  and is *improved* by it: the opening `allowed` event omits the gated key entirely, so it updates
+  the other windows and leaves the verdict alone. The residual noted there — "a turn killed between
+  the two events leaves the cheerful reading held" — also shrinks, because a killed turn can no
+  longer delete the gated window. **M3 should claim that improvement rather than leaving it
+  implicit.**
+
+**Window instance changes replace; they do not merge.** A reading whose `resetsAt` for a known key
+differs from the held one describes a **new instance** of that window and replaces it outright,
+dropping the previous instance's flags — bypassing `observed_at` ranking entirely. This matters in
+one case and it is the case ranking gets wrong: an undated or lower-ranked reading carrying a freshly
+cycled window.
+
+Storage stays keyed by **window key**. `resetsAt` is a same-key check, *not* part of the identity —
+treating `(key, resetsAt)` as the identity would imply two stored entries for one window and require
+something to arbitrate between them, which is worse than today.
+
+This also protects the "no expiry needed" argument: utilization only climbs *within* a window, so a
+retained value understates. Across a reissued window that invariant does not hold, which is exactly
+why a changed reset must replace.
+
+**Staleness otherwise fails safe.** The existing reset-passed rule drops a window once it cycles,
+which retires its flags with it. No age threshold is needed.
+
+**One assumption to state rather than bury: `isUsingOverage` is treated as account-wide.** Taking it
+from the newest reading is only correct if it describes the account rather than the window that
+triggered it. If it were window-scoped, a Fable turn could put the account in overage with the gated
+window at 100%, an Opus turn report `isUsingOverage: false`, and the ⚡ escalation vanish while the
+retained window stays — the same "later reading deletes still-true state" defect this milestone
+exists to fix, relocated to the account fields and invisible because the window keeps rendering.
+**Unprobeable on this account** (both stores read `overageDisabledReason: org_level_disabled`), so it
+goes in M5's gap register with what would close it. M3 established that `unifiedWindows` is partial;
+it has not established that its siblings in the same payload are not.
+
+**Per-window provenance, and the label race this creates.** The gated window has no label of its
+own; it is named from the model of the turn that delivered it, so that model must ride with the
+window rather than with the reading.
+
+**This turns an accepted race into a durable defect, and fixing it is not optional.**
+`index.svelte.ts:1001-1005` documents the trade today: two agents interleaving between one turn's
+rate-limit event and the other's `init` can label a window with the wrong model, and the comment
+prices that as *"strictly better than dropping the label."* **That pricing assumed whole
+replacement**, where the mislabel survives one reading — seconds. Under merge the window outlives the
+reading and `nameUsageModel` never relabels a filled slot, so:
+
+> Agent A (Fable) emits its rate-limit event before its `init` lands → the gated window stores
+> unlabelled → Agent B (Opus) `session_meta` arrives → the Fable cap renders "Weekly · Opus" for up
+> to seven days.
+
+The correction path is closed by the same condition that creates the state: only another gated-model
+turn can fix it, and the user is capped on that model.
+
+**Fix: scope the fill to its producer.** Record on the window the agent whose event contributed it,
+and have `nameUsageModel` fill only blanks contributed by *that* agent's most recent event. Both call
+sites already hold `agentId` (`recordAccountUsage`, `:1006`). **Re-price the comment at `:1001`** — it
+currently justifies a risk at a duration that no longer applies. No information is lost: the label
+comes from the delivering agent or not at all, and a window whose deliverer never reported a model
+renders unlabelled rather than wrong, which is the rule this surface follows throughout.
+
+**The fallback path changes meaning and the plan must say so.** `claudeRateLimitView` currently gates
+its bare `resetsAt`/`rateLimitType` fallback line on the **newest reading's** `unifiedWindows` being
+empty. After merging, windows live in the store, so a reading with an empty map would render the
+fallback line while retained windows are still live. The rule becomes: **the fallback applies only
+when the merged window set is empty**, not when the newest reading's map is. This is a new state that
+merging creates, and it lands on the same "an empty container counts as absent" comment that already
+reasons carefully about the reading-level case.
+
+**Persistence nests inside `payload`.** `asReading` (`harnessUsage.svelte.ts:184-200`) is a hard
+whitelist — `payload` is copied wholesale and anything beside it is dropped. Per-window provenance
+must live inside `payload` or it is silently stripped on every load. This is the same trap as the
+previous round's gate-lost-on-restart finding; M3 owns extending the whitelist for its own fields
+(M2 must not touch `asReading`). M2 deletes `limit_reached` from it.
+
+**Tooltip.** Replace the single harness-level "Measured … ago" line with a per-window line, because
+merged windows genuinely have different measurement times and one line for all of them would be
+false.
+
+**Drop the "send a message to refresh" imperative for both harnesses.** It is not merely stale for
+Codex — after merging it becomes *wrong for Claude, in exactly the situation this milestone exists
+for*: sending a message refreshes only the windows that turn's model touches, and the gated window is
+refreshed by a gated-model turn and by nothing else. A user staring at a stale Fable cap would be
+told to send a message, do it, and watch that instant not move. The footer instead states the real
+rule — that each window updates when a turn runs against it — which explains why the instants differ
+and is true for Codex too, whose windows all update together because one call refreshes them.
+
+Per-window instants are used for both harnesses. Codex's will read identically since they arrive from
+one call; that is truthful and is preferred over a layout that changes shape depending on whether the
+values happen to agree.
+
+**Persistence.** Stored Claude entries in the old shape carry no per-window instants. Treat a missing
+per-window instant as unknown and render that window without an age line rather than backfilling it
+with the reading-level timestamp, which would date a window by when a *different* window was
+measured. The next turn repairs it.
+
+### Definition of Done
+
+- A reading omitting a window does not remove it; the window survives with its previous value, its
+  own instant, and its own flags.
+- A reading *containing* the window updates it, including clearing a threshold flag the new reading
+  no longer reports.
+- A window whose reset passes drops, taking its flags with it, even if no newer reading has arrived.
+- The gated window keeps its model label after a later reading from a different model.
+- `nameUsageModel` fills the label on the correct window when `init` arrives after the rate-limit
+  event, and a later turn on a different model does not relabel it.
+- **Two agents interleaving across the event/`init` boundary do not cross-label**: a second agent's
+  `session_meta` never names a window contributed by a different agent.
+- A reading whose `resetsAt` for a known key differs replaces that window and drops its flags, even
+  when the reading is undated or would lose on `observed_at`.
+- Account-level card state — overage escalation and the fallback line — reflects the newest reading
+  only and is not merged.
+- **The fallback line renders only when the merged window set is empty**, not when the newest
+  reading's map is; retained windows suppress it.
+- Tooltip: per-window measured lines, no refresh imperative for either harness; a window with no
+  known instant shows none.
+- **Persistence round-trips.** A *new*-shape entry survives `set_harness_usage` /
+  `get_harness_usage` with per-window instants, models, and delivering context intact — a case
+  distinguishable from the old-shape one below, which the previous DoD wording was not: "loads
+  without inventing instants" passes identically whether persistence works or strips every entry on
+  every restart.
+- An old-shape persisted entry loads and renders without inventing instants. It still retires
+  correctly, because the reset rule is per-window and reads the payload's own reset — only the age
+  *line* is unavailable.
+- The completeness/identity table is recorded in the code.
+
+---
+
+## M4 — Delete the Codex rollout rate-limit path
 
 ### Goal & Outcome
 
@@ -458,7 +711,7 @@ context window). Only the rate-limit extraction leaves.
 
 ---
 
-## M4 — Correct and close the harness record
+## M5 — Correct and close the harness record
 
 ### Goal & Outcome
 
@@ -489,11 +742,39 @@ accurate evidence trail. Reframe it as **closing an open capture**:
 - §2's kind table (`:96`) and **G3 (`:573`)**, which records "One narrow exception since:
   `usage_limit` is read by the sidebar to draw…" — M2 deletes that reader, so `error_kind` returns
   to having no readers at all.
-- **G8**, which describes the rollout-derived Codex rendering M3 deletes.
+- **G8**, which describes the rollout-derived Codex rendering M4 deletes.
 - **§1.4** quick-reference.
 - A version-log entry for the discovery, including the probe table (unpinned refused, `gpt-reserve`
   succeeded, `gpt-5.6-luna` refused) and the conclusion that `normalModelSlug` is a display alias
   rather than a dispatchable slug.
+- **The Claude partial-payload finding (M3) — record the *consequence*, not the fact.** The fact is
+  already documented: §3.12 (`:549-550`) states that `seven_day_overage_included` "appears only on
+  turns run on one of them", and the version log at `:699` calls it model-gated while `:695` records
+  a captured payload with "no `seven_day_overage_included` key at all". **Do not "correct" those
+  entries — they are right.** This is the second entry in this plan that was called wrong when it was
+  accurate-but-incomplete (the §5 Codex entry was the first); treat that as a pattern to check for
+  before editing anything in M5.
+
+  What was never written down is that whole-reading replacement therefore *deletes a window still in
+  force*. Add that to §3.12 as a line saying a reading is a partial view of the account and must not
+  be treated as a replacement, and add the omission caveat to **§1.4**, which does lack it — it
+  describes `unifiedWindows` as a map of key → `{utilization, resetsAt}` and documents the warning
+  event's map as a superset, with no hint the base map can omit a window.
+
+  **Frame it as G7 one level down, which is both accurate and stronger than a new discovery.** §1.4
+  (`:579`) already records that "a record carrying no `rate_limit_info` emits no event at all, so it
+  cannot overwrite that snapshot with nothing" — the *absence is not data* rule. It was applied at
+  the reading level and stopped there; M3 applies it at the window. That is why this bug survived in
+  a well-documented harness.
+
+- **Two entries whose rationale goes stale under merging**, both needing a clause rather than a
+  rewrite: `:581`, whose reason for skipping an empty `rate_limit_info` ("would erase every window
+  from memory *and* from disk") is half-false once an empty record is a no-op rather than a wipe —
+  the rule stands, the memory half of the reason does not; and `:695`, whose "that ordering is what
+  makes newest-wins safe on this payload" becomes a statement about *per-key* newest-wins.
+  `:695` should also be cited in M3 as pre-existing corroboration for the partial payload: it
+  captures the Fable wall as `seven_day_overage_included: 1` alongside `five_hour: 0.28` /
+  `seven_day: 0.70`, which is the "last turn Fable" column independently.
 
 **Record in the gap register, because the captures are perishable and re-capturing needs another
 wall:** the `rateLimitUpsell` shape (including `banner_type`, the `{time}` placeholder, `ctas`, and
@@ -501,10 +782,12 @@ wall:** the `rateLimitUpsell` shape (including `banner_type`, the `{time}` place
 items with what would close each.
 
 **`README.md` "Harness support and limitations"** gains a short user-facing entry: when the Codex
-weekly allowance is spent, Switchboard shows it as spent and the models in the picker will be
-refused; a model reserve may still be available through the Codex terminal directly. Symptom first,
-one or two plain lines — this is the documented answer for finishing a task while capped, and it
-exists because we decided not to put `GPT-Reserve` in the picker.
+weekly allowance is spent, Switchboard shows it as spent and every model in the picker is refused;
+running the task in the Codex CLI directly still works, because it offers a reserve model Switchboard
+does not expose. Symptom first, one or two plain lines. **Verified**, not inferred — the interactive
+CLI reports the exhaustion and offers the switch, and a task was completed that way. Keep it accurate
+on that point: the probe table's "unpinned is refused" result is about `codex exec` and does not
+describe the interactive CLI.
 
 ### Definition of Done
 
@@ -548,9 +831,12 @@ cannot be conjured on demand, which is why they gate the PR rather than the work
      pinning the refreshed-bucket shape, because at that point the flag alone is known-wrong and a
      future simplification would reintroduce the bug.
 
-   Either way the answer replaces the assumption in M2's code comment with an observation.
+   Either way the answer replaces the assumption in M2's code comment with an observation, and
+   **record what `rateLimitReachedType` actually does on recovery even if the rule does not change**
+   — that observation is what lets a future reader delete the conjunct deliberately rather than
+   inherit it as folklore.
 
 2. **`make test-live-codex`.** Required by `AGENTS.md` before merging adapter-touching changes, and
    it needs quota to be available — the same reset that enables item 1.
 
-Record both outcomes in M4's gap-register entries rather than leaving them in the PR description.
+Record both outcomes in M5's gap-register entries rather than leaving them in the PR description.

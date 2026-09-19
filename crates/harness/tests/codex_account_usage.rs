@@ -58,6 +58,18 @@ fn recorded_shim(dir: &Path, fixture: &str) -> PathBuf {
 /// real call's measured latency.
 const AMPLE: Duration = Duration::from_secs(30);
 
+/// The bound used by the tests that *want* a timeout.
+///
+/// **Not as tight as it could be, on purpose.** The fixture has to reach its
+/// directives — writing its pgid, printing its diagnostic — before the bound
+/// expires, and it cannot do that if the bound beats process startup. At two
+/// seconds this was observed failing on a cold first run right after a link,
+/// where the shim's `exec` pays an uncached binary: the child was killed before
+/// it ran, so the pgid file never appeared and the test failed for a reason
+/// unrelated to what it asserts. Five seconds is far above any spawn observed
+/// here and still quick enough to keep the file's runtime in single digits.
+const WANTS_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[tokio::test]
 async fn reads_every_account_bucket_from_the_recorded_response() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -199,13 +211,15 @@ async fn a_hung_server_times_out_and_leaves_no_process_behind() {
     .unwrap();
     let shim = codex_shim(dir.path(), &fixture);
 
-    let timeout = Duration::from_secs(2);
-    let read = tokio::spawn(async move { read_account_usage(&shim, timeout).await });
-    let leader = wait_for_pgid(&pgid_path).await;
+    // Awaited, not raced. The fixture writes its pgid before it hangs, so the
+    // file is on disk by the time the read gives up; polling for it concurrently
+    // only creates a second way for the test to fail.
+    let started = std::time::Instant::now();
+    let error = read_account_usage(&shim, WANTS_TIMEOUT).await.unwrap_err();
+    let elapsed = started.elapsed();
 
-    let error = read.await.unwrap().unwrap_err();
     assert!(
-        matches!(error, AccountUsageError::Timeout { bound, .. } if bound == timeout),
+        matches!(error, AccountUsageError::Timeout { bound, .. } if bound == WANTS_TIMEOUT),
         "got {error:?}"
     );
     // A wedged child that printed a reason first is the common shape, and the
@@ -215,7 +229,16 @@ async fn a_hung_server_times_out_and_leaves_no_process_behind() {
         error.to_string().contains("wedged before answering"),
         "the timeout must carry the server's last words; got {error}"
     );
-    assert_group_reaped(leader).await;
+    // The error output is collected *after* the kill, so the collection ends on
+    // EOF instead of burning its whole budget waiting on a child that is still
+    // alive. Before that ordering this call took the bound plus the full
+    // `STDERR_SETTLE`; the margin here is loose enough to survive a slow
+    // machine and tight enough to catch a revert.
+    assert!(
+        elapsed < WANTS_TIMEOUT + Duration::from_millis(400),
+        "collecting stderr should not wait on a child we already killed; took {elapsed:?}"
+    );
+    assert_group_reaped(wait_for_pgid(&pgid_path).await).await;
 }
 
 #[cfg(unix)]
@@ -223,10 +246,12 @@ async fn a_hung_server_times_out_and_leaves_no_process_behind() {
 async fn abandoning_the_call_still_tears_the_server_down() {
     // The leak the detached task exists to prevent. `codex app-server` holds
     // stdio open waiting for more requests, so a caller that drops this future
-    // — a coalescing refresh superseded by a newer one, a panel that closes —
-    // would otherwise strand one server per abandoned call, after every Codex
-    // turn. `kill_on_drop` is not a substitute: it signals only the spawned
-    // pid, never a descendant.
+    // would otherwise strand one server per abandoned call. `kill_on_drop` is
+    // not a substitute: it signals only the spawned pid, never a descendant.
+    //
+    // **No production caller does this today** — see `read_account_usage`'s doc.
+    // This test is the only thing that exercises the path, which is the reason
+    // to keep it rather than to delete the machinery.
     let dir = tempfile::TempDir::new().unwrap();
     let pgid_path = dir.path().join("pgid");
     let fixture = dir.path().join("hang.jsonl");
@@ -237,7 +262,9 @@ async fn abandoning_the_call_still_tears_the_server_down() {
     .unwrap();
     let shim = codex_shim(dir.path(), &fixture);
 
-    // A bound far longer than the test, so nothing but the drop can end this.
+    // A bound far longer than the test, so nothing but the drop can end this —
+    // which is what makes this a test of promptness rather than of eventual
+    // cleanup by timeout.
     let mut call = Box::pin(read_account_usage(&shim, Duration::from_mins(10)));
     // Poll it once so the spawn actually happens, then walk away.
     let started = tokio::time::timeout(Duration::from_millis(200), &mut call).await;
@@ -270,4 +297,29 @@ async fn the_server_is_killed_after_a_successful_read_too() {
 
     let leader = wait_for_pgid(&pgid_path).await;
     assert_group_reaped(leader).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_wedged_servers_unterminated_last_words_reach_the_error() {
+    // The canonical wedged-process shape: a half-written diagnostic, then a
+    // stall. Because it carries no trailing newline, a line-oriented reader
+    // holds it until the pipe reaches EOF — and a hung child never closes
+    // stderr, so the only way to surface it is to collect the tail *after* the
+    // kill rather than before.
+    let dir = tempfile::TempDir::new().unwrap();
+    let fixture = dir.path().join("partial.jsonl");
+    std::fs::write(
+        &fixture,
+        "// stderr_partial:error: connecting to api.openai.com\n// hang\n",
+    )
+    .unwrap();
+    let shim = codex_shim(dir.path(), &fixture);
+
+    let error = read_account_usage(&shim, WANTS_TIMEOUT).await.unwrap_err();
+
+    assert!(
+        error.to_string().contains("connecting to api.openai.com"),
+        "a stalled child's only diagnostic must survive; got {error}"
+    );
 }

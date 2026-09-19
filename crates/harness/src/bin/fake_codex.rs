@@ -31,6 +31,8 @@
 //! Special comment lines in the fixture (processed, never forwarded to stdout):
 //!   `// exit:<N>` — exit with code N instead of 0; stops line processing.
 //!   `// stderr:<message>` — write message to stderr before streaming begins.
+//!   `// stderr_partial:<message>` — same, but with NO trailing newline, so a
+//!     line-oriented reader cannot surface it until the pipe reaches EOF.
 //!   `// read_stdin` — read stdin to EOF before streaming. The adapter must
 //!     spawn the child with `Stdio::null()` for stdin so this returns
 //!     immediately; without it, the test would deadlock waiting for input.
@@ -95,6 +97,16 @@ fn main() {
 
         if let Some(msg) = line.strip_prefix("// stderr:") {
             writeln!(err, "fake_codex: {}", msg.trim()).ok();
+            continue;
+        }
+
+        // Unterminated, deliberately: no trailing newline. A line reader holds
+        // a final partial line until EOF, so this models the canonical wedged
+        // process — a half-written diagnostic and then a stall — whose only
+        // output is unreachable until the pipe closes.
+        if let Some(msg) = line.strip_prefix("// stderr_partial:") {
+            write!(err, "fake_codex: {}", msg.trim()).ok();
+            err.flush().ok();
             continue;
         }
 

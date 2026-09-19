@@ -6937,15 +6937,59 @@ pub fn check_codex_auth_impl(home_dir: &Path) -> Result<(), AppError> {
 /// logged out, a protocol that moved — collapses here, logged once at `warn`
 /// with the reason intact.
 ///
+/// What a change in account-usage outcome is worth saying.
+///
+/// A value rather than a `tracing` call inside the read, so the de-duplication
+/// rule is something a test can assert on directly. The previous version stored
+/// the reason and logged inline, which left no way to check *how many times* a
+/// warning fired — its test passed after a single call and would have passed
+/// with the suppression deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountUsageLog {
+    /// A failure that differs in kind from whatever came before it.
+    Failure,
+    /// The read started working again after a failure.
+    Recovery,
+}
+
+/// Decide whether an account-usage outcome is worth a log line.
+///
+/// Both arguments are failure *kinds* (`AccountUsageError::kind`), never
+/// rendered messages: the messages for the silence variants interpolate
+/// whatever the server printed, so keying on them would emit a line per refresh
+/// for a single unchanging condition.
+#[must_use]
+pub fn account_usage_log_decision(
+    last: Option<&str>,
+    now: Option<&str>,
+) -> Option<AccountUsageLog> {
+    match (last, now) {
+        (None, None) => None,
+        (Some(_), None) => Some(AccountUsageLog::Recovery),
+        (last, Some(kind)) if last == Some(kind) => None,
+        (_, Some(_)) => Some(AccountUsageLog::Failure),
+    }
+}
+
+/// Read the Codex account's metered quotas — every limit it holds, each named
+/// by Codex. `None` means "no reading available", never "something went wrong."
+///
+/// **Returns `Option`, not `Result`, and that is the contract rather than
+/// laziness.** This is a background refresh of a meter: the caller's only
+/// sensible response to any failure is to keep showing the reading it already
+/// has. Handing the frontend an error would invite it to render one, and a
+/// banner saying the quota read failed is noise about a number the user did not
+/// ask to be updated.
+///
 /// **Repeated failures are logged once, not once per turn.** Almost every way
 /// this read fails is a steady state rather than a blip — no Codex installed,
 /// logged out, offline, or a Codex too old to report named quotas — and the
 /// read runs at startup and after every Codex turn. Logging unconditionally
 /// would emit the same line forever and bury the transient failures that
-/// actually carry information, so the reason is remembered on `state` and a
-/// warning is emitted only when it changes. Recovery is logged too, at `info`:
-/// "it started working again" is the other half of the story and is otherwise
-/// invisible.
+/// actually carry information. The *kind* of the last failure is remembered on
+/// `state` and [`account_usage_log_decision`] decides; recovery is logged too,
+/// because "it started working again" is the other half of the story and is
+/// otherwise invisible.
 ///
 /// `binary` and `timeout` are parameters rather than constants read inside, for
 /// the same testability reason as [`check_codex_auth_impl`]'s `home_dir`: the
@@ -6966,26 +7010,30 @@ pub async fn read_codex_account_usage_impl(
         return None;
     }
     let outcome = switchboard_harness::read_account_usage(binary, timeout).await;
-    let reason = match &outcome {
-        Ok(_) => None,
-        Err(error) => Some(error.to_string()),
-    };
+    let kind = outcome
+        .as_ref()
+        .err()
+        .map(switchboard_harness::AccountUsageError::kind);
     let mut last = match state.last_account_usage_failure.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if *last != reason {
-        match &reason {
-            Some(reason) => {
-                tracing::warn!(%reason, "codex account usage read produced no reading");
-            }
-            None if last.is_some() => {
-                tracing::info!("codex account usage read recovered");
-            }
-            None => {}
+    match account_usage_log_decision(*last, kind) {
+        // The full message rides along; only the *key* is the kind.
+        Some(AccountUsageLog::Failure) => {
+            let reason = outcome
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            tracing::warn!(kind = kind.unwrap_or_default(), %reason, "codex account usage read produced no reading");
         }
-        *last = reason;
+        Some(AccountUsageLog::Recovery) => {
+            tracing::info!("codex account usage read recovered");
+        }
+        None => {}
     }
+    *last = kind;
     outcome.ok()
 }
 
@@ -11608,25 +11656,60 @@ mod tests {
         assert!(reading.is_none());
     }
 
+    #[test]
+    fn a_repeating_failure_is_logged_once_and_recovery_is_logged() {
+        // The guarantee the previous version of this test only appeared to
+        // make: it asserted that a reason was *stored*, which is true after one
+        // call, and observed no logging at all — so it passed with the
+        // suppression deleted. Asserting on the decision itself is what makes
+        // the count observable.
+        use AccountUsageLog::{Failure, Recovery};
+        let seq = ["timeout", "timeout", "timeout"];
+        let mut last: Option<&str> = None;
+        let mut decisions = Vec::new();
+        for kind in seq {
+            decisions.push(account_usage_log_decision(last, Some(kind)));
+            last = Some(kind);
+        }
+        assert_eq!(decisions, vec![Some(Failure), None, None]);
+
+        // Recovery, then the same failure again — both are news.
+        assert_eq!(account_usage_log_decision(last, None), Some(Recovery));
+        assert_eq!(
+            account_usage_log_decision(None, Some("timeout")),
+            Some(Failure)
+        );
+        // Steady success says nothing.
+        assert_eq!(account_usage_log_decision(None, None), None);
+    }
+
+    #[test]
+    fn a_change_of_failure_kind_is_logged_even_while_still_failing() {
+        // A user on a Codex too old to report named quotas sits in one drift
+        // condition permanently. A genuine protocol move arriving on top of it
+        // is a different event and must not be suppressed.
+        assert_eq!(
+            account_usage_log_decision(
+                Some("legacy-view-without-buckets"),
+                Some("non-object-bucket-map")
+            ),
+            Some(AccountUsageLog::Failure)
+        );
+    }
+
     #[tokio::test]
-    async fn a_repeated_account_usage_failure_is_recorded_once() {
-        // The read runs after every Codex turn and nearly all of its failures
-        // are steady states (no binary, logged out, offline, a Codex too old).
-        // Logging each one would emit the same line forever and bury the
-        // transient failures that carry information, so the remembered reason
-        // is what suppresses the repeat.
+    async fn two_failures_with_different_messages_share_one_kind() {
+        // The defect keying on the rendered message caused: the silence variants
+        // interpolate whatever the server printed, so one unchanging condition
+        // produced a fresh string — and a fresh warning — on every refresh.
         let state = account_usage_state().with_real_harnesses(true);
         let tmp = TempDir::new().unwrap();
         let absent = tmp.path().join("definitely-not-codex");
         for _ in 0..3 {
             read_codex_account_usage_impl(&state, &absent, std::time::Duration::from_secs(5)).await;
         }
-        let last = state.last_account_usage_failure.lock().unwrap();
-        assert_eq!(
-            last.as_deref(),
-            Some("codex binary not found"),
-            "the reason must be retained so the next identical failure stays quiet"
-        );
+        let last = *state.last_account_usage_failure.lock().unwrap();
+        assert_eq!(last, Some("binary-not-found"));
     }
 
     #[test]

@@ -377,6 +377,19 @@ exactly one further call. This is not a technicality — a read that started bef
 returns a number predating that turn's consumption, so answering the later request from the in-flight
 call would systematically understate usage.
 
+**Size it for a read that is usually already running.** The measured distribution above (median
+2.07s, p90 5.63s) against a trigger that fires at every turn end means the in-flight case is the
+**normal** path, not the burst path. Do not reason about this as "several agents finishing at
+once" — assume a read is in flight most times one is requested, and that the follow-up flag is set
+on the majority of triggers rather than rarely.
+
+**Superseding an in-flight read by discarding it is not available.** The mirror *awaits* the in-flight
+call, and Tauri propagates no cancellation, so nothing on either side drops the future — which is why
+`ACCOUNT_USAGE_TIMEOUT` is load-bearing rather than defensive: an unbounded read against a wedged
+server would hold the single in-flight slot for the life of the session and permanently disable the
+Codex meter. If a later revision wants supersede-by-discard, `read_account_usage`'s cancellation
+handling is what makes that safe, and adopting it is a deliberate change rather than a free option.
+
 **Which quotas render.** Show buckets whose `normalModelSlug` is null — account-wide allowances.
 Hide model-scoped ones. **Filter on the model association, not on `limit_id === "codex"`**: the
 identifier is not guaranteed across plans, and the rule as stated keeps working on a plan carrying

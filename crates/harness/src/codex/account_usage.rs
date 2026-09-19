@@ -162,8 +162,62 @@ pub enum AccountUsageError {
     /// whose `result` is not the documented shape. Distinct from
     /// [`Self::Rpc`]: that is Codex declining, this is the protocol having
     /// moved under us — the drift the live test exists to catch.
-    #[error("`codex app-server` returned an unreadable response: {0}")]
-    Malformed(String),
+    #[error("`codex app-server` returned an unreadable response ({kind}): {detail}")]
+    Malformed {
+        /// Which drift this is, as a stable identifier.
+        ///
+        /// **Carried separately from `detail` because the two most likely
+        /// producers are not the same event.** The absent-bucket-map rule fires
+        /// for a Codex CLI too old to report named quotas — a permanent state
+        /// documented to users in `README.md` — while the other rules fire for
+        /// a protocol that moved, which is a one-off needing investigation.
+        /// Callers de-duplicating repeated failures key on this, so a user
+        /// sitting in the first condition still sees the second when it
+        /// arrives.
+        kind: &'static str,
+        detail: String,
+    },
+}
+
+impl AccountUsageError {
+    /// A stable identifier for *what kind of thing went wrong*, with no
+    /// variable content in it.
+    ///
+    /// **Exists so callers can suppress a repeating failure without keying on
+    /// the rendered message.** `Display` for the silence variants interpolates
+    /// whatever the server printed, which is exactly the content that varies
+    /// between two occurrences of one condition — so a de-duplication built on
+    /// the message would log forever in the cases it was added to quieten.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::BinaryNotFound => "binary-not-found",
+            Self::Spawn(_) => "spawn-failed",
+            Self::Timeout { .. } => "timeout",
+            Self::NoResponse { .. } => "no-response",
+            Self::Handshake(_) => "handshake-rejected",
+            Self::Rpc(_) => "rpc-error",
+            Self::Malformed { kind, .. } => kind,
+        }
+    }
+}
+
+/// Render a value that came off the wire for inclusion in an error message,
+/// capped the way the shared stderr formatter caps its tail.
+///
+/// The offending value on a drift path can be arbitrarily large — a whole
+/// response object, or an array where an object was expected — and it lands in
+/// a `warn!` that repeats while the condition lasts. Truncation is on a char
+/// boundary because byte-slicing a `String` can land mid-UTF-8 and panic.
+fn capped(value: &serde_json::Value) -> String {
+    let rendered = value.to_string();
+    if rendered.len() <= crate::subprocess::STDERR_MESSAGE_MAX_LEN {
+        return rendered;
+    }
+    let end = (crate::subprocess::STDERR_MESSAGE_MAX_LEN..=rendered.len())
+        .find(|&i| rendered.is_char_boundary(i))
+        .unwrap_or(rendered.len());
+    format!("{}…", &rendered[..end])
 }
 
 fn stderr_suffix(tail: &str) -> String {
@@ -199,13 +253,23 @@ const RATE_LIMITS_ID: i64 = 1;
 /// **Cancellation-safe by construction.** The work runs on a task that owns the
 /// child, and dropping this future *signals* that task to stop waiting and tear
 /// the child down. Both halves are needed and neither alone is enough: a
-/// detached task alone would clean up only once its own bound expired, leaving
-/// a server alive for up to `timeout` after the caller walked away, while a
+/// detached task alone would clean up only once its own bound expired, leaving a
+/// server alive for up to `timeout` after the caller walked away, while a
 /// cancellation signal without the detached task would abandon the teardown
-/// midway. The shape this guards against is a coalescing refresh superseding an
-/// in-flight read, or a panel closing, once per Codex turn — and `kill_on_drop`
-/// is not a substitute, because by this module's own spawn comment it cannot
-/// reach a descendant.
+/// midway. `kill_on_drop` is not a substitute either — by this module's own
+/// spawn comment it cannot reach a descendant.
+///
+/// **No caller triggers this today, and the honest reason to keep it is the
+/// contract rather than a current bug.** Two plausible triggers were considered
+/// and both turn out not to exist: the frontend's refresh coalescing *awaits*
+/// an in-flight read rather than discarding it, and Tauri propagates no
+/// cancellation, so a frontend that abandons its request leaves the command
+/// running to completion. Nothing drops this future except runtime teardown. The
+/// machinery stays because the alternative contract — clean teardown, provided
+/// you wait — is one no caller should have to read this source to discover, and
+/// because a later decision to supersede a refresh by dropping it is exactly
+/// what this makes safe. `abandoning_the_call_still_tears_the_server_down` is
+/// what exercises it.
 ///
 /// **What `timeout` bounds, precisely:** binary resolution, spawn, the
 /// handshake, and the wait for the answer. It does **not** bound teardown,
@@ -217,6 +281,13 @@ const RATE_LIMITS_ID: i64 = 1;
 /// `PATH` hangs *inside* the bound and out of its reach. That is a pre-existing
 /// property of every dispatch in this crate, named here rather than papered
 /// over.
+///
+/// **Worst-case occupancy is therefore more than the bound**, and a caller
+/// budgeting against the constant should use the total: `timeout`, plus
+/// `STDERR_SETTLE` (0.5s) on a failure that needs the server's last words, plus
+/// `TERMINATE_GRACE` (2s) if the child ignores `SIGTERM`, plus the reap. Call it
+/// `timeout + ~2.5s`. In practice the settle ends on EOF almost immediately
+/// because the kill runs first, so this is a ceiling rather than a typical cost.
 ///
 /// A parameter rather than a constant read inside, so the kill-on-timeout path
 /// is testable without a fifteen-second test; production passes
@@ -304,40 +375,12 @@ async fn read_on_task(
         }
     })?;
 
-    let result = tokio::select! {
-        result = converse(&mut child, deadline, timeout) => result,
-        () = cancel.cancelled() => Err(AccountUsageError::NoResponse {
-            detail: "the caller abandoned the read".to_owned(),
-            stderr: String::new(),
-        }),
-    };
-    // Kill on *every* exit path, success included. The server holds stdio open
-    // and waits for more requests; without this it outlives the answer it gave
-    // us. Deliberately outside the deadline — see the bound's scope above.
-    crate::subprocess::terminate_then_kill(&mut child).await;
-    result
-}
-
-/// The handshake-and-read, factored out so the caller can kill the child on
-/// every return path with one call rather than at each `?`.
-///
-/// `bound` is carried alongside `deadline` only so a timeout can report the
-/// budget it exhausted; the deadline is what actually governs.
-async fn converse(
-    child: &mut tokio::process::Child,
-    deadline: tokio::time::Instant,
-    bound: Duration,
-) -> Result<CodexAccountUsage, AccountUsageError> {
-    let missing = || AccountUsageError::NoResponse {
-        detail: "the child exposed no pipes".to_owned(),
-        stderr: String::new(),
-    };
-    let stdout = child.stdout.take().ok_or_else(missing)?;
-    let stderr = child.stderr.take();
-    let mut stdin = child.stdin.take().ok_or_else(missing)?;
-
+    // The child's error output is drained from here rather than from `converse`,
+    // and that placement is the whole reason these two functions are split.
+    // The tail has to outlive the read so it can be collected *after* the kill;
+    // see the sequencing note below.
     let tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
-    let draining = stderr.map(|stderr| {
+    let draining = child.stderr.take().map(|stderr| {
         let tail = Arc::clone(&tail);
         // Drained rather than nulled so a spawn that fails *after* exec (a
         // panicking binary, a shim that errors) leaves a reason in the log.
@@ -356,6 +399,93 @@ async fn converse(
         })
     });
 
+    let mut abandoned = false;
+    let answer = tokio::select! {
+        result = converse(&mut child, deadline, timeout) => result,
+        () = cancel.cancelled() => {
+            abandoned = true;
+            Err(AccountUsageError::NoResponse {
+                detail: "the caller abandoned the read".to_owned(),
+                stderr: String::new(),
+            })
+        }
+    };
+
+    // Kill on *every* exit path, success included. The server holds stdio open
+    // and waits for more requests; without this it outlives the answer it gave
+    // us. Deliberately outside the deadline — see the bound's scope above.
+    crate::subprocess::terminate_then_kill(&mut child).await;
+
+    // Nobody is waiting for this, so there is no log line to complete.
+    if abandoned {
+        return answer;
+    }
+
+    // **The kill has to come first, and this ordering is a correctness fix
+    // rather than tidiness.** Two reasons, both measured:
+    //
+    // - A hung child still holds its error pipe open, so the drain can never
+    //   reach EOF while it lives. Settling before the kill therefore always
+    //   burned the full `STDERR_SETTLE` budget and learned nothing by waiting —
+    //   2.51s observed against a 2.00s bound, three identical runs.
+    // - A line reader yields nothing for a final line with no trailing newline
+    //   until EOF. That is the canonical wedged-process shape — a half-written
+    //   diagnostic, then a stall — and before this ordering its message was
+    //   unreachable *entirely*, not merely late. `SIGKILL` closes the pipe, the
+    //   fragment arrives, and the settle returns in roughly no time.
+    //
+    // Still bounded: `terminate_then_kill` reaps our direct child, and a
+    // descendant holding the pipe would otherwise park this forever.
+    if matches!(
+        answer,
+        Err(AccountUsageError::Timeout { .. } | AccountUsageError::NoResponse { .. })
+    ) && let Some(draining) = draining
+    {
+        let _ = tokio::time::timeout(STDERR_SETTLE, draining).await;
+    }
+
+    attach_stderr(answer, &tail)
+}
+
+/// Give a failure the server's own last words. Only the two variants that
+/// describe silence carry a tail; the rest already quote what Codex said.
+fn attach_stderr(
+    answer: Result<CodexAccountUsage, AccountUsageError>,
+    tail: &Mutex<VecDeque<String>>,
+) -> Result<CodexAccountUsage, AccountUsageError> {
+    match answer {
+        Err(AccountUsageError::Timeout { bound, .. }) => Err(AccountUsageError::Timeout {
+            bound,
+            stderr: crate::subprocess::format_stderr_tail(tail),
+        }),
+        Err(AccountUsageError::NoResponse { detail, .. }) => Err(AccountUsageError::NoResponse {
+            detail,
+            stderr: crate::subprocess::format_stderr_tail(tail),
+        }),
+        other => other,
+    }
+}
+
+/// The handshake, the write, and the wait for an answer.
+///
+/// Split from [`read_on_task`] so the error output can be collected *after* the
+/// kill — the ordering documented there. This function therefore never attaches
+/// a stderr tail: it returns the bare failure and its caller fills one in.
+///
+/// `bound` is carried alongside `deadline` only so a timeout can report the
+/// budget it exhausted; the deadline is what actually governs.
+async fn converse(
+    child: &mut tokio::process::Child,
+    deadline: tokio::time::Instant,
+    bound: Duration,
+) -> Result<CodexAccountUsage, AccountUsageError> {
+    let missing = || AccountUsageError::NoResponse {
+        detail: "the child exposed no pipes".to_owned(),
+        stderr: String::new(),
+    };
+    let stdout = child.stdout.take().ok_or_else(missing)?;
+    let mut stdin = child.stdin.take().ok_or_else(missing)?;
+
     let requests = format!("{}\n{}\n", initialize_request(), rate_limits_request());
     // A write failure means the child is already gone; read stdout anyway
     // rather than returning here, so whatever it managed to say still reaches
@@ -369,6 +499,11 @@ async fn converse(
     // answering: on 0.154.0, 20 runs closing stdin produced no `id:1` response
     // and 20 runs leaving it open answered every time. The child is reaped by
     // the caller's kill, not by EOF on its input.
+    //
+    // The same behavior is the app's shutdown guarantee, which is easy to miss
+    // because it reads here purely as a hazard: when Switchboard exits, our end
+    // of this pipe closes, and that is what makes an `app-server` we never got
+    // to signal exit on its own.
     let answer = match tokio::time::timeout_at(deadline, read_response(stdout)).await {
         Ok(result) => result,
         Err(_) => Err(AccountUsageError::Timeout {
@@ -377,30 +512,7 @@ async fn converse(
         }),
     };
     drop(stdin);
-
-    // Both failure shapes want the server's own last words, and neither can
-    // read them until the drain has caught up: stdout ending says nothing about
-    // whether the stderr task is done, so an unsettled tail is a coin flip —
-    // worse than no tail, because an intermittently empty reason reads as "there
-    // was no reason." Bounded, because the child need not have closed stderr.
-    let needs_reason = matches!(
-        answer,
-        Err(AccountUsageError::Timeout { .. } | AccountUsageError::NoResponse { .. })
-    );
-    if needs_reason && let Some(draining) = draining {
-        let _ = tokio::time::timeout(STDERR_SETTLE, draining).await;
-    }
-    match answer {
-        Err(AccountUsageError::Timeout { bound, .. }) => Err(AccountUsageError::Timeout {
-            bound,
-            stderr: crate::subprocess::format_stderr_tail(&tail),
-        }),
-        Err(AccountUsageError::NoResponse { detail, .. }) => Err(AccountUsageError::NoResponse {
-            detail,
-            stderr: crate::subprocess::format_stderr_tail(&tail),
-        }),
-        other => other,
-    }
+    answer
 }
 
 /// How long to wait for the stderr drain to finish once the read has ended.
@@ -523,9 +635,10 @@ fn classify_line(line: &str) -> Option<Result<CodexAccountUsage, AccountUsageErr
         return Some(Err(AccountUsageError::Rpc(error.to_string())));
     }
     let Some(result) = message.get("result") else {
-        return Some(Err(AccountUsageError::Malformed(
-            "response carried neither `result` nor `error`".to_owned(),
-        )));
+        return Some(Err(AccountUsageError::Malformed {
+            kind: "no-result-or-error",
+            detail: "the response carried neither `result` nor `error`".to_owned(),
+        }));
     };
     Some(lift_usage(result))
 }
@@ -555,22 +668,31 @@ fn classify_line(line: &str) -> Option<Result<CodexAccountUsage, AccountUsageErr
 ///
 /// Absent with no legacy sibling either is a genuine empty reading. A
 /// `rateLimitsByLimitId` that is present and not an object is drift too.
+///
+/// **The guard is not total, and this is its one hole.** It works because
+/// `rateLimits` is expected to outlive `rateLimitsByLimitId` — the legacy field
+/// being the one a vendor keeps. A rename that moves *both* at once lands back
+/// on a silent empty reading, detectable only by the live test. That is the same
+/// detection-after-the-fact posture this module accepts throughout, recorded
+/// here because this is the one place a reader might assume otherwise.
 fn lift_usage(result: &serde_json::Value) -> Result<CodexAccountUsage, AccountUsageError> {
     if !result.is_object() {
-        return Err(AccountUsageError::Malformed(format!(
-            "`result` is not an object: {result}"
-        )));
+        return Err(AccountUsageError::Malformed {
+            kind: "non-object-result",
+            detail: format!("`result` is not an object: {}", capped(result)),
+        });
     }
     let legacy_answered = result
         .get("rateLimits")
         .is_some_and(|legacy| !legacy.is_null());
     let buckets = match result.get("rateLimitsByLimitId") {
         None | Some(serde_json::Value::Null) if legacy_answered => {
-            return Err(AccountUsageError::Malformed(
-                "`rateLimitsByLimitId` is absent while the legacy `rateLimits` view answered — \
-                 the multi-bucket view has moved or this Codex predates it"
+            return Err(AccountUsageError::Malformed {
+                kind: "legacy-view-without-buckets",
+                detail: "`rateLimitsByLimitId` is absent while the legacy `rateLimits` view \
+                         answered — the multi-bucket view has moved, or this Codex predates it"
                     .to_owned(),
-            ));
+            });
         }
         None | Some(serde_json::Value::Null) => BTreeMap::new(),
         Some(serde_json::Value::Object(map)) => map
@@ -578,9 +700,10 @@ fn lift_usage(result: &serde_json::Value) -> Result<CodexAccountUsage, AccountUs
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         Some(other) => {
-            return Err(AccountUsageError::Malformed(format!(
-                "`rateLimitsByLimitId` is not an object: {other}"
-            )));
+            return Err(AccountUsageError::Malformed {
+                kind: "non-object-bucket-map",
+                detail: format!("`rateLimitsByLimitId` is not an object: {}", capped(other)),
+            });
         }
     };
     Ok(CodexAccountUsage {
@@ -658,9 +781,12 @@ mod tests {
     }
 
     #[test]
-    fn a_response_with_no_buckets_is_an_empty_reading_not_an_error() {
-        // Legitimate per the schema: only the legacy `rateLimits` field is
-        // required. The frontend renders nothing; it is not a drift signal.
+    fn a_response_with_neither_usage_view_is_an_empty_reading() {
+        // The *absence of the legacy view* is what makes this an empty account
+        // rather than drift. Note the schema-requires-only-`rateLimits` argument
+        // does not license relaxing the rule next door: when `rateLimits` does
+        // answer while the bucket map is gone, that combination is precisely the
+        // drift signal, and this case is distinguished by having neither.
         let stream = r#"{"id":1,"result":{"ordinaryUsageAllowed":true}}"#;
         let usage = read_all(stream).expect("the stream answers").unwrap();
         assert_eq!(usage.ordinary_usage_allowed, Some(true));
@@ -691,7 +817,7 @@ mod tests {
         let stream = r#"{"id":1,"result":{"ordinaryUsageAllowed":false,"rateLimits":{"limitId":"codex","primary":{"usedPercent":100}}}}"#;
         let error = read_all(stream).expect("the stream answers").unwrap_err();
         assert!(
-            matches!(error, AccountUsageError::Malformed(ref d) if d.contains("rateLimitsByLimitId")),
+            matches!(error, AccountUsageError::Malformed { kind, .. } if kind == "legacy-view-without-buckets"),
             "got {error:?}"
         );
     }
@@ -734,6 +860,14 @@ mod tests {
         // Deliberately fixture-only. A live test on this shape would have to
         // provoke a protocol violation and assert on how the server reacts,
         // which is neither ours to promise nor stable enough to pin.
+        //
+        // A review reported this shape hanging in most trials. The cause was the
+        // probe, not the server: it waited on the raw stdout descriptor while
+        // reading through a buffered wrapper, so when both replies arrived in one
+        // chunk the second sat in userspace and the descriptor never signalled
+        // again. Re-probed with a reader thread it answered 16/16. Recorded so
+        // the trial counts above are not re-litigated by someone who reproduces
+        // the same artifact.
         let stream = r#"{"error":{"code":-32600,"message":"Invalid request: missing field `version`"},"id":0}"#;
         let error = read_all(stream).expect("the stream answers").unwrap_err();
         assert!(
@@ -767,7 +901,7 @@ mod tests {
         let stream = r#"{"id":1,"jsonrpc":"2.0"}"#;
         let error = read_all(stream).expect("the stream answers").unwrap_err();
         assert!(
-            matches!(error, AccountUsageError::Malformed(_)),
+            matches!(error, AccountUsageError::Malformed { .. }),
             "got {error:?}"
         );
     }
@@ -779,7 +913,7 @@ mod tests {
         let stream = r#"{"id":1,"result":{"rateLimitsByLimitId":[]}}"#;
         let error = read_all(stream).expect("the stream answers").unwrap_err();
         assert!(
-            matches!(error, AccountUsageError::Malformed(_)),
+            matches!(error, AccountUsageError::Malformed { .. }),
             "got {error:?}"
         );
     }
@@ -789,7 +923,7 @@ mod tests {
         let stream = r#"{"id":1,"result":"ok"}"#;
         let error = read_all(stream).expect("the stream answers").unwrap_err();
         assert!(
-            matches!(error, AccountUsageError::Malformed(_)),
+            matches!(error, AccountUsageError::Malformed { .. }),
             "got {error:?}"
         );
     }
@@ -814,6 +948,64 @@ mod tests {
             r#"{"method":"remoteControl/status/changed","params":{}}"#,
         );
         assert!(read_all(stream).is_none());
+    }
+
+    #[test]
+    fn drift_kinds_are_distinguishable_from_each_other() {
+        // The old-CLI condition and a genuine protocol move must not collapse
+        // into one identifier, because a caller suppressing repeats keys on it:
+        // a user permanently in the first would otherwise never see the second.
+        let old_cli = r#"{"id":1,"result":{"rateLimits":{"limitId":"codex"}}}"#;
+        let moved = r#"{"id":1,"result":{"rateLimitsByLimitId":[]}}"#;
+        let kinds: Vec<&str> = [old_cli, moved]
+            .iter()
+            .map(|stream| {
+                read_all(stream)
+                    .expect("the stream answers")
+                    .unwrap_err()
+                    .kind()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["legacy-view-without-buckets", "non-object-bucket-map"]
+        );
+    }
+
+    #[test]
+    fn a_huge_offending_value_is_capped_in_the_error_message() {
+        // The drift message repeats while the condition lasts, so an unbounded
+        // response body would land in a warning on every refresh.
+        let huge = serde_json::Value::Array(vec![serde_json::json!("x".repeat(64)); 200]);
+        let stream =
+            serde_json::json!({"id": 1, "result": {"rateLimitsByLimitId": huge}}).to_string();
+        let error = read_all(&stream).expect("the stream answers").unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.len() < crate::subprocess::STDERR_MESSAGE_MAX_LEN + 200,
+            "message should be capped; got {} chars",
+            message.len()
+        );
+        assert!(
+            message.contains("rateLimitsByLimitId"),
+            "the capped message must still name the field: {message}"
+        );
+    }
+
+    #[test]
+    fn kinds_carry_no_variable_content() {
+        // The property a caller's de-duplication depends on: two occurrences of
+        // one condition share a kind even when their messages differ.
+        let first = AccountUsageError::Timeout {
+            bound: Duration::from_secs(30),
+            stderr: "pid 1 failed".to_owned(),
+        };
+        let second = AccountUsageError::Timeout {
+            bound: Duration::from_secs(30),
+            stderr: "pid 2 failed".to_owned(),
+        };
+        assert_ne!(first.to_string(), second.to_string());
+        assert_eq!(first.kind(), second.kind());
     }
 
     #[test]

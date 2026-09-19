@@ -517,8 +517,12 @@ pub struct AppState {
     /// second copy of that decision is one that can silently disagree with the
     /// first.
     pub spawns_real_harnesses: bool,
-    /// The last account-usage failure reported, so a persistent one is logged
-    /// on change rather than on repeat.
+    /// The *kind* of the last account-usage failure, so a persistent one is
+    /// logged on change rather than on repeat.
+    ///
+    /// The kind rather than the message: the messages for the silence variants
+    /// interpolate whatever Codex printed, which is exactly what varies between
+    /// two occurrences of one condition.
     ///
     /// **Nearly every way that read can fail is a steady state**, not a blip:
     /// no Codex installed, logged out, offline, or a Codex too old to report
@@ -526,7 +530,7 @@ pub struct AppState {
     /// logging each failure would emit the same line indefinitely and bury the
     /// transient failures that actually mean something. `None` is "nothing has
     /// failed since startup", which is why recovery logs too.
-    pub last_account_usage_failure: Mutex<Option<String>>,
+    pub last_account_usage_failure: Mutex<Option<&'static str>>,
 }
 
 impl AppState {

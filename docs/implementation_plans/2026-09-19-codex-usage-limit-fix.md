@@ -802,6 +802,55 @@ measured. The next turn repairs it.
   *line* is unavailable.
 - The completeness/identity table is recorded in the code.
 
+### As built (2026-09-19)
+
+Seven decisions differ from the outline above, or resolve something it left open.
+
+**The merge rule is selected by the reading's shape, not by its harness.** A reading either carries
+a window map or it does not: Claude's does (lifted from `unifiedWindows` by the caller that knows the
+reading is partial), Codex's never does. `observeUsage` merges whatever map it is given and replaces
+everything else, so the store holds no harness check and no per-harness branch. `reportsPartialUsageWindows`
+carries the completeness/identity table and is consulted at the two ingestion sites, which is where the
+question "is this reading complete?" is actually answerable.
+
+**Per-window state is a sibling of `payload`, not nested inside it.** The outline offered both and gave
+M3 the whitelist. `payload` is documented end to end as the vendor's payload, opaque to everything but
+the reader; putting our own bookkeeping inside it would make that false at the one place a reader checks.
+`asReading` gained a `windows` arm instead.
+
+**The stored per-window context is four fields, not the outline's three.** `isUsingOverage` had to join
+`status` / `rateLimitType` / `surpassedThreshold`, because the refusal derivation reads it to separate a
+wall from paid overage. Taken from the newest reading it would have reintroduced exactly the leak this
+milestone removes — an Opus turn reporting `isUsingOverage: true` would silence a Fable refusal.
+
+**The fallback rule is a conjunction, not a replacement.** The outline says the line renders "only when
+the merged window set is empty". Implemented literally, that would *relax* a pre-existing rule: a
+non-empty `unifiedWindows` whose entries were all filtered out (reset-passed, unreadable, or a key we
+exclude) deliberately clean-hides rather than falling back, because falling back there overrides the
+per-window rules instead of filling a gap. Both conditions now hold — the newest reading has no window
+container **and** nothing renders — which is strictly narrower than either rule alone.
+
+**The fallback line keeps a reading-level measured instant.** Every window is dated individually, but
+the fallback is not a window: it is drawn from the newest payload by definition, so that reading's
+instant is exactly what dates it. Without this the whole fallback path silently lost its age line, which
+the outline did not intend and no DoD item would have caught.
+
+**A restored reading records no contributing agent.** The outline scopes the label fill to the agent that
+contributed a window; it does not say what a *restored* window's contributor is. It is left unset. A
+restored window describes a turn that already ended, so a later `init` from that agent would name it with
+whatever model is running now — a guess about an older measurement, which is the mislabel the scoping
+exists to prevent, not an instance of the race it fixes.
+
+**An unreadable persisted window map drops the whole entry.** One severity, matching the reading-level
+instant check and for the same reason: the file is machine-written, so a map that is not the shape we
+write is not evidence of a window worth salvaging, and repairing it field by field would quietly demote a
+window to unlabelled or unranked. The next turn rebuilds it.
+
+Verification: ten mutations covering every rule above were applied and each was caught by a named test —
+merge-becomes-replace, the reissue bypass, the agent scoping on the label fill, tone and refusal read from
+the newest reading rather than the delivering one, the per-window instant, the persistence whitelist, the
+fallback suppression, the legacy instant backfill, and a contributing agent on a restored reading.
+
 ---
 
 ## M4 — Delete the Codex rollout rate-limit path

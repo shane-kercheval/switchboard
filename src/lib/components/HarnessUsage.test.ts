@@ -11,6 +11,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 const usage = await import("$lib/state/harnessUsage.svelte");
 const accountUsage = await import("$lib/state/accountUsage.svelte");
 const { invoke } = await import("@tauri-apps/api/core");
+const { claudeStoredWindows } = await import("$lib/usageWindows");
 
 /// Rendering claims for the account-scoped usage section: meter counts, labels,
 /// order, tone, the tooltip's absolute dates, and every clean-hide rule. What the
@@ -46,16 +47,23 @@ function agoIso(ms: number): string {
 /// Seed the account-scoped store and render. **No agent and no project**: that
 /// is the point of the relocation — a reading is a fact about the harness
 /// account, so nothing here needs a roster to render it.
+/// Put a Claude reading in the store the way the event path does. Every Claude
+/// seed here goes through this: a reading recorded without its windows lifted out
+/// renders nothing, which would make a test pass for the wrong reason.
+function seedClaude(payload: unknown, observedAt: string, model?: string): void {
+  usage.observeUsage("claude_code", {
+    payload,
+    observed_at: observedAt,
+    windows: claudeStoredWindows(payload, { observedAt, model }),
+  });
+}
+
 async function renderClaudeWithRateLimit(
   info: unknown,
   measuredAt: string | null,
   model?: string,
 ): Promise<void> {
-  usage.observeUsage("claude_code", {
-    payload: info,
-    observed_at: measuredAt ?? new Date().toISOString(),
-    model,
-  });
+  seedClaude(info, measuredAt ?? new Date().toISOString(), model);
   render(HarnessUsage);
   await tick();
 }
@@ -438,8 +446,9 @@ describe("Claude rate-limit tooltip", () => {
     expect(detail).toHaveTextContent("Resets");
     // The overage window is surfaced here.
     expect(detail).toHaveTextContent(/overage window resets/i);
-    // Every reading dates itself, including a live one.
-    expect(screen.getByTestId("harness-usage-measured")).toHaveTextContent(/measured/i);
+    // The fallback line dates itself from the reading it came from, which is the
+    // only instant it has — it is not a window and nothing measured it separately.
+    expect(screen.getByTestId("harness-usage-measured")).toBeInTheDocument();
   });
 
   it("spells out each window's percentage and full reset date on hover", async () => {
@@ -474,20 +483,87 @@ describe("Claude rate-limit tooltip", () => {
     expect(within(detail).getAllByText("Resets")).toHaveLength(2);
   });
 
-  it("dates the reading and says how to refresh it", async () => {
-    // The age line is unconditional and harness-agnostic, because an
-    // account-level reading is only as fresh as the last turn any agent ran —
-    // a durable session-file reading can itself be days old.
+  it("dates the fallback line and states the refresh rule beside it", async () => {
+    // An age is still claimed on this path: the bare reset line comes from the
+    // newest reading by definition, so that reading's instant is exactly what
+    // dates it, and nothing about merging changes where it came from.
     await renderClaudeWithRateLimit(
       { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(4 * 3600) },
       agoIso(3 * 60 * 60 * 1000),
     );
     await fireEvent.pointerEnter(screen.getByTestId("harness-usage-claude_code"));
     await vi.advanceTimersByTimeAsync(500);
+    const detail = await waitFor(() => screen.getByTestId("harness-usage-detail-claude_code"));
+    expect(screen.getByTestId("harness-usage-measured")).toHaveTextContent(/ago/i);
+    // **The rule, not an instruction to send a message.** That imperative was
+    // wrong in exactly the situation these meters exist for: a turn refreshes only
+    // the limits its own model draws on, so a user watching a stale model-gated cap
+    // would send a message and watch the instant not move.
+    expect(within(detail).getByTestId("harness-usage-refresh-rule")).toHaveTextContent(
+      "Each limit updates when a turn runs against it.",
+    );
+    expect(detail).not.toHaveTextContent(/send a message/i);
+  });
+});
+
+/// The tooltip's measurement lines, which is where retained windows become visible
+/// as separately-dated things rather than one reading.
+describe("HarnessUsage measurement times", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("dates each window separately when they were measured at different times", async () => {
+    // Two readings a day apart on different models, which is the state this whole
+    // surface was rebuilt for. One shared "Measured … ago" line would be true of
+    // the 5-hour window and false of the cap beside it.
+    const older = agoIso(26 * 60 * 60 * 1000);
+    const newer = agoIso(2 * 60 * 1000);
+    const capped = {
+      status: "rejected",
+      rateLimitType: "seven_day_overage_included",
+      isUsingOverage: false,
+      unifiedWindows: {
+        seven_day_overage_included: { utilization: 1, resetsAt: epochFromNow(5 * 86400) },
+      },
+    };
+    seedClaude(capped, older, "claude-fable-5-1");
+    seedClaude({ status: "allowed", unifiedWindows: unifiedWindows() }, newer, "claude-opus-5");
+    render(HarnessUsage);
+    await tick();
+
+    await fireEvent.pointerEnter(screen.getByTestId("harness-usage-claude_code"));
+    await vi.advanceTimersByTimeAsync(500);
     await waitFor(() => screen.getByTestId("harness-usage-detail-claude_code"));
-    const measured = screen.getByTestId("harness-usage-measured");
-    expect(measured).toHaveTextContent(/measured .* ago/i);
-    expect(measured).toHaveTextContent(/refresh/i);
+    expect(
+      screen.getAllByTestId("harness-usage-measured").map((el) => el.textContent?.trim()),
+    ).toEqual(["2m ago", "2m ago", "1d ago"]);
+  });
+
+  it("dates a Codex window from the reading that fetched every limit at once", async () => {
+    // Truthfully identical across rows, and stated per row anyway: a layout that
+    // collapsed to one line when the values agreed would change shape depending on
+    // the data.
+    usage.observeUsage("codex", {
+      payload: codexAccount({
+        codex: codexBucket({
+          primary: { usedPercent: 41, windowDurationMins: 300, resetsAt: epochFromNow(3600) },
+          secondary: { usedPercent: 12, windowDurationMins: 10080, resetsAt: epochFromNow(86400) },
+        }),
+      }),
+      observed_at: agoIso(5 * 60 * 1000),
+    });
+    render(HarnessUsage);
+    await tick();
+    await fireEvent.pointerEnter(screen.getByTestId("harness-usage-codex"));
+    await vi.advanceTimersByTimeAsync(500);
+    await waitFor(() => screen.getByTestId("harness-usage-detail-codex"));
+    expect(
+      screen.getAllByTestId("harness-usage-measured").map((el) => el.textContent?.trim()),
+    ).toEqual(["5m ago", "5m ago"]);
   });
 });
 
@@ -667,13 +743,13 @@ describe("Codex account quotas", () => {
       payload: { primary: { used_percent: 42.0, resets_at: epochFromNow(3600) } },
       observed_at: new Date().toISOString(),
     });
-    usage.observeUsage("claude_code", {
-      payload: {
+    seedClaude(
+      {
         status: "allowed",
         unifiedWindows: { five_hour: { utilization: 0.28, resetsAt: epochFromNow(3600) } },
       },
-      observed_at: new Date().toISOString(),
-    });
+      new Date().toISOString(),
+    );
     render(HarnessUsage);
     await tick();
     expect(screen.queryByTestId("harness-usage-codex")).toBeNull();
@@ -818,13 +894,13 @@ describe("HarnessUsage percentage alignment", () => {
       payload: codexAccount({ codex: codexBucket({ primary: { usedPercent: 100 } }) }),
       observed_at: new Date().toISOString(),
     });
-    usage.observeUsage("claude_code", {
-      payload: {
+    seedClaude(
+      {
         status: "allowed",
         unifiedWindows: { five_hour: { utilization: 0.28, resetsAt: epochFromNow(3600) } },
       },
-      observed_at: new Date().toISOString(),
-    });
+      new Date().toISOString(),
+    );
     render(HarnessUsage);
     await tick();
     const widths = reservedWidths();

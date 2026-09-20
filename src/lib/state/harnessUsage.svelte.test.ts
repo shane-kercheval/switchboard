@@ -6,6 +6,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 const usage = await import("./harnessUsage.svelte");
+const { claudeStoredWindows } = await import("$lib/usageWindows");
 
 /// Two readings of the same weekly window, and one of a window that has since
 /// rolled. Window identity is the set of reset times, so a percentage may move
@@ -19,6 +20,29 @@ const WEEKLY_LATER = {
   primary: { used_percent: 96, window_minutes: 10080, resets_at: 1_789_845_487 },
 };
 const ROLLED = { primary: { used_percent: 2, window_minutes: 10080, resets_at: 1_790_375_461 } };
+
+const WEEK_RESET = 1_789_845_487;
+const NEXT_WEEK_RESET = 1_790_375_461;
+
+/// Record a Claude reading the way the event path does: the payload alongside the
+/// windows lifted out of it, which is what tells the store this reading is partial.
+function observeClaude(
+  windows: Record<string, unknown>,
+  context: { observedAt?: string; model?: string; agentId?: string } = {},
+  accountFields: Record<string, unknown> = {},
+): void {
+  const payload = { status: "allowed", ...accountFields, unifiedWindows: windows };
+  usage.observeUsage("claude_code", {
+    payload,
+    observed_at: context.observedAt,
+    windows: claudeStoredWindows(payload, context),
+  });
+}
+
+/// The windows the store is holding for Claude, by key.
+function heldWindows(): Record<string, { window: unknown; model?: string; observed_at?: string }> {
+  return usage.harnessUsage.claude_code?.windows ?? {};
+}
 
 beforeEach(() => {
   invokeMock.mockReset();
@@ -48,15 +72,11 @@ describe("observeUsage", () => {
     expect(usage.harnessUsage.claude_code?.payload).toEqual(ROLLED);
   });
 
-  it("takes the whole reading rather than merging windows into the stored one", () => {
-    // Two weekly windows with different resets can coexist across agents after a
-    // plan change. Merging per label would flip between them; a whole snapshot
-    // cannot describe a state no agent reported.
-    usage.observeUsage("codex", {
-      payload: WEEKLY,
-      observed_at: "2026-09-18T20:00:00Z",
-      model: "gpt-5.6-sol",
-    });
+  it("replaces a reading that names no windows of its own", () => {
+    // A reading carrying no window map states every limit the account holds, so
+    // nothing in the held one can still be true and unmentioned. Replacing is
+    // correct there for exactly the reason merging is correct for Claude.
+    usage.observeUsage("codex", { payload: WEEKLY, observed_at: "2026-09-18T20:00:00Z" });
     usage.observeUsage("codex", { payload: ROLLED, observed_at: "2026-09-18T21:00:00Z" });
     expect(usage.harnessUsage.codex).toEqual({
       payload: ROLLED,
@@ -77,6 +97,76 @@ describe("observeUsage", () => {
     usage.observeUsage("codex", { payload: WEEKLY, observed_at: "2026-09-18T20:00:00Z" });
     invokeMock.mockClear();
     usage.observeUsage("codex", { payload: ROLLED, observed_at: "2026-09-18T19:00:00Z" });
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("merging a reading that names its windows", () => {
+  const FIVE_HOUR = { five_hour: { utilization: 0.07, resetsAt: WEEK_RESET } };
+  const GATED = { seven_day_overage_included: { utilization: 1, resetsAt: WEEK_RESET } };
+
+  it("keeps a window the new reading does not mention", () => {
+    // The defect this exists for. A Claude reading omits the model-gated weekly
+    // window unless the turn ran on a model it gates, so an Opus turn arriving
+    // after a capped Fable turn used to delete a cap that was still blocking work.
+    observeClaude(GATED, { observedAt: "2026-09-18T20:00:00Z", model: "claude-fable-5-1" });
+    observeClaude(FIVE_HOUR, { observedAt: "2026-09-18T21:00:00Z", model: "claude-opus-5" });
+    expect(Object.keys(heldWindows()).sort()).toEqual(["five_hour", "seven_day_overage_included"]);
+    expect(heldWindows().seven_day_overage_included?.model).toBe("claude-fable-5-1");
+  });
+
+  it("updates a window the new reading does mention", () => {
+    observeClaude(FIVE_HOUR, { observedAt: "2026-09-18T20:00:00Z" });
+    observeClaude(
+      { five_hour: { utilization: 0.4, resetsAt: WEEK_RESET } },
+      { observedAt: "2026-09-18T21:00:00Z" },
+    );
+    expect(heldWindows().five_hour?.window).toEqual({ utilization: 0.4, resetsAt: WEEK_RESET });
+  });
+
+  it("keeps the held window when the arriving reading is older", () => {
+    // Same ordering rule as the reading level, applied per key, so there is one
+    // rule to know rather than two.
+    observeClaude(FIVE_HOUR, { observedAt: "2026-09-18T21:00:00Z" });
+    observeClaude(
+      { five_hour: { utilization: 0.4, resetsAt: WEEK_RESET } },
+      { observedAt: "2026-09-18T20:00:00Z" },
+    );
+    expect(heldWindows().five_hour?.window).toEqual({ utilization: 0.07, resetsAt: WEEK_RESET });
+  });
+
+  it("replaces a reissued window even from a reading that would lose on instant", () => {
+    // The one case ranking gets wrong. Utilization only climbs *within* a window,
+    // so retaining a value understates it — but across a reissue that invariant
+    // does not hold, and keeping the spent instance would show a cap that cleared.
+    observeClaude(
+      { five_hour: { utilization: 1, resetsAt: WEEK_RESET } },
+      { observedAt: "2026-09-18T21:00:00Z" },
+    );
+    observeClaude({ five_hour: { utilization: 0.02, resetsAt: NEXT_WEEK_RESET } });
+    expect(heldWindows().five_hour?.window).toEqual({
+      utilization: 0.02,
+      resetsAt: NEXT_WEEK_RESET,
+    });
+  });
+
+  it("lets an older reading contribute a window while the newer one keeps the account fields", () => {
+    // Exactly a restored reading from the agent that ran the gated model: it is
+    // authoritative about a window nothing else has seen and stale about the
+    // account-level state, and those are different scopes.
+    observeClaude(FIVE_HOUR, { observedAt: "2026-09-18T21:00:00Z" }, { isUsingOverage: true });
+    observeClaude(GATED, { observedAt: "2026-09-18T20:00:00Z" }, { isUsingOverage: false });
+    expect(Object.keys(heldWindows())).toContain("seven_day_overage_included");
+    expect(usage.harnessUsage.claude_code?.payload).toMatchObject({ isUsingOverage: true });
+  });
+
+  it("does not write the file for an older reading that adds no window", () => {
+    observeClaude(FIVE_HOUR, { observedAt: "2026-09-18T21:00:00Z" });
+    invokeMock.mockClear();
+    observeClaude(
+      { five_hour: { utilization: 0.4, resetsAt: WEEK_RESET } },
+      { observedAt: "2026-09-18T20:00:00Z" },
+    );
     expect(invokeMock).not.toHaveBeenCalled();
   });
 });
@@ -102,7 +192,6 @@ describe("loadPersistedUsage", () => {
                 payload: WEEKLY,
                 observed_at: "2026-09-18T19:00:00Z",
                 limit_reached: true,
-                model: "gpt-5.6-sol",
               },
             },
           }
@@ -116,7 +205,6 @@ describe("loadPersistedUsage", () => {
     expect(usage.harnessUsage.codex).toEqual({
       payload: WEEKLY,
       observed_at: "2026-09-18T19:00:00Z",
-      model: "gpt-5.6-sol",
     });
   });
 
@@ -147,6 +235,106 @@ describe("loadPersistedUsage", () => {
     expect(usage.harnessUsage.codex).toBeUndefined();
   });
 
+  it("round-trips a window map with each window's own context", async () => {
+    // The whitelist copies `payload` wholesale and drops everything beside it, so
+    // a field added outside it is silently stripped on every restart — invisible,
+    // because the next turn repairs it. Asserting the values come back is what
+    // separates working persistence from persistence that strips every entry.
+    const stored = {
+      claude_code: {
+        payload: { status: "allowed", unifiedWindows: {} },
+        observed_at: "2026-09-18T21:00:00Z",
+        windows: {
+          seven_day_overage_included: {
+            window: { utilization: 1, resetsAt: WEEK_RESET },
+            status: "rejected",
+            rate_limit_type: "seven_day_overage_included",
+            surpassed_threshold: 80,
+            is_using_overage: false,
+            observed_at: "2026-09-18T20:00:00Z",
+            model: "claude-fable-5-1",
+            agent_id: "agent-1",
+          },
+        },
+      },
+    };
+    invokeMock.mockImplementation(async (cmd) =>
+      cmd === "get_harness_usage" ? { harnesses: stored } : undefined,
+    );
+    await usage.loadPersistedUsage();
+    expect(usage.harnessUsage.claude_code?.windows).toEqual(stored.claude_code.windows);
+  });
+
+  it("recovers windows from an entry written before they were held individually", async () => {
+    // The old shape carries its windows inside the payload and one instant for the
+    // whole reading. The windows are lifted so they still render and still retire;
+    // the reading-level instant is *not* copied onto them, because it would date
+    // each window by when a different one was measured.
+    invokeMock.mockImplementation(async (cmd) =>
+      cmd === "get_harness_usage"
+        ? {
+            harnesses: {
+              claude_code: {
+                payload: {
+                  status: "allowed",
+                  unifiedWindows: {
+                    seven_day_overage_included: { utilization: 1, resetsAt: WEEK_RESET },
+                  },
+                },
+                observed_at: "2026-09-18T20:00:00Z",
+                model: "claude-fable-5-1",
+              },
+            },
+          }
+        : undefined,
+    );
+    await usage.loadPersistedUsage();
+    expect(heldWindows().seven_day_overage_included).toEqual({
+      window: { utilization: 1, resetsAt: WEEK_RESET },
+      status: "allowed",
+      rate_limit_type: undefined,
+      surpassed_threshold: undefined,
+      is_using_overage: undefined,
+      observed_at: undefined,
+      model: "claude-fable-5-1",
+      agent_id: undefined,
+    });
+  });
+
+  it("leaves a Codex entry with no window map rather than inventing one", async () => {
+    // The recovery is shape-driven rather than version-checked: a payload with no
+    // window container yields none, which is what keeps one call serving every
+    // harness.
+    invokeMock.mockImplementation(async (cmd) =>
+      cmd === "get_harness_usage"
+        ? { harnesses: { codex: { payload: WEEKLY, observed_at: "2026-09-18T20:00:00Z" } } }
+        : undefined,
+    );
+    await usage.loadPersistedUsage();
+    expect(usage.harnessUsage.codex?.windows).toBeUndefined();
+  });
+
+  it.each([
+    ["a non-object window map", "nope"],
+    ["an array window map", []],
+    ["a window entry that is not an object", { five_hour: "nope" }],
+    ["a window entry with nothing stored", { five_hour: {} }],
+    ["a non-string per-window instant", { five_hour: { window: {}, observed_at: 1_789_845_487 } }],
+    ["a non-string per-window model", { five_hour: { window: {}, model: 5 } }],
+    ["a non-string contributing agent", { five_hour: { window: {}, agent_id: 5 } }],
+  ])("drops the whole entry for %s", async (_case, windows) => {
+    // One severity, deliberately. The file is machine-written, so a map that is not
+    // the shape we write is not evidence of a window worth salvaging; repairing it
+    // field by field would quietly demote a window to unlabelled or unranked.
+    invokeMock.mockImplementation(async (cmd) =>
+      cmd === "get_harness_usage"
+        ? { harnesses: { claude_code: { payload: WEEKLY, windows } } }
+        : undefined,
+    );
+    await usage.loadPersistedUsage();
+    expect(usage.harnessUsage.claude_code).toBeUndefined();
+  });
+
   it("survives a failed read with no readings rather than throwing", async () => {
     invokeMock.mockRejectedValue(new Error("unreadable"));
     await expect(usage.loadPersistedUsage()).resolves.toBeUndefined();
@@ -155,36 +343,67 @@ describe("loadPersistedUsage", () => {
 });
 
 describe("nameUsageModel", () => {
-  it("labels a reading that arrived before its turn's init", () => {
-    usage.observeUsage("claude_code", { payload: WEEKLY, observed_at: "2026-09-18T20:00:00Z" });
-    usage.nameUsageModel("claude_code", "claude-fable-5-1");
-    expect(usage.harnessUsage.claude_code?.model).toBe("claude-fable-5-1");
+  const gated = { seven_day_overage_included: { utilization: 1, resetsAt: WEEK_RESET } };
+
+  it("labels the windows this agent contributed once its init lands", () => {
+    observeClaude(gated, { observedAt: "2026-09-18T20:00:00Z", agentId: "agent-1" });
+    usage.nameUsageModel("claude_code", "agent-1", "claude-fable-5-1");
+    expect(heldWindows().seven_day_overage_included?.model).toBe("claude-fable-5-1");
   });
 
-  it("never relabels a reading that already names a model", () => {
-    // A later turn on a different model must not rewrite the label on a window
-    // the earlier model delivered.
-    usage.observeUsage("claude_code", {
-      payload: WEEKLY,
-      observed_at: "2026-09-18T20:00:00Z",
+  it("never relabels a window that already names a model", () => {
+    // A later turn on a different model must not rewrite the label on a window an
+    // earlier model delivered.
+    observeClaude(gated, {
+      observedAt: "2026-09-18T20:00:00Z",
       model: "claude-fable-5-1",
+      agentId: "agent-1",
     });
-    usage.nameUsageModel("claude_code", "claude-sonnet-5");
-    expect(usage.harnessUsage.claude_code?.model).toBe("claude-fable-5-1");
+    usage.nameUsageModel("claude_code", "agent-1", "claude-sonnet-5");
+    expect(heldWindows().seven_day_overage_included?.model).toBe("claude-fable-5-1");
+  });
+
+  it("does not name a window a different agent contributed", () => {
+    // The cross-label race: agent A's reading lands unlabelled, then agent B's
+    // `init` arrives first. Unscoped, B's model would name A's cap — and under
+    // retention that wrong label renders until the window resets, correctable only
+    // by another turn on the model the user is capped on.
+    observeClaude(gated, { observedAt: "2026-09-18T20:00:00Z", agentId: "agent-1" });
+    usage.nameUsageModel("claude_code", "agent-2", "claude-opus-5");
+    expect(heldWindows().seven_day_overage_included?.model).toBeUndefined();
+  });
+
+  it("does not name a window whose contributor is unknown", () => {
+    // Restored from disk: a later turn's model would be a guess about an older
+    // measurement, so the window renders unlabelled instead.
+    observeClaude(gated, { observedAt: "2026-09-18T20:00:00Z" });
+    usage.nameUsageModel("claude_code", "agent-1", "claude-opus-5");
+    expect(heldWindows().seven_day_overage_included?.model).toBeUndefined();
   });
 
   it.each([
     ["undefined", undefined],
     ["an empty string", ""],
   ])("ignores %s rather than storing it as a label", (_case, model) => {
-    usage.observeUsage("claude_code", { payload: WEEKLY, observed_at: "2026-09-18T20:00:00Z" });
-    usage.nameUsageModel("claude_code", model);
-    expect(usage.harnessUsage.claude_code?.model).toBeUndefined();
+    observeClaude(gated, { observedAt: "2026-09-18T20:00:00Z", agentId: "agent-1" });
+    usage.nameUsageModel("claude_code", "agent-1", model);
+    expect(heldWindows().seven_day_overage_included?.model).toBeUndefined();
   });
 
   it("does nothing when no reading is held", () => {
-    usage.nameUsageModel("claude_code", "claude-fable-5-1");
+    usage.nameUsageModel("claude_code", "agent-1", "claude-fable-5-1");
     expect(usage.harnessUsage.claude_code).toBeUndefined();
+  });
+
+  it("does not write the file when there is no blank to fill", () => {
+    observeClaude(gated, {
+      observedAt: "2026-09-18T20:00:00Z",
+      model: "claude-fable-5-1",
+      agentId: "agent-1",
+    });
+    invokeMock.mockClear();
+    usage.nameUsageModel("claude_code", "agent-1", "claude-sonnet-5");
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });
 
@@ -260,7 +479,7 @@ describe("writing the file", () => {
     // Three more changes while the first write is still in flight.
     usage.observeUsage("codex", { payload: WEEKLY_LATER, observed_at: "2026-09-18T20:01:00Z" });
     usage.observeUsage("codex", { payload: WEEKLY_LATER, observed_at: "2026-09-18T20:02:00Z" });
-    usage.nameUsageModel("codex", "gpt-5.6-terra");
+    usage.observeUsage("codex", { payload: ROLLED, observed_at: "2026-09-18T20:03:00Z" });
     expect(write.calls()).toBe(1);
 
     write.release();

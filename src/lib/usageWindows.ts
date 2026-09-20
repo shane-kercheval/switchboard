@@ -6,6 +6,7 @@
 /// through a rendered agent card. The component keeps the markup, the tooltip
 /// content, and the per-harness gating.
 import { claudeModelFamilyLabel } from "$lib/agentSelection";
+import type { AgentId, HarnessKind } from "$lib/types";
 
 /// One usage window as the card draws it. `usedFraction` is 0–1 **used**,
 /// converted here rather than at the meter: Codex reports 0–100 and Claude a
@@ -16,6 +17,17 @@ export type UsageWindow = {
   label: string;
   usedFraction: number;
   resetsAtMs: number | null;
+  /// When this window was measured, ISO-8601.
+  ///
+  /// **Per window rather than per card.** Windows are retained individually, so
+  /// they genuinely do not share one instant: a weekly cap measured on Tuesday
+  /// sits beside a 5-hour window measured a minute ago. A single card-level line
+  /// would be true of one row and false of the rest.
+  ///
+  /// Absent when the delivering reading carried no instant, and for a window
+  /// restored from a file written before instants were held per window. No age is
+  /// claimed rather than one borrowed from a different window's measurement.
+  measuredAt?: string;
   /// Set only when the harness itself reported passing a threshold — never a
   /// percentage we pick, which would make the same occupancy alarming on one
   /// harness and calm on the other.
@@ -83,32 +95,205 @@ function rateLimitLabel(rateLimitType: unknown): string {
   return rateLimitType === "five_hour" ? LABEL_FIVE_HOUR : "rate limit";
 }
 
-/// Defensive read of Claude's opaque `last_rate_limit` payload.
+/// One window as the store holds it: the vendor's own window object, verbatim,
+/// plus the context of the reading that delivered it.
 ///
-/// `unifiedWindows` is authoritative whenever it is present — it carries
-/// every window the desktop app shows, each with a used fraction. The
-/// top-level `resetsAt` / `rateLimitType` pair is a **fallback only**, for an
-/// older CLI (or a future one that drops the field): it has no percentage, so
-/// it renders as a bare reset line rather than a meter. A bar with no value
-/// would be a blank bar, which the card's clean-hide convention forbids more
-/// than it forbids a missing bar. The fallback is not dead code; the field is
-/// undocumented and could vanish without notice.
+/// **Nothing stored here is a conclusion**, and that is load-bearing rather than
+/// stylistic. Every displayed number, label, and tone is re-derived from these
+/// fields at render, so a mistaken interpretation is corrected *retroactively*
+/// for windows already on disk — twice now, that property is the only reason a
+/// bad reading did not have to be waited out. Deriving flags at ingest instead
+/// would freeze the judgement into `usage.yaml` until each window reset.
+export type StoredUsageWindow = {
+  /// `unifiedWindows[key]`, exactly as Claude sent it, and **not validated
+  /// here**: a window whose fraction or reset cannot be read is stored anyway
+  /// and dropped at render, so tightening that read later applies to what is
+  /// already stored.
+  window: unknown;
+  /// The account-level fields of the delivering reading that this window's tone
+  /// is derived from, verbatim.
+  ///
+  /// **Held per window rather than read from the newest reading, which is the
+  /// point of merging at all.** Claude's `status` is account-level, so an
+  /// `allowed` reading delivered by an Opus turn is evidence about the windows
+  /// that turn measured and says nothing about a model-gated cap it never
+  /// mentioned. Deriving that cap's tone from it would clear a refusal nothing
+  /// re-measured.
+  status?: unknown;
+  rate_limit_type?: unknown;
+  surpassed_threshold?: unknown;
+  /// Read only to separate a refusal from paid overage, which Claude reports
+  /// under the same `status`. Part of this window's own context for the same
+  /// reason the other three are.
+  is_using_overage?: unknown;
+  /// When the delivering reading was observed, ISO-8601. **Absent for a window
+  /// restored from a file written before instants were held per window**, which
+  /// renders with no age line rather than borrowing the reading-level instant —
+  /// that would date this window by when a *different* one was measured.
+  observed_at?: string;
+  /// Model of the delivering turn. The model-gated weekly window carries no name
+  /// of its own, so this is the only thing that can label it.
+  model?: string;
+  /// The agent whose event contributed this window.
+  ///
+  /// **Scopes the late label fill to its producer.** Two agents interleaving
+  /// across one turn's rate-limit-event/`init` boundary would otherwise let the
+  /// second agent's model name the first agent's window — and under merging that
+  /// mislabel outlives the reading that caused it, rendering until the window
+  /// resets. The correction path is closed by the same condition that creates
+  /// the state: only another turn on the gated model can fix the label, and the
+  /// user is capped on that model.
+  agent_id?: AgentId;
+};
+
+/// Whether this harness's readings are **partial**, so each one contributes
+/// windows to a retained set rather than replacing it.
 ///
-/// Every window is gated on its own reset being in the *future*. A reset is
-/// an absolute timestamp, so it stays accurate however old the snapshot is —
-/// right until `nowMs` passes it, at which point that window has cycled and
-/// we don't have its new reset, so it drops while its siblings stay.
+/// The governing questions are whether a reading is *complete*, and whether its
+/// parts are identifiable from the reading itself:
 ///
-/// `overage` is the separate "using credits" escalation (`isUsingOverage`),
-/// about what is being *billed* rather than how full a window is. Its own
-/// window can be days out, so it lives in the tooltip. A null overage reset
-/// ("flag set, no window time") is still shown — we can't prove it stale.
+/// | Reading | Complete? | Identity carried in the reading? | Correct policy |
+/// | --- | --- | --- | --- |
+/// | Codex `account/rateLimits/read` | yes | yes — `limit_id` | replace; nothing is missing |
+/// | Claude `rate_limit_event` | **no** | yes — the key *is* the identity | **merge per window** |
+/// | Codex rollout `rate_limits` | no | **no** | neither; the source was replaced |
+///
+/// Claude's `unifiedWindows` omits the model-gated weekly window unless the turn
+/// ran on one of the models it gates, so an Opus turn's reading is a complete
+/// statement about the windows it names and silent about the rest. Replacing on
+/// it deleted a cap that was still blocking work, which is the defect this exists
+/// to fix.
+///
+/// **The third row fails the first column regardless of how the second resolves,
+/// and that is the argument to lean on**: one bucket of N can never be a complete
+/// reading. The second column says "carried in the reading" rather than
+/// "knowable" deliberately — a rollout's neighbouring records *do* co-vary with
+/// the bucket, so a future reader checking this table against one would find a
+/// model slug there and conclude the table is wrong. The honest claim is that
+/// identity would have to be reconstructed from an adjacent record by a rule
+/// nothing establishes.
+///
+/// **The first row's premise is the one with no detection if it is wrong.** It
+/// rests on the schema's own wording plus a single capture on a single plan, and
+/// `replace` silently drops a bucket that stops appearing.
+///
+/// This table lives in the code, not only in a plan, because it is what stops a
+/// future reader making one harness match the other.
+export function reportsPartialUsageWindows(harness: HarnessKind | undefined): boolean {
+  return harness === "claude_code";
+}
+
+/// Lift the windows out of a Claude reading, each tagged with what delivered it.
+///
+/// Iterates `CLAUDE_WINDOWS` rather than the payload's keys, so the store holds
+/// only windows this file can name — the same rule that keeps unlabelled keys
+/// from rendering keeps them from being persisted.
+///
+/// Returns `undefined` rather than an empty map when the reading carries no
+/// recognised window, so a harness with no `unifiedWindows` at all contributes
+/// no window map instead of an empty one. That is what lets the store decide
+/// merge-versus-replace from the reading's shape alone.
+export function claudeStoredWindows(
+  payload: unknown,
+  context: { observedAt?: string; model?: string; agentId?: AgentId },
+): Record<string, StoredUsageWindow> | undefined {
+  if (typeof payload !== "object" || payload === null) return undefined;
+  const p = payload as {
+    status?: unknown;
+    rateLimitType?: unknown;
+    surpassedThreshold?: unknown;
+    unifiedWindows?: unknown;
+  };
+  const unified = p.unifiedWindows;
+  if (typeof unified !== "object" || unified === null) return undefined;
+  const windows: Record<string, StoredUsageWindow> = {};
+  for (const { key } of CLAUDE_WINDOWS) {
+    const w = (unified as Record<string, unknown>)[key];
+    if (typeof w !== "object" || w === null) continue;
+    windows[key] = {
+      window: w,
+      status: p.status,
+      rate_limit_type: p.rateLimitType,
+      surpassed_threshold: p.surpassedThreshold,
+      is_using_overage: (payload as { isUsingOverage?: unknown }).isUsingOverage,
+      observed_at: context.observedAt,
+      model: context.model,
+      agent_id: context.agentId,
+    };
+  }
+  return Object.keys(windows).length > 0 ? windows : undefined;
+}
+
+/// The reset `stored` states, in vendor seconds, or `null` when it cannot be read.
+function windowResetsAt(stored: StoredUsageWindow): number | null {
+  const w = stored.window;
+  if (typeof w !== "object" || w === null) return null;
+  const resetsAt = (w as { resetsAt?: unknown }).resetsAt;
+  return typeof resetsAt === "number" ? resetsAt : null;
+}
+
+/// Whether `candidate` describes a **different instance** of the same window than
+/// `held` — one that has cycled and been reissued.
+///
+/// Lets the store bypass instant ranking for the one case ranking gets wrong: an
+/// undated or lower-ranked reading carrying a freshly cycled window would
+/// otherwise lose to a held entry describing the window before it. Utilization
+/// only ever climbs *within* a window, so retaining a value understates it, which
+/// is what makes retention safe; across a reissue that invariant does not hold.
+///
+/// **`resetsAt` is a same-key check, not part of the identity.** Keying storage by
+/// `(key, resetsAt)` would imply two live entries for one window and require
+/// something to arbitrate between them, which is worse than what it fixes.
+///
+/// False when either reset is unreadable: that is no evidence of a reissue, so
+/// ranking decides as usual.
+export function describesNewWindowInstance(
+  candidate: StoredUsageWindow,
+  held: StoredUsageWindow,
+): boolean {
+  const a = windowResetsAt(candidate);
+  const b = windowResetsAt(held);
+  return a !== null && b !== null && a !== b;
+}
+
+/// Defensive read of Claude's retained windows plus the newest reading's
+/// account-level fields.
+///
+/// **Windows come from `stored`, not from `payload`.** A Claude reading names
+/// only the windows the turn's model touched, so the displayed set is the union
+/// the store has retained; `payload` supplies only what genuinely belongs to the
+/// newest reading — the overage escalation and the no-window-map fallback.
+///
+/// Each window's tone is derived from the context of the reading that delivered
+/// *that window*, so a later turn cannot clear a refusal it never measured, and a
+/// threshold flag the newest reading drops is cleared on the window it named.
+///
+/// The top-level `resetsAt` / `rateLimitType` pair is a **fallback only**, for an
+/// older CLI (or a future one that drops `unifiedWindows`): it has no percentage,
+/// so it renders as a bare reset line rather than a meter. A bar with no value
+/// would be a blank bar, which the card's clean-hide convention forbids more than
+/// it forbids a missing bar. The field is undocumented and could vanish without
+/// notice, so this is not dead code.
+///
+/// Every window is gated on its own reset being in the *future*. A reset is an
+/// absolute timestamp, so it stays accurate however old the reading is — right
+/// until `nowMs` passes it, at which point that window has cycled, we do not have
+/// its new reset, and it drops while its siblings stay. That is also what retires
+/// a retained window's flags, so no age threshold is needed.
+///
+/// `overage` is the separate "using credits" escalation (`isUsingOverage`), about
+/// what is being *billed* rather than how full a window is. Its own window can be
+/// days out, so it lives in the tooltip. A null overage reset ("flag set, no
+/// window time") is still shown — we can't prove it stale. **Taken from the newest
+/// reading, which assumes it describes the account rather than the window that
+/// triggered it**; unprobeable on the development account and recorded in the gap
+/// register with what would close it.
 ///
 /// Returns `null` when nothing is displayable.
 export function claudeRateLimitView(
   payload: unknown,
+  stored: Record<string, StoredUsageWindow> | undefined,
   nowMs: number,
-  model: string | undefined,
 ): {
   windows: UsageWindow[];
   fallback: { label: string; resetsAtMs: number } | null;
@@ -116,45 +301,37 @@ export function claudeRateLimitView(
 } | null {
   if (typeof payload !== "object" || payload === null) return null;
   const p = payload as {
-    status?: unknown;
     rateLimitType?: unknown;
-    surpassedThreshold?: unknown;
     resetsAt?: unknown;
     isUsingOverage?: unknown;
     overageResetsAt?: unknown;
     unifiedWindows?: unknown;
   };
 
-  // An **empty** container counts as absent: it reported nothing, so the
-  // top-level fallback is still the best available signal. A *non-empty*
-  // container whose entries were all dropped (reset-passed, unreadable
-  // fraction, or a key we deliberately exclude) stays authoritative and the
-  // cell clean-hides — those windows were filtered on purpose, and falling
-  // back there would override the per-window rules rather than fill a gap.
-  const unified = p.unifiedWindows;
-  const hasUnified =
-    typeof unified === "object" && unified !== null && Object.keys(unified).length > 0;
   const windows: UsageWindow[] = [];
-  if (hasUnified) {
+  for (const { key, label } of CLAUDE_WINDOWS) {
+    const held = stored?.[key];
+    if (held === undefined) continue;
+    const w = held.window;
+    if (typeof w !== "object" || w === null) continue;
+    const ww = w as { utilization?: unknown; resetsAt?: unknown };
+    if (typeof ww.utilization !== "number") continue;
+    if (!(ww.utilization >= 0 && ww.utilization <= 1)) continue;
+    if (typeof ww.resetsAt !== "number") continue;
+    const resetsAtMs = ww.resetsAt * 1000;
+    if (resetsAtMs <= nowMs) continue;
     // The threshold flag names its window in `rateLimitType` and its level in
-    // `surpassedThreshold`. A turn can emit a second event carrying the
-    // superset, so last-write-wins on the payload is what makes this correct.
-    //
-    // A flag naming a window outside `CLAUDE_WINDOWS` is dropped with that
-    // window, losing the signal. Unobserved (the rendered keys cover every
-    // window any probe has seen) and deliberately not backfilled with a
-    // generic amber line — recorded under the plan's known limitations.
-    const flagged =
-      p.status === "allowed_warning" && typeof p.rateLimitType === "string"
-        ? p.rateLimitType
-        : undefined;
-    const threshold = typeof p.surpassedThreshold === "number" ? p.surpassedThreshold : undefined;
+    // `surpassedThreshold`, so a reading flags at most one of the windows it
+    // delivered. A flag naming a window outside `CLAUDE_WINDOWS` is dropped with
+    // that window, losing the signal — unobserved, and deliberately not
+    // backfilled with a generic amber line.
+    const flagged = held.status === "allowed_warning" && held.rate_limit_type === key;
     // **The wall, which is a different status from the warning.** At a warning
     // Claude sends `allowed_warning` plus a numeric `surpassedThreshold`; at a
     // refusal it sends `rejected` and no threshold at all, so the warning path
-    // above leaves every window unflagged and the meter draws a spent quota in
-    // the neutral tone. `rateLimitType` names the window that did the blocking in
-    // both cases.
+    // above leaves every window unflagged and the meter would draw a spent quota
+    // in the neutral tone. `rateLimitType` names the window that did the blocking
+    // in both cases.
     //
     // **`rejected` is overloaded and does not mean blocked on its own.** An
     // **overage** turn carries the same status (§1.4: `isUsingOverage:true` plus
@@ -170,38 +347,39 @@ export function claudeRateLimitView(
     // states separate on this field in the only observation we have.
     //
     // **Nothing here overrides the measurement**, unlike the Codex reader. Codex
-    // records a windowless payload on a refused turn, so its last number is
-    // stale and the refusal is the only truthful thing left; Claude reports the
+    // recorded a windowless payload on a refused turn, so its last number was
+    // stale and the refusal was the only truthful thing left; Claude reports the
     // blocked window's own utilization in the same payload that refuses, so the
-    // number is already right and only the tone was missing. A window named here
-    // but outside `CLAUDE_WINDOWS` drops with its flag, exactly as a threshold
-    // warning does.
+    // number is already right and only the tone was missing.
     const refused =
-      p.status === "rejected" && p.isUsingOverage !== true && typeof p.rateLimitType === "string"
-        ? p.rateLimitType
-        : undefined;
-    for (const { key, label } of CLAUDE_WINDOWS) {
-      const w = (unified as Record<string, unknown>)[key];
-      if (typeof w !== "object" || w === null) continue;
-      const ww = w as { utilization?: unknown; resetsAt?: unknown };
-      if (typeof ww.utilization !== "number") continue;
-      if (!(ww.utilization >= 0 && ww.utilization <= 1)) continue;
-      if (typeof ww.resetsAt !== "number") continue;
-      const resetsAtMs = ww.resetsAt * 1000;
-      if (resetsAtMs <= nowMs) continue;
-      windows.push({
-        key,
-        label: label ?? modelWeeklyLabel(model),
-        usedFraction: ww.utilization,
-        resetsAtMs,
-        surpassedThreshold: key === flagged ? threshold : undefined,
-        limitReached: key === refused ? true : undefined,
-      });
-    }
+      held.status === "rejected" && held.is_using_overage !== true && held.rate_limit_type === key;
+    windows.push({
+      key,
+      label: label ?? modelWeeklyLabel(held.model),
+      usedFraction: ww.utilization,
+      resetsAtMs,
+      measuredAt: held.observed_at,
+      surpassedThreshold:
+        flagged && typeof held.surpassed_threshold === "number"
+          ? held.surpassed_threshold
+          : undefined,
+      limitReached: refused ? true : undefined,
+    });
   }
 
+  // **Two conditions, and they answer different questions.** `unifiedWindows`
+  // being absent or empty is what makes the top-level pair the best signal the
+  // *newest reading* has: a non-empty container whose entries were all filtered
+  // out (reset-passed, unreadable, or a key we exclude) stays authoritative, and
+  // falling back there would override the per-window rules rather than fill a
+  // gap. Merging adds the second condition — a retained window still on screen
+  // suppresses the line even when the newest reading carries no map at all,
+  // because a bare reset date beside live meters reads as a sixth window.
+  const unified = p.unifiedWindows;
+  const hasUnified =
+    typeof unified === "object" && unified !== null && Object.keys(unified).length > 0;
   let fallback: { label: string; resetsAtMs: number } | null = null;
-  if (!hasUnified && typeof p.resetsAt === "number") {
+  if (!hasUnified && windows.length === 0 && typeof p.resetsAt === "number") {
     const resetsAtMs = p.resetsAt * 1000;
     if (resetsAtMs > nowMs) fallback = { label: rateLimitLabel(p.rateLimitType), resetsAtMs };
   }

@@ -41,12 +41,12 @@
     /// Claude's separate billing escalation. Not a window: it says what is being
     /// charged rather than how full a quota is.
     overage: { resetsAtMs: number | null } | null;
-    /// Bare reset line for a Claude payload with no window map at all.
-    fallback: { label: string; resetsAtMs: number } | null;
-    /// When the harness measured the reading, for the age line. Absent when the
-    /// reading carries no instant, in which case no age is claimed rather than a
-    /// fabricated one being shown.
-    measuredAt: string | undefined;
+    /// Bare reset line for a Claude payload with no window map at all, dated by
+    /// the reading it came from. **The one reading-level instant left**, and it is
+    /// not an exception to the per-window rule: this line is not a window, and it
+    /// is drawn from the newest payload by definition, so the reading's own
+    /// measurement is exactly what dates it.
+    fallback: { label: string; resetsAtMs: number; measuredAt: string | undefined } | null;
   };
 
   /// **Opening the panel refreshes it**, and that is the whole claim. This
@@ -77,7 +77,6 @@
     for (const harness of ALL_HARNESSES) {
       const reading = harnessUsage[harness];
       if (reading === undefined) continue;
-      const measuredAt = reading.observed_at;
       // Selected by capability rather than by name: this branch reads the
       // account payload, which exists only for a harness Switchboard can ask
       // directly. Matching on "codex" here would decide by harness name the one
@@ -85,21 +84,33 @@
       if (supportsAccountUsageRead(harness)) {
         const view = codexAccountUsageView(reading.payload, now);
         if (view.windows.length > 0) {
-          built.push({ harness, windows: view.windows, overage: null, fallback: null, measuredAt });
+          built.push({
+            harness,
+            // Codex's windows all come from one call, so they share the reading's
+            // instant. Attached per window anyway, so both harnesses' tooltips
+            // have one shape rather than changing layout depending on whether the
+            // values happen to agree — and here they truthfully do.
+            windows: view.windows.map((w) => ({ ...w, measuredAt: reading.observed_at })),
+            overage: null,
+            fallback: null,
+          });
         }
         continue;
       }
       if (harness === "claude_code") {
-        // Claude states a refusal in the payload, so no verdict is passed in
-        // here — see `claudeRateLimitView`.
-        const view = claudeRateLimitView(reading.payload, now, reading.model);
+        // Windows come from the store's retained set, not from the payload: a
+        // Claude reading names only the windows its turn's model touched. The
+        // payload still supplies the account-level state — the overage escalation
+        // and the no-window-map fallback — which only the newest reading speaks
+        // for.
+        const view = claudeRateLimitView(reading.payload, reading.windows, now);
         if (view !== null) {
           built.push({
             harness,
             windows: view.windows,
             overage: view.overage,
-            fallback: view.fallback,
-            measuredAt,
+            fallback:
+              view.fallback === null ? null : { ...view.fallback, measuredAt: reading.observed_at },
           });
         }
         continue;
@@ -206,6 +217,21 @@
                     <span class="text-right tabular-nums">{formatResetDateTime(w.resetsAtMs)}</span>
                   </div>
                 {/if}
+                <!-- Per window, not per card. Retained windows are measured by
+                     the turns that touch them, so a weekly cap read on Tuesday
+                     genuinely sits beside a 5-hour window read a minute ago and
+                     one shared line would be false for all but one of them.
+                     Omitted when the window carries no instant — the clean-hide
+                     rule the rest of this surface follows, and the reason the
+                     instant is nullable rather than sentinel-filled. -->
+                {#if w.measuredAt !== undefined}
+                  <div class="text-primary-fg/70 grid grid-cols-[auto_1fr] gap-4 text-[12px]">
+                    <span>Measured</span>
+                    <span class="text-right" data-testid="harness-usage-measured">
+                      {relativeTime(w.measuredAt)}
+                    </span>
+                  </div>
+                {/if}
               </section>
             {/each}
             {#if row.fallback !== null}
@@ -215,6 +241,14 @@
                   Resets {formatResetDateTime(row.fallback.resetsAtMs)}
                 </span>
               </div>
+              {#if row.fallback.measuredAt !== undefined}
+                <div class="text-primary-fg/70 grid grid-cols-[auto_1fr] gap-4 text-[12px]">
+                  <span>Measured</span>
+                  <span class="text-right" data-testid="harness-usage-measured">
+                    {relativeTime(row.fallback.measuredAt)}
+                  </span>
+                </div>
+              {/if}
             {/if}
             {#if row.overage !== null}
               <div class="text-warning border-primary-fg/20 border-t pt-2">
@@ -226,22 +260,18 @@
                 {/if}
               </div>
             {/if}
-            <!-- Shown for every harness, not just a restored stream-only
-                 snapshot. A session-file-backed reading is durable, which was
-                 mistaken for current: it is re-read on every open but the file
-                 itself can be days old, and an account-level reading is only as
-                 fresh as the last turn *any* agent ran.
-                 Omitted entirely when the reading carries no instant — the
-                 clean-hide rule the rest of this surface follows, and the reason
-                 the ordering key is nullable rather than sentinel-filled. -->
-            {#if row.measuredAt !== undefined}
-              <p
-                class="text-primary-fg/70 border-primary-fg/20 border-t pt-2 text-[12px]"
-                data-testid="harness-usage-measured"
-              >
-                Measured {relativeTime(row.measuredAt)} — send a message to refresh.
-              </p>
-            {/if}
+            <!-- States the refresh rule rather than an instruction to send a
+                 message. That imperative was wrong in exactly the situation these
+                 meters exist for: a turn refreshes only the limits its own model
+                 draws on, so a user staring at a stale model-gated cap would send
+                 a message and watch the instant not move. The rule explains both
+                 why the times above can differ and what moves them. -->
+            <p
+              class="text-primary-fg/70 border-primary-fg/20 border-t pt-2 text-[12px]"
+              data-testid="harness-usage-refresh-rule"
+            >
+              Each limit updates when a turn runs against it.
+            </p>
           </div>
         </Tooltip>
       {/each}

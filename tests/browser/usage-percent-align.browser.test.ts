@@ -16,6 +16,7 @@ vi.mock("$lib/state/workspace.svelte", () => ({
 import { render } from "vitest-browser-svelte";
 import SidebarHost from "./SidebarHost.svelte";
 import { PROJECT_ID, ALICE } from "./fixtures";
+import { claudeStoredWindows } from "$lib/usageWindows";
 import { observeUsage, _testing } from "$lib/state/harnessUsage.svelte";
 
 /// The percentage column is reserved in `ch`, which is exact only for tabular
@@ -46,9 +47,21 @@ function detailLeftEdges(): number[] {
     });
 }
 
-test("rows with different digit counts keep their detail text on one left edge", async () => {
+/// Seed a Claude reading the way the event path does: the payload plus the windows
+/// lifted out of it. A reading recorded without them renders nothing, so every seed
+/// goes through here rather than reaching into the store directly.
+function seedClaude(payload: unknown, model?: string): void {
+  const observedAt = new Date().toISOString();
   observeUsage("claude_code", {
-    payload: {
+    payload,
+    observed_at: observedAt,
+    windows: claudeStoredWindows(payload, { observedAt, model }),
+  });
+}
+
+test("rows with different digit counts keep their detail text on one left edge", async () => {
+  seedClaude(
+    {
       status: "allowed",
       unifiedWindows: {
         five_hour: { utilization: 0.28, resetsAt: future(3 * 3600) },
@@ -56,9 +69,8 @@ test("rows with different digit counts keep their detail text on one left edge",
         seven_day_overage_included: { utilization: 1, resetsAt: future(5 * 86400) },
       },
     },
-    observed_at: new Date().toISOString(),
-    model: "claude-fable-5-1",
-  });
+    "claude-fable-5-1",
+  );
   render(SidebarHost, { projectId: PROJECT_ID, agents: [ALICE] });
 
   await expect.poll(() => detailLeftEdges().length).toBe(3);
@@ -70,27 +82,21 @@ test("rows with different digit counts keep their detail text on one left edge",
 });
 
 test("a section that never reaches three digits is not indented for one", async () => {
-  observeUsage("claude_code", {
-    payload: {
-      status: "allowed",
-      unifiedWindows: { five_hour: { utilization: 0.28, resetsAt: future(3 * 3600) } },
-    },
-    observed_at: new Date().toISOString(),
+  seedClaude({
+    status: "allowed",
+    unifiedWindows: { five_hour: { utilization: 0.28, resetsAt: future(3 * 3600) } },
   });
   render(SidebarHost, { projectId: PROJECT_ID, agents: [ALICE] });
   await expect.poll(() => detailLeftEdges().length).toBe(1);
   const narrow = detailLeftEdges()[0]!;
 
   _testing.reset();
-  observeUsage("claude_code", {
-    payload: {
-      status: "allowed",
-      unifiedWindows: {
-        five_hour: { utilization: 0.28, resetsAt: future(3 * 3600) },
-        seven_day: { utilization: 1, resetsAt: future(5 * 86400) },
-      },
+  seedClaude({
+    status: "allowed",
+    unifiedWindows: {
+      five_hour: { utilization: 0.28, resetsAt: future(3 * 3600) },
+      seven_day: { utilization: 1, resetsAt: future(5 * 86400) },
     },
-    observed_at: new Date().toISOString(),
   });
   render(SidebarHost, { projectId: PROJECT_ID, agents: [ALICE] });
   await expect.poll(() => detailLeftEdges().length).toBe(2);
@@ -106,15 +112,12 @@ test("the harness name sits further from its meters than the meters do from each
   // top margins, so it is 8px rather than the sum of the two. Switching the list
   // to a flex gap would stop the collapse and silently change this, which is why
   // it is measured rather than assumed from the classes.
-  observeUsage("claude_code", {
-    payload: {
-      status: "allowed",
-      unifiedWindows: {
-        five_hour: { utilization: 0.28, resetsAt: future(3 * 3600) },
-        seven_day: { utilization: 0.7, resetsAt: future(5 * 86400) },
-      },
+  seedClaude({
+    status: "allowed",
+    unifiedWindows: {
+      five_hour: { utilization: 0.28, resetsAt: future(3 * 3600) },
+      seven_day: { utilization: 0.7, resetsAt: future(5 * 86400) },
     },
-    observed_at: new Date().toISOString(),
   });
   render(SidebarHost, { projectId: PROJECT_ID, agents: [ALICE] });
   await expect.poll(() => detailLeftEdges().length).toBe(2);

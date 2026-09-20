@@ -12,7 +12,12 @@
 /// that rule exists.** The backend persists the map without interpreting it, so
 /// there is no second copy to disagree with this one.
 import { invoke } from "@tauri-apps/api/core";
-import type { HarnessKind } from "$lib/types";
+import {
+  claudeStoredWindows,
+  describesNewWindowInstance,
+  type StoredUsageWindow,
+} from "$lib/usageWindows";
+import type { AgentId, HarnessKind } from "$lib/types";
 
 /// One harness account's newest reading.
 export type HarnessUsageReading = {
@@ -38,9 +43,16 @@ export type HarnessUsageReading = {
   /// given a fabricated instant that would sort correctly and then be shown to
   /// the user as a date in 1970.
   observed_at?: string;
-  /// Model of the turn that delivered the reading, which is what names Claude's
-  /// model-gated weekly window — the payload never names it itself.
-  model?: string;
+  /// The windows this account holds, keyed by the harness's own window key, each
+  /// with the context of the reading that delivered *it*.
+  ///
+  /// **Present only for a harness whose readings are partial**, and that is what
+  /// selects the merge rule below — the policy follows the data rather than a
+  /// harness name. A reading that names every limit it has (Codex's account read)
+  /// carries no map and replaces wholesale; one that names only the windows a
+  /// turn's model touched (Claude's `rate_limit_event`) carries a map and merges
+  /// into what is held. `reportsPartialUsageWindows` records why.
+  windows?: Record<string, StoredUsageWindow>;
 };
 
 /// Keyed by harness. Partial because a harness contributes an entry only once one
@@ -74,34 +86,111 @@ function isNewer(candidate: string | undefined, stored: string | undefined): boo
   return a > b;
 }
 
-/// Record a reading, keeping it only if nothing newer is already held.
+/// Merge windows the reading names, and take its account-level fields if it is
+/// the newest one.
+///
+/// **Two scopes, two rules, because a reading can be authoritative about one and
+/// silent about the other.** `payload` holds account-level state — Claude's
+/// overage escalation, the no-window-map fallback — and only the newest reading
+/// speaks for that. `windows` are merged per key: a reading that does not mention
+/// a window is not evidence the window is gone, so the held one survives with its
+/// own value, its own instant, and its own flags. Replacing wholesale is what let
+/// a turn on one model delete a still-blocking cap on another.
+///
+/// An older reading can therefore still contribute a window the store has never
+/// seen while losing the account-level fields — which is the point, since that is
+/// exactly a restored reading from the agent that ran the gated model.
 ///
 /// **Nothing is carried across readings.** A reading used to drag a separately
 /// recorded refusal verdict forward whenever it described the same windows,
 /// because Codex's per-turn payload could not say which quota had refused. Both
-/// harnesses now state exhaustion inside the payload, per window, so a reading
-/// is self-describing and superseding it retires its verdict with it.
+/// harnesses now state exhaustion inside the payload, and a retained window keeps
+/// the judgement made about *it* rather than inheriting one made about another.
 export function observeUsage(harness: HarnessKind, reading: HarnessUsageReading): void {
   const stored = harnessUsage[harness];
   // Nothing held yet takes the reading whatever its instant; ranking only decides
   // between two readings that both exist.
-  if (stored !== undefined && !isNewer(reading.observed_at, stored.observed_at)) return;
-  harnessUsage[harness] = reading;
+  if (stored === undefined) {
+    harnessUsage[harness] = reading;
+    persist();
+    return;
+  }
+  const windows = mergeWindows(stored.windows, reading.windows);
+  if (isNewer(reading.observed_at, stored.observed_at)) {
+    harnessUsage[harness] = { ...reading, windows };
+  } else if (windows !== stored.windows) {
+    harnessUsage[harness] = { ...stored, windows };
+  } else {
+    return;
+  }
   persist();
 }
 
-/// Fill in the model that delivered the newest reading, once it is known.
+/// Fold the windows a reading names into the held set, per key.
+///
+/// Ranked by the **same rule as the reading level** — strictly newer wins, an
+/// absent instant ranks last, a tie keeps what is held — so there is one ordering
+/// rule to know rather than two. The single exception is a reissued window, which
+/// bypasses ranking outright; see `describesNewWindowInstance` for why ranking
+/// gets that case wrong.
+///
+/// Returns the held map by identity when nothing changed, so the caller can skip
+/// a write and a reactive update.
+function mergeWindows(
+  held: Record<string, StoredUsageWindow> | undefined,
+  incoming: Record<string, StoredUsageWindow> | undefined,
+): Record<string, StoredUsageWindow> | undefined {
+  if (incoming === undefined) return held;
+  const merged = { ...held };
+  let changed = false;
+  for (const [key, window] of Object.entries(incoming)) {
+    const h = merged[key];
+    if (
+      h !== undefined &&
+      !describesNewWindowInstance(window, h) &&
+      !isNewer(window.observed_at, h.observed_at)
+    ) {
+      continue;
+    }
+    merged[key] = window;
+    changed = true;
+  }
+  return changed ? merged : held;
+}
+
+/// Name the windows `agentId` contributed, once that turn's model is known.
 ///
 /// Claude's model-gated weekly window carries no model of its own, so the label
-/// comes from the turn that delivered the reading — and that turn's `init` can
-/// arrive *after* its rate-limit event. **Fills a blank only**: a reading that
-/// already names a model is never relabelled, so a later turn on a different
-/// model cannot rewrite history.
-export function nameUsageModel(harness: HarnessKind, model: string | undefined): void {
+/// comes from the turn that delivered it — and that turn's `init` can arrive
+/// *after* its rate-limit event.
+///
+/// **Fills only blanks, and only ones this agent contributed.** Both halves are
+/// load-bearing. Without the blank check a later turn on a different model would
+/// rewrite history; without the agent check a second agent's `init`, landing in
+/// the milliseconds between the first agent's reading and its own `init`, would
+/// name a window it never measured — and a mislabel now outlives the reading that
+/// caused it, rendering until the window resets, correctable only by another turn
+/// on the very model the user is capped on.
+///
+/// A window whose contributor is unknown — restored from disk, where a later
+/// turn's model would be a guess about an older measurement — is never filled. It
+/// renders unlabelled rather than wrong, which is the rule this surface follows
+/// throughout.
+export function nameUsageModel(
+  harness: HarnessKind,
+  agentId: AgentId,
+  model: string | undefined,
+): void {
   if (model === undefined || model === "") return;
   const stored = harnessUsage[harness];
-  if (stored === undefined || stored.model !== undefined) return;
-  harnessUsage[harness] = { ...stored, model };
+  if (stored?.windows === undefined) return;
+  let windows: Record<string, StoredUsageWindow> | undefined;
+  for (const [key, window] of Object.entries(stored.windows)) {
+    if (window.model !== undefined || window.agent_id !== agentId) continue;
+    windows = { ...(windows ?? stored.windows), [key]: { ...window, model } };
+  }
+  if (windows === undefined) return;
+  harnessUsage[harness] = { ...stored, windows };
   persist();
 }
 
@@ -153,11 +242,69 @@ function asReading(value: unknown): HarnessUsageReading | null {
   // resolving plain scalars to a timestamp type, and if that ever changes the
   // entry should disappear loudly rather than quietly demote itself to unranked.
   if (v.observed_at !== undefined && typeof v.observed_at !== "string") return null;
+  const windows = v.windows === undefined ? legacyWindows(v) : asStoredWindows(v.windows);
+  if (windows === null) return null;
   return {
     payload: v.payload,
     observed_at: typeof v.observed_at === "string" ? v.observed_at : undefined,
-    model: typeof v.model === "string" ? v.model : undefined,
+    windows,
   };
+}
+
+/// Read a persisted window map, or `null` to reject the whole entry.
+///
+/// **One severity, and it is loud.** The file is machine-written, so a map that is
+/// not the shape we write is not evidence of a window worth salvaging; the entry
+/// is discarded and the next turn rebuilds it. Repairing it field by field would
+/// quietly demote a window to unlabelled or unranked, which is the failure mode
+/// the reading-level instant check already refuses for the same reason.
+///
+/// Unknown fields are ignored rather than rejected, so a later version may add one
+/// without this dropping every entry an older build wrote — but they are also not
+/// preserved, matching the reading-level whitelist.
+function asStoredWindows(value: unknown): Record<string, StoredUsageWindow> | undefined | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const windows: Record<string, StoredUsageWindow> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry !== "object" || entry === null) return null;
+    const e = entry as Record<string, unknown>;
+    if (e.window === undefined) return null;
+    const observedAt = e.observed_at;
+    const model = e.model;
+    const agentId = e.agent_id;
+    if (observedAt !== undefined && typeof observedAt !== "string") return null;
+    if (model !== undefined && typeof model !== "string") return null;
+    if (agentId !== undefined && typeof agentId !== "string") return null;
+    windows[key] = {
+      window: e.window,
+      status: e.status,
+      rate_limit_type: e.rate_limit_type,
+      surpassed_threshold: e.surpassed_threshold,
+      is_using_overage: e.is_using_overage,
+      observed_at: observedAt,
+      model,
+      agent_id: agentId,
+    };
+  }
+  return Object.keys(windows).length > 0 ? windows : undefined;
+}
+
+/// Recover windows from an entry written before they were held individually.
+///
+/// Lifted from the stored payload rather than migrated by a version check, which
+/// works because the extraction is shape-driven: a Claude payload yields its
+/// windows and any other yields none, so the same call serves every harness.
+///
+/// **Deliberately carries no instant and no contributing agent.** The
+/// reading-level timestamp dated the reading, not each window, and using it here
+/// would date one window by when another was measured; an absent contributor is
+/// what stops a later turn's `init` labelling a measurement it knows nothing
+/// about. Only the age line and a missing model label are unavailable — the window
+/// still renders and still retires, because both read the payload's own reset.
+function legacyWindows(v: Record<string, unknown>): Record<string, StoredUsageWindow> | undefined {
+  return claudeStoredWindows(v.payload, {
+    model: typeof v.model === "string" ? v.model : undefined,
+  });
 }
 
 /// Whether a write is in flight, and whether the map changed while it was.

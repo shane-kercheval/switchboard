@@ -2,7 +2,13 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
-import { claudeRateLimitView, codexAccountUsageView } from "./usageWindows";
+import {
+  claudeRateLimitView,
+  claudeStoredWindows,
+  codexAccountUsageView,
+  describesNewWindowInstance,
+  type StoredUsageWindow,
+} from "./usageWindows";
 
 /// Input validation against each harness's opaque payload. These live here
 /// rather than in the Sidebar suite because they are about what the derivation
@@ -12,8 +18,25 @@ import { claudeRateLimitView, codexAccountUsageView } from "./usageWindows";
 const NOW = Date.UTC(2026, 8, 17, 12, 0, 0);
 const future = (seconds: number): number => Math.floor(NOW / 1000) + seconds;
 
+/// A reading taken the way the app takes one: lifted into stored windows, then
+/// rendered from them.
+///
+/// **Both halves, because neither is the reader on its own.** The tone and label
+/// rules read a window's *delivering* context, so asserting them against a
+/// hand-built store would let the extraction stop recording that context without
+/// a single test noticing. Tests that need a store assembled from several readings
+/// build one explicitly; everything about reading one payload goes through here.
+function claudeView(
+  payload: unknown,
+  nowMs: number,
+  model: string | undefined,
+  observedAt?: string,
+): ReturnType<typeof claudeRateLimitView> {
+  return claudeRateLimitView(payload, claudeStoredWindows(payload, { model, observedAt }), nowMs);
+}
+
 function claudeWindows(fiveHour: unknown): ReturnType<typeof claudeRateLimitView> {
-  return claudeRateLimitView(
+  return claudeView(
     {
       status: "allowed",
       unifiedWindows: {
@@ -58,17 +81,247 @@ describe("claudeRateLimitView input validation", () => {
     ["null", null],
     ["a payload with nothing displayable", { status: "allowed" }],
   ])("returns null for %s", (_case, payload) => {
-    expect(claudeRateLimitView(payload, NOW, undefined)).toBeNull();
+    expect(claudeView(payload, NOW, undefined)).toBeNull();
   });
 
   it("reads the container as absent when it is empty, so the fallback applies", () => {
-    const view = claudeRateLimitView(
+    const view = claudeView(
       { status: "allowed", rateLimitType: "five_hour", resetsAt: future(3600), unifiedWindows: {} },
       NOW,
       undefined,
     );
     expect(view?.windows).toEqual([]);
     expect(view?.fallback?.label).toBe("5-hour limit");
+  });
+});
+
+describe("claudeStoredWindows", () => {
+  it("carries no window map for a payload with no window container", () => {
+    // What makes the store's merge-versus-replace rule follow the data instead of
+    // a harness name: a reading with nothing to merge says so by shape.
+    expect(claudeStoredWindows({ status: "allowed" }, {})).toBeUndefined();
+    expect(claudeStoredWindows({ unifiedWindows: {} }, {})).toBeUndefined();
+    expect(claudeStoredWindows({ rateLimitsByLimitId: { codex: {} } }, {})).toBeUndefined();
+  });
+
+  it("records only windows this reader can name", () => {
+    // Iterating the key list rather than the payload's keys is what keeps an
+    // unlabelable window out of the store as well as off the card.
+    const stored = claudeStoredWindows(
+      {
+        unifiedWindows: {
+          five_hour: { utilization: 0.1, resetsAt: future(3600) },
+          seven_day_omelette: { utilization: 0.9, resetsAt: future(3600) },
+        },
+      },
+      {},
+    );
+    expect(Object.keys(stored ?? {})).toEqual(["five_hour"]);
+  });
+
+  it("stores a window whose fields are unreadable, leaving the judgement to render", () => {
+    // Validating at ingest would freeze today's read into `usage.yaml`; storing
+    // verbatim is what lets a later correction apply to windows already on disk.
+    const stored = claudeStoredWindows(
+      { unifiedWindows: { five_hour: { utilization: "later" } } },
+      {},
+    );
+    expect(stored?.five_hour?.window).toEqual({ utilization: "later" });
+    expect(claudeRateLimitView({ unifiedWindows: {} }, stored, NOW)).toBeNull();
+  });
+
+  it("tags every window with the same delivering context", () => {
+    const stored = claudeStoredWindows(
+      {
+        status: "allowed_warning",
+        rateLimitType: "seven_day",
+        surpassedThreshold: 80,
+        isUsingOverage: false,
+        unifiedWindows: {
+          five_hour: { utilization: 0.1, resetsAt: future(3600) },
+          seven_day: { utilization: 0.81, resetsAt: future(5 * 86400) },
+        },
+      },
+      { observedAt: "2026-09-17T11:00:00.000Z", model: "claude-opus-5", agentId: "agent-1" },
+    );
+    expect(stored?.five_hour).toMatchObject({
+      status: "allowed_warning",
+      rate_limit_type: "seven_day",
+      surpassed_threshold: 80,
+      is_using_overage: false,
+      observed_at: "2026-09-17T11:00:00.000Z",
+      model: "claude-opus-5",
+      agent_id: "agent-1",
+    });
+  });
+});
+
+describe("describesNewWindowInstance", () => {
+  const at = (resetsAt: unknown): StoredUsageWindow => ({ window: { resetsAt } });
+
+  it("is true only when both resets are readable and differ", () => {
+    expect(describesNewWindowInstance(at(future(7200)), at(future(3600)))).toBe(true);
+    expect(describesNewWindowInstance(at(future(3600)), at(future(3600)))).toBe(false);
+  });
+
+  it("is false when either reset cannot be read", () => {
+    // An unreadable reset is no evidence of a reissue, so ranking decides as
+    // usual rather than a missing field forcing a replacement.
+    expect(describesNewWindowInstance(at("soon"), at(future(3600)))).toBe(false);
+    expect(describesNewWindowInstance(at(future(3600)), at(undefined))).toBe(false);
+    expect(describesNewWindowInstance({ window: null }, at(future(3600)))).toBe(false);
+  });
+});
+
+/// Two readings from the same account, a day apart, on different models — the
+/// state this milestone exists for.
+describe("claudeRateLimitView over a retained window set", () => {
+  const OPUS_AT = "2026-09-17T11:59:00.000Z";
+  const FABLE_AT = "2026-09-16T08:00:00.000Z";
+
+  /// Complete about the windows this turn's model touched, silent about the
+  /// model-gated cap it never did. Verified on the real account: two installs,
+  /// same login, same moment, and only the Fable one carries the gated key.
+  const opusTurn = {
+    status: "allowed",
+    isUsingOverage: false,
+    unifiedWindows: {
+      five_hour: { utilization: 0.07, resetsAt: future(3600) },
+      seven_day: { utilization: 0.73, resetsAt: future(5 * 86400) },
+    },
+  };
+  /// The turn that hit the gated cap, from the day before.
+  const fableTurn = {
+    status: "rejected",
+    rateLimitType: "seven_day_overage_included",
+    isUsingOverage: false,
+    unifiedWindows: {
+      five_hour: { utilization: 0.28, resetsAt: future(3600) },
+      seven_day: { utilization: 0.7, resetsAt: future(5 * 86400) },
+      seven_day_overage_included: { utilization: 1, resetsAt: future(5 * 86400) },
+    },
+  };
+  /// The later reading's windows over the earlier one's, which is what the store's
+  /// per-key merge produces.
+  const retained: Record<string, StoredUsageWindow> = {
+    ...claudeStoredWindows(fableTurn, { model: "claude-fable-5-1", observedAt: FABLE_AT }),
+    ...claudeStoredWindows(opusTurn, { model: "claude-opus-5", observedAt: OPUS_AT }),
+  };
+
+  it("renders the cap the newest reading never mentioned", () => {
+    const view = claudeRateLimitView(opusTurn, retained, NOW);
+    expect(view?.windows.map((w) => w.key)).toEqual([
+      "five_hour",
+      "seven_day",
+      "seven_day_overage_included",
+    ]);
+  });
+
+  it("keeps the refusal on the retained window while the newest reading says allowed", () => {
+    // The tone has to come from the reading that measured *this* window. Claude's
+    // `status` is account-level, so reading it off the newest reading would let an
+    // Opus turn clear a Fable cap it never touched — and the cap is still in force.
+    const view = claudeRateLimitView(opusTurn, retained, NOW);
+    expect(view?.windows.map((w) => [w.key, w.limitReached])).toEqual([
+      ["five_hour", undefined],
+      ["seven_day", undefined],
+      ["seven_day_overage_included", true],
+    ]);
+  });
+
+  it("labels the retained window from the turn that delivered it", () => {
+    // The gated window has no name of its own, and the model that named it is a
+    // day old by now. Taking the label from the newest reading would call a Fable
+    // cap "Weekly · Opus" for as long as it lasts.
+    const view = claudeRateLimitView(opusTurn, retained, NOW);
+    expect(view?.windows.find((w) => w.key === "seven_day_overage_included")?.label).toBe(
+      "Weekly · Fable",
+    );
+  });
+
+  it("dates each window by its own measurement", () => {
+    const view = claudeRateLimitView(opusTurn, retained, NOW);
+    expect(view?.windows.map((w) => [w.key, w.measuredAt])).toEqual([
+      ["five_hour", OPUS_AT],
+      ["seven_day", OPUS_AT],
+      ["seven_day_overage_included", FABLE_AT],
+    ]);
+  });
+
+  it("claims no age for a window whose reading carried no instant", () => {
+    // The shape a file written before per-window instants restores as. Borrowing
+    // the reading-level timestamp would date this window by when a different one
+    // was measured.
+    const undated = claudeStoredWindows(opusTurn, { model: "claude-opus-5" });
+    const view = claudeRateLimitView(opusTurn, undated, NOW);
+    expect(view?.windows.every((w) => w.measuredAt === undefined)).toBe(true);
+  });
+
+  it("clears a threshold flag the newest reading no longer reports", () => {
+    // A reading that *does* contain the window replaces its context wholesale, so
+    // a warning that has since cleared does not linger until the window resets.
+    const warned = claudeStoredWindows(
+      {
+        status: "allowed_warning",
+        rateLimitType: "five_hour",
+        surpassedThreshold: 80,
+        unifiedWindows: { five_hour: { utilization: 0.81, resetsAt: future(3600) } },
+      },
+      { observedAt: FABLE_AT },
+    );
+    expect(claudeRateLimitView(opusTurn, warned, NOW)?.windows[0]?.surpassedThreshold).toBe(80);
+    const cleared = { ...warned, ...claudeStoredWindows(opusTurn, { observedAt: OPUS_AT }) };
+    expect(
+      claudeRateLimitView(opusTurn, cleared, NOW)?.windows[0]?.surpassedThreshold,
+    ).toBeUndefined();
+  });
+
+  it("retires a window whose reset has passed, flag and all", () => {
+    const expired = claudeStoredWindows(fableTurn, { model: "claude-fable-5-1" });
+    const view = claudeRateLimitView(opusTurn, expired, NOW + 6 * 86400 * 1000);
+    expect(view).toBeNull();
+  });
+});
+
+describe("claudeRateLimitView fallback line", () => {
+  const bare = { status: "rejected", rateLimitType: "five_hour", resetsAt: future(3600) };
+
+  it("renders when the newest reading has no window map and nothing is retained", () => {
+    const view = claudeRateLimitView(bare, undefined, NOW);
+    expect(view?.fallback?.label).toBe("5-hour limit");
+  });
+
+  it("is suppressed by a retained window that is still live", () => {
+    // New state that merging creates: the newest reading genuinely has no map, but
+    // a bare reset date printed beside live meters reads as a sixth window.
+    const retained = claudeStoredWindows(
+      {
+        status: "allowed",
+        unifiedWindows: { seven_day: { utilization: 0.4, resetsAt: future(5 * 86400) } },
+      },
+      {},
+    );
+    expect(claudeRateLimitView(bare, retained, NOW)?.fallback).toBeNull();
+  });
+
+  it("is suppressed when the newest reading's windows were all filtered out", () => {
+    // Pre-existing rule, and merging must not relax it: a *non-empty* container
+    // whose entries were dropped on purpose stays authoritative, because falling
+    // back there would override the per-window rules rather than fill a gap.
+    //
+    // The overage flag is here only to keep the view from collapsing to `null`, so
+    // a suppressed fallback is distinguishable from nothing being displayable.
+    const payload = {
+      status: "allowed",
+      rateLimitType: "five_hour",
+      resetsAt: future(3600),
+      isUsingOverage: true,
+      overageResetsAt: future(6 * 86400),
+      unifiedWindows: { five_hour: { utilization: 0.5, resetsAt: Math.floor(NOW / 1000) - 60 } },
+    };
+    const view = claudeView(payload, NOW, undefined);
+    expect(view?.windows).toEqual([]);
+    expect(view?.fallback).toBeNull();
   });
 });
 
@@ -377,7 +630,7 @@ describe("claudeRateLimitView at the wall", () => {
   };
 
   it("flags the window the payload names and leaves its siblings measured", () => {
-    const view = claudeRateLimitView(rejected, NOW, "claude-fable-5-1");
+    const view = claudeView(rejected, NOW, "claude-fable-5-1");
     expect(view?.windows.map((w) => [w.label, w.usedFraction, w.limitReached])).toEqual([
       ["5-hour limit", 0.28, undefined],
       ["Weekly · all models", 0.7, undefined],
@@ -395,20 +648,20 @@ describe("claudeRateLimitView at the wall", () => {
         seven_day_overage_included: { utilization: 0.97, resetsAt: future(5 * 86400) },
       },
     };
-    const view = claudeRateLimitView(belowCap, NOW, "claude-fable-5-1");
+    const view = claudeView(belowCap, NOW, "claude-fable-5-1");
     expect(view?.windows[0]?.usedFraction).toBe(0.97);
     expect(view?.windows[0]?.limitReached).toBe(true);
   });
 
   it("leaves every window unflagged while the status is allowed", () => {
-    const view = claudeRateLimitView({ ...rejected, status: "allowed" }, NOW, "claude-fable-5-1");
+    const view = claudeView({ ...rejected, status: "allowed" }, NOW, "claude-fable-5-1");
     expect(view?.windows.every((w) => w.limitReached === undefined)).toBe(true);
   });
 
   it("flags nothing when the refusal names a window the reader drops", () => {
     // Same rule the threshold warning already follows: an unrecognized key is
     // dropped rather than labelled by guesswork, and its flag goes with it.
-    const view = claudeRateLimitView(
+    const view = claudeView(
       { ...rejected, rateLimitType: "seven_day_something_new" },
       NOW,
       "claude-fable-5-1",
@@ -435,19 +688,19 @@ describe("claudeRateLimitView on an overage turn", () => {
   it("leaves the spent window unflagged, so the tone stays neutral", () => {
     // Flagging it would keep the card permanently amber for anyone routinely in
     // overage, and make a genuine refusal indistinguishable from being billed.
-    const view = claudeRateLimitView(overaging, NOW, undefined);
+    const view = claudeView(overaging, NOW, undefined);
     expect(view?.windows.every((w) => w.limitReached === undefined)).toBe(true);
   });
 
   it("still reports the credits escalation, which is the signal for this state", () => {
-    const view = claudeRateLimitView(overaging, NOW, undefined);
+    const view = claudeView(overaging, NOW, undefined);
     expect(view?.overage).not.toBeNull();
   });
 
   it("flags the window again once the same status arrives without overage", () => {
     // The discriminator is the overage flag, not the status: the captured wall
     // carries `isUsingOverage: false`.
-    const view = claudeRateLimitView({ ...overaging, isUsingOverage: false }, NOW, undefined);
+    const view = claudeView({ ...overaging, isUsingOverage: false }, NOW, undefined);
     expect(view?.windows.find((w) => w.key === "seven_day")?.limitReached).toBe(true);
   });
 });

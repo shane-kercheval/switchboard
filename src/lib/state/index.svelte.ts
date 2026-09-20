@@ -71,6 +71,7 @@ import {
 } from "$lib/state/harnessUsage.svelte";
 import { requestAccountUsageRefresh } from "$lib/state/accountUsage.svelte";
 import { supportsAccountUsageRead } from "$lib/harnessCapabilities";
+import { claudeStoredWindows, reportsPartialUsageWindows } from "$lib/usageWindows";
 
 /// Per-agent turn lists, keyed by `agent_id`. The unified-view renderer
 /// merges across all agents at render time:
@@ -435,14 +436,26 @@ function recordRestoredUsage(agentId: AgentId, hydrate: Required<Hydrate>): void
   // measurement instant, so it would routinely outrank a *correct* live reading
   // and put the old shape back on screen at project open.
   if (supportsAccountUsageRead(harness)) return;
+  // The measured instant when the harness recorded one, else the snapshot's
+  // capture time. A reading with neither stays **undated** rather than being given
+  // a sentinel: `isNewer` ranks an absent instant last on its own, and a sentinel
+  // would sort correctly and then be rendered to the user as a date.
+  const observedAt =
+    hydrate.last_rate_limit_observed_at ?? hydrate.last_rate_limit_as_of ?? undefined;
   observeUsage(harness, {
     payload: hydrate.last_rate_limit,
-    // The measured instant when the harness recorded one, else the snapshot's
-    // capture time. A reading with neither stays **undated** rather than being
-    // given a sentinel: `isNewer` ranks an absent instant last on its own, and a
-    // sentinel would sort correctly and then be rendered to the user as a date.
-    observed_at: hydrate.last_rate_limit_observed_at ?? hydrate.last_rate_limit_as_of ?? undefined,
-    model: hydrate.last_rate_limit_model ?? undefined,
+    observed_at: observedAt,
+    // **No contributing agent is recorded, unlike the live path.** A restored
+    // reading describes a turn that has already ended, so a later `init` from this
+    // agent would name it with whatever model is running *now* — a guess about an
+    // older measurement. Its model comes from the sidecar or the window renders
+    // unlabelled.
+    windows: reportsPartialUsageWindows(harness)
+      ? claudeStoredWindows(hydrate.last_rate_limit, {
+          observedAt,
+          model: hydrate.last_rate_limit_model ?? undefined,
+        })
+      : undefined,
   });
 }
 
@@ -994,13 +1007,19 @@ function recordAccountUsage(agentId: AgentId, event: NormalizedEvent, receivedAt
     // single turn. Leaving it connected would clean-hide the Codex section
     // after every turn for as long as both paths coexist.
     if (supportsAccountUsageRead(harness)) return;
+    const model = runtimes[agentId]?.current_turn_model;
     observeUsage(harness, {
       payload: event.info,
       // Arrival time, not a measured instant: a live reading is current by
       // construction, and this is what ranks it above anything restored from
       // disk.
       observed_at: receivedAt,
-      model: runtimes[agentId]?.current_turn_model,
+      // Handed over as named windows rather than as a payload to replace, because
+      // this reading covers only the windows the turn's model touched — see
+      // `reportsPartialUsageWindows` for the completeness rule that decides it.
+      windows: reportsPartialUsageWindows(harness)
+        ? claudeStoredWindows(event.info, { observedAt: receivedAt, model, agentId })
+        : undefined,
     });
   } else if (event.type === "session_meta") {
     // **Late model label.** Claude's per-model weekly window never names its own
@@ -1011,11 +1030,16 @@ function recordAccountUsage(agentId: AgentId, event: NormalizedEvent, receivedAt
     //
     // Only ever fills a blank, and only from the reducer's `current_turn_model`
     // (this turn's own `init`), never from `meta.model`, which survives across
-    // turns and would name the previous model. The narrow cost is that two agents
-    // interleaving inside the milliseconds between one turn's reading and its
-    // `init` could label a window with the other's model; that is strictly better
-    // than dropping the label, which is the alternative.
-    nameUsageModel(harness, runtimes[agentId]?.current_turn_model);
+    // turns and would name the previous model.
+    //
+    // **Scoped to the windows this agent contributed.** Two agents interleaving
+    // inside the milliseconds between one turn's reading and its `init` would
+    // otherwise cross-label. That was once priced as acceptable — the mislabel
+    // survived only until the next reading replaced it, seconds — but windows are
+    // now retained until they reset, so the same race writes a wrong model that
+    // renders for days and can only be corrected by another turn on the gated
+    // model, which is the one thing a capped user cannot run.
+    nameUsageModel(harness, agentId, runtimes[agentId]?.current_turn_model);
   } else if (event.type === "turn_end") {
     // **Every outcome triggers a refresh, not just a completed one.** A turn
     // that failed or was cancelled still consumed whatever it ran before

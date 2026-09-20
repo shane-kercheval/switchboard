@@ -214,6 +214,80 @@ describe("event routing", () => {
   });
 });
 
+/// Claude's late model label, across two agents.
+///
+/// **The window outlives the reading now, which is what makes this a defect rather
+/// than a race with a short blast radius.** Cross-labelling used to survive only
+/// until the next reading replaced it — seconds. Under retention the wrong model
+/// renders until the window resets, and the only thing that can correct it is
+/// another turn on the gated model, which is the one thing a capped user cannot
+/// run.
+describe("naming Claude's model-gated weekly window", () => {
+  const GATED = {
+    status: "allowed",
+    unifiedWindows: {
+      seven_day_overage_included: { utilization: 1, resetsAt: 1_800_000_000 },
+    },
+  };
+
+  function gatedWindow(): { model?: string; agent_id?: string } | undefined {
+    return usage.harnessUsage.claude_code?.windows?.seven_day_overage_included;
+  }
+
+  it("labels the window once the delivering turn's init lands", async () => {
+    // The recorded order on a compaction stream: the rate-limit event arrives
+    // before the `init` that names the model.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cc", "claude_code"));
+    fireTo(`agent:${AGENT_A}`, { type: "rate_limit_event", agent_id: AGENT_A, info: GATED });
+    expect(gatedWindow()?.model).toBeUndefined();
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "claude-fable-5-1",
+      harness_version: "2.1.274",
+      inventory: {},
+      raw: {},
+    });
+    expect(gatedWindow()?.model).toBe("claude-fable-5-1");
+  });
+
+  it("does not let a second agent's init name a window the first contributed", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cc", "claude_code"));
+    await state.registerAgent(agentRecord(AGENT_B, "cc2", "claude_code"));
+    fireTo(`agent:${AGENT_A}`, { type: "rate_limit_event", agent_id: AGENT_A, info: GATED });
+    fireTo(`agent:${AGENT_B}`, {
+      type: "session_meta",
+      agent_id: AGENT_B,
+      model: "claude-opus-5",
+      harness_version: "2.1.274",
+      inventory: {},
+      raw: {},
+    });
+    expect(gatedWindow()?.model).toBeUndefined();
+
+    // Still repairable by the agent that actually measured it.
+    fireTo(`agent:${AGENT_A}`, {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "claude-fable-5-1",
+      harness_version: "2.1.274",
+      inventory: {},
+      raw: {},
+    });
+    expect(gatedWindow()?.model).toBe("claude-fable-5-1");
+  });
+
+  it("records which agent contributed the window", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cc", "claude_code"));
+    fireTo(`agent:${AGENT_A}`, { type: "rate_limit_event", agent_id: AGENT_A, info: GATED });
+    expect(gatedWindow()?.agent_id).toBe(AGENT_A);
+  });
+});
+
 /// The Codex quota cut. Codex's per-turn reading is replaced by an account read
 /// that names every limit; these pin that the old path is disconnected at both
 /// frontend entry points and that the new one is triggered.
@@ -1370,7 +1444,7 @@ describe("hydrateAgent", () => {
     expect(state.runtimes[AGENT_A]?.meta_as_of).toBe("2026-09-17T12:00:00Z");
   });
 
-  it("carries the rate-limit model from the IPC reply to the usage store", async () => {
+  it("carries the rate-limit model onto the window the snapshot delivered", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
 
@@ -1388,7 +1462,12 @@ describe("hydrateAgent", () => {
     });
 
     await state.hydrateAgent(AGENT_A);
-    expect(usage.harnessUsage.claude_code?.model).toBe("claude-fable-5-1");
+    const restored = usage.harnessUsage.claude_code?.windows?.seven_day_overage_included;
+    expect(restored?.model).toBe("claude-fable-5-1");
+    // **No contributing agent**, unlike a live reading. A restored window describes
+    // a turn that has already ended, so a later `init` from this agent would name
+    // it with whatever model is running now — a guess about an older measurement.
+    expect(restored?.agent_id).toBeUndefined();
   });
 
   it("does not restore a Codex reading from the rollout snapshot", async () => {

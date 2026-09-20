@@ -1206,6 +1206,49 @@ describe("Cmd-held target overlay", () => {
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
   });
 
+  it("stays disarmed when a chord key's keyup arrives stamped with Cmd after Cmd is up", async () => {
+    // Reported symptom: ⌘Enter in the composer sent the message, and the pane
+    // under the cursor kept the targeting ring with nothing held until the mouse
+    // moved. Releasing ⌘ and Enter together can deliver Enter's keyup stamped
+    // `metaKey: true` *after* the Meta keyup, and the re-arm believed it — so the
+    // state went back to armed with nothing left to clear it. The re-arm now
+    // needs a Meta keydown that has not been released.
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    await fireEvent.pointerEnter(paneEls()[0]!);
+    await fireEvent.keyDown(window, { key: "Meta" });
+    await fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    await fireEvent.keyUp(window, { key: "Meta" });
+    await fireEvent.keyUp(window, { key: "Enter", metaKey: true });
+
+    // The send hides the compose box, and the pane growing under a stationary
+    // cursor is what WebKit reports as pointer movement — carrying the same stale
+    // modifier flag. That is the event that used to raise the ring.
+    await fireEvent.pointerMove(window, { metaKey: true });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+  });
+
+  it("re-arms after a chord key is released while Cmd is genuinely still down", async () => {
+    // The other side of the same gate: Enter released first, ⌘ still held, so the
+    // user is back to a plain ⌘ hold and the preview must return. Holding this
+    // down keeps the fix above from becoming "keyups never re-arm."
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    await fireEvent.pointerEnter(paneEls()[0]!);
+    await fireEvent.keyDown(window, { key: "Meta" });
+    await fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    await fireEvent.keyUp(window, { key: "Enter", metaKey: true });
+    await fireEvent.pointerMove(window, { metaKey: true });
+    expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
+
+    await fireEvent.keyUp(window, { key: "Meta" });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+  });
+
   it("disarms on window blur (Cmd+Tab away loses the keyup)", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);

@@ -304,8 +304,13 @@
   let cmdOnlyHeld = $state(false);
   let cmdPointerMoved = $state(false);
   let hoveredPaneId = $state<string | null>(null);
+  /// Whether a Meta keydown has been seen without its keyup yet. **The only
+  /// evidence that Cmd is physically down**, and the gate on re-arming after a
+  /// chord — see `onWindowKeyup`. Not `$state`: nothing renders from it.
+  let metaDown = false;
 
   function onWindowKeydown(event: KeyboardEvent): void {
+    if (event.key === "Meta") metaDown = true;
     if (event.key === "Meta" && !event.altKey && !event.shiftKey && !event.ctrlKey) {
       cmdOnlyHeld = true;
       cmdPointerMoved = false;
@@ -314,8 +319,22 @@
     cmdOnlyHeld = false;
     cmdPointerMoved = false;
   }
+  /// Releasing the chord key while Cmd stays down returns to the plain-Cmd hold,
+  /// so the overlay comes back on the next movement — release ⌘C's C and the
+  /// preview is available again without re-pressing Cmd.
+  ///
+  /// **That re-arm is gated on having seen the Meta keydown, not on the keyup's
+  /// own `metaKey` flag.** A keyup's modifier flags describe the instant the OS
+  /// stamped the event, and releasing ⌘ and a chord key together can deliver the
+  /// chord key's keyup stamped `metaKey: true` after Cmd is already up. Trusting
+  /// it re-armed the overlay with nothing held, and since the Meta keyup had
+  /// already been processed nothing cleared it: the ring then followed the cursor
+  /// until a movement proved Cmd was down. ⌘Enter from the composer hit this
+  /// every time, and the layout shift as the compose box hides on send supplied
+  /// the pointer event that made the ring appear.
   function onWindowKeyup(event: KeyboardEvent): void {
-    if (event.key === "Meta" || !event.metaKey) {
+    if (event.key === "Meta") metaDown = false;
+    if (event.key === "Meta" || !event.metaKey || !metaDown) {
       cmdOnlyHeld = false;
       cmdPointerMoved = false;
       return;
@@ -324,6 +343,7 @@
     cmdPointerMoved = false;
   }
   function onWindowBlur(): void {
+    metaDown = false;
     cmdOnlyHeld = false;
     cmdPointerMoved = false;
   }
@@ -343,6 +363,7 @@
   /// only the keyboard knows a non-modifier key is down.
   function syncCmdFromPointer(event: PointerEvent): void {
     if (!event.metaKey || event.altKey || event.shiftKey || event.ctrlKey) {
+      if (!event.metaKey) metaDown = false;
       cmdOnlyHeld = false;
       cmdPointerMoved = false;
       return;

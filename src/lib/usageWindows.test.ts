@@ -78,8 +78,8 @@ describe("claudeRateLimitView input validation", () => {
 ///
 /// `limitName: null` on the account-wide bucket is not an oversight in the
 /// fixture: it is what every capture shows. Only the model reserve is named.
-function accountPayload(buckets: Record<string, unknown>, ordinaryUsageAllowed = true): unknown {
-  return { ordinaryUsageAllowed, rateLimitsByLimitId: buckets };
+function accountPayload(buckets: Record<string, unknown>): unknown {
+  return { ordinaryUsageAllowed: true, rateLimitsByLimitId: buckets };
 }
 
 /// Windows are built from the schema's shape rather than from the shape this
@@ -96,7 +96,6 @@ const ACCOUNT_BUCKET = {
   normalModelSlug: null,
   primary: window(42, 10080),
   secondary: null,
-  rateLimitReachedType: null,
 };
 
 const RESERVE_BUCKET = {
@@ -105,14 +104,10 @@ const RESERVE_BUCKET = {
   normalModelSlug: "gpt-5.6-luna",
   primary: window(5, 10080),
   secondary: null,
-  rateLimitReachedType: null,
 };
 
-const view = (
-  buckets: Record<string, unknown>,
-  allowed = true,
-): ReturnType<typeof codexAccountUsageView> =>
-  codexAccountUsageView(accountPayload(buckets, allowed), NOW);
+const view = (buckets: Record<string, unknown>): ReturnType<typeof codexAccountUsageView> =>
+  codexAccountUsageView(accountPayload(buckets), NOW);
 
 describe("codexAccountUsageView bucket selection", () => {
   it("renders an account-wide bucket", () => {
@@ -210,6 +205,44 @@ describe("codexAccountUsageView bucket windows", () => {
   });
 });
 
+describe("codexAccountUsageView exhaustion", () => {
+  it("marks a spent quota from the measurement alone", () => {
+    // Codex also sends a reason code naming why a limit was hit, and this reader
+    // deliberately ignores it: four of its five values are team-billing states
+    // that say nothing about a usage window, and deciding which bar the fifth
+    // applied to produced a defect in two consecutive review rounds. 100% used
+    // is what fills the bar and what marks it.
+    const { windows } = view({ codex: { ...ACCOUNT_BUCKET, primary: window(100, 10080) } });
+    expect(windows[0]?.usedFraction).toBe(1);
+    expect(windows[0]?.limitReached).toBe(true);
+  });
+
+  it("leaves a quota below 100% unmarked", () => {
+    const { windows } = view({ codex: { ...ACCOUNT_BUCKET, primary: window(99, 10080) } });
+    expect(windows[0]?.limitReached).toBeUndefined();
+  });
+
+  it("ignores the reason code entirely", () => {
+    // Same payload with and without every reason code Codex can send; the
+    // rendered rows are identical. This is what keeps a rename or a sixth value
+    // upstream from changing anything the user sees.
+    const plain = view({ codex: { ...ACCOUNT_BUCKET, primary: window(100, 10080) } }).windows;
+    for (const reason of [
+      "rate_limit_reached",
+      "workspace_owner_credits_depleted",
+      "workspace_member_credits_depleted",
+      "workspace_owner_usage_limit_reached",
+      "workspace_member_usage_limit_reached",
+      "some_future_value",
+    ]) {
+      const withReason = view({
+        codex: { ...ACCOUNT_BUCKET, primary: window(100, 10080), rateLimitReachedType: reason },
+      }).windows;
+      expect(withReason).toEqual(plain);
+    }
+  });
+});
+
 describe("codexAccountUsageView labels", () => {
   it("labels an account-wide weekly quota in the harness-shared vocabulary", () => {
     // The same string Claude's `seven_day` row uses. Both halves are read
@@ -241,149 +274,6 @@ describe("codexAccountUsageView labels", () => {
     const { windows } = view({ a: { ...ACCOUNT_BUCKET }, b: { ...ACCOUNT_BUCKET, limitId: "b" } });
     expect(windows.map((w) => w.label)).toEqual(["Weekly · all models", "Weekly · all models"]);
     expect(new Set(windows.map((w) => w.key)).size).toBe(2);
-  });
-});
-
-describe("codexAccountUsageView exhaustion", () => {
-  const capped = {
-    ...ACCOUNT_BUCKET,
-    primary: window(100, 10080),
-    rateLimitReachedType: "rate_limit_reached",
-  };
-
-  it("marks a spent quota because Codex says so, without inflating the number", () => {
-    // The measurement stands as measured. The reader this replaced painted its
-    // guessed window to 100%, because the per-turn payload recorded no number
-    // on a refusal.
-    const { windows } = view({ codex: { ...capped, primary: window(97, 10080) } }, false);
-    expect(windows[0]?.limitReached).toBe(true);
-    expect(windows[0]?.usedFraction).toBeCloseTo(0.97);
-  });
-
-  it("marks a spent quota even at zero percent used", () => {
-    // The rule this replaced vetoed the flag whenever usage read 0%, on the
-    // reasoning that a quota cannot be both unspent and exhausted. That holds
-    // only for consumption refusals.
-    const { windows } = view({ codex: { ...capped, primary: window(0, 10080) } }, false);
-    expect(windows[0]?.limitReached).toBe(true);
-  });
-
-  it("never marks a bar for a workspace-level restriction", () => {
-    // Four of Codex's five restriction kinds are workspace facts that say
-    // nothing about this window's consumption. Marking the bar would tell a
-    // user whose workspace ran out of credits that their weekly quota is
-    // exhausted, on a bar reading 42%.
-    for (const reason of [
-      "workspace_owner_credits_depleted",
-      "workspace_member_credits_depleted",
-      "workspace_owner_usage_limit_reached",
-      "workspace_member_usage_limit_reached",
-    ]) {
-      // `ordinaryUsageAllowed` is left unanswered on purpose: the restriction
-      // itself has to reach the account statement, or it is lost whenever the
-      // backend declines to answer that field — which it is permitted to do.
-      const payload = {
-        rateLimitsByLimitId: { codex: { ...ACCOUNT_BUCKET, rateLimitReachedType: reason } },
-      };
-      const { windows, blocked } = codexAccountUsageView(payload, NOW);
-      expect(windows[0]?.limitReached).toBeUndefined();
-      expect(blocked).toBe(true);
-    }
-  });
-
-  it("marks neither window when a two-window bucket reports a refusal", () => {
-    // The protocol does not say which of a bucket's windows refused, and
-    // picking one is the guess this reader deleted. The account-level statement
-    // is what tells the user they are blocked.
-    // Again with no account-level answer, so the bucket's own refusal is what
-    // must surface. A two-window bucket names neither window, and picking one is
-    // the guess this reader deleted.
-    const payload = {
-      rateLimitsByLimitId: {
-        codex: { ...capped, primary: window(30, 300, 1800), secondary: window(100, 10080) },
-      },
-    };
-    const { windows, blocked } = codexAccountUsageView(payload, NOW);
-    expect(windows.map((w) => w.limitReached)).toEqual([undefined, undefined]);
-    expect(blocked).toBe(true);
-  });
-
-  it("does not attribute a refusal to the survivor of an expired sibling", () => {
-    // The bucket declared two windows, so the refusal is unattributable even
-    // though only one window renders. Counting rendered windows instead of
-    // declared ones would put the flag on whichever one happened to survive.
-    const { windows } = view(
-      { codex: { ...capped, primary: window(100, 300, -60), secondary: window(40, 10080) } },
-      false,
-    );
-    expect(windows.map((w) => w.key)).toEqual(["codex:secondary"]);
-    expect(windows[0]?.limitReached).toBeUndefined();
-  });
-
-  it("reads a recovered account as healthy", () => {
-    const { windows, blocked } = view({ codex: ACCOUNT_BUCKET });
-    expect(windows[0]?.limitReached).toBeUndefined();
-    expect(blocked).toBe(false);
-  });
-});
-
-describe("codexAccountUsageView account-level restriction", () => {
-  it.each([
-    ["an explicit false", false, true],
-    ["an explicit true", true, false],
-  ])("reports %s as blocked=%s", (_case, allowed, expected) => {
-    expect(view({ codex: ACCOUNT_BUCKET }, allowed as boolean).blocked).toBe(expected);
-  });
-
-  it("does not state a restriction when an attributed bar already carries it", () => {
-    // A single-window bucket's refusal lands on its bar, so the line would be
-    // saying the same thing twice.
-    const payload = {
-      rateLimitsByLimitId: {
-        codex: {
-          ...ACCOUNT_BUCKET,
-          primary: window(100, 10080),
-          rateLimitReachedType: "rate_limit_reached",
-        },
-      },
-    };
-    const { windows, blocked } = codexAccountUsageView(payload, NOW);
-    expect(windows[0]?.limitReached).toBe(true);
-    expect(blocked).toBe(false);
-  });
-
-  it("states a restriction reported by a bucket whose windows all expired", () => {
-    // Nothing renders, so the bucket's own refusal is the only thing left to
-    // say — and it would be lost if the statement depended on the account gate.
-    const payload = {
-      rateLimitsByLimitId: {
-        codex: {
-          ...ACCOUNT_BUCKET,
-          primary: window(100, 10080, -60),
-          rateLimitReachedType: "rate_limit_reached",
-        },
-      },
-    };
-    const { windows, blocked } = codexAccountUsageView(payload, NOW);
-    expect(windows).toEqual([]);
-    expect(blocked).toBe(true);
-  });
-
-  it("treats an absent answer as absence, never as permission", () => {
-    // The schema is emphatic that clients must not infer recovery; `null` means
-    // the backend did not say.
-    const payload = { rateLimitsByLimitId: { codex: ACCOUNT_BUCKET } };
-    expect(codexAccountUsageView(payload, NOW).blocked).toBe(false);
-  });
-
-  it("reports a restriction even when no window survives", () => {
-    // The shapes that produce a restriction most often are the ones that leave
-    // nothing to draw. Requiring a meter would hide the harness's own answer in
-    // the cases it matters most.
-    const expired = { ...ACCOUNT_BUCKET, primary: window(100, 10080, -60) };
-    const { windows, blocked } = view({ codex: expired }, false);
-    expect(windows).toEqual([]);
-    expect(blocked).toBe(true);
   });
 });
 
@@ -436,184 +326,6 @@ describe("codexAccountUsageView against the recorded account response", () => {
     // The drift detector, against real bytes: if Codex stops emitting the field
     // that separates an allowance from a reserve, this is what says so.
     expect(codexAccountUsageView(captured, justBeforeReset).diagnostics).toEqual([]);
-  });
-});
-
-/// The account statement's sourcing, as a decision table rather than as a list
-/// of examples. Both defects in this area were empty cells in a grid like this
-/// one: a restriction reported on a bucket the meters skip, and a bucket-level
-/// signal overriding an explicit answer. Enumerating the combinations is what
-/// reaches interactions that breaking one condition at a time does not.
-describe("codexAccountUsageView restriction routing", () => {
-  const WORKSPACE = "workspace_owner_credits_depleted";
-  const CONSUMPTION = "rate_limit_reached";
-
-  /// Deliberately omits `ordinaryUsageAllowed` so the gate is unanswered and the
-  /// bucket's own restriction is the only thing that can set the statement. A
-  /// fixture that also set the gate would satisfy the assertion by the gate,
-  /// which is precisely how the dropped-restriction defect passed its test.
-  const gateSilent = (buckets: Record<string, unknown>): unknown => ({
-    rateLimitsByLimitId: buckets,
-  });
-
-  const reserve = (reason: unknown): unknown => ({
-    ...RESERVE_BUCKET,
-    rateLimitReachedType: reason,
-  });
-  const account = (reason: unknown): unknown => ({
-    ...ACCOUNT_BUCKET,
-    rateLimitReachedType: reason,
-  });
-
-  it.each([
-    ["a workspace restriction on the account quota", account(WORKSPACE), true],
-    ["a workspace restriction on the reserve", reserve(WORKSPACE), true],
-    ["a consumption refusal on the reserve", reserve(CONSUMPTION), false],
-    ["no restriction at all", account(null), false],
-  ])("with the gate unanswered, %s sets the statement: %s", (_case, bucket, expected) => {
-    expect(codexAccountUsageView(gateSilent({ b: bucket }), NOW).blocked).toBe(expected);
-  });
-
-  it("routes a workspace restriction from a bucket it cannot even classify", () => {
-    // No `normalModelSlug` key, so the bucket is skipped and reported — but a
-    // workspace fact is not a property of the quota that carried it.
-    const { normalModelSlug: _dropped, ...unclassifiable } = ACCOUNT_BUCKET;
-    const view = codexAccountUsageView(
-      gateSilent({ codex: { ...unclassifiable, rateLimitReachedType: WORKSPACE } }),
-      NOW,
-    );
-    expect(view.blocked).toBe(true);
-    expect(view.diagnostics.map((d) => d.kind)).toContain("bucket-without-model-association");
-  });
-
-  it("treats an unrecognised restriction kind as unattributable rather than absent", () => {
-    // An additive enum on an experimental protocol: a sixth value must still
-    // reach the statement rather than marking a bar or vanishing.
-    const view = codexAccountUsageView(gateSilent({ codex: account("something_new") }), NOW);
-    expect(view.blocked).toBe(true);
-    expect(view.windows[0]?.limitReached).toBeUndefined();
-  });
-
-  it("drops an unrecognised restriction kind reported only on the reserve", () => {
-    // Saying something about the account on an unknown reason, reported against
-    // a quota we do not render, would assert more than we know.
-    expect(codexAccountUsageView(gateSilent({ r: reserve("something_new") }), NOW).blocked).toBe(
-      false,
-    );
-  });
-});
-
-/// The claim the comments make, asserted as a property over every combination
-/// rather than trusted as prose beside code that cannot enforce it.
-///
-/// Three defects in this area were all a sweeping comment covering a branch the
-/// code did not reach. A cross-product test fails on the first such branch and
-/// keeps failing for the next one, which is what prose cannot do.
-describe("no reported restriction disappears without a recorded reason", () => {
-  const REASONS = [
-    "rate_limit_reached",
-    "workspace_owner_credits_depleted",
-    "workspace_member_credits_depleted",
-    "workspace_owner_usage_limit_reached",
-    "workspace_member_usage_limit_reached",
-    "an_unrecognised_future_kind",
-  ];
-
-  const SCOPES = [
-    { name: "account-wide, one window", bucket: { ...ACCOUNT_BUCKET } },
-    {
-      name: "account-wide, two windows",
-      bucket: { ...ACCOUNT_BUCKET, primary: window(30, 300, 1800), secondary: window(90, 10080) },
-    },
-    {
-      name: "account-wide, window expired",
-      bucket: { ...ACCOUNT_BUCKET, primary: window(100, 10080, -60) },
-    },
-    { name: "model-scoped reserve", bucket: { ...RESERVE_BUCKET } },
-  ];
-
-  /// The one combination that is *supposed* to produce nothing: a reserve
-  /// reporting its own consumption is spent, which says nothing about ordinary
-  /// work. An unrecognised kind on a reserve is silent for the same reason —
-  /// asserting an account-level restriction from an unknown reason on a quota we
-  /// do not render would claim more than we know.
-  const deliberatelySilent = (scope: string, reason: string): boolean =>
-    scope === "model-scoped reserve" && !reason.startsWith("workspace_");
-
-  for (const scope of SCOPES) {
-    for (const reason of REASONS) {
-      it(`${scope.name} + ${reason}`, () => {
-        // Gate left unanswered so the bucket's restriction is the only source.
-        const view = codexAccountUsageView(
-          { rateLimitsByLimitId: { b: { ...scope.bucket, rateLimitReachedType: reason } } },
-          NOW,
-        );
-        const markedBar = view.windows.some((w) => w.limitReached === true);
-        const surfaced = markedBar || view.blocked;
-        if (deliberatelySilent(scope.name, reason)) {
-          expect(surfaced).toBe(false);
-        } else {
-          expect(surfaced).toBe(true);
-        }
-        // Never both: a bar carrying it makes the account line a duplicate.
-        expect(markedBar && view.blocked).toBe(false);
-      });
-    }
-  }
-});
-
-describe("codexAccountUsageView gate precedence", () => {
-  const capped = {
-    ...ACCOUNT_BUCKET,
-    primary: window(30, 300, 1800),
-    secondary: window(100, 10080),
-    rateLimitReachedType: "rate_limit_reached",
-  };
-
-  it("lets an explicit permission override an unattributable restriction", () => {
-    // The schema calls this field the backend's validated permission for
-    // ordinary usage, so when it speaks it is the authority. Without this the app
-    // tells a user they are blocked immediately after Codex said they are not.
-    const view = codexAccountUsageView(
-      { ordinaryUsageAllowed: true, rateLimitsByLimitId: { codex: capped } },
-      NOW,
-    );
-    expect(view.blocked).toBe(false);
-  });
-
-  it("reports the contradiction rather than resolving it in silence", () => {
-    const view = codexAccountUsageView(
-      { ordinaryUsageAllowed: true, rateLimitsByLimitId: { codex: capped } },
-      NOW,
-    );
-    expect(view.diagnostics).toEqual([
-      { kind: "restriction-despite-permission", limitId: "codex" },
-    ]);
-  });
-
-  it("states the restriction on an explicit denial even with no bucket signal", () => {
-    const view = codexAccountUsageView(
-      { ordinaryUsageAllowed: false, rateLimitsByLimitId: { codex: ACCOUNT_BUCKET } },
-      NOW,
-    );
-    expect(view.blocked).toBe(true);
-    expect(view.diagnostics).toEqual([]);
-  });
-
-  it("leaves a bar marked from its own measurement even when permission is granted", () => {
-    // A window-scoped mark is not an account-level claim, so it does not defer
-    // to the account-level answer.
-    const single = {
-      ...ACCOUNT_BUCKET,
-      primary: window(100, 10080),
-      rateLimitReachedType: "rate_limit_reached",
-    };
-    const view = codexAccountUsageView(
-      { ordinaryUsageAllowed: true, rateLimitsByLimitId: { codex: single } },
-      NOW,
-    );
-    expect(view.windows[0]?.limitReached).toBe(true);
-    expect(view.blocked).toBe(false);
   });
 });
 

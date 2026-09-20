@@ -134,6 +134,28 @@ describe("Claude rate-limit fallback (no unifiedWindows)", () => {
     expect(overage).toHaveClass("text-warning");
   });
 
+  it("leaves a spent window neutral while the user is paying for overage", async () => {
+    // Requests still succeed on credits here, so the bar must not read as a
+    // block — the escalation beneath it is what explains the state. This is
+    // asserted at the component because the reader cannot see it: the reader
+    // correctly leaves the window unflagged, and the regression this guards
+    // was the *meter template* colouring it anyway on a full-bar rule written
+    // for Codex.
+    await renderClaudeWithRateLimit(
+      {
+        status: "rejected",
+        rateLimitType: "seven_day",
+        isUsingOverage: true,
+        overageResetsAt: epochFromNow(6 * 86400),
+        unifiedWindows: { seven_day: { utilization: 1, resetsAt: epochFromNow(5 * 86400) } },
+      },
+      null,
+    );
+    expect(screen.getByTestId("harness-usage-window")).toHaveTextContent("100%");
+    expect(screen.getByTestId("harness-usage-window-fill")).not.toHaveClass("bg-warning");
+    expect(screen.getByTestId("harness-usage-overage")).toHaveClass("text-warning");
+  });
+
   it("drops the overage escalation once the overage window has passed", async () => {
     // isUsingOverage true, but the overage window elapsed → the credit window
     // has cycled, so the escalation is stale and hidden. The still-future
@@ -479,7 +501,6 @@ function codexBucket(overrides: Record<string, unknown> = {}): Record<string, un
     limitName: null,
     normalModelSlug: null,
     primary: { usedPercent: 42.0, windowDurationMins: 10080, resetsAt: epochFromNow(86_400) },
-    rateLimitReachedType: null,
     ...overrides,
   };
 }
@@ -489,12 +510,9 @@ function codexAccount(buckets: Record<string, unknown>): unknown {
   return { ordinaryUsageAllowed: true, rateLimitsByLimitId: buckets };
 }
 
-async function renderCodexAccountUsage(
-  buckets: Record<string, unknown>,
-  ordinaryUsageAllowed = true,
-): Promise<void> {
+async function renderCodexAccountUsage(buckets: Record<string, unknown>): Promise<void> {
   usage.observeUsage("codex", {
-    payload: { ordinaryUsageAllowed, rateLimitsByLimitId: buckets },
+    payload: { ordinaryUsageAllowed: true, rateLimitsByLimitId: buckets },
     observed_at: new Date().toISOString(),
   });
   render(HarnessUsage);
@@ -606,60 +624,22 @@ describe("Codex account quotas", () => {
     }
   });
 
-  it("draws a quota amber when Codex reports it exhausted, without inflating the number", async () => {
-    // The bar shows what Codex measured. The cell this replaced overwrote the
-    // measurement with 100%, because the per-turn payload recorded no number on
-    // a refusal and the stale one would have contradicted the refusal beside it.
+  it("draws a spent quota as a full amber bar", async () => {
+    // The tone comes from the bar being full, not from Codex's reason code.
+    // That keeps a rename or a new value upstream from changing what renders.
     await renderCodexAccountUsage({
       codex: codexBucket({
-        primary: { usedPercent: 97, windowDurationMins: 10080, resetsAt: epochFromNow(86_400) },
-        rateLimitReachedType: "rate_limit_reached",
+        primary: { usedPercent: 100, windowDurationMins: 10080, resetsAt: epochFromNow(86_400) },
       }),
     });
-    const meter = screen.getByTestId("harness-usage-window");
-    expect(meter).toHaveTextContent("97%");
+    expect(screen.getByTestId("harness-usage-window")).toHaveTextContent("100%");
     expect(screen.getByTestId("harness-usage-window-fill")).toHaveClass("bg-warning");
-  });
-
-  it("flags only the quota that reports itself exhausted", async () => {
-    // Each bucket carries its own verdict, so a spent 5-hour quota cannot
-    // condemn the weekly one — days of waiting claimed for an hour of it, which
-    // is what the old most-used guess risked on every refusal.
-    await renderCodexAccountUsage({
-      five_hour: codexBucket({
-        limitId: "five_hour",
-        primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: epochFromNow(1800) },
-        rateLimitReachedType: "rate_limit_reached",
-      }),
-      weekly: codexBucket({
-        limitId: "weekly",
-        primary: { usedPercent: 30, windowDurationMins: 10080, resetsAt: epochFromNow(86_400) },
-      }),
-    });
-    const fills = screen.getAllByTestId("harness-usage-window-fill");
-    expect(fills).toHaveLength(2);
-    expect(fills[0]).toHaveClass("bg-warning");
-    expect(fills[1]).not.toHaveClass("bg-warning");
   });
 
   it("leaves a healthy quota in the neutral tone", async () => {
     await renderCodexAccountUsage({ codex: codexBucket({ primary: { usedPercent: 93 } }) });
     expect(screen.getByTestId("harness-usage-window")).toHaveTextContent("93%");
     expect(screen.getByTestId("harness-usage-window-fill")).not.toHaveClass("bg-warning");
-  });
-
-  it("states exhaustion inline, without waiting for a hover", async () => {
-    // The section has no collapsed state, so the claim a warning line used to
-    // carry belongs to the meter itself: the percentage and the tone in the row.
-    await renderCodexAccountUsage({
-      codex: codexBucket({
-        primary: { usedPercent: 100, resetsAt: epochFromNow(86_400) },
-        rateLimitReachedType: "rate_limit_reached",
-      }),
-    });
-    const meter = screen.getByTestId("harness-usage-window");
-    expect(meter).toHaveTextContent("100%");
-    expect(screen.getByTestId("harness-usage-window-fill")).toHaveClass("bg-warning");
   });
 
   it("renders nothing for a Codex entry still holding the old rollout shape", async () => {
@@ -715,44 +695,24 @@ describe("Codex account quotas", () => {
     expect(meters[1]).toHaveTextContent("Weekly · all models");
   });
 
-  it("states an account-level restriction beside the meters", async () => {
-    await renderCodexAccountUsage({ codex: codexBucket() }, false);
-    expect(screen.getByTestId("harness-usage-blocked")).toBeInTheDocument();
-    expect(screen.getByTestId("harness-usage-window")).toBeInTheDocument();
-  });
-
-  it("states an account-level restriction even when no meter survives", async () => {
-    // The shapes that produce a restriction most often leave nothing to draw —
-    // a workspace limit against windows that have all cycled. Hiding the row
-    // for want of a meter would suppress the harness's own explicit answer at
-    // the moment it matters most.
-    await renderCodexAccountUsage(
-      {
-        codex: codexBucket({
-          primary: { usedPercent: 100, windowDurationMins: 10080, resetsAt: epochFromNow(-60) },
-        }),
-      },
-      false,
-    );
-    expect(screen.getByTestId("harness-usage-codex")).toBeInTheDocument();
-    expect(screen.getByTestId("harness-usage-blocked")).toBeInTheDocument();
-    expect(screen.queryByTestId("harness-usage-window")).toBeNull();
-  });
-
-  it("says nothing about restriction on a healthy account", async () => {
-    await renderCodexAccountUsage({ codex: codexBucket() });
-    expect(screen.queryByTestId("harness-usage-blocked")).toBeNull();
-  });
-
-  it("leaves every bar neutral when a workspace restriction is in force", async () => {
-    // A workspace credit problem is not a statement about any window's
-    // consumption, so no bar turns amber for it; the account line carries it.
-    await renderCodexAccountUsage(
-      { codex: codexBucket({ rateLimitReachedType: "workspace_owner_credits_depleted" }) },
-      false,
-    );
-    expect(screen.getByTestId("harness-usage-window-fill")).not.toHaveClass("bg-warning");
-    expect(screen.getByTestId("harness-usage-blocked")).toBeInTheDocument();
+  it("marks only the spent quota, leaving its sibling neutral", async () => {
+    // The behaviour survived the reason-code deletion; its old test did not,
+    // because that test's fixture drove the tone from a reason code. Restored
+    // in measurement terms: the threshold applies to the full window only.
+    await renderCodexAccountUsage({
+      five_hour: codexBucket({
+        limitId: "five_hour",
+        primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: epochFromNow(1800) },
+      }),
+      weekly: codexBucket({
+        limitId: "weekly",
+        primary: { usedPercent: 30, windowDurationMins: 10080, resetsAt: epochFromNow(86_400) },
+      }),
+    });
+    const fills = screen.getAllByTestId("harness-usage-window-fill");
+    expect(fills).toHaveLength(2);
+    expect(fills[0]).toHaveClass("bg-warning");
+    expect(fills[1]).not.toHaveClass("bg-warning");
   });
 
   it("asks the account for a fresh reading when the panel mounts", async () => {

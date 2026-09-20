@@ -118,6 +118,14 @@ pub struct CodexAccountUsage {
     /// `None` means the backend did not say. The schema is explicit that
     /// clients "must not infer recovery from percentages or reset times", so an
     /// absent value is absence, never a healthy default.
+    ///
+    /// **Carried and deliberately unread.** This crate extracts it and the IPC
+    /// layer transports it, but no rendering or decision logic consumes it: the
+    /// meter draws bars from each quota's measured percentage and makes no
+    /// account-level claim about whether work is permitted. Kept because
+    /// forwarding it costs nothing and it is the field to reach for if such a
+    /// statement is ever wanted — so its extraction does not read as arbitrary
+    /// to the next person here.
     pub ordinary_usage_allowed: Option<bool>,
     /// Every metered quota, keyed by Codex's `limit_id` (`codex`,
     /// `base_model_inference`, …).

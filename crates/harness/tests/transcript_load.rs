@@ -732,8 +732,9 @@ fn assert_claude_agent_usage(turn: &Turn) {
 }
 
 /// Codex's parser enriches `usage.context_window` from
-/// `task_started.model_context_window` and carries `last_rate_limit` from
-/// `token_count.rate_limits` — both load-bearing for the sidebar.
+/// `task_started.model_context_window`, which is what the sidebar's context
+/// gauge reads. The rollout's quota reading is deliberately not carried — see
+/// the assertion above that it stays absent.
 fn assert_codex_agent_usage(turn: &Turn) {
     let Turn::Agent { usage, .. } = turn else {
         unreachable!("caller already matched Turn::Agent");

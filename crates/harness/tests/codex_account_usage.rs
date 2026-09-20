@@ -102,11 +102,12 @@ async fn a_recovered_account_clears_the_exhaustion_flag_rather_than_leaving_it_s
     // produced on demand by spending quota, and this one cannot be produced at
     // all until a reset happens to land.
     //
-    // It answers the question the meter's "exhausted" rule rests on. A bucket
-    // that has recovered reports `usedPercent: 0` against a *new* `resetsAt`
-    // and drops `rateLimitReachedType` back to null — the flag tracks the live
-    // window rather than latching on the account. Were it sticky, a recovered
-    // quota would keep rendering as blocked until the app forgot it.
+    // Its durable value is the recorded fact that a recovered bucket reports
+    // `usedPercent: 0` against a *new* `resetsAt` — recovery is a fresh window,
+    // not the old one with its counter zeroed, which is what lets the meter's
+    // exhausted rule read the percentage alone. The reason code dropping back
+    // to null is recorded too, as a property of a field nothing reads: it
+    // tracks the live window rather than latching on the account.
     let dir = tempfile::TempDir::new().unwrap();
     let shim = recorded_shim(dir.path(), "account-rate-limits-healthy");
 

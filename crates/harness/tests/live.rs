@@ -4658,15 +4658,22 @@ async fn live_codex_account_usage_read_returns_named_buckets() {
             bucket.is_object(),
             "bucket {limit_id} should be an object: {bucket}"
         );
-        // The field M2 filters on to tell an account-wide allowance from a
-        // model-specific reserve. It is legitimately `null` on the account-wide
-        // buckets — what matters is that the key still exists, because its
-        // *absence* would silently turn every bucket into an account-wide one.
+        // The field the reader filters on to tell an account-wide allowance
+        // from a model-specific reserve. It is legitimately `null` on the
+        // account-wide buckets — what matters is that the key still exists. A
+        // bucket missing it is skipped and reported rather than assumed
+        // account-wide, so a rename does not mislabel a reserve; it empties the
+        // section instead, which is why the key's presence is asserted here.
         assert!(
             bucket.get("normalModelSlug").is_some(),
             "bucket {limit_id} should carry `normalModelSlug` (null is fine): {bucket}"
         );
-        // Exhaustion comes from the harness, never from our own arithmetic.
+        // **Not a dependency — a watched field.** Exhaustion is inferred from
+        // `usedPercent` reaching 100; this reason code is deliberately unread
+        // (four of its five values are team/business billing states). Asserted
+        // anyway because it is the only structured "you are blocked" signal the
+        // payload carries, so we want to know if it disappears before deciding
+        // whether to read it.
         assert!(
             bucket.get("rateLimitReachedType").is_some(),
             "bucket {limit_id} should carry `rateLimitReachedType`: {bucket}"
@@ -4697,12 +4704,13 @@ async fn live_codex_account_usage_read_returns_named_buckets() {
     }
 
     // Asserted rather than merely typed. `lift_usage` collapses "absent" and
-    // "null" into `None`, which is right for rendering and useless for drift
-    // detection: were the field renamed, every read would report "unknown"
-    // forever and a type-shaped check would pass. A failure here means one of
-    // two things worth knowing — the field moved, or a real account genuinely
-    // returns null, which would itself be news since the exhaustion rule
-    // assumes otherwise.
+    // "null" into `None`, which is right for carrying the value and useless for
+    // drift detection: were the field renamed, every read would report
+    // "unknown" forever and a type-shaped check would pass. Nothing renders
+    // from it — it states whether the account may work, which is a different
+    // question from how full a window is — so this is a watched field like the
+    // reason code above: a failure means the field moved, or a real account
+    // returns null, and either is worth knowing before anything depends on it.
     assert!(
         usage.ordinary_usage_allowed.is_some(),
         "the account-level usage gate should carry a value: {usage:?}"

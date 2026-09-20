@@ -190,9 +190,16 @@ defeat an automatic fallback to the reserve, making this a dispatch bug rather t
 
 - **There is no dispatch bug.** Unpinning does not reach the reserve; the hypothesis is refuted and
   no change to `build_args` follows.
-- **`normalModelSlug` is a display alias, not a dispatchable slug** — consistent with the schema
-  ("Normal model whose display name and reasoning options describe this quota alias"). `limitName`
-  happens to be the dispatchable one here. Do not assume either field is a model you can send.
+- **`normalModelSlug` does not select the quota it is attached to** — pinning it was refused exactly
+  as the unpinned dispatch was, while `limitName` reached the reserve. So neither field can be
+  assumed to name the model that reaches a given quota, consistent with the schema calling it a
+  description ("Normal model whose display name and reasoning options describe this quota alias").
+
+  **Correction (M5):** this bullet originally read "`normalModelSlug` is a display alias, not a
+  dispatchable slug," which the repo falsifies — `gpt-5.6-luna` is a shipping picker option and two
+  live tests dispatch it and require completion. A quota refusal means the allowance is spent, not
+  that the identifier is invalid (a bad `-m` returns a 400). The narrowed claim above is what the
+  probe actually supports, and it is the one M2 filters on.
 - **A model-scoped quota is identifiable by `normalModelSlug` being non-null.** This is the rule M2
   filters on.
 
@@ -1162,6 +1169,79 @@ they asserted behavior that no longer exists.
 - **Three code comments** claiming the `usage_limit` kind drives a meter — `src/lib/types.ts`,
   `src/lib/state/types.ts`, and `classify_outcome`'s doc in `crates/harness/src/codex/mod.rs`, where
   the narrowness rationale rested on a full meter being drawn for a transient throttle.
+
+### Review corrections (2026-09-19)
+
+Seven corrections after review, all documentation and comments. Three corrected claims made in the
+first pass, and they share one cause worth naming: each was verified at a single layer or against a
+single symbol set and then reported as complete.
+
+- **`system-design.md` said neither harness marks a reading from a refusal.** False for Claude, which
+  still takes a window's tone from the refusal payload while excluding served-overage turns — the
+  sentence borrowed the code comment's first clause as evidence against its second. The paragraph is
+  now **two explicit harness contracts**, because the claims that were wrong were the ones stated
+  once for both. The sentence it replaced was accurate for Claude and wrong only for Codex, so the
+  first correction flipped which harness it was wrong about. `harness-behavior.md`'s "newest _whole_
+  reading per harness" is corrected with it.
+- **Four stale rationales in the Codex quota tests, not one.** Beyond the `transcript_load.rs`
+  helper, the live account-read test explained three assertions by rules M2 deleted (that a missing
+  model association would promote buckets to account-wide, that exhaustion comes from the reason code
+  rather than our arithmetic, that the permission flag feeds an exhaustion rule), and
+  `codex_account_usage.rs` framed a fixture around the same reason code. Every assertion is kept and
+  reframed as a watched field. **Why the first sweep could not find them:** it grepped the _deleted_
+  field names, and these are comments about _surviving_ fields that explain them via deleted
+  consumers. A symbol sweep cannot reach that class.
+- **Class E claimed one member.** Antigravity's quota meets the definition (§5.1: answers outside any
+  turn, probed, built, cut on cost). Its cell is now `E, unbuilt` and the restart column reads "when
+  built", so the build decision sits in the cell rather than in the class — which is the table's own
+  rule that a class states where the harness puts a datum.
+- **The README promised the meter recovers on its own.** Nothing in the panel responds to time
+  passing: neither the value nor the reset-passed drop re-evaluates while it sits open. Copy now
+  names both refresh paths and the absence of a timer, and the reset-passed rule is documented as
+  evaluated on recompute rather than continuously.
+- **A clock tick was considered and rejected**, reversing this plan's first instinct. It would fire
+  the drop while mounted and _empty_ the Codex section rather than correct it — the blank-panel
+  failure the harness-scoped card exists to prevent (G8's 18-agent measurement). It had also already
+  been declined, with the reasoning recorded in `HarnessUsage.svelte`. **G38** files the shape worth
+  building instead — ask for a reading when a reset elapses — with its open questions and the fact
+  that it has no Claude analogue.
+- **"`normalModelSlug` is not a dispatchable slug" is falsified by this repo**: it is a shipping
+  picker option and two live tests dispatch it and require completion. Narrowed to what the probe
+  supports, here and in the probe-results section above.
+- **The playbook's "a rename fails silently" was wrong in both directions.** A vanished bucket map is
+  already guarded by `lift_usage` unless the legacy view moves with it, and two other fields log a
+  deduplicated warning — while the field whose rename costs the most, `resetsAt`, was described as
+  the mildest case. Replaced with the per-field consequences, worst first, and the test instruction
+  corrected: a stale reading is only reachable by failing a read against a restored one, never by
+  taking a fresh one. The proposal to skip a window with an unreadable reset is **withdrawn** — the
+  current behavior is deliberate, documented and tested, on the grounds that absence is
+  indistinguishable from a rename.
+
+Also corrected: the read-coalescing guarantee is one read at a time with a single pending follow-up,
+not two reads per burst.
+
+**Then the schema was actually read, rather than reasoned about, and it settled three of those
+corrections and opened a fourth.** `codex app-server generate-json-schema` costs nothing and needed
+running once — the review round spent two exchanges arguing about field optionality that one local
+command answers.
+
+- `RateLimitWindow` **requires only `usedPercent`**; `resetsAt` and `windowDurationMins` are optional
+  and nullable. So the reader rendering a window with no reset, and falling back to a neutral label
+  with no duration, is the **correct read of the contract** rather than a tolerated gap — and no
+  diagnostic is warranted for either, because absence is a documented option indistinguishable from a
+  rename. The register question is closed and the playbook's rename list corrected accordingly.
+- `RateLimitSnapshot` declares **no required fields at all**, so a bucket omitting `normalModelSlug`
+  is schema-legal. The reader still treats it as a reportable condition, and the live test still
+  asserts the key is present — both now recorded as deliberately **stricter than the contract**,
+  because the safe failure is an empty section and the unsafe one is labelling a reserve as the
+  account allowance.
+- **`ordinaryUsageAllowed`'s meaning, read off the schema:** the backend's permission for "ordinary
+  included usage," with the instruction *"clients must not infer recovery from percentages or reset
+  times."* `supportsLunaReserve` corroborates the scope — the reserve is the fallback "after ordinary
+  usage is blocked" — which matches the probe. Recorded in G8 as Codex behavior. It was briefly filed
+  as a gap-register entry instead, which was wrong twice over: the register is for work Switchboard
+  should do, and what the card renders was already decided. A harness fact belongs in the harness
+  record whether or not anything reads it.
 
 ---
 

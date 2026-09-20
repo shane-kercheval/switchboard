@@ -149,13 +149,21 @@
        carry them off screen. `shrink-0` beside the roster section's `flex-1`
        is what pins it to the panel's foot — the roster absorbs every spare
        pixel and scrolls when it runs out, this strip keeps its content height. -->
-  <section class="border-border/80 shrink-0 border-t px-2 pb-2" data-testid="harness-usage">
+  <section
+    class="border-border/80 bg-raised shrink-0 border-t px-2 pb-3"
+    data-testid="harness-usage"
+  >
     <div
       class="text-muted flex h-8 items-center px-1 text-[11px] leading-none font-semibold tracking-wide uppercase"
     >
       Usage limits
     </div>
-    <div class="flex flex-col gap-2">
+    <!-- Deliberately tighter under the header than the agent roster, which puts
+         its first row 12px down (`pt-1` plus the rows' `py-2`). This section is
+         pinned to the panel's foot, so its height is what decides whether the
+         strip lines up with the pane edges beside it; the roster absorbs slack
+         and has no such constraint. -->
+    <div class="flex flex-col gap-2 pt-[7px]">
       {#each rows as row (row.harness)}
         <Tooltip side="left">
           {#snippet trigger(props)}
@@ -165,7 +173,7 @@
             <div
               {...props}
               tabindex="0"
-              class="cursor-default space-y-1 rounded-md px-1 py-0.5 text-xs"
+              class="cursor-default space-y-1 rounded-md px-1 py-0.5 text-[13px]"
               data-testid={`harness-usage-${row.harness}`}
             >
               <!-- `mb-2` against the list's own `space-y-1`: adjacent margins
@@ -175,7 +183,7 @@
                    another row in the same rhythm. -->
               <div class="mb-2 flex items-center gap-1.5">
                 <HarnessIcon harness={row.harness} size="sm" class="h-3.5 w-3.5" />
-                <span class="text-fg text-[11px] font-medium">{HARNESS_LABEL[row.harness]}</span>
+                <span class="text-fg text-xs font-medium">{HARNESS_LABEL[row.harness]}</span>
               </div>
               {#each row.windows as w (w.key)}
                 <Meter
@@ -188,6 +196,7 @@
                     ? "neutral"
                     : "warning"}
                   testid="harness-usage-window"
+                  class="text-xs"
                 />
               {/each}
               {#if row.fallback !== null}

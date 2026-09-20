@@ -31,3 +31,20 @@ export function supportsManualCompaction(harness: HarnessKind | undefined): bool
 export function supportsContextReport(harness: HarnessKind | undefined): boolean {
   return harness === "claude_code";
 }
+
+/// Whether Switchboard can read this harness's **account quotas directly**,
+/// without waiting for a turn to report them.
+///
+/// Codex only, and the capability is narrower than "has quota data". Every
+/// harness reports *something* about usage as a side effect of running a turn.
+/// What this names is the ability to ask the account, on demand, for every
+/// metered limit it holds — which for Codex means a separate app-server call,
+/// and which Claude has no equivalent of: its windows arrive with a turn's
+/// response and nowhere else.
+///
+/// Gates which harness sections a self-refreshing read may serve. Without it
+/// the UI would decide by harness name, which is the thing these mirrors exist
+/// to stop.
+export function supportsAccountUsageRead(harness: HarnessKind | undefined): boolean {
+  return harness === "codex";
+}

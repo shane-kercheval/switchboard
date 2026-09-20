@@ -716,7 +716,7 @@ async fn dispatch_with_home_and_options(
 }
 
 #[tokio::test]
-async fn first_turn_emits_enriched_turn_end_rate_limit_and_session_meta() {
+async fn first_turn_emits_enriched_turn_end_and_session_meta_but_no_rate_limit() {
     // First-turn dispatch with a real session file staged at today's date
     // partition + MCP config + a skill. Asserts the full enriched event
     // sequence: TurnEnd(enriched) → RateLimitEvent → SessionMeta.
@@ -759,22 +759,29 @@ command = "x"
 
     let events = dispatch_with_home(&agent, cwd.path(), home.path(), &fixture("text-only")).await;
 
-    // Locate the TurnEnd, RateLimitEvent, SessionMeta — and verify ordering.
+    // Locate the TurnEnd and SessionMeta — and verify ordering.
     let terminal_idx = events
         .iter()
         .position(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
         .expect("TurnEnd present");
-    let rate_limit_idx = events
-        .iter()
-        .position(|e| matches!(e, AdapterEvent::RateLimitEvent { .. }))
-        .expect("RateLimitEvent emitted post-terminal");
     let session_meta_idx = events
         .iter()
         .position(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
         .expect("SessionMeta emitted on first turn");
     assert!(
-        terminal_idx < rate_limit_idx && rate_limit_idx < session_meta_idx,
-        "order must be TurnEnd → RateLimitEvent → SessionMeta; got indices {terminal_idx}, {rate_limit_idx}, {session_meta_idx}"
+        terminal_idx < session_meta_idx,
+        "order must be TurnEnd → SessionMeta; got indices {terminal_idx}, {session_meta_idx}"
+    );
+    // **No rate-limit event, and this is the assertion that keeps it gone.** The
+    // rollout still carries `token_count.rate_limits`; reading it produced one
+    // unnamed bucket that could not say which quota it described, so quotas are
+    // asked for over the app-server protocol instead and that read is not an
+    // adapter event.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::RateLimitEvent { .. })),
+        "Codex must emit no rate-limit event from its rollout"
     );
 
     // Enriched context_window from task_started.model_context_window.
@@ -787,17 +794,6 @@ command = "x"
             );
         }
         other => panic!("expected TurnEnd with Some(usage), got {other:?}"),
-    }
-
-    // RateLimitEvent.info carries the rate_limits object verbatim.
-    match &events[rate_limit_idx] {
-        AdapterEvent::RateLimitEvent { info, .. } => {
-            assert_eq!(
-                info.pointer("/primary/used_percent"),
-                Some(&serde_json::Value::from(42.0))
-            );
-        }
-        _ => unreachable!(),
     }
 
     assert_first_turn_session_meta(&events[session_meta_idx]);
@@ -850,7 +846,7 @@ fn assert_first_turn_session_meta(event: &AdapterEvent) {
 }
 
 #[tokio::test]
-async fn resume_turn_emits_session_meta_and_rate_limit_and_enriches() {
+async fn resume_turn_emits_session_meta_and_enriches_but_no_rate_limit() {
     // A resuming agent carries its locator on the record, so the adapter treats
     // this as a resume — and must still emit `SessionMeta`. The inventory in
     // the rollout changes between turns (a skill installed, a command
@@ -875,21 +871,19 @@ async fn resume_turn_emits_session_meta_and_rate_limit_and_enriches() {
         .iter()
         .position(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
         .expect("TurnEnd present");
-    let rate_limit_idx = events
-        .iter()
-        .position(|e| matches!(e, AdapterEvent::RateLimitEvent { .. }))
-        .expect("RateLimitEvent emitted every turn");
-    assert!(
-        terminal_idx < rate_limit_idx,
-        "RateLimitEvent must follow TurnEnd on resume turns too; got indices {terminal_idx}, {rate_limit_idx}"
-    );
     let session_meta_idx = events
         .iter()
         .position(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
         .expect("SessionMeta must fire on a resume turn, not only the first");
     assert!(
         terminal_idx < session_meta_idx,
-        "SessionMeta must follow TurnEnd, like the rate-limit event; got indices {terminal_idx}, {session_meta_idx}"
+        "SessionMeta must follow TurnEnd; got indices {terminal_idx}, {session_meta_idx}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::RateLimitEvent { .. })),
+        "Codex must emit no rate-limit event from its rollout, on a resume turn either"
     );
     // TurnEnd is still enriched.
     let enriched_window = events.iter().find_map(|e| match e {
@@ -1102,12 +1096,14 @@ async fn cross_midnight_uses_record_date_not_today() {
         Some(Some(258_400)),
         "enrichment must use the record's partition_date (yesterday), not today"
     );
-    // Also confirms the RateLimitEvent path traverses the cross-day file.
+    // The enriched window above is the proof of traversal: it can only come from
+    // yesterday's file. There is no longer a rate-limit event to corroborate it —
+    // Codex's quotas come from the account read, not the rollout.
     assert!(
-        events
+        !events
             .iter()
             .any(|e| matches!(e, AdapterEvent::RateLimitEvent { .. })),
-        "RateLimitEvent found in yesterday's session file"
+        "Codex must emit no rate-limit event from its rollout"
     );
 }
 

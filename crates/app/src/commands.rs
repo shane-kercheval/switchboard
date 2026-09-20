@@ -4784,9 +4784,14 @@ fn apply_turnmeta_overlay(
 ///
 /// - **Rate limit** (transcript-level): fills `last_rate_limit` (+ its
 ///   `last_rate_limit_as_of` capture time) *only* when the loader left it
-///   unset. A loader-provided value is a class-B source (e.g. Codex's
-///   session-file rate-limit) that's already durable and authoritative — it
-///   wins, and carries no `as_of` qualifier because it isn't a stale snapshot.
+///   unset. A loader-provided value would be a class-B source — already durable
+///   and authoritative — so it wins and carries no `as_of` qualifier, because it
+///   isn't a stale snapshot. **No loader provides one today**: Codex's
+///   session-file rate-limit was the only class-B reading and it is gone, since
+///   the rollout reports one unnamed bucket whichever limit it describes and
+///   Codex's quotas are asked for over its app-server protocol instead. The
+///   precedence rule stays because it belongs to this function rather than to a
+///   harness, and it is what a future durable reading would land on.
 /// - **Context window** (per-turn): Claude's window is stream-only, so a
 ///   hydrated turn has `usage.context_window == None`. Reattach the latest
 ///   snapshot only to the exact final assistant message that produced it,
@@ -5350,11 +5355,6 @@ pub struct AgentConversationMeta {
     /// sidecar (stream-only/class-C value); drives the UI staleness
     /// qualifier. `None` for live values and for class-B (durable) sources.
     pub last_rate_limit_as_of: Option<chrono::DateTime<chrono::Utc>>,
-    /// When the harness measured `last_rate_limit`, for ordering this agent's
-    /// reading against other agents' readings of the same account-scoped quota.
-    /// Distinct from `last_rate_limit_as_of`, which is a staleness qualifier
-    /// shown to the user; see `LoadedTranscript::last_rate_limit_observed_at`.
-    pub last_rate_limit_observed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Capture time of `meta.inventory` when restored from the metadata
     /// sidecar. Same qualifier role as `last_rate_limit_as_of`: `None` means
     /// the inventory is live or re-read from a durable harness file.
@@ -6462,7 +6462,6 @@ fn merge_project_conversation(
             last_rate_limit: transcript.last_rate_limit,
             last_rate_limit_model: transcript.last_rate_limit_model,
             last_rate_limit_as_of: transcript.last_rate_limit_as_of,
-            last_rate_limit_observed_at: transcript.last_rate_limit_observed_at,
             meta_as_of: transcript.meta_as_of,
             last_context_report: transcript.last_context_report,
             last_context_report_at: transcript.last_context_report_at,
@@ -6925,6 +6924,216 @@ pub fn check_codex_auth_impl(home_dir: &Path) -> Result<(), AppError> {
     }
 }
 
+/// Read the Codex account's metered quotas — every limit it holds, each named
+/// by Codex. `None` means "no reading available", never "something went wrong."
+///
+/// **Returns `Option`, not `Result`, and that is the contract rather than
+/// laziness.** This is a background refresh of a meter: the caller's only
+/// sensible response to any failure is to keep showing the reading it already
+/// has. Handing the frontend an error would invite it to render one, and a
+/// banner saying the quota read failed is noise about a number the user did not
+/// ask to be updated. Every failure mode — no binary, failed spawn, timeout,
+/// logged out, a protocol that moved — collapses here, logged once at `warn`
+/// with the reason intact.
+///
+/// What a change in account-usage outcome is worth saying.
+///
+/// A value rather than a `tracing` call inside the read, so the de-duplication
+/// rule is something a test can assert on directly. The previous version stored
+/// the reason and logged inline, which left no way to check *how many times* a
+/// warning fired — its test passed after a single call and would have passed
+/// with the suppression deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountUsageLog {
+    /// A failure that differs in kind from whatever came before it.
+    Failure,
+    /// The read started working again after a failure.
+    Recovery,
+}
+
+/// Decide whether an account-usage outcome is worth a log line.
+///
+/// Both arguments are failure *kinds* (`AccountUsageError::kind`), never
+/// rendered messages: the messages for the silence variants interpolate
+/// whatever the server printed, so keying on them would emit a line per refresh
+/// for a single unchanging condition.
+#[must_use]
+pub fn account_usage_log_decision(
+    last: Option<&str>,
+    now: Option<&str>,
+) -> Option<AccountUsageLog> {
+    match (last, now) {
+        (None, None) => None,
+        (Some(_), None) => Some(AccountUsageLog::Recovery),
+        (last, Some(kind)) if last == Some(kind) => None,
+        (_, Some(_)) => Some(AccountUsageLog::Failure),
+    }
+}
+
+/// Whether any agent the user has configured belongs to a harness that can
+/// report its account quota directly.
+///
+/// **Asked of the agents that exist, not of a harness this code already knows.**
+/// The gate's job is to decide whether the account read is warranted at all, and
+/// the honest form of that question is "does the user run a harness with this
+/// capability" — so the predicate is applied to each record's own `harness`
+/// field. Calling `HarnessKind::Codex.supports_account_usage_read()` at a site
+/// that already knows it means Codex would answer a question nobody asked and
+/// leave the predicate decorative.
+///
+/// Without this, a user who runs only Claude agents would still have a `codex`
+/// subprocess spawned on their behalf at startup and after every turn, failing
+/// every time with "binary not found" — work and a log line for a harness they
+/// do not use.
+///
+/// **An unreadable store answers "no".** The alternative is spawning a
+/// subprocess on the strength of a store read that just failed, and the cost of
+/// answering no is one skipped meter refresh: the gate is consulted per read,
+/// not once per session, so the next trigger asks again.
+///
+/// **Deliberately uncached, including on the Codex turn-end path.** Finding a
+/// match short-circuits the remaining projects but still reads a registry from
+/// disk, so this is not free on any call. Caching it would be: a remembered
+/// "no" would suppress the meter for a user who creates their first Codex agent
+/// mid-session, and invalidating correctly costs more machinery than the scan
+/// costs to repeat a handful of times per session.
+fn any_configured_agent_reports_account_usage(state: &AppState) -> bool {
+    let Ok(entries) = indexed_projects(state) else {
+        return false;
+    };
+    entries.into_iter().any(|entry| {
+        state
+            .store
+            .read_project_registry(&entry)
+            .is_ok_and(|agents| {
+                agents
+                    .iter()
+                    .any(|agent| agent.harness.supports_account_usage_read())
+            })
+    })
+}
+
+/// Read the Codex account's metered quotas — every limit it holds, each named
+/// by Codex. `None` means "no reading available", never "something went wrong."
+///
+/// **Returns `Option`, not `Result`, and that is the contract rather than
+/// laziness.** This is a background refresh of a meter: the caller's only
+/// sensible response to any failure is to keep showing the reading it already
+/// has. Handing the frontend an error would invite it to render one, and a
+/// banner saying the quota read failed is noise about a number the user did not
+/// ask to be updated.
+///
+/// **Repeated failures are logged once, not once per turn.** Almost every way
+/// this read fails is a steady state rather than a blip — no Codex installed,
+/// logged out, offline, or a Codex too old to report named quotas — and the
+/// read runs whenever the usage panel mounts and after every Codex turn. Logging
+/// unconditionally
+/// would emit the same line forever and bury the transient failures that
+/// actually carry information. The *kind* of the last failure is remembered on
+/// `state` and [`account_usage_log_decision`] decides; recovery is logged too,
+/// because "it started working again" is the other half of the story and is
+/// otherwise invisible.
+///
+/// `binary` and `timeout` are parameters rather than constants read inside, for
+/// the same testability reason as [`check_codex_auth_impl`]'s `home_dir`: the
+/// Tauri shim supplies the production values.
+///
+/// The read itself is documented in `crates/harness/src/codex/account_usage.rs`
+/// — including why it lives in that crate and what the experimental-protocol
+/// exposure costs.
+pub async fn read_codex_account_usage_impl(
+    state: &AppState,
+    binary: &Path,
+    timeout: std::time::Duration,
+) -> Option<switchboard_harness::CodexAccountUsage> {
+    read_codex_account_usage_with(
+        state,
+        binary,
+        timeout,
+        switchboard_harness::subprocess::ensure_path_settled(ACCOUNT_USAGE_PATH_WAIT),
+    )
+    .await
+}
+
+/// [`read_codex_account_usage_impl`] with the PATH readiness it waits on
+/// injected, which is the seam its own test needs: a readiness that completes on
+/// command is what separates "resolved the binary too early" from "took a while".
+///
+/// Paired with the wrapper above exactly as [`install_status_with`] is paired
+/// with [`install_status_for`] — production wiring in this module rather than in
+/// the Tauri shim, which holds no logic.
+///
+/// **Every production call goes through the wrapper. `path_ready` is a test
+/// seam, not a knob.** A caller here passing an already-resolved future — the
+/// obvious thing to reach for when adding a second caller — silently restores
+/// the launch defect this exists to prevent: `codex` resolved against the
+/// provisional GUI PATH, missed on any install outside the fallback's well-known
+/// directories, and a blank usage card until a turn ends or the panel reopens.
+///
+/// **No test covers that argument**, because every test supplies its own
+/// readiness and so never executes the wrapper's choice. The alternatives were
+/// weighed and declined: a process-global readiness provider is larger than what
+/// it guards at one call site, and forcing the shared PATH cache into `Capturing`
+/// from a test here would hand the concurrently-running tests in this binary a
+/// fallback PATH and change their answers. [`install_status_for`] carries the
+/// same uncovered wiring for the same reason.
+async fn read_codex_account_usage_with(
+    state: &AppState,
+    binary: &Path,
+    timeout: std::time::Duration,
+    path_ready: impl std::future::Future<Output = PathSource>,
+) -> Option<switchboard_harness::CodexAccountUsage> {
+    // Mock mode means "this process spawns no harness CLIs". Resolved at
+    // startup beside the adapter choice; this is the one call that would
+    // otherwise bypass it.
+    if !state.spawns_real_harnesses {
+        return None;
+    }
+    if !any_configured_agent_reports_account_usage(state) {
+        return None;
+    }
+    // **After the gates, before the spawn.** A GUI launch inherits a PATH that
+    // omits nvm, Homebrew and `~/.local/bin`, and the login-shell capture that
+    // recovers it can still be running when this first fires — the usage panel
+    // mounts as soon as a launch opens onto an agent roster. Resolving
+    // `codex` against the provisional PATH finds nothing on an install outside
+    // the fallback's well-known directories, and the completion event re-probes
+    // install status only — nothing asks for a quota again, so the section stays
+    // empty until a turn ends or the panel is reopened.
+    //
+    // The source is deliberately discarded: `Capturing` means the budget expired
+    // and the capture is still running, and proceeding on the fallback is then
+    // the same accepted residual dispatch takes. There is no better answer to be
+    // had by waiting longer.
+    let _ = path_ready.await;
+    let outcome = switchboard_harness::read_account_usage(binary, timeout).await;
+    let kind = outcome
+        .as_ref()
+        .err()
+        .map(switchboard_harness::AccountUsageError::kind);
+    let mut last = match state.last_account_usage_failure.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match account_usage_log_decision(*last, kind) {
+        // The full message rides along; only the *key* is the kind.
+        Some(AccountUsageLog::Failure) => {
+            let reason = outcome
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            tracing::warn!(kind = kind.unwrap_or_default(), %reason, "codex account usage read produced no reading");
+        }
+        Some(AccountUsageLog::Recovery) => {
+            tracing::info!("codex account usage read recovered");
+        }
+        None => {}
+    }
+    *last = kind;
+    outcome.ok()
+}
+
 /// Install status of a harness CLI, for the getting-started surface.
 /// A missing binary is `installed: false` with no version — *data*, not an
 /// error path (unlike `check_*_binary`, which gates agent creation and so
@@ -7023,6 +7232,36 @@ pub const RECHECK_CAPTURE_WAIT: std::time::Duration =
 /// user*, because an agent silently missing is worse than an agent visibly
 /// missing.
 pub const AUTOCREATE_PATH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the account quota read waits for the login-shell PATH before
+/// giving up and resolving `codex` against whatever is current.
+///
+/// **Waits out a whole capture, unlike every other caller.** The short budgets
+/// elsewhere buy responsiveness for someone who is watching: dispatch must not
+/// hold Send, auto-create must not freeze a non-dismissible modal. Nothing
+/// waits on this read — it is a background meter refresh whose every failure
+/// already collapses to "no reading" — so there is no spinner to keep short and
+/// no reason to answer before the answer exists.
+///
+/// One attempt rather than [`RECHECK_CAPTURE_WAIT`]'s two: that budget doubles
+/// because Recheck *invalidates* first, so an in-flight capture burns its
+/// timeout being superseded before the replacement starts. This one joins the
+/// capture already running.
+///
+/// Derived from the capture budget rather than written as a literal, so it
+/// cannot silently stop covering the worst case when that timeout is bumped.
+///
+/// **Additive to the read's own bound, which is what a caller budgeting against
+/// either constant needs to know.** This wait (~22s) precedes
+/// `ACCOUNT_USAGE_TIMEOUT` (30s) and its teardown tail (~2.5s), so one
+/// `read_codex_account_usage` occupies the frontend's single refresh slot for up
+/// to ~54s rather than the ~32s that constant documents. That is the sum of the
+/// explicitly bounded stages, not an absolute worst case — `resolve_binary` can
+/// still block on filesystem work outside any async timeout. Paid only while a
+/// capture is in flight: once the PATH resolves this returns immediately, so the
+/// typical cost is zero.
+pub const ACCOUNT_USAGE_PATH_WAIT: std::time::Duration =
+    switchboard_harness::subprocess::capture_attempt_budget();
 
 /// Discard the cached harness PATH and re-resolve it from the user's login
 /// shell, waiting for the result. Backs the "Recheck" action: a capture that
@@ -11501,6 +11740,224 @@ mod tests {
         assert!(check_codex_binary_impl(&state).is_ok());
     }
 
+    /// Bare state for the account-usage tests: they touch no store, no project
+    /// and no adapter — only the mock-mode flag and the remembered failure.
+    /// A state holding exactly one configured agent, on `harness`.
+    ///
+    /// The harness is a parameter because the read is gated on what the user
+    /// actually runs: passing `ClaudeCode` here is how the "never spawns for a
+    /// user without Codex" case is exercised, and passing `Codex` is what lets
+    /// the failure-handling tests reach the read at all.
+    ///
+    /// The `TempDir` is returned rather than dropped: it backs the project the
+    /// agent lives in, and dropping it would empty the registry the gate reads.
+    fn account_usage_state(harness: HarnessKind) -> (TempDir, AppState) {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        create_agent_impl(&state, "a", harness, AgentSelection::default()).unwrap();
+        (tmp, state)
+    }
+
+    /// A PATH already settled, so a test that is not about the wait does not
+    /// arm a real login-shell capture to get past it.
+    fn path_settled() -> std::future::Ready<PathSource> {
+        std::future::ready(PathSource::LoginShell)
+    }
+
+    #[tokio::test]
+    async fn codex_account_usage_collapses_a_missing_binary_to_no_reading() {
+        // The contract the `Option` return exists for: every failure is "no
+        // newer number", so the caller keeps whatever reading it holds. If this
+        // ever grows an error path, the meter gains a way to blank itself or
+        // shout at the user over a refresh nobody asked for.
+        let (_tmp, state) = account_usage_state(HarnessKind::Codex);
+        let state = state.with_real_harnesses(true);
+        let dir = TempDir::new().unwrap();
+        let absent = dir.path().join("definitely-not-codex");
+        let reading = read_codex_account_usage_with(
+            &state,
+            &absent,
+            std::time::Duration::from_secs(5),
+            path_settled(),
+        )
+        .await;
+        assert!(reading.is_none());
+        // Asserted so this cannot start passing for the wrong reason: a gate
+        // that skipped the read entirely would also return `None`, and the
+        // point here is that the read *ran* and its failure collapsed.
+        assert_eq!(
+            *state.last_account_usage_failure.lock().unwrap(),
+            Some("binary-not-found")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_account_usage_does_not_spawn_in_mock_mode() {
+        // This is the one call that bypasses the adapter layer, so nothing else
+        // would stop a mock run from shelling out to the real CLI. `codex` is
+        // passed by name deliberately: were the gate absent, this would resolve
+        // and spawn the developer's own installed binary.
+        let (_tmp, state) = account_usage_state(HarnessKind::Codex);
+        assert!(!state.spawns_real_harnesses);
+        let reading = read_codex_account_usage_with(
+            &state,
+            Path::new("codex"),
+            std::time::Duration::from_secs(5),
+            path_settled(),
+        )
+        .await;
+        assert!(reading.is_none());
+    }
+
+    #[test]
+    fn a_repeating_failure_is_logged_once_and_recovery_is_logged() {
+        // The guarantee the previous version of this test only appeared to
+        // make: it asserted that a reason was *stored*, which is true after one
+        // call, and observed no logging at all — so it passed with the
+        // suppression deleted. Asserting on the decision itself is what makes
+        // the count observable.
+        use AccountUsageLog::{Failure, Recovery};
+        let seq = ["timeout", "timeout", "timeout"];
+        let mut last: Option<&str> = None;
+        let mut decisions = Vec::new();
+        for kind in seq {
+            decisions.push(account_usage_log_decision(last, Some(kind)));
+            last = Some(kind);
+        }
+        assert_eq!(decisions, vec![Some(Failure), None, None]);
+
+        // Recovery, then the same failure again — both are news.
+        assert_eq!(account_usage_log_decision(last, None), Some(Recovery));
+        assert_eq!(
+            account_usage_log_decision(None, Some("timeout")),
+            Some(Failure)
+        );
+        // Steady success says nothing.
+        assert_eq!(account_usage_log_decision(None, None), None);
+    }
+
+    #[test]
+    fn a_change_of_failure_kind_is_logged_even_while_still_failing() {
+        // A user on a Codex too old to report named quotas sits in one drift
+        // condition permanently. A genuine protocol move arriving on top of it
+        // is a different event and must not be suppressed.
+        assert_eq!(
+            account_usage_log_decision(
+                Some("legacy-view-without-buckets"),
+                Some("non-object-bucket-map")
+            ),
+            Some(AccountUsageLog::Failure)
+        );
+    }
+
+    #[tokio::test]
+    async fn two_failures_with_different_messages_share_one_kind() {
+        // The defect keying on the rendered message caused: the silence variants
+        // interpolate whatever the server printed, so one unchanging condition
+        // produced a fresh string — and a fresh warning — on every refresh.
+        let (_tmp, state) = account_usage_state(HarnessKind::Codex);
+        let state = state.with_real_harnesses(true);
+        let dir = TempDir::new().unwrap();
+        let absent = dir.path().join("definitely-not-codex");
+        for _ in 0..3 {
+            read_codex_account_usage_with(
+                &state,
+                &absent,
+                std::time::Duration::from_secs(5),
+                path_settled(),
+            )
+            .await;
+        }
+        let last = *state.last_account_usage_failure.lock().unwrap();
+        assert_eq!(last, Some("binary-not-found"));
+    }
+
+    #[tokio::test]
+    async fn the_quota_read_waits_for_a_slow_path_capture_before_resolving_codex() {
+        // The launch race this guards: a GUI start inherits a PATH without nvm
+        // or Homebrew, and the login-shell capture that fixes it is still
+        // running when the first read fires. Resolving against the provisional
+        // PATH misses an install outside the fallback's well-known directories,
+        // and nothing asks again once the capture lands — the frontend's
+        // completion listener re-probes install status only.
+        //
+        // **The binary becomes findable only when readiness resolves**, which is
+        // what the capture does in production and what makes this deterministic:
+        // the two orderings produce different failure kinds rather than
+        // different timings. Reading first spawns a path that does not exist yet
+        // and fails `NotFound`; waiting yields whatever spawning the stub
+        // produces. A clock-based version would prove nothing, because the read
+        // runs on its own task and is `Pending` before it has attempted the spawn.
+        //
+        // **`resolve_binary` is not exercised here**: an absolute path is
+        // returned verbatim without probing, so the failure is `spawn`'s. The
+        // production equivalent is `which_in` missing a bare `codex` on the
+        // provisional PATH, which reaches the same error.
+        let (_tmp, state) = account_usage_state(HarnessKind::Codex);
+        let state = state.with_real_harnesses(true);
+        let dir = TempDir::new().unwrap();
+        let stub = dir.path().join("codex-stub");
+
+        let appears_when_the_path_settles = {
+            let stub = stub.clone();
+            async move {
+                std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+                #[cfg(unix)]
+                std::fs::set_permissions(
+                    &stub,
+                    <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+                )
+                .unwrap();
+                PathSource::LoginShell
+            }
+        };
+
+        assert!(!stub.exists(), "the stub must not exist before the wait");
+        let reading = read_codex_account_usage_with(
+            &state,
+            &stub,
+            std::time::Duration::from_secs(5),
+            appears_when_the_path_settles,
+        )
+        .await;
+
+        assert!(reading.is_none());
+        let kind = *state.last_account_usage_failure.lock().unwrap();
+        assert_ne!(
+            kind,
+            Some("binary-not-found"),
+            "the read resolved the binary against the provisional PATH instead of waiting"
+        );
+        // Asserted positively too, so this cannot pass by the read being skipped
+        // altogether — a gate that returned early also never records a kind.
+        assert_eq!(kind, Some("no-response"));
+    }
+
+    #[tokio::test]
+    async fn no_codex_agent_means_no_codex_subprocess() {
+        // A Claude-only user should never have a `codex` spawned on their
+        // behalf. `codex` is passed by name so that, were the gate absent, this
+        // would resolve and run the developer's own installed binary — the read
+        // would then *succeed* against a real account and the assertion below
+        // would fail on a populated reading rather than passing by luck.
+        let (_tmp, state) = account_usage_state(HarnessKind::ClaudeCode);
+        let state = state.with_real_harnesses(true);
+        let reading = read_codex_account_usage_with(
+            &state,
+            Path::new("codex"),
+            std::time::Duration::from_secs(5),
+            path_settled(),
+        )
+        .await;
+        assert!(reading.is_none());
+        // No read ran, so there is no failure to remember. This is what
+        // separates "skipped" from "ran and failed"; without it the assertion
+        // above is satisfied by either.
+        assert_eq!(*state.last_account_usage_failure.lock().unwrap(), None);
+    }
+
     #[test]
     fn check_codex_auth_returns_ok_when_auth_json_exists() {
         let tmp = TempDir::new().unwrap();
@@ -13556,10 +14013,15 @@ mod tests {
 
     #[test]
     fn overlay_does_not_override_loader_provided_rate_limit() {
-        // Codex-shape (class B): the loader already populated last_rate_limit
-        // from the session file (durable, authoritative). A stray sidecar
-        // must NOT override it, and no `as_of` qualifier is added — the
-        // session value isn't a stale snapshot.
+        // A class-B shape: the loader already populated last_rate_limit from a
+        // harness's own session file (durable, authoritative). A stray sidecar
+        // must NOT override it, and no `as_of` qualifier is added — a session
+        // value isn't a stale snapshot.
+        //
+        // Constructed directly rather than loaded, because **no loader produces
+        // this today** — Codex's was the only one. The precedence rule is this
+        // function's own and is what a future durable reading would land on, so
+        // it is still worth pinning.
         let mut transcript = switchboard_harness::LoadedTranscript {
             last_rate_limit: Some(serde_json::json!({"primary": {"used_percent": 10.0}})),
             ..Default::default()

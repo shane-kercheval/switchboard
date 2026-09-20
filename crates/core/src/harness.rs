@@ -220,6 +220,41 @@ impl HarnessKind {
             Self::Codex | Self::Antigravity => false,
         }
     }
+
+    /// Whether Switchboard can ask this harness for the **account's complete
+    /// quota state** — every metered limit the logged-in account holds, each
+    /// named by the harness, on demand and outside any turn.
+    ///
+    /// True only for Codex, whose `app-server` answers
+    /// `account/rateLimits/read` at no quota cost and while the account is
+    /// capped.
+    ///
+    /// **This is a predicate about the *complete* reading, not about having
+    /// usage data at all.** Both other harnesses report usage, but only as a
+    /// side effect of a turn: Claude's stream carries a `rate_limit_event` that
+    /// names its windows but omits any window the turn did not touch, and
+    /// Antigravity reports none. Neither can be *asked*. The distinction
+    /// matters because the two defects this predicate's feature fixes were both
+    /// caused by treating a turn-shaped reading as an account-wide one — so
+    /// "has a number" and "can state the account's position" must not collapse
+    /// into one flag.
+    ///
+    /// **Codex's turn-shaped reading is the counterexample, not the
+    /// precedent.** Its rollout file records one quota per turn under
+    /// identifiers that are identical across different pools, so it cannot say
+    /// which pool it describes; that source is what this call replaces. See
+    /// `crates/harness/src/codex/account_usage.rs`.
+    ///
+    /// Same authority + exhaustiveness role as the siblings above: callers ask
+    /// the capability rather than matching on harness kind, and a new harness
+    /// forces a decision here.
+    #[must_use]
+    pub fn supports_account_usage_read(self) -> bool {
+        match self {
+            Self::Codex => true,
+            Self::ClaudeCode | Self::Antigravity => false,
+        }
+    }
 }
 
 /// The two independent per-agent selection axes. A closed, complete set — model
@@ -365,6 +400,17 @@ mod tests {
         assert!(HarnessKind::ClaudeCode.supports_context_report());
         assert!(!HarnessKind::Codex.supports_context_report());
         assert!(!HarnessKind::Antigravity.supports_context_report());
+    }
+
+    #[test]
+    fn supports_account_usage_read_is_codex_only() {
+        // The one predicate in this set that is true for Codex and false for
+        // Claude. Claude reports usage on its stream, but only for the windows
+        // a turn touched — it cannot be asked for the account's position, which
+        // is what this capability names.
+        assert!(HarnessKind::Codex.supports_account_usage_read());
+        assert!(!HarnessKind::ClaudeCode.supports_account_usage_read());
+        assert!(!HarnessKind::Antigravity.supports_account_usage_read());
     }
 
     #[test]

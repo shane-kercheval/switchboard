@@ -22,6 +22,7 @@
   import Textarea from "$lib/components/ui/Textarea.svelte";
   import ClearIcon from "$lib/components/ui/ClearIcon.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
+  import Spinner from "$lib/components/ui/Spinner.svelte";
   import WorkflowSteps from "$lib/components/WorkflowSteps.svelte";
   import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
@@ -387,16 +388,7 @@
       data-testid="workflow-resolving"
       aria-live="polite"
     >
-      <svg
-        class="h-3.5 w-3.5 animate-spin"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2"
-        aria-hidden="true"
-      >
-        <path d="M21 12a9 9 0 1 1-6.219-8.56" stroke-linecap="round" />
-      </svg>
+      <Spinner class="h-3.5 w-3.5 border-current/30 border-t-current" />
       Resolving prompts…
     </p>
   {:else if incompatible}

@@ -2186,9 +2186,13 @@ async fn live_codex_basic_turn_completes() {
     //   is thread-cumulative). The live parser stamps context_input_tokens
     //   None, so a Some here proves the real CLI still writes the
     //   last_token_usage shape the overlay depends on — drift guard.
-    // - RateLimitEvent fires every turn from token_count.rate_limits.
     // - SessionMeta fires on the first turn carrying model + cli_version +
     //   the merged MCP servers / skills registries.
+    // - No RateLimitEvent: the rollout still writes token_count.rate_limits, but
+    //   it reports one unnamed bucket whichever limit it describes, so quotas are
+    //   asked for over the app-server protocol instead — see
+    //   `live_codex_account_usage_read_returns_named_buckets`, which is where the
+    //   payload-shape drift guard for Codex quotas now lives.
     match terminal {
         AdapterEvent::TurnEnd { usage: Some(u), .. } => {
             assert!(
@@ -2206,62 +2210,21 @@ async fn live_codex_basic_turn_completes() {
         }
         _ => panic!("expected TurnEnd with Some(usage), got: {terminal:?}"),
     }
-    let rate_limit_idx = events
-        .iter()
-        .position(|e| matches!(e, AdapterEvent::RateLimitEvent { .. }))
-        .expect("RateLimitEvent must fire post-terminal for Codex");
     let session_meta_idx = events
         .iter()
         .position(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
         .expect("SessionMeta must fire on first turn for Codex");
     assert!(
-        terminal_idx < rate_limit_idx && rate_limit_idx < session_meta_idx,
-        "enrichment events must arrive after TurnEnd in order: TurnEnd → RateLimitEvent → SessionMeta"
+        terminal_idx < session_meta_idx,
+        "enrichment events must arrive after TurnEnd in order: TurnEnd → SessionMeta"
     );
-
-    // Rate-limit payload-shape drift detection. The ordering
-    // check above proves the event fires; this proves its `info` still carries
-    // the fields the Sidebar's Codex windows read: `primary.used_percent` (the
-    // gauge — relied on since the original single cell), plus `window_minutes`
-    // (the window-label source) and `resets_at` (the tooltip reset time).
-    // SessionFileBacked — Codex's own session file is canonical, so we don't
-    // re-persist it. `secondary` is intentionally not asserted (a fresh
-    // account may not have a weekly window yet; the Sidebar shows it only when
-    // present).
-    match &events[rate_limit_idx] {
-        AdapterEvent::RateLimitEvent { info, source, .. } => {
-            assert_eq!(
-                *source,
-                RateLimitSource::SessionFileBacked,
-                "Codex rate-limit is read from its session file (class B) → not re-persisted"
-            );
-            let primary = info
-                .get("primary")
-                .expect("rate_limits.primary must be present: {info}");
-            assert!(
-                primary
-                    .get("used_percent")
-                    .and_then(serde_json::Value::as_f64)
-                    .is_some(),
-                "primary.used_percent must be a number (Sidebar gauge reads it): {info}"
-            );
-            assert!(
-                primary
-                    .get("window_minutes")
-                    .and_then(serde_json::Value::as_i64)
-                    .is_some(),
-                "primary.window_minutes must be present (Sidebar window label derives from it): {info}"
-            );
-            assert!(
-                primary
-                    .get("resets_at")
-                    .and_then(serde_json::Value::as_i64)
-                    .is_some(),
-                "primary.resets_at must be present (Sidebar tooltip reset time reads it): {info}"
-            );
-        }
-        _ => unreachable!(),
-    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::RateLimitEvent { .. })),
+        "Codex must emit no rate-limit event from its rollout — its quotas come from \
+         the account read, which names every limit the account holds"
+    );
 
     // SessionMeta shape: structural-only checks. mcp_servers / skills lists
     // are developer-environment-dependent (we don't pin a particular ~/.codex
@@ -4642,5 +4605,114 @@ async fn live_claude_context_report_parses() {
             }
         )),
         "the report turn must complete: {events:?}"
+    );
+}
+
+/// The drift detector for `account/rateLimits/read`.
+///
+/// **This is the primary mitigation for reading an undocumented, explicitly
+/// experimental protocol.** `codex app-server` is marked `[experimental]` in
+/// the CLI's own help and is absent from the published Codex documentation, so
+/// its method names and response shapes can move without a version bump.
+/// Nothing in the fixture suite would notice; everything there replays a stream
+/// we recorded ourselves.
+///
+/// It asserts **structure, never values**. Which quotas an account holds, how
+/// spent they are and when they reset all depend on the developer's plan and
+/// the hour of the day — pinning any of those would make this fail for reasons
+/// that have nothing to do with drift. What must stay true is that the account
+/// can be *asked*, that the answer is keyed by limit id, and that each bucket
+/// carries the fields the meter is built on.
+///
+/// Costs no quota and makes no model call, and succeeds while the account is
+/// rate-limited — so unlike its neighbours here it can be run freely, including
+/// when the rest of the Codex live suite is blocked.
+///
+/// **It also pins the one transport behavior no replay fake can model.**
+/// Closing stdin after writing the requests — the obvious move, since we send
+/// nothing else — makes `codex app-server` shut down *before* answering:
+/// measured on 0.154.0, three runs closing stdin produced no response and three
+/// leaving it open answered every time; re-probed across the 0.155.1 bump at
+/// 20 closed (none answered) and 25 open (all answered). `fake_codex` replays a
+/// recording and
+/// would answer either way, so a regression that closed stdin passes the whole
+/// hermetic suite and fails only here. No separate test for it: it exercises
+/// the identical production call, so a second one would isolate nothing.
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_account_usage_read_returns_named_buckets() {
+    let usage = switchboard_harness::read_account_usage(
+        Path::new("codex"),
+        switchboard_harness::ACCOUNT_USAGE_TIMEOUT,
+    )
+    .await
+    .expect("codex should answer account/rateLimits/read");
+
+    assert!(
+        !usage.rate_limits_by_limit_id.is_empty(),
+        "an authenticated account should report at least one metered limit; got {usage:?}"
+    );
+
+    for (limit_id, bucket) in &usage.rate_limits_by_limit_id {
+        assert!(
+            bucket.is_object(),
+            "bucket {limit_id} should be an object: {bucket}"
+        );
+        // The field the reader filters on to tell an account-wide allowance
+        // from a model-specific reserve. It is legitimately `null` on the
+        // account-wide buckets — what matters is that the key still exists. A
+        // bucket missing it is skipped and reported rather than assumed
+        // account-wide, so a rename does not mislabel a reserve; it empties the
+        // section instead, which is why the key's presence is asserted here.
+        assert!(
+            bucket.get("normalModelSlug").is_some(),
+            "bucket {limit_id} should carry `normalModelSlug` (null is fine): {bucket}"
+        );
+        // **Not a dependency — a watched field.** Exhaustion is inferred from
+        // `usedPercent` reaching 100; this reason code is deliberately unread
+        // (four of its five values are team/business billing states). Asserted
+        // anyway because it is the only structured "you are blocked" signal the
+        // payload carries, so we want to know if it disappears before deciding
+        // whether to read it.
+        assert!(
+            bucket.get("rateLimitReachedType").is_some(),
+            "bucket {limit_id} should carry `rateLimitReachedType`: {bucket}"
+        );
+        let window = bucket
+            .get("primary")
+            .unwrap_or_else(|| panic!("bucket {limit_id} should carry a `primary` window"));
+        // A windowless bucket is a shape we have seen (`limit_id: "premium"`
+        // arrives with both windows null on a refused turn), so `null` here is
+        // tolerated — the meter skips those. A missing *key* is not.
+        if !window.is_null() {
+            assert!(
+                window
+                    .get("usedPercent")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some(),
+                "window on {limit_id} should carry a numeric `usedPercent`: {window}"
+            );
+            assert!(
+                window.get("resetsAt").is_some(),
+                "window on {limit_id} should carry `resetsAt`: {window}"
+            );
+            assert!(
+                window.get("windowDurationMins").is_some(),
+                "window on {limit_id} should carry `windowDurationMins`: {window}"
+            );
+        }
+    }
+
+    // Asserted rather than merely typed. `lift_usage` collapses "absent" and
+    // "null" into `None`, which is right for carrying the value and useless for
+    // drift detection: were the field renamed, every read would report
+    // "unknown" forever and a type-shaped check would pass. Nothing renders
+    // from it — it states whether the account may work, which is a different
+    // question from how full a window is — so this is a watched field like the
+    // reason code above: a failure means the field moved, or a real account
+    // returns null, and either is worth knowing before anything depends on it.
+    assert!(
+        usage.ordinary_usage_allowed.is_some(),
+        "the account-level usage gate should carry a value: {usage:?}"
     );
 }

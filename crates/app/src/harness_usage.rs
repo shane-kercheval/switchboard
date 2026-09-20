@@ -164,6 +164,39 @@ mod tests {
     }
 
     #[test]
+    fn a_per_window_reading_round_trips_with_every_nested_field() {
+        // Claude's windows are retained individually, each carrying the context of
+        // the reading that delivered it. That is a map inside a map inside the
+        // entry, and it reaches the file through the same untyped passthrough as a
+        // flat reading — so nothing here needs to know the shape, but something
+        // has to prove the nesting survives a YAML round trip.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("usage.yaml");
+        let entry = serde_json::json!({
+            "payload": { "status": "allowed", "unifiedWindows": {} },
+            "observed_at": "2026-09-18T21:00:00Z",
+            "windows": {
+                "seven_day_overage_included": {
+                    "window": { "utilization": 1.0, "resetsAt": 1_789_845_487u64 },
+                    "status": "rejected",
+                    "rate_limit_type": "seven_day_overage_included",
+                    "is_using_overage": false,
+                    "observed_at": "2026-09-18T20:00:00Z",
+                    "model": "claude-fable-5-1",
+                    "turn_id": "0199a0e8-0000-7000-8000-000000000001"
+                }
+            }
+        });
+        let usage = HarnessUsage {
+            harnesses: BTreeMap::from([("claude_code".to_owned(), entry.clone())]),
+        };
+        save(&path, &usage).unwrap();
+
+        let loaded = load(&path).usage;
+        assert_eq!(loaded.harnesses["claude_code"], entry);
+    }
+
+    #[test]
     fn an_unknown_harness_key_round_trips_instead_of_failing_the_file() {
         // Forward compatibility is the reason the keys are strings: a reading
         // written by a build that knows a harness this one does not must not

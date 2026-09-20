@@ -2,20 +2,26 @@
   /// Account-scoped quota meters, one row per harness that has reported a
   /// reading.
   ///
-  /// **Above the agent roster rather than on each agent card, and fed from one
-  /// store rather than per agent.** A quota belongs to the account the harness is
-  /// logged into: N cards showed one fact N times at N staleness levels, and a
-  /// card restored from a project's own state showed that project's older
-  /// reading. Nothing here is project-scoped — the same numbers render whichever
-  /// project is open, which is also what tells the user these are not
-  /// per-project.
+  /// **One section pinned to the bottom of the sidebar rather than a cell on
+  /// each agent card, and fed from one store rather than per agent.** A quota
+  /// belongs to the account the harness is logged into: N cards showed one fact
+  /// N times at N staleness levels, and a card restored from a project's own
+  /// state showed that project's older reading. Nothing here is project-scoped —
+  /// the same numbers render whichever project is open, which is also what tells
+  /// the user these are not per-project.
+  ///
+  /// Below the roster rather than above it: the roster is the surface the user
+  /// works in and it gets the top of the panel plus all the flexible height,
+  /// while this readout keeps its own fixed strip at the foot.
   ///
   /// The right sidebar rather than the left: the projects rail is collapsed
   /// during single-project work, and a passive readout the user wants glanceable
   /// must not disappear with it. This panel is where every other piece of
   /// telemetry already lives.
   import { harnessUsage } from "$lib/state/harnessUsage.svelte";
-  import { claudeRateLimitView, codexRateLimitView, type UsageWindow } from "$lib/usageWindows";
+  import { claudeRateLimitView, codexAccountUsageView, type UsageWindow } from "$lib/usageWindows";
+  import { supportsAccountUsageRead } from "$lib/harnessCapabilities";
+  import { requestAccountUsageRefresh } from "$lib/state/accountUsage.svelte";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import {
     formatResetCountdown,
@@ -39,13 +45,35 @@
     /// Claude's separate billing escalation. Not a window: it says what is being
     /// charged rather than how full a quota is.
     overage: { resetsAtMs: number | null } | null;
-    /// Bare reset line for a Claude payload with no window map at all.
-    fallback: { label: string; resetsAtMs: number } | null;
-    /// When the harness measured the reading, for the age line. Absent when the
-    /// reading carries no instant, in which case no age is claimed rather than a
-    /// fabricated one being shown.
-    measuredAt: string | undefined;
+    /// Bare reset line for a Claude payload with no window map at all, dated by
+    /// the reading it came from. **The one reading-level instant left**, and it is
+    /// not an exception to the per-window rule: this line is not a window, and it
+    /// is drawn from the newest payload by definition, so the reading's own
+    /// measurement is exactly what dates it.
+    fallback: { label: string; resetsAtMs: number; measuredAt: string | undefined } | null;
   };
+
+  /// **Opening the panel refreshes it**, and that is the whole claim. This
+  /// component is mounted only while the sidebar is open on this mode, so
+  /// mounting is the moment these meters become visible.
+  ///
+  /// **Nothing here reacts to time passing, deliberately.** The rows derive
+  /// from the stored reading alone, so while the panel stays open a countdown
+  /// keeps whatever text it had when the reading landed and a window whose
+  /// reset elapses does not drop. A clock that re-derived on an interval would
+  /// fix both; it was considered and declined, because the reading is dated for
+  /// the user ("Measured … ago") and a stale countdown beside a stated
+  /// measurement time is legible rather than misleading.
+  ///
+  /// The consequence to know: a user waiting out a reset with the panel open
+  /// sees the numbers from their last refresh until something triggers another
+  /// one, and ending a turn is the trigger they cannot reach while blocked.
+  ///
+  /// Reads no reactive state, so it runs once per mount rather than on every
+  /// change to the rows below.
+  $effect(() => {
+    requestAccountUsageRefresh();
+  });
 
   const rows = $derived.by((): Row[] => {
     const now = Date.now();
@@ -53,25 +81,40 @@
     for (const harness of ALL_HARNESSES) {
       const reading = harnessUsage[harness];
       if (reading === undefined) continue;
-      const measuredAt = reading.observed_at;
-      if (harness === "codex") {
-        const windows = codexRateLimitView(reading.payload, now, reading.limit_reached === true);
-        if (windows.length > 0) {
-          built.push({ harness, windows, overage: null, fallback: null, measuredAt });
+      // Selected by capability rather than by name: this branch reads the
+      // account payload, which exists only for a harness Switchboard can ask
+      // directly. Matching on "codex" here would decide by harness name the one
+      // thing the capability mirror exists to decide.
+      if (supportsAccountUsageRead(harness)) {
+        const view = codexAccountUsageView(reading.payload, now);
+        if (view.windows.length > 0) {
+          built.push({
+            harness,
+            // Codex's windows all come from one call, so they share the reading's
+            // instant. Attached per window anyway, so both harnesses' tooltips
+            // have one shape rather than changing layout depending on whether the
+            // values happen to agree — and here they truthfully do.
+            windows: view.windows.map((w) => ({ ...w, measuredAt: reading.observed_at })),
+            overage: null,
+            fallback: null,
+          });
         }
         continue;
       }
       if (harness === "claude_code") {
-        // Claude states a refusal in the payload, so no verdict is passed in
-        // here — see `claudeRateLimitView`.
-        const view = claudeRateLimitView(reading.payload, now, reading.model);
+        // Windows come from the store's retained set, not from the payload: a
+        // Claude reading names only the windows its turn's model touched. The
+        // payload still supplies the account-level state — the overage escalation
+        // and the no-window-map fallback — which only the newest reading speaks
+        // for.
+        const view = claudeRateLimitView(reading.payload, reading.windows, now);
         if (view !== null) {
           built.push({
             harness,
             windows: view.windows,
             overage: view.overage,
-            fallback: view.fallback,
-            measuredAt,
+            fallback:
+              view.fallback === null ? null : { ...view.fallback, measuredAt: reading.observed_at },
           });
         }
         continue;
@@ -103,14 +146,24 @@
 {#if rows.length > 0}
   <!-- Fixed block, deliberately outside the roster's scroll container: these
        meters exist to be glanceable, and scrolling a long agent list must not
-       carry them off screen. -->
-  <section class="border-border/80 shrink-0 border-b px-2 pb-2" data-testid="harness-usage">
+       carry them off screen. `shrink-0` beside the roster section's `flex-1`
+       is what pins it to the panel's foot — the roster absorbs every spare
+       pixel and scrolls when it runs out, this strip keeps its content height. -->
+  <section
+    class="border-border/80 bg-raised shrink-0 border-t px-2 pb-3"
+    data-testid="harness-usage"
+  >
     <div
       class="text-muted flex h-8 items-center px-1 text-[11px] leading-none font-semibold tracking-wide uppercase"
     >
       Usage limits
     </div>
-    <div class="flex flex-col gap-2">
+    <!-- Deliberately tighter under the header than the agent roster, which puts
+         its first row 12px down (`pt-1` plus the rows' `py-2`). This section is
+         pinned to the panel's foot, so its height is what decides whether the
+         strip lines up with the pane edges beside it; the roster absorbs slack
+         and has no such constraint. -->
+    <div class="flex flex-col gap-2 pt-[7px]">
       {#each rows as row (row.harness)}
         <Tooltip side="left">
           {#snippet trigger(props)}
@@ -120,7 +173,7 @@
             <div
               {...props}
               tabindex="0"
-              class="cursor-default space-y-1 rounded-md px-1 py-0.5 text-xs"
+              class="cursor-default space-y-1 rounded-md px-1 py-0.5 text-[13px]"
               data-testid={`harness-usage-${row.harness}`}
             >
               <!-- `mb-2` against the list's own `space-y-1`: adjacent margins
@@ -130,7 +183,7 @@
                    another row in the same rhythm. -->
               <div class="mb-2 flex items-center gap-1.5">
                 <HarnessIcon harness={row.harness} size="sm" class="h-3.5 w-3.5" />
-                <span class="text-fg text-[11px] font-medium">{HARNESS_LABEL[row.harness]}</span>
+                <span class="text-fg text-xs font-medium">{HARNESS_LABEL[row.harness]}</span>
               </div>
               {#each row.windows as w (w.key)}
                 <Meter
@@ -143,6 +196,7 @@
                     ? "neutral"
                     : "warning"}
                   testid="harness-usage-window"
+                  class="text-xs"
                 />
               {/each}
               {#if row.fallback !== null}
@@ -178,6 +232,21 @@
                     <span class="text-right tabular-nums">{formatResetDateTime(w.resetsAtMs)}</span>
                   </div>
                 {/if}
+                <!-- Per window, not per card. Retained windows are measured by
+                     the turns that touch them, so a weekly cap read on Tuesday
+                     genuinely sits beside a 5-hour window read a minute ago and
+                     one shared line would be false for all but one of them.
+                     Omitted when the window carries no instant — the clean-hide
+                     rule the rest of this surface follows, and the reason the
+                     instant is nullable rather than sentinel-filled. -->
+                {#if w.measuredAt !== undefined}
+                  <div class="text-primary-fg/70 grid grid-cols-[auto_1fr] gap-4 text-[12px]">
+                    <span>Measured</span>
+                    <span class="text-right" data-testid="harness-usage-measured">
+                      {relativeTime(w.measuredAt)}
+                    </span>
+                  </div>
+                {/if}
               </section>
             {/each}
             {#if row.fallback !== null}
@@ -187,6 +256,14 @@
                   Resets {formatResetDateTime(row.fallback.resetsAtMs)}
                 </span>
               </div>
+              {#if row.fallback.measuredAt !== undefined}
+                <div class="text-primary-fg/70 grid grid-cols-[auto_1fr] gap-4 text-[12px]">
+                  <span>Measured</span>
+                  <span class="text-right" data-testid="harness-usage-measured">
+                    {relativeTime(row.fallback.measuredAt)}
+                  </span>
+                </div>
+              {/if}
             {/if}
             {#if row.overage !== null}
               <div class="text-warning border-primary-fg/20 border-t pt-2">
@@ -198,22 +275,18 @@
                 {/if}
               </div>
             {/if}
-            <!-- Shown for every harness, not just a restored stream-only
-                 snapshot. A session-file-backed reading is durable, which was
-                 mistaken for current: it is re-read on every open but the file
-                 itself can be days old, and an account-level reading is only as
-                 fresh as the last turn *any* agent ran.
-                 Omitted entirely when the reading carries no instant — the
-                 clean-hide rule the rest of this surface follows, and the reason
-                 the ordering key is nullable rather than sentinel-filled. -->
-            {#if row.measuredAt !== undefined}
-              <p
-                class="text-primary-fg/70 border-primary-fg/20 border-t pt-2 text-[12px]"
-                data-testid="harness-usage-measured"
-              >
-                Measured {relativeTime(row.measuredAt)} — send a message to refresh.
-              </p>
-            {/if}
+            <!-- States the refresh rule rather than an instruction to send a
+                 message. That imperative was wrong in exactly the situation these
+                 meters exist for: a turn refreshes only the limits its own model
+                 draws on, so a user staring at a stale model-gated cap would send
+                 a message and watch the instant not move. The rule explains both
+                 why the times above can differ and what moves them. -->
+            <p
+              class="text-primary-fg/70 border-primary-fg/20 border-t pt-2 text-[12px]"
+              data-testid="harness-usage-refresh-rule"
+            >
+              Each limit updates when a turn runs against it.
+            </p>
           </div>
         </Tooltip>
       {/each}

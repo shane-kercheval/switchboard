@@ -511,11 +511,13 @@ fn terminate_group_then_kill(child: &mut std::process::Child) {
 /// Gatekeeper validation.
 ///
 /// **Routine reads never wait on this window** — [`resolved_path`] returns a
-/// snapshot immediately. Three callers deliberately do wait, each with its own
+/// snapshot immediately. Four callers deliberately do wait, each with its own
 /// bound: turn dispatch (~3s, so an agent isn't spawned on a guessed PATH),
-/// auto-create (~5s, so a new project isn't seeded from one), and Recheck (the
-/// full derived budget, because the user is watching a spinner). So this figure
-/// is not free — it is the ceiling those bounded waits are sized against.
+/// auto-create (~5s, so a new project isn't seeded from one), Recheck (the full
+/// derived budget, because the user is watching a spinner), and the Codex
+/// account quota read (one full attempt — nothing waits on it, so there is no
+/// spinner to keep short). So this figure is not free — it is the ceiling those
+/// bounded waits are sized against.
 #[cfg(target_os = "macos")]
 pub const PATH_CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -1356,11 +1358,55 @@ pub async fn drain_stderr_with_observer<F>(
 ) where
     F: FnMut(&str) + Send,
 {
+    if let Err(e) = drain_stderr_into_tail(stderr, tail, |line| {
+        tracing::debug!(agent_id = %agent_id, %turn_id, "{harness_name} stderr: {line}");
+        observe(line);
+    })
+    .await
+    {
+        tracing::warn!(agent_id = %agent_id, %turn_id, error = %e, "stderr read error");
+    }
+}
+
+/// The stderr read loop itself, with **no per-turn identity attached**.
+///
+/// Split out from [`drain_stderr_with_observer`] because a harness call that
+/// belongs to no agent and no turn — the Codex account usage read is the first
+/// — otherwise has to choose between inventing ids it does not have and
+/// copying this loop. Both are worse than a parameter it does not take: the
+/// copy is the one this module's docs warn about, and it has already been
+/// written once and drifted in exactly the predicted place (the read-error
+/// branch, which the copy dropped).
+///
+/// `observe` sees every line **before** the bounded tail does, for the reason
+/// [`drain_stderr_with_observer`] documents: the tail front-evicts, so it
+/// cannot be the source of truth for a signal that must not be missed.
+/// Callers that want per-line `tracing` emit it from there.
+///
+/// **A read error is returned, not logged**, because the useful log line is the
+/// caller's: a turn's drain can name its agent and turn, and an account-scoped
+/// call cannot. Returning it is also what keeps the branch from being silently
+/// dropped — which is precisely how the one hand-written copy of this loop
+/// went wrong. Callers must report it; a caller that reaches EOF and one whose
+/// read failed have different stories, and a tail that lost lines to an IO
+/// error while looking complete is worse than an empty one.
+///
+/// # Errors
+///
+/// The first read error on the stream, after which draining stops. A clean EOF
+/// is `Ok(())`.
+pub async fn drain_stderr_into_tail<F>(
+    stderr: tokio::process::ChildStderr,
+    tail: Arc<Mutex<VecDeque<String>>>,
+    mut observe: F,
+) -> Result<(), std::io::Error>
+where
+    F: FnMut(&str) + Send,
+{
     let mut lines = tokio::io::BufReader::new(stderr).lines();
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
-                tracing::debug!(agent_id = %agent_id, %turn_id, "{harness_name} stderr: {line}");
                 observe(&line);
                 if let Ok(mut buf) = tail.lock() {
                     // Eviction policy: mirrored by the Antigravity adapter's
@@ -1372,11 +1418,8 @@ pub async fn drain_stderr_with_observer<F>(
                     buf.push_back(line);
                 }
             }
-            Ok(None) => break,
-            Err(e) => {
-                tracing::warn!(agent_id = %agent_id, %turn_id, error = %e, "stderr read error");
-                break;
-            }
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e),
         }
     }
 }

@@ -224,7 +224,18 @@ pub enum RateLimitSource {
     StreamOnly,
     /// Already persisted by the harness in its own session file (class B); the
     /// harness file is canonical and durable, so Switchboard does **not**
-    /// re-persist it. Codex's session-file-enriched rate-limit.
+    /// re-persist it.
+    ///
+    /// **Knowingly without a production producer.** Codex's rollout-derived
+    /// rate-limit was the only one, and it is gone: the rollout reports a single
+    /// unnamed bucket under identical identifiers whichever limit it describes,
+    /// so Codex's quotas are asked for over its app-server protocol instead, and
+    /// that read never becomes an `AdapterEvent`. The variant stays because it
+    /// encodes the class B/C distinction the docs lean on, its two siblings keep
+    /// both arms for surfaces Codex still produces, and the three-way symmetry
+    /// below is what keeps the persistence rule in the type system rather than in
+    /// a `match harness {…}`. `MockHarnessAdapter` still emits it, so the
+    /// dispatcher's do-not-persist gate stays covered by a test.
     SessionFileBacked,
 }
 

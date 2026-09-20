@@ -12,19 +12,29 @@
 /// that rule exists.** The backend persists the map without interpreting it, so
 /// there is no second copy to disagree with this one.
 import { invoke } from "@tauri-apps/api/core";
-import type { HarnessKind } from "$lib/types";
-import { sameCodexUsageWindows } from "$lib/usageWindows";
+import { claudeStoredWindows, windowResetsAt, type StoredUsageWindow } from "$lib/usageWindows";
+import type { HarnessKind, TurnId } from "$lib/types";
 
 /// One harness account's newest reading.
 export type HarnessUsageReading = {
   /// The harness's own rate-limit payload, opaque here exactly as it is opaque
   /// through the adapter, the dispatcher, and IPC. Only `usageWindows.ts`
   /// interprets it.
+  ///
+  /// **What it is *not* the source of, for a harness whose readings are partial:**
+  /// a Claude payload's `unifiedWindows` is only the delivering reading's partial
+  /// snapshot. Meter values, labels, and tones come from `windows` below; reading
+  /// the raw container for them reinstates the defect that made per-window
+  /// retention necessary. The container is still live for two narrower jobs — it
+  /// decides whether the bare fallback line may render, and it is what recovers
+  /// windows from a file written before they were held individually.
   payload: unknown;
   /// **The ordering key**, ISO-8601. For a live event this is arrival time; for a
-  /// reading recovered from a harness's own session file it is the instant the
-  /// harness measured it, which is the only thing that can order several agents'
-  /// restored readings against each other.
+  /// reading restored at project open it is the capture instant recorded beside
+  /// it in Switchboard's own metadata sidecar, which is the only thing that can
+  /// order several agents' restored readings against each other. No harness
+  /// session file supplies one — the loaders deliberately leave the field unset.
+  /// The sidecar is therefore the only restore-path producer.
   ///
   /// **Also what dates the reading for the user.** There used to be a second
   /// field for that, set only when a reading came from a stream-only snapshot, on
@@ -32,25 +42,29 @@ export type HarnessUsageReading = {
   /// because it is durable. Durable was mistaken for current: the file is re-read
   /// on every open but can itself be days old. One instant answers both questions.
   ///
-  /// **Optional, because a reading can genuinely have no measured instant**: a
-  /// Codex `token_count` record whose line carries no parseable timestamp yields
-  /// one, and the reading is still worth keeping. Such a reading ranks below
-  /// every stamped one and renders with no age line at all, rather than being
-  /// given a fabricated instant that would sort correctly and then be shown to
-  /// the user as a date in 1970.
-  observed_at?: string;
-  /// Model of the turn that delivered the reading, which is what names Claude's
-  /// model-gated weekly window — the payload never names it itself.
-  model?: string;
-  /// Whether the harness is currently refusing work because a window in this
-  /// reading is exhausted.
+  /// **Optional for compatibility, not because anything still produces one.**
+  /// Every current path supplies an instant: a live event has its arrival time,
+  /// and the sidecar's capture time is a required field, written in the same
+  /// block as the payload it dates, so a restored reading cannot arrive undated.
+  /// What can still arrive undated is a `usage.yaml` entry — written by a build
+  /// whose Codex rollout reading could carry no parseable timestamp, or edited by
+  /// hand, which `asReading` already treats the file as open to.
   ///
-  /// **Needed only for a harness whose payload cannot say so.** Codex records a
-  /// windowless payload on a refused turn and names no window, so the verdict has
-  /// to be carried beside the reading. Claude states it in the payload itself, so
-  /// nothing sets this for Claude and `usageWindows.ts` reads Claude's own
-  /// status instead.
-  limit_reached?: boolean;
+  /// Such a reading ranks below every stamped one and renders with no age line at
+  /// all, rather than being given a fabricated instant that would sort correctly
+  /// and then be shown to the user as a date in 1970. That is what the optionality
+  /// buys, and why tightening the type would break restore rather than tidy it.
+  observed_at?: string;
+  /// The windows this account holds, keyed by the harness's own window key, each
+  /// with the context of the reading that delivered *it*.
+  ///
+  /// **Present only for a harness whose readings are partial**, and that is what
+  /// selects the merge rule below — the policy follows the data rather than a
+  /// harness name. A reading that names every limit it has (Codex's account read)
+  /// carries no map and replaces wholesale; one that names only the windows a
+  /// turn's model touched (Claude's `rate_limit_event`) carries a map and merges
+  /// into what is held. `reportsPartialUsageWindows` records why.
+  windows?: Record<string, StoredUsageWindow>;
 };
 
 /// Keyed by harness. Partial because a harness contributes an entry only once one
@@ -84,70 +98,208 @@ function isNewer(candidate: string | undefined, stored: string | undefined): boo
   return a > b;
 }
 
-/// Record a reading, keeping it only if nothing newer is already held.
+/// Merge windows the reading names, and take its account-level fields if it is
+/// the newest one.
 ///
-/// The refusal verdict is carried forward **only when the new reading describes
-/// the same windows**. A verdict is a judgment about a particular window, so a
-/// reading describing different windows retires it along with the window it
-/// judged. Without that, a stale verdict paints a freshly reset quota as spent,
-/// which the reset-passed gate cannot correct because the new window is current.
-/// A refused turn's own reading re-reports the same windows, which is what lets
-/// the verdict survive the sequence that set it.
+/// **Two scopes, two rules, because a reading can be authoritative about one and
+/// silent about the other.** `payload` holds account-level state — Claude's
+/// overage escalation, the no-window-map fallback — and only the newest reading
+/// speaks for that. `windows` are merged per key: a reading that does not mention
+/// a window is not evidence the window is gone, so the held one survives with its
+/// own value, its own instant, and its own flags. Replacing wholesale is what let
+/// a turn on one model delete a still-blocking cap on another.
+///
+/// An older reading can therefore still contribute a window the store has never
+/// seen while losing the account-level fields — which is the point, since that is
+/// exactly a restored reading from the agent that ran the gated model.
+///
+/// **Nothing is carried across readings.** A reading used to drag a separately
+/// recorded refusal verdict forward whenever it described the same windows,
+/// because Codex's per-turn payload could not say which quota had refused. Both
+/// harnesses now state exhaustion inside the payload, and a retained window keeps
+/// the judgement made about *it* rather than inheriting one made about another.
 export function observeUsage(harness: HarnessKind, reading: HarnessUsageReading): void {
   const stored = harnessUsage[harness];
   // Nothing held yet takes the reading whatever its instant; ranking only decides
   // between two readings that both exist.
-  if (stored !== undefined && !isNewer(reading.observed_at, stored.observed_at)) return;
-  const carried =
-    stored?.limit_reached === true && sameCodexUsageWindows(stored.payload, reading.payload);
-  harnessUsage[harness] = carried ? { ...reading, limit_reached: true } : reading;
+  if (stored === undefined) {
+    harnessUsage[harness] = reading;
+    persist();
+    return;
+  }
+  const windows = mergeWindows(stored.windows, reading.windows);
+  if (isNewer(reading.observed_at, stored.observed_at)) {
+    harnessUsage[harness] = { ...reading, windows };
+  } else if (windows !== stored.windows) {
+    harnessUsage[harness] = { ...stored, windows };
+  } else {
+    return;
+  }
   persist();
 }
 
-/// Record that the harness refused a turn because a quota is exhausted.
+/// Whether `candidate` describes a later state of a window than `held` does.
 ///
-/// Attaches to the reading already held rather than creating an entry: the
-/// verdict is *about* a reading, and a refusal with no measurement to attach to
-/// has no window to mark.
+/// **Two tiers, and the reading level has only the second one.** A reading can be
+/// ordered solely by when we heard it; a *window* additionally carries the vendor's
+/// own reset, which states which generation of the window it is rather than when we
+/// learned of it. Generation is the stronger signal, so it decides first and the
+/// instant decides only when both resets say the same thing or cannot be read.
 ///
-/// Usually there is one, because the reading that preceded the refusal is still
-/// the newest window-bearing record on disk. **Not always**: an agent whose
-/// rollout contains only the refused turn has no window-bearing record at all, so
-/// no reading was ever emitted and the refusal is dropped. That shows no meter
-/// rather than a wrong one, which is the direction this code takes throughout.
-export function recordUsageRefusal(harness: HarnessKind): void {
-  const stored = harnessUsage[harness];
-  if (stored === undefined || stored.limit_reached === true) return;
-  harnessUsage[harness] = { ...stored, limit_reached: true };
-  persist();
+/// **Directional, which is the whole point.** An earlier reset is positive evidence
+/// that the arriving window is the *superseded* instance, so it is skipped rather
+/// than falling through to instant ranking — otherwise a dated-but-stale reading
+/// beats an undated current one under the absent-ranks-last rule, which is right in
+/// general and wrong when the reset proves which instance is older. A symmetric
+/// "any different reset wins" test let a project's hours-old snapshot overwrite a
+/// live window and, once its elapsed reset dropped it at render, take the whole
+/// Claude row off the card.
+///
+/// Both directions are needed. Utilization only ever climbs *within* a window, so a
+/// retained value understates and retention is safe; across a reissue that
+/// invariant does not hold, which is why a later reset must land even from a
+/// reading that would lose on its instant.
+///
+/// **The premise, recorded because nothing in the payload enforces it: for a given
+/// key, a larger reset means a later generation.** A vendor moving a reset
+/// *backward* — a corrected allowance — is therefore not handled: that reading is
+/// read as the older instance and skipped, so the key holds its value until the
+/// stale reset elapses and the window drops, up to its own duration. Unobserved,
+/// and indistinguishable from an older instance using what the payload gives us, so
+/// it is a stated limitation rather than a case to detect.
+function supersedesWindow(candidate: StoredUsageWindow, held: StoredUsageWindow): boolean {
+  const a = windowResetsAt(candidate);
+  const b = windowResetsAt(held);
+  if (a !== null && b !== null && a !== b) return a > b;
+  return isNewer(candidate.observed_at, held.observed_at);
 }
 
-/// Fill in the model that delivered the newest reading, once it is known.
+/// Whether a window `supersedesWindow` just rejected was nonetheless the newer
+/// measurement of the two.
+///
+/// **That combination is impossible under the premise the ordering rests on, which
+/// is the whole reason it is worth reporting.** A window's reset is supposed to
+/// advance across generations, so a newer measurement cannot carry an earlier
+/// reset. If one ever does, the premise is false — and this is the only place that
+/// can notice, because the claim compares two readings at least a window's duration
+/// apart and no test, live or otherwise, spans that. Only the running app does.
+///
+/// **Call-site predicate: it does not re-test the reset direction, because nothing
+/// could reach that test.** Arriving here means the candidate lost, and a candidate
+/// with the *later* reset never loses; an equal or unreadable reset defers to the
+/// very instant comparison below, which then cannot have favoured the candidate. So
+/// a true answer already implies both resets were readable and the candidate's was
+/// the earlier one, which is what lets the caller report them.
+///
+/// The ordinary rejection is silent here: a project whose saved reading predates a
+/// window rolling over is older on *both* axes, which is the common case and no
+/// contradiction at all.
+///
+/// **Both instants must parse.** `isNewer` ranks an absent instant last by
+/// convention rather than by evidence, so a dated candidate against an undated held
+/// window is not a disagreement and must not be reported as one.
+function wasNewerMeasurement(candidate: StoredUsageWindow, held: StoredUsageWindow): boolean {
+  const measured = Date.parse(candidate.observed_at ?? "");
+  const heldMeasured = Date.parse(held.observed_at ?? "");
+  return !Number.isNaN(measured) && !Number.isNaN(heldMeasured) && measured > heldMeasured;
+}
+
+/// Window keys under a standing contradiction, so one logs once rather than on
+/// every reading until the stale reset elapses.
+///
+/// A plain object rather than a `Set`, which the lint rule would want reactive:
+/// nothing renders from this and nothing should re-derive when it changes. It is log
+/// bookkeeping, the same role `lastDiagnostics` plays for the account read.
+const resetRegressions: Record<string, true> = {};
+
+/// Fold the windows a reading names into the held set, per key.
+///
+/// Returns the held map by identity when nothing changed, so the caller can skip
+/// a write and a reactive update.
+function mergeWindows(
+  held: Record<string, StoredUsageWindow> | undefined,
+  incoming: Record<string, StoredUsageWindow> | undefined,
+): Record<string, StoredUsageWindow> | undefined {
+  if (incoming === undefined) return held;
+  const merged = { ...held };
+  let changed = false;
+  for (const [key, window] of Object.entries(incoming)) {
+    const h = merged[key];
+    if (h !== undefined && !supersedesWindow(window, h)) {
+      if (wasNewerMeasurement(window, h) && resetRegressions[key] === undefined) {
+        resetRegressions[key] = true;
+        // Carries both resets and both instants because the point of the line is to
+        // describe a shape we have never seen. No recovery line is logged the way
+        // the account read's diagnostics do: there the useful fact is that a
+        // condition ended, here it is that it happened at all.
+        console.warn(
+          `harness usage: ${key} reset moved backward — a reading measured at ` +
+            `${window.observed_at} states reset ${windowResetsAt(window)} while one ` +
+            `measured at ${h.observed_at} states ${windowResetsAt(h)}. The window is ` +
+            `held at the later reset; ordering assumes a reset only advances.`,
+        );
+      }
+      continue;
+    }
+    // The condition ends when this key next takes a window, which is the only
+    // signal available — the store never prunes, so a held window with a stale
+    // reset would otherwise keep the mark for the life of the session.
+    delete resetRegressions[key];
+    merged[key] = window;
+    changed = true;
+  }
+  return changed ? merged : held;
+}
+
+/// Name the windows turn `turnId` contributed, once that turn's model is known.
 ///
 /// Claude's model-gated weekly window carries no model of its own, so the label
-/// comes from the turn that delivered the reading — and that turn's `init` can
-/// arrive *after* its rate-limit event. **Fills a blank only**: a reading that
-/// already names a model is never relabelled, so a later turn on a different
-/// model cannot rewrite history.
-export function nameUsageModel(harness: HarnessKind, model: string | undefined): void {
-  if (model === undefined || model === "") return;
-  const stored = harnessUsage[harness];
-  if (stored === undefined || stored.model !== undefined) return;
-  harnessUsage[harness] = { ...stored, model };
-  persist();
-}
-
-/// Clear the refusal verdict after a turn completes.
+/// comes from the turn that delivered it — and that turn's `init` can arrive
+/// *after* its rate-limit event.
 ///
-/// **Only a completed turn clears it.** A cancellation is the user's own doing
-/// and an unrelated failure is no evidence the quota moved, so neither is taken
-/// as proof the harness is serving work again. Clearing on either reproduces, on
-/// a slower clock, the flicker that came from deriving this from the last error.
-export function clearUsageRefusal(harness: HarnessKind): void {
+/// **A narrow fallback, not the normal route.** In the refusal ordering actually
+/// observed, the gated window arrives in a *second* rate-limit event that follows
+/// `session_meta`, so it is labelled at ingest and never reaches here. This exists
+/// for the inverted order recorded on a compaction stream.
+///
+/// **Fills only blanks, and only ones this turn contributed.** Both halves are
+/// load-bearing, and the turn rather than the agent is the grain that works.
+/// Without the blank check a later reading would rewrite history. With only an
+/// agent check, a turn that died before reporting its model leaves a blank that
+/// the same agent's *next* turn fills with a different model — which
+/// `runtimeReducer` already refuses one layer down by clearing the per-turn model
+/// at every turn start.
+///
+/// **An unknown turn grants nothing, and one check covers both sides.** Rejecting
+/// an absent `turnId` up front is what makes the strict comparison below sufficient
+/// to reject a window carrying no turn: with the caller's turn known to be a real
+/// id, an unattributed window can never match it. Checking both separately reads as
+/// belt-and-braces but leaves two expressions where either alone is load-bearing,
+/// so neither can be pinned by a test. What must not happen is absent matching
+/// absent, which would make every unlabelled window eligible to any fill — worse
+/// than the race being fixed.
+///
+/// A window whose turn is unknown — restored from disk, where a later turn's model
+/// would be a guess about an older measurement — is therefore never filled. It
+/// renders unlabelled rather than wrong, which is the rule this surface follows
+/// throughout.
+export function nameUsageModel(
+  harness: HarnessKind,
+  turnId: TurnId | undefined,
+  model: string | undefined,
+): void {
+  if (model === undefined || model === "") return;
+  if (turnId === undefined) return;
   const stored = harnessUsage[harness];
-  if (stored === undefined || stored.limit_reached !== true) return;
-  const { limit_reached: _limitReached, ...rest } = stored;
-  harnessUsage[harness] = rest;
+  if (stored?.windows === undefined) return;
+  let windows: Record<string, StoredUsageWindow> | undefined;
+  for (const [key, window] of Object.entries(stored.windows)) {
+    if (window.model !== undefined) continue;
+    if (window.turn_id !== turnId) continue;
+    windows = { ...(windows ?? stored.windows), [key]: { ...window, model } };
+  }
+  if (windows === undefined) return;
+  harnessUsage[harness] = { ...stored, windows };
   persist();
 }
 
@@ -181,6 +333,15 @@ export async function loadPersistedUsage(): Promise<void> {
 /// Defensive read of one persisted entry. The file is machine-written, but it is
 /// also user-editable and forward-compatible by design, so an entry that does not
 /// carry the two fields every consumer needs is dropped rather than rendered.
+/// **An entry written before the Codex account read is kept, not migrated.**
+/// It is tolerated because the two payload shapes cannot be confused: the old
+/// one is the rollout's `rate_limits` object and structurally cannot carry
+/// `rateLimitsByLimitId`, so the account view reads it as nothing and the
+/// section renders empty until a fresh read supersedes it on arrival-time
+/// ranking. That is normally the refresh the usage panel issues when it mounts,
+/// but it depends on the read succeeding — offline, or with no Codex installed,
+/// the stale entry simply keeps rendering nothing. No version check or shape
+/// sniff is needed anywhere.
 function asReading(value: unknown): HarnessUsageReading | null {
   if (typeof value !== "object" || value === null) return null;
   const v = value as Record<string, unknown>;
@@ -191,12 +352,81 @@ function asReading(value: unknown): HarnessUsageReading | null {
   // resolving plain scalars to a timestamp type, and if that ever changes the
   // entry should disappear loudly rather than quietly demote itself to unranked.
   if (v.observed_at !== undefined && typeof v.observed_at !== "string") return null;
+  const windows = v.windows === undefined ? legacyWindows(v) : asStoredWindows(v.windows);
+  if (windows === null) return null;
   return {
     payload: v.payload,
     observed_at: typeof v.observed_at === "string" ? v.observed_at : undefined,
-    model: typeof v.model === "string" ? v.model : undefined,
-    limit_reached: v.limit_reached === true ? true : undefined,
+    windows,
   };
+}
+
+/// Read a persisted window map, or `null` to reject the whole entry.
+///
+/// **One severity, and it is loud.** The file is machine-written, so a map that is
+/// not the shape we write is not evidence of a window worth salvaging; the entry
+/// is discarded and the next turn rebuilds it. Repairing it field by field would
+/// quietly demote a window to unlabelled or unranked, which is the failure mode
+/// the reading-level instant check already refuses for the same reason.
+///
+/// Unknown fields are ignored rather than rejected, so a later version may add one
+/// without this dropping every entry an older build wrote — but they are also not
+/// preserved, matching the reading-level whitelist.
+function asStoredWindows(value: unknown): Record<string, StoredUsageWindow> | undefined | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const windows: Record<string, StoredUsageWindow> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry !== "object" || entry === null) return null;
+    const e = entry as Record<string, unknown>;
+    if (e.window === undefined) return null;
+    const observedAt = e.observed_at;
+    const model = e.model;
+    if (observedAt !== undefined && typeof observedAt !== "string") return null;
+    if (model !== undefined && typeof model !== "string") return null;
+    windows[key] = {
+      window: e.window,
+      status: e.status,
+      rate_limit_type: e.rate_limit_type,
+      surpassed_threshold: e.surpassed_threshold,
+      is_using_overage: e.is_using_overage,
+      observed_at: observedAt,
+      model,
+      // **`turn_id` is written to the file and deliberately not read back**, which
+      // is the one asymmetry here. It authorizes the late label fill, a repair
+      // inside one live turn; a restored one could only ever authorize a stale fill
+      // in a later session, naming a window from a turn that had nothing to do with
+      // measuring it. Dropped here rather than filtered at write time, because
+      // `persist` writing the map verbatim is its own invariant and turning it into
+      // a projection would put a second rule in the one place that must stay dumb.
+      // Turn ids are unique, so a match would already be vanishingly unlikely —
+      // "unlikely" is not the standard the rest of this file holds.
+      //
+      // **The omission is the safeguard, and `does not restore permission to label a
+      // window` is what keeps it here.** Every other field on a stored window is
+      // read back, so this line's absence is the only thing standing between a
+      // restored file and a stale fill; completing the list for symmetry would
+      // reopen the mislabel silently. That test is the reason it cannot.
+    };
+  }
+  return Object.keys(windows).length > 0 ? windows : undefined;
+}
+
+/// Recover windows from an entry written before they were held individually.
+///
+/// Lifted from the stored payload rather than migrated by a version check, which
+/// works because the extraction is shape-driven: a Claude payload yields its
+/// windows and any other yields none, so the same call serves every harness.
+///
+/// **Deliberately carries no instant and no contributing agent.** The
+/// reading-level timestamp dated the reading, not each window, and using it here
+/// would date one window by when another was measured; an absent contributor is
+/// what stops a later turn's `init` labelling a measurement it knows nothing
+/// about. Only the age line and a missing model label are unavailable — the window
+/// still renders and still retires, because both read the payload's own reset.
+function legacyWindows(v: Record<string, unknown>): Record<string, StoredUsageWindow> | undefined {
+  return claudeStoredWindows(v.payload, {
+    model: typeof v.model === "string" ? v.model : undefined,
+  });
 }
 
 /// Whether a write is in flight, and whether the map changed while it was.
@@ -241,9 +471,24 @@ function persist(): void {
 /// Test-only reset. Named under `_testing` so a production caller grepping for
 /// "reset" cannot autocomplete into clearing app state.
 export const _testing = {
+  /// Resolve once no write is running and none is pending.
+  ///
+  /// **Awaited before `reset`, never instead of it.** `reset` clears the maps but
+  /// cannot stop a drain loop already running: that loop re-reads `harnessUsage`
+  /// on every pass, so a write surviving into the next test issues an
+  /// `invoke` there — against a cleared map, after the mock was cleared, in a
+  /// test that never touched this store.
+  async settled(): Promise<void> {
+    while (writeInFlight !== null) {
+      await writeInFlight;
+    }
+  },
   reset(): void {
     for (const key of Object.keys(harnessUsage)) {
       delete harnessUsage[key as HarnessKind];
+    }
+    for (const key of Object.keys(resetRegressions)) {
+      delete resetRegressions[key];
     }
   },
 };

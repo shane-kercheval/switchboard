@@ -36,6 +36,9 @@ async function loadState() {
 /// `_testing.reset()`, so no separate teardown here.
 const usage = await import("./harnessUsage.svelte");
 
+/// The self-refreshing account read, for asserting *whether* it was asked.
+const accountUsage = await import("./accountUsage.svelte");
+
 function agentRecord(
   id: string,
   name = "test",
@@ -208,6 +211,190 @@ describe("event routing", () => {
     // it describes belongs to the harness account this agent happens to use.
     expect(usage.harnessUsage.claude_code?.payload).toEqual({ primary: { used_percent: 30 } });
     expect(state.transcripts[AGENT_A]).toEqual([]);
+  });
+});
+
+/// Claude's late model label.
+///
+/// **A narrow fallback, not the normal route.** In the refusal ordering observed on
+/// the real account, the gated window arrives in a *second* rate-limit event that
+/// follows `session_meta`, so it is labelled at ingest and never reaches the repair
+/// path. This covers the inverted order recorded on a compaction stream.
+///
+/// **The window outlives the reading now, which is what makes a mislabel a defect
+/// rather than a race with a short blast radius.** It used to survive only until the
+/// next reading replaced it — seconds. Under retention a wrong model renders until
+/// the window resets, and the only thing that can correct it is another turn on the
+/// gated model, which is the one thing a capped user cannot run.
+describe("naming Claude's model-gated weekly window", () => {
+  const GATED = {
+    status: "allowed",
+    unifiedWindows: {
+      seven_day_overage_included: { utilization: 1, resetsAt: 1_900_000_000 },
+    },
+  };
+
+  function gatedWindow(): { model?: string; turn_id?: string } | undefined {
+    return usage.harnessUsage.claude_code?.windows?.seven_day_overage_included;
+  }
+
+  /// Turn boundaries are fired for real, because the contributing turn is what
+  /// authorizes the label. Without them both sides carry no turn and the tests would
+  /// pass on an absent-equals-absent match rather than on the rule.
+  function startTurn(agentId: string, turnId: string, startedAt: string): void {
+    fireTo(`agent:${agentId}`, {
+      type: "turn_start",
+      turn_id: turnId,
+      message_id: crypto.randomUUID(),
+      send_id: crypto.randomUUID(),
+      started_at: startedAt,
+    });
+  }
+
+  function reportModel(agentId: string, model: string): void {
+    fireTo(`agent:${agentId}`, {
+      type: "session_meta",
+      agent_id: agentId,
+      model,
+      harness_version: "2.1.274",
+      inventory: {},
+      raw: {},
+    });
+  }
+
+  it("labels the window once the delivering turn's init lands", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cc", "claude_code"));
+    startTurn(AGENT_A, crypto.randomUUID(), "2026-05-15T00:00:00Z");
+    fireTo(`agent:${AGENT_A}`, { type: "rate_limit_event", agent_id: AGENT_A, info: GATED });
+    expect(gatedWindow()?.model).toBeUndefined();
+
+    reportModel(AGENT_A, "claude-fable-5-1");
+    expect(gatedWindow()?.model).toBe("claude-fable-5-1");
+  });
+
+  it("does not let a second agent's init name a window the first contributed", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cc", "claude_code"));
+    await state.registerAgent(agentRecord(AGENT_B, "cc2", "claude_code"));
+    const turnA = crypto.randomUUID();
+    startTurn(AGENT_A, turnA, "2026-05-15T00:00:00Z");
+    startTurn(AGENT_B, crypto.randomUUID(), "2026-05-15T00:00:01Z");
+    fireTo(`agent:${AGENT_A}`, { type: "rate_limit_event", agent_id: AGENT_A, info: GATED });
+    reportModel(AGENT_B, "claude-opus-5");
+    expect(gatedWindow()?.model).toBeUndefined();
+
+    // Still repairable by the turn that actually measured it.
+    reportModel(AGENT_A, "claude-fable-5-1");
+    expect(gatedWindow()?.model).toBe("claude-fable-5-1");
+  });
+
+  it("does not let this agent's next turn name a window an earlier turn contributed", async () => {
+    // A turn that dies before reporting its model leaves a blank. Scoping the fill to
+    // the agent would let the next turn — a different model — claim it, and it would
+    // render that way for up to a week. `runtimeReducer` already refuses the same
+    // thing one layer down by clearing the per-turn model at every turn start.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cc", "claude_code"));
+    startTurn(AGENT_A, crypto.randomUUID(), "2026-05-15T00:00:00Z");
+    fireTo(`agent:${AGENT_A}`, { type: "rate_limit_event", agent_id: AGENT_A, info: GATED });
+    fireTo(`agent:${AGENT_A}`, { type: "agent_idle", agent_id: AGENT_A });
+
+    startTurn(AGENT_A, crypto.randomUUID(), "2026-05-15T00:10:00Z");
+    reportModel(AGENT_A, "claude-opus-5");
+    expect(gatedWindow()?.model).toBeUndefined();
+  });
+
+  it("records which turn contributed the window", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cc", "claude_code"));
+    const turnA = crypto.randomUUID();
+    startTurn(AGENT_A, turnA, "2026-05-15T00:00:00Z");
+    fireTo(`agent:${AGENT_A}`, { type: "rate_limit_event", agent_id: AGENT_A, info: GATED });
+    expect(gatedWindow()?.turn_id).toBe(turnA);
+  });
+});
+
+/// The Codex quota cut. Codex's per-turn reading is replaced by an account read
+/// that names every limit; these pin that the old path is disconnected at both
+/// frontend entry points and that the new one is triggered.
+///
+/// **The cut has to happen with the replacement, not after the backend stops
+/// emitting.** A live Codex reading is stamped with *arrival* time, so it wins
+/// newest-wins against the account read on every single turn. Left connected, it
+/// would overwrite the account payload after every turn and the Codex section
+/// would clean-hide — worse than the bug being fixed.
+describe("Codex account usage", () => {
+  it("does not route a Codex rate-limit event into the store", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cx", "codex"));
+    fireTo(`agent:${AGENT_A}`, {
+      type: "rate_limit_event",
+      agent_id: AGENT_A,
+      info: { primary: { used_percent: 30 } },
+    });
+    expect(usage.harnessUsage.codex).toBeUndefined();
+  });
+
+  it("still routes a Claude rate-limit event", async () => {
+    // The cut is per harness, not a blanket disconnect: Claude has no account
+    // read, so its per-turn reading is the only reading it has.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_B, "cc", "claude_code"));
+    fireTo(`agent:${AGENT_B}`, {
+      type: "rate_limit_event",
+      agent_id: AGENT_B,
+      info: { primary: { used_percent: 30 } },
+    });
+    expect(usage.harnessUsage.claude_code?.payload).toEqual({ primary: { used_percent: 30 } });
+  });
+
+  it("asks the account for a reading when a Codex turn ends", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cx", "codex"));
+    invokeMock.mockClear();
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:05Z",
+    });
+    await accountUsage._testing.settled();
+    expect(invokeMock).toHaveBeenCalledWith("read_codex_account_usage", undefined);
+  });
+
+  it("asks after a failed turn too, not only a completed one", async () => {
+    // A turn refused *for* the quota is the moment the number on screen is most
+    // wrong, and a turn that failed partway still consumed what it ran. The read
+    // costs no quota and no model call, so there is nothing to save by being
+    // selective.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cx", "codex"));
+    invokeMock.mockClear();
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "failed", kind: "usage_limit", message: "nope" },
+      ended_at: "2026-05-15T00:00:05Z",
+    });
+    await accountUsage._testing.settled();
+    expect(invokeMock).toHaveBeenCalledWith("read_codex_account_usage", undefined);
+  });
+
+  it("does not ask when a Claude turn ends", async () => {
+    // Gated on the capability, not on the harness name — Claude has no account
+    // to ask, so a read here would spawn a Codex subprocess for a Claude turn.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_B, "cc", "claude_code"));
+    invokeMock.mockClear();
+    fireTo(`agent:${AGENT_B}`, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-15T00:00:05Z",
+    });
+    await accountUsage._testing.settled();
+    expect(invokeMock).not.toHaveBeenCalledWith("read_codex_account_usage", undefined);
   });
 });
 
@@ -1284,7 +1471,7 @@ describe("hydrateAgent", () => {
     expect(state.runtimes[AGENT_A]?.meta_as_of).toBe("2026-09-17T12:00:00Z");
   });
 
-  it("carries the rate-limit model from the IPC reply to the usage store", async () => {
+  it("carries the rate-limit model onto the window the snapshot delivered", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
 
@@ -1302,7 +1489,35 @@ describe("hydrateAgent", () => {
     });
 
     await state.hydrateAgent(AGENT_A);
-    expect(usage.harnessUsage.claude_code?.model).toBe("claude-fable-5-1");
+    const restored = usage.harnessUsage.claude_code?.windows?.seven_day_overage_included;
+    expect(restored?.model).toBe("claude-fable-5-1");
+    // **No contributing turn**, unlike a live reading. A restored window describes a
+    // turn that has already ended, so no live turn can claim to have measured it and
+    // none may name it.
+    expect(restored?.turn_id).toBeUndefined();
+  });
+
+  it("does not restore a Codex reading from the rollout snapshot", async () => {
+    // The restored shape is the one-unnamed-bucket payload the account read
+    // replaces, so it would put the old shape back on screen at project open.
+    //
+    // **The backend no longer sends one**, which does not make this test
+    // redundant: it pins the frontend's own capability gate, so a harness that
+    // starts reporting a rollout reading again — or a future one that does —
+    // cannot reach the store without that decision being made deliberately.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cx", "codex"));
+
+    invokeMock.mockResolvedValueOnce({
+      turns: [],
+      meta: null,
+      last_rate_limit: { primary: { used_percent: 93, resets_at: 1_800_000_000 } },
+      last_rate_limit_as_of: "2026-09-17T12:00:00Z",
+      warnings: [],
+    });
+
+    await state.hydrateAgent(AGENT_A);
+    expect(usage.harnessUsage.codex).toBeUndefined();
   });
 
   it("a live inventory that lands before hydration resolves never inherits the snapshot's age", async () => {

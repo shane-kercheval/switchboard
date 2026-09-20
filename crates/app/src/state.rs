@@ -506,6 +506,32 @@ pub struct AppState {
     /// runs, which stay per-project). `None` on a host with no resolvable config
     /// dir; production injects it via [`AppState::with_workflows_dir`].
     pub workflows_dir: Option<PathBuf>,
+    /// Whether this process may spawn real harness CLIs.
+    ///
+    /// **Resolved once, at startup, from the same decision that chose the
+    /// adapters** — not re-read per call. Every ordinary harness call reaches a
+    /// CLI through an adapter, so selecting `MockHarnessAdapter` is what keeps a
+    /// mock run from shelling out. The Codex account usage read is the one call
+    /// that bypasses the adapter layer, and so the one that would not notice; it
+    /// reads this instead of asking the environment a second time, because a
+    /// second copy of that decision is one that can silently disagree with the
+    /// first.
+    pub spawns_real_harnesses: bool,
+    /// The *kind* of the last account-usage failure, so a persistent one is
+    /// logged on change rather than on repeat.
+    ///
+    /// The kind rather than the message: the messages for the silence variants
+    /// interpolate whatever Codex printed, which is exactly what varies between
+    /// two occurrences of one condition.
+    ///
+    /// **Nearly every way that read can fail is a steady state**, not a blip:
+    /// no Codex installed, logged out, offline, or a Codex too old to report
+    /// named quotas. The read runs whenever the usage panel mounts and after
+    /// every Codex turn, so logging each failure would emit the same line
+    /// indefinitely and bury the transient failures that actually mean
+    /// something. `None` is "nothing has failed since startup", which is why
+    /// recovery logs too.
+    pub last_account_usage_failure: Mutex<Option<&'static str>>,
 }
 
 impl AppState {
@@ -557,6 +583,10 @@ impl AppState {
                 crate::notification::OsAuthorizationRequester,
             ))),
             workflows_dir: None,
+            // Tests construct state directly and never spawn a real CLI
+            // through this seam; production overrides it in `run`.
+            spawns_real_harnesses: false,
+            last_account_usage_failure: Mutex::new(None),
         }
     }
 
@@ -622,6 +652,15 @@ impl AppState {
     #[must_use]
     pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
         self.notifier = notifier;
+        self
+    }
+
+    /// Builder step recording whether this process may spawn real harness CLIs.
+    /// Production passes what `build_adapters` decided; the default is `false`,
+    /// so a test that forgets this cannot accidentally shell out.
+    #[must_use]
+    pub fn with_real_harnesses(mut self, spawns_real_harnesses: bool) -> Self {
+        self.spawns_real_harnesses = spawns_real_harnesses;
         self
     }
 

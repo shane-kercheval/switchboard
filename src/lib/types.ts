@@ -18,10 +18,13 @@ export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure" |
 // `turn.failed.error` containing `"401 Unauthorized"`.
 // `usage_limit` is the harness refusing the turn because a subscription
 // window is exhausted — typed from a structured signal (Codex's
-// `task_complete.error.codex_error_info`), never from the prose. Read once, by
-// the `turn_end` reducer, which translates it into
-// the account-scoped usage store; that store is what draws the usage window
-// full (see `usageWindows.ts::codexRateLimitView`).
+// `task_complete.error.codex_error_info`), never from the prose.
+//
+// **No surface reads it.** It once fed the usage store, which drew the refused
+// window full; that reader is gone, because a refusal cannot say *which* quota
+// refused and asking the account can. The kind is still typed: it is the
+// structured record of why a turn failed, and recovering that from prose later
+// is strictly worse than carrying it now.
 
 // Who initiated a cancellation. Carried on the `cancelled` outcome.
 export type CancelSource = "user" | "workflow" | "shutdown";
@@ -398,20 +401,19 @@ export type LoadedTranscript = {
   /// Capture time of `last_rate_limit` when restored from the per-agent
   /// metadata sidecar (a stream-only/class-C value, e.g. Claude's overage
   /// signal, that would otherwise be lost on restart). ISO-8601 string.
-  /// `null` for live values and for class-B (already-durable) sources;
-  /// drives the UI "as of …" staleness qualifier.
-  last_rate_limit_as_of?: string | null;
-  /// When the harness **measured** `last_rate_limit`, for ranking this agent's
-  /// reading against other agents' readings of the same account-scoped quota.
-  /// ISO-8601.
+  /// `null` for live values and for class-B (already-durable) sources.
   ///
-  /// Distinct from `last_rate_limit_as_of`, which is a staleness qualifier shown
-  /// to the user and deliberately absent for a durable source. This is an
-  /// ordering key, needed precisely for the durable case: a reading recovered
-  /// from a harness's own session file has no arrival time, so without the
-  /// measured instant several restored readings are indistinguishable and
-  /// "newest wins" cannot pick between them.
-  last_rate_limit_observed_at?: string | null;
+  /// **Three consumers, one meaning.** It is the instant the reading was
+  /// observed, so it both dates the reading for the user and orders it — against
+  /// other agents' readings of the same account quota, and per window against
+  /// another reading of the same window. All three are the same question asked of
+  /// one measurement, which is why they share a field.
+  ///
+  /// This is safe only because the dispatcher stamps it when the reading arrives
+  /// and every later write of that payload reuses it. A write that restamped it —
+  /// the model-label repair used to — makes a stale reading outrank a fresher one
+  /// and claims it was measured just now.
+  last_rate_limit_as_of?: string | null;
   /// Capture time of `meta.inventory` when restored from the metadata sidecar
   /// (ISO-8601). Same role as `last_rate_limit_as_of`: `null`/absent means the
   /// inventory is live or re-read from a durable harness file, so the card
@@ -506,10 +508,6 @@ export type Hydrate = {
   /// `LoadedTranscript.last_rate_limit_as_of`). `null` when the value is
   /// live or class-B.
   last_rate_limit_as_of?: string | null;
-  /// When the harness measured `last_rate_limit` (see
-  /// `LoadedTranscript.last_rate_limit_observed_at`). The ordering key for the
-  /// account-scoped usage store, not a staleness qualifier.
-  last_rate_limit_observed_at?: string | null;
   /// Capture time of `meta.inventory` from the metadata sidecar (see
   /// `LoadedTranscript.meta_as_of`).
   meta_as_of?: string | null;

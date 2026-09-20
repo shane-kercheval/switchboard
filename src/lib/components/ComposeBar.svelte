@@ -1014,6 +1014,16 @@
         return;
       }
       if (e.key === "Escape") {
+        // **An Escape another layer already consumed is not ours**, even though
+        // focus reads as the composer's by the time it gets here. Dismissible
+        // layers (the transcript navigator, dialogs, dropdowns) listen on
+        // `document`, which runs before this window listener: they close, call
+        // `preventDefault`, and restore focus to whatever had it before they
+        // opened — the composer, if the user pressed ⌘F while typing. The focus
+        // check below then passes and the same keystroke that closed the dialog
+        // also cleared the recipient chips. `defaultPrevented` is the only part
+        // of that sequence still true when we run.
+        if (e.defaultPrevented) return;
         if (composeEl === undefined || !composeEl.contains(document.activeElement)) return;
         // First dismiss whichever menu is open, otherwise clear the recipient
         // set. The draft text is untouched either way.
@@ -4271,16 +4281,7 @@
           {#if showStop}
             <StopIcon class="size-5" />
           {:else if composerBusy}
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2.25"
-              class="h-3.5 w-3.5 animate-spin"
-              aria-hidden="true"
-            >
-              <path d="M21 12a9 9 0 1 1-6.2-8.6" stroke-linecap="round" />
-            </svg>
+            <Spinner class="h-3.5 w-3.5 border-current/30 border-t-current" />
           {:else}
             <svg
               viewBox="0 0 24 24"

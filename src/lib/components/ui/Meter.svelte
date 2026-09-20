@@ -75,8 +75,11 @@
 </script>
 
 {#if measurable}
-  <div class={cn("min-w-0", className)} data-testid={testid}>
-    <div class="text-muted mb-0.5 flex items-baseline gap-2 text-[11px]">
+  <!-- Size lives on the wrapper so `class` can raise it; the label row inherits
+       rather than restating it, which is what lets a caller pass `text-xs`
+       without the inner size silently winning. -->
+  <div class={cn("min-w-0 text-[11px]", className)} data-testid={testid}>
+    <div class="text-muted mb-0.5 flex items-baseline gap-2">
       <span class="min-w-0 truncate">{label}</span>
       <span class="ml-auto flex shrink-0 items-baseline gap-1.5 tabular-nums">
         {#if detail !== undefined}

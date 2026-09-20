@@ -65,12 +65,13 @@ import {
 } from "./sendCompletion";
 import type { AgentRuntime, PendingSend, RuntimeMap, ToolCall, TranscriptMap, Turn } from "./types";
 import {
-  clearUsageRefusal,
   nameUsageModel,
   observeUsage,
-  recordUsageRefusal,
   _testing as usageTesting,
 } from "$lib/state/harnessUsage.svelte";
+import { requestAccountUsageRefresh } from "$lib/state/accountUsage.svelte";
+import { supportsAccountUsageRead } from "$lib/harnessCapabilities";
+import { claudeStoredWindows, reportsPartialUsageWindows } from "$lib/usageWindows";
 
 /// Per-agent turn lists, keyed by `agent_id`. The unified-view renderer
 /// merges across all agents at render time:
@@ -396,7 +397,6 @@ export function applyAgentHydrate(
     last_rate_limit: loaded.last_rate_limit ?? null,
     last_rate_limit_model: loaded.last_rate_limit_model ?? null,
     last_rate_limit_as_of: loaded.last_rate_limit_as_of ?? null,
-    last_rate_limit_observed_at: loaded.last_rate_limit_observed_at ?? null,
     meta_as_of: loaded.meta_as_of ?? null,
     last_context_report: loaded.last_context_report ?? null,
     last_context_report_at: loaded.last_context_report_at ?? null,
@@ -429,14 +429,35 @@ export function applyAgentHydrate(
 function recordRestoredUsage(agentId: AgentId, hydrate: Required<Hydrate>): void {
   const harness = agentHarness.get(agentId);
   if (harness === undefined || hydrate.last_rate_limit == null) return;
+  // **A harness we can ask does not get restored from a rollout.** The account
+  // read returns every limit named; a restored Codex reading is the one-unnamed-
+  // bucket shape this work replaced, and it is stamped with the harness's own
+  // measurement instant, so it would routinely outrank a *correct* live reading
+  // and put the old shape back on screen at project open.
+  if (supportsAccountUsageRead(harness)) return;
+  // The sidecar's capture time — when the reading was actually observed during
+  // the turn that reported it, not when this file was read. A reading without one
+  // stays **undated** rather than being given a sentinel: `isNewer` ranks an
+  // absent instant last on its own, and a sentinel would sort correctly and then
+  // be rendered to the user as a date.
+  //
+  // There is no measured-instant alternative to fall back to any more. That field
+  // existed to order several agents' *restored Codex* readings against each other,
+  // and Codex no longer restores one — its quotas come from the account read.
+  const observedAt = hydrate.last_rate_limit_as_of ?? undefined;
   observeUsage(harness, {
     payload: hydrate.last_rate_limit,
-    // The measured instant when the harness recorded one, else the snapshot's
-    // capture time. A reading with neither stays **undated** rather than being
-    // given a sentinel: `isNewer` ranks an absent instant last on its own, and a
-    // sentinel would sort correctly and then be rendered to the user as a date.
-    observed_at: hydrate.last_rate_limit_observed_at ?? hydrate.last_rate_limit_as_of ?? undefined,
-    model: hydrate.last_rate_limit_model ?? undefined,
+    observed_at: observedAt,
+    // **No contributing turn is recorded, unlike the live path.** A restored
+    // reading describes a turn that has already ended, so no live turn can claim to
+    // have measured it and none may name it. Its model comes from the sidecar or the
+    // window renders unlabelled.
+    windows: reportsPartialUsageWindows(harness)
+      ? claudeStoredWindows(hydrate.last_rate_limit, {
+          observedAt,
+          model: hydrate.last_rate_limit_model ?? undefined,
+        })
+      : undefined,
   });
 }
 
@@ -971,24 +992,49 @@ function cancelledEntryFor(
 /// Feed the account-scoped usage store from a live event.
 ///
 /// Separate from `runtimeReducer` because what it updates is not this agent's
-/// state: a quota reading and a refusal are facts about the harness account, and
-/// every agent on that harness reports the same ones. Driven from the same
-/// boundary so the two cannot see different events.
+/// state: a quota reading is a fact about the harness account, and every agent
+/// on that harness reports the same one. Driven from the same boundary so the
+/// two cannot see different events.
 ///
-/// `turn_end` moves the refusal verdict and `rate_limit_event` moves the reading.
-/// A cancellation and an unrelated failure move neither — see
-/// [`clearUsageRefusal`] for why neither counts as evidence the quota recovered.
+/// Three events reach the store, and none of them carries a verdict about
+/// whether the account is exhausted. `rate_limit_event` moves the reading for a
+/// harness that reports one, `session_meta` fills in a model label the reading
+/// arrived without, and `turn_end` asks a harness that can be asked for a fresh
+/// account-wide reading. Exhaustion used to be inferred here from a turn's
+/// outcome, because the per-turn payload could not say which quota had refused;
+/// asking the account answers it directly and the bookkeeping is gone.
 function recordAccountUsage(agentId: AgentId, event: NormalizedEvent, receivedAt: string): void {
   const harness = agentHarness.get(agentId);
   if (harness === undefined) return;
   if (event.type === "rate_limit_event") {
+    // Same cut as the restored path. **No Codex adapter emits this event** — its
+    // quotas are asked for over the app-server protocol — so this is a
+    // capability statement rather than a guard against a live double-write: it
+    // is where a future Codex stream reading would land, and it says that such a
+    // reading must not displace the account read. It would otherwise win
+    // newest-wins every single turn, being stamped with arrival time, and
+    // clean-hide the Codex section behind the one-unnamed-bucket shape.
+    if (supportsAccountUsageRead(harness)) return;
+    const model = runtimes[agentId]?.current_turn_model;
     observeUsage(harness, {
       payload: event.info,
       // Arrival time, not a measured instant: a live reading is current by
       // construction, and this is what ranks it above anything restored from
       // disk.
       observed_at: receivedAt,
-      model: runtimes[agentId]?.current_turn_model,
+      // Handed over as named windows rather than as a payload to replace, because
+      // this reading covers only the windows the turn's model touched — see
+      // `reportsPartialUsageWindows` for the completeness rule that decides it.
+      //
+      // Tagged with the *turn*, not the agent: it is what authorizes the late label
+      // fill, and only the turn that measured a window may name it.
+      windows: reportsPartialUsageWindows(harness)
+        ? claudeStoredWindows(event.info, {
+            observedAt: receivedAt,
+            model,
+            turnId: runtimes[agentId]?.in_flight_turn_id,
+          })
+        : undefined,
     });
   } else if (event.type === "session_meta") {
     // **Late model label.** Claude's per-model weekly window never names its own
@@ -999,23 +1045,34 @@ function recordAccountUsage(agentId: AgentId, event: NormalizedEvent, receivedAt
     //
     // Only ever fills a blank, and only from the reducer's `current_turn_model`
     // (this turn's own `init`), never from `meta.model`, which survives across
-    // turns and would name the previous model. The narrow cost is that two agents
-    // interleaving inside the milliseconds between one turn's reading and its
-    // `init` could label a window with the other's model; that is strictly better
-    // than dropping the label, which is the alternative.
-    nameUsageModel(harness, runtimes[agentId]?.current_turn_model);
+    // turns and would name the previous model.
+    //
+    // **Scoped to the windows this turn contributed**, which is narrower than this
+    // agent's and has to be. Two agents interleaving inside the milliseconds
+    // between one turn's reading and its `init` would cross-label; so would this
+    // agent's *next* turn, if the turn that reported the window died before
+    // reporting its model. Both write a wrong model that now renders until the
+    // window resets, correctable only by another turn on the gated model, which is
+    // the one thing a capped user cannot run.
+    //
+    // The turn id rather than a liveness check: it names which turn's measurement
+    // this `init` belongs to, which is the only question being asked here.
+    nameUsageModel(
+      harness,
+      runtimes[agentId]?.in_flight_turn_id,
+      runtimes[agentId]?.current_turn_model,
+    );
   } else if (event.type === "turn_end") {
-    // **Terminal before reading.** `emit_terminal_with_enrichment` emits `TurnEnd`
-    // ahead of the post-terminal `RateLimitEvent`, so a refusal recorded here
-    // attaches to the reading that *preceded* the refused turn. It survives the
-    // event that immediately follows only because that event re-reports the same
-    // windows and `observeUsage` carries the verdict across a matching reading.
-    // Reordering those two emissions would silently retire every refusal.
-    if (event.outcome.status === "completed") {
-      clearUsageRefusal(harness);
-    } else if (event.outcome.status === "failed" && event.outcome.kind === "usage_limit") {
-      recordUsageRefusal(harness);
-    }
+    // **Every outcome triggers a refresh, not just a completed one.** A turn
+    // that failed or was cancelled still consumed whatever it ran before
+    // stopping, and a turn refused *for* the quota is the moment the number is
+    // most wrong on screen. The read costs no quota and no model call, so there
+    // is nothing to save by being selective.
+    //
+    // This replaced a pair of refusal bookkeepers that inferred exhaustion from
+    // the turn's outcome, because the per-turn payload could not say which quota
+    // had refused. Asking the account answers it directly.
+    if (supportsAccountUsageRead(harness)) requestAccountUsageRefresh();
   }
 }
 

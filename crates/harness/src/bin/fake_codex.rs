@@ -13,12 +13,26 @@
 //! the real CLI calls the prompt arg" as the fixture path; the real CLIs
 //! just disagree about where that arg lives.
 //!
+//! **`app-server` mode needs no separate branch.** The account usage read
+//! (`codex::account_usage`) invokes `codex app-server` and speaks JSON-RPC over
+//! the pipes; a fake for it only has to emit a recorded response stream, which
+//! is what this binary already does. `fake_codex app-server <fixture-path>`
+//! lands the fixture in the last-argv slot and replays it — the same mechanism,
+//! not a special case. Since the real call passes no fixture argument, tests
+//! point it at a tiny `sh` shim that appends one (see
+//! `tests/codex_account_usage.rs`); a `$FAKE_CODEX_…` environment variable
+//! would have to be set process-wide, which is neither parallel-safe nor
+//! `unsafe`-free in edition 2024. The reader matches on JSON-RPC id, so it does
+//! not care that this binary never reads the requests it is "answering."
+//!
 //! Each non-empty, non-comment line of the fixture is written to stdout
 //! verbatim.
 //!
 //! Special comment lines in the fixture (processed, never forwarded to stdout):
 //!   `// exit:<N>` — exit with code N instead of 0; stops line processing.
 //!   `// stderr:<message>` — write message to stderr before streaming begins.
+//!   `// stderr_partial:<message>` — same, but with NO trailing newline, so a
+//!     line-oriented reader cannot surface it until the pipe reaches EOF.
 //!   `// read_stdin` — read stdin to EOF before streaming. The adapter must
 //!     spawn the child with `Stdio::null()` for stdin so this returns
 //!     immediately; without it, the test would deadlock waiting for input.
@@ -83,6 +97,16 @@ fn main() {
 
         if let Some(msg) = line.strip_prefix("// stderr:") {
             writeln!(err, "fake_codex: {}", msg.trim()).ok();
+            continue;
+        }
+
+        // Unterminated, deliberately: no trailing newline. A line reader holds
+        // a final partial line until EOF, so this models the canonical wedged
+        // process — a half-written diagnostic and then a stall — whose only
+        // output is unreachable until the pipe closes.
+        if let Some(msg) = line.strip_prefix("// stderr_partial:") {
+            write!(err, "fake_codex: {}", msg.trim()).ok();
+            err.flush().ok();
             continue;
         }
 

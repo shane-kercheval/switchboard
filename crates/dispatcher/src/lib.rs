@@ -2182,8 +2182,16 @@ async fn drain_turn(
     // metadata sidecar can restore the exact label after restart. Either event
     // may arrive first (compaction currently emits rate limit before init), so
     // a later model observation repairs the just-written snapshot.
+    //
+    // The payload's **own capture time** is held beside it, because that repair
+    // rewrites the row and must not restamp it: the snapshot's `captured_at` is
+    // what orders one agent's restored reading against another's, and a model
+    // label is not a new measurement. Restamping let a stale reading outrank a
+    // fresher one from a sibling agent and told the user it was measured just
+    // now.
     let mut rate_limit_model: Option<String> = None;
     let mut stream_rate_limit_payload: Option<serde_json::Value> = None;
+    let mut stream_rate_limit_captured_at: Option<DateTime<Utc>> = None;
 
     loop {
         tokio::select! {
@@ -2414,7 +2422,10 @@ async fn drain_turn(
                             agent_id,
                             payload.clone(),
                             rate_limit_model.clone(),
-                            Utc::now(),
+                            // The reading's own capture time, never `now`: this
+                            // write attaches a label to a measurement already
+                            // taken, and the timestamp is an ordering key.
+                            stream_rate_limit_captured_at.unwrap_or_else(Utc::now),
                         );
                     }
                 }
@@ -2428,11 +2439,16 @@ async fn drain_turn(
                     && *source == RateLimitSource::StreamOnly
                 {
                     stream_rate_limit_payload = Some(info.clone());
+                    // Arrival time, and the one place it is taken: this is the
+                    // instant the reading was observed, and every later write of
+                    // the same payload reuses it.
+                    let captured_at = Utc::now();
+                    stream_rate_limit_captured_at = Some(captured_at);
                     metadata.record_rate_limit(
                         *a,
                         info.clone(),
                         rate_limit_model.clone(),
-                        Utc::now(),
+                        captured_at,
                     );
                 }
                 // Persist the stream-only environment inventory, on the same

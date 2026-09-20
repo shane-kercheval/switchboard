@@ -470,6 +470,10 @@
     // before any project opens and before any turn runs. Each restored reading is
     // ranked rather than applied, so a live one that lands first still wins.
     void loadPersistedUsage();
+    // No account read alongside it: the restored reading's only consumer is the
+    // usage panel, which asks for a fresh one when it mounts. A read here would
+    // warm a store nothing looks at until the moment it refreshes itself, and
+    // would land while the login-shell PATH capture is still running.
     void loadWorkspace()
       .then(() => {
         // A closed sidebar is a legitimate device-local preference while the

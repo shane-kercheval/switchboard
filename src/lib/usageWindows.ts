@@ -6,6 +6,7 @@
 /// through a rendered agent card. The component keeps the markup, the tooltip
 /// content, and the per-harness gating.
 import { claudeModelFamilyLabel } from "$lib/agentSelection";
+import type { HarnessKind, TurnId } from "$lib/types";
 
 /// One usage window as the card draws it. `usedFraction` is 0–1 **used**,
 /// converted here rather than at the meter: Codex reports 0–100 and Claude a
@@ -16,20 +17,35 @@ export type UsageWindow = {
   label: string;
   usedFraction: number;
   resetsAtMs: number | null;
+  /// When this window was measured, ISO-8601.
+  ///
+  /// **Per window rather than per card.** Windows are retained individually, so
+  /// they genuinely do not share one instant: a weekly cap measured on Tuesday
+  /// sits beside a 5-hour window measured a minute ago. A single card-level line
+  /// would be true of one row and false of the rest.
+  ///
+  /// Absent when the delivering reading carried no instant, and for a window
+  /// restored from a file written before instants were held per window. No age is
+  /// claimed rather than one borrowed from a different window's measurement.
+  measuredAt?: string;
   /// Set only when the harness itself reported passing a threshold — never a
   /// percentage we pick, which would make the same occupancy alarming on one
   /// harness and calm on the other.
   surpassedThreshold?: number;
-  /// Set on the window a refusal applies to, which is the one signal that draws a
-  /// meter in the warning tone without the harness having reported a threshold.
+  /// Draw this meter in the warning tone. **The two readers set it on different
+  /// grounds, and the weaker one is Codex's.**
   ///
-  /// **How it is established differs per harness, and so does its effect on
-  /// `usedFraction`.** Claude names the blocked window and reports its real
-  /// utilization in the same payload that refuses, so the measurement stands as
-  /// measured. Codex names no window and records no measurement on a refused turn,
-  /// so the window is inferred and drawn full — the last measurement may read 93%
-  /// while the harness has since said no, and a bar still reading 93% beside a
-  /// refusal says the meter is wrong. See each harness's reader for the detail.
+  /// - **Claude: the payload named this window as the refused one.** Claude
+  ///   reports that window's real utilization alongside the refusal, so the
+  ///   number stands as measured and only the tone is added.
+  /// - **Codex: the measurement reached 100%.** That is our inference from a
+  ///   number, not something Codex said. Codex does send a reason code, and this
+  ///   reader deliberately ignores it — see `codexAccountUsageView`.
+  ///
+  /// Both are stated because this milestone exists on account of a field whose
+  /// name implied a claim the data did not support. One name spanning two
+  /// strengths of evidence is exactly that hazard, so the difference is written
+  /// down rather than left to the name.
   limitReached?: true;
 };
 
@@ -79,32 +95,202 @@ function rateLimitLabel(rateLimitType: unknown): string {
   return rateLimitType === "five_hour" ? LABEL_FIVE_HOUR : "rate limit";
 }
 
-/// Defensive read of Claude's opaque `last_rate_limit` payload.
+/// One window as the store holds it: the vendor's own window object, verbatim,
+/// plus the context of the reading that delivered it.
 ///
-/// `unifiedWindows` is authoritative whenever it is present — it carries
-/// every window the desktop app shows, each with a used fraction. The
-/// top-level `resetsAt` / `rateLimitType` pair is a **fallback only**, for an
-/// older CLI (or a future one that drops the field): it has no percentage, so
-/// it renders as a bare reset line rather than a meter. A bar with no value
-/// would be a blank bar, which the card's clean-hide convention forbids more
-/// than it forbids a missing bar. The fallback is not dead code; the field is
-/// undocumented and could vanish without notice.
+/// **Nothing stored here is a conclusion**, and that is load-bearing rather than
+/// stylistic. Every displayed number, label, and tone is re-derived from these
+/// fields at render, so a mistaken interpretation is corrected *retroactively*
+/// for windows already on disk — twice now, that property is the only reason a
+/// bad reading did not have to be waited out. Deriving flags at ingest instead
+/// would freeze the judgement into `usage.yaml` until each window reset.
+export type StoredUsageWindow = {
+  /// `unifiedWindows[key]`, exactly as Claude sent it, and **not validated
+  /// here**: a window whose fraction or reset cannot be read is stored anyway
+  /// and dropped at render, so tightening that read later applies to what is
+  /// already stored.
+  window: unknown;
+  /// The account-level fields of the delivering reading that this window's tone
+  /// is derived from, verbatim.
+  ///
+  /// **Held per window rather than read from the newest reading, which is the
+  /// point of merging at all.** Claude's `status` is account-level, so an
+  /// `allowed` reading delivered by an Opus turn is evidence about the windows
+  /// that turn measured and says nothing about a model-gated cap it never
+  /// mentioned. Deriving that cap's tone from it would clear a refusal nothing
+  /// re-measured.
+  status?: unknown;
+  rate_limit_type?: unknown;
+  surpassed_threshold?: unknown;
+  /// Read only to separate a refusal from paid overage, which Claude reports
+  /// under the same `status`. Part of this window's own context for the same
+  /// reason the other three are.
+  is_using_overage?: unknown;
+  /// When the delivering reading was observed, ISO-8601. **Absent for a window
+  /// restored from a file written before instants were held per window**, which
+  /// renders with no age line rather than borrowing the reading-level instant —
+  /// that would date this window by when a *different* one was measured.
+  observed_at?: string;
+  /// Model of the delivering turn. The model-gated weekly window carries no name
+  /// of its own, so this is the only thing that can label it.
+  model?: string;
+  /// The turn whose event contributed this window.
+  ///
+  /// **Scopes the late label fill to the turn that measured it, and the turn is
+  /// the right grain — the agent is not.** Two hazards, and agent identity only
+  /// covers the first. Two agents interleaving across one turn's
+  /// rate-limit-event/`init` boundary would let the second agent's model name the
+  /// first agent's window; and a turn that dies before reporting its model leaves
+  /// a blank that the *same* agent's next turn would fill with a different model.
+  /// `runtimeReducer` already refuses the second hazard one layer down, clearing
+  /// the per-turn model at every turn start so a dead turn cannot lend its model
+  /// to the next turn's reading.
+  ///
+  /// Under merging a mislabel outlives the reading that caused it, rendering until
+  /// the window resets — and the correction path is closed by the same condition
+  /// that creates the state, since only another turn on the gated model can fix
+  /// the label and the user is capped on that model.
+  ///
+  /// **Deliberately not restored from the file.** The fill is a within-turn
+  /// repair, so a persisted eligibility could only ever authorize a stale one; see
+  /// `asStoredWindows`.
+  turn_id?: TurnId;
+};
+
+/// Whether this harness's readings are **partial**, so each one contributes
+/// windows to a retained set rather than replacing it.
 ///
-/// Every window is gated on its own reset being in the *future*. A reset is
-/// an absolute timestamp, so it stays accurate however old the snapshot is —
-/// right until `nowMs` passes it, at which point that window has cycled and
-/// we don't have its new reset, so it drops while its siblings stay.
+/// The governing questions are whether a reading is *complete*, and whether its
+/// parts are identifiable from the reading itself:
 ///
-/// `overage` is the separate "using credits" escalation (`isUsingOverage`),
-/// about what is being *billed* rather than how full a window is. Its own
-/// window can be days out, so it lives in the tooltip. A null overage reset
-/// ("flag set, no window time") is still shown — we can't prove it stale.
+/// | Reading | Complete? | Identity carried in the reading? | Correct policy |
+/// | --- | --- | --- | --- |
+/// | Codex `account/rateLimits/read` | yes | yes — `limit_id` | replace; nothing is missing |
+/// | Claude `rate_limit_event` | **no** | yes — the key *is* the identity | **merge per window** |
+/// | Codex rollout `rate_limits` | no | **no** | neither; the source was replaced |
+///
+/// Claude's `unifiedWindows` omits the model-gated weekly window unless the turn
+/// ran on one of the models it gates, so an Opus turn's reading is a complete
+/// statement about the windows it names and silent about the rest. Replacing on
+/// it deleted a cap that was still blocking work, which is the defect this exists
+/// to fix.
+///
+/// **The third row fails the first column regardless of how the second resolves,
+/// and that is the argument to lean on**: one bucket of N can never be a complete
+/// reading. The second column says "carried in the reading" rather than
+/// "knowable" deliberately — a rollout's neighbouring records *do* co-vary with
+/// the bucket, so a future reader checking this table against one would find a
+/// model slug there and conclude the table is wrong. The honest claim is that
+/// identity would have to be reconstructed from an adjacent record by a rule
+/// nothing establishes.
+///
+/// **The first row's premise is the one with no detection if it is wrong.** It
+/// rests on the schema's own wording plus a single capture on a single plan, and
+/// `replace` silently drops a bucket that stops appearing.
+///
+/// This table lives in the code, not only in a plan, because it is what stops a
+/// future reader making one harness match the other.
+export function reportsPartialUsageWindows(harness: HarnessKind | undefined): boolean {
+  return harness === "claude_code";
+}
+
+/// Lift the windows out of a Claude reading, each tagged with what delivered it.
+///
+/// Iterates `CLAUDE_WINDOWS` rather than the payload's keys, so the store holds
+/// only windows this file can name — the same rule that keeps unlabelled keys
+/// from rendering keeps them from being persisted.
+///
+/// Returns `undefined` rather than an empty map when the reading carries no
+/// recognised window, so a harness with no `unifiedWindows` at all contributes
+/// no window map instead of an empty one. That is what lets the store decide
+/// merge-versus-replace from the reading's shape alone.
+export function claudeStoredWindows(
+  payload: unknown,
+  context: { observedAt?: string; model?: string; turnId?: TurnId },
+): Record<string, StoredUsageWindow> | undefined {
+  if (typeof payload !== "object" || payload === null) return undefined;
+  const p = payload as {
+    status?: unknown;
+    rateLimitType?: unknown;
+    surpassedThreshold?: unknown;
+    unifiedWindows?: unknown;
+  };
+  const unified = p.unifiedWindows;
+  if (typeof unified !== "object" || unified === null) return undefined;
+  const windows: Record<string, StoredUsageWindow> = {};
+  for (const { key } of CLAUDE_WINDOWS) {
+    const w = (unified as Record<string, unknown>)[key];
+    if (typeof w !== "object" || w === null) continue;
+    windows[key] = {
+      window: w,
+      status: p.status,
+      rate_limit_type: p.rateLimitType,
+      surpassed_threshold: p.surpassedThreshold,
+      is_using_overage: (payload as { isUsingOverage?: unknown }).isUsingOverage,
+      observed_at: context.observedAt,
+      model: context.model,
+      turn_id: context.turnId,
+    };
+  }
+  return Object.keys(windows).length > 0 ? windows : undefined;
+}
+
+/// The reset a stored window states, in vendor seconds, or `null` when it cannot
+/// be read.
+///
+/// Exported because the store orders two entries for one key by it, and a reset is
+/// the vendor's own statement of *which generation* of the window this is. The read
+/// lives here with the rest of the payload knowledge; the ordering rule it feeds
+/// lives beside `isNewer`, in the module that owns which reading wins.
+///
+/// **`resetsAt` is a same-key comparison, not part of the identity.** Keying
+/// storage by `(key, resetsAt)` would imply two live entries for one window and
+/// require something to arbitrate between them, which is worse than what it fixes.
+export function windowResetsAt(stored: StoredUsageWindow): number | null {
+  const w = stored.window;
+  if (typeof w !== "object" || w === null) return null;
+  const resetsAt = (w as { resetsAt?: unknown }).resetsAt;
+  return typeof resetsAt === "number" ? resetsAt : null;
+}
+
+/// Defensive read of Claude's retained windows plus the newest reading's
+/// account-level fields.
+///
+/// **Windows come from `stored`, not from `payload`.** A Claude reading names
+/// only the windows the turn's model touched, so the displayed set is the union
+/// the store has retained; `payload` supplies only what genuinely belongs to the
+/// newest reading — the overage escalation and the no-window-map fallback.
+///
+/// Each window's tone is derived from the context of the reading that delivered
+/// *that window*, so a later turn cannot clear a refusal it never measured, and a
+/// threshold flag the newest reading drops is cleared on the window it named.
+///
+/// The top-level `resetsAt` / `rateLimitType` pair is a **fallback only**, for an
+/// older CLI (or a future one that drops `unifiedWindows`): it has no percentage,
+/// so it renders as a bare reset line rather than a meter. A bar with no value
+/// would be a blank bar, which the card's clean-hide convention forbids more than
+/// it forbids a missing bar. The field is undocumented and could vanish without
+/// notice, so this is not dead code.
+///
+/// Every window is gated on its own reset being in the *future*. A reset is an
+/// absolute timestamp, so it stays accurate however old the reading is — right
+/// until `nowMs` passes it, at which point that window has cycled, we do not have
+/// its new reset, and it drops while its siblings stay. That is also what retires
+/// a retained window's flags, so no age threshold is needed.
+///
+/// `overage` is the separate "using credits" escalation (`isUsingOverage`), about
+/// what is being *billed* rather than how full a window is. Its own window can be
+/// days out, so it lives in the tooltip. A null overage reset ("flag set, no
+/// window time") is still shown — we can't prove it stale. **Taken from the newest
+/// reading, which assumes it describes the account rather than the window that
+/// triggered it**; unprobeable on the development account and recorded in the gap
+/// register with what would close it.
 ///
 /// Returns `null` when nothing is displayable.
 export function claudeRateLimitView(
   payload: unknown,
+  stored: Record<string, StoredUsageWindow> | undefined,
   nowMs: number,
-  model: string | undefined,
 ): {
   windows: UsageWindow[];
   fallback: { label: string; resetsAtMs: number } | null;
@@ -112,45 +298,43 @@ export function claudeRateLimitView(
 } | null {
   if (typeof payload !== "object" || payload === null) return null;
   const p = payload as {
-    status?: unknown;
     rateLimitType?: unknown;
-    surpassedThreshold?: unknown;
     resetsAt?: unknown;
     isUsingOverage?: unknown;
     overageResetsAt?: unknown;
     unifiedWindows?: unknown;
   };
 
-  // An **empty** container counts as absent: it reported nothing, so the
-  // top-level fallback is still the best available signal. A *non-empty*
-  // container whose entries were all dropped (reset-passed, unreadable
-  // fraction, or a key we deliberately exclude) stays authoritative and the
-  // cell clean-hides — those windows were filtered on purpose, and falling
-  // back there would override the per-window rules rather than fill a gap.
-  const unified = p.unifiedWindows;
-  const hasUnified =
-    typeof unified === "object" && unified !== null && Object.keys(unified).length > 0;
   const windows: UsageWindow[] = [];
-  if (hasUnified) {
+  for (const { key, label } of CLAUDE_WINDOWS) {
+    const held = stored?.[key];
+    if (held === undefined) continue;
+    const w = held.window;
+    if (typeof w !== "object" || w === null) continue;
+    const ww = w as { utilization?: unknown; resetsAt?: unknown };
+    if (typeof ww.utilization !== "number") continue;
+    if (!(ww.utilization >= 0 && ww.utilization <= 1)) continue;
+    // **Dropped rather than kept with a null reset, which is the opposite of the
+    // Codex reader below, and has to be.** The store never prunes: this render-time
+    // check against `nowMs` is the only thing that ever retires a retained Claude
+    // window. One held without a reset could never be retired — and the store
+    // persists, so it would survive restarts too. Not a stale percentage until the
+    // session ends, a permanent one.
+    if (typeof ww.resetsAt !== "number") continue;
+    const resetsAtMs = ww.resetsAt * 1000;
+    if (resetsAtMs <= nowMs) continue;
     // The threshold flag names its window in `rateLimitType` and its level in
-    // `surpassedThreshold`. A turn can emit a second event carrying the
-    // superset, so last-write-wins on the payload is what makes this correct.
-    //
-    // A flag naming a window outside `CLAUDE_WINDOWS` is dropped with that
-    // window, losing the signal. Unobserved (the rendered keys cover every
-    // window any probe has seen) and deliberately not backfilled with a
-    // generic amber line — recorded under the plan's known limitations.
-    const flagged =
-      p.status === "allowed_warning" && typeof p.rateLimitType === "string"
-        ? p.rateLimitType
-        : undefined;
-    const threshold = typeof p.surpassedThreshold === "number" ? p.surpassedThreshold : undefined;
+    // `surpassedThreshold`, so a reading flags at most one of the windows it
+    // delivered. A flag naming a window outside `CLAUDE_WINDOWS` is dropped with
+    // that window, losing the signal — unobserved, and deliberately not
+    // backfilled with a generic amber line.
+    const flagged = held.status === "allowed_warning" && held.rate_limit_type === key;
     // **The wall, which is a different status from the warning.** At a warning
     // Claude sends `allowed_warning` plus a numeric `surpassedThreshold`; at a
     // refusal it sends `rejected` and no threshold at all, so the warning path
-    // above leaves every window unflagged and the meter draws a spent quota in
-    // the neutral tone. `rateLimitType` names the window that did the blocking in
-    // both cases.
+    // above leaves every window unflagged and the meter would draw a spent quota
+    // in the neutral tone. `rateLimitType` names the window that did the blocking
+    // in both cases.
     //
     // **`rejected` is overloaded and does not mean blocked on its own.** An
     // **overage** turn carries the same status (§1.4: `isUsingOverage:true` plus
@@ -165,39 +349,38 @@ export function claudeRateLimitView(
     // `isUsingOverage: false` with overage disabled at the org level, so the two
     // states separate on this field in the only observation we have.
     //
-    // **Nothing here overrides the measurement**, unlike the Codex reader. Codex
-    // records a windowless payload on a refused turn, so its last number is
-    // stale and the refusal is the only truthful thing left; Claude reports the
-    // blocked window's own utilization in the same payload that refuses, so the
-    // number is already right and only the tone was missing. A window named here
-    // but outside `CLAUDE_WINDOWS` drops with its flag, exactly as a threshold
-    // warning does.
+    // **Nothing here overrides the measurement.** Claude reports the blocked
+    // window's own utilization in the same payload that refuses, so the number is
+    // already right and only the tone was missing.
     const refused =
-      p.status === "rejected" && p.isUsingOverage !== true && typeof p.rateLimitType === "string"
-        ? p.rateLimitType
-        : undefined;
-    for (const { key, label } of CLAUDE_WINDOWS) {
-      const w = (unified as Record<string, unknown>)[key];
-      if (typeof w !== "object" || w === null) continue;
-      const ww = w as { utilization?: unknown; resetsAt?: unknown };
-      if (typeof ww.utilization !== "number") continue;
-      if (!(ww.utilization >= 0 && ww.utilization <= 1)) continue;
-      if (typeof ww.resetsAt !== "number") continue;
-      const resetsAtMs = ww.resetsAt * 1000;
-      if (resetsAtMs <= nowMs) continue;
-      windows.push({
-        key,
-        label: label ?? modelWeeklyLabel(model),
-        usedFraction: ww.utilization,
-        resetsAtMs,
-        surpassedThreshold: key === flagged ? threshold : undefined,
-        limitReached: key === refused ? true : undefined,
-      });
-    }
+      held.status === "rejected" && held.is_using_overage !== true && held.rate_limit_type === key;
+    windows.push({
+      key,
+      label: label ?? modelWeeklyLabel(held.model),
+      usedFraction: ww.utilization,
+      resetsAtMs,
+      measuredAt: held.observed_at,
+      surpassedThreshold:
+        flagged && typeof held.surpassed_threshold === "number"
+          ? held.surpassed_threshold
+          : undefined,
+      limitReached: refused ? true : undefined,
+    });
   }
 
+  // **Two conditions, and they answer different questions.** `unifiedWindows`
+  // being absent or empty is what makes the top-level pair the best signal the
+  // *newest reading* has: a non-empty container whose entries were all filtered
+  // out (reset-passed, unreadable, or a key we exclude) stays authoritative, and
+  // falling back there would override the per-window rules rather than fill a
+  // gap. Merging adds the second condition — a retained window still on screen
+  // suppresses the line even when the newest reading carries no map at all,
+  // because a bare reset date beside live meters reads as a sixth window.
+  const unified = p.unifiedWindows;
+  const hasUnified =
+    typeof unified === "object" && unified !== null && Object.keys(unified).length > 0;
   let fallback: { label: string; resetsAtMs: number } | null = null;
-  if (!hasUnified && typeof p.resetsAt === "number") {
+  if (!hasUnified && windows.length === 0 && typeof p.resetsAt === "number") {
     const resetsAtMs = p.resetsAt * 1000;
     if (resetsAtMs > nowMs) fallback = { label: rateLimitLabel(p.rateLimitType), resetsAtMs };
   }
@@ -216,127 +399,177 @@ export function claudeRateLimitView(
   return { windows, fallback, overage };
 }
 
-/// Label for a Codex rate-limit window, from its `window_minutes` duration
-/// (300 = the ~5-hour primary, 10080 = the weekly secondary) mapped onto the
-/// shared strings above. Unknown/absent durations fall back to "Quota" — a
-/// payload carrying only a bare `used_percent` still reads as a real gauge.
-function codexWindowLabel(windowMinutes: unknown): string {
-  if (windowMinutes === 300) return LABEL_FIVE_HOUR;
-  if (windowMinutes === 10080) return LABEL_WEEKLY_ALL;
-  return "Quota";
-}
+/// What a Codex account payload could not be read as, for the ingestion log.
+///
+/// **Returned rather than logged here**, because this function is pure and is
+/// called from a `$derived` — a warning inside it would re-fire on every
+/// recompute. The read path logs these once per distinct condition.
+///
+/// This exists for one reason: the quota filter below is the only thing
+/// standing between a valid-but-changed Codex response and a panel that
+/// silently renders nothing. Every field on a quota is optional in the
+/// protocol, so a server that stops emitting nulls empties the section without
+/// failing anything.
+///
+/// **Every variant is collected before any time-dependent filtering**, so the
+/// ingestion call and the render call always agree whatever instant each
+/// passes. That is what makes it safe to run this reader twice per read — once
+/// to log, once to draw — rather than maintaining a second walker that would
+/// drift from this one. A variant added below the reset check would break it
+/// silently; a test asserts identical diagnostics at two far-apart instants.
+export type CodexAccountDiagnostic =
+  /// A quota carried no `normalModelSlug` key at all, so it could not be
+  /// classified as account-wide or model-scoped and was skipped.
+  | { kind: "bucket-without-model-association"; limitId: string }
+  /// A quota declared a window whose `usedPercent` is missing or not a number.
+  /// Carries the slot, because a quota has two and the useful thing to know is
+  /// which one could not be read.
+  | { kind: "window-without-usable-percent"; limitId: string; slot: string };
 
-/// Whether two Codex rate-limit payloads describe the **same windows**, used to
-/// decide whether a recorded refusal still applies to the snapshot on screen.
+/// Codex's **account quota** payload, read into the bars the meter draws.
 ///
-/// The refusal (`HarnessUsageReading.limit_reached`) is a verdict about a
-/// particular window, not about the harness, and the reading is replaced
-/// independently of it — so without this the verdict can decorate a snapshot it
-/// was never about, drawing a freshly reset quota as spent.
+/// The payload is the response of `account/rateLimits/read`, stored under its
+/// own wrapping as `{ordinaryUsageAllowed, rateLimitsByLimitId}`.
 ///
-/// **Identity is the set of `resets_at` values**, which is what makes the
-/// asymmetry work: a refused turn's own enrichment re-emits the *same*
-/// pre-cap record (`enrichment.rate_limits` is the last window-*bearing*
-/// record in the file, and a refusal appends only windowless ones), so the
-/// refusal survives the `TurnEnd → RateLimitEvent` pair that set it, while a
-/// genuinely new window does not match and clears it.
+/// **This replaced a reader that could not tell which quota it held.** Codex's
+/// per-turn rollout reports one quota under identical identifiers whichever
+/// limit it describes, so the old path had to assert a scope it could not check
+/// and paint a guessed window full on a refusal. Reading the account is what
+/// makes the scope knowable: each quota declares its model association.
 ///
-/// **An indeterminate identity counts as different**, i.e. clears. A payload
-/// can render meters while reporting no reset time at all — `codexRateLimitView`
-/// keeps such a window deliberately, since staleness can't be proven without
-/// one — and there is no way to tell two reset-less windows apart. Treating
-/// unknown as "same" would let a stale verdict sit on a reset-less window
-/// forever, because the reset-passed gate can never retire it either. The cost
-/// is that on a payload reporting no reset times the refusal never takes
-/// effect; no Codex version we have observed omits them. This is the same
-/// direction taken everywhere else here: understating a quota is safer than
-/// telling someone to stop working.
-export function sameCodexUsageWindows(a: unknown, b: unknown): boolean {
-  const left = codexWindowIdentity(a);
-  return left !== null && left === codexWindowIdentity(b);
-}
-
-/// `resets_at` of every window-bearing key, sorted, or `null` when any of them
-/// is unreadable (see [`sameCodexUsageWindows`] for why unknown is not "same").
-function codexWindowIdentity(payload: unknown): string | null {
-  if (typeof payload !== "object" || payload === null) return null;
-  const resets: number[] = [];
-  for (const key of ["primary", "secondary"] as const) {
-    const w = (payload as Record<string, unknown>)[key];
-    if (typeof w !== "object" || w === null) continue;
-    const ww = w as { used_percent?: unknown; resets_at?: unknown };
-    if (typeof ww.used_percent !== "number") continue;
-    if (typeof ww.resets_at !== "number") return null;
-    resets.push(ww.resets_at);
-  }
-  return resets.length === 0 ? null : resets.sort((x, y) => x - y).join(",");
-}
-
-/// Defensive read of Codex's opaque `last_rate_limit` into its independent
-/// windows (`primary` + `secondary`). Same reset-passed rule as the Claude
-/// reader; a window with no `resets_at` is kept (can't prove it stale — older
-/// Codex shapes and minimal fixtures omit it). Codex rate-limit is
-/// session-file-backed (class B, durable), so there's no snapshot-age
-/// qualifier. Codex reports no threshold flag; the one way a window here
-/// warns is `limitReached`.
+/// **A quota is a container of up to two windows, not a window.** Each carries
+/// a `primary` and a `secondary` slot — typically a short window and a weekly
+/// one for the *same* limit — and both are rendered, keyed and expired
+/// independently. Reading only `primary` drops the second quota entirely and
+/// takes the whole row down when the first slot cycles, which is a shape this
+/// account's plan cannot produce and other plans can.
 ///
-/// `limitReached` is the agent's last turn having been refused for the
-/// limit (`FailureKind.usage_limit`). The payload cannot say so itself: a
-/// refused turn records a *windowless* payload (kept out of the snapshot, see
-/// `session_file.rs::rate_limits_carry_window`), so the snapshot still holds
-/// the last measurement — 93%, say — while the harness has since said no.
+/// **Which quotas render: the account-wide ones, identified by having no
+/// associated model.** A quota carrying a `normalModelSlug` is a model-specific
+/// reserve (the observed one is `gpt-reserve` on `gpt-5.6-luna`), and showing it
+/// beside an account allowance invites reading a reserve's headroom as the quota
+/// that governs ordinary work.
 ///
-/// **The refusal is attributed to one window, the most-used.** Codex reports
-/// that *a* limit was exceeded and never which (`rate_limit_reached_type` is
-/// null even on a 100% record), so flagging every surviving window would tell
-/// a user who exhausted a 5-hour quota that their weekly one is gone too —
-/// days of waiting claimed for an hour of it, which is a worse error than the
-/// stale measurement this flag exists to correct. The most-used window is the
-/// likeliest culprit, not provably the exhausted one: one large turn can push
-/// a short window past its limit from a low last reading while a weekly sits
-/// higher. That mis-picks between two windows rather than condemning both,
-/// and on a single-window payload it cannot mis-pick at all.
+/// Filtering on the model association rather than on `limitId === "codex"` is
+/// deliberate: the identifier is not guaranteed across plans, and this rule
+/// keeps working on a plan carrying both a 5-hour and a weekly account limit —
+/// which is how Claude's section already behaves.
 ///
-/// The reset-passed gate still applies first: once a window has cycled, the
-/// refusal is as stale as the measurement, and the window drops with it —
-/// which is also why the flag needs no expiry of its own.
+/// **A quota missing `normalModelSlug` entirely is skipped, not treated as
+/// account-wide**, and reported. Treating absence as "no model" would promote
+/// every reserve into the account section and label it as an ordinary
+/// allowance — the defect this milestone removes, rebuilt in a new place.
 ///
-/// `used_percent / 100` is left unrounded. Rounding at the source would make
-/// the rendered percentage byte-match Codex's own TUI at half-percent values,
-/// but nobody compares the two, and the bar and the number should be drawn
-/// from one value rather than from a figure pre-rounded for a different
-/// renderer. Returns `[]` when nothing is displayable.
-export function codexRateLimitView(
+/// **`rateLimitReachedType` is deliberately not read.** Codex reports a reason
+/// code alongside each quota, and four of its five values are team/business
+/// billing states (credits depleted, workspace spend caps) that say nothing
+/// about a usage window. Deciding which bar a reason code applied to, and
+/// whether it should become an account-wide message, was machinery for account
+/// types this product does not target and cannot test against — and it produced
+/// a defect in two consecutive review rounds.
+///
+/// **What the meter claims, precisely: it warns when measured usage reaches
+/// 100%. It does not determine whether requests are permitted.** A refusal below
+/// 100%, if any plan produces one, renders neutral — that is the accepted cost
+/// of reading one number instead of a five-valued enum. The supporting evidence
+/// is that `usedPercent` is reliably populated when a quota is spent, across
+/// eight separate exhaustions between 2026-05 and 2026-09 in the local rollout
+/// corpus; it is *not* evidence that the account read's reason code is
+/// unreliable, since the rollout never emits that field at all.
+///
+/// `spendControlReached` and `individualLimit` arrive in the same snapshot and
+/// are also not read. They were weighed rather than overlooked: the captured
+/// account reports `spendControlReached: false` with `individualLimit` null, and
+/// neither field's meaning is established well enough to render from — the name
+/// of the second suggests an individual cap but nothing confirms it.
+export function codexAccountUsageView(
   payload: unknown,
   nowMs: number,
-  limitReached = false,
-): UsageWindow[] {
-  if (typeof payload !== "object" || payload === null) return [];
+): { windows: UsageWindow[]; diagnostics: CodexAccountDiagnostic[] } {
+  if (typeof payload !== "object" || payload === null) return { windows: [], diagnostics: [] };
+  const buckets = (payload as { rateLimitsByLimitId?: unknown }).rateLimitsByLimitId;
+  if (typeof buckets !== "object" || buckets === null) return { windows: [], diagnostics: [] };
+
   const windows: UsageWindow[] = [];
-  for (const key of ["primary", "secondary"] as const) {
-    const w = (payload as Record<string, unknown>)[key];
-    if (typeof w !== "object" || w === null) continue;
-    const ww = w as { used_percent?: unknown; resets_at?: unknown; window_minutes?: unknown };
-    if (typeof ww.used_percent !== "number") continue;
-    let resetsAtMs: number | null = null;
-    if (typeof ww.resets_at === "number") {
-      const ms = ww.resets_at * 1000;
-      if (ms <= nowMs) continue; // reset-passed → window cycled, % is stale
-      resetsAtMs = ms;
+  const diagnostics: CodexAccountDiagnostic[] = [];
+  for (const [limitId, bucket] of Object.entries(buckets as Record<string, unknown>)) {
+    if (typeof bucket !== "object" || bucket === null) continue;
+    const b = bucket as {
+      limitName?: unknown;
+      normalModelSlug?: unknown;
+      primary?: unknown;
+      secondary?: unknown;
+    };
+    if (!("normalModelSlug" in b)) {
+      diagnostics.push({ kind: "bucket-without-model-association", limitId });
+      continue;
     }
-    windows.push({
-      key,
-      label: codexWindowLabel(ww.window_minutes),
-      usedFraction: ww.used_percent / 100,
-      resetsAtMs,
-    });
+    if (b.normalModelSlug !== null) continue;
+
+    for (const slot of ["primary", "secondary"] as const) {
+      const w = b[slot];
+      // A windowless quota is a shape Codex emits (`limit_id: "premium"` arrives
+      // with both slots null on a refused turn); it is skipped rather than
+      // rendered as a bar with no value.
+      if (typeof w !== "object" || w === null) continue;
+      const ww = w as { usedPercent?: unknown; resetsAt?: unknown; windowDurationMins?: unknown };
+      if (typeof ww.usedPercent !== "number") {
+        diagnostics.push({ kind: "window-without-usable-percent", limitId, slot });
+        continue;
+      }
+      let resetsAtMs: number | null = null;
+      if (typeof ww.resetsAt === "number") {
+        const ms = ww.resetsAt * 1000;
+        // Reset passed → the window cycled and this percentage describes the
+        // window before it, so it drops while its siblings stay.
+        if (ms <= nowMs) continue;
+        resetsAtMs = ms;
+      }
+      windows.push({
+        // Keyed by quota *and* slot: one quota contributes up to two rows, and
+        // they must not collide.
+        key: `${limitId}:${slot}`,
+        label: codexBucketLabel(ww.windowDurationMins, b.limitName),
+        usedFraction: ww.usedPercent / 100,
+        resetsAtMs,
+        // **Decided here rather than in the meter template**, which draws every
+        // harness: a "full bar is a warning" rule written there also caught
+        // Claude, whose reader deliberately leaves a spent window neutral while
+        // the user is paying for overage and requests still succeed.
+        limitReached: ww.usedPercent >= 100 ? true : undefined,
+      });
+    }
   }
-  if (limitReached && windows.length > 0) {
-    // First wins on a tie, so two equally-used windows attribute
-    // deterministically rather than by key order elsewhere in the payload.
-    const culprit = windows.reduce((a, b) => (b.usedFraction > a.usedFraction ? b : a));
-    culprit.usedFraction = 1;
-    culprit.limitReached = true;
-  }
-  return windows;
+  return { windows, diagnostics };
+}
+
+/// Name an **account-wide** quota's window, using the shared cross-harness
+/// vocabulary.
+///
+/// **This is the same string Claude's `seven_day` row uses, and that is the
+/// point.** A user reading the two harnesses' rows side by side should be
+/// comparing quantities, not decoding two vocabularies for one idea.
+///
+/// **Why "all models" is a reading of the data here and was an invention
+/// before.** The old rollout path received a single unnamed quota and could not
+/// tell the account allowance from the model reserve, so calling it "all models"
+/// asserted something that might have been false — that was the original defect.
+/// This reader only ever labels quotas that passed the `normalModelSlug === null`
+/// filter, so the quota in hand is *by construction* the one with no model
+/// association. The duration is likewise stated by the payload
+/// (`windowDurationMins`), not guessed.
+///
+/// Falls back to Codex's own `limitName` for a duration we do not recognize —
+/// the account-wide quota carries `limitName: null` in every capture, so this is
+/// for a future shape rather than today's — and to a neutral noun when there is
+/// nothing to go on. What it never does is invent a duration or a scope.
+///
+/// **Two account-wide windows sharing a duration would share a label.** They
+/// stay distinguishable by key and reset time, and no supported plan produces
+/// the shape, so nothing disambiguates them yet; a quota's two windows are
+/// separated by their durations, which is what the slots are for.
+function codexBucketLabel(windowDurationMins: unknown, limitName: unknown): string {
+  if (windowDurationMins === 10080) return LABEL_WEEKLY_ALL;
+  if (windowDurationMins === 300) return LABEL_FIVE_HOUR;
+  return typeof limitName === "string" && limitName !== "" ? limitName : "Quota";
 }

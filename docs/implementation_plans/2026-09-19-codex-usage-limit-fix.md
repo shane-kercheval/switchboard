@@ -835,21 +835,67 @@ the fallback is not a window: it is drawn from the newest payload by definition,
 instant is exactly what dates it. Without this the whole fallback path silently lost its age line, which
 the outline did not intend and no DoD item would have caught.
 
-**A restored reading records no contributing agent.** The outline scopes the label fill to the agent that
-contributed a window; it does not say what a *restored* window's contributor is. It is left unset. A
-restored window describes a turn that already ended, so a later `init` from that agent would name it with
-whatever model is running now — a guess about an older measurement, which is the mislabel the scoping
-exists to prevent, not an instance of the race it fixes.
+**The label fill is scoped to the contributing *turn*, not the contributing agent.** The outline says
+"that agent's most recent event" and then gives the actionable form as an agent id; the qualifier was the
+load-bearing half. Agent scoping covers only the cross-agent race. It leaves a second hole: a turn that
+dies before reporting its model leaves a blank that the *same* agent's next turn fills with a different
+model, which then renders until the window resets. `runtimeReducer` already refuses exactly this one layer
+down, clearing the per-turn model at every turn start — so agent scoping regressed a decision the codebase
+had already made. Turn ids are `Uuid::now_v7`, globally unique, so turn identity strictly subsumes agent
+identity and `agent_id` is not stored at all. An absent turn on either side grants nothing: absent-equals-
+absent would make every unlabelled window eligible to any fill.
+
+A restored reading records no contributing turn, so no live turn can claim to have measured it. The turn is
+also **not read back from the file**, so a stale cross-session fill cannot happen.
+
+That last part is the one place this file writes a field it refuses to read, and it is worth knowing why the
+alternatives lost. Filtering at write time instead would keep the file free of transient state, which is a
+legitimate design — it was declined because `persist` writes the map verbatim and knows nothing about entry
+structure, and making it shape-aware costs more clarity than the asymmetry does. Holding eligibility in a
+non-persisted side map would remove the asymmetry entirely; it was declined because eligibility has to stay
+coupled to the measurement that was actually stored — a map written at ingest would still authorize a label
+when `mergeWindows` rejected the window as a superseded instance, and gating the map on the merge outcome
+reimplements, with an extra structure and an extra write point, what carrying the turn on the record gives
+directly. The omission in `asStoredWindows` is held in place by `does not restore permission to label a
+window` rather than by convention.
+
+Worth knowing before touching this again: in the refusal ordering observed on the real account, the gated
+window arrives in a *second* rate-limit event that follows `session_meta`, so it is labelled at ingest and
+never reaches the repair path at all. The fill exists for the inverted order recorded on a compaction
+stream, which is why tightening its eligibility cannot break the main path.
+
+**Window ordering is two-tier and directional, and it rests on one unenforced premise.** A window carries
+the vendor's own reset, which states *which generation* of the window it is — a stronger signal than our
+measurement instant, which states only when we heard. So the reset decides first and the instant decides
+only when both resets agree or cannot be read. The first draft tested for a reset that merely *differed*,
+which let a project's hours-old snapshot overwrite a live window; once its elapsed reset dropped it at
+render, the whole Claude row left the card. Directional in both directions: a later reset must land even
+from a reading that would lose on its instant, and an earlier one is positive evidence of the superseded
+generation and is skipped rather than falling through to ranking — otherwise a dated-but-stale reading
+beats an undated current one under absent-ranks-last.
+
+The premise, recorded because nothing in the payload enforces it: **for a given key, a larger reset means a
+later generation.** A vendor moving a reset *backward* — a corrected allowance — is not handled. That
+reading is read as the older instance and skipped, so the key holds its value until the stale reset elapses
+and the window drops, up to its own duration. Unobserved, and indistinguishable from an older instance
+using what the payload gives us, so it is a stated limitation rather than a case to detect.
 
 **An unreadable persisted window map drops the whole entry.** One severity, matching the reading-level
 instant check and for the same reason: the file is machine-written, so a map that is not the shape we
 write is not evidence of a window worth salvaging, and repairing it field by field would quietly demote a
 window to unlabelled or unranked. The next turn rebuilds it.
 
-Verification: ten mutations covering every rule above were applied and each was caught by a named test —
-merge-becomes-replace, the reissue bypass, the agent scoping on the label fill, tone and refusal read from
-the newest reading rather than the delivering one, the per-window instant, the persistence whitelist, the
-fallback suppression, the legacy instant backfill, and a contributing agent on a restored reading.
+Verification: mutations covering every rule above were applied and each was caught by a named test —
+merge-becomes-replace, both directions of the instance comparison, the turn scoping on the label fill and
+its absent-equals-absent case, tone and refusal read from the newest reading rather than the delivering one,
+the per-window instant, the persistence whitelist, the fallback suppression, the legacy instant backfill,
+and a contributing turn on a restored reading.
+
+One more correction that came out of review: `payload.unifiedWindows` is **not** unread after this change. It
+no longer supplies meter values, but it still decides whether the bare fallback line may render and it is
+what recovers windows from a pre-M3 file. The note on `HarnessUsageReading.payload` says that rather than
+claiming the container is dead, which would have been wrong in a file whose whole convention is precise
+comments.
 
 ---
 
@@ -968,6 +1014,27 @@ accurate evidence trail. Reframe it as **closing an open capture**:
 wall:** the `rateLimitUpsell` shape (including `banner_type`, the `{time}` placeholder, `ctas`, and
 `reset_at` pointing at the blocking quota), the `rateLimitResetCredits` shape, and M1's unprobed
 items with what would close each.
+
+**Also in the register: two assumptions no test can reach, with the detector that would close one.**
+
+- **A window's reset only ever advances.** M3's window ordering trusts it — a reading whose reset is
+  earlier is read as the superseded generation and skipped, so a vendor correcting a reset *backward*
+  would freeze that bar's value until the stale reset elapsed, up to the window's own duration.
+  **Not reachable by a live test**, and that is structural rather than a matter of cost: the claim
+  compares two readings at least one window apart (five hours at the shortest) and a live test is a
+  single dispatch. `live_claude_rate_limit_carries_unified_windows` already covers what *is*
+  testable in one shot — the container's presence, `utilization` as a 0–1 fraction, `resetsAt` as a
+  number — which catches the field vanishing or the units flipping, the drifts that actually ship.
+  What closes this one is the running app: `mergeWindows` warns, once per window key, when a skip
+  contradicts its own measurement order (reset says older generation, instant says newer reading), a
+  combination the assumption makes impossible. The ordinary stale-project-snapshot skip is older on
+  both axes and stays silent. If the line ever appears it carries both resets and both instants, so
+  the register entry is closed by a payload rather than by another probe.
+- **`isUsingOverage` describes the account rather than the window that triggered it.** Unprobeable on
+  the development account, which reports `overageDisabledReason: org_level_disabled` in both stores.
+  Closed by a capture from an account with overage enabled, hitting a model-gated cap and then
+  running a turn on an ungated model: if the flag drops to `false` there while the gated window is
+  still spent, the escalation is window-scoped and the card is taking it from the wrong reading.
 
 **`README.md` "Harness support and limitations"** gains a short user-facing entry: when the Codex
 weekly allowance is spent, Switchboard shows it as spent and every model in the picker is refused;

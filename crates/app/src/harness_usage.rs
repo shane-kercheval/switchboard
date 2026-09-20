@@ -183,7 +183,7 @@ mod tests {
                     "is_using_overage": false,
                     "observed_at": "2026-09-18T20:00:00Z",
                     "model": "claude-fable-5-1",
-                    "agent_id": "agent-1"
+                    "turn_id": "0199a0e8-0000-7000-8000-000000000001"
                 }
             }
         });

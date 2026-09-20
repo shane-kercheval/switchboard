@@ -6,7 +6,7 @@
 /// through a rendered agent card. The component keeps the markup, the tooltip
 /// content, and the per-harness gating.
 import { claudeModelFamilyLabel } from "$lib/agentSelection";
-import type { AgentId, HarnessKind } from "$lib/types";
+import type { HarnessKind, TurnId } from "$lib/types";
 
 /// One usage window as the card draws it. `usedFraction` is 0–1 **used**,
 /// converted here rather than at the meter: Codex reports 0–100 and Claude a
@@ -134,16 +134,27 @@ export type StoredUsageWindow = {
   /// Model of the delivering turn. The model-gated weekly window carries no name
   /// of its own, so this is the only thing that can label it.
   model?: string;
-  /// The agent whose event contributed this window.
+  /// The turn whose event contributed this window.
   ///
-  /// **Scopes the late label fill to its producer.** Two agents interleaving
-  /// across one turn's rate-limit-event/`init` boundary would otherwise let the
-  /// second agent's model name the first agent's window — and under merging that
-  /// mislabel outlives the reading that caused it, rendering until the window
-  /// resets. The correction path is closed by the same condition that creates
-  /// the state: only another turn on the gated model can fix the label, and the
-  /// user is capped on that model.
-  agent_id?: AgentId;
+  /// **Scopes the late label fill to the turn that measured it, and the turn is
+  /// the right grain — the agent is not.** Two hazards, and agent identity only
+  /// covers the first. Two agents interleaving across one turn's
+  /// rate-limit-event/`init` boundary would let the second agent's model name the
+  /// first agent's window; and a turn that dies before reporting its model leaves
+  /// a blank that the *same* agent's next turn would fill with a different model.
+  /// `runtimeReducer` already refuses the second hazard one layer down, clearing
+  /// the per-turn model at every turn start so a dead turn cannot lend its model
+  /// to the next turn's reading.
+  ///
+  /// Under merging a mislabel outlives the reading that caused it, rendering until
+  /// the window resets — and the correction path is closed by the same condition
+  /// that creates the state, since only another turn on the gated model can fix
+  /// the label and the user is capped on that model.
+  ///
+  /// **Deliberately not restored from the file.** The fill is a within-turn
+  /// repair, so a persisted eligibility could only ever authorize a stale one; see
+  /// `asStoredWindows`.
+  turn_id?: TurnId;
 };
 
 /// Whether this harness's readings are **partial**, so each one contributes
@@ -195,7 +206,7 @@ export function reportsPartialUsageWindows(harness: HarnessKind | undefined): bo
 /// merge-versus-replace from the reading's shape alone.
 export function claudeStoredWindows(
   payload: unknown,
-  context: { observedAt?: string; model?: string; agentId?: AgentId },
+  context: { observedAt?: string; model?: string; turnId?: TurnId },
 ): Record<string, StoredUsageWindow> | undefined {
   if (typeof payload !== "object" || payload === null) return undefined;
   const p = payload as {
@@ -218,42 +229,28 @@ export function claudeStoredWindows(
       is_using_overage: (payload as { isUsingOverage?: unknown }).isUsingOverage,
       observed_at: context.observedAt,
       model: context.model,
-      agent_id: context.agentId,
+      turn_id: context.turnId,
     };
   }
   return Object.keys(windows).length > 0 ? windows : undefined;
 }
 
-/// The reset `stored` states, in vendor seconds, or `null` when it cannot be read.
-function windowResetsAt(stored: StoredUsageWindow): number | null {
+/// The reset a stored window states, in vendor seconds, or `null` when it cannot
+/// be read.
+///
+/// Exported because the store orders two entries for one key by it, and a reset is
+/// the vendor's own statement of *which generation* of the window this is. The read
+/// lives here with the rest of the payload knowledge; the ordering rule it feeds
+/// lives beside `isNewer`, in the module that owns which reading wins.
+///
+/// **`resetsAt` is a same-key comparison, not part of the identity.** Keying
+/// storage by `(key, resetsAt)` would imply two live entries for one window and
+/// require something to arbitrate between them, which is worse than what it fixes.
+export function windowResetsAt(stored: StoredUsageWindow): number | null {
   const w = stored.window;
   if (typeof w !== "object" || w === null) return null;
   const resetsAt = (w as { resetsAt?: unknown }).resetsAt;
   return typeof resetsAt === "number" ? resetsAt : null;
-}
-
-/// Whether `candidate` describes a **different instance** of the same window than
-/// `held` — one that has cycled and been reissued.
-///
-/// Lets the store bypass instant ranking for the one case ranking gets wrong: an
-/// undated or lower-ranked reading carrying a freshly cycled window would
-/// otherwise lose to a held entry describing the window before it. Utilization
-/// only ever climbs *within* a window, so retaining a value understates it, which
-/// is what makes retention safe; across a reissue that invariant does not hold.
-///
-/// **`resetsAt` is a same-key check, not part of the identity.** Keying storage by
-/// `(key, resetsAt)` would imply two live entries for one window and require
-/// something to arbitrate between them, which is worse than what it fixes.
-///
-/// False when either reset is unreadable: that is no evidence of a reissue, so
-/// ranking decides as usual.
-export function describesNewWindowInstance(
-  candidate: StoredUsageWindow,
-  held: StoredUsageWindow,
-): boolean {
-  const a = windowResetsAt(candidate);
-  const b = windowResetsAt(held);
-  return a !== null && b !== null && a !== b;
 }
 
 /// Defensive read of Claude's retained windows plus the newest reading's

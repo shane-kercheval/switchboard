@@ -6,7 +6,6 @@ import {
   claudeRateLimitView,
   claudeStoredWindows,
   codexAccountUsageView,
-  describesNewWindowInstance,
   type StoredUsageWindow,
 } from "./usageWindows";
 
@@ -142,7 +141,7 @@ describe("claudeStoredWindows", () => {
           seven_day: { utilization: 0.81, resetsAt: future(5 * 86400) },
         },
       },
-      { observedAt: "2026-09-17T11:00:00.000Z", model: "claude-opus-5", agentId: "agent-1" },
+      { observedAt: "2026-09-17T11:00:00.000Z", model: "claude-opus-5", turnId: "turn-1" },
     );
     expect(stored?.five_hour).toMatchObject({
       status: "allowed_warning",
@@ -151,25 +150,8 @@ describe("claudeStoredWindows", () => {
       is_using_overage: false,
       observed_at: "2026-09-17T11:00:00.000Z",
       model: "claude-opus-5",
-      agent_id: "agent-1",
+      turn_id: "turn-1",
     });
-  });
-});
-
-describe("describesNewWindowInstance", () => {
-  const at = (resetsAt: unknown): StoredUsageWindow => ({ window: { resetsAt } });
-
-  it("is true only when both resets are readable and differ", () => {
-    expect(describesNewWindowInstance(at(future(7200)), at(future(3600)))).toBe(true);
-    expect(describesNewWindowInstance(at(future(3600)), at(future(3600)))).toBe(false);
-  });
-
-  it("is false when either reset cannot be read", () => {
-    // An unreadable reset is no evidence of a reissue, so ranking decides as
-    // usual rather than a missing field forcing a replacement.
-    expect(describesNewWindowInstance(at("soon"), at(future(3600)))).toBe(false);
-    expect(describesNewWindowInstance(at(future(3600)), at(undefined))).toBe(false);
-    expect(describesNewWindowInstance({ window: null }, at(future(3600)))).toBe(false);
   });
 });
 

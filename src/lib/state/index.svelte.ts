@@ -445,11 +445,10 @@ function recordRestoredUsage(agentId: AgentId, hydrate: Required<Hydrate>): void
   observeUsage(harness, {
     payload: hydrate.last_rate_limit,
     observed_at: observedAt,
-    // **No contributing agent is recorded, unlike the live path.** A restored
-    // reading describes a turn that has already ended, so a later `init` from this
-    // agent would name it with whatever model is running *now* — a guess about an
-    // older measurement. Its model comes from the sidecar or the window renders
-    // unlabelled.
+    // **No contributing turn is recorded, unlike the live path.** A restored
+    // reading describes a turn that has already ended, so no live turn can claim to
+    // have measured it and none may name it. Its model comes from the sidecar or the
+    // window renders unlabelled.
     windows: reportsPartialUsageWindows(harness)
       ? claudeStoredWindows(hydrate.last_rate_limit, {
           observedAt,
@@ -1017,8 +1016,15 @@ function recordAccountUsage(agentId: AgentId, event: NormalizedEvent, receivedAt
       // Handed over as named windows rather than as a payload to replace, because
       // this reading covers only the windows the turn's model touched — see
       // `reportsPartialUsageWindows` for the completeness rule that decides it.
+      //
+      // Tagged with the *turn*, not the agent: it is what authorizes the late label
+      // fill, and only the turn that measured a window may name it.
       windows: reportsPartialUsageWindows(harness)
-        ? claudeStoredWindows(event.info, { observedAt: receivedAt, model, agentId })
+        ? claudeStoredWindows(event.info, {
+            observedAt: receivedAt,
+            model,
+            turnId: runtimes[agentId]?.in_flight_turn_id,
+          })
         : undefined,
     });
   } else if (event.type === "session_meta") {
@@ -1032,14 +1038,21 @@ function recordAccountUsage(agentId: AgentId, event: NormalizedEvent, receivedAt
     // (this turn's own `init`), never from `meta.model`, which survives across
     // turns and would name the previous model.
     //
-    // **Scoped to the windows this agent contributed.** Two agents interleaving
-    // inside the milliseconds between one turn's reading and its `init` would
-    // otherwise cross-label. That was once priced as acceptable — the mislabel
-    // survived only until the next reading replaced it, seconds — but windows are
-    // now retained until they reset, so the same race writes a wrong model that
-    // renders for days and can only be corrected by another turn on the gated
-    // model, which is the one thing a capped user cannot run.
-    nameUsageModel(harness, agentId, runtimes[agentId]?.current_turn_model);
+    // **Scoped to the windows this turn contributed**, which is narrower than this
+    // agent's and has to be. Two agents interleaving inside the milliseconds
+    // between one turn's reading and its `init` would cross-label; so would this
+    // agent's *next* turn, if the turn that reported the window died before
+    // reporting its model. Both write a wrong model that now renders until the
+    // window resets, correctable only by another turn on the gated model, which is
+    // the one thing a capped user cannot run.
+    //
+    // The turn id rather than a liveness check: it names which turn's measurement
+    // this `init` belongs to, which is the only question being asked here.
+    nameUsageModel(
+      harness,
+      runtimes[agentId]?.in_flight_turn_id,
+      runtimes[agentId]?.current_turn_model,
+    );
   } else if (event.type === "turn_end") {
     // **Every outcome triggers a refresh, not just a completed one.** A turn
     // that failed or was cancelled still consumed whatever it ran before

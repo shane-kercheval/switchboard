@@ -214,42 +214,62 @@ describe("event routing", () => {
   });
 });
 
-/// Claude's late model label, across two agents.
+/// Claude's late model label.
 ///
-/// **The window outlives the reading now, which is what makes this a defect rather
-/// than a race with a short blast radius.** Cross-labelling used to survive only
-/// until the next reading replaced it — seconds. Under retention the wrong model
-/// renders until the window resets, and the only thing that can correct it is
-/// another turn on the gated model, which is the one thing a capped user cannot
-/// run.
+/// **A narrow fallback, not the normal route.** In the refusal ordering observed on
+/// the real account, the gated window arrives in a *second* rate-limit event that
+/// follows `session_meta`, so it is labelled at ingest and never reaches the repair
+/// path. This covers the inverted order recorded on a compaction stream.
+///
+/// **The window outlives the reading now, which is what makes a mislabel a defect
+/// rather than a race with a short blast radius.** It used to survive only until the
+/// next reading replaced it — seconds. Under retention a wrong model renders until
+/// the window resets, and the only thing that can correct it is another turn on the
+/// gated model, which is the one thing a capped user cannot run.
 describe("naming Claude's model-gated weekly window", () => {
   const GATED = {
     status: "allowed",
     unifiedWindows: {
-      seven_day_overage_included: { utilization: 1, resetsAt: 1_800_000_000 },
+      seven_day_overage_included: { utilization: 1, resetsAt: 1_900_000_000 },
     },
   };
 
-  function gatedWindow(): { model?: string; agent_id?: string } | undefined {
+  function gatedWindow(): { model?: string; turn_id?: string } | undefined {
     return usage.harnessUsage.claude_code?.windows?.seven_day_overage_included;
   }
 
-  it("labels the window once the delivering turn's init lands", async () => {
-    // The recorded order on a compaction stream: the rate-limit event arrives
-    // before the `init` that names the model.
-    const state = await loadState();
-    await state.registerAgent(agentRecord(AGENT_A, "cc", "claude_code"));
-    fireTo(`agent:${AGENT_A}`, { type: "rate_limit_event", agent_id: AGENT_A, info: GATED });
-    expect(gatedWindow()?.model).toBeUndefined();
+  /// Turn boundaries are fired for real, because the contributing turn is what
+  /// authorizes the label. Without them both sides carry no turn and the tests would
+  /// pass on an absent-equals-absent match rather than on the rule.
+  function startTurn(agentId: string, turnId: string, startedAt: string): void {
+    fireTo(`agent:${agentId}`, {
+      type: "turn_start",
+      turn_id: turnId,
+      message_id: crypto.randomUUID(),
+      send_id: crypto.randomUUID(),
+      started_at: startedAt,
+    });
+  }
 
-    fireTo(`agent:${AGENT_A}`, {
+  function reportModel(agentId: string, model: string): void {
+    fireTo(`agent:${agentId}`, {
       type: "session_meta",
-      agent_id: AGENT_A,
-      model: "claude-fable-5-1",
+      agent_id: agentId,
+      model,
       harness_version: "2.1.274",
       inventory: {},
       raw: {},
     });
+  }
+
+  it("labels the window once the delivering turn's init lands", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cc", "claude_code"));
+    startTurn(AGENT_A, crypto.randomUUID(), "2026-05-15T00:00:00Z");
+    fireTo(`agent:${AGENT_A}`, { type: "rate_limit_event", agent_id: AGENT_A, info: GATED });
+    expect(gatedWindow()?.model).toBeUndefined();
+
+    reportModel(AGENT_A, "claude-fable-5-1");
     expect(gatedWindow()?.model).toBe("claude-fable-5-1");
   });
 
@@ -257,34 +277,41 @@ describe("naming Claude's model-gated weekly window", () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A, "cc", "claude_code"));
     await state.registerAgent(agentRecord(AGENT_B, "cc2", "claude_code"));
+    const turnA = crypto.randomUUID();
+    startTurn(AGENT_A, turnA, "2026-05-15T00:00:00Z");
+    startTurn(AGENT_B, crypto.randomUUID(), "2026-05-15T00:00:01Z");
     fireTo(`agent:${AGENT_A}`, { type: "rate_limit_event", agent_id: AGENT_A, info: GATED });
-    fireTo(`agent:${AGENT_B}`, {
-      type: "session_meta",
-      agent_id: AGENT_B,
-      model: "claude-opus-5",
-      harness_version: "2.1.274",
-      inventory: {},
-      raw: {},
-    });
+    reportModel(AGENT_B, "claude-opus-5");
     expect(gatedWindow()?.model).toBeUndefined();
 
-    // Still repairable by the agent that actually measured it.
-    fireTo(`agent:${AGENT_A}`, {
-      type: "session_meta",
-      agent_id: AGENT_A,
-      model: "claude-fable-5-1",
-      harness_version: "2.1.274",
-      inventory: {},
-      raw: {},
-    });
+    // Still repairable by the turn that actually measured it.
+    reportModel(AGENT_A, "claude-fable-5-1");
     expect(gatedWindow()?.model).toBe("claude-fable-5-1");
   });
 
-  it("records which agent contributed the window", async () => {
+  it("does not let this agent's next turn name a window an earlier turn contributed", async () => {
+    // A turn that dies before reporting its model leaves a blank. Scoping the fill to
+    // the agent would let the next turn — a different model — claim it, and it would
+    // render that way for up to a week. `runtimeReducer` already refuses the same
+    // thing one layer down by clearing the per-turn model at every turn start.
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A, "cc", "claude_code"));
+    startTurn(AGENT_A, crypto.randomUUID(), "2026-05-15T00:00:00Z");
     fireTo(`agent:${AGENT_A}`, { type: "rate_limit_event", agent_id: AGENT_A, info: GATED });
-    expect(gatedWindow()?.agent_id).toBe(AGENT_A);
+    fireTo(`agent:${AGENT_A}`, { type: "agent_idle", agent_id: AGENT_A });
+
+    startTurn(AGENT_A, crypto.randomUUID(), "2026-05-15T00:10:00Z");
+    reportModel(AGENT_A, "claude-opus-5");
+    expect(gatedWindow()?.model).toBeUndefined();
+  });
+
+  it("records which turn contributed the window", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A, "cc", "claude_code"));
+    const turnA = crypto.randomUUID();
+    startTurn(AGENT_A, turnA, "2026-05-15T00:00:00Z");
+    fireTo(`agent:${AGENT_A}`, { type: "rate_limit_event", agent_id: AGENT_A, info: GATED });
+    expect(gatedWindow()?.turn_id).toBe(turnA);
   });
 });
 
@@ -1464,10 +1491,10 @@ describe("hydrateAgent", () => {
     await state.hydrateAgent(AGENT_A);
     const restored = usage.harnessUsage.claude_code?.windows?.seven_day_overage_included;
     expect(restored?.model).toBe("claude-fable-5-1");
-    // **No contributing agent**, unlike a live reading. A restored window describes
-    // a turn that has already ended, so a later `init` from this agent would name
-    // it with whatever model is running now — a guess about an older measurement.
-    expect(restored?.agent_id).toBeUndefined();
+    // **No contributing turn**, unlike a live reading. A restored window describes a
+    // turn that has already ended, so no live turn can claim to have measured it and
+    // none may name it.
+    expect(restored?.turn_id).toBeUndefined();
   });
 
   it("does not restore a Codex reading from the rollout snapshot", async () => {

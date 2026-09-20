@@ -397,7 +397,6 @@ export function applyAgentHydrate(
     last_rate_limit: loaded.last_rate_limit ?? null,
     last_rate_limit_model: loaded.last_rate_limit_model ?? null,
     last_rate_limit_as_of: loaded.last_rate_limit_as_of ?? null,
-    last_rate_limit_observed_at: loaded.last_rate_limit_observed_at ?? null,
     meta_as_of: loaded.meta_as_of ?? null,
     last_context_report: loaded.last_context_report ?? null,
     last_context_report_at: loaded.last_context_report_at ?? null,
@@ -436,12 +435,16 @@ function recordRestoredUsage(agentId: AgentId, hydrate: Required<Hydrate>): void
   // measurement instant, so it would routinely outrank a *correct* live reading
   // and put the old shape back on screen at project open.
   if (supportsAccountUsageRead(harness)) return;
-  // The measured instant when the harness recorded one, else the snapshot's
-  // capture time. A reading with neither stays **undated** rather than being given
-  // a sentinel: `isNewer` ranks an absent instant last on its own, and a sentinel
-  // would sort correctly and then be rendered to the user as a date.
-  const observedAt =
-    hydrate.last_rate_limit_observed_at ?? hydrate.last_rate_limit_as_of ?? undefined;
+  // The sidecar's capture time — when the reading was actually observed during
+  // the turn that reported it, not when this file was read. A reading without one
+  // stays **undated** rather than being given a sentinel: `isNewer` ranks an
+  // absent instant last on its own, and a sentinel would sort correctly and then
+  // be rendered to the user as a date.
+  //
+  // There is no measured-instant alternative to fall back to any more. That field
+  // existed to order several agents' *restored Codex* readings against each other,
+  // and Codex no longer restores one — its quotas come from the account read.
+  const observedAt = hydrate.last_rate_limit_as_of ?? undefined;
   observeUsage(harness, {
     payload: hydrate.last_rate_limit,
     observed_at: observedAt,

@@ -405,13 +405,6 @@ export type LoadedTranscript = {
   /// reading against other agents' readings of the same account-scoped quota.
   /// ISO-8601.
   ///
-  /// Distinct from `last_rate_limit_as_of`, which is a staleness qualifier shown
-  /// to the user and deliberately absent for a durable source. This is an
-  /// ordering key, needed precisely for the durable case: a reading recovered
-  /// from a harness's own session file has no arrival time, so without the
-  /// measured instant several restored readings are indistinguishable and
-  /// "newest wins" cannot pick between them.
-  last_rate_limit_observed_at?: string | null;
   /// Capture time of `meta.inventory` when restored from the metadata sidecar
   /// (ISO-8601). Same role as `last_rate_limit_as_of`: `null`/absent means the
   /// inventory is live or re-read from a durable harness file, so the card
@@ -506,10 +499,6 @@ export type Hydrate = {
   /// `LoadedTranscript.last_rate_limit_as_of`). `null` when the value is
   /// live or class-B.
   last_rate_limit_as_of?: string | null;
-  /// When the harness measured `last_rate_limit` (see
-  /// `LoadedTranscript.last_rate_limit_observed_at`). The ordering key for the
-  /// account-scoped usage store, not a staleness qualifier.
-  last_rate_limit_observed_at?: string | null;
   /// Capture time of `meta.inventory` from the metadata sidecar (see
   /// `LoadedTranscript.meta_as_of`).
   meta_as_of?: string | null;

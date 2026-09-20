@@ -6,8 +6,6 @@
 //! the **only** source for:
 //! - `event_msg/task_started.payload.model_context_window` →
 //!   `TurnEnd.usage.context_window` (per-turn).
-//! - `event_msg/token_count.rate_limits` (window-bearing records only — see
-//!   [`rate_limits_carry_window`]) → `RateLimitEvent.info` (per-turn).
 //! - `event_msg/token_count.info.last_token_usage` → per-turn token usage
 //!   overlaid onto `TurnEnd.usage`. The stream's `turn.completed.usage` is
 //!   **not** per-turn — codex-rs populates it from the thread-cumulative
@@ -94,28 +92,6 @@ pub struct Enrichment {
     /// From the last `event_msg/task_started` record in the file. Used to
     /// fill `TurnEnd.usage.context_window`.
     pub context_window: Option<u32>,
-    /// From the last `event_msg/token_count` record whose `rate_limits`
-    /// actually carries a window (see [`rate_limits_carry_window`] — non-null
-    /// is not enough). Used as `RateLimitEvent.info`. Carried as raw JSON
-    /// because the rate-limit shape is "opaque to consumers" per
-    /// `docs/system-design.md`.
-    pub rate_limits: Option<Value>,
-    /// The record-level timestamp of the line [`Self::rate_limits`] was taken
-    /// from, so a reading can be ordered against readings from other agents.
-    ///
-    /// Captured because the quota is **account-scoped**: every agent on this
-    /// harness reports the same account's windows, so the display picks the
-    /// newest reading across all of them and needs a comparable instant for
-    /// each. A live event can be stamped on arrival, but a reading recovered
-    /// from a rollout on project open cannot — the only record of when it was
-    /// measured is the line itself.
-    ///
-    /// Always set and cleared **together with** [`Self::rate_limits`]: a
-    /// reading whose age is unknown cannot be ordered, and a timestamp with no
-    /// reading describes nothing. `None` when the record carries no parseable
-    /// timestamp, which leaves the reading orderable only as "older than
-    /// anything stamped."
-    pub rate_limits_observed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// From `session_meta.payload.cli_version` (line 1). Used for
     /// `SessionMeta.harness_version`.
     pub cli_version: Option<String>,
@@ -548,55 +524,21 @@ fn absorb_session_meta(payload: &Value, enrichment: &mut Enrichment) -> HistoryM
     mode
 }
 
-/// A rollout record's own `timestamp`, read by the two enrichment fields that
-/// need to know *when* something in the file happened:
-/// [`Enrichment::current_turn_started_at`] (the freshness proof for cancel-path
-/// identity recovery) and [`Enrichment::rate_limits_observed_at`] (the ordering
-/// key for a quota reading).
+/// A rollout record's own `timestamp`, read by
+/// [`Enrichment::current_turn_started_at`] — the freshness proof for cancel-path
+/// identity recovery.
 ///
-/// Absent/unparseable reads as `None` — **fail-closed** for both consumers: the
-/// freshness check rejects and no identity is recovered, and an unstamped
-/// reading loses to any stamped one. Deliberately silent here: this parse runs
-/// on every enrichment read, where neither value is necessarily consulted, so
-/// the consumer that needs a breadcrumb owns it and the warn fires exactly when
-/// missing data changed an outcome — never about values nothing read.
+/// Absent/unparseable reads as `None`, which is **fail-closed** for that
+/// consumer: the freshness check rejects and no identity is recovered.
+/// Deliberately silent here: this parse runs on every enrichment read, where the
+/// value is not necessarily consulted, so the consumer that needs a breadcrumb
+/// owns it and the warn fires exactly when missing data changed an outcome —
+/// never about a value nothing read.
 fn record_timestamp(value: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
     value
         .get("timestamp")
         .and_then(Value::as_str)
         .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
-}
-
-/// Whether a `token_count.rate_limits` value carries a usage window, and so
-/// may supersede the previously captured one.
-///
-/// **Non-null is not enough.** On quota exhaustion Codex keeps emitting
-/// `rate_limits`, but switches it to a different limit that reports no window
-/// at all — observed `{"limit_id":"premium","primary":null,"secondary":null,
-/// "credits":{"has_credits":false,"balance":"0"},…}`, arriving 78 seconds
-/// after the same session read `primary.used_percent: 100.0`. Treating that as
-/// a snapshot erased the last real reading, so the meters vanished at exactly
-/// the moment the number mattered — and permanently for a session whose last
-/// such record was windowless. It is not a measurement of a window; it says
-/// nothing about one. So it is skipped, and the last real reading stands until
-/// its own `resets_at` passes.
-///
-/// Names `primary` / `secondary` deliberately, mirroring the frontend's
-/// `codexRateLimitView` key-for-key: the invariant worth holding is that
-/// anything captured here is something that reader can render, so the two
-/// cannot disagree about what "has a window" means. A key-agnostic scan for
-/// any nested `used_percent` would be more rename-tolerant but would also
-/// accept a window the reader ignores (`individual_limit` is unread and its
-/// shape unobserved), reintroducing the same silent-erase. If Codex ever
-/// renames these keys, this captures nothing and the card holds the last good
-/// reading until it expires, which is the safe direction to fail.
-fn rate_limits_carry_window(rate_limits: &Value) -> bool {
-    ["primary", "secondary"].iter().any(|key| {
-        rate_limits
-            .get(key)
-            .and_then(|window| window.get("used_percent"))
-            .is_some_and(Value::is_number)
-    })
 }
 
 // One pass over the rollout feeding a dozen independent last-wins /
@@ -749,19 +691,13 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                             .map(str::to_owned);
                     }
                     "token_count" => {
-                        // Two variants share this type; each feeds a different
-                        // enrichment field and either may be null on a given
-                        // record. Last-record-wins for both, independently.
-                        if let Some(rate_limits) = p.get("rate_limits")
-                            && rate_limits_carry_window(rate_limits)
-                        {
-                            enrichment.rate_limits = Some(rate_limits.clone());
-                            // One unit with the reading above: overwritten on
-                            // every window-bearing record so the stamp always
-                            // describes the reading being kept, never an
-                            // earlier one that a later record superseded.
-                            enrichment.rate_limits_observed_at = record_timestamp(&value);
-                        }
+                        // `rate_limits` on this record is deliberately unread.
+                        // Codex's quotas are asked for over the app-server
+                        // protocol, which names every limit the account holds;
+                        // the rollout reports one unnamed bucket under identical
+                        // identifiers whichever limit it describes, so a reading
+                        // taken here could not say which quota it belonged to.
+                        // Only the token usage is taken. Last-record-wins.
                         if let Some(usage) = p
                             .get("info")
                             .filter(|v| !v.is_null())
@@ -1148,12 +1084,13 @@ pub(crate) fn parse_codex_transcript_content(content: &str, agent_id: AgentId) -
     // Associated completions are dispatched beside their canonical wrapper,
     // but warnings retain source-file order for stable diagnostics.
     t.warnings.sort_by_key(|warning| warning.line_number);
-    // Use the existing enrichment parser to extract model/cli_version/last
-    // rate_limits, then merge into our LoadedTranscript shape. Single source
-    // of truth for meta fields.
+    // Use the existing enrichment parser to extract model/cli_version, then
+    // merge into our LoadedTranscript shape. Single source of truth for meta
+    // fields. `last_rate_limit` is deliberately left unset: Codex's quotas come
+    // from the account read, and a rollout-derived reading would carry an
+    // unnamed bucket stamped with the harness's own measurement instant, which
+    // would outrank a correct live reading at project open.
     let enrichment = parse_session_content(content);
-    t.last_rate_limit.clone_from(&enrichment.rate_limits);
-    t.last_rate_limit_observed_at = enrichment.rate_limits_observed_at;
     // The rollout's own inventory only — the config loaders are layered on in
     // `load_codex_transcript`, which is the one place that knows the home and
     // working directories.
@@ -3722,7 +3659,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rate_limits_fixture_extracts_all_four_fields() {
+    fn parse_session_fixture_extracts_the_meta_fields_the_rollout_owns() {
         let content = std::fs::read_to_string(fixture_path("rate-limits.session.jsonl")).unwrap();
         let enrichment = parse_session_content(&content);
 
@@ -3736,7 +3673,6 @@ mod tests {
             Some("0.130.0"),
             "session_meta.cli_version must be extracted"
         );
-        assert!(enrichment.rate_limits.is_some(), "rate_limits extracted");
         assert!(
             enrichment.session_meta_raw.is_some(),
             "session_meta line preserved as raw"
@@ -3804,20 +3740,14 @@ mod tests {
 
     #[test]
     fn parse_filters_token_count_info_only_variant() {
-        // The info-only token_count (rate_limits: null) must not populate
-        // rate_limits; only the rate-limits-bearing variant feeds
-        // RateLimitEvent. A degenerate info (no parseable token fields) must
-        // not fabricate a zero-valued per_turn_usage either — that would
-        // replace genuine stream telemetry in the adapter overlay.
+        // A degenerate info (no parseable token fields) must not fabricate a
+        // zero-valued per_turn_usage — that would replace genuine stream
+        // telemetry in the adapter overlay.
         let content = r#"
 {"type":"session_meta","payload":{"cli_version":"0.130.0"}}
 {"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{}},"rate_limits":null}}
 "#;
         let enrichment = parse_session_content(content);
-        assert!(
-            enrichment.rate_limits.is_none(),
-            "info-only token_count must not populate rate_limits"
-        );
         assert!(
             enrichment.per_turn_usage.is_none(),
             "degenerate info must not fabricate zero-valued per-turn usage"
@@ -3952,98 +3882,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_takes_last_rate_limit_bearing_token_count() {
-        let content = r#"
-{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0}}}}
-{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":50.0}}}}
-"#;
-        let enrichment = parse_session_content(content);
-        let rate_limits = enrichment.rate_limits.expect("rate_limits captured");
-        // The second record's percent must win.
-        assert_eq!(
-            rate_limits.pointer("/primary/used_percent"),
-            Some(&Value::from(50.0))
-        );
-    }
-
-    #[test]
-    fn parse_stamps_the_rate_limit_reading_with_its_own_records_timestamp() {
-        // The reading and its stamp move together, so the stamp describes the
-        // reading that was kept rather than the last timestamp seen in the
-        // file. Here a *windowless* record follows the one that wins: it
-        // supersedes neither, so neither the percent nor the stamp advances.
-        let content = r#"
-{"type":"event_msg","timestamp":"2026-09-18T19:00:00.000Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0,"resets_at":1789845487}}}}
-{"type":"event_msg","timestamp":"2026-09-18T20:30:00.000Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":50.0,"resets_at":1789845487}}}}
-{"type":"event_msg","timestamp":"2026-09-18T20:31:00.000Z","payload":{"type":"token_count","rate_limits":{"limit_id":"premium","primary":null,"secondary":null}}}
-"#;
-        let enrichment = parse_session_content(content);
-        assert_eq!(
-            enrichment
-                .rate_limits
-                .as_ref()
-                .and_then(|r| r.pointer("/primary/used_percent")),
-            Some(&Value::from(50.0))
-        );
-        assert_eq!(
-            enrichment.rate_limits_observed_at,
-            Some(
-                "2026-09-18T20:30:00Z"
-                    .parse::<chrono::DateTime<chrono::Utc>>()
-                    .expect("fixture timestamp parses")
-            ),
-            "the stamp must name the record the kept reading came from"
-        );
-    }
-
-    #[test]
-    fn parse_stamps_no_observation_time_when_the_record_carries_no_timestamp() {
-        // Orderable only as "older than anything stamped". The reading itself is
-        // still taken — an unknown measurement time is a reason to rank a
-        // reading last, never a reason to discard a real window.
-        let content = r#"
-{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0}}}}
-"#;
-        let enrichment = parse_session_content(content);
-        assert!(enrichment.rate_limits.is_some(), "the reading still stands");
-        assert_eq!(enrichment.rate_limits_observed_at, None);
-    }
-
-    #[test]
-    fn parse_keeps_last_window_when_quota_exhaustion_reports_none() {
-        // Verbatim shape from a rollout that hit its weekly cap: Codex switched
-        // `limit_id` to "premium" and reported no window at all. Non-null, so
-        // the old guard took it and the card lost every meter at the moment the
-        // number mattered. The 100% reading has to stand.
-        let content = r#"
-{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":100.0,"window_minutes":10080,"resets_at":1789845487},"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":"prolite","rate_limit_reached_type":null}}}
-{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"premium","limit_name":null,"primary":null,"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}
-"#;
-        let enrichment = parse_session_content(content);
-        let rate_limits = enrichment.rate_limits.expect("rate_limits captured");
-        assert_eq!(
-            rate_limits.pointer("/primary/used_percent"),
-            Some(&Value::from(100.0)),
-            "a windowless payload must not supersede the last real window"
-        );
-    }
-
-    #[test]
-    fn parse_captures_no_rate_limits_when_every_record_is_windowless() {
-        // The same shape with no good predecessor: nothing to hold, so nothing
-        // is claimed. Reachable — a session whose last activity was hitting the
-        // cap ends on exactly this record, and it is all the reload path sees.
-        let content = r#"
-{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"premium","primary":null,"secondary":null,"credits":{"has_credits":false,"balance":"0"}}}}
-"#;
-        let enrichment = parse_session_content(content);
-        assert!(
-            enrichment.rate_limits.is_none(),
-            "a payload with no window is not a snapshot of one"
-        );
-    }
-
-    #[test]
     fn parse_captures_the_current_turns_error_info_and_resets_it_per_turn() {
         // Verbatim from a rollout: a turn rejected at the weekly cap ends on a
         // `task_complete` whose `error` carries Codex's own classification. The
@@ -4080,23 +3918,6 @@ mod tests {
         assert_eq!(
             parse_session_content(unclassified).current_turn_error_info,
             None
-        );
-    }
-
-    #[test]
-    fn parse_takes_a_secondary_only_window() {
-        // The guard reads both keys, not just `primary`: which window a plan
-        // reports is plan-dependent (on `prolite` `secondary` is null and
-        // `primary` is the weekly one), so requiring `primary` would drop a
-        // shape the frontend renders fine.
-        let content = r#"
-{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":null,"secondary":{"used_percent":7.0,"window_minutes":10080,"resets_at":1800600000}}}}
-"#;
-        let enrichment = parse_session_content(content);
-        let rate_limits = enrichment.rate_limits.expect("rate_limits captured");
-        assert_eq!(
-            rate_limits.pointer("/secondary/used_percent"),
-            Some(&Value::from(7.0))
         );
     }
 
@@ -4482,6 +4303,58 @@ not valid json
         };
         let result = build_session_meta_fields(&e, vec![], vec![]);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn load_codex_transcript_reads_no_rate_limit_from_a_window_bearing_rollout() {
+        // **The positive proof of the deletion, not an absence by neglect.** The
+        // fixture carries a perfectly good `token_count.rate_limits` with a real
+        // percentage — exactly the record the loader used to lift — and the loader
+        // must still leave `last_rate_limit` unset.
+        //
+        // Reading it was the original defect: the rollout reports one bucket under
+        // identical identifiers whichever limit it describes, so a restored reading
+        // could not say which quota it belonged to, and it arrived stamped with the
+        // harness's own measurement instant, which outranked a *correct* live
+        // reading at project open.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3366";
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.4", "2026-05-14T19:33:20Z"),
+            user_message("hi", "2026-05-14T19:33:21Z"),
+            agent_message("ok", "2026-05-14T19:33:22Z"),
+            serde_json::json!({
+                "timestamp": "2026-05-14T19:33:23Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": null,
+                    "rate_limits": { "primary": { "used_percent": 10.0 } }
+                }
+            }),
+            task_complete(session_id, "2026-05-14T19:33:24Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        assert!(
+            result.last_rate_limit.is_none(),
+            "the rollout must contribute no quota reading, got {:?}",
+            result.last_rate_limit
+        );
+        // The rest of the enrichment still lands, so this is a targeted cut rather
+        // than the loader having stopped reading the file.
+        assert_eq!(
+            result.meta.as_ref().map(|m| m.model.as_str()),
+            Some("gpt-5.4"),
+            "the rollout's other meta fields must still be read"
+        );
     }
 
     #[test]
@@ -5313,110 +5186,6 @@ not valid json
                 .unwrap();
         assert!(!result.warnings.is_empty(), "warning emitted for bad line");
         assert_eq!(result.warnings[0].line_number, 2);
-    }
-
-    #[test]
-    fn load_codex_transcript_propagates_rate_limits_to_last_rate_limit() {
-        let home = TempDir::new().unwrap();
-        let cwd = TempDir::new().unwrap();
-        let agent_id = Uuid::now_v7();
-        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
-        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3366";
-        let rate_limit_record = serde_json::json!({
-            "timestamp": "2026-05-14T19:33:23Z",
-            "type": "event_msg",
-            "payload": {
-                "type": "token_count",
-                "info": null,
-                "rate_limits": { "primary": { "used_percent": 10.0 } }
-            }
-        });
-        let content = jsonl_lines(&[
-            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
-            turn_context("gpt-5.4", "2026-05-14T19:33:20Z"),
-            user_message("hi", "2026-05-14T19:33:21Z"),
-            agent_message("ok", "2026-05-14T19:33:22Z"),
-            rate_limit_record,
-            task_complete(session_id, "2026-05-14T19:33:24Z"),
-        ]);
-        write_session_at(home.path(), date, session_id, &content);
-
-        let result =
-            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
-                .unwrap();
-        let rl = result.last_rate_limit.unwrap();
-        assert_eq!(rl["primary"]["used_percent"].as_f64(), Some(10.0));
-        // The measured instant rides out with the reading. Codex's reading is
-        // recovered from the file rather than received live, so this is the only
-        // thing that can order it against another agent's reading of the same
-        // account quota.
-        assert_eq!(
-            result.last_rate_limit_observed_at,
-            Some(
-                "2026-05-14T19:33:23Z"
-                    .parse::<chrono::DateTime<chrono::Utc>>()
-                    .unwrap()
-            )
-        );
-    }
-
-    #[test]
-    fn load_codex_transcript_keeps_the_last_window_past_a_quota_exhausted_record() {
-        // The reload path, which is where this was permanent: on project open
-        // the file is all we have, so a trailing windowless record used to be
-        // the whole answer and the agent came back with no usage limits at all.
-        let home = TempDir::new().unwrap();
-        let cwd = TempDir::new().unwrap();
-        let agent_id = Uuid::now_v7();
-        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
-        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3366";
-        let windowed = serde_json::json!({
-            "timestamp": "2026-05-14T19:33:23Z",
-            "type": "event_msg",
-            "payload": {
-                "type": "token_count",
-                "info": null,
-                "rate_limits": {
-                    "limit_id": "codex",
-                    "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": 1_789_845_487_i64 },
-                    "secondary": null,
-                    "plan_type": "prolite",
-                }
-            }
-        });
-        let exhausted = serde_json::json!({
-            "timestamp": "2026-05-14T19:33:24Z",
-            "type": "event_msg",
-            "payload": {
-                "type": "token_count",
-                "info": null,
-                "rate_limits": {
-                    "limit_id": "premium",
-                    "primary": null,
-                    "secondary": null,
-                    "credits": { "has_credits": false, "unlimited": false, "balance": "0" },
-                    "plan_type": null,
-                }
-            }
-        });
-        let content = jsonl_lines(&[
-            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
-            turn_context("gpt-5.6-sol", "2026-05-14T19:33:20Z"),
-            user_message("hi", "2026-05-14T19:33:21Z"),
-            agent_message("ok", "2026-05-14T19:33:22Z"),
-            windowed,
-            exhausted,
-            task_complete(session_id, "2026-05-14T19:33:25Z"),
-        ]);
-        write_session_at(home.path(), date, session_id, &content);
-
-        let result =
-            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
-                .unwrap();
-        let rl = result
-            .last_rate_limit
-            .expect("the real window survives a trailing windowless record");
-        assert_eq!(rl["primary"]["used_percent"].as_f64(), Some(100.0));
     }
 
     #[test]

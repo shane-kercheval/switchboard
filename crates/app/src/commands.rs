@@ -4784,9 +4784,14 @@ fn apply_turnmeta_overlay(
 ///
 /// - **Rate limit** (transcript-level): fills `last_rate_limit` (+ its
 ///   `last_rate_limit_as_of` capture time) *only* when the loader left it
-///   unset. A loader-provided value is a class-B source (e.g. Codex's
-///   session-file rate-limit) that's already durable and authoritative — it
-///   wins, and carries no `as_of` qualifier because it isn't a stale snapshot.
+///   unset. A loader-provided value would be a class-B source — already durable
+///   and authoritative — so it wins and carries no `as_of` qualifier, because it
+///   isn't a stale snapshot. **No loader provides one today**: Codex's
+///   session-file rate-limit was the only class-B reading and it is gone, since
+///   the rollout reports one unnamed bucket whichever limit it describes and
+///   Codex's quotas are asked for over its app-server protocol instead. The
+///   precedence rule stays because it belongs to this function rather than to a
+///   harness, and it is what a future durable reading would land on.
 /// - **Context window** (per-turn): Claude's window is stream-only, so a
 ///   hydrated turn has `usage.context_window == None`. Reattach the latest
 ///   snapshot only to the exact final assistant message that produced it,
@@ -5350,11 +5355,6 @@ pub struct AgentConversationMeta {
     /// sidecar (stream-only/class-C value); drives the UI staleness
     /// qualifier. `None` for live values and for class-B (durable) sources.
     pub last_rate_limit_as_of: Option<chrono::DateTime<chrono::Utc>>,
-    /// When the harness measured `last_rate_limit`, for ordering this agent's
-    /// reading against other agents' readings of the same account-scoped quota.
-    /// Distinct from `last_rate_limit_as_of`, which is a staleness qualifier
-    /// shown to the user; see `LoadedTranscript::last_rate_limit_observed_at`.
-    pub last_rate_limit_observed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Capture time of `meta.inventory` when restored from the metadata
     /// sidecar. Same qualifier role as `last_rate_limit_as_of`: `None` means
     /// the inventory is live or re-read from a durable harness file.
@@ -6462,7 +6462,6 @@ fn merge_project_conversation(
             last_rate_limit: transcript.last_rate_limit,
             last_rate_limit_model: transcript.last_rate_limit_model,
             last_rate_limit_as_of: transcript.last_rate_limit_as_of,
-            last_rate_limit_observed_at: transcript.last_rate_limit_observed_at,
             meta_as_of: transcript.meta_as_of,
             last_context_report: transcript.last_context_report,
             last_context_report_at: transcript.last_context_report_at,
@@ -13852,10 +13851,15 @@ mod tests {
 
     #[test]
     fn overlay_does_not_override_loader_provided_rate_limit() {
-        // Codex-shape (class B): the loader already populated last_rate_limit
-        // from the session file (durable, authoritative). A stray sidecar
-        // must NOT override it, and no `as_of` qualifier is added — the
-        // session value isn't a stale snapshot.
+        // A class-B shape: the loader already populated last_rate_limit from a
+        // harness's own session file (durable, authoritative). A stray sidecar
+        // must NOT override it, and no `as_of` qualifier is added — a session
+        // value isn't a stale snapshot.
+        //
+        // Constructed directly rather than loaded, because **no loader produces
+        // this today** — Codex's was the only one. The precedence rule is this
+        // function's own and is what a future durable reading would land on, so
+        // it is still worth pinning.
         let mut transcript = switchboard_harness::LoadedTranscript {
             last_rate_limit: Some(serde_json::json!({"primary": {"used_percent": 10.0}})),
             ..Default::default()

@@ -288,20 +288,6 @@ pub struct LoadedTranscript {
     /// class-B value (e.g. Codex's session-file rate-limit) carries `None`
     /// here because it's already durable and needs no staleness qualifier.
     pub last_rate_limit_as_of: Option<DateTime<Utc>>,
-    /// When the harness actually measured [`Self::last_rate_limit`], for
-    /// ordering this agent's reading against other agents' readings of the same
-    /// account-scoped quota.
-    ///
-    /// **Distinct from [`Self::last_rate_limit_as_of`]**, which is a staleness
-    /// *qualifier* the UI shows the user and which is deliberately `None` for a
-    /// durable source. This is an *ordering key*, needed precisely for the
-    /// durable case: a harness whose reading is recovered from its own session
-    /// file carries no arrival time, so without the measured instant several
-    /// agents' readings are indistinguishable and "newest wins" cannot pick.
-    ///
-    /// `None` from any loader whose reading is stream-only, where the consumer
-    /// stamps arrival instead, and for a record carrying no parseable timestamp.
-    pub last_rate_limit_observed_at: Option<DateTime<Utc>>,
     /// Capture time of `meta.inventory` when it was restored from the
     /// per-agent metadata sidecar. Same role and same caveats as
     /// [`Self::last_rate_limit_as_of`]: **always `None` from the per-harness

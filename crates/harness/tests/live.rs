@@ -2186,9 +2186,13 @@ async fn live_codex_basic_turn_completes() {
     //   is thread-cumulative). The live parser stamps context_input_tokens
     //   None, so a Some here proves the real CLI still writes the
     //   last_token_usage shape the overlay depends on — drift guard.
-    // - RateLimitEvent fires every turn from token_count.rate_limits.
     // - SessionMeta fires on the first turn carrying model + cli_version +
     //   the merged MCP servers / skills registries.
+    // - No RateLimitEvent: the rollout still writes token_count.rate_limits, but
+    //   it reports one unnamed bucket whichever limit it describes, so quotas are
+    //   asked for over the app-server protocol instead — see
+    //   `live_codex_account_usage_read_returns_named_buckets`, which is where the
+    //   payload-shape drift guard for Codex quotas now lives.
     match terminal {
         AdapterEvent::TurnEnd { usage: Some(u), .. } => {
             assert!(
@@ -2206,62 +2210,21 @@ async fn live_codex_basic_turn_completes() {
         }
         _ => panic!("expected TurnEnd with Some(usage), got: {terminal:?}"),
     }
-    let rate_limit_idx = events
-        .iter()
-        .position(|e| matches!(e, AdapterEvent::RateLimitEvent { .. }))
-        .expect("RateLimitEvent must fire post-terminal for Codex");
     let session_meta_idx = events
         .iter()
         .position(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
         .expect("SessionMeta must fire on first turn for Codex");
     assert!(
-        terminal_idx < rate_limit_idx && rate_limit_idx < session_meta_idx,
-        "enrichment events must arrive after TurnEnd in order: TurnEnd → RateLimitEvent → SessionMeta"
+        terminal_idx < session_meta_idx,
+        "enrichment events must arrive after TurnEnd in order: TurnEnd → SessionMeta"
     );
-
-    // Rate-limit payload-shape drift detection. The ordering
-    // check above proves the event fires; this proves its `info` still carries
-    // the fields the Sidebar's Codex windows read: `primary.used_percent` (the
-    // gauge — relied on since the original single cell), plus `window_minutes`
-    // (the window-label source) and `resets_at` (the tooltip reset time).
-    // SessionFileBacked — Codex's own session file is canonical, so we don't
-    // re-persist it. `secondary` is intentionally not asserted (a fresh
-    // account may not have a weekly window yet; the Sidebar shows it only when
-    // present).
-    match &events[rate_limit_idx] {
-        AdapterEvent::RateLimitEvent { info, source, .. } => {
-            assert_eq!(
-                *source,
-                RateLimitSource::SessionFileBacked,
-                "Codex rate-limit is read from its session file (class B) → not re-persisted"
-            );
-            let primary = info
-                .get("primary")
-                .expect("rate_limits.primary must be present: {info}");
-            assert!(
-                primary
-                    .get("used_percent")
-                    .and_then(serde_json::Value::as_f64)
-                    .is_some(),
-                "primary.used_percent must be a number (Sidebar gauge reads it): {info}"
-            );
-            assert!(
-                primary
-                    .get("window_minutes")
-                    .and_then(serde_json::Value::as_i64)
-                    .is_some(),
-                "primary.window_minutes must be present (Sidebar window label derives from it): {info}"
-            );
-            assert!(
-                primary
-                    .get("resets_at")
-                    .and_then(serde_json::Value::as_i64)
-                    .is_some(),
-                "primary.resets_at must be present (Sidebar tooltip reset time reads it): {info}"
-            );
-        }
-        _ => unreachable!(),
-    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::RateLimitEvent { .. })),
+        "Codex must emit no rate-limit event from its rollout — its quotas come from \
+         the account read, which names every limit the account holds"
+    );
 
     // SessionMeta shape: structural-only checks. mcp_servers / skills lists
     // are developer-environment-dependent (we don't pin a particular ~/.codex

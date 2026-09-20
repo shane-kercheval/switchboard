@@ -737,8 +737,12 @@ fn classify_outcome(outcome: TurnOutcome, enrichment: &Enrichment) -> TurnOutcom
 ///    (preserves the strict "None means unparseable" contract). A failed
 ///    outcome is re-typed from the rollout's own classification first
 ///    (see [`classify_outcome`]).
-/// 4. Emit `RateLimitEvent` if rate-limit info was extracted.
-/// 5. Emit `SessionMeta` if the enrichment yielded a model or `cli_version`.
+/// 4. Emit `SessionMeta` if the enrichment yielded a model or `cli_version`.
+///
+/// No `RateLimitEvent`: Codex's quotas are asked for over the app-server
+/// protocol, which names every limit the account holds. The rollout reports one
+/// unnamed bucket under identical identifiers whichever limit it describes, so a
+/// reading taken from it could not say which quota it belonged to.
 ///
 /// All steps degrade gracefully — a missing locator or session-file absence
 /// emits a non-enriched `TurnEnd` only, and the post-terminal derived events
@@ -778,7 +782,7 @@ async fn emit_terminal_with_enrichment(
     // — see `apply_per_turn_usage`), then the window overlays. Both come from
     // Codex's own session file — class B, already durable — so it's tagged
     // `SessionFileBacked` and the dispatcher does NOT re-persist it to the
-    // metadata sidecar (mirrors the rate-limit gate below).
+    // metadata sidecar.
     let enriched_usage = apply_context_window(
         apply_per_turn_usage(usage, enrichment.per_turn_usage.clone()),
         enrichment.context_window,
@@ -811,19 +815,7 @@ async fn emit_terminal_with_enrichment(
         first_message_id: enrichment.current_turn_id.clone(),
     });
 
-    // Step 4: emit RateLimitEvent if rate-limit info was found. Codex's
-    // rate-limit is read from its own session file at turn-end (class B) —
-    // already durable on disk, so it's marked `SessionFileBacked` and the
-    // dispatcher does NOT re-persist it to the metadata sidecar.
-    if let Some(rate_limits) = enrichment.rate_limits.clone() {
-        let _ = tx.send(AdapterEvent::RateLimitEvent {
-            agent_id,
-            info: rate_limits,
-            source: crate::events::RateLimitSource::SessionFileBacked,
-        });
-    }
-
-    // Step 5: emit SessionMeta after **every** turn, not only the first. The
+    // Step 4: emit SessionMeta after **every** turn, not only the first. The
     // rollout's inventory — the skills Codex loaded, the approved-command
     // allowlist, the run settings — changes between turns (a new skill
     // installed, a command approved, the sandbox widened), and the card has to

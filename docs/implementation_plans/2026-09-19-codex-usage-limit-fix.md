@@ -943,6 +943,38 @@ context window). Only the rate-limit extraction leaves.
 - Claude's sidecar-backed rate-limit restore still works, proven by a test.
 - `make test-live-codex` passes, covering the rollout reader's remaining responsibilities.
 
+### As built (2026-09-19)
+
+Both corrections above held: `meta_sidecar.rs` needed no change and `RateLimitSource` stayed, with a
+note that its `SessionFileBacked` arm is knowingly without a production producer — `MockHarnessAdapter`
+still emits it, so the dispatcher's do-not-persist gate stays covered by a test.
+
+Two things the outline did not anticipate.
+
+**`LoadedTranscript::last_rate_limit_observed_at` went with it, and the frontend field too.** Codex's
+rollout was its only producer — Claude's restore path carries `last_rate_limit_as_of` from the metadata
+sidecar instead — so the measured-instant ordering key became unreachable rather than merely unused. It
+is gone from the transcript, the `Hydrate` wire shape, `types.ts`, and `recordRestoredUsage`, which now
+reads the sidecar capture time alone.
+
+**The precedence rule in `apply_meta_sidecar_overlay` is producerless in the same way as the enum
+variant.** Its "a loader-provided value wins over the sidecar" arm existed for Codex's class-B reading.
+Kept, because the rule belongs to that function rather than to a harness and is what a future durable
+reading would land on, with both the doc and
+`overlay_does_not_override_loader_provided_rate_limit` saying so rather than leaving a reader hunting
+for the producer.
+
+**A live test caught what the offline suite could not**, which is the case for keeping them:
+`make check` passed while `live_codex_transcript_load_via_captured_locator_round_trips` still asserted
+`last_rate_limit.is_some()` against a real rollout. It now asserts the opposite, and the same inversion
+is pinned offline by `load_codex_transcript_reads_no_rate_limit_from_a_window_bearing_rollout` — a
+fixture carrying a perfectly good `used_percent` that the loader must still ignore, so the deletion is
+proven rather than merely unobserved.
+
+Eight tests whose subject no longer exists were deleted, and five trimmed to the part that survives.
+Claude's sidecar restore is proven by `overlay_fills_rate_limit_when_loader_left_it_empty`.
+`make test-live-codex`: 17 passed.
+
 ---
 
 ## M5 — Correct and close the harness record

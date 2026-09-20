@@ -538,9 +538,17 @@ async fn live_codex_transcript_load_via_captured_locator_round_trips() {
         transcript.warnings
     );
     assert_meta_structure(&transcript);
+    // **Against a real rollout that does carry `token_count.rate_limits`.** The
+    // reading is deliberately not lifted: the rollout reports one bucket under
+    // identical identifiers whichever limit it describes, so it could not say which
+    // quota it belonged to, and it arrived stamped with the harness's own
+    // measurement instant — outranking a correct live reading at project open.
+    // Codex's quotas come from `account/rateLimits/read`, covered by
+    // `live_codex_account_usage_read_returns_named_buckets`.
     assert!(
-        transcript.last_rate_limit.is_some(),
-        "Codex hydration must populate last_rate_limit from the session file"
+        transcript.last_rate_limit.is_none(),
+        "Codex hydration must contribute no quota reading, got {:?}",
+        transcript.last_rate_limit
     );
 
     let (user, agent_turn) = first_user_and_agent(&transcript.turns);

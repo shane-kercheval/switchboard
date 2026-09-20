@@ -1499,9 +1499,12 @@ describe("hydrateAgent", () => {
 
   it("does not restore a Codex reading from the rollout snapshot", async () => {
     // The restored shape is the one-unnamed-bucket payload the account read
-    // replaces, and it is stamped with the harness's own measurement instant —
-    // so it would routinely outrank a *correct* live reading and put the old
-    // shape back on screen at project open.
+    // replaces, so it would put the old shape back on screen at project open.
+    //
+    // **The backend no longer sends one**, which does not make this test
+    // redundant: it pins the frontend's own capability gate, so a harness that
+    // starts reporting a rollout reading again — or a future one that does —
+    // cannot reach the store without that decision being made deliberately.
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A, "cx", "codex"));
 
@@ -1509,7 +1512,7 @@ describe("hydrateAgent", () => {
       turns: [],
       meta: null,
       last_rate_limit: { primary: { used_percent: 93, resets_at: 1_800_000_000 } },
-      last_rate_limit_observed_at: "2026-09-17T12:00:00Z",
+      last_rate_limit_as_of: "2026-09-17T12:00:00Z",
       warnings: [],
     });
 

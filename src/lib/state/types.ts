@@ -267,11 +267,11 @@ export type ContextReportRequest = {
 ///   IS sendable again — `run_status` flips back to `"idle"` on `AgentIdle`
 ///   regardless of whether the turn succeeded or failed.
 /// - `last_error`: runtime record of the most-recent failure, rendered in the
-///   transcript as a failed agent turn. Read by no other surface — the one
-///   consumer of a failure's *kind* is the `turn_end` reducer, which translates
-///   a `usage_limit` refusal to the account-scoped usage store and never hands
-///   `last_error` to the sidebar. Does NOT gate Send. Cleared when the next
-///   turn starts.
+///   transcript as a failed agent turn. Read by no other surface, and no
+///   surface reads a failure's *kind* either — the usage store, once the lone
+///   consumer of `usage_limit`, now asks the harness for its account quota
+///   state on every turn end regardless of outcome. Does NOT gate Send.
+///   Cleared when the next turn starts.
 /// - `in_flight_turn_id`: heartbeat scope. The turn the timer is tracking.
 ///
 /// Conflating these (e.g., a status enum with `"errored"`) would force the

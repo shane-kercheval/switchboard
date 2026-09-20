@@ -704,10 +704,12 @@ async fn run_producer(
 /// **The match is deliberately narrow.** `CodexErrorInfo` has siblings that
 /// look quota-shaped — `rate_limit_exceeded` above all — and none has been
 /// observed, so none is mapped: if that one is a transient throttle rather
-/// than an exhausted window, drawing a full meter for a seconds-long wait
-/// would be a fresh wrong number. See the gap-register entry in
-/// `docs/harness-behavior.md`; one probe against an exhausted short window
-/// settles it.
+/// than an exhausted window, typing it as an exhausted quota would describe a
+/// seconds-long wait as a spent allowance. No meter rides on the answer — the
+/// usage card reads the account, not the verdict — so what a wrong mapping
+/// costs is a mislabelled failure rather than a wrong number. See the
+/// gap-register entry in `docs/harness-behavior.md`; one probe against an
+/// exhausted short window settles it.
 fn classify_outcome(outcome: TurnOutcome, enrichment: &Enrichment) -> TurnOutcome {
     match outcome {
         TurnOutcome::Failed {

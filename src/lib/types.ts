@@ -18,10 +18,13 @@ export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure" |
 // `turn.failed.error` containing `"401 Unauthorized"`.
 // `usage_limit` is the harness refusing the turn because a subscription
 // window is exhausted — typed from a structured signal (Codex's
-// `task_complete.error.codex_error_info`), never from the prose. Read once, by
-// the `turn_end` reducer, which translates it into
-// the account-scoped usage store; that store is what draws the usage window
-// full (see `usageWindows.ts::codexRateLimitView`).
+// `task_complete.error.codex_error_info`), never from the prose.
+//
+// **No surface reads it.** It once fed the usage store, which drew the refused
+// window full; that reader is gone, because a refusal cannot say *which* quota
+// refused and asking the account can. The kind is still typed: it is the
+// structured record of why a turn failed, and recovering that from prose later
+// is strictly worse than carrying it now.
 
 // Who initiated a cancellation. Carried on the `cancelled` outcome.
 export type CancelSource = "user" | "workflow" | "shutdown";

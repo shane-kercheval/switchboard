@@ -1099,6 +1099,70 @@ describe the interactive CLI.
 - `:96`, G3, G8, §1.4 updated; version-log entry added with the probe table.
 - Perishable captures and unprobed items recorded.
 
+### As built (2026-09-19)
+
+Documentation only — no production code changed, and three code *comments* were corrected because
+they asserted behavior that no longer exists.
+
+**`docs/harness-behavior.md`:**
+
+- **§1.4** — the Codex row now names the account read as the meter's source and the refusal as the
+  message's, and records that a refusal says a quota is spent and never which. The Claude row gains
+  the partial-map caveat and the per-key merge.
+- **§2 (`:96`)** and **G3** — `error_kind` has no readers at all again. Both entries say so, and both
+  say why the kind stays typed anyway: it is the structured record of *why*, and reconstructing it
+  from prose later is worse. G3 records the exception as opened *and closed*, rather than deleting the
+  sentence, so the entry reads as a history instead of as never having happened.
+- **§3.1** — a **fifth parity class, E ("on-demand — we ask")**, with Codex's quota as its only
+  member, and the class-B prose corrected in the three places that enumerated the session-file
+  rate-limit read. The class was added rather than forcing the account read into B because the
+  distinction is the whole point of the milestone: a B value is whatever the last turn happened to
+  write, an E value is the harness's current answer to a question asked on purpose.
+- **§3.12** — the M3 consequence, framed as **G7's rule one level down** (*absence is not data*,
+  applied at the window rather than the reading) with the corroborating capture already on the page
+  cited. Not a correction: §3.12's model-gating statements were accurate, and the plan's warning about
+  calling an accurate-but-incomplete entry wrong applied here.
+- **G7** — the half-expired reason on the empty-`rate_limit_info` skip, corrected with a clause rather
+  than a rewrite: an empty payload can no longer wipe memory (the merge is per key), the disk half
+  stands, and so does the rule.
+- **G8** — rewritten around the account read, with the rollout path's whole history kept and
+  past-tensed: the windowless-at-the-cap shape, the deleted capture guard (`:597`'s present-tense
+  claim corrected here, as the plan instructed, rather than on its own), and the deleted most-used
+  attribution. The two unprobed items moved to the refusal paragraph and one is reframed — "which
+  codes mean quota" stopped being urgent when the meter left the verdict, and now costs a mislabelled
+  failure rather than a wrong number. `:697`'s "See G7 and G8" was checked and reads coherently.
+- **G13** — `SessionFileBacked` recorded as having lost its only production producer, and the
+  `RateLimitSource` gate credited for needing no change when the quota moved.
+- **§4** — **G35** (the perishable `rateLimitUpsell` / `rateLimitResetCredits` shapes, plus M1's
+  unprobed responses and what closes each; the fixtures are named as the durable copy), **G36** (reset
+  monotonicity, with the `mergeWindows` warning as the detector and why no live test can reach it),
+  **G37** (`isUsingOverage` scope, with the capture that would settle it).
+- **§5** — the coexisting-weekly-windows capture **closed**: both open questions answered, the false
+  "merging would be worse" clause replaced with what it actually prevented, and every observation
+  left standing as the evidence trail.
+- **§6** — a version-log entry for the discovery, carrying the probe table, the `normalModelSlug`
+  conclusion, the 0.155.1 revalidation, the measured latency distributions, and the **scope limit**
+  that all three probe rows are `codex exec` and do not describe the interactive CLI. The 0.154.0
+  entry is marked superseded in its mechanism and not in its observations; the 2.1.276 entry now reads
+  "newest-wins" as per-key and names its opening event as the first captured partial map.
+
+**Elsewhere:**
+
+- **`docs/system-design.md`** — eight statements sourcing Codex's quota from the session file,
+  including the §9 capability matrix, the `RateLimitEvent` row, and §7's usage-section description
+  (which also claimed a refusal marks a window).
+- **`docs/harness-update-review.md`** — the session-file bullet no longer lists rate limits, and a new
+  bullet covers the **Codex app-server protocol** as a dependency surface: regenerate the schema, the
+  four fields whose rename fails *silently*, the live drift detector by name, and the three
+  undocumented behavioral properties (stdin closure kills the read, `initialized` not required,
+  interleaved notifications) that the code asserts as measured facts.
+- **`README.md`** — the user-facing entry: the allowance reads spent, every model refuses, and the
+  Codex terminal still finishes the job because it offers a reserve model Switchboard does not expose.
+  Written from the verified interactive behavior, not from the `codex exec` probe rows.
+- **Three code comments** claiming the `usage_limit` kind drives a meter — `src/lib/types.ts`,
+  `src/lib/state/types.ts`, and `classify_outcome`'s doc in `crates/harness/src/codex/mod.rs`, where
+  the narrowness rationale rested on a full meter being drawn for a transient throttle.
+
 ---
 
 ## Risks

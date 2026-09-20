@@ -314,6 +314,12 @@ export function claudeRateLimitView(
     const ww = w as { utilization?: unknown; resetsAt?: unknown };
     if (typeof ww.utilization !== "number") continue;
     if (!(ww.utilization >= 0 && ww.utilization <= 1)) continue;
+    // **Dropped rather than kept with a null reset, which is the opposite of the
+    // Codex reader below, and has to be.** The store never prunes: this render-time
+    // check against `nowMs` is the only thing that ever retires a retained Claude
+    // window. One held without a reset could never be retired — and the store
+    // persists, so it would survive restarts too. Not a stale percentage until the
+    // session ends, a permanent one.
     if (typeof ww.resetsAt !== "number") continue;
     const resetsAtMs = ww.resetsAt * 1000;
     if (resetsAtMs <= nowMs) continue;
@@ -343,11 +349,9 @@ export function claudeRateLimitView(
     // `isUsingOverage: false` with overage disabled at the org level, so the two
     // states separate on this field in the only observation we have.
     //
-    // **Nothing here overrides the measurement**, unlike the Codex reader. Codex
-    // recorded a windowless payload on a refused turn, so its last number was
-    // stale and the refusal was the only truthful thing left; Claude reports the
-    // blocked window's own utilization in the same payload that refuses, so the
-    // number is already right and only the tone was missing.
+    // **Nothing here overrides the measurement.** Claude reports the blocked
+    // window's own utilization in the same payload that refuses, so the number is
+    // already right and only the tone was missing.
     const refused =
       held.status === "rejected" && held.is_using_overage !== true && held.rate_limit_type === key;
     windows.push({

@@ -6,7 +6,32 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 const usage = await import("./harnessUsage.svelte");
-const { claudeRateLimitView, claudeStoredWindows } = await import("$lib/usageWindows");
+const { claudeRateLimitView, claudeStoredWindows, codexAccountUsageView } =
+  await import("$lib/usageWindows");
+
+/// A Codex entry exactly as a pre-account-read Switchboard wrote it, copied from
+/// a real `usage.yaml` rather than composed here. A hand-written legacy shape
+/// would be derived from the same understanding of the format as the reader it
+/// is meant to test, so it would agree with itself whatever the reader did.
+///
+/// The distinguishing feature is structural, not a version marker: snake_case
+/// keys and one unnamed bucket at the top level, where the account read nests
+/// named buckets under `rateLimitsByLimitId`.
+const LEGACY_CODEX_ENTRY = {
+  model: "gpt-6-astra",
+  observed_at: "2026-09-20T15:22:43.642Z",
+  payload: {
+    credits: { balance: "0", has_credits: false, unlimited: false },
+    individual_limit: null,
+    limit_id: "codex",
+    limit_name: null,
+    plan_type: "prolite",
+    primary: { resets_at: 1_790_453_706, used_percent: 22, window_minutes: 10080 },
+    rate_limit_reached_type: null,
+    secondary: null,
+    spend_control_reached: null,
+  },
+};
 
 /// Two readings of the same weekly window, and one of a window that has since
 /// rolled. Window identity is the set of reset times, so a percentage may move
@@ -569,6 +594,34 @@ describe("loadPersistedUsage", () => {
     );
     await usage.loadPersistedUsage();
     expect(usage.harnessUsage.claude_code).toBeUndefined();
+  });
+
+  it("keeps a pre-upgrade Codex entry and reads it as no windows", async () => {
+    // **The upgrade path, asserted end to end rather than at the field.** An
+    // entry written before the account read is kept rather than migrated, on the
+    // grounds that the two shapes cannot be confused — so the guarantee that
+    // matters is not that `windows` is unset but that the account view finds
+    // nothing in it and the Codex section therefore renders empty until a fresh
+    // read supersedes it on arrival-time ranking.
+    //
+    // Retention itself is not what is being claimed: this payload renders nothing
+    // whether it is kept or dropped. What is pinned is that the legacy shape is
+    // recognised without a version check, contributes no false windows, and is not
+    // mistaken for a read that failed.
+    //
+    invokeMock.mockImplementation(async (cmd) =>
+      cmd === "get_harness_usage" ? { harnesses: { codex: LEGACY_CODEX_ENTRY } } : undefined,
+    );
+    await usage.loadPersistedUsage();
+    const restored = usage.harnessUsage.codex;
+    expect(restored?.observed_at).toBe("2026-09-20T15:22:43.642Z");
+    expect(restored?.windows).toBeUndefined();
+    const view = codexAccountUsageView(restored?.payload, Date.parse("2026-09-20T16:00:00Z"));
+    expect(view.windows).toEqual([]);
+    // No diagnostic either: an old entry is a known shape, not a read we failed
+    // to make sense of, and logging one would fire on every launch until a fresh
+    // reading replaced it.
+    expect(view.diagnostics).toEqual([]);
   });
 
   it("survives a failed read with no readings rather than throwing", async () => {

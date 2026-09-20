@@ -7026,7 +7026,8 @@ fn any_configured_agent_reports_account_usage(state: &AppState) -> bool {
 /// **Repeated failures are logged once, not once per turn.** Almost every way
 /// this read fails is a steady state rather than a blip — no Codex installed,
 /// logged out, offline, or a Codex too old to report named quotas — and the
-/// read runs at startup and after every Codex turn. Logging unconditionally
+/// read runs whenever the usage panel mounts and after every Codex turn. Logging
+/// unconditionally
 /// would emit the same line forever and bury the transient failures that
 /// actually carry information. The *kind* of the last failure is remembered on
 /// `state` and [`account_usage_log_decision`] decides; recovery is logged too,
@@ -7045,6 +7046,30 @@ pub async fn read_codex_account_usage_impl(
     binary: &Path,
     timeout: std::time::Duration,
 ) -> Option<switchboard_harness::CodexAccountUsage> {
+    read_codex_account_usage_with(
+        state,
+        binary,
+        timeout,
+        switchboard_harness::subprocess::ensure_path_settled(ACCOUNT_USAGE_PATH_WAIT),
+    )
+    .await
+}
+
+/// [`read_codex_account_usage_impl`] with the PATH readiness it waits on
+/// injected, which is the seam its own test needs: a readiness that completes on
+/// command is what separates "resolved the binary too early" from "took a while".
+///
+/// Paired with the wrapper above exactly as [`install_status_with`] is paired
+/// with [`install_status_for`] — production wiring in this module rather than in
+/// the Tauri shim, which holds no logic. Nothing pins the wrapper's choice of
+/// readiness source; keeping it here at least puts it where the rest of this
+/// file's PATH policy lives.
+async fn read_codex_account_usage_with(
+    state: &AppState,
+    binary: &Path,
+    timeout: std::time::Duration,
+    path_ready: impl std::future::Future<Output = PathSource>,
+) -> Option<switchboard_harness::CodexAccountUsage> {
     // Mock mode means "this process spawns no harness CLIs". Resolved at
     // startup beside the adapter choice; this is the one call that would
     // otherwise bypass it.
@@ -7054,6 +7079,20 @@ pub async fn read_codex_account_usage_impl(
     if !any_configured_agent_reports_account_usage(state) {
         return None;
     }
+    // **After the gates, before the spawn.** A GUI launch inherits a PATH that
+    // omits nvm, Homebrew and `~/.local/bin`, and the login-shell capture that
+    // recovers it can still be running when this first fires — the usage panel
+    // mounts as soon as a launch opens onto an agent roster. Resolving
+    // `codex` against the provisional PATH finds nothing on an install outside
+    // the fallback's well-known directories, and the completion event re-probes
+    // install status only — nothing asks for a quota again, so the section stays
+    // empty until a turn ends or the panel is reopened.
+    //
+    // The source is deliberately discarded: `Capturing` means the budget expired
+    // and the capture is still running, and proceeding on the fallback is then
+    // the same accepted residual dispatch takes. There is no better answer to be
+    // had by waiting longer.
+    let _ = path_ready.await;
     let outcome = switchboard_harness::read_account_usage(binary, timeout).await;
     let kind = outcome
         .as_ref()
@@ -7180,6 +7219,36 @@ pub const RECHECK_CAPTURE_WAIT: std::time::Duration =
 /// user*, because an agent silently missing is worse than an agent visibly
 /// missing.
 pub const AUTOCREATE_PATH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the account quota read waits for the login-shell PATH before
+/// giving up and resolving `codex` against whatever is current.
+///
+/// **Waits out a whole capture, unlike every other caller.** The short budgets
+/// elsewhere buy responsiveness for someone who is watching: dispatch must not
+/// hold Send, auto-create must not freeze a non-dismissible modal. Nothing
+/// waits on this read — it is a background meter refresh whose every failure
+/// already collapses to "no reading" — so there is no spinner to keep short and
+/// no reason to answer before the answer exists.
+///
+/// One attempt rather than [`RECHECK_CAPTURE_WAIT`]'s two: that budget doubles
+/// because Recheck *invalidates* first, so an in-flight capture burns its
+/// timeout being superseded before the replacement starts. This one joins the
+/// capture already running.
+///
+/// Derived from the capture budget rather than written as a literal, so it
+/// cannot silently stop covering the worst case when that timeout is bumped.
+///
+/// **Additive to the read's own bound, which is what a caller budgeting against
+/// either constant needs to know.** This wait (~22s) precedes
+/// `ACCOUNT_USAGE_TIMEOUT` (30s) and its teardown tail (~2.5s), so one
+/// `read_codex_account_usage` occupies the frontend's single refresh slot for up
+/// to ~54s rather than the ~32s that constant documents. That is the sum of the
+/// explicitly bounded stages, not an absolute worst case — `resolve_binary` can
+/// still block on filesystem work outside any async timeout. Paid only while a
+/// capture is in flight: once the PATH resolves this returns immediately, so the
+/// typical cost is zero.
+pub const ACCOUNT_USAGE_PATH_WAIT: std::time::Duration =
+    switchboard_harness::subprocess::capture_attempt_budget();
 
 /// Discard the cached harness PATH and re-resolve it from the user's login
 /// shell, waiting for the result. Backs the "Recheck" action: a capture that
@@ -11678,6 +11747,12 @@ mod tests {
         (tmp, state)
     }
 
+    /// A PATH already settled, so a test that is not about the wait does not
+    /// arm a real login-shell capture to get past it.
+    fn path_settled() -> std::future::Ready<PathSource> {
+        std::future::ready(PathSource::LoginShell)
+    }
+
     #[tokio::test]
     async fn codex_account_usage_collapses_a_missing_binary_to_no_reading() {
         // The contract the `Option` return exists for: every failure is "no
@@ -11688,8 +11763,13 @@ mod tests {
         let state = state.with_real_harnesses(true);
         let dir = TempDir::new().unwrap();
         let absent = dir.path().join("definitely-not-codex");
-        let reading =
-            read_codex_account_usage_impl(&state, &absent, std::time::Duration::from_secs(5)).await;
+        let reading = read_codex_account_usage_with(
+            &state,
+            &absent,
+            std::time::Duration::from_secs(5),
+            path_settled(),
+        )
+        .await;
         assert!(reading.is_none());
         // Asserted so this cannot start passing for the wrong reason: a gate
         // that skipped the read entirely would also return `None`, and the
@@ -11708,10 +11788,11 @@ mod tests {
         // and spawn the developer's own installed binary.
         let (_tmp, state) = account_usage_state(HarnessKind::Codex);
         assert!(!state.spawns_real_harnesses);
-        let reading = read_codex_account_usage_impl(
+        let reading = read_codex_account_usage_with(
             &state,
             Path::new("codex"),
             std::time::Duration::from_secs(5),
+            path_settled(),
         )
         .await;
         assert!(reading.is_none());
@@ -11768,10 +11849,77 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let absent = dir.path().join("definitely-not-codex");
         for _ in 0..3 {
-            read_codex_account_usage_impl(&state, &absent, std::time::Duration::from_secs(5)).await;
+            read_codex_account_usage_with(
+                &state,
+                &absent,
+                std::time::Duration::from_secs(5),
+                path_settled(),
+            )
+            .await;
         }
         let last = *state.last_account_usage_failure.lock().unwrap();
         assert_eq!(last, Some("binary-not-found"));
+    }
+
+    #[tokio::test]
+    async fn the_quota_read_waits_for_a_slow_path_capture_before_resolving_codex() {
+        // The launch race this guards: a GUI start inherits a PATH without nvm
+        // or Homebrew, and the login-shell capture that fixes it is still
+        // running when the first read fires. Resolving against the provisional
+        // PATH misses an install outside the fallback's well-known directories,
+        // and nothing asks again once the capture lands — the frontend's
+        // completion listener re-probes install status only.
+        //
+        // **The binary becomes findable only when readiness resolves**, which is
+        // what the capture does in production and what makes this deterministic:
+        // the two orderings produce different failure kinds rather than
+        // different timings. Reading first spawns a path that does not exist yet
+        // and fails `NotFound`; waiting yields whatever spawning the stub
+        // produces. A clock-based version would prove nothing, because the read
+        // runs on its own task and is `Pending` before it has attempted the spawn.
+        //
+        // **`resolve_binary` is not exercised here**: an absolute path is
+        // returned verbatim without probing, so the failure is `spawn`'s. The
+        // production equivalent is `which_in` missing a bare `codex` on the
+        // provisional PATH, which reaches the same error.
+        let (_tmp, state) = account_usage_state(HarnessKind::Codex);
+        let state = state.with_real_harnesses(true);
+        let dir = TempDir::new().unwrap();
+        let stub = dir.path().join("codex-stub");
+
+        let appears_when_the_path_settles = {
+            let stub = stub.clone();
+            async move {
+                std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+                #[cfg(unix)]
+                std::fs::set_permissions(
+                    &stub,
+                    <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+                )
+                .unwrap();
+                PathSource::LoginShell
+            }
+        };
+
+        assert!(!stub.exists(), "the stub must not exist before the wait");
+        let reading = read_codex_account_usage_with(
+            &state,
+            &stub,
+            std::time::Duration::from_secs(5),
+            appears_when_the_path_settles,
+        )
+        .await;
+
+        assert!(reading.is_none());
+        let kind = *state.last_account_usage_failure.lock().unwrap();
+        assert_ne!(
+            kind,
+            Some("binary-not-found"),
+            "the read resolved the binary against the provisional PATH instead of waiting"
+        );
+        // Asserted positively too, so this cannot pass by the read being skipped
+        // altogether — a gate that returned early also never records a kind.
+        assert_eq!(kind, Some("no-response"));
     }
 
     #[tokio::test]
@@ -11783,10 +11931,11 @@ mod tests {
         // would fail on a populated reading rather than passing by luck.
         let (_tmp, state) = account_usage_state(HarnessKind::ClaudeCode);
         let state = state.with_real_harnesses(true);
-        let reading = read_codex_account_usage_impl(
+        let reading = read_codex_account_usage_with(
             &state,
             Path::new("codex"),
             std::time::Duration::from_secs(5),
+            path_settled(),
         )
         .await;
         assert!(reading.is_none());

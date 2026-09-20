@@ -563,6 +563,19 @@ describe("App", () => {
     // (empty repos, null install status), which destabilizes the reactive
     // runtime and intermittently hangs the next test's mount on slow CI.
     cleanup();
+    // **Drained before anything is reset, and both coordinators, in this order.**
+    // Each store runs a loop that re-reads shared state on every pass, and
+    // `reset` only clears that state — it cannot stop a loop already running. A
+    // survivor issues its `invoke` inside the *next* test, after `beforeEach`
+    // cleared the mock, where it reads as that test's own call. The account
+    // refresher is the one that corrupts a call count; the usage writer is here
+    // because the same shape has the same fix.
+    const accountUsage = await import("$lib/state/accountUsage.svelte");
+    await accountUsage._testing.settled();
+    const harnessUsage = await import("$lib/state/harnessUsage.svelte");
+    await harnessUsage._testing.settled();
+    accountUsage._testing.reset();
+    harnessUsage._testing.reset();
     const idx = await import("$lib/state/index.svelte");
     idx._testing.reset();
     const ws = await import("$lib/state/workspace.svelte");
@@ -655,22 +668,59 @@ describe("App", () => {
     expect(screen.queryByTestId(/^banner-auth_missing-/)).not.toBeInTheDocument();
   });
 
-  it("asks Codex for the account's quotas at startup", async () => {
-    // One of three refresh triggers, and the only one that populates the meters
-    // before any turn has run — without it the usage section stays empty until
-    // the user's first Codex turn ends. Deleting the call in `App.svelte` used to
-    // break nothing in the suite.
+  it("asks Codex for the account's quotas when the usage panel appears, and not before", async () => {
+    // **The panel is the trigger, so there is exactly one read per launch.**
+    // Launch used to ask as well, and because a request arriving mid-read
+    // deliberately causes a further one rather than being answered from the
+    // call in flight, the two spawned `codex app-server` twice for a number
+    // with a single consumer — this panel, which refreshes itself on mount.
     //
-    // Mounted on the welcome state deliberately: no project is open, so the
-    // usage panel never mounts and its own mount-time trigger cannot satisfy
-    // this assertion in place of the startup one.
+    // The welcome state is asserted first because it is where the launch-time
+    // call used to be observable: no project, no panel, and now no read.
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
-    await waitFor(() => {
-      const reads = invokeMock.mock.calls.filter(([c]) => c === "read_codex_account_usage");
-      expect(reads.length).toBeGreaterThan(0);
-    });
     expect(screen.queryByTestId("harness-usage")).not.toBeInTheDocument();
+    // Drained before counting, so this asserts a settled total rather than a
+    // moment before a read that was already on its way.
+    const accountUsage = await import("$lib/state/accountUsage.svelte");
+    await accountUsage._testing.settled();
+    expect(invokeMock.mock.calls.filter(([c]) => c === "read_codex_account_usage")).toHaveLength(0);
+  });
+
+  it("reads the account's quotas once when a launch opens straight into the usage panel", async () => {
+    // The common launch, and the one the duplicate cost: the right sidebar is a
+    // persisted preference, so a user who left it open lands on a mounted usage
+    // panel. Set explicitly — with it closed nothing mounts, and a
+    // "reads exactly once" assertion would pass by reading zero times.
+    const { layout } = await import("$lib/layout.svelte");
+    layout.rightSidebarOpen = true;
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant", harness: "codex" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    // The roster, not the usage strip: the strip renders only once a reading
+    // exists, and the read being asserted is what produces one. Waiting on it
+    // would wait on the assertion's own outcome.
+    await waitFor(() => expect(screen.getByTestId("sidebar-agent")).toBeInTheDocument());
+    // **Wait for one, drain, then assert exactly one.** Draining first would
+    // return immediately — nothing is in flight until the panel's mount effect
+    // has run — and assert against zero. Asserting on `waitFor` alone would
+    // resolve at the first read and never see a second, which is the whole
+    // defect: the two are sequential, so one is a state the duplicate passes
+    // through on its way to two.
+    const accountUsage = await import("$lib/state/accountUsage.svelte");
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.filter(([c]) => c === "read_codex_account_usage").length,
+      ).toBeGreaterThan(0),
+    );
+    await accountUsage._testing.settled();
+    expect(invokeMock.mock.calls.filter(([c]) => c === "read_codex_account_usage")).toHaveLength(1);
   });
 
   it("re-probes when the backend reports the login-shell PATH resolved", async () => {

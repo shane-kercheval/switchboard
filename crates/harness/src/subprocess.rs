@@ -511,11 +511,13 @@ fn terminate_group_then_kill(child: &mut std::process::Child) {
 /// Gatekeeper validation.
 ///
 /// **Routine reads never wait on this window** — [`resolved_path`] returns a
-/// snapshot immediately. Three callers deliberately do wait, each with its own
+/// snapshot immediately. Four callers deliberately do wait, each with its own
 /// bound: turn dispatch (~3s, so an agent isn't spawned on a guessed PATH),
-/// auto-create (~5s, so a new project isn't seeded from one), and Recheck (the
-/// full derived budget, because the user is watching a spinner). So this figure
-/// is not free — it is the ceiling those bounded waits are sized against.
+/// auto-create (~5s, so a new project isn't seeded from one), Recheck (the full
+/// derived budget, because the user is watching a spinner), and the Codex
+/// account quota read (one full attempt — nothing waits on it, so there is no
+/// spinner to keep short). So this figure is not free — it is the ceiling those
+/// bounded waits are sized against.
 #[cfg(target_os = "macos")]
 pub const PATH_CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 

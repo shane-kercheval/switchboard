@@ -45,10 +45,15 @@ let requestedSinceRead = false;
 ///
 /// **Superseding an in-flight read by discarding it is not available**: this
 /// awaits the call, and Tauri propagates no cancellation, so nothing on either
-/// side drops the future. That is why the backend's timeout is load-bearing
+/// side drops the future. That is why the backend's bounds are load-bearing
 /// rather than defensive — an unbounded read against a wedged server would hold
 /// this single slot for the life of the session and permanently freeze the
 /// Codex meter.
+///
+/// **Two bounds, not one**, and the slot is held for their sum: the backend
+/// waits for the login-shell PATH before it resolves `codex` (~22s, and only
+/// while a capture is in flight), then bounds the read itself (~32s including
+/// teardown). Budget ~54s for one call rather than the read timeout alone.
 ///
 /// Fire-and-forget: never awaited on a turn's critical path, and every failure
 /// is already collapsed to "no reading" by the backend.

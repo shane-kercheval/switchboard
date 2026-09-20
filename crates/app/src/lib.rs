@@ -460,7 +460,9 @@ async fn check_codex_auth() -> Result<(), String> {
 /// which also owns the mock-mode gate and the log de-duplication.
 ///
 /// The binary name matches `CodexAdapter::new()`'s: production resolves `codex`
-/// on the login-shell PATH, and there is no configured override to honour.
+/// on the login-shell PATH, and there is no configured override to honour. How
+/// long that resolution waits for the capture is decided by
+/// [`read_codex_account_usage_impl`], not here.
 #[tauri::command]
 async fn read_codex_account_usage(
     state: State<'_, AppState>,

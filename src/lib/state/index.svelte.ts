@@ -992,22 +992,28 @@ function cancelledEntryFor(
 /// Feed the account-scoped usage store from a live event.
 ///
 /// Separate from `runtimeReducer` because what it updates is not this agent's
-/// state: a quota reading and a refusal are facts about the harness account, and
-/// every agent on that harness reports the same ones. Driven from the same
-/// boundary so the two cannot see different events.
+/// state: a quota reading is a fact about the harness account, and every agent
+/// on that harness reports the same one. Driven from the same boundary so the
+/// two cannot see different events.
 ///
-/// `turn_end` moves the refusal verdict and `rate_limit_event` moves the reading.
-/// A cancellation and an unrelated failure move neither — see
-/// [`clearUsageRefusal`] for why neither counts as evidence the quota recovered.
+/// Three events reach the store, and none of them carries a verdict about
+/// whether the account is exhausted. `rate_limit_event` moves the reading for a
+/// harness that reports one, `session_meta` fills in a model label the reading
+/// arrived without, and `turn_end` asks a harness that can be asked for a fresh
+/// account-wide reading. Exhaustion used to be inferred here from a turn's
+/// outcome, because the per-turn payload could not say which quota had refused;
+/// asking the account answers it directly and the bookkeeping is gone.
 function recordAccountUsage(agentId: AgentId, event: NormalizedEvent, receivedAt: string): void {
   const harness = agentHarness.get(agentId);
   if (harness === undefined) return;
   if (event.type === "rate_limit_event") {
-    // Same cut as the restored path, and it has to happen here rather than
-    // waiting for the backend emission to go: this reading is stamped with
-    // *arrival* time, so it wins newest-wins against the account read every
-    // single turn. Leaving it connected would clean-hide the Codex section
-    // after every turn for as long as both paths coexist.
+    // Same cut as the restored path. **No Codex adapter emits this event** — its
+    // quotas are asked for over the app-server protocol — so this is a
+    // capability statement rather than a guard against a live double-write: it
+    // is where a future Codex stream reading would land, and it says that such a
+    // reading must not displace the account read. It would otherwise win
+    // newest-wins every single turn, being stamped with arrival time, and
+    // clean-hide the Codex section behind the one-unnamed-bucket shape.
     if (supportsAccountUsageRead(harness)) return;
     const model = runtimes[agentId]?.current_turn_model;
     observeUsage(harness, {

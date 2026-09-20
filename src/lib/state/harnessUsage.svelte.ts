@@ -30,9 +30,11 @@ export type HarnessUsageReading = {
   /// windows from a file written before they were held individually.
   payload: unknown;
   /// **The ordering key**, ISO-8601. For a live event this is arrival time; for a
-  /// reading recovered from a harness's own session file it is the instant the
-  /// harness measured it, which is the only thing that can order several agents'
-  /// restored readings against each other.
+  /// reading restored at project open it is the capture instant recorded beside
+  /// it in Switchboard's own metadata sidecar, which is the only thing that can
+  /// order several agents' restored readings against each other. No harness
+  /// session file supplies one — the loaders deliberately leave the field unset.
+  /// The sidecar is therefore the only restore-path producer.
   ///
   /// **Also what dates the reading for the user.** There used to be a second
   /// field for that, set only when a reading came from a stream-only snapshot, on
@@ -40,12 +42,18 @@ export type HarnessUsageReading = {
   /// because it is durable. Durable was mistaken for current: the file is re-read
   /// on every open but can itself be days old. One instant answers both questions.
   ///
-  /// **Optional, because a reading can genuinely have no measured instant**: a
-  /// Codex `token_count` record whose line carries no parseable timestamp yields
-  /// one, and the reading is still worth keeping. Such a reading ranks below
-  /// every stamped one and renders with no age line at all, rather than being
-  /// given a fabricated instant that would sort correctly and then be shown to
-  /// the user as a date in 1970.
+  /// **Optional for compatibility, not because anything still produces one.**
+  /// Every current path supplies an instant: a live event has its arrival time,
+  /// and the sidecar's capture time is a required field, written in the same
+  /// block as the payload it dates, so a restored reading cannot arrive undated.
+  /// What can still arrive undated is a `usage.yaml` entry — written by a build
+  /// whose Codex rollout reading could carry no parseable timestamp, or edited by
+  /// hand, which `asReading` already treats the file as open to.
+  ///
+  /// Such a reading ranks below every stamped one and renders with no age line at
+  /// all, rather than being given a fabricated instant that would sort correctly
+  /// and then be shown to the user as a date in 1970. That is what the optionality
+  /// buys, and why tightening the type would break restore rather than tidy it.
   observed_at?: string;
   /// The windows this account holds, keyed by the harness's own window key, each
   /// with the context of the reading that delivered *it*.
@@ -330,9 +338,10 @@ export async function loadPersistedUsage(): Promise<void> {
 /// one is the rollout's `rate_limits` object and structurally cannot carry
 /// `rateLimitsByLimitId`, so the account view reads it as nothing and the
 /// section renders empty until a fresh read supersedes it on arrival-time
-/// ranking. That is normally the startup refresh, but it depends on the read
-/// succeeding — offline, or with no Codex installed, the stale entry simply
-/// keeps rendering nothing. No version check or shape sniff is needed anywhere.
+/// ranking. That is normally the refresh the usage panel issues when it mounts,
+/// but it depends on the read succeeding — offline, or with no Codex installed,
+/// the stale entry simply keeps rendering nothing. No version check or shape
+/// sniff is needed anywhere.
 function asReading(value: unknown): HarnessUsageReading | null {
   if (typeof value !== "object" || value === null) return null;
   const v = value as Record<string, unknown>;
@@ -462,6 +471,18 @@ function persist(): void {
 /// Test-only reset. Named under `_testing` so a production caller grepping for
 /// "reset" cannot autocomplete into clearing app state.
 export const _testing = {
+  /// Resolve once no write is running and none is pending.
+  ///
+  /// **Awaited before `reset`, never instead of it.** `reset` clears the maps but
+  /// cannot stop a drain loop already running: that loop re-reads `harnessUsage`
+  /// on every pass, so a write surviving into the next test issues an
+  /// `invoke` there — against a cleared map, after the mock was cleared, in a
+  /// test that never touched this store.
+  async settled(): Promise<void> {
+    while (writeInFlight !== null) {
+      await writeInFlight;
+    }
+  },
   reset(): void {
     for (const key of Object.keys(harnessUsage)) {
       delete harnessUsage[key as HarnessKind];

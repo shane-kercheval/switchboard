@@ -1576,13 +1576,23 @@ async fn stream_only_rate_limit_is_persisted_to_metadata_cache() {
         "a rate-limit arriving before its model is first persisted generically, then repaired"
     );
     assert_eq!(calls[0].2, None);
+    assert!(
+        calls[0].3 >= before && calls[0].3 <= after,
+        "the reading's capture time is stamped when it arrives (roughly now)"
+    );
     let (recorded_agent, payload, model, captured_at) = &calls[1];
     assert_eq!(*recorded_agent, agent.id);
     assert_eq!(payload["primary"]["used_percent"], 42.0);
     assert_eq!(model.as_deref(), Some("mock-fable"));
-    assert!(
-        *captured_at >= before && *captured_at <= after,
-        "captured_at must be stamped at record time (roughly now)"
+    // **The repair must not restamp the reading.** It attaches a model label to a
+    // measurement already taken, and `captured_at` is what orders one agent's
+    // restored reading against another's — so advancing it let a stale reading
+    // outrank a sibling agent's fresher one at project open, and told the user it
+    // had been measured just now. Same instant, not merely "roughly now": the
+    // second write carries the first write's time.
+    assert_eq!(
+        *captured_at, calls[0].3,
+        "a model repair must reuse the reading's own capture time, not take a new one"
     );
 }
 

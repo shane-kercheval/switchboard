@@ -891,6 +891,17 @@ its absent-equals-absent case, tone and refusal read from the newest reading rat
 the per-window instant, the persistence whitelist, the fallback suppression, the legacy instant backfill,
 and a contributing turn on a restored reading.
 
+A pre-existing dispatcher defect surfaced while documenting M4's surviving timestamp, and was fixed with
+it. The metadata sidecar's `captured_at` is the ordering key for a restored reading, and the model-label
+repair (`dispatcher/src/lib.rs`) rewrote the row with `Utc::now()` — no new measurement. Two agents on one
+harness, one of them switching model: the switcher's older reading took a fresher stamp than a sibling's
+newer one and won at project open, with an age line claiming it had just been measured. The dispatcher now
+holds the payload's own capture time beside it and reuses it on repair;
+`stream_only_rate_limit_is_persisted_to_metadata_cache` asserts the two writes carry the same instant, and
+fails when the repair takes a new one. Predates this milestone; found by checking the field's *producer*
+rather than its consumers, after an earlier round of this review had asserted the timestamp was safe on the
+strength of its consumers alone.
+
 One more correction that came out of review: `payload.unifiedWindows` is **not** unread after this change. It
 no longer supplies meter values, but it still decides whether the bare fallback line may render and it is
 what recovers windows from a pre-M3 file. The note on `HarnessUsageReading.payload` says that rather than
@@ -1008,7 +1019,12 @@ accurate evidence trail. Reframe it as **closing an open capture**:
 - §2's kind table (`:96`) and **G3 (`:573`)**, which records "One narrow exception since:
   `usage_limit` is read by the sidebar to draw…" — M2 deletes that reader, so `error_kind` returns
   to having no readers at all.
-- **G8**, which describes the rollout-derived Codex rendering M4 deletes.
+- **G8**, which describes the rollout-derived Codex rendering M4 deletes. Includes `:597`, which says
+  `session_file.rs::rate_limits_carry_window` "now gates capture" in the present tense about a function
+  M4 deleted. **Correct it as part of the G8 rewrite, not before it** — past-tensing that one sentence on
+  its own would make the entry read as already handled and invite whoever executes this batch to skip it.
+  `:697`'s "See G7 and G8 for all of it" still resolves afterwards, but check it reads coherently once G8
+  describes the account read rather than the capture guard.
 - **§1.4** quick-reference.
 - A version-log entry for the discovery, including the probe table (unpinned refused, `gpt-reserve`
   succeeded, `gpt-5.6-luna` refused) and the conclusion that `normalModelSlug` is a display alias

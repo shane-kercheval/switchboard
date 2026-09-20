@@ -398,13 +398,19 @@ export type LoadedTranscript = {
   /// Capture time of `last_rate_limit` when restored from the per-agent
   /// metadata sidecar (a stream-only/class-C value, e.g. Claude's overage
   /// signal, that would otherwise be lost on restart). ISO-8601 string.
-  /// `null` for live values and for class-B (already-durable) sources;
-  /// drives the UI "as of …" staleness qualifier.
-  last_rate_limit_as_of?: string | null;
-  /// When the harness **measured** `last_rate_limit`, for ranking this agent's
-  /// reading against other agents' readings of the same account-scoped quota.
-  /// ISO-8601.
+  /// `null` for live values and for class-B (already-durable) sources.
   ///
+  /// **Three consumers, one meaning.** It is the instant the reading was
+  /// observed, so it both dates the reading for the user and orders it — against
+  /// other agents' readings of the same account quota, and per window against
+  /// another reading of the same window. All three are the same question asked of
+  /// one measurement, which is why they share a field.
+  ///
+  /// This is safe only because the dispatcher stamps it when the reading arrives
+  /// and every later write of that payload reuses it. A write that restamped it —
+  /// the model-label repair used to — makes a stale reading outrank a fresher one
+  /// and claims it was measured just now.
+  last_rate_limit_as_of?: string | null;
   /// Capture time of `meta.inventory` when restored from the metadata sidecar
   /// (ISO-8601). Same role as `last_rate_limit_as_of`: `null`/absent means the
   /// inventory is live or re-read from a durable harness file, so the card

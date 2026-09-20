@@ -7061,9 +7061,22 @@ pub async fn read_codex_account_usage_impl(
 ///
 /// Paired with the wrapper above exactly as [`install_status_with`] is paired
 /// with [`install_status_for`] — production wiring in this module rather than in
-/// the Tauri shim, which holds no logic. Nothing pins the wrapper's choice of
-/// readiness source; keeping it here at least puts it where the rest of this
-/// file's PATH policy lives.
+/// the Tauri shim, which holds no logic.
+///
+/// **Every production call goes through the wrapper. `path_ready` is a test
+/// seam, not a knob.** A caller here passing an already-resolved future — the
+/// obvious thing to reach for when adding a second caller — silently restores
+/// the launch defect this exists to prevent: `codex` resolved against the
+/// provisional GUI PATH, missed on any install outside the fallback's well-known
+/// directories, and a blank usage card until a turn ends or the panel reopens.
+///
+/// **No test covers that argument**, because every test supplies its own
+/// readiness and so never executes the wrapper's choice. The alternatives were
+/// weighed and declined: a process-global readiness provider is larger than what
+/// it guards at one call site, and forcing the shared PATH cache into `Capturing`
+/// from a test here would hand the concurrently-running tests in this binary a
+/// fallback PATH and change their answers. [`install_status_for`] carries the
+/// same uncovered wiring for the same reason.
 async fn read_codex_account_usage_with(
     state: &AppState,
     binary: &Path,

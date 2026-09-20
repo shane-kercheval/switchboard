@@ -1014,6 +1014,16 @@
         return;
       }
       if (e.key === "Escape") {
+        // **An Escape another layer already consumed is not ours**, even though
+        // focus reads as the composer's by the time it gets here. Dismissible
+        // layers (the transcript navigator, dialogs, dropdowns) listen on
+        // `document`, which runs before this window listener: they close, call
+        // `preventDefault`, and restore focus to whatever had it before they
+        // opened — the composer, if the user pressed ⌘F while typing. The focus
+        // check below then passes and the same keystroke that closed the dialog
+        // also cleared the recipient chips. `defaultPrevented` is the only part
+        // of that sequence still true when we run.
+        if (e.defaultPrevented) return;
         if (composeEl === undefined || !composeEl.contains(document.activeElement)) return;
         // First dismiss whichever menu is open, otherwise clear the recipient
         // set. The draft text is untouched either way.

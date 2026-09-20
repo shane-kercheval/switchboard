@@ -46,6 +46,15 @@ export default ts.config(
     },
   },
   {
+    // Browser test hosts mount real components in WebKit, so they see the DOM
+    // the same way `src/` does. The Node block above matches only `.ts`/`.js`,
+    // which leaves these `.svelte` files with no globals at all.
+    files: ["tests/browser/**/*.svelte"],
+    languageOptions: {
+      globals: { ...globals.browser },
+    },
+  },
+  {
     files: ["**/*.svelte", "**/*.svelte.ts"],
     languageOptions: {
       parserOptions: {

@@ -526,10 +526,11 @@ pub struct AppState {
     ///
     /// **Nearly every way that read can fail is a steady state**, not a blip:
     /// no Codex installed, logged out, offline, or a Codex too old to report
-    /// named quotas. The read runs at startup and after every Codex turn, so
-    /// logging each failure would emit the same line indefinitely and bury the
-    /// transient failures that actually mean something. `None` is "nothing has
-    /// failed since startup", which is why recovery logs too.
+    /// named quotas. The read runs whenever the usage panel mounts and after
+    /// every Codex turn, so logging each failure would emit the same line
+    /// indefinitely and bury the transient failures that actually mean
+    /// something. `None` is "nothing has failed since startup", which is why
+    /// recovery logs too.
     pub last_account_usage_failure: Mutex<Option<&'static str>>,
 }
 

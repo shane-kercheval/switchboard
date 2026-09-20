@@ -1,6 +1,7 @@
 <script lang="ts">
   import { cn } from "$lib/utils";
-  import { Ban, LoaderCircle } from "@lucide/svelte";
+  import { Ban } from "@lucide/svelte";
+  import Spinner from "$lib/components/ui/Spinner.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
   import {
@@ -110,7 +111,7 @@
           {#if readiness === "empty"}
             <Ban class="h-3.5 w-3.5" aria-hidden="true" />
           {:else}
-            <LoaderCircle class="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+            <Spinner class="h-3.5 w-3.5 border-current/30 border-t-current" />
           {/if}
         </span>
       {/snippet}

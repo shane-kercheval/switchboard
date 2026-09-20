@@ -431,12 +431,26 @@
   // below the ~50 point). Past there, the answer is a true
   // sliding-window/virtualization follow-up, not CSS containment estimates.
 
-  /// Clip + bottom-fade for a height-clipped preview. Absolute stops (not
-  /// percentages) so a short message never fades; the fade starts around the
-  /// halfway mark so "there's more below" is unmistakable. The `-webkit-` mask is
-  /// explicit because the app runs in WebKit (Tauri/macOS).
-  const PREVIEW_CLIP =
-    "max-h-[14rem] overflow-hidden [mask-image:linear-gradient(to_bottom,black_7rem,transparent_14rem)] [-webkit-mask-image:linear-gradient(to_bottom,black_7rem,transparent_14rem)]";
+  /// Height cap for a clipped preview. Always applied while compact — it is what
+  /// creates the overflow the fade below reports on.
+  const PREVIEW_CLIP = "max-h-[14rem] overflow-hidden";
+
+  /// Bottom fade, in absolute stops so the gradient lines up with the cap rather
+  /// than with the message's own height. The `-webkit-` mask is explicit because
+  /// the app runs in WebKit (Tauri/macOS).
+  const PREVIEW_FADE =
+    "[mask-image:linear-gradient(to_bottom,black_7rem,transparent_14rem)] [-webkit-mask-image:linear-gradient(to_bottom,black_7rem,transparent_14rem)]";
+
+  /// The cap and the fade, applied together **only when the content actually
+  /// exceeds the cap**. The fade means "there is more below"; a message between
+  /// the gradient's first stop (7rem) and the cap (14rem) is entirely visible, so
+  /// fading its last lines promised hidden text that did not exist — and, because
+  /// the same measurement decides the expand toggle, it faded with no way to
+  /// expand. A mask has no layout effect, so switching it off cannot disturb the
+  /// measurement that switched it off.
+  function previewClip(key: string): string {
+    return clipOverflow[key] === true ? `${PREVIEW_CLIP} ${PREVIEW_FADE}` : PREVIEW_CLIP;
+  }
 
   /// Whether each clipped preview's content actually exceeds the cap, keyed by
   /// preview key — measured from the DOM. A toggle is only worth showing when
@@ -1889,7 +1903,7 @@
            keeps the re-collapse toggle alive, instead of the observer firing on
            the now-unclipped div and clearing it. -->
       {#if compact}
-        <div class={PREVIEW_CLIP} use:measureClip={key} data-testid="preview-clip">
+        <div class={previewClip(key)} use:measureClip={key} data-testid="preview-clip">
           {@render userBody(row)}
         </div>
       {:else}
@@ -2087,7 +2101,7 @@
           {@render turnBody(turn, false, "final")}
         {:else}
           <div
-            class={cn("space-y-1.5", PREVIEW_CLIP)}
+            class={cn("space-y-1.5", previewClip(key))}
             use:measureClip={key}
             data-testid="preview-clip"
           >
@@ -2592,7 +2606,7 @@
                           {/each}
                         {:else}
                           <div
-                            class={cn("space-y-1.5", PREVIEW_CLIP)}
+                            class={cn("space-y-1.5", previewClip(colKey))}
                             use:measureClip={colKey}
                             data-testid="preview-clip"
                           >

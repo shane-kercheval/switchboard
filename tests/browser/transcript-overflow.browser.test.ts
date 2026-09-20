@@ -98,3 +98,54 @@ test("a non-latest agent response that overflows gets a toggle", async () => {
     .toBeGreaterThan(1);
   await expect.element(page.getByTestId("turn-preview-toggle")).toBeInTheDocument();
 });
+
+// Behavior 2: the bottom fade is a claim that text is hidden, so it may only
+// appear when text is actually hidden. The gradient's first stop is at 7rem and
+// the cap is at 14rem, which leaves a band where a message is fully visible and
+// was being faded anyway — with no toggle, since nothing overflowed to expand.
+
+/// Computed mask on the clip, normalized across the two property names WebKit
+/// reports. "none" is the fade being off.
+function clipMask(): string {
+  const el = page.getByTestId("preview-clip").element() as HTMLElement;
+  const style = getComputedStyle(el);
+  const mask = style.maskImage;
+  if (mask !== undefined && mask !== "") return mask;
+  return style.webkitMaskImage;
+}
+
+test("a message past the fade's first stop but inside the cap is not faded", async () => {
+  await registerAgent(ALICE);
+  // Tall enough to reach into the gradient (7rem ≈ 112px), short enough to fit
+  // the 14rem cap. The height assertion below pins it to that band, so a future
+  // line-height change fails here rather than silently testing a short message.
+  seedTurns(ALICE.id, [userTurn({ id: "user-1", agentId: ALICE.id, text: longText(6) })]);
+
+  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
+  await expect.element(page.getByTestId("preview-clip")).toBeInTheDocument();
+
+  await expect
+    .poll(() => {
+      const el = page.getByTestId("preview-clip").element() as HTMLElement;
+      return el.scrollHeight - el.clientHeight;
+    })
+    .toBeLessThanOrEqual(1);
+
+  const height = (page.getByTestId("preview-clip").element() as HTMLElement).clientHeight;
+  expect(height).toBeGreaterThan(112);
+  expect(height).toBeLessThanOrEqual(224);
+
+  expect(page.getByTestId("turn-preview-toggle").elements()).toHaveLength(0);
+  expect(clipMask()).toBe("none");
+});
+
+test("a message that overflows the cap keeps its fade", async () => {
+  // The other half: the fade still marks hidden text, so switching it off for
+  // the fitting case cannot have switched it off everywhere.
+  await registerAgent(ALICE);
+  seedTurns(ALICE.id, [userTurn({ id: "user-1", agentId: ALICE.id, text: longText() })]);
+
+  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
+  await expect.element(page.getByTestId("turn-preview-toggle")).toBeInTheDocument();
+  await expect.poll(() => clipMask()).not.toBe("none");
+});

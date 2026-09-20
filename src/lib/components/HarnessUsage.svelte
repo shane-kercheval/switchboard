@@ -2,13 +2,17 @@
   /// Account-scoped quota meters, one row per harness that has reported a
   /// reading.
   ///
-  /// **Above the agent roster rather than on each agent card, and fed from one
-  /// store rather than per agent.** A quota belongs to the account the harness is
-  /// logged into: N cards showed one fact N times at N staleness levels, and a
-  /// card restored from a project's own state showed that project's older
-  /// reading. Nothing here is project-scoped — the same numbers render whichever
-  /// project is open, which is also what tells the user these are not
-  /// per-project.
+  /// **One section pinned to the bottom of the sidebar rather than a cell on
+  /// each agent card, and fed from one store rather than per agent.** A quota
+  /// belongs to the account the harness is logged into: N cards showed one fact
+  /// N times at N staleness levels, and a card restored from a project's own
+  /// state showed that project's older reading. Nothing here is project-scoped —
+  /// the same numbers render whichever project is open, which is also what tells
+  /// the user these are not per-project.
+  ///
+  /// Below the roster rather than above it: the roster is the surface the user
+  /// works in and it gets the top of the panel plus all the flexible height,
+  /// while this readout keeps its own fixed strip at the foot.
   ///
   /// The right sidebar rather than the left: the projects rail is collapsed
   /// during single-project work, and a passive readout the user wants glanceable
@@ -142,8 +146,10 @@
 {#if rows.length > 0}
   <!-- Fixed block, deliberately outside the roster's scroll container: these
        meters exist to be glanceable, and scrolling a long agent list must not
-       carry them off screen. -->
-  <section class="border-border/80 shrink-0 border-b px-2 pb-2" data-testid="harness-usage">
+       carry them off screen. `shrink-0` beside the roster section's `flex-1`
+       is what pins it to the panel's foot — the roster absorbs every spare
+       pixel and scrolls when it runs out, this strip keeps its content height. -->
+  <section class="border-border/80 shrink-0 border-t px-2 pb-2" data-testid="harness-usage">
     <div
       class="text-muted flex h-8 items-center px-1 text-[11px] leading-none font-semibold tracking-wide uppercase"
     >

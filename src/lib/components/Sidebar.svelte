@@ -919,7 +919,6 @@
       draftWidth = null;
     }}
   />
-  <HarnessUsage />
   <SidebarSection title="Agents">
     {#snippet action()}
       <div class="flex items-center gap-0.5">
@@ -1622,6 +1621,7 @@
       {/each}
     </div>
   </SidebarSection>
+  <HarnessUsage />
 </SidebarPanel>
 
 <ContextBreakdown

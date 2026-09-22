@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome};
-use crate::parser::{self, ParseOutcome, ParserState, StreamMode};
+use crate::parser::{self, ParseOutcome, ParserState, StreamMode, UsageSeed};
 
 /// Adapter for Claude Code (`claude -p`). Spawns a `claude` subprocess,
 /// feeds the prompt as a positional argument, and maps the stream-json output
@@ -40,6 +40,10 @@ pub struct ClaudeCodeAdapter {
     /// adapter with no grants as the negative control that proves the
     /// out-of-cwd read fence is real (`with_working_directory_grants`).
     working_directory_grants: Vec<PathBuf>,
+    /// Overrides this process's `$HOME` as the home Claude's session files are
+    /// resolved under and the child runs with. `None` in production. See
+    /// [`Self::home`] and [`Self::with_home_dir`].
+    home_dir: Option<PathBuf>,
 }
 
 /// The production working-directory grant: the filesystem root.
@@ -74,6 +78,7 @@ impl ClaudeCodeAdapter {
             claude_binary_path: PathBuf::from("claude"),
             cached_version: OnceLock::new(),
             working_directory_grants: root_grant().to_vec(),
+            home_dir: None,
         }
     }
 
@@ -83,6 +88,7 @@ impl ClaudeCodeAdapter {
             claude_binary_path: path.into(),
             cached_version: OnceLock::new(),
             working_directory_grants: root_grant().to_vec(),
+            home_dir: None,
         }
     }
 
@@ -94,6 +100,28 @@ impl ClaudeCodeAdapter {
     pub fn with_working_directory_grants(mut self, grants: Vec<PathBuf>) -> Self {
         self.working_directory_grants = grants;
         self
+    }
+
+    /// Resolve session files under `home` and run the child with `HOME=home`,
+    /// in place of this process's `$HOME`. Test seam, so a test can stage the
+    /// session file the child resumes. Production never calls this.
+    #[must_use]
+    pub fn with_home_dir(mut self, home: impl Into<PathBuf>) -> Self {
+        self.home_dir = Some(home.into());
+        self
+    }
+
+    /// The home one dispatch resolves every session file under and runs the
+    /// child with — the override, else this process's `$HOME` (read as an
+    /// `OsString`, so a non-UTF-8 home is not lost). Resolved **once** per
+    /// dispatch and passed everywhere: the adapter reads the session file the
+    /// child will resume, to choose `--resume` and to learn the child's cost
+    /// seed, so the two must agree on one home by construction. `None` when
+    /// `$HOME` is unset, which reads as "no session file".
+    fn home(&self) -> Option<PathBuf> {
+        self.home_dir
+            .clone()
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
     }
 }
 
@@ -156,12 +184,13 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             )));
         }
         let binary = crate::subprocess::resolve_binary(&self.claude_binary_path)?;
+        let home = self.home();
         let args = build_args(&BuildArgsInput {
             agent,
             invocation: Invocation::Prompt(prompt),
             cwd,
             chrome: options.chrome_integration,
-            home_override: None,
+            home: home.as_deref(),
             grants: &self.working_directory_grants,
         });
 
@@ -172,8 +201,10 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             agent,
             turn_id,
             StreamMode::Send,
+            home.as_deref(),
             options.cancel_token,
         )
+        .await
     }
 
     /// Compact this agent's conversation. Shares every dispatch flag with a
@@ -205,7 +236,11 @@ impl HarnessAdapter for ClaudeCodeAdapter {
                 agent.id
             )));
         };
-        if !session_file_exists(cwd, session_id) {
+        let home = self.home();
+        if !home
+            .as_deref()
+            .is_some_and(|home| session_exists_in(home, cwd, session_id))
+        {
             return Err(DispatchError::InvalidAgentState(format!(
                 "Claude agent {} has no session file yet — there is no conversation to compact",
                 agent.id
@@ -217,7 +252,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             invocation: Invocation::Compact,
             cwd,
             chrome: options.chrome_integration,
-            home_override: None,
+            home: home.as_deref(),
             grants: &self.working_directory_grants,
         });
         spawn_stream(
@@ -227,8 +262,10 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             agent,
             turn_id,
             StreamMode::Compaction,
+            home.as_deref(),
             options.cancel_token,
         )
+        .await
     }
 
     /// Ask Claude what is occupying this agent's context window. Shares every
@@ -237,7 +274,9 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     /// requested under that model's configuration.
     ///
     /// Unlike a compaction this costs nothing: the CLI answers `/context`
-    /// locally, with no model call (`total_cost_usd: 0`, empty `modelUsage`).
+    /// locally, with no model call. Its `result` still reports cost — zero on a
+    /// fresh session, the session's seeded totals on a resumed one — and the
+    /// parser discards all of it.
     ///
     /// Fails closed with no session file, and resumes rather than forks, for the
     /// reasons spelled out on `compact` — a maintenance action must never mint a
@@ -255,7 +294,11 @@ impl HarnessAdapter for ClaudeCodeAdapter {
                 agent.id
             )));
         };
-        if !session_file_exists(cwd, session_id) {
+        let home = self.home();
+        if !home
+            .as_deref()
+            .is_some_and(|home| session_exists_in(home, cwd, session_id))
+        {
             return Err(DispatchError::InvalidAgentState(format!(
                 "Claude agent {} has no session file yet — there is no context to report on",
                 agent.id
@@ -267,7 +310,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             invocation: Invocation::Context,
             cwd,
             chrome: options.chrome_integration,
-            home_override: None,
+            home: home.as_deref(),
             grants: &self.working_directory_grants,
         });
         spawn_stream(
@@ -277,8 +320,10 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             agent,
             turn_id,
             StreamMode::ContextReport,
+            home.as_deref(),
             options.cancel_token,
         )
+        .await
     }
 }
 
@@ -286,16 +331,35 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 /// `dispatch` and `compact`: the process handling (process group, null stdin,
 /// kill-on-drop, the producer task) is identical for both, and only the
 /// argument list and the parser's [`StreamMode`] differ.
-fn spawn_stream(
+///
+/// The usage seed is read **before** the spawn: the process appends its own
+/// `cost-state` record on exit, and a fast dispatch could otherwise be read back
+/// as its own seed. An operation whose usage is discarded reads none
+/// ([`StreamMode::reports_usage`]).
+///
+/// `home` is the dispatch's resolved home (see [`ClaudeCodeAdapter::home`]):
+/// the child runs with it as `HOME`, the directory its session file was
+/// resolved under. In production that is the value it would inherit anyway.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_stream(
     binary: &Path,
     args: &[String],
     cwd: &Path,
     agent: &AgentRecord,
     turn_id: TurnId,
     mode: StreamMode,
+    home: Option<&Path>,
     cancel_token: CancellationToken,
 ) -> Result<EventStream, DispatchError> {
+    let usage_seed = if mode.reports_usage() {
+        read_usage_seed_for(args, cwd, home).await
+    } else {
+        UsageSeed::Empty
+    };
     let mut command = tokio::process::Command::new(binary);
+    if let Some(home) = home {
+        command.env("HOME", home);
+    }
     command
         .args(args)
         .current_dir(cwd)
@@ -334,10 +398,62 @@ fn spawn_stream(
         agent.id,
         agent.effort.clone(),
         mode,
+        usage_seed,
         cancel_token,
     ));
 
     Ok(Box::pin(UnboundedReceiverStream::new(rx)))
+}
+
+/// Which session a `claude -p` argv resumes, read back out of the argv so the
+/// seed is looked up for exactly the session the CLI will seed from — the parent
+/// on a fork's materializing turn, the agent's own session otherwise.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeTarget {
+    /// No `--resume`: the invocation starts a session, so nothing is seeded.
+    None,
+    Session(uuid::Uuid),
+    /// `--resume` with a missing or non-UUID value: the CLI resumes something
+    /// this adapter cannot identify.
+    Invalid,
+}
+
+/// Only flags before the `--` separator count, so a prompt can never be read as
+/// one.
+fn resume_target(args: &[String]) -> ResumeTarget {
+    let flags = args.split(|arg| arg == "--").next().unwrap_or_default();
+    let Some(at) = flags.iter().position(|arg| arg == "--resume") else {
+        return ResumeTarget::None;
+    };
+    match flags.get(at + 1).and_then(|value| value.parse().ok()) {
+        Some(session_id) => ResumeTarget::Session(session_id),
+        None => ResumeTarget::Invalid,
+    }
+}
+
+/// What this invocation's session cost counters will start from: nothing when it
+/// resumes no session, otherwise the resumed session file's last `cost-state`
+/// (see [`UsageSeed`]) under the dispatch's resolved `home`. Read off the async
+/// runtime, since the file is on disk and can be large.
+async fn read_usage_seed_for(args: &[String], cwd: &Path, home: Option<&Path>) -> UsageSeed {
+    let session_id = match resume_target(args) {
+        ResumeTarget::None => return UsageSeed::Empty,
+        ResumeTarget::Invalid => return UsageSeed::Unknown,
+        ResumeTarget::Session(session_id) => session_id,
+    };
+    let Some(home) = home.map(Path::to_path_buf) else {
+        return UsageSeed::Unknown;
+    };
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let Ok(canonical) = cwd.canonicalize() else {
+            return UsageSeed::Unknown;
+        };
+        let path = claude_session_file_path(&home, &canonical, &session_id);
+        session_file::read_usage_seed(&path, &session_id)
+    })
+    .await
+    .unwrap_or(UsageSeed::Unknown)
 }
 
 /// What a `claude -p` invocation asks the CLI to do. The two forms share every
@@ -366,8 +482,9 @@ struct BuildArgsInput<'a> {
     cwd: &'a Path,
     /// Enables the Claude in Chrome browser tools for this turn.
     chrome: bool,
-    /// `None` in production (reads `$HOME`); `Some(path)` in tests.
-    home_override: Option<&'a Path>,
+    /// The dispatch's resolved home (see [`ClaudeCodeAdapter::home`]); `None`
+    /// means there is no home to find a session file under.
+    home: Option<&'a Path>,
     /// Emitted as `--add-dir` entries (see [`root_grant`]).
     grants: &'a [PathBuf],
 }
@@ -378,7 +495,7 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
         invocation,
         cwd,
         chrome,
-        home_override,
+        home,
         grants,
     } = *input;
     let mut args = vec![
@@ -403,10 +520,7 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
         // resume their own session whatever the answer — so short-circuit rather
         // than stat a path whose result those arms discard.
         let exists = matches!(invocation, Invocation::Prompt(_))
-            && match home_override {
-                Some(home) => session_exists_in(home, cwd, session_id),
-                None => session_file_exists(cwd, session_id),
-            };
+            && home.is_some_and(|home| session_exists_in(home, cwd, session_id));
         match (invocation, exists, agent.forked_from_session) {
             // An ordinary resume, reached two ways.
             //
@@ -545,15 +659,7 @@ pub fn claude_transport_prompt(prompt: &str) -> String {
     }
 }
 
-/// Production wrapper: reads `$HOME` and delegates to `session_exists_in`.
-fn session_file_exists(cwd: &Path, session_id: &uuid::Uuid) -> bool {
-    let Ok(home) = std::env::var("HOME") else {
-        return false;
-    };
-    session_exists_in(Path::new(&home), cwd, session_id)
-}
-
-/// Pure check — testable without touching the real `$HOME`.
+/// Whether `session_id` has a session file for `cwd` under `home`.
 fn session_exists_in(home: &Path, cwd: &Path, session_id: &uuid::Uuid) -> bool {
     let Ok(canonical) = cwd.canonicalize() else {
         return false;
@@ -674,7 +780,7 @@ fn to_base36(mut value: u32) -> String {
 // that flow without improving readability.
 // Arg count matches the Codex producer, which carries the same allow:
 // the params are independent handles (child, pipes, tx, ids, dispatched effort,
-// cancel token) with no meaningful grouping — bundling them into a struct here
+// usage seed, cancel token) with no meaningful grouping — bundling them into a struct here
 // would add a type without removing a decision.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_producer(
@@ -686,6 +792,7 @@ async fn run_producer(
     agent_id: AgentId,
     dispatched_effort: Option<String>,
     mode: StreamMode,
+    usage_seed: UsageSeed,
     cancel_token: CancellationToken,
 ) {
     // Drain stderr concurrently; prevents pipe-full deadlock if the subprocess
@@ -709,7 +816,8 @@ async fn run_producer(
     // cancel outcome; a binary token can't carry the source). So the cancel
     // path must skip the truncation synthesis below.
     let mut cancelled = false;
-    let mut parser_state = ParserState::for_stream(mode, dispatched_effort.clone());
+    let mut parser_state =
+        ParserState::for_stream(mode, dispatched_effort.clone()).with_usage_seed(usage_seed);
 
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
@@ -947,7 +1055,7 @@ mod tests {
             invocation: Invocation::Prompt("hi"),
             cwd,
             chrome: false,
-            home_override: Some(home),
+            home: Some(home),
             grants: root_grant(),
         }
     }
@@ -1307,6 +1415,64 @@ mod tests {
             flag_at(&args, "--fork-session") < flag_at(&args, "--"),
             "{args:?}"
         );
+    }
+
+    #[test]
+    fn the_usage_seed_is_read_from_the_session_the_argv_resumes() {
+        // The seed must be the session the CLI will seed from, and the argv is
+        // the one place that is true by construction: nothing on a first turn,
+        // the agent's own session on an ordinary resume, the parent on a fork's
+        // materializing turn (probed @ 2.1.280: a fork's first result is the
+        // parent's saved total plus the fork's own turn).
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let own_session = Uuid::now_v7();
+        let parent_session = Uuid::now_v7();
+
+        let mut fork = agent_with_session(own_session);
+        fork.forked_from_session = Some(parent_session);
+        let first_fork_turn = build_args(&input(&fork, project.path(), home.path()));
+        assert_eq!(
+            resume_target(&first_fork_turn),
+            ResumeTarget::Session(parent_session)
+        );
+
+        let plain = agent_with_session(own_session);
+        let first_turn = build_args(&input(&plain, project.path(), home.path()));
+        assert_eq!(resume_target(&first_turn), ResumeTarget::None);
+
+        materialize_session(home.path(), project.path(), own_session);
+        let resumed = build_args(&input(&plain, project.path(), home.path()));
+        assert_eq!(resume_target(&resumed), ResumeTarget::Session(own_session));
+    }
+
+    #[test]
+    fn a_prompt_naming_a_resume_flag_is_not_read_as_one() {
+        // Everything after `--` is the prompt, whatever it says.
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::now_v7());
+        let prompt = format!("--resume {}", Uuid::now_v7());
+        let args = build_args(&BuildArgsInput {
+            invocation: Invocation::Prompt(&prompt),
+            ..input(&agent, project.path(), home.path())
+        });
+        assert_eq!(resume_target(&args), ResumeTarget::None, "{args:?}");
+    }
+
+    #[test]
+    fn a_resume_flag_without_a_session_id_is_an_unidentified_target() {
+        // Unreachable through `build_args`, which always writes a UUID; the
+        // point is that "resumes something unidentifiable" must not read as
+        // "resumes nothing" — the latter reports the result unreduced.
+        let argv = |parts: &[&str]| parts.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+        for args in [
+            argv(&["-p", "--resume", "not-a-uuid", "--", "hi"]),
+            argv(&["-p", "--resume", "--", "hi"]),
+            argv(&["-p", "--resume"]),
+        ] {
+            assert_eq!(resume_target(&args), ResumeTarget::Invalid, "{args:?}");
+        }
     }
 
     #[test]

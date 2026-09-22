@@ -93,8 +93,7 @@ pub struct CodexAdapter {
     /// Optional override for the user's home directory. Used by tests to
     /// stage temp directories without mutating process-wide `$HOME`. In
     /// production this is `None` and the adapter resolves `$HOME` at
-    /// dispatch time (mirrors `claude_code::session_file_exists`'s
-    /// pattern).
+    /// dispatch time (the same pattern as `ClaudeCodeAdapter::home`).
     home_dir_override: Option<PathBuf>,
     /// Lazily-resolved `codex --version`, cached for the lifetime of the
     /// adapter. Empty string caches a failed/absent probe (version is

@@ -4,7 +4,7 @@ use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, ClaudeCodeAdapter, ContentKind, DispatchError, DispatchOptions, FailureKind,
-    HarnessAdapter, ToolKind, TurnOutcome,
+    HarnessAdapter, ToolKind, TurnOutcome, TurnUsage, claude_session_file_path,
 };
 use uuid::Uuid;
 
@@ -851,4 +851,160 @@ async fn cancel_pre_first_output_kills_group_and_emits_no_terminal() {
             .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
         "adapter must emit no terminal event on pre-output cancel; got: {events:?}"
     );
+}
+
+/// A `cost-state` record for `session_id`: the running totals Claude saved when
+/// the session's previous process exited (shape as written by 2.1.280).
+fn saved_cost_state(session_id: Uuid) -> String {
+    serde_json::json!({
+        "type": "cost-state",
+        "sessionId": session_id.to_string(),
+        "totalCostUSD": 0.107_895_600_000_000_01,
+        "modelUsage": {
+            "claude-opus-5-5": {
+                "inputTokens": 2,
+                "outputTokens": 4,
+                "cacheReadInputTokens": 10118,
+                "cacheCreationInputTokens": 13223,
+                "webSearchRequests": 0,
+                "costUSD": 0.107_895_600_000_000_01,
+            }
+        },
+    })
+    .to_string()
+}
+
+/// A resumed dispatch's stream on a seeding CLI: its `result` reports the
+/// session so far (turn 2 of a real 2.1.280 Opus 5.5 session), and the
+/// `// home_to:` directive records the `HOME` the child ran under.
+fn seeded_turn_fixture(dir: &Path, home_report: &Path) -> String {
+    let path = dir.join("seeded-turn.jsonl");
+    let lines = [
+        format!("// home_to:{}", home_report.display()),
+        r#"{"type":"system","subtype":"init","model":"claude-opus-5-5","claude_code_version":"2.1.280"}"#.to_owned(),
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"ack","usage":{"input_tokens":2,"output_tokens":276,"cache_read_input_tokens":11786,"cache_creation_input_tokens":11597},"modelUsage":{"claude-opus-5-5":{"inputTokens":4,"outputTokens":280,"cacheReadInputTokens":21904,"cacheCreationInputTokens":24820,"webSearchRequests":0,"costUSD":0.2085568,"contextWindow":1000000}},"total_cost_usd":0.2085568}"#.to_owned(),
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").expect("write fixture");
+    path.to_string_lossy().into_owned()
+}
+
+fn write_session_file(home: &Path, cwd: &Path, session_id: Uuid, content: &str) {
+    let path = claude_session_file_path(home, cwd, &session_id);
+    std::fs::create_dir_all(path.parent().expect("session dir")).expect("mkdir");
+    std::fs::write(path, content).expect("write session file");
+}
+
+fn terminal_usage(events: &[AdapterEvent]) -> TurnUsage {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                usage,
+                ..
+            } => usage.clone(),
+            _ => None,
+        })
+        .expect("a completed TurnEnd carrying usage")
+}
+
+/// Dispatch `agent` through `fake_claude` under a temporary home, returning the
+/// terminal usage and the `HOME` the child reported.
+async fn dispatch_seeded(
+    agent: &AgentRecord,
+    home: &Path,
+    cwd: &Path,
+    scratch: &Path,
+) -> (TurnUsage, String) {
+    let home_report = scratch.join("home.txt");
+    let fixture = seeded_turn_fixture(scratch, &home_report);
+    let events: Vec<AdapterEvent> = adapter()
+        .with_home_dir(home)
+        .dispatch(
+            agent,
+            cwd,
+            &fixture,
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed")
+        .collect()
+        .await;
+    let child_home = std::fs::read_to_string(&home_report).expect("child reported HOME");
+    (terminal_usage(&events), child_home.trim().to_owned())
+}
+
+#[tokio::test]
+async fn a_resumed_dispatch_reports_its_own_usage_from_the_seed_it_resumes() {
+    // The wiring end to end: the adapter finds the session file under its home,
+    // resumes it, reads the saved totals before the child starts, and the
+    // terminal reports the result minus that seed. The child runs under the
+    // same home, so both sides read one file.
+    let home = tempfile::TempDir::new().expect("home");
+    let cwd = tempfile::TempDir::new().expect("cwd");
+    let scratch = tempfile::TempDir::new().expect("scratch");
+    let cwd = cwd.path().canonicalize().expect("canonical cwd");
+    let agent = fake_agent();
+    let Some(SessionLocator::Uuid(session_id)) = agent.session_locator else {
+        panic!("fake_agent has a uuid locator");
+    };
+    write_session_file(
+        home.path(),
+        &cwd,
+        session_id,
+        &(saved_cost_state(session_id) + "\n"),
+    );
+
+    let (usage, child_home) = dispatch_seeded(&agent, home.path(), &cwd, scratch.path()).await;
+
+    assert_eq!(usage.output_tokens, 276, "280 reported - 4 saved");
+    assert_eq!(usage.input_tokens, 2);
+    let cost = usage.total_cost_usd.expect("cost reported");
+    assert!(
+        (cost - 0.100_661_2).abs() < 1e-9,
+        "turn's own cost, got {cost}"
+    );
+    assert_eq!(child_home, home.path().to_string_lossy());
+}
+
+#[tokio::test]
+async fn a_forks_first_dispatch_is_reduced_by_its_parents_seed() {
+    // A fork's materializing turn resumes the parent, and Claude seeds it from
+    // the parent's saved totals; the fork has no file of its own yet.
+    let home = tempfile::TempDir::new().expect("home");
+    let cwd = tempfile::TempDir::new().expect("cwd");
+    let scratch = tempfile::TempDir::new().expect("scratch");
+    let cwd = cwd.path().canonicalize().expect("canonical cwd");
+    let parent_session = Uuid::now_v7();
+    let mut agent = fake_agent();
+    agent.forked_from_session = Some(parent_session);
+    write_session_file(
+        home.path(),
+        &cwd,
+        parent_session,
+        &(saved_cost_state(parent_session) + "\n"),
+    );
+
+    let (usage, _) = dispatch_seeded(&agent, home.path(), &cwd, scratch.path()).await;
+
+    assert_eq!(usage.output_tokens, 276);
+    assert!((usage.total_cost_usd.expect("cost") - 0.100_661_2).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn a_first_dispatch_subtracts_nothing() {
+    // No session file: `--session-id`, no resume, nothing seeded — even if a
+    // file for some other session holds saved totals.
+    let home = tempfile::TempDir::new().expect("home");
+    let cwd = tempfile::TempDir::new().expect("cwd");
+    let scratch = tempfile::TempDir::new().expect("scratch");
+    let cwd = cwd.path().canonicalize().expect("canonical cwd");
+    let other = Uuid::now_v7();
+    write_session_file(home.path(), &cwd, other, &(saved_cost_state(other) + "\n"));
+
+    let (usage, _) = dispatch_seeded(&fake_agent(), home.path(), &cwd, scratch.path()).await;
+
+    assert_eq!(usage.output_tokens, 280, "reported unchanged");
+    assert!((usage.total_cost_usd.expect("cost") - 0.208_556_8).abs() < 1e-9);
 }

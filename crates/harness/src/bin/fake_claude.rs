@@ -21,6 +21,10 @@
 //!   `// pgid_to:<path>` — write the child's own process-group id (decimal
 //!     ASCII, single line) to the given path before streaming. Tests use
 //!     this to assert the adapter put us in our own process group.
+//!   `// home_to:<path>` — write the child's `HOME` environment variable
+//!     (single line; empty when unset) to the given path. Tests use this to
+//!     assert the adapter ran us under the home it resolved the session file
+//!     under.
 //!   `// hang` — flush any lines emitted so far, then sleep indefinitely
 //!     (never exit on our own). Leaves the adapter's stdout read parked, so a
 //!     cancellation test can fire the token mid-stream (or, if `// hang` is the
@@ -80,6 +84,13 @@ fn main() {
             // blocks forever — exactly the deadlock the stdin-EOF test guards.
             let mut sink = String::new();
             io::stdin().lock().read_to_string(&mut sink).ok();
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("// home_to:") {
+            if let Ok(mut f) = std::fs::File::create(path.trim()) {
+                let _ = writeln!(f, "{}", std::env::var("HOME").unwrap_or_default());
+            }
             continue;
         }
 

@@ -132,7 +132,8 @@ pub struct ParserState {
     /// Kept-last is whole-dispatch-correct: the final result's
     /// `total_cost_usd` is the dispatch total (= Σ `modelUsage[*].costUSD`,
     /// subagent work included) and its `modelUsage` holds whole-dispatch
-    /// per-model aggregates. Failure results bypass this stash and fail fast.
+    /// per-model aggregates — each on top of the session seed on a resumed
+    /// dispatch, which [`extract_usage_from_result`] removes. Failure results bypass this stash and fail fast.
     pending_completed_terminal: Option<PendingCompletedTerminal>,
     /// Which operation's stream this state is reading. Compaction-only rules are
     /// gated on this; an ordinary send's handling of every affected record is
@@ -170,6 +171,116 @@ pub struct ParserState {
     /// success, which keeps "a boundary alone never invents a success" intact
     /// without the ordering dependency.
     compaction_occupancy: Option<CompactionOccupancy>,
+    /// What this process's session cost counters started from. Subtracted from
+    /// the `result` so the turn reports its own usage, not the session's; see
+    /// [`UsageSeed`].
+    usage_seed: UsageSeed,
+}
+
+/// The session-to-date totals a `claude -p --resume` process starts its cost
+/// counters from.
+///
+/// Since 2.1.277 every `-p` process appends a `cost-state` record to the session
+/// file on exit, and the next `--resume` seeds its counters from the last valid
+/// one. So on every dispatch after a session's first, `result.total_cost_usd` and
+/// `result.modelUsage` report **the whole session so far**, while the per-cycle
+/// `result.usage` stays per-dispatch (probed @ 2.1.280, A/B-confirmed against
+/// 2.1.274, which reports per-dispatch totals). A fork seeds from its *parent's*
+/// record, and a cancelled dispatch writes one without adding its own partial
+/// cost. Both fall out of reading the seed for whichever session `--resume`
+/// names, immediately before spawning. See `harness-behavior.md` G39.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) enum UsageSeed {
+    /// Nothing was seeded: the session's first dispatch, or a session no
+    /// `cost-state` was ever saved for (every file written before 2.1.277).
+    #[default]
+    Empty,
+    /// The totals of the record the process seeds from.
+    Totals(SessionTotals),
+    /// What the process seeds from cannot be determined — an unreadable file or
+    /// an unusable last record — so no `result` total
+    /// can be reduced to this dispatch's share. Cost is withheld. Tokens fall
+    /// back to the per-cycle `result.usage`, which is partial: it counts the
+    /// parent's last cycle only, so it can miss subagent work and earlier cycles
+    /// of a background-agent dispatch.
+    Unknown,
+}
+
+/// A `cost-state` record's totals, summed across its per-model entries.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct SessionTotals {
+    pub(crate) cost_usd: f64,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_read_input_tokens: u64,
+    pub(crate) cache_creation_input_tokens: u64,
+}
+
+/// A seeded `result`'s cost and token aggregate, reduced to this dispatch's own
+/// share — or `None` when the reduction cannot be trusted and neither number
+/// should be reported.
+struct OwnShare {
+    cost_usd: Option<f64>,
+    aggregate: Option<ModelUsageAggregate>,
+}
+
+/// How far below the seed a reported cost may fall and still count as equal.
+/// The CLI adds each call's cost to the seed it read, so the difference carries
+/// only float rounding; anything larger means the seed was not what we read.
+const SEED_COST_TOLERANCE_USD: f64 = 1e-9;
+
+impl UsageSeed {
+    /// Reduce a `result`'s reported cost and `modelUsage` aggregate to this
+    /// dispatch's share.
+    ///
+    /// `None` when the seed is [`UsageSeed::Unknown`], or when the result
+    /// reports *less* than the seed on any axis. A running total can only grow,
+    /// so a smaller one means the process did not start from the record we read,
+    /// e.g. an older CLI that does not seed, reading a file a newer one wrote.
+    /// Subtracting anyway would report a meaningless number, so the caller
+    /// withholds the cost and falls back to the per-cycle tokens.
+    fn own_share(
+        &self,
+        cost_usd: Option<f64>,
+        aggregate: Option<ModelUsageAggregate>,
+    ) -> Option<OwnShare> {
+        let totals = match self {
+            UsageSeed::Empty => {
+                return Some(OwnShare {
+                    cost_usd,
+                    aggregate,
+                });
+            }
+            UsageSeed::Unknown => return None,
+            UsageSeed::Totals(totals) => totals,
+        };
+        let cost_usd = match cost_usd {
+            Some(cost) if cost + SEED_COST_TOLERANCE_USD < totals.cost_usd => return None,
+            Some(cost) => Some((cost - totals.cost_usd).max(0.0)),
+            None => None,
+        };
+        let aggregate = match aggregate {
+            // Cache fields are optional in `modelUsage`: an absent one stays
+            // absent rather than being compared against the seed.
+            Some(reported) => Some(ModelUsageAggregate {
+                input: reported.input.checked_sub(totals.input_tokens)?,
+                output: reported.output.checked_sub(totals.output_tokens)?,
+                cached_input: match reported.cached_input {
+                    Some(v) => Some(v.checked_sub(totals.cache_read_input_tokens)?),
+                    None => None,
+                },
+                cache_creation: match reported.cache_creation {
+                    Some(v) => Some(v.checked_sub(totals.cache_creation_input_tokens)?),
+                    None => None,
+                },
+            }),
+            None => None,
+        };
+        Some(OwnShare {
+            cost_usd,
+            aggregate,
+        })
+    }
 }
 
 /// Which operation a [`ParserState`] is reading the stream of. Claude emits the
@@ -184,6 +295,20 @@ pub(crate) enum StreamMode {
     Send,
     Compaction,
     ContextReport,
+}
+
+impl StreamMode {
+    /// Whether this operation's `result` usage is reported at all. A context
+    /// report makes no model call, so nothing its `result` carries is its own
+    /// (see [`withhold_usage_on_a_turn_that_measured_nothing`]); the adapter
+    /// reads no cost seed for it for the same reason. One rule for both, so
+    /// they cannot drift apart.
+    pub(crate) fn reports_usage(self) -> bool {
+        match self {
+            StreamMode::Send | StreamMode::Compaction => true,
+            StreamMode::ContextReport => false,
+        }
+    }
 }
 
 /// What Claude's `system/status` record said about a requested compaction.
@@ -279,6 +404,12 @@ impl ParserState {
         }
     }
 
+    /// Set what this process's session cost counters were seeded with.
+    pub(crate) fn with_usage_seed(mut self, seed: UsageSeed) -> Self {
+        self.usage_seed = seed;
+        self
+    }
+
     fn compacting(&self) -> bool {
         self.mode == StreamMode::Compaction
     }
@@ -328,12 +459,13 @@ impl ParserState {
 /// family word (`some-vendor-opus-proxy`).
 ///
 /// **Probed @ 2.1.241 with Switchboard's exact `-p` flags** (`claude-fable-5-1`
-/// added @ 2.1.257, when the `fable` alias moved to it) — the requested level is
-/// written back verbatim for exactly these four:
+/// added @ 2.1.257 and `claude-opus-5-5` @ 2.1.280, each when its alias moved to
+/// it) — the requested level is written back verbatim for exactly these five:
 ///
 /// | id | `--effort` sent | recorded |
 /// |---|---|---|
 /// | `claude-opus-5` | `high` | `"high"` |
+/// | `claude-opus-5-5` | `low` / `max` | `"low"` / `"max"` (`max` recorded even with thinking disabled — no clamp) |
 /// | `claude-sonnet-5` | `max` / `low` | `"max"` / `"low"` |
 /// | `claude-fable-5` | `low` | `"low"` (upper bound on disk unprobed; full-id pinning only) |
 /// | `claude-fable-5-1` | `low` / `max` | `"low"` / `"max"` (`max` is the live loop's standing check) |
@@ -351,8 +483,9 @@ impl ParserState {
 /// live-vs-disk mismatch — which is the signal to probe the new id and add it.
 /// See the "Model catalog" step in `harness-update-review.md`.
 fn model_records_effort(model: &str) -> bool {
-    const EFFORT_RECORDING_MODELS: [&str; 4] = [
+    const EFFORT_RECORDING_MODELS: [&str; 5] = [
         "claude-opus-5",
+        "claude-opus-5-5",
         "claude-sonnet-5",
         "claude-fable-5",
         "claude-fable-5-1",
@@ -590,6 +723,7 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
     );
     let usage = extract_usage_from_result(
         obj,
+        &state.usage_seed,
         context_input_tokens,
         context_tokens_after_turn,
         context_window
@@ -770,9 +904,12 @@ fn compaction_failure(state: &ParserState, diagnostic: Option<&str>) -> Option<T
 /// which `a_folded_success_still_fails_on_a_dirty_exit` pins.
 ///
 /// **A context report is withheld unconditionally**, for the same mechanism and
-/// a simpler reason: it makes no model call at all, so its `modelUsage` is
-/// always empty and its `result.usage` always schema-present zeros. It is free
-/// by construction, so there is no turn it could truthfully bill — and letting
+/// a simpler reason: it makes no model call at all, so nothing its `result`
+/// reports is its own. Its `result.usage` is schema-present zeros, and its
+/// `modelUsage` is empty on a fresh session but carries the session's seeded
+/// totals on a resumed one (since 2.1.277; probed @ 2.1.280) — which is why the
+/// adapter reads no seed for it. It is free by construction, so there is no
+/// turn it could truthfully bill — and letting
 /// its zero-Some through would make "the report does not blank the very bar its
 /// chevron opens" depend on the frontend suppressing the row, rather than on the
 /// event never carrying the number.
@@ -780,7 +917,7 @@ fn withhold_usage_on_a_turn_that_measured_nothing(
     state: &ParserState,
     usage: Option<TurnUsage>,
 ) -> Option<TurnUsage> {
-    if state.reporting_context() {
+    if !state.mode.reports_usage() {
         return None;
     }
     if state.compacting()
@@ -812,6 +949,14 @@ fn withhold_usage_on_a_turn_that_measured_nothing(
 /// Zero *values* from a real harness (auth-failure synthetic responses) DO
 /// produce a valid `Some` — what matters is schema presence, not non-zero.
 ///
+/// **Both totals are session-to-date on a resumed dispatch** (since 2.1.277),
+/// so `seed` is subtracted from `total_cost_usd` and the `modelUsage` sums
+/// before either is reported; the per-cycle `result.usage` is never seeded and
+/// is used as-is. When the seed cannot be applied (see [`UsageSeed::own_share`])
+/// the cost is withheld and the tokens come from that per-cycle fallback, which
+/// is partial — the parent's last cycle only, so it can miss subagent work and
+/// earlier cycles.
+///
 /// Populated for both Completed and Failed turns. The harness charges for
 /// partial work, so token counts on failure are meaningful telemetry.
 /// The **occupancy** field (`context_input_tokens`) comes from neither
@@ -821,13 +966,26 @@ fn withhold_usage_on_a_turn_that_measured_nothing(
 /// fullness (see `ParserState::last_assistant_context_input_tokens`).
 fn extract_usage_from_result(
     obj: &Value,
+    seed: &UsageSeed,
     last_call_context_input_tokens: Option<u64>,
     last_call_context_tokens_after_turn: Option<u64>,
     context_window: Option<u32>,
 ) -> Option<TurnUsage> {
-    let total_cost_usd = obj.get("total_cost_usd").and_then(Value::as_f64);
+    let reported_cost = obj.get("total_cost_usd").and_then(Value::as_f64);
+    let (total_cost_usd, aggregate) =
+        if let Some(own) = seed.own_share(reported_cost, sum_model_usage_tokens(obj)) {
+            (own.cost_usd, own.aggregate)
+        } else {
+            tracing::warn!(
+                ?seed,
+                reported_cost,
+                "Claude result could not be reduced to this dispatch's share of the \
+                 session totals; withholding cost and using result.usage"
+            );
+            (None, None)
+        };
 
-    if let Some(aggregate) = sum_model_usage_tokens(obj) {
+    if let Some(aggregate) = aggregate {
         return Some(TurnUsage {
             input_tokens: aggregate.input,
             output_tokens: aggregate.output,
@@ -1678,6 +1836,7 @@ mod tests {
         // where the session file corroborates it — verified for these families.
         for model in [
             "claude-opus-5",
+            "claude-opus-5-5",
             "claude-sonnet-5",
             "claude-fable-5",
             "claude-fable-5-1",
@@ -2056,6 +2215,138 @@ mod tests {
             Some(1_000_000),
             "context window still selected"
         );
+    }
+
+    fn turn_end_usage_seeded(lines: &[&str], seed: UsageSeed) -> Option<TurnUsage> {
+        let mut state = ParserState::for_stream(StreamMode::Send, None).with_usage_seed(seed);
+        let turn_id = tid();
+        let agent_id = aid();
+        for line in lines {
+            let _ = parse_line(line, turn_id, agent_id, &mut state);
+        }
+        match state.take_final_turn_end(turn_id, TurnOutcome::Completed) {
+            Some(AdapterEvent::TurnEnd { usage, .. }) => usage,
+            other => panic!("expected a folded terminal, got {other:?}"),
+        }
+    }
+
+    /// Turn 2 of a real three-turn Opus 5.5 session (claude 2.1.280): the
+    /// `result` reports the session so far, seeded from turn 1's `cost-state`.
+    const SEEDED_OPUS_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"ack","usage":{"input_tokens":2,"output_tokens":276,"cache_read_input_tokens":11786,"cache_creation_input_tokens":11597},"modelUsage":{"claude-opus-5-5":{"inputTokens":4,"outputTokens":280,"thinkingTokens":272,"cacheReadInputTokens":21904,"cacheCreationInputTokens":24820,"webSearchRequests":0,"costUSD":0.2085568,"contextWindow":1000000,"maxOutputTokens":128000}},"total_cost_usd":0.2085568}"#;
+
+    /// Turn 1's `cost-state` from the same session — what turn 2 seeded from.
+    fn opus_turn_one_totals() -> SessionTotals {
+        SessionTotals {
+            cost_usd: 0.107_895_600_000_000_01,
+            input_tokens: 2,
+            output_tokens: 4,
+            cache_read_input_tokens: 10_118,
+            cache_creation_input_tokens: 13_223,
+        }
+    }
+
+    #[test]
+    fn a_seeded_result_reports_only_this_dispatchs_share() {
+        // The regression: a resumed dispatch's `result` totals are
+        // session-to-date. With the seed removed the tokens equal this
+        // single-cycle turn's own per-cycle `result.usage`, which is the
+        // independent check that the subtraction is the right one.
+        let usage = turn_end_usage_seeded(
+            &[SEEDED_OPUS_RESULT],
+            UsageSeed::Totals(opus_turn_one_totals()),
+        )
+        .expect("Some(usage)");
+        assert_eq!(usage.input_tokens, 2);
+        assert_eq!(usage.output_tokens, 276);
+        assert_eq!(usage.cached_input_tokens, Some(11_786));
+        assert_eq!(usage.cache_creation_input_tokens, Some(11_597));
+        let cost = usage.total_cost_usd.expect("cost reported");
+        assert!(
+            (cost - 0.100_661_2).abs() < 1e-9,
+            "turn 2's own cost, not the session's $0.2086; got {cost}"
+        );
+        assert_eq!(usage.context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn an_empty_seed_reports_the_result_as_is() {
+        // A session's first dispatch, or any file no seeding CLI ever wrote.
+        let usage =
+            turn_end_usage_seeded(&[SEEDED_OPUS_RESULT], UsageSeed::Empty).expect("Some(usage)");
+        assert_eq!(usage.output_tokens, 280);
+        assert!((usage.total_cost_usd.unwrap() - 0.208_556_8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn an_unknown_seed_withholds_cost_and_uses_per_cycle_tokens() {
+        // An unreadable session file: the result might be seeded by anything,
+        // so no reported total is attributable to this turn.
+        let usage =
+            turn_end_usage_seeded(&[SEEDED_OPUS_RESULT], UsageSeed::Unknown).expect("Some(usage)");
+        assert_eq!(usage.total_cost_usd, None);
+        assert_eq!(usage.input_tokens, 2, "per-cycle result.usage");
+        assert_eq!(usage.output_tokens, 276);
+        assert_eq!(
+            usage.context_window,
+            Some(1_000_000),
+            "window is not a total"
+        );
+    }
+
+    #[test]
+    fn a_result_below_its_seed_withholds_cost_and_uses_per_cycle_tokens() {
+        // A running total never shrinks, so a result under the seed was not
+        // seeded from it (an older CLI resuming a file a newer one wrote).
+        // Subtracting would clamp to zero or underflow; neither is this turn.
+        for seed in [
+            SessionTotals {
+                cost_usd: 1.0,
+                ..opus_turn_one_totals()
+            },
+            SessionTotals {
+                output_tokens: 281,
+                ..opus_turn_one_totals()
+            },
+            SessionTotals {
+                cache_read_input_tokens: 21_905,
+                ..opus_turn_one_totals()
+            },
+        ] {
+            let usage = turn_end_usage_seeded(&[SEEDED_OPUS_RESULT], UsageSeed::Totals(seed))
+                .expect("Some(usage)");
+            assert_eq!(usage.total_cost_usd, None, "seed {seed:?}");
+            assert_eq!(usage.output_tokens, 276, "seed {seed:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_context_report_goes_without_usage() {
+        // Sends and compactions bill and report usage, so both need their seed
+        // removed; a context report's usage is discarded and needs no seed.
+        assert!(StreamMode::Send.reports_usage());
+        assert!(StreamMode::Compaction.reports_usage());
+        assert!(!StreamMode::ContextReport.reports_usage());
+    }
+
+    #[test]
+    fn a_seed_is_removed_from_a_multi_model_result_in_aggregate() {
+        // A session whose earlier turns ran on Sonnet and whose resumed turn ran
+        // on Opus: the seeded `modelUsage` carries both models, and the seed
+        // (summed across its own entries) comes off the sum.
+        let result = r#"{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":5,"output_tokens":7},"modelUsage":{"claude-sonnet-5":{"inputTokens":30,"outputTokens":40,"cacheReadInputTokens":500,"cacheCreationInputTokens":600,"costUSD":0.5,"contextWindow":1000000},"claude-opus-5-5":{"inputTokens":5,"outputTokens":7,"cacheReadInputTokens":80,"cacheCreationInputTokens":90,"costUSD":0.25,"contextWindow":1000000}},"total_cost_usd":0.75}"#;
+        let seed = SessionTotals {
+            cost_usd: 0.5,
+            input_tokens: 30,
+            output_tokens: 40,
+            cache_read_input_tokens: 500,
+            cache_creation_input_tokens: 600,
+        };
+        let usage = turn_end_usage_seeded(&[result], UsageSeed::Totals(seed)).expect("Some(usage)");
+        assert_eq!(usage.input_tokens, 5);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cached_input_tokens, Some(80));
+        assert_eq!(usage.cache_creation_input_tokens, Some(90));
+        assert!((usage.total_cost_usd.unwrap() - 0.25).abs() < 1e-9);
     }
 
     #[test]
@@ -3362,7 +3653,17 @@ mod compaction_tests {
         fixture: &str,
         exit_outcome: TurnOutcome,
     ) -> Vec<AdapterEvent> {
-        let mut state = ParserState::for_stream(mode, None);
+        replay_seeded(mode, fixture, exit_outcome, UsageSeed::Empty)
+    }
+
+    /// [`replay_with`] for a process that resumed a session with saved totals.
+    fn replay_seeded(
+        mode: StreamMode,
+        fixture: &str,
+        exit_outcome: TurnOutcome,
+        seed: UsageSeed,
+    ) -> Vec<AdapterEvent> {
+        let mut state = ParserState::for_stream(mode, None).with_usage_seed(seed);
         let (turn_id, agent_id) = (tid(), aid());
         let mut events: Vec<AdapterEvent> = Vec::new();
         for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
@@ -3394,6 +3695,44 @@ mod compaction_tests {
         let found = terminals(events);
         assert_eq!(found.len(), 1, "exactly one terminal per turn");
         found[0]
+    }
+
+    #[test]
+    fn a_seeded_compaction_reports_its_own_cost_not_the_sessions() {
+        // A compaction bills — its row shows the cost on an overage turn — and
+        // on a resumed session its `result` is seeded exactly like a send's.
+        // The capture's totals stand in for session-to-date over a smaller
+        // saved seed; what the row may show is the difference.
+        let seed = SessionTotals {
+            cost_usd: 0.04,
+            input_tokens: 1_000,
+            output_tokens: 400,
+            cache_read_input_tokens: 10_000,
+            cache_creation_input_tokens: 0,
+        };
+        let events = replay_seeded(
+            StreamMode::Compaction,
+            SUCCESS,
+            TurnOutcome::Completed,
+            UsageSeed::Totals(seed),
+        );
+        let AdapterEvent::TurnEnd { usage, .. } = sole_terminal(&events) else {
+            unreachable!("filtered to TurnEnd");
+        };
+        let usage = usage
+            .as_ref()
+            .expect("a successful compaction reports usage");
+        let cost = usage.total_cost_usd.expect("cost reported");
+        assert!(
+            (cost - 0.059_425).abs() < 1e-9,
+            "0.099425 - 0.04; got {cost}"
+        );
+        assert_eq!(usage.input_tokens, 1_033);
+        assert_eq!(usage.output_tokens, 1_065);
+        assert_eq!(usage.cached_input_tokens, Some(13_380));
+        // Occupancy comes from `compact_metadata`, not from any total.
+        assert_eq!(usage.context_input_tokens, Some(23_423));
+        assert_eq!(usage.context_tokens_after_turn, Some(4_172));
     }
 
     #[test]

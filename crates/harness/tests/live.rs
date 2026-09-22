@@ -1178,6 +1178,105 @@ async fn live_claude_multi_call_turn_context_occupancy_is_final_call() {
     );
 }
 
+/// The `(cost, output tokens)` a successful turn reported on its `TurnEnd`.
+///
+/// Refuses anything that could make a usage comparison pass vacuously: the
+/// turn must complete, produce a reply, and report non-zero cost and output — a
+/// failed dispatch (logged out, over quota) can carry zero telemetry that adds
+/// up to a zero saved total just as well as real numbers do.
+fn turn_end_cost_and_output(events: &[AdapterEvent]) -> (f64, u64) {
+    let replied = events.iter().any(|e| {
+        matches!(
+            e,
+            AdapterEvent::ContentChunk { text, kind: ContentKind::Text, .. } if !text.trim().is_empty()
+        )
+    });
+    assert!(replied, "the turn must produce a reply; events: {events:?}");
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                usage,
+                ..
+            } => usage.clone(),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a completed TurnEnd carrying usage; events: {events:?}"));
+    let cost = usage.total_cost_usd.expect("Claude reports a cost");
+    assert!(cost > 0.0, "a real turn costs something; got {cost}");
+    assert!(
+        usage.output_tokens > 0,
+        "a real turn produces output tokens"
+    );
+    (cost, usage.output_tokens)
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_resumed_turn_reports_its_own_usage_not_the_sessions() {
+    // Drift guard for the session-seeded totals (2.1.277+): every `-p` process
+    // saves a `cost-state` on exit and the next `--resume` starts its
+    // `total_cost_usd` / `modelUsage` from it, so an unadjusted second turn
+    // reports turn 1 + turn 2. The session's own saved total is the ground
+    // truth: per-turn values are right exactly when they add up to it. Under
+    // the regression turn 1 is counted twice and the sum overshoots.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cwd = tmp.path().canonicalize().expect("canonical cwd");
+    let adapter = ClaudeCodeAdapter::new();
+    let mut agent = live_agent();
+    agent.model = Some("haiku".to_owned());
+    let Some(SessionLocator::Uuid(session_id)) = agent.session_locator else {
+        panic!("live_agent pre-mints a uuid locator");
+    };
+
+    let mut reported = Vec::new();
+    for _ in 0..2 {
+        let events: Vec<AdapterEvent> = adapter
+            .dispatch(
+                &agent,
+                &cwd,
+                "Reply with the single word 'ack'.",
+                Uuid::now_v7(),
+                DispatchOptions::default(),
+            )
+            .await
+            .expect("dispatch should succeed with real claude")
+            .collect()
+            .await;
+        reported.push(turn_end_cost_and_output(&events));
+    }
+
+    let path = claude_session_file_path(&home_dir(), &cwd, &session_id);
+    let saved = std::fs::read_to_string(&path)
+        .expect("session file")
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|record| record["type"] == "cost-state")
+        .expect("claude saves a cost-state on exit (2.1.277+)");
+    let saved_cost = saved["totalCostUSD"].as_f64().expect("totalCostUSD");
+    let saved_output: u64 = saved["modelUsage"]
+        .as_object()
+        .expect("modelUsage")
+        .values()
+        .map(|entry| entry["outputTokens"].as_u64().expect("outputTokens"))
+        .sum();
+
+    let (cost_sum, output_sum) = reported
+        .iter()
+        .fold((0.0, 0), |(cost, output), (c, o)| (cost + c, output + o));
+    assert!(
+        (cost_sum - saved_cost).abs() < 1e-6,
+        "per-turn costs {reported:?} must add up to the session's saved \
+         ${saved_cost}, not overshoot it"
+    );
+    assert_eq!(
+        output_sum, saved_output,
+        "per-turn output tokens {reported:?} must add up to the session's saved total"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_resume_reuses_session() {

@@ -40,6 +40,9 @@ describe("agent selection catalogs", () => {
       expect(EFFORT_OPTIONS[harness].length > 0).toBe(SUPPORTS_EFFORT_SELECTION[harness]);
       expect(defaults.model_choices).toContain(defaults.default_model);
       expect(defaults.effort_choices).toContain(defaults.default_effort);
+      expect(
+        effortOptionsFor(harness, defaults.default_model ?? undefined).map(({ value }) => value),
+      ).toContain(defaults.default_effort);
       expect(MODEL_OPTIONS[harness].map(({ value }) => value)).toEqual(
         expect.arrayContaining(defaults.model_choices),
       );
@@ -57,9 +60,9 @@ describe("agent selection catalogs", () => {
       default_effort: "medium",
     });
     expect(DEFAULT_AGENT_SELECTIONS.codex).toEqual({
-      model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
+      model_choices: ["gpt-6-sol", "gpt-5.6-terra"],
       effort_choices: ["medium", "high"],
-      default_model: "gpt-5.6-terra",
+      default_model: "gpt-6-sol",
       default_effort: "medium",
     });
     expect(DEFAULT_AGENT_SELECTIONS.antigravity).toEqual({
@@ -81,19 +84,13 @@ describe("agent selection catalogs", () => {
     ]);
   });
 
-  it("offers Astra without changing the built-in Codex quick choices", () => {
+  it("offers the GPT-6 family plus GPT-5.6 Terra, which has no GPT-6 counterpart", () => {
     expect(MODEL_OPTIONS.codex).toEqual([
       { label: "GPT-6 Astra", value: "gpt-6-astra" },
-      { label: "GPT-5.6 Sol", value: "gpt-5.6-sol" },
+      { label: "GPT-6 Sol", value: "gpt-6-sol" },
       { label: "GPT-5.6 Terra", value: "gpt-5.6-terra" },
-      { label: "GPT-5.6 Luna", value: "gpt-5.6-luna" },
+      { label: "GPT-6 Luna", value: "gpt-6-luna" },
     ]);
-    expect(DEFAULT_AGENT_SELECTIONS.codex).toEqual({
-      model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
-      effort_choices: ["medium", "high"],
-      default_model: "gpt-5.6-terra",
-      default_effort: "medium",
-    });
   });
 });
 

@@ -58,6 +58,7 @@
 //! file we want. The fallback exists for resilience against cwd encoding
 //! drift across Claude CLI versions.
 
+use std::io::{BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -67,7 +68,7 @@ use uuid::Uuid;
 
 use crate::context_report;
 use crate::events::{ContentKind, SessionInventory, SkillEntry, TurnId, TurnUsage};
-use crate::parser::classify_claude_tool_kind;
+use crate::parser::{SessionTotals, UsageSeed, classify_claude_tool_kind};
 use crate::transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, SystemMarker, Turn,
     TurnItem, TurnStatus, UserPromptSource, merge_meta_with_loaders,
@@ -1235,6 +1236,129 @@ fn extract_tool_result_text(content: Option<&Value>) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// What `claude -p --resume <session_id>` seeds its session cost counters with,
+/// decided by the **last** `cost-state` record for that session in `path`.
+///
+/// The CLI keeps the last such record (it is a last-wins record keyed by
+/// `sessionId`), and a process appends one on every exit, so the one we want is
+/// almost always within the final lines. The reader therefore scans only the
+/// last [`SEED_TAIL_BYTES`] and falls back to the whole file when nothing there
+/// concerns this session — which is every file written before 2.1.277, until
+/// its first seeding dispatch writes one.
+///
+/// The last record decides even when it is unusable: a record that parses but
+/// lacks a value we read is [`UsageSeed::Unknown`], never a fall back to an
+/// earlier one. Falling back would under-subtract whenever the CLI had in fact
+/// seeded from the newer record (e.g. after renaming a field we read), reporting
+/// the session's earlier spend as this turn's — silently, since a result above
+/// the seed passes every consistency check. Unknown only withholds one turn's
+/// cost. A line that does not parse at all — a torn write — is skipped, because
+/// the CLI's own loader skips it and seeds from the previous valid record.
+///
+/// Only called for a session being resumed, so a file that cannot be read is
+/// also `Unknown`: the CLI is about to seed from *something* we cannot see.
+pub(crate) fn read_usage_seed(path: &Path, session_id: &Uuid) -> UsageSeed {
+    match last_cost_state_decision(path, &session_id.to_string()) {
+        Ok(Some(seed)) => seed,
+        Ok(None) => UsageSeed::Empty,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "cannot read Claude session file for its cost seed");
+            UsageSeed::Unknown
+        }
+    }
+}
+
+/// How much of a session file's end is searched before reading all of it.
+const SEED_TAIL_BYTES: u64 = 1 << 20;
+
+fn last_cost_state_decision(path: &Path, session_id: &str) -> std::io::Result<Option<UsageSeed>> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > SEED_TAIL_BYTES {
+        file.seek(SeekFrom::Start(len - SEED_TAIL_BYTES))?;
+        let mut tail = std::io::BufReader::new(&file);
+        // The window almost always starts mid-line; that fragment is discarded
+        // rather than misread. If it was the record we want, nothing later in
+        // the window concerns this session and the full scan below finds it.
+        tail.read_until(b'\n', &mut Vec::new())?;
+        if let Some(seed) = scan_cost_states(tail, session_id)? {
+            return Ok(Some(seed));
+        }
+        file.seek(SeekFrom::Start(0))?;
+    }
+    scan_cost_states(std::io::BufReader::new(&file), session_id)
+}
+
+/// The decision of the last line in `reader` that concerns `session_id`'s
+/// cost state, or `None` when no line does.
+fn scan_cost_states(reader: impl BufRead, session_id: &str) -> std::io::Result<Option<UsageSeed>> {
+    let mut decision = None;
+    for line in reader.split(b'\n') {
+        if let Some(seed) = cost_state_line(&line?, session_id) {
+            decision = Some(seed);
+        }
+    }
+    Ok(decision)
+}
+
+/// What one line says about `session_id`'s seed, or `None` when it says
+/// nothing about it: it is not a `cost-state` for this session, or it does not
+/// parse (a torn write, which the CLI's loader skips too). Leading NUL bytes
+/// are stripped first, as the CLI does before parsing a record.
+fn cost_state_line(line: &[u8], session_id: &str) -> Option<UsageSeed> {
+    let text = std::str::from_utf8(line).ok()?.trim_start_matches('\0');
+    if !text.contains("\"cost-state\"") {
+        return None;
+    }
+    let record = serde_json::from_str::<Value>(text).ok()?;
+    if record.get("type").and_then(Value::as_str) != Some("cost-state")
+        || record.get("sessionId").and_then(Value::as_str) != Some(session_id)
+    {
+        return None;
+    }
+    Some(cost_state_totals(&record).map_or_else(
+        || {
+            tracing::warn!(
+                session_id,
+                "unusable Claude cost-state record; cost seed unknown"
+            );
+            UsageSeed::Unknown
+        },
+        UsageSeed::Totals,
+    ))
+}
+
+/// A `cost-state` record's totals, or `None` when a value this reads is missing
+/// or malformed: `totalCostUSD` must be a finite non-negative number and every
+/// `modelUsage` entry must carry the four token counters as non-negative
+/// integers.
+///
+/// Deliberately checks nothing else. The record carries more (durations, line
+/// counts, a start time), and requiring any of it would couple us to fields we
+/// never read — a CLI that dropped one would make every record unusable.
+fn cost_state_totals(record: &Value) -> Option<SessionTotals> {
+    let cost_usd = record
+        .get("totalCostUSD")
+        .and_then(Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)?;
+    let mut totals = SessionTotals {
+        cost_usd,
+        ..SessionTotals::default()
+    };
+    for entry in record.get("modelUsage")?.as_object()?.values() {
+        let tokens = |field: &str| entry.get(field).and_then(Value::as_u64);
+        totals.input_tokens = totals.input_tokens.checked_add(tokens("inputTokens")?)?;
+        totals.output_tokens = totals.output_tokens.checked_add(tokens("outputTokens")?)?;
+        totals.cache_read_input_tokens = totals
+            .cache_read_input_tokens
+            .checked_add(tokens("cacheReadInputTokens")?)?;
+        totals.cache_creation_input_tokens = totals
+            .cache_creation_input_tokens
+            .checked_add(tokens("cacheCreationInputTokens")?)?;
+    }
+    Some(totals)
 }
 
 #[cfg(test)]
@@ -4393,5 +4517,277 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A `cost-state` record shaped as claude 2.1.280 writes it.
+    fn cost_state(session_id: Uuid, cost: f64, output_tokens: u64) -> Value {
+        json!({
+            "type": "cost-state",
+            "sessionId": session_id.to_string(),
+            "totalCostUSD": cost,
+            "totalAPIDuration": 1334,
+            "totalAPIDurationWithoutRetries": 1332,
+            "totalToolDuration": 0,
+            "totalLinesAdded": 0,
+            "totalLinesRemoved": 0,
+            "totalDuration": 3645,
+            "startTime": 1_790_099_840_508_u64,
+            "modelUsage": {
+                "claude-opus-5-5": {
+                    "inputTokens": 2,
+                    "outputTokens": output_tokens,
+                    "thinkingTokens": 0,
+                    "cacheReadInputTokens": 10118,
+                    "cacheCreationInputTokens": 13223,
+                    "webSearchRequests": 0,
+                    "costUSD": cost,
+                }
+            },
+            "hasUnknownModelCost": false,
+        })
+    }
+
+    fn write_lines(dir: &TempDir, lines: &[String]) -> PathBuf {
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        path
+    }
+
+    fn seeded_output_tokens(seed: UsageSeed) -> u64 {
+        match seed {
+            UsageSeed::Totals(totals) => totals.output_tokens,
+            other => panic!("expected seeded totals, got {other:?}"),
+        }
+    }
+
+    /// The first half of a `cost-state` line as Claude writes it — `type` and
+    /// `sessionId` lead — cut off mid-record by a torn write.
+    fn torn_cost_state(session_id: Uuid) -> String {
+        format!(
+            r#"{{"type":"cost-state","sessionId":"{session_id}","totalCostUSD":0.2,"modelUsage":{{"claude-opus-5-5":{{"inputTok"#
+        )
+    }
+
+    /// One JSONL line of exactly `len` bytes that is not a cost-state record.
+    fn padding_line(len: usize) -> String {
+        let prefix = r#"{"type":"user","pad":""#;
+        let suffix = r#""}"#;
+        format!(
+            "{prefix}{}{suffix}",
+            "x".repeat(len - prefix.len() - suffix.len())
+        )
+    }
+
+    #[test]
+    fn the_last_cost_state_for_the_session_is_the_seed() {
+        // One record per process exit; the CLI keeps the last. Transcript
+        // records around them are not read.
+        let dir = TempDir::new().unwrap();
+        let session = Uuid::now_v7();
+        let path = write_lines(
+            &dir,
+            &[
+                user_record("hi", "2026-09-22T00:00:00Z").to_string(),
+                cost_state(session, 0.1, 4).to_string(),
+                user_record("again", "2026-09-22T00:01:00Z").to_string(),
+                cost_state(session, 0.2, 280).to_string(),
+            ],
+        );
+        match read_usage_seed(&path, &session) {
+            UsageSeed::Totals(totals) => {
+                assert!((totals.cost_usd - 0.2).abs() < f64::EPSILON);
+                assert_eq!(totals.input_tokens, 2);
+                assert_eq!(totals.output_tokens, 280);
+                assert_eq!(totals.cache_read_input_tokens, 10_118);
+                assert_eq!(totals.cache_creation_input_tokens, 13_223);
+            }
+            other => panic!("expected totals, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cost_state_for_another_session_is_not_the_seed() {
+        // The CLI keys the record by `sessionId`, so a record belonging to a
+        // different session cannot seed this one even when it comes last.
+        let dir = TempDir::new().unwrap();
+        let session = Uuid::now_v7();
+        let path = write_lines(
+            &dir,
+            &[
+                cost_state(session, 0.1, 4).to_string(),
+                cost_state(Uuid::now_v7(), 9.0, 999).to_string(),
+            ],
+        );
+        assert_eq!(seeded_output_tokens(read_usage_seed(&path, &session)), 4);
+    }
+
+    #[test]
+    fn fields_the_seed_does_not_read_are_not_required() {
+        // A CLI that drops or retypes a field we never read must not make its
+        // records unusable — that would silently report session totals again.
+        let session = Uuid::now_v7();
+        let mut record = cost_state(session, 0.3, 30);
+        let object = record.as_object_mut().unwrap();
+        for field in [
+            "totalAPIDuration",
+            "totalAPIDurationWithoutRetries",
+            "totalToolDuration",
+            "totalLinesAdded",
+            "totalLinesRemoved",
+            "totalDuration",
+            "startTime",
+        ] {
+            object.remove(field);
+        }
+        object.insert("hasUnknownModelCost".to_owned(), json!("no"));
+        let entry = record["modelUsage"]["claude-opus-5-5"]
+            .as_object_mut()
+            .unwrap();
+        entry.remove("webSearchRequests");
+        entry.remove("costUSD");
+        entry.remove("thinkingTokens");
+
+        let dir = TempDir::new().unwrap();
+        let path = write_lines(&dir, &[record.to_string()]);
+        assert_eq!(seeded_output_tokens(read_usage_seed(&path, &session)), 30);
+    }
+
+    #[test]
+    fn an_unusable_last_record_is_an_unknown_seed_not_the_earlier_one() {
+        // Falling back to the earlier record would under-subtract if the CLI
+        // seeded from the newer one, and nothing downstream could tell.
+        let session = Uuid::now_v7();
+        let mut negative_cost = cost_state(session, 0.5, 50);
+        negative_cost["totalCostUSD"] = json!(-1.0);
+        let mut no_cost = cost_state(session, 0.5, 50);
+        no_cost.as_object_mut().unwrap().remove("totalCostUSD");
+        let mut no_model_usage = cost_state(session, 0.5, 50);
+        no_model_usage.as_object_mut().unwrap().remove("modelUsage");
+        let mut missing_tokens = cost_state(session, 0.5, 50);
+        missing_tokens["modelUsage"]["claude-opus-5-5"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cacheReadInputTokens");
+        let mut fractional_tokens = cost_state(session, 0.5, 50);
+        fractional_tokens["modelUsage"]["claude-opus-5-5"]["outputTokens"] = json!(50.5);
+
+        for bad in [
+            negative_cost,
+            no_cost,
+            no_model_usage,
+            missing_tokens,
+            fractional_tokens,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = write_lines(
+                &dir,
+                &[cost_state(session, 0.1, 4).to_string(), bad.to_string()],
+            );
+            assert_eq!(
+                read_usage_seed(&path, &session),
+                UsageSeed::Unknown,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_torn_line_is_skipped_as_the_cli_skips_it() {
+        // A write cut short by a crash does not parse, and the CLI's loader
+        // skips it and seeds from the previous valid record — so that record is
+        // the seed, whichever session the fragment belonged to.
+        let dir = TempDir::new().unwrap();
+        let session = Uuid::now_v7();
+        let transcript = user_record("hi", "2026-09-22T00:00:00Z").to_string();
+        let path = write_lines(
+            &dir,
+            &[
+                cost_state(session, 0.1, 4).to_string(),
+                torn_cost_state(session),
+                torn_cost_state(Uuid::now_v7()),
+                transcript[..transcript.len() / 2].to_owned(),
+            ],
+        );
+        assert_eq!(seeded_output_tokens(read_usage_seed(&path, &session)), 4);
+    }
+
+    #[test]
+    fn a_torn_line_with_leading_nuls_still_parses() {
+        // The CLI strips leading NUL bytes before parsing a record.
+        let dir = TempDir::new().unwrap();
+        let session = Uuid::now_v7();
+        let path = write_lines(&dir, &[format!("\0\0{}", cost_state(session, 0.3, 30))]);
+        assert_eq!(seeded_output_tokens(read_usage_seed(&path, &session)), 30);
+    }
+
+    #[test]
+    fn a_long_file_is_searched_from_its_tail() {
+        // The usual shape: a large transcript whose newest record sits near
+        // the end, after an older record the window never reaches.
+        let dir = TempDir::new().unwrap();
+        let session = Uuid::now_v7();
+        let window = usize::try_from(SEED_TAIL_BYTES).unwrap();
+        let path = write_lines(
+            &dir,
+            &[
+                cost_state(session, 0.1, 4).to_string(),
+                padding_line(window * 2),
+                cost_state(session, 0.2, 20).to_string(),
+            ],
+        );
+        assert_eq!(seeded_output_tokens(read_usage_seed(&path, &session)), 20);
+    }
+
+    #[test]
+    fn a_record_before_the_tail_window_is_found_by_the_full_scan() {
+        let dir = TempDir::new().unwrap();
+        let session = Uuid::now_v7();
+        let window = usize::try_from(SEED_TAIL_BYTES).unwrap();
+        let path = write_lines(
+            &dir,
+            &[
+                cost_state(session, 0.2, 20).to_string(),
+                padding_line(window * 2),
+            ],
+        );
+        assert_eq!(seeded_output_tokens(read_usage_seed(&path, &session)), 20);
+    }
+
+    #[test]
+    fn a_record_cut_by_the_tail_windows_start_is_found_by_the_full_scan() {
+        // The window's first fragment is discarded; when that fragment was the
+        // record, the full scan must still find it whole.
+        let dir = TempDir::new().unwrap();
+        let session = Uuid::now_v7();
+        let record = cost_state(session, 0.2, 20).to_string();
+        let window = usize::try_from(SEED_TAIL_BYTES).unwrap();
+        // Bytes after the record: padding line + two newlines. Making that half
+        // a record short of the window puts the window's start mid-record.
+        let padding = padding_line(window - record.len() / 2 - 2);
+        let path = write_lines(&dir, &[record, padding]);
+        assert_eq!(seeded_output_tokens(read_usage_seed(&path, &session)), 20);
+    }
+
+    #[test]
+    fn a_session_with_no_cost_state_seeds_nothing() {
+        // Every session file written before 2.1.277.
+        let dir = TempDir::new().unwrap();
+        let path = write_lines(
+            &dir,
+            &[user_record("hi", "2026-09-22T00:00:00Z").to_string()],
+        );
+        assert_eq!(read_usage_seed(&path, &Uuid::now_v7()), UsageSeed::Empty);
+    }
+
+    #[test]
+    fn an_unreadable_session_file_is_an_unknown_seed() {
+        // Only resumed sessions are read, so the CLI is about to seed from
+        // *something* this adapter cannot see.
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("absent.jsonl");
+        assert_eq!(
+            read_usage_seed(&missing, &Uuid::now_v7()),
+            UsageSeed::Unknown
+        );
     }
 }

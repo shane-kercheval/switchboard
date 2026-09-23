@@ -61,7 +61,9 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
         name: "main",
         upstream: "origin/main",
         sync: { kind: "in_sync" },
-        behind_base: null,
+        behind_base: { kind: "unknown" },
+        last_commit_at: null,
+        recent: true,
         merged: null,
         dangling: false,
         github_url: null,
@@ -77,7 +79,9 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
         name: "old-feature",
         upstream: null,
         sync: { kind: "local_only" },
-        behind_base: null,
+        behind_base: { kind: "unknown" },
+        last_commit_at: null,
+        recent: true,
         merged: true,
         dangling: false,
         github_url: null,
@@ -85,8 +89,22 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
       },
     ],
     remote_branches: [
-      { name: "origin/main", github_url: null, merged: null, behind_base: null },
-      { name: "origin/remote-only", github_url: null, merged: null, behind_base: null },
+      {
+        name: "origin/main",
+        github_url: null,
+        merged: null,
+        behind_base: { kind: "unknown" },
+        last_commit_at: null,
+        recent: true,
+      },
+      {
+        name: "origin/remote-only",
+        github_url: null,
+        merged: null,
+        behind_base: { kind: "unknown" },
+        last_commit_at: null,
+        recent: true,
+      },
     ],
     detached_worktrees: [],
     ...over,
@@ -608,7 +626,9 @@ describe("GitView", () => {
             name: "feature",
             upstream: null,
             sync: { kind: "local_only" },
-            behind_base: null,
+            behind_base: { kind: "unknown" },
+            last_commit_at: null,
+            recent: true,
             merged: null,
             dangling: false,
             github_url: null,
@@ -624,7 +644,9 @@ describe("GitView", () => {
             name: "main",
             upstream: "origin/main",
             sync: { kind: "in_sync" },
-            behind_base: null,
+            behind_base: { kind: "unknown" },
+            last_commit_at: null,
+            recent: true,
             merged: null,
             dangling: false,
             github_url: null,
@@ -916,6 +938,37 @@ describe("GitView", () => {
     );
     expect(screen.getByTestId("branch-comparison-row")).toHaveTextContent("vs main");
     expect(screen.getByTestId("detail-title")).toHaveTextContent("Branch changes");
+  });
+
+  it("offers a collapsed older branch as a comparison base", async () => {
+    const staleRemote = {
+      name: "origin/stale",
+      github_url: null,
+      merged: false,
+      behind_base: { kind: "not_computed" as const },
+      last_commit_at: "2024-01-01T00:00:00Z",
+      recent: false,
+    };
+    wire(
+      [repo({ remote_branches: [...repo().repo.remote_branches, staleRemote] })],
+      aggregateComparison,
+    );
+    await refreshAll();
+    render(GitView);
+    const mainRow = (await screen.findByTestId("git-repo")).querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    await fireEvent.click(within(mainRow).getByTestId("branch-select"));
+    await screen.findByTestId("branch-comparison-row");
+
+    expect(
+      document.querySelector('[data-testid="git-remote-branch"][data-branch="origin/stale"]'),
+    ).toBeNull();
+    expect(screen.getByTestId("older-branches-toggle")).toHaveTextContent("Show 1 older branch");
+
+    await fireEvent.click(screen.getByTestId("comparison-base-trigger"));
+    const menu = await screen.findByTestId("comparison-base-menu");
+    expect(within(menu).getByText("origin/stale")).toBeInTheDocument();
   });
 
   it("clicking a remote-only branch opens the panel on its latest commit (no worktree)", async () => {

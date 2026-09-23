@@ -1,11 +1,11 @@
 //! The read functions: path → [`RepoView`], plus per-worktree changed-files and
 //! diff text. All local, all `git2`, all synchronous.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use git2::{
-    Branch, BranchType, Diff, DiffFormat, DiffOptions, Direction, ErrorCode, Oid, Patch,
+    Branch, BranchType, Diff, DiffFormat, DiffOptions, Direction, ErrorCode, Oid, Patch, Remote,
     Repository, Status, StatusOptions,
 };
 
@@ -14,10 +14,22 @@ use url::Url;
 
 use crate::error::{GitError, Result};
 use crate::model::{
-    BranchComparison, BranchView, ChangeKind, ChangedFile, CommitChanges, CommitRangeKind,
-    DiffHunk, DiffLine, DiffLineKind, FileDiff, GitCommitRange, GitCommitSummary, RemoteBranchView,
-    RepoView, SyncState, WorktreeView, WorktreeWarning,
+    BehindBase, BranchComparison, BranchView, ChangeKind, ChangedFile, CommitChanges,
+    CommitRangeKind, DiffHunk, DiffLine, DiffLineKind, FileDiff, GitCommitRange, GitCommitSummary,
+    RemoteBranchView, RepoView, SyncState, WorktreeView, WorktreeWarning,
 };
+
+/// How many of the most recently committed branches of each kind (local, remote)
+/// get an exact behind-base count; see [`BehindBase`] for why the rest don't.
+pub const RECENT_BRANCH_LIMIT: usize = 30;
+
+/// Most commits the shared `merged` walk visits in one read. Past it, older
+/// branches the walk hasn't reached are reported as undetermined (no badge).
+const MERGED_WALK_BUDGET: usize = 100_000;
+
+/// Slack on the shared walk's time bound for commits dated earlier than their
+/// descendants (clock skew, imported history).
+const COMMIT_TIME_SKEW_SECONDS: i64 = 24 * 60 * 60;
 
 /// Resolve any path inside (or at) a git repo to the canonical **main-worktree /
 /// common-dir root**. Returns `None` if the path is not inside a git repo. This
@@ -581,27 +593,85 @@ fn build_repo_view(repo: &Repository, root: PathBuf, name: String) -> Result<Rep
     // collect the prunable/orphaned warnings. Done once up front so branch
     // enumeration can attach worktrees without rescanning.
     let worktrees = collect_worktrees(repo).map_err(err)?;
-    let github_remotes = github_remote_urls(repo);
-    // Both readers populate one set so local and remote tips dedupe without
-    // re-enumerating refs after their view models are built.
-    let mut branch_tips = HashSet::new();
+    let configured_remotes = ConfiguredRemotes::load(repo);
 
+    let locals = list_branches(repo, BranchType::Local).map_err(err)?;
+    let remotes = list_branches(repo, BranchType::Remote).map_err(err)?;
+    let tip_times = tip_commit_times(repo, locals.iter().chain(&remotes));
+
+    // Read once: each local branch's upstream decides both its sync status and
+    // which remote refs the tree shows (a tracked remote renders as its local
+    // branch's row, never its own).
+    let upstreams: Vec<Upstream> = locals
+        .iter()
+        .map(|b| upstream_status(repo, &b.branch, b.tip))
+        .collect();
+    let tracked: HashSet<&str> = upstreams.iter().filter_map(|u| u.name.as_deref()).collect();
+    let remote_only: Vec<&ListedBranch<'_>> = remotes
+        .iter()
+        .filter(|b| !tracked.contains(b.name.as_str()))
+        .collect();
+
+    let local_recent =
+        recent_branch_names(&locals.iter().collect::<Vec<_>>(), &tip_times, |name| {
+            default_branch.as_deref() == Some(name) || worktrees.for_branch(name).is_some()
+        });
+    let default_remote = default_branch.as_deref().map(|b| format!("origin/{b}"));
+    let remote_recent = recent_branch_names(&remote_only, &tip_times, |name| {
+        default_remote.as_deref() == Some(name)
+    });
+
+    // Older branches get `merged` from one shared walk of the default
+    // branch's history; it only needs to reach back as far as the oldest of them.
+    let older_tips: Vec<Option<Oid>> = locals
+        .iter()
+        .filter(|b| !local_recent.contains(b.name.as_str()))
+        .chain(
+            remote_only
+                .iter()
+                .copied()
+                .filter(|b| !remote_recent.contains(b.name.as_str())),
+        )
+        .map(|b| b.tip)
+        .collect();
+    let walk_plan = (!older_tips.is_empty()).then(|| {
+        let oldest = older_tips
+            .iter()
+            .map(|tip| tip.and_then(|t| tip_times.get(&t)).map(git2::Time::seconds))
+            .min()
+            .flatten();
+        MergedWalkPlan {
+            targets: locals
+                .iter()
+                .chain(remote_only.iter().copied())
+                .filter_map(|b| b.tip)
+                .collect(),
+            stop_before: oldest.map(|seconds| seconds.saturating_sub(COMMIT_TIME_SKEW_SECONDS)),
+        }
+    });
+    let ancestry = Ancestry::new(repo, default_tip, walk_plan.as_ref(), MERGED_WALK_BUDGET);
     let local_branches = read_local_branches(
         repo,
-        default_tip.as_ref(),
+        &locals,
+        &upstreams,
+        &local_recent,
+        &ancestry,
+        &tip_times,
         &worktrees,
-        &github_remotes,
-        &mut branch_tips,
-    )
-    .map_err(err)?;
+        &configured_remotes.github,
+    );
     let remote_branches = read_remote_branches(
-        repo,
-        default_tip.as_ref(),
-        &github_remotes,
-        &mut branch_tips,
-    )
-    .map_err(err)?;
-    let last_commit_at = latest_branch_tip_commit_time(repo, &branch_tips);
+        &remotes,
+        &tracked,
+        &remote_recent,
+        &ancestry,
+        &tip_times,
+        &configured_remotes,
+    );
+    let last_commit_at = tip_times
+        .values()
+        .max_by_key(|time| time.seconds())
+        .and_then(|time| rfc3339(*time));
     let detached_worktrees = worktrees.into_detached();
 
     Ok(RepoView {
@@ -654,85 +724,164 @@ fn default_branch_tip(repo: &Repository, default: &str) -> Option<Oid> {
         .and_then(|b| b.get().target())
 }
 
-fn read_local_branches(
+/// One enumerated branch, held so the recent set can be chosen across all
+/// branches of a kind before any per-branch status is computed.
+struct ListedBranch<'repo> {
+    branch: Branch<'repo>,
+    name: String,
+    tip: Option<Oid>,
+}
+
+fn list_branches(
     repo: &Repository,
-    default_tip: Option<&Oid>,
-    worktrees: &Worktrees,
-    github_remotes: &HashMap<String, Url>,
-    branch_tips: &mut HashSet<Oid>,
-) -> std::result::Result<Vec<BranchView>, git2::Error> {
-    let mut views = Vec::new();
-    for branch in repo.branches(Some(BranchType::Local))? {
+    branch_type: BranchType,
+) -> std::result::Result<Vec<ListedBranch<'_>>, git2::Error> {
+    let mut listed = Vec::new();
+    for branch in repo.branches(Some(branch_type))? {
         let (branch, _) = branch?;
         let Some(name) = branch.name()?.map(str::to_owned) else {
             continue; // non-UTF-8 branch name — skip rather than fail the whole read
         };
-        let tip = branch.get().target();
-        branch_tips.extend(tip);
-        let (upstream, sync, dangling) = upstream_status(repo, &branch, tip);
-        let github_url = if dangling {
-            None
-        } else {
-            local_branch_github_url(repo, github_remotes, &branch)
-        };
-        let (merged, behind_base) = ancestry_signals(repo, tip, default_tip);
-        let worktree = worktrees.for_branch(&name);
-        views.push(BranchView {
-            name,
-            upstream,
-            sync,
-            behind_base,
-            merged,
-            dangling,
-            github_url,
-            worktree,
-        });
-    }
-    views.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(views)
-}
-
-fn read_remote_branches(
-    repo: &Repository,
-    default_tip: Option<&Oid>,
-    github_remotes: &HashMap<String, Url>,
-    branch_tips: &mut HashSet<Oid>,
-) -> std::result::Result<Vec<RemoteBranchView>, git2::Error> {
-    let mut views = Vec::new();
-    for branch in repo.branches(Some(BranchType::Remote))? {
-        let (branch, _) = branch?;
-        let Some(name) = branch.name()?.map(str::to_owned) else {
-            continue;
-        };
         // Skip the symbolic `origin/HEAD` pointer — it's not a real branch.
-        if name.ends_with("/HEAD") {
+        if branch_type == BranchType::Remote && name.ends_with("/HEAD") {
             continue;
         }
         let tip = branch.get().target();
-        branch_tips.extend(tip);
-        let github_url = remote_branch_github_url(repo, github_remotes, &branch);
-        let (merged, behind_base) = ancestry_signals(repo, tip, default_tip);
-        views.push(RemoteBranchView {
-            name,
-            github_url,
-            merged,
-            behind_base,
-        });
+        listed.push(ListedBranch { branch, name, tip });
     }
-    views.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(views)
+    Ok(listed)
 }
 
-fn latest_branch_tip_commit_time(repo: &Repository, branch_tips: &HashSet<Oid>) -> Option<String> {
-    branch_tips
+/// Committer time of every distinct branch tip. One commit lookup per tip —
+/// cheap next to any history walk, which is why recency (not ancestry) decides
+/// the recent set.
+fn tip_commit_times<'a, 'repo: 'a>(
+    repo: &Repository,
+    branches: impl Iterator<Item = &'a ListedBranch<'repo>>,
+) -> HashMap<Oid, git2::Time> {
+    let mut times = HashMap::new();
+    for tip in branches.filter_map(|b| b.tip) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = times.entry(tip)
+            && let Ok(commit) = repo.find_commit(tip)
+        {
+            slot.insert(commit.committer().when());
+        }
+    }
+    times
+}
+
+/// The branches that get an exact behind-base count: the
+/// [`RECENT_BRANCH_LIMIT`] most recently committed (ties broken by name), plus
+/// any `pinned` branch regardless of age.
+fn recent_branch_names<'a>(
+    branches: &[&'a ListedBranch<'_>],
+    tip_times: &HashMap<Oid, git2::Time>,
+    pinned: impl Fn(&str) -> bool,
+) -> HashSet<&'a str> {
+    let seconds = |b: &ListedBranch<'_>| {
+        b.tip
+            .and_then(|t| tip_times.get(&t))
+            .map(git2::Time::seconds)
+    };
+    let mut ranked: Vec<&'a ListedBranch<'_>> = branches.to_vec();
+    // Descending on `Option`, so a branch with no resolvable tip time ranks last.
+    ranked.sort_by(|a, b| {
+        seconds(b)
+            .cmp(&seconds(a))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    ranked
+        .into_iter()
+        .take(RECENT_BRANCH_LIMIT)
+        .chain(branches.iter().copied().filter(|b| pinned(&b.name)))
+        .map(|b| b.name.as_str())
+        .collect()
+}
+
+fn tip_commit_at(tip: Option<Oid>, tip_times: &HashMap<Oid, git2::Time>) -> Option<String> {
+    tip.and_then(|t| tip_times.get(&t))
+        .and_then(|time| rfc3339(*time))
+}
+
+fn rfc3339(time: git2::Time) -> Option<String> {
+    commit_datetime(time).map(|datetime| datetime.to_rfc3339())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is a distinct per-read index built once in build_repo_view"
+)]
+fn read_local_branches(
+    repo: &Repository,
+    branches: &[ListedBranch<'_>],
+    upstreams: &[Upstream],
+    recent: &HashSet<&str>,
+    ancestry: &Ancestry<'_>,
+    tip_times: &HashMap<Oid, git2::Time>,
+    worktrees: &Worktrees,
+    github_remotes: &HashMap<String, Url>,
+) -> Vec<BranchView> {
+    let mut views: Vec<BranchView> = branches
         .iter()
-        .filter_map(|oid| repo.find_commit(*oid).ok())
-        .filter_map(|commit| {
-            let time = commit.committer().when();
-            commit_datetime(time).map(|datetime| (time.seconds(), datetime))
+        .zip(upstreams)
+        .map(|(ListedBranch { branch, name, tip }, upstream)| {
+            let github_url = if upstream.dangling {
+                None
+            } else {
+                local_branch_github_url(repo, github_remotes, branch)
+            };
+            let recent = recent.contains(name.as_str());
+            let (merged, behind_base) = ancestry.signals(*tip, recent);
+            BranchView {
+                name: name.clone(),
+                upstream: upstream.name.clone(),
+                sync: upstream.sync,
+                behind_base,
+                merged,
+                dangling: upstream.dangling,
+                github_url,
+                worktree: worktrees.for_branch(name),
+                last_commit_at: tip_commit_at(*tip, tip_times),
+                recent,
+            }
         })
-        .max_by_key(|(seconds, _)| *seconds)
-        .map(|(_, datetime)| datetime.to_rfc3339())
+        .collect();
+    views.sort_by(|a, b| a.name.cmp(&b.name));
+    views
+}
+
+/// A remote ref tracked by a local branch renders as that branch's row, so its
+/// own ancestry signals would never be shown; they're left uncomputed rather
+/// than spending walks (or a slot in the recent set) on them.
+fn read_remote_branches(
+    branches: &[ListedBranch<'_>],
+    tracked: &HashSet<&str>,
+    recent: &HashSet<&str>,
+    ancestry: &Ancestry<'_>,
+    tip_times: &HashMap<Oid, git2::Time>,
+    remotes: &ConfiguredRemotes<'_>,
+) -> Vec<RemoteBranchView> {
+    let mut views: Vec<RemoteBranchView> = branches
+        .iter()
+        .map(|ListedBranch { branch, name, tip }| {
+            let recent = recent.contains(name.as_str());
+            let (merged, behind_base) = if tracked.contains(name.as_str()) {
+                (None, BehindBase::NotComputed)
+            } else {
+                ancestry.signals(*tip, recent)
+            };
+            RemoteBranchView {
+                name: name.clone(),
+                github_url: remote_branch_github_url(remotes, branch),
+                merged,
+                behind_base,
+                last_commit_at: tip_commit_at(*tip, tip_times),
+                recent,
+            }
+        })
+        .collect();
+    views.sort_by(|a, b| a.name.cmp(&b.name));
+    views
 }
 
 fn local_branch_github_url(
@@ -749,23 +898,19 @@ fn local_branch_github_url(
 }
 
 fn remote_branch_github_url(
-    repo: &Repository,
-    github_remotes: &HashMap<String, Url>,
+    remotes: &ConfiguredRemotes<'_>,
     branch: &Branch<'_>,
 ) -> Option<String> {
+    if remotes.github.is_empty() {
+        return None;
+    }
     let refname = branch.get().name().ok()?;
-    let remote_name = repo.branch_remote_name(refname).ok()?;
-    let remote_name = remote_name.as_str().ok()?;
-    let branch_name = remote_branch_source_name(repo, remote_name, refname)?;
-    github_branch_url(github_remotes, remote_name, &branch_name)
+    let (remote_name, remote) = remotes.owner_of(refname)?;
+    let branch_name = remote_branch_source_name(remote, refname)?;
+    github_branch_url(&remotes.github, remote_name, &branch_name)
 }
 
-fn remote_branch_source_name(
-    repo: &Repository,
-    remote_name: &str,
-    destination_ref: &str,
-) -> Option<String> {
-    let remote = repo.find_remote(remote_name).ok()?;
+fn remote_branch_source_name(remote: &Remote<'_>, destination_ref: &str) -> Option<String> {
     let mut source_ref = None;
     for refspec in remote.refspecs() {
         if refspec.direction() != Direction::Fetch || !refspec.dst_matches(destination_ref) {
@@ -796,21 +941,45 @@ fn github_branch_url(
     Some(url.into())
 }
 
-fn github_remote_urls(repo: &Repository) -> HashMap<String, Url> {
-    let mut urls = HashMap::new();
-    let Ok(remote_names) = repo.remotes() else {
-        return urls;
-    };
-    for remote_name in remote_names.iter().filter_map(|name| name.ok().flatten()) {
-        let Ok(remote) = repo.find_remote(remote_name) else {
-            continue;
-        };
-        let Some(url) = remote.url().ok().and_then(github_repo_url) else {
-            continue;
-        };
-        urls.insert(remote_name.to_owned(), url);
+/// Every configured remote, loaded once per read. Asking libgit2 which remote
+/// owns a remote-tracking ref re-reads the remote config on each call, which
+/// dominated reads of repos with hundreds of remote branches.
+struct ConfiguredRemotes<'repo> {
+    remotes: Vec<(String, Remote<'repo>)>,
+    /// Browser URL per remote name, for the remotes hosted on GitHub.
+    github: HashMap<String, Url>,
+}
+
+impl<'repo> ConfiguredRemotes<'repo> {
+    fn load(repo: &'repo Repository) -> Self {
+        let mut remotes = Vec::new();
+        let mut github = HashMap::new();
+        if let Ok(names) = repo.remotes() {
+            for name in names.iter().filter_map(|name| name.ok().flatten()) {
+                let Ok(remote) = repo.find_remote(name) else {
+                    continue;
+                };
+                if let Some(url) = remote.url().ok().and_then(github_repo_url) {
+                    github.insert(name.to_owned(), url);
+                }
+                remotes.push((name.to_owned(), remote));
+            }
+        }
+        Self { remotes, github }
     }
-    urls
+
+    /// The one remote whose fetch refspecs map onto `refname`, as
+    /// `git_branch_remote_name` resolves it: `None` when no remote does, or
+    /// when more than one does (ambiguous).
+    fn owner_of(&self, refname: &str) -> Option<(&str, &Remote<'repo>)> {
+        let mut owners = self.remotes.iter().filter(|(_, remote)| {
+            remote
+                .refspecs()
+                .any(|spec| spec.direction() == Direction::Fetch && spec.dst_matches(refname))
+        });
+        let (name, remote) = owners.next()?;
+        owners.next().is_none().then_some((name.as_str(), remote))
+    }
 }
 
 fn github_repo_url(remote_url: &str) -> Option<Url> {
@@ -856,19 +1025,23 @@ fn is_github_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("ssh.github.com")
 }
 
-/// A branch's position vs. its own upstream, plus whether that upstream is
-/// "gone" (configured but the remote-tracking ref no longer exists → dangling).
-///
-/// Returns `(upstream_name, sync_state, dangling)`. No configured upstream is
-/// `LocalOnly` (a fine state), distinct from a configured-but-missing upstream
-/// (`dangling = true`).
-fn upstream_status(
-    repo: &Repository,
-    branch: &Branch<'_>,
-    tip: Option<Oid>,
-) -> (Option<String>, SyncState, bool) {
+/// A local branch's upstream, its position vs. that upstream, and whether the
+/// upstream is "gone" (configured but the remote-tracking ref no longer exists
+/// → dangling). No configured upstream is `LocalOnly` (a fine state), distinct
+/// from a configured-but-missing upstream (`dangling`).
+struct Upstream {
+    name: Option<String>,
+    sync: SyncState,
+    dangling: bool,
+}
+
+fn upstream_status(repo: &Repository, branch: &Branch<'_>, tip: Option<Oid>) -> Upstream {
     let Ok(refname) = branch.get().name() else {
-        return (None, SyncState::Unknown, false);
+        return Upstream {
+            name: None,
+            sync: SyncState::Unknown,
+            dangling: false,
+        };
     };
     // `branch_upstream_name` reads config — it returns a name even when the
     // remote-tracking ref itself has been deleted, which is exactly how we tell
@@ -879,7 +1052,11 @@ fn upstream_status(
         .ok()
         .and_then(|buf| buf.as_str().ok().map(str::to_owned))
     else {
-        return (None, SyncState::LocalOnly, false);
+        return Upstream {
+            name: None,
+            sync: SyncState::LocalOnly,
+            dangling: false,
+        };
     };
 
     match branch.upstream() {
@@ -893,12 +1070,19 @@ fn upstream_status(
                 (Some(local), Some(up)) => sync_from_counts(repo, local, up),
                 _ => SyncState::Unknown,
             };
-            (Some(name), sync, false)
+            Upstream {
+                name: Some(name),
+                sync,
+                dangling: false,
+            }
         }
         // Configured upstream that no longer resolves → the remote branch was
         // deleted. Dangling; sync vs. a missing upstream is meaningless.
-        Err(e) if is_not_found(&e) => (Some(configured), SyncState::Unknown, true),
-        Err(_) => (Some(configured), SyncState::Unknown, false),
+        Err(e) => Upstream {
+            name: Some(configured),
+            sync: SyncState::Unknown,
+            dangling: is_not_found(&e),
+        },
     }
 }
 
@@ -919,30 +1103,155 @@ fn sync_from_counts(repo: &Repository, local: Oid, upstream: Oid) -> SyncState {
     }
 }
 
-/// `merged` and `behind_base` against the default-branch tip. Both are ancestry
-/// walks that work on any commit (local branch or remote ref). `None` when the
-/// default branch (or this tip) can't be resolved.
-fn ancestry_signals(
-    repo: &Repository,
-    tip: Option<Oid>,
-    default_tip: Option<&Oid>,
-) -> (Option<bool>, Option<u32>) {
-    let (Some(tip), Some(&base)) = (tip, default_tip) else {
-        return (None, None);
-    };
-    // merged = this branch's tip is an ancestor of (or equal to) the default tip.
-    let merged = if tip == base {
-        Some(true)
-    } else {
-        repo.graph_descendant_of(base, tip).ok()
-    };
-    // behind_base = commits the default has that this branch lacks. The "behind"
-    // half of ahead/behind(this, default).
-    let behind_base = repo
-        .graph_ahead_behind(tip, base)
-        .ok()
-        .map(|(_, behind)| clamp_u32(behind));
-    (merged, behind_base)
+/// `merged` and `behind_base` against the default-branch tip, for every branch
+/// of one read.
+///
+/// Per-branch walks are as long as the history a branch missed, so a repo full
+/// of long-abandoned branches can't afford two per branch. When any shown
+/// branch falls outside the recent set, the default branch's history is walked
+/// once up front and `merged` is read off that walk; only the recent set then
+/// pays a per-branch walk, for the behind-base count. When every branch is
+/// recent, the up-front walk is skipped — on a long history with few branches
+/// it would cost more than the short per-branch walks it replaces.
+struct Ancestry<'repo> {
+    repo: &'repo Repository,
+    base: Option<Oid>,
+    walk: Option<MergedWalk>,
+}
+
+impl<'repo> Ancestry<'repo> {
+    /// `walk_plan` is the shared walk to classify tips with, or `None` to
+    /// answer every branch with its own walks.
+    fn new(
+        repo: &'repo Repository,
+        base: Option<Oid>,
+        walk_plan: Option<&MergedWalkPlan>,
+        budget: usize,
+    ) -> Self {
+        let walk = base
+            .zip(walk_plan)
+            .map(|(base, plan)| MergedWalk::run(repo, base, plan, budget));
+        Self { repo, base, walk }
+    }
+
+    /// `(merged, behind_base)` for one branch tip. Both are "couldn't determine"
+    /// when the default branch (or this tip) can't be resolved.
+    fn signals(&self, tip: Option<Oid>, recent: bool) -> (Option<bool>, BehindBase) {
+        let (Some(tip), Some(base)) = (tip, self.base) else {
+            return (None, BehindBase::Unknown);
+        };
+        // merged = this branch's tip is an ancestor of (or equal to) the default
+        // tip. A recent branch the shared walk couldn't classify falls back to
+        // its own (short) walk; an older one is left undetermined.
+        let merged = match self.walk.as_ref().and_then(|walk| walk.merged(tip)) {
+            Some(merged) => Some(merged),
+            None if tip == base => Some(true),
+            None if recent => self.repo.graph_descendant_of(base, tip).ok(),
+            None => None,
+        };
+        if !recent {
+            return (merged, BehindBase::NotComputed);
+        }
+        // behind_base = commits the default has that this branch lacks. The
+        // "behind" half of ahead/behind(this, default).
+        let behind_base =
+            self.repo
+                .graph_ahead_behind(tip, base)
+                .map_or(BehindBase::Unknown, |(_, behind)| BehindBase::Count {
+                    commits: clamp_u32(behind),
+                });
+        (merged, behind_base)
+    }
+}
+
+/// What one shared walk of the default branch's history looks for.
+struct MergedWalkPlan {
+    /// Tips to classify as merged (reached) or not.
+    targets: HashSet<Oid>,
+    /// Stop once every remaining commit is older than this (committer time,
+    /// seconds): no target older than the oldest branch that needs the walk is
+    /// worth searching for. `None` walks with no time bound.
+    stop_before: Option<i64>,
+}
+
+/// Which target tips one walk of the default branch's history reached.
+///
+/// The walk visits commits newest-first, so it can stop at the plan's time
+/// bound instead of traversing the whole history, and it stops after `budget`
+/// commits regardless. (libgit2's own time-sorted revwalk traverses the entire
+/// history before yielding its first commit, which is why this walk is ours.)
+/// A target it reached is merged. A target it didn't reach is unmerged only if
+/// the walk exhausted the history; if it stopped at the time bound or the
+/// budget, or failed partway, that target is undetermined — never a confident
+/// "not merged" from a partial walk. Commit dates only decide where to stop
+/// searching, so a skewed history can leave a merged branch undetermined but
+/// never mislabels one.
+struct MergedWalk {
+    reached: HashSet<Oid>,
+    covered_history: bool,
+}
+
+impl MergedWalk {
+    fn run(repo: &Repository, base: Oid, plan: &MergedWalkPlan, budget: usize) -> Self {
+        let mut reached = HashSet::new();
+        // On its own handle: loading this many commits into the read's shared
+        // object cache measurably slowed every per-branch ahead/behind walk
+        // after it (a 15ms walk cost ~500ms downstream on a 20k-commit repo).
+        let covered_history = Repository::open(repo.path())
+            .and_then(|own| Self::walk(&own, base, plan, budget, &mut reached))
+            .unwrap_or(false);
+        Self {
+            reached,
+            covered_history,
+        }
+    }
+
+    /// Records reached targets; returns whether every unreached target is known
+    /// to be outside the history (the walk exhausted it, or found them all).
+    fn walk(
+        repo: &Repository,
+        base: Oid,
+        plan: &MergedWalkPlan,
+        budget: usize,
+        reached: &mut HashSet<Oid>,
+    ) -> std::result::Result<bool, git2::Error> {
+        let base_commit = repo.find_commit(base)?;
+        let mut frontier = BinaryHeap::from([(base_commit.time().seconds(), base)]);
+        let mut seen = HashSet::from([base]);
+        let mut visited = 0;
+        while let Some((time, oid)) = frontier.pop() {
+            if plan.stop_before.is_some_and(|bound| time < bound) || visited == budget {
+                return Ok(false);
+            }
+            visited += 1;
+            if plan.targets.contains(&oid) {
+                reached.insert(oid);
+                if reached.len() == plan.targets.len() {
+                    return Ok(true);
+                }
+            }
+            // `parent_ids` + an explicit lookup, not `parents()`: that iterator
+            // silently skips a parent it can't load, which would make a broken
+            // history look fully walked.
+            for parent_id in repo.find_commit(oid)?.parent_ids() {
+                if seen.insert(parent_id) {
+                    let parent = repo.find_commit(parent_id)?;
+                    frontier.push((parent.time().seconds(), parent_id));
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn merged(&self, tip: Oid) -> Option<bool> {
+        if self.reached.contains(&tip) {
+            Some(true)
+        } else if self.covered_history {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 /// Worktree records for a repo, indexed for branch attachment and warning
@@ -1989,7 +2298,93 @@ fn is_not_found(e: &git2::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::github_repo_coordinates;
+    use git2::{Oid, Repository, Signature, Time};
+    use tempfile::TempDir;
+
+    use super::{MergedWalk, MergedWalkPlan, github_repo_coordinates};
+
+    /// A linear history of `count` empty commits, oldest first, plus one
+    /// unrelated root commit.
+    fn linear_history(count: i64) -> (TempDir, Repository, Vec<Oid>, Oid) {
+        let dir = TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
+        let mut history = Vec::new();
+        let orphan;
+        {
+            let tree = repo.find_tree(tree_id).unwrap();
+            let commit = |n: i64, parents: &[&git2::Commit<'_>]| -> Oid {
+                let sig = Signature::new("T", "t@e", &Time::new(1_700_000_000 + n, 0)).unwrap();
+                repo.commit(None, &sig, &sig, &format!("c{n}"), &tree, parents)
+                    .unwrap()
+            };
+            for n in 0..count {
+                let parents: Vec<git2::Commit<'_>> = history
+                    .last()
+                    .map(|oid| repo.find_commit(*oid).unwrap())
+                    .into_iter()
+                    .collect();
+                history.push(commit(n, &parents.iter().collect::<Vec<_>>()));
+            }
+            orphan = commit(-1, &[]);
+        }
+        (dir, repo, history, orphan)
+    }
+
+    fn plan(targets: &[Oid], stop_before: Option<i64>) -> MergedWalkPlan {
+        MergedWalkPlan {
+            targets: targets.iter().copied().collect(),
+            stop_before,
+        }
+    }
+
+    #[test]
+    fn merged_walk_classifies_every_target_when_it_covers_the_history() {
+        let (_dir, repo, history, orphan) = linear_history(10);
+        let walk = MergedWalk::run(&repo, history[9], &plan(&[history[1], orphan], None), 100);
+        assert_eq!(walk.merged(history[1]), Some(true));
+        assert_eq!(walk.merged(orphan), Some(false));
+    }
+
+    #[test]
+    fn merged_walk_leaves_unreached_targets_undetermined_when_the_budget_runs_out() {
+        let (_dir, repo, history, orphan) = linear_history(10);
+        let targets = [history[8], history[1], orphan];
+        let walk = MergedWalk::run(&repo, history[9], &plan(&targets, None), 3);
+        assert_eq!(walk.merged(history[8]), Some(true), "reached within budget");
+        assert_eq!(walk.merged(history[1]), None);
+        assert_eq!(walk.merged(orphan), None);
+    }
+
+    #[test]
+    fn merged_walk_leaves_targets_past_the_time_bound_undetermined() {
+        let (_dir, repo, history, orphan) = linear_history(10);
+        let history_5_time = repo.find_commit(history[5]).unwrap().time().seconds();
+        let targets = [history[7], history[1], orphan];
+        let walk = MergedWalk::run(
+            &repo,
+            history[9],
+            &plan(&targets, Some(history_5_time)),
+            100,
+        );
+        assert_eq!(walk.merged(history[7]), Some(true));
+        assert_eq!(walk.merged(history[1]), None, "older than the bound");
+        assert_eq!(walk.merged(orphan), None);
+    }
+
+    #[test]
+    fn merged_walk_is_complete_when_the_budget_ends_exactly_at_the_root() {
+        let (_dir, repo, history, orphan) = linear_history(10);
+        let walk = MergedWalk::run(&repo, history[9], &plan(&[orphan], None), 10);
+        assert_eq!(walk.merged(orphan), Some(false));
+    }
+
+    #[test]
+    fn merged_walk_stops_early_once_every_target_is_found() {
+        let (_dir, repo, history, _orphan) = linear_history(10);
+        let walk = MergedWalk::run(&repo, history[9], &plan(&[history[8]], None), 2);
+        assert_eq!(walk.merged(history[8]), Some(true));
+    }
 
     #[test]
     fn github_coordinates_accept_supported_git_transport_forms_on_github_hosts() {

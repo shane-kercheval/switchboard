@@ -16,7 +16,7 @@
     Trash2,
     TriangleAlert,
   } from "@lucide/svelte";
-  import { cn, basename } from "$lib/utils";
+  import { cn, basename, compareIsoTimestampsDescending, relativeTime } from "$lib/utils";
   import { formatHomePath } from "$lib/utils";
   import Badge from "$lib/components/ui/Badge.svelte";
   import GitStatusIcon from "$lib/components/GitStatusIcon.svelte";
@@ -109,6 +109,24 @@
   // the cursor during commit keyboard nav. Focus/open reveals stay.
   const triggerHoverReveal = $derived(hoverableClass("group-hover:opacity-100"));
 
+  // Newest tip first, so branches still in play lead and long-abandoned ones
+  // sink; a branch with no resolvable tip time sorts last. Names break ties in
+  // code-unit order, matching the backend's choice of which branches are recent.
+  function compareByRecency(
+    a: BranchView | RemoteBranchView,
+    b: BranchView | RemoteBranchView,
+  ): number {
+    if (a.last_commit_at !== null && b.last_commit_at !== null) {
+      const byTime = compareIsoTimestampsDescending(a.last_commit_at, b.last_commit_at);
+      if (byTime !== 0) return byTime;
+    } else if (a.last_commit_at !== null) {
+      return -1;
+    } else if (b.last_commit_at !== null) {
+      return 1;
+    }
+    return a.name === b.name ? 0 : a.name < b.name ? -1 : 1;
+  }
+
   // The default branch anchors the branch list even when it has no local folder.
   // Other folderless branches stay hidden until the user asks for inactive ones.
   const localBranches = $derived(
@@ -124,15 +142,48 @@
         const bDefault = b.name === repo.default_branch ? 0 : 1;
         const aActive = a.worktree !== null ? 0 : 1;
         const bActive = b.worktree !== null ? 0 : 1;
-        return aDefault - bDefault || aActive - bActive || a.name.localeCompare(b.name);
+        return aDefault - bDefault || aActive - bActive || compareByRecency(a, b);
       }),
   );
+  const trackedUpstreams = $derived(new Set(repo.local_branches.map((b) => b.upstream)));
   const remoteOnlyBranches = $derived(
-    repo.remote_branches.filter(
-      (remote) => !repo.local_branches.some((local) => local.upstream === remote.name),
-    ),
+    repo.remote_branches
+      .filter((remote) => !trackedUpstreams.has(remote.name))
+      .sort(compareByRecency),
   );
   const visibleRemoteOnlyBranches = $derived(branchFilter === "local" ? [] : remoteOnlyBranches);
+
+  // The backend marks the recent branches (the most recently committed, plus
+  // the default and checked-out ones); the rest are the long tail a repo that
+  // never prunes accumulates, so they collapse behind one row. A selected older
+  // branch stays visible, so collapsing never hides the branch whose commits
+  // are open.
+  let showOlderBranches = $state(false);
+
+  function isOlderBranch(branch: BranchView | RemoteBranchView): boolean {
+    return !branch.recent;
+  }
+
+  const shownLocalBranches = $derived(
+    showOlderBranches
+      ? localBranches
+      : localBranches.filter((b) => !isOlderBranch(b) || isLocalSelected(b.name)),
+  );
+  const shownRemoteOnlyBranches = $derived(
+    showOlderBranches
+      ? visibleRemoteOnlyBranches
+      : visibleRemoteOnlyBranches.filter((b) => !isOlderBranch(b) || isRemoteSelected(b.name)),
+  );
+  const olderBranchCount = $derived(
+    localBranches.filter(isOlderBranch).length +
+      visibleRemoteOnlyBranches.filter(isOlderBranch).length,
+  );
+  const hiddenOlderCount = $derived(
+    localBranches.length +
+      visibleRemoteOnlyBranches.length -
+      shownLocalBranches.length -
+      shownRemoteOnlyBranches.length,
+  );
 
   onMount(() => {
     void homeDir()
@@ -145,8 +196,8 @@
   });
 
   const branchActionKeys = $derived([
-    ...localBranches.map((branch) => `local:${branch.name}`),
-    ...visibleRemoteOnlyBranches.map((branch) => `remote:${branch.name}`),
+    ...shownLocalBranches.map((branch) => `local:${branch.name}`),
+    ...shownRemoteOnlyBranches.map((branch) => `remote:${branch.name}`),
   ]);
 
   $effect(() => {
@@ -599,7 +650,7 @@
           This repository is unavailable (moved or unmounted).
         </p>
       {:else}
-        {#each localBranches as branch (branch.name)}
+        {#each shownLocalBranches as branch (branch.name)}
           {@const selected = isLocalSelected(branch.name)}
           {@const worktreePath = branch.worktree?.path ?? null}
           {@const githubUrl = branch.github_url}
@@ -763,7 +814,7 @@
           {/if}
         {/each}
 
-        {#each visibleRemoteOnlyBranches as branch (branch.name)}
+        {#each shownRemoteOnlyBranches as branch (branch.name)}
           {@const selected = isRemoteSelected(branch.name)}
           {@const githubUrl = branch.github_url}
           {@const actionsKey = `remote:${branch.name}`}
@@ -847,6 +898,28 @@
             {@render commitList(null, false)}
           {/if}
         {/each}
+
+        {#if olderBranchCount > 0 && (showOlderBranches || hiddenOlderCount > 0)}
+          <Tooltip
+            label={`Branches outside the most recently committed ones. They don't show how far behind ${repo.default_branch ?? "the default branch"} they are: counting that for every stale branch is what makes repos with many branches slow to load.`}
+            delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+          >
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class="text-muted hover:text-fg px-2 py-1 text-[11px] transition-colors hover:underline"
+                data-testid="older-branches-toggle"
+                aria-expanded={showOlderBranches}
+                onclick={() => (showOlderBranches = !showOlderBranches)}
+              >
+                {showOlderBranches
+                  ? "Hide older branches"
+                  : `Show ${hiddenOlderCount} older ${hiddenOlderCount === 1 ? "branch" : "branches"}`}
+              </button>
+            {/snippet}
+          </Tooltip>
+        {/if}
 
         {#if localBranches.length === 0 && visibleRemoteOnlyBranches.length === 0}
           <p class="text-muted px-2 py-1.5 text-xs">
@@ -1228,7 +1301,7 @@
         <GitStatusIcon indicator={indicators[0]!} focusable={false} />
       </div>
     </div>
-    <div class="text-muted truncate text-[11px] leading-4">No local folder</div>
+    {@render folderlessSubtitle(branch.last_commit_at)}
   </div>
   <div class="flex shrink-0 items-center gap-1">
     {#each indicators.slice(1) as indicator (indicator.key)}
@@ -1261,8 +1334,15 @@
         {/snippet}
       </Tooltip>
     {:else}
-      <div class="text-muted truncate text-[11px] leading-4">No local folder</div>
+      {@render folderlessSubtitle(branch.last_commit_at)}
     {/if}
+  </div>
+{/snippet}
+
+{#snippet folderlessSubtitle(lastCommitAt: string | null)}
+  {@const age = lastCommitAt === null ? "" : relativeTime(lastCommitAt)}
+  <div class="text-muted truncate text-[11px] leading-4" data-testid="branch-subtitle">
+    No local folder{age === "" ? "" : ` · last commit ${age}`}
   </div>
 {/snippet}
 

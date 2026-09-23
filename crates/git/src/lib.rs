@@ -23,9 +23,9 @@
 //! The default branch (used for `merged` and `behind_base`) is detected in this
 //! order: the symbolic target of `refs/remotes/origin/HEAD`, then a local
 //! `main`, then a local `master`. If none resolves, `merged`/`behind_base` are
-//! reported as `None` ("couldn't determine"). Note `origin/HEAD` only exists on
-//! cloned repos, so the local-`main` fallback is the common path for `git init`
-//! repos — not an edge case.
+//! reported as "couldn't determine" (`None` / [`BehindBase::Unknown`]). Note
+//! `origin/HEAD` only exists on cloned repos, so the local-`main` fallback is
+//! the common path for `git init` repos — not an edge case.
 //!
 //! # Branch-primary, two-level status
 //!
@@ -35,6 +35,18 @@
 //! orphaned/prunable warnings) only for branches that are checked out. Remote
 //! branches carry only the cleanup signals (`merged`, `behind_base`). See
 //! [`mod@model`] for the full contract.
+//!
+//! # Many-branch repos
+//!
+//! Per-branch ancestry against the default branch is the expensive part of a
+//! read: each is a history walk as long as the branch is stale, and repos that
+//! never prune carry hundreds of stale branches. So `merged` for branches
+//! outside the recent set comes from one shared walk of the default branch's
+//! history instead of one walk per branch, and the behind-base count is skipped
+//! for them entirely ([`BehindBase::NotComputed`]). That walk is bounded — it
+//! reaches back only as far as the oldest such branch, and never past a fixed
+//! commit budget — so on a very long history an older branch it didn't reach
+//! reports `merged: None` rather than a guess.
 //!
 //! # Not computed (v1)
 //!
@@ -49,12 +61,12 @@ mod read;
 
 pub use error::{GitError, Result};
 pub use model::{
-    BranchComparison, BranchView, ChangeKind, ChangedFile, CommitChanges, CommitRangeKind,
-    DiffHunk, DiffLine, DiffLineKind, FileDiff, GitCommitRange, GitCommitSummary, RemoteBranchView,
-    RepoView, SyncState, WorktreeView, WorktreeWarning,
+    BehindBase, BranchComparison, BranchView, ChangeKind, ChangedFile, CommitChanges,
+    CommitRangeKind, DiffHunk, DiffLine, DiffLineKind, FileDiff, GitCommitRange, GitCommitSummary,
+    RemoteBranchView, RepoView, SyncState, WorktreeView, WorktreeWarning,
 };
 pub use read::{
-    BranchKind, branch_comparison, branch_comparison_file_diff, changed_files,
+    BranchKind, RECENT_BRANCH_LIMIT, branch_comparison, branch_comparison_file_diff, changed_files,
     commit_changed_files, commit_file_diff, commit_ranges, file_diff, read_repo, resolve_repo_root,
     validate_branch_comparison_endpoint,
 };

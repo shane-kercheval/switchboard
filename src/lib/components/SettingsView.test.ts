@@ -111,9 +111,9 @@ describe("SettingsView", () => {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             codex: {
-              model_choices: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"],
+              model_choices: ["gpt-6-sol", "gpt-5.6-terra", "gpt-6-astra"],
               effort_choices: ["medium", "high"],
-              default_model: "gpt-5.6-terra",
+              default_model: "gpt-6-sol",
               default_effort: "medium",
             },
           }),
@@ -122,16 +122,16 @@ describe("SettingsView", () => {
     );
 
     await fireEvent.change(screen.getByTestId("settings-selection-codex-model-current"), {
-      target: { value: "gpt-5.6-sol" },
+      target: { value: "gpt-5.6-terra" },
     });
     await waitFor(() =>
       expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             codex: {
-              model_choices: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"],
+              model_choices: ["gpt-6-sol", "gpt-5.6-terra", "gpt-6-astra"],
               effort_choices: ["medium", "high"],
-              default_model: "gpt-5.6-sol",
+              default_model: "gpt-5.6-terra",
               default_effort: "medium",
             },
           }),

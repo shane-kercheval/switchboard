@@ -219,9 +219,9 @@ describe("CreateAgentForm", () => {
       name: "codex",
       harness: "codex",
       selection: {
-        model: "gpt-5.6-terra",
+        model: "gpt-6-sol",
         effort: "medium",
-        model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
+        model_choices: ["gpt-6-sol", "gpt-5.6-terra"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
@@ -574,7 +574,7 @@ describe("CreateAgentForm", () => {
   it("create + Codex: pickers preselect the configured default", async () => {
     renderForm();
     await fireEvent.click(screen.getByTestId("harness-codex"));
-    expect(pickerValue("model-select")).toBe("gpt-5.6-terra");
+    expect(pickerValue("model-select")).toBe("gpt-6-sol");
     expect(pickerValue("effort-select")).toBe("medium");
   });
 
@@ -719,16 +719,16 @@ describe("CreateAgentForm", () => {
     await choosePicker("model-select", "haiku");
     await fireEvent.click(screen.getByTestId("harness-codex"));
     // The stale Claude value is gone — Codex shows its own default.
-    expect(pickerValue("model-select")).toBe("gpt-5.6-terra");
+    expect(pickerValue("model-select")).toBe("gpt-6-sol");
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
       name: "codex",
       harness: "codex",
       selection: {
-        model: "gpt-5.6-terra",
+        model: "gpt-6-sol",
         effort: "medium",
-        model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
+        model_choices: ["gpt-6-sol", "gpt-5.6-terra"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
@@ -835,9 +835,9 @@ describe("CreateAgentForm", () => {
       name: "my-thing",
       harness: "codex",
       selection: {
-        model: "gpt-5.6-terra",
+        model: "gpt-6-sol",
         effort: "medium",
-        model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
+        model_choices: ["gpt-6-sol", "gpt-5.6-terra"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);

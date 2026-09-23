@@ -30,11 +30,16 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
     { label: "Sonnet", value: "sonnet" },
     { label: "Haiku", value: "haiku" },
   ],
+  /// Codex has no family aliases — `-m` takes an exact id and an agent stays on
+  /// it — so the labels keep the generation: a bare `Sol` would read like
+  /// Claude's self-upgrading `Opus`. Which generations are offered, and why,
+  /// is recorded in `harness-behavior.md` §3.3.
   codex: [
     { label: "GPT-6 Astra", value: "gpt-6-astra" },
+    { label: "GPT-6 Sol", value: "gpt-6-sol" },
     { label: "GPT-5.6 Sol", value: "gpt-5.6-sol" },
     { label: "GPT-5.6 Terra", value: "gpt-5.6-terra" },
-    { label: "GPT-5.6 Luna", value: "gpt-5.6-luna" },
+    { label: "GPT-6 Luna", value: "gpt-6-luna" },
   ],
   /// Stable slugs from `agy models` (probed @ 1.1.19, 2026-08-25), with the
   /// harness's own display names. **Effort-bearing models are listed by their
@@ -243,9 +248,9 @@ export const DEFAULT_AGENT_SELECTIONS: Preferences["agent_defaults"] = {
     default_effort: "medium",
   },
   codex: {
-    model_choices: ["gpt-5.6-sol", "gpt-5.6-terra"],
+    model_choices: ["gpt-6-sol", "gpt-5.6-terra"],
     effort_choices: ["medium", "high"],
-    default_model: "gpt-5.6-terra",
+    default_model: "gpt-6-sol",
     default_effort: "medium",
   },
   // Both carry explicit effort because `agy` rejects these effort-bearing

@@ -84,11 +84,10 @@ describe("agent selection catalogs", () => {
     ]);
   });
 
-  it("offers the GPT-6 family without dropping GPT-5.6 Sol or Terra", () => {
+  it("offers the GPT-6 family plus GPT-5.6 Terra, which has no GPT-6 counterpart", () => {
     expect(MODEL_OPTIONS.codex).toEqual([
       { label: "GPT-6 Astra", value: "gpt-6-astra" },
       { label: "GPT-6 Sol", value: "gpt-6-sol" },
-      { label: "GPT-5.6 Sol", value: "gpt-5.6-sol" },
       { label: "GPT-5.6 Terra", value: "gpt-5.6-terra" },
       { label: "GPT-6 Luna", value: "gpt-6-luna" },
     ]);

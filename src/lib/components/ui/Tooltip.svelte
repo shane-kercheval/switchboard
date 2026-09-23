@@ -274,7 +274,10 @@
         {@render trigger(tooltipTriggerProps(props))}
       {/snippet}
     </Bits.Trigger>
-    {#if !disabled}
+    <!-- Mounted only while open: a bits-ui Portal mounts its own Svelte root
+         into <body> even while closed, and tearing hundreds of those down at
+         once (collapsing a long list of rows) costs quadratically. -->
+    {#if !disabled && open}
       <Portal>
         <Bits.Content
           {side}

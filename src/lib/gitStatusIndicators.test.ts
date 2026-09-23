@@ -14,7 +14,6 @@ const branch = (over: Partial<BranchView> = {}): BranchView => ({
   sync: { kind: "in_sync" },
   behind_base: { kind: "unknown" },
   last_commit_at: null,
-  recent: true,
   merged: null,
   dangling: false,
   github_url: null,
@@ -78,7 +77,6 @@ describe("localBranchIndicators", () => {
               merged: null,
               behind_base,
               last_commit_at: null,
-              recent: false,
             },
             "main",
           ),
@@ -167,7 +165,6 @@ describe("remoteBranchIndicators", () => {
       merged: null,
       behind_base: { kind: "unknown" },
       last_commit_at: null,
-      recent: true,
       ...over,
     });
     expect(remoteBranchIndicators(b(), null)).toEqual([]);
@@ -184,7 +181,6 @@ describe("remoteBranchIndicators", () => {
       merged: true,
       behind_base: { kind: "unknown" },
       last_commit_at: null,
-      recent: true,
       ...over,
     });
     expect(keys(remoteBranchIndicators(b(), "main"))).not.toContain("merged");

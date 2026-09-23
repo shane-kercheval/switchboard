@@ -110,8 +110,9 @@
   const triggerHoverReveal = $derived(hoverableClass("group-hover:opacity-100"));
 
   // Newest tip first, so branches still in play lead and long-abandoned ones
-  // sink; a branch with no resolvable tip time sorts last. Names break ties in
-  // code-unit order, matching the backend's choice of which branches are recent.
+  // sink; a branch with no resolvable tip time sorts last, and names break ties
+  // in code-unit order. This is the backend's ranking (`recent_branch_names`),
+  // so the rows shown before "Show older" are the ones it counted.
   function compareByRecency(
     a: BranchView | RemoteBranchView,
     b: BranchView | RemoteBranchView,
@@ -125,6 +126,21 @@
       return 1;
     }
     return a.name === b.name ? 0 : a.name < b.name ? -1 : 1;
+  }
+
+  // Mirrors the backend's `RECENT_BRANCH_LIMIT`: it counts behind-base for the
+  // same top remote-only rows, so the rows shown first carry their counts.
+  const RECENT_BRANCH_COUNT = 30;
+
+  /// The remote-only rows shown before "Show older": the RECENT_BRANCH_COUNT
+  /// most recently committed (pinned rows ranked with the rest), plus every
+  /// pinned row — the same selection the backend makes.
+  function recentNames(
+    branches: RemoteBranchView[],
+    pinned: (branch: RemoteBranchView) => boolean,
+  ): Set<string> {
+    const ranked = [...branches].sort(compareByRecency).slice(0, RECENT_BRANCH_COUNT);
+    return new Set([...ranked, ...branches.filter(pinned)].map((b) => b.name));
   }
 
   // The default branch anchors the branch list even when it has no local folder.
@@ -153,36 +169,27 @@
   );
   const visibleRemoteOnlyBranches = $derived(branchFilter === "local" ? [] : remoteOnlyBranches);
 
-  // The backend marks the recent branches (the most recently committed, plus
-  // the default and checked-out ones); the rest are the long tail a repo that
-  // never prunes accumulates, so they collapse behind one row. A selected older
-  // branch stays visible, so collapsing never hides the branch whose commits
-  // are open.
+  // Local branches are the user's own work and always list in full. Past the
+  // most recent remote-only rows is the long tail a repo that never prunes
+  // accumulates, so it collapses behind one row. Visibility is decided here,
+  // after the active filter, rather than by the backend. The default branch's
+  // remote and the selected branch always show, so collapsing never hides the
+  // branch whose commits are open.
   let showOlderBranches = $state(false);
 
-  function isOlderBranch(branch: BranchView | RemoteBranchView): boolean {
-    return !branch.recent;
-  }
-
-  const shownLocalBranches = $derived(
-    showOlderBranches
-      ? localBranches
-      : localBranches.filter((b) => !isOlderBranch(b) || isLocalSelected(b.name)),
+  const recentRemoteNames = $derived(
+    recentNames(
+      visibleRemoteOnlyBranches,
+      (b) => b.name === `origin/${repo.default_branch}` || isRemoteSelected(b.name),
+    ),
   );
   const shownRemoteOnlyBranches = $derived(
     showOlderBranches
       ? visibleRemoteOnlyBranches
-      : visibleRemoteOnlyBranches.filter((b) => !isOlderBranch(b) || isRemoteSelected(b.name)),
+      : visibleRemoteOnlyBranches.filter((b) => recentRemoteNames.has(b.name)),
   );
   const olderBranchCount = $derived(
-    localBranches.filter(isOlderBranch).length +
-      visibleRemoteOnlyBranches.filter(isOlderBranch).length,
-  );
-  const hiddenOlderCount = $derived(
-    localBranches.length +
-      visibleRemoteOnlyBranches.length -
-      shownLocalBranches.length -
-      shownRemoteOnlyBranches.length,
+    visibleRemoteOnlyBranches.filter((b) => !recentRemoteNames.has(b.name)).length,
   );
 
   onMount(() => {
@@ -196,7 +203,7 @@
   });
 
   const branchActionKeys = $derived([
-    ...shownLocalBranches.map((branch) => `local:${branch.name}`),
+    ...localBranches.map((branch) => `local:${branch.name}`),
     ...shownRemoteOnlyBranches.map((branch) => `remote:${branch.name}`),
   ]);
 
@@ -650,7 +657,7 @@
           This repository is unavailable (moved or unmounted).
         </p>
       {:else}
-        {#each shownLocalBranches as branch (branch.name)}
+        {#each localBranches as branch (branch.name)}
           {@const selected = isLocalSelected(branch.name)}
           {@const worktreePath = branch.worktree?.path ?? null}
           {@const githubUrl = branch.github_url}
@@ -899,9 +906,9 @@
           {/if}
         {/each}
 
-        {#if olderBranchCount > 0 && (showOlderBranches || hiddenOlderCount > 0)}
+        {#if olderBranchCount > 0}
           <Tooltip
-            label={`Branches outside the most recently committed ones. They don't show how far behind ${repo.default_branch ?? "the default branch"} they are: counting that for every stale branch is what makes repos with many branches slow to load.`}
+            label={`Remote branches without a local copy, past the most recently committed ones. They don't show how far behind ${repo.default_branch ?? "the default branch"} they are: counting that for every stale branch is what makes repos with many branches slow to load.`}
             delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
           >
             {#snippet trigger(props)}
@@ -914,8 +921,8 @@
                 onclick={() => (showOlderBranches = !showOlderBranches)}
               >
                 {showOlderBranches
-                  ? "Hide older branches"
-                  : `Show ${hiddenOlderCount} older ${hiddenOlderCount === 1 ? "branch" : "branches"}`}
+                  ? "Hide older remote branches"
+                  : `Show ${olderBranchCount} older remote ${olderBranchCount === 1 ? "branch" : "branches"}`}
               </button>
             {/snippet}
           </Tooltip>

@@ -19,12 +19,14 @@ use crate::model::{
     RemoteBranchView, RepoView, SyncState, WorktreeView, WorktreeWarning,
 };
 
-/// How many of the most recently committed branches of each kind (local, remote)
+/// How many of the most recently committed remote refs no local branch tracks
 /// get an exact behind-base count; see [`BehindBase`] for why the rest don't.
 pub const RECENT_BRANCH_LIMIT: usize = 30;
 
 /// Most commits the shared `merged` walk visits in one read. Past it, older
 /// branches the walk hasn't reached are reported as undetermined (no badge).
+/// Each walk holds its own repository handle while it runs, so concurrent
+/// refreshes of several very large repos each pay that memory at once.
 const MERGED_WALK_BUDGET: usize = 100_000;
 
 /// Slack on the shared walk's time bound for commits dated earlier than their
@@ -612,44 +614,31 @@ fn build_repo_view(repo: &Repository, root: PathBuf, name: String) -> Result<Rep
         .filter(|b| !tracked.contains(b.name.as_str()))
         .collect();
 
-    let local_recent =
-        recent_branch_names(&locals.iter().collect::<Vec<_>>(), &tip_times, |name| {
-            default_branch.as_deref() == Some(name) || worktrees.for_branch(name).is_some()
-        });
+    // Every local branch is counted: local branches are the user's own work,
+    // always listed in full, and usually few. The recency cut applies only to
+    // remote refs no local branch tracks — the long tail a repo that never
+    // prunes accumulates. The tree ranks that list the same way, so the rows it
+    // shows first carry their counts.
+    let local_recent: HashSet<&str> = locals.iter().map(|b| b.name.as_str()).collect();
     let default_remote = default_branch.as_deref().map(|b| format!("origin/{b}"));
     let remote_recent = recent_branch_names(&remote_only, &tip_times, |name| {
         default_remote.as_deref() == Some(name)
     });
 
-    // Older branches get `merged` from one shared walk of the default
-    // branch's history; it only needs to reach back as far as the oldest of them.
-    let older_tips: Vec<Option<Oid>> = locals
+    // Older remote refs get `merged` from one shared walk of the default
+    // branch's history. A tip whose commit can't be read can be neither dated
+    // nor found, so it's left out of the walk and stays undetermined.
+    let older_tips: HashSet<Oid> = remote_only
         .iter()
-        .filter(|b| !local_recent.contains(b.name.as_str()))
-        .chain(
-            remote_only
-                .iter()
-                .copied()
-                .filter(|b| !remote_recent.contains(b.name.as_str())),
-        )
-        .map(|b| b.tip)
+        .filter(|b| !remote_recent.contains(b.name.as_str()))
+        .filter_map(|b| b.tip)
+        .filter(|tip| tip_times.contains_key(tip))
         .collect();
-    let walk_plan = (!older_tips.is_empty()).then(|| {
-        let oldest = older_tips
-            .iter()
-            .map(|tip| tip.and_then(|t| tip_times.get(&t)).map(git2::Time::seconds))
-            .min()
-            .flatten();
-        MergedWalkPlan {
-            targets: locals
-                .iter()
-                .chain(remote_only.iter().copied())
-                .filter_map(|b| b.tip)
-                .collect(),
-            stop_before: oldest.map(|seconds| seconds.saturating_sub(COMMIT_TIME_SKEW_SECONDS)),
-        }
+    let walk_plan = (!older_tips.is_empty()).then(|| MergedWalkPlan {
+        stop_before: walk_stop_time(&older_tips, &tip_times),
+        targets: older_tips,
     });
-    let ancestry = Ancestry::new(repo, default_tip, walk_plan.as_ref(), MERGED_WALK_BUDGET);
+    let ancestry = Ancestry::new(repo, default_tip, walk_plan, MERGED_WALK_BUDGET);
     let local_branches = read_local_branches(
         repo,
         &locals,
@@ -798,6 +787,20 @@ fn recent_branch_names<'a>(
         .collect()
 }
 
+/// Where the shared walk can stop: just before the oldest of `tips` it has any
+/// date for, less a margin for skewed commit dates. `None` (no time bound)
+/// only when none of them can be dated.
+fn walk_stop_time<'a>(
+    tips: impl IntoIterator<Item = &'a Oid>,
+    tip_times: &HashMap<Oid, git2::Time>,
+) -> Option<i64> {
+    tips.into_iter()
+        .filter_map(|tip| tip_times.get(tip))
+        .map(git2::Time::seconds)
+        .min()
+        .map(|seconds| seconds.saturating_sub(COMMIT_TIME_SKEW_SECONDS))
+}
+
 fn tip_commit_at(tip: Option<Oid>, tip_times: &HashMap<Oid, git2::Time>) -> Option<String> {
     tip.and_then(|t| tip_times.get(&t))
         .and_then(|time| rfc3339(*time))
@@ -842,7 +845,6 @@ fn read_local_branches(
                 github_url,
                 worktree: worktrees.for_branch(name),
                 last_commit_at: tip_commit_at(*tip, tip_times),
-                recent,
             }
         })
         .collect();
@@ -876,7 +878,6 @@ fn read_remote_branches(
                 merged,
                 behind_base,
                 last_commit_at: tip_commit_at(*tip, tip_times),
-                recent,
             }
         })
         .collect();
@@ -1106,13 +1107,12 @@ fn sync_from_counts(repo: &Repository, local: Oid, upstream: Oid) -> SyncState {
 /// `merged` and `behind_base` against the default-branch tip, for every branch
 /// of one read.
 ///
-/// Per-branch walks are as long as the history a branch missed, so a repo full
-/// of long-abandoned branches can't afford two per branch. When any shown
-/// branch falls outside the recent set, the default branch's history is walked
-/// once up front and `merged` is read off that walk; only the recent set then
-/// pays a per-branch walk, for the behind-base count. When every branch is
-/// recent, the up-front walk is skipped — on a long history with few branches
-/// it would cost more than the short per-branch walks it replaces.
+/// A recent branch pays one per-branch ahead/behind walk, which answers both:
+/// its behind count, and `merged` (a tip is an ancestor of the default tip
+/// exactly when it has no commits of its own). Per-branch walks are as long as
+/// the history a branch missed, so older branches — the long tail a repo that
+/// never prunes accumulates — skip the count and read `merged` off one shared
+/// walk of the default branch's history instead.
 struct Ancestry<'repo> {
     repo: &'repo Repository,
     base: Option<Oid>,
@@ -1120,12 +1120,12 @@ struct Ancestry<'repo> {
 }
 
 impl<'repo> Ancestry<'repo> {
-    /// `walk_plan` is the shared walk to classify tips with, or `None` to
-    /// answer every branch with its own walks.
+    /// `walk_plan` is the shared walk for the older branches, or `None` when
+    /// there are none to classify.
     fn new(
         repo: &'repo Repository,
         base: Option<Oid>,
-        walk_plan: Option<&MergedWalkPlan>,
+        walk_plan: Option<MergedWalkPlan>,
         budget: usize,
     ) -> Self {
         let walk = base
@@ -1140,27 +1140,19 @@ impl<'repo> Ancestry<'repo> {
         let (Some(tip), Some(base)) = (tip, self.base) else {
             return (None, BehindBase::Unknown);
         };
-        // merged = this branch's tip is an ancestor of (or equal to) the default
-        // tip. A recent branch the shared walk couldn't classify falls back to
-        // its own (short) walk; an older one is left undetermined.
-        let merged = match self.walk.as_ref().and_then(|walk| walk.merged(tip)) {
-            Some(merged) => Some(merged),
-            None if tip == base => Some(true),
-            None if recent => self.repo.graph_descendant_of(base, tip).ok(),
-            None => None,
-        };
         if !recent {
+            let merged = self.walk.as_ref().and_then(|walk| walk.merged(tip));
             return (merged, BehindBase::NotComputed);
         }
-        // behind_base = commits the default has that this branch lacks. The
-        // "behind" half of ahead/behind(this, default).
-        let behind_base =
-            self.repo
-                .graph_ahead_behind(tip, base)
-                .map_or(BehindBase::Unknown, |(_, behind)| BehindBase::Count {
+        match self.repo.graph_ahead_behind(tip, base) {
+            Ok((ahead, behind)) => (
+                Some(ahead == 0),
+                BehindBase::Count {
                     commits: clamp_u32(behind),
-                });
-        (merged, behind_base)
+                },
+            ),
+            Err(_) => (None, BehindBase::Unknown),
+        }
     }
 }
 
@@ -1187,20 +1179,22 @@ struct MergedWalkPlan {
 /// searching, so a skewed history can leave a merged branch undetermined but
 /// never mislabels one.
 struct MergedWalk {
+    targets: HashSet<Oid>,
     reached: HashSet<Oid>,
     covered_history: bool,
 }
 
 impl MergedWalk {
-    fn run(repo: &Repository, base: Oid, plan: &MergedWalkPlan, budget: usize) -> Self {
+    fn run(repo: &Repository, base: Oid, plan: MergedWalkPlan, budget: usize) -> Self {
         let mut reached = HashSet::new();
         // On its own handle: loading this many commits into the read's shared
         // object cache measurably slowed every per-branch ahead/behind walk
         // after it (a 15ms walk cost ~500ms downstream on a 20k-commit repo).
         let covered_history = Repository::open(repo.path())
-            .and_then(|own| Self::walk(&own, base, plan, budget, &mut reached))
+            .and_then(|own| Self::walk(&own, base, &plan, budget, &mut reached))
             .unwrap_or(false);
         Self {
+            targets: plan.targets,
             reached,
             covered_history,
         }
@@ -1243,8 +1237,12 @@ impl MergedWalk {
         Ok(true)
     }
 
+    /// `None` for a tip the walk wasn't looking for, as well as for one it
+    /// couldn't classify.
     fn merged(&self, tip: Oid) -> Option<bool> {
-        if self.reached.contains(&tip) {
+        if !self.targets.contains(&tip) {
+            None
+        } else if self.reached.contains(&tip) {
             Some(true)
         } else if self.covered_history {
             Some(false)
@@ -2298,36 +2296,50 @@ fn is_not_found(e: &git2::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use git2::{Oid, Repository, Signature, Time};
+    use std::collections::HashMap;
+
+    use git2::{BranchType, Oid, Repository, Signature, Time};
     use tempfile::TempDir;
 
-    use super::{MergedWalk, MergedWalkPlan, github_repo_coordinates};
+    use super::{
+        MergedWalk, MergedWalkPlan, RECENT_BRANCH_LIMIT, github_repo_coordinates, list_branches,
+        recent_branch_names, tip_commit_times, walk_stop_time,
+    };
+
+    const EPOCH: i64 = 1_700_000_000;
+
+    /// An empty-tree commit dated `EPOCH + offset` seconds.
+    fn commit_at(repo: &Repository, offset: i64, parents: &[Oid]) -> Oid {
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let parents: Vec<git2::Commit<'_>> = parents
+            .iter()
+            .map(|oid| repo.find_commit(*oid).unwrap())
+            .collect();
+        let sig = Signature::new("T", "t@e", &Time::new(EPOCH + offset, 0)).unwrap();
+        repo.commit(
+            None,
+            &sig,
+            &sig,
+            &format!("c{offset}"),
+            &tree,
+            &parents.iter().collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
 
     /// A linear history of `count` empty commits, oldest first, plus one
     /// unrelated root commit.
     fn linear_history(count: i64) -> (TempDir, Repository, Vec<Oid>, Oid) {
         let dir = TempDir::new().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
-        let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
-        let mut history = Vec::new();
-        let orphan;
-        {
-            let tree = repo.find_tree(tree_id).unwrap();
-            let commit = |n: i64, parents: &[&git2::Commit<'_>]| -> Oid {
-                let sig = Signature::new("T", "t@e", &Time::new(1_700_000_000 + n, 0)).unwrap();
-                repo.commit(None, &sig, &sig, &format!("c{n}"), &tree, parents)
-                    .unwrap()
-            };
-            for n in 0..count {
-                let parents: Vec<git2::Commit<'_>> = history
-                    .last()
-                    .map(|oid| repo.find_commit(*oid).unwrap())
-                    .into_iter()
-                    .collect();
-                history.push(commit(n, &parents.iter().collect::<Vec<_>>()));
-            }
-            orphan = commit(-1, &[]);
+        let mut history: Vec<Oid> = Vec::new();
+        for n in 0..count {
+            let parents: Vec<Oid> = history.last().copied().into_iter().collect();
+            history.push(commit_at(&repo, n, &parents));
         }
+        let orphan = commit_at(&repo, -1, &[]);
         (dir, repo, history, orphan)
     }
 
@@ -2341,7 +2353,7 @@ mod tests {
     #[test]
     fn merged_walk_classifies_every_target_when_it_covers_the_history() {
         let (_dir, repo, history, orphan) = linear_history(10);
-        let walk = MergedWalk::run(&repo, history[9], &plan(&[history[1], orphan], None), 100);
+        let walk = MergedWalk::run(&repo, history[9], plan(&[history[1], orphan], None), 100);
         assert_eq!(walk.merged(history[1]), Some(true));
         assert_eq!(walk.merged(orphan), Some(false));
     }
@@ -2350,7 +2362,7 @@ mod tests {
     fn merged_walk_leaves_unreached_targets_undetermined_when_the_budget_runs_out() {
         let (_dir, repo, history, orphan) = linear_history(10);
         let targets = [history[8], history[1], orphan];
-        let walk = MergedWalk::run(&repo, history[9], &plan(&targets, None), 3);
+        let walk = MergedWalk::run(&repo, history[9], plan(&targets, None), 3);
         assert_eq!(walk.merged(history[8]), Some(true), "reached within budget");
         assert_eq!(walk.merged(history[1]), None);
         assert_eq!(walk.merged(orphan), None);
@@ -2361,12 +2373,7 @@ mod tests {
         let (_dir, repo, history, orphan) = linear_history(10);
         let history_5_time = repo.find_commit(history[5]).unwrap().time().seconds();
         let targets = [history[7], history[1], orphan];
-        let walk = MergedWalk::run(
-            &repo,
-            history[9],
-            &plan(&targets, Some(history_5_time)),
-            100,
-        );
+        let walk = MergedWalk::run(&repo, history[9], plan(&targets, Some(history_5_time)), 100);
         assert_eq!(walk.merged(history[7]), Some(true));
         assert_eq!(walk.merged(history[1]), None, "older than the bound");
         assert_eq!(walk.merged(orphan), None);
@@ -2375,15 +2382,100 @@ mod tests {
     #[test]
     fn merged_walk_is_complete_when_the_budget_ends_exactly_at_the_root() {
         let (_dir, repo, history, orphan) = linear_history(10);
-        let walk = MergedWalk::run(&repo, history[9], &plan(&[orphan], None), 10);
+        let walk = MergedWalk::run(&repo, history[9], plan(&[orphan], None), 10);
         assert_eq!(walk.merged(orphan), Some(false));
     }
 
     #[test]
     fn merged_walk_stops_early_once_every_target_is_found() {
         let (_dir, repo, history, _orphan) = linear_history(10);
-        let walk = MergedWalk::run(&repo, history[9], &plan(&[history[8]], None), 2);
+        let walk = MergedWalk::run(&repo, history[9], plan(&[history[8]], None), 2);
         assert_eq!(walk.merged(history[8]), Some(true));
+    }
+
+    #[test]
+    fn merged_walk_follows_a_merge_commit_s_second_parent() {
+        let dir = TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let root = commit_at(&repo, 0, &[]);
+        let main_side = commit_at(&repo, 10, &[root]);
+        let feature = commit_at(&repo, 20, &[root]);
+        let feature_tip = commit_at(&repo, 30, &[feature]);
+        let merge = commit_at(&repo, 40, &[main_side, feature_tip]);
+
+        let walk = MergedWalk::run(&repo, merge, plan(&[feature], None), 100);
+        assert_eq!(walk.merged(feature), Some(true));
+    }
+
+    #[test]
+    fn merged_walk_leaves_a_merged_tip_behind_a_skewed_date_undetermined() {
+        let dir = TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let root = commit_at(&repo, 0, &[]);
+        let main_side = commit_at(&repo, 1_000, &[root]);
+        // Merged through the second parent, but dated before the bound (as an
+        // imported or clock-skewed commit would be).
+        let feature = commit_at(&repo, -1_000, &[root]);
+        let merge = commit_at(&repo, 2_000, &[main_side, feature]);
+
+        let walk = MergedWalk::run(&repo, merge, plan(&[feature], Some(EPOCH + 500)), 100);
+        assert_eq!(walk.merged(feature), None, "never a confident false");
+    }
+
+    #[test]
+    fn merged_walk_answers_nothing_for_a_tip_it_was_not_looking_for() {
+        let (_dir, repo, history, orphan) = linear_history(3);
+        let walk = MergedWalk::run(&repo, history[2], plan(&[history[0]], None), 100);
+        assert_eq!(walk.merged(orphan), None);
+    }
+
+    #[test]
+    fn walk_stop_time_ignores_tips_it_cannot_date() {
+        let dated = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        let undated = Oid::from_str("2222222222222222222222222222222222222222").unwrap();
+        let tip_times = HashMap::from([(dated, Time::new(EPOCH, 0))]);
+        assert_eq!(
+            walk_stop_time(&[undated, dated], &tip_times),
+            Some(EPOCH - super::COMMIT_TIME_SKEW_SECONDS)
+        );
+        assert_eq!(walk_stop_time(&[undated], &tip_times), None);
+    }
+
+    /// The UI picks its visible rows with this same ranking (`compareByRecency`
+    /// in `GitRepoNode.svelte`, pinned by a matching component test): newest
+    /// tip first, ties by code-unit name order, undated tips last, the top
+    /// `RECENT_BRANCH_LIMIT` taken including pinned branches, then any pinned
+    /// branch added.
+    #[test]
+    fn recent_branch_names_breaks_ties_by_name_and_ranks_undated_tips_last() {
+        let dir = TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let tip = repo.find_commit(commit_at(&repo, 0, &[])).unwrap();
+        for i in 0..=RECENT_BRANCH_LIMIT {
+            repo.branch(&format!("b{i:02}"), &tip, false).unwrap();
+        }
+        for name in ["a-undated", "z-pinned-undated"] {
+            std::fs::write(
+                repo.path().join("refs/heads").join(name),
+                "0123456789abcdef0123456789abcdef01234567\n",
+            )
+            .unwrap();
+        }
+        let branches = list_branches(&repo, BranchType::Local).unwrap();
+        let tip_times = tip_commit_times(&repo, branches.iter());
+
+        let recent =
+            recent_branch_names(&branches.iter().collect::<Vec<_>>(), &tip_times, |name| {
+                name == "z-pinned-undated"
+            });
+
+        let mut expected: Vec<String> = (0..RECENT_BRANCH_LIMIT)
+            .map(|i| format!("b{i:02}"))
+            .collect();
+        expected.push("z-pinned-undated".to_owned());
+        let mut actual: Vec<&str> = recent.into_iter().collect();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
     #[test]

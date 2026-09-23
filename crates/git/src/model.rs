@@ -85,9 +85,8 @@ pub struct BranchView {
     /// branch's own upstream).
     pub behind_base: BehindBase,
     /// Whether this branch's tip is an ancestor of the default branch tip
-    /// ("done — safe to delete"). `None` when the default branch can't be
-    /// resolved, or for an older branch the shared history walk didn't reach
-    /// before its budget ran out or it failed.
+    /// ("done — safe to delete"). `None` when the default branch (or this tip)
+    /// can't be resolved.
     pub merged: Option<bool>,
     /// The branch had an upstream that no longer exists (the remote branch was
     /// deleted) — a stale-branch cleanup signal.
@@ -100,9 +99,6 @@ pub struct BranchView {
     /// Committer timestamp of the branch tip, as RFC-3339. `None` when the tip
     /// can't be resolved to a commit.
     pub last_commit_at: Option<String>,
-    /// In the recent set (see [`BehindBase`]) — the rows a list shows before
-    /// "show older". Decided independently of whether the counts resolved.
-    pub recent: bool,
 }
 
 /// A branch's position relative to its own upstream. Each variant maps 1:1 to an
@@ -142,10 +138,14 @@ pub struct RemoteBranchView {
     /// GitHub-owned remote.
     pub github_url: Option<String>,
     /// Already an ancestor of the default branch? ("stale remote, safe to
-    /// delete"). `None` when the default branch can't be resolved, when an
-    /// older ref's history walk was cut short, or when a local branch tracks
-    /// this ref — that ref renders as the local branch's row, which carries its
-    /// own signals.
+    /// delete"). `None` when the default branch (or this tip) can't be
+    /// resolved, or when a local branch tracks this ref — that ref renders as
+    /// the local branch's row, which carries its own signals. For a ref outside
+    /// the recent set (see [`BehindBase`]) this is effectively "`true` or
+    /// undetermined": `Some(false)` only when the shared history walk covered
+    /// the entire history, and `None` when it stopped first — at the oldest such
+    /// ref's date, at its commit budget, or on an error — or when the tip's
+    /// commit can't be read.
     pub merged: Option<bool>,
     /// Commits the default branch has that this remote ref lacks.
     /// `NotComputed` for a ref a local branch tracks, for the same reason.
@@ -153,9 +153,6 @@ pub struct RemoteBranchView {
     /// Committer timestamp of the ref's tip, as RFC-3339. `None` when the tip
     /// can't be resolved to a commit.
     pub last_commit_at: Option<String>,
-    /// In the recent set among the remote refs no local branch tracks — the
-    /// ones a tree shows as rows of their own. Always `false` for a tracked ref.
-    pub recent: bool,
 }
 
 /// How far behind the default branch a branch is.
@@ -163,9 +160,9 @@ pub struct RemoteBranchView {
 /// Counting is a history walk from the default tip back to where the branch
 /// forked, so a long-abandoned branch costs as much as the history it missed.
 /// Repos that never prune accumulate hundreds of those, so the count is only
-/// taken for the recent set — the default branch, branches checked out in a
-/// worktree, and the [`RECENT_BRANCH_LIMIT`](crate::RECENT_BRANCH_LIMIT) most
-/// recently committed local branches and remote refs no local branch tracks.
+/// taken for the recent set — every local branch, plus the
+/// [`RECENT_BRANCH_LIMIT`](crate::RECENT_BRANCH_LIMIT) most recently committed
+/// remote refs no local branch tracks and the default branch's remote ref.
 /// Everything else is `NotComputed`, which is deliberately distinct from
 /// `Unknown`: the answer exists, it just wasn't worth the walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

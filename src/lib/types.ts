@@ -711,9 +711,6 @@ export type BranchView = {
   github_url: string | null;
   worktree: WorktreeView | null;
   last_commit_at: string | null;
-  // In the backend's recent set — shown before "show older". Independent of
-  // whether the behind-base count resolved.
-  recent: boolean;
 };
 
 // Remote branches carry only the cleanup status signals (merged, behind_base),
@@ -725,8 +722,6 @@ export type RemoteBranchView = {
   merged: boolean | null;
   behind_base: BehindBase;
   last_commit_at: string | null;
-  // Always false for a ref a local branch tracks (it renders as that branch).
-  recent: boolean;
 };
 
 export type RepoView = {

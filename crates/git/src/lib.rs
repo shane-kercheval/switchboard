@@ -40,10 +40,11 @@
 //!
 //! Per-branch ancestry against the default branch is the expensive part of a
 //! read: each is a history walk as long as the branch is stale, and repos that
-//! never prune carry hundreds of stale branches. So `merged` for branches
-//! outside the recent set comes from one shared walk of the default branch's
-//! history instead of one walk per branch, and the behind-base count is skipped
-//! for them entirely ([`BehindBase::NotComputed`]). That walk is bounded — it
+//! never prune carry hundreds of stale remote branches. Every local branch is
+//! still counted, but `merged` for remote refs outside the recent set comes
+//! from one shared walk of the default branch's history instead of one walk
+//! per branch, and the behind-base count is skipped for them entirely
+//! ([`BehindBase::NotComputed`]). That walk is bounded — it
 //! reaches back only as far as the oldest such branch, and never past a fixed
 //! commit budget — so on a very long history an older branch it didn't reach
 //! reports `merged: None` rather than a guess.

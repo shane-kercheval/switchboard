@@ -495,7 +495,7 @@ fn update_refs(dir: &Path, refs: &[(String, String)]) {
 }
 
 #[test]
-fn older_branches_skip_the_behind_count_but_keep_merged() {
+fn every_local_branch_is_counted_but_older_remote_refs_skip_the_count() {
     let repo = TempDir::new().unwrap();
     init_repo(repo.path());
     write(repo.path(), "README.md", "base\n");
@@ -519,9 +519,9 @@ fn older_branches_skip_the_behind_count_but_keep_merged() {
     git(repo.path(), &["switch", "-q", "main"]);
     git(repo.path(), &["branch", "-q", "-D", "fresh"]);
 
-    // Enough newer branches (local and remote) to fill the recent set, so
-    // everything older falls outside it — including `main`, `origin/main`, and
-    // a checked-out branch, which are pinned regardless of age.
+    // Enough newer branches (local and remote) to fill the recent set. Older
+    // remote refs fall outside it; `origin/main` is pinned regardless of age,
+    // and every local branch is counted however old.
     let mut refs = Vec::new();
     for i in 0..RECENT_BRANCH_LIMIT {
         refs.push((format!("refs/heads/recent-{i:02}"), fresh.clone()));
@@ -555,18 +555,14 @@ fn older_branches_skip_the_behind_count_but_keep_merged() {
     };
 
     let recent_local = branch_view(&view, "recent-00");
-    assert!(recent_local.recent);
     assert_eq!(recent_local.behind_base, BehindBase::Count { commits: 0 });
-    // Recent branches read `merged` off the same shared walk as older ones.
     assert_eq!(recent_local.merged, Some(false));
     let main = branch_view(&view, "main");
-    assert!(main.recent, "the default branch is always recent");
     assert_eq!(main.behind_base, BehindBase::Count { commits: 0 });
     assert_eq!(main.merged, Some(true));
     assert_eq!(
         branch_view(&view, "old-checked-out").behind_base,
-        BehindBase::Count { commits: 1 },
-        "a checked-out branch is always counted"
+        BehindBase::Count { commits: 1 }
     );
     assert_eq!(
         remote("origin/main").behind_base,
@@ -575,11 +571,10 @@ fn older_branches_skip_the_behind_count_but_keep_merged() {
     );
 
     let old_merged = branch_view(&view, "old-merged");
-    assert!(!old_merged.recent);
-    assert_eq!(old_merged.behind_base, BehindBase::NotComputed);
+    assert_eq!(old_merged.behind_base, BehindBase::Count { commits: 1 });
     assert_eq!(old_merged.merged, Some(true));
     let old_unmerged = branch_view(&view, "old-unmerged");
-    assert_eq!(old_unmerged.behind_base, BehindBase::NotComputed);
+    assert_eq!(old_unmerged.behind_base, BehindBase::Count { commits: 1 });
     assert_eq!(old_unmerged.merged, Some(false));
     assert_eq!(
         old_unmerged.last_commit_at.as_deref(),
@@ -587,11 +582,9 @@ fn older_branches_skip_the_behind_count_but_keep_merged() {
     );
 
     let recent_remote = remote("origin/recent-00");
-    assert!(recent_remote.recent);
     assert_eq!(recent_remote.behind_base, BehindBase::Count { commits: 0 });
     assert_eq!(recent_remote.merged, Some(false));
     let remote_merged = remote("origin/old-merged");
-    assert!(!remote_merged.recent);
     assert_eq!(remote_merged.behind_base, BehindBase::NotComputed);
     assert_eq!(remote_merged.merged, Some(true));
     let remote_unmerged = remote("origin/old-unmerged");
@@ -671,18 +664,20 @@ fn tracked_remotes_do_not_crowd_remote_only_branches_out_of_the_recent_set() {
     };
 
     let colleague = remote("origin/colleague");
-    assert!(colleague.recent, "the only remote-only ref is recent");
-    assert_eq!(colleague.behind_base, BehindBase::Count { commits: 1 });
+    assert_eq!(
+        colleague.behind_base,
+        BehindBase::Count { commits: 1 },
+        "the only remote-only ref is in the recent set"
+    );
     assert_eq!(colleague.merged, Some(true));
 
     let tracked = remote("origin/tracked-00");
-    assert!(!tracked.recent);
     assert_eq!(tracked.behind_base, BehindBase::NotComputed);
     assert_eq!(tracked.merged, None);
 }
 
 #[test]
-fn older_branches_are_marked_even_when_the_default_branch_is_unresolvable() {
+fn many_branches_with_an_unresolvable_default_report_unknown_not_skipped() {
     let repo = TempDir::new().unwrap();
     git(repo.path(), &["init", "-q", "-b", "trunk"]);
     git(repo.path(), &["config", "user.email", "test@example.com"]);
@@ -699,14 +694,50 @@ fn older_branches_are_marked_even_when_the_default_branch_is_unresolvable() {
 
     let view = read_repo(repo.path()).unwrap();
     assert_eq!(view.default_branch, None);
+    // An older branch's count isn't "skipped" when there's nothing to count
+    // against: it's unknown, like a recent branch's.
     let abandoned = branch_view(&view, "abandoned");
-    assert!(
-        !abandoned.recent,
-        "collapse doesn't depend on a resolvable default"
-    );
     assert_eq!(abandoned.behind_base, BehindBase::Unknown);
     assert_eq!(abandoned.merged, None);
-    assert!(branch_view(&view, "recent-00").recent);
+    assert_eq!(
+        branch_view(&view, "recent-00").behind_base,
+        BehindBase::Unknown
+    );
+}
+
+#[test]
+fn every_local_branch_is_counted_however_old() {
+    let (repo, base, _main_tip, fresh) = repo_with_fresh_commit();
+    fill_recent_set(repo.path(), "refs/heads/newer-", &fresh);
+    update_refs(repo.path(), &[("refs/heads/abandoned".to_owned(), base)]);
+
+    let view = read_repo(repo.path()).unwrap();
+    let abandoned = branch_view(&view, "abandoned");
+    assert_eq!(abandoned.behind_base, BehindBase::Count { commits: 1 });
+    assert_eq!(abandoned.merged, Some(true));
+}
+
+#[test]
+fn an_unreadable_branch_tip_is_undetermined_not_unmerged() {
+    let (repo, _base, _main_tip, fresh) = repo_with_fresh_commit();
+    fill_recent_set(repo.path(), "refs/remotes/origin/recent-", &fresh);
+    // An older remote ref whose commit is gone: it can't be dated or found by
+    // the walk, even though the walk covers the whole (tiny) history.
+    std::fs::write(
+        repo.path().join(".git/refs/remotes/origin/ghost"),
+        "0123456789abcdef0123456789abcdef01234567\n",
+    )
+    .unwrap();
+
+    let view = read_repo(repo.path()).unwrap();
+    let ghost = view
+        .remote_branches
+        .iter()
+        .find(|b| b.name == "origin/ghost")
+        .expect("origin/ghost should be listed");
+    assert_eq!(ghost.merged, None);
+    assert_eq!(ghost.behind_base, BehindBase::NotComputed);
+    assert_eq!(ghost.last_commit_at, None);
 }
 
 #[test]
@@ -721,21 +752,29 @@ fn a_history_walk_that_fails_partway_leaves_unreached_branches_undetermined() {
     }
     git(
         repo.path(),
-        &["switch", "-q", "-c", "old-unmerged", &main_commits[0]],
+        &["switch", "-q", "-c", "side", &main_commits[0]],
     );
     write(repo.path(), "side.txt", "side\n");
     commit_all_at(repo.path(), "side", 1_700_000_005);
+    let side = git(repo.path(), &["rev-parse", "HEAD"]);
     git(repo.path(), &["switch", "-q", "main"]);
+    git(repo.path(), &["branch", "-q", "-D", "side"]);
     git(repo.path(), &["switch", "-q", "-c", "fresh"]);
     write(repo.path(), "fresh.txt", "fresh\n");
     commit_all_at(repo.path(), "fresh", 1_700_001_000);
     let fresh = git(repo.path(), &["rev-parse", "HEAD"]);
     git(repo.path(), &["switch", "-q", "main"]);
     git(repo.path(), &["branch", "-q", "-D", "fresh"]);
-    fill_recent_set(repo.path(), "refs/heads/recent-", &fresh);
+    fill_recent_set(repo.path(), "refs/remotes/origin/recent-", &fresh);
     update_refs(
         repo.path(),
-        &[("refs/heads/old-merged".to_owned(), main_commits[3].clone())],
+        &[
+            (
+                "refs/remotes/origin/old-merged".to_owned(),
+                main_commits[3].clone(),
+            ),
+            ("refs/remotes/origin/old-unmerged".to_owned(), side),
+        ],
     );
     // Remove a commit between the merged branch and the fork point, so the walk
     // from main reaches `old-merged` and then fails.
@@ -749,13 +788,19 @@ fn a_history_walk_that_fails_partway_leaves_unreached_branches_undetermined() {
     .unwrap();
 
     let view = read_repo(repo.path()).unwrap();
+    let remote = |name: &str| {
+        view.remote_branches
+            .iter()
+            .find(|b| b.name == name)
+            .unwrap_or_else(|| panic!("remote {name:?} not listed"))
+    };
     assert_eq!(
-        branch_view(&view, "old-merged").merged,
+        remote("origin/old-merged").merged,
         Some(true),
         "reached before the failure"
     );
     assert_eq!(
-        branch_view(&view, "old-unmerged").merged,
+        remote("origin/old-unmerged").merged,
         None,
         "never a confident \"not merged\" from a partial walk"
     );
@@ -763,13 +808,20 @@ fn a_history_walk_that_fails_partway_leaves_unreached_branches_undetermined() {
 
 #[test]
 fn shallow_clones_classify_older_branches() {
-    let (origin, base, main_tip, fresh) = repo_with_fresh_commit();
+    let (origin, base, _main_tip, fresh) = repo_with_fresh_commit();
     git(origin.path(), &["switch", "-q", "-c", "unmerged", &base]);
     write(origin.path(), "side.txt", "side\n");
     commit_all_at(origin.path(), "side", 1_700_000_010);
     git(origin.path(), &["switch", "-q", "main"]);
+    // Two more main commits, so a depth-3 clone cuts main's history off and
+    // `merged` sits behind the tip the walk starts from.
+    write(origin.path(), "main.txt", "main 3\n");
+    commit_all_at(origin.path(), "main 3", 1_700_000_030);
+    let merged = git(origin.path(), &["rev-parse", "HEAD"]);
+    write(origin.path(), "main.txt", "main 4\n");
+    commit_all_at(origin.path(), "main 4", 1_700_000_040);
     fill_recent_set(origin.path(), "refs/heads/recent-", &fresh);
-    update_refs(origin.path(), &[("refs/heads/merged".to_owned(), main_tip)]);
+    update_refs(origin.path(), &[("refs/heads/merged".to_owned(), merged)]);
 
     let clone = TempDir::new().unwrap();
     let url = format!("file://{}", origin.path().display());
@@ -779,7 +831,7 @@ fn shallow_clones_classify_older_branches() {
             "clone",
             "-q",
             "--depth",
-            "1",
+            "3",
             "--no-single-branch",
             &url,
             ".",
@@ -793,7 +845,11 @@ fn shallow_clones_classify_older_branches() {
             .find(|b| b.name == name)
             .unwrap_or_else(|| panic!("remote {name:?} not listed"))
     };
-    assert!(!remote("origin/merged").recent);
+    assert_eq!(
+        remote("origin/merged").behind_base,
+        BehindBase::NotComputed,
+        "outside the recent set, so classified by the shared walk"
+    );
     assert_eq!(remote("origin/merged").merged, Some(true));
     assert_eq!(remote("origin/unmerged").merged, Some(false));
 }

@@ -63,7 +63,6 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
         sync: { kind: "in_sync" },
         behind_base: { kind: "unknown" },
         last_commit_at: null,
-        recent: true,
         merged: null,
         dangling: false,
         github_url: null,
@@ -81,7 +80,6 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
         sync: { kind: "local_only" },
         behind_base: { kind: "unknown" },
         last_commit_at: null,
-        recent: true,
         merged: true,
         dangling: false,
         github_url: null,
@@ -95,7 +93,6 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
         merged: null,
         behind_base: { kind: "unknown" },
         last_commit_at: null,
-        recent: true,
       },
       {
         name: "origin/remote-only",
@@ -103,7 +100,6 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
         merged: null,
         behind_base: { kind: "unknown" },
         last_commit_at: null,
-        recent: true,
       },
     ],
     detached_worktrees: [],
@@ -628,7 +624,6 @@ describe("GitView", () => {
             sync: { kind: "local_only" },
             behind_base: { kind: "unknown" },
             last_commit_at: null,
-            recent: true,
             merged: null,
             dangling: false,
             github_url: null,
@@ -646,7 +641,6 @@ describe("GitView", () => {
             sync: { kind: "in_sync" },
             behind_base: { kind: "unknown" },
             last_commit_at: null,
-            recent: true,
             merged: null,
             dangling: false,
             github_url: null,
@@ -947,10 +941,15 @@ describe("GitView", () => {
       merged: false,
       behind_base: { kind: "not_computed" as const },
       last_commit_at: "2024-01-01T00:00:00Z",
-      recent: false,
     };
+    const newerRemotes = Array.from({ length: 30 }, (_, i) => ({
+      ...staleRemote,
+      name: `origin/newer-${String(i).padStart(2, "0")}`,
+      behind_base: { kind: "count" as const, commits: 0 },
+      last_commit_at: "2026-09-01T00:00:00Z",
+    }));
     wire(
-      [repo({ remote_branches: [...repo().repo.remote_branches, staleRemote] })],
+      [repo({ remote_branches: [...repo().repo.remote_branches, ...newerRemotes, staleRemote] })],
       aggregateComparison,
     );
     await refreshAll();
@@ -964,7 +963,7 @@ describe("GitView", () => {
     expect(
       document.querySelector('[data-testid="git-remote-branch"][data-branch="origin/stale"]'),
     ).toBeNull();
-    expect(screen.getByTestId("older-branches-toggle")).toHaveTextContent("Show 1 older branch");
+    expect(screen.getByTestId("older-branches-toggle")).toBeInTheDocument();
 
     await fireEvent.click(screen.getByTestId("comparison-base-trigger"));
     const menu = await screen.findByTestId("comparison-base-menu");

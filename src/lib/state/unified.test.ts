@@ -6,6 +6,7 @@ import {
   copyTextOf,
   groupRenderBlocks,
   lastAnswerTextOf,
+  recentSendsStartIndex,
   type RenderBlock,
   type UnifiedRow,
 } from "./unified";
@@ -542,6 +543,68 @@ describe("buildUnifiedRows: system markers (compaction)", () => {
       return rows.find((r) => r.kind === "system_marker")!.key;
     };
     expect(keyOf("parse-1-uuid")).toBe(keyOf("parse-2-uuid"));
+  });
+});
+
+describe("recentSendsStartIndex", () => {
+  function exchange(sendId: string, second: number, pending?: true): Turn[] {
+    const at = `2026-05-16T00:00:${String(second).padStart(2, "0")}Z`;
+    const prompt = userTurn(`u-${sendId}`, AGENT_A, at, "hi", sendId, pending);
+    return pending ? [prompt] : [prompt, agentTurn(`a-${sendId}`, AGENT_A, at, sendId)];
+  }
+  function indexOfUser(blocks: RenderBlock[], sendId: string): number {
+    return blocks.findIndex((b) =>
+      b.kind === "fanout" ? b.send_id === sendId : b.row.key === `u:${sendId}`,
+    );
+  }
+
+  it("starts at the block holding the count-th most recent send", () => {
+    const blocks = groupRenderBlocks(
+      buildUnifiedRows(
+        [...exchange("s1", 0), ...exchange("s2", 1), ...exchange("s3", 2), ...exchange("s4", 3)],
+        [],
+      ),
+    );
+    expect(recentSendsStartIndex(blocks, 3)).toBe(indexOfUser(blocks, "s2"));
+    expect(recentSendsStartIndex(blocks, 1)).toBe(indexOfUser(blocks, "s4"));
+  });
+
+  it("starts at the oldest send when there are fewer sends than the count", () => {
+    const blocks = groupRenderBlocks(
+      buildUnifiedRows(
+        // A response with no prompt of its own (imported history) precedes the send.
+        [agentTurn("a-orphan", AGENT_A, "2026-05-16T00:00:00Z"), ...exchange("s1", 1)],
+        [],
+      ),
+    );
+    expect(recentSendsStartIndex(blocks, 3)).toBe(indexOfUser(blocks, "s1"));
+    expect(indexOfUser(blocks, "s1")).toBeGreaterThan(0);
+  });
+
+  it("is empty when no send has started", () => {
+    const blocks = groupRenderBlocks(
+      buildUnifiedRows([agentTurn("a-orphan", AGENT_A, "2026-05-16T00:00:00Z")], []),
+    );
+    expect(recentSendsStartIndex(blocks, 3)).toBe(blocks.length);
+  });
+
+  it("skips a send nothing has started but counts a partially started fan-out", () => {
+    const blocks = groupRenderBlocks(
+      buildUnifiedRows(
+        [
+          ...exchange("s1", 0),
+          ...exchange("s2", 1),
+          // Fan-out: A has started, B is still queued behind other work.
+          userTurn("u-s3a", AGENT_A, "2026-05-16T00:00:02Z", "fan", "s3"),
+          userTurn("u-s3b", AGENT_B, "2026-05-16T00:00:02Z", "fan", "s3", true),
+          agentTurn("a-s3", AGENT_A, "2026-05-16T00:00:02Z", "s3"),
+          ...exchange("s4", 3, true),
+        ],
+        [],
+      ),
+      [AGENT_A, AGENT_B],
+    );
+    expect(recentSendsStartIndex(blocks, 2)).toBe(indexOfUser(blocks, "s2"));
   });
 });
 

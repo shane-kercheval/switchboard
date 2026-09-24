@@ -71,6 +71,8 @@ export function userTurn(opts: {
   text: string;
   at?: string;
   sendId?: string;
+  /** Queued: accepted but not started on this agent. */
+  pending?: true;
 }): Turn {
   return {
     role: "user",
@@ -79,7 +81,35 @@ export function userTurn(opts: {
     started_at: opts.at ?? "2026-05-16T00:00:00Z",
     text: opts.text,
     ...(opts.sendId ? { send_id: opts.sendId } : {}),
+    ...(opts.pending ? { pending: opts.pending } : {}),
   };
+}
+
+/** `count` short exchanges (prompt + one-line answer) for `agentId`, stamped after
+ * every other fixture timestamp. Nothing in them clips or toggles, so specs append
+ * them to push the message under test out of the recent-sends range (which opens
+ * expanded) without adding competing toggles. */
+export function paddingSends(agentId: string, count: number): Turn[] {
+  return Array.from({ length: count }, (_, i): Turn[] => {
+    const at = `2026-05-16T01:00:${String(i).padStart(2, "0")}Z`;
+    return [
+      userTurn({
+        id: `pad-user-${i}-${agentId}`,
+        agentId,
+        text: "padding",
+        at,
+        sendId: `pad-send-${i}-${agentId}`,
+      }),
+      agentTurn({
+        id: `pad-agent-${i}-${agentId}`,
+        agentId,
+        at,
+        endedAt: at,
+        sendId: `pad-send-${i}-${agentId}`,
+        items: [textItem("padding reply")],
+      }),
+    ];
+  }).flat();
 }
 
 export function agentTurn(opts: {
@@ -91,6 +121,8 @@ export function agentTurn(opts: {
   endedAt?: string;
   sendId?: string;
   model?: string;
+  /** The harness's durable message id — what makes a reply pinnable. */
+  hydrationKey?: string;
 }): AgentTurn {
   return {
     role: "agent",
@@ -102,5 +134,6 @@ export function agentTurn(opts: {
     ...(opts.endedAt ? { ended_at: opts.endedAt } : {}),
     ...(opts.sendId ? { send_id: opts.sendId } : {}),
     ...(opts.model ? { model: opts.model } : {}),
+    ...(opts.hydrationKey ? { hydration_key: opts.hydrationKey } : {}),
   };
 }

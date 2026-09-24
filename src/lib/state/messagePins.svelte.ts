@@ -313,9 +313,20 @@ export function dismissPinMutationError(projectId: ProjectId): void {
   ensureState(projectId).mutationError = null;
 }
 
+/// Whether a message's identity — its canonical key or any alias — is among the
+/// pinned keys, as `isPinnedKey` reports them. The one place a message is
+/// matched against pins: a single lookup scans the pin list, a batched caller
+/// builds a set once and passes its `has`.
+export function identityPinnedBy(
+  identity: PinnableMessageIdentity,
+  isPinnedKey: (key: string) => boolean,
+): boolean {
+  return identityKeys(identity).some(isPinnedKey);
+}
+
 export function isMessagePinned(projectId: ProjectId, identity: PinnableMessageIdentity): boolean {
-  const keys = identityKeys(identity);
-  return pinsFor(projectId).some((pin) => keys.includes(pin.key));
+  const pins = pinsFor(projectId);
+  return identityPinnedBy(identity, (key) => pins.some((pin) => pin.key === key));
 }
 
 export function isPinCollapsed(projectId: ProjectId, key: string): boolean {

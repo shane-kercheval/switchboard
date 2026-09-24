@@ -5,8 +5,7 @@
 //!
 //! - **Branch-level** ([`BranchView`]): sync-vs-upstream, behind-base,
 //!   merged-into-default, dangling — computed for *every* local branch whether
-//!   or not it's checked out anywhere. The one exception is the behind-base
-//!   *count*, which is only walked for the recent set (see [`BehindBase`]).
+//!   or not it's checked out anywhere.
 //! - **Worktree-level** ([`WorktreeView`]): uncommitted changes and the
 //!   orphaned/prunable warnings — only present for a branch that is checked out.
 //!
@@ -143,7 +142,8 @@ pub struct RemoteBranchView {
     /// the local branch's row, which carries its own signals. For a ref outside
     /// the recent set (see [`BehindBase`]) this is effectively "`true` or
     /// undetermined": `Some(false)` only when the shared history walk covered
-    /// the entire history, and `None` when it stopped first — at the oldest such
+    /// the entire locally available history (a shallow clone's boundary counts
+    /// as its end), and `None` when it stopped first — at the oldest such
     /// ref's date, at its commit budget, or on an error — or when the tip's
     /// commit can't be read.
     pub merged: Option<bool>,

@@ -614,12 +614,10 @@ fn build_repo_view(repo: &Repository, root: PathBuf, name: String) -> Result<Rep
         .filter(|b| !tracked.contains(b.name.as_str()))
         .collect();
 
-    // Every local branch is counted: local branches are the user's own work,
-    // always listed in full, and usually few. The recency cut applies only to
-    // remote refs no local branch tracks — the long tail a repo that never
-    // prunes accumulates. The tree ranks that list the same way, so the rows it
-    // shows first carry their counts.
-    let local_recent: HashSet<&str> = locals.iter().map(|b| b.name.as_str()).collect();
+    // Local branches are all counted (see `read_local_branches`). The recency
+    // cut applies only to remote refs no local branch tracks — the long tail a
+    // repo that never prunes accumulates. The tree ranks that list the same way,
+    // so the rows it shows first carry their counts.
     let default_remote = default_branch.as_deref().map(|b| format!("origin/{b}"));
     let remote_recent = recent_branch_names(&remote_only, &tip_times, |name| {
         default_remote.as_deref() == Some(name)
@@ -643,7 +641,6 @@ fn build_repo_view(repo: &Repository, root: PathBuf, name: String) -> Result<Rep
         repo,
         &locals,
         &upstreams,
-        &local_recent,
         &ancestry,
         &tip_times,
         &worktrees,
@@ -810,15 +807,13 @@ fn rfc3339(time: git2::Time) -> Option<String> {
     commit_datetime(time).map(|datetime| datetime.to_rfc3339())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each is a distinct per-read index built once in build_repo_view"
-)]
+/// Every local branch gets its full status, including an exact behind-base
+/// count: local branches are the user's own work, always listed in full, and
+/// usually few.
 fn read_local_branches(
     repo: &Repository,
     branches: &[ListedBranch<'_>],
     upstreams: &[Upstream],
-    recent: &HashSet<&str>,
     ancestry: &Ancestry<'_>,
     tip_times: &HashMap<Oid, git2::Time>,
     worktrees: &Worktrees,
@@ -833,8 +828,7 @@ fn read_local_branches(
             } else {
                 local_branch_github_url(repo, github_remotes, branch)
             };
-            let recent = recent.contains(name.as_str());
-            let (merged, behind_base) = ancestry.signals(*tip, recent);
+            let (merged, behind_base) = ancestry.signals(*tip, true);
             BranchView {
                 name: name.clone(),
                 upstream: upstream.name.clone(),
@@ -1173,7 +1167,8 @@ struct MergedWalkPlan {
 /// commits regardless. (libgit2's own time-sorted revwalk traverses the entire
 /// history before yielding its first commit, which is why this walk is ours.)
 /// A target it reached is merged. A target it didn't reach is unmerged only if
-/// the walk exhausted the history; if it stopped at the time bound or the
+/// the walk exhausted the history (a shallow clone's boundary counts as the
+/// end of history, as it does for git itself); if it stopped at the time bound or the
 /// budget, or failed partway, that target is undetermined — never a confident
 /// "not merged" from a partial walk. Commit dates only decide where to stop
 /// searching, so a skewed history can leave a merged branch undetermined but
@@ -2441,11 +2436,13 @@ mod tests {
         assert_eq!(walk_stop_time(&[undated], &tip_times), None);
     }
 
-    /// The UI picks its visible rows with this same ranking (`compareByRecency`
+    /// The UI mirrors this ranking to pick its visible rows (`compareByRecency`
     /// in `GitRepoNode.svelte`, pinned by a matching component test): newest
-    /// tip first, ties by code-unit name order, undated tips last, the top
-    /// `RECENT_BRANCH_LIMIT` taken including pinned branches, then any pinned
-    /// branch added.
+    /// tip first, ties by name, undated tips last, the top `RECENT_BRANCH_LIMIT`
+    /// taken including pinned branches, then any pinned branch added. Malformed
+    /// commit data (a date the UI can't parse, a tie between non-BMP names) can
+    /// make the two disagree at the edge; the cost is a shown row without a
+    /// behind count.
     #[test]
     fn recent_branch_names_breaks_ties_by_name_and_ranks_undated_tips_last() {
         let dir = TempDir::new().unwrap();

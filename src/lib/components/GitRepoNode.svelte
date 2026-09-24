@@ -111,8 +111,10 @@
 
   // Newest tip first, so branches still in play lead and long-abandoned ones
   // sink; a branch with no resolvable tip time sorts last, and names break ties
-  // in code-unit order. This is the backend's ranking (`recent_branch_names`),
-  // so the rows shown before "Show older" are the ones it counted.
+  // in code-unit order. This mirrors the backend's ranking
+  // (`recent_branch_names`), so the rows shown before "Show older" are the ones
+  // it counted; malformed commit data can make the two disagree at the edge,
+  // costing at most a shown row without a behind count.
   function compareByRecency(
     a: BranchView | RemoteBranchView,
     b: BranchView | RemoteBranchView,

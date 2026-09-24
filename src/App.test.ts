@@ -4530,22 +4530,14 @@ describe("App", () => {
       ended_at: "2026-05-20T00:00:01Z",
       usage: null,
     });
-    // The user is elsewhere when the mode clears itself, so it must not pull
-    // focus into the returning compose box.
-    const toggle = screen.getByTestId("reading-mode-toggle");
-    toggle.focus();
     fireTo(channel, { type: "agent_idle", agent_id: "ag-1" });
 
     await waitFor(() => expect(screen.getByTestId("compose-box")).toBeInTheDocument());
     // The flush ran and cleared, but stayed silent — a cancel is something the
     // user did while present.
     expect(invokeMock.mock.calls.slice(enabledAt).some(([c]) => c === "notify")).toBe(false);
-    // Long enough for a focus request that waits a tick before bumping, and for
-    // the composer's frame-delayed mount focus, to have landed if either fired.
-    await new Promise(requestAnimationFrame);
-    await new Promise(requestAnimationFrame);
-    await tick();
-    expect(toggle).toHaveFocus();
+    // The agents are done, so the user is back to type.
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
   });
 
   it("stays on for a project that is already quiet", async () => {

@@ -124,20 +124,15 @@
     agents,
     focusOnMount = false,
     focusRequest = 0,
-    focusFormRequest = 0,
     onConfigurePrompts,
   }: {
     projectId: ProjectId;
     agents: AgentRecord[];
     focusOnMount?: boolean;
-    /// A monotonic counter the parent bumps to pull focus into the plain message
-    /// box (a pane Cmd+click). Not project state — a transient one-shot signal
+    /// A monotonic counter the parent bumps to pull focus into the composer
+    /// (a pane Cmd+click). Not project state — a transient one-shot signal
     /// owned by `App` and delivered as a prop; see the watching effect.
     focusRequest?: number;
-    /// Like `focusRequest`, but lands in whichever form is showing: the message
-    /// box, a prompt's first field, or a workflow's first text field. Bumped when
-    /// the user turns reading mode off — they are back to type, whatever the mode.
-    focusFormRequest?: number;
     /// Open Settings at the prompt-source section.
     onConfigurePrompts?: () => void;
   } = $props();
@@ -702,41 +697,24 @@
     }
   });
 
-  /// Run `onBump` each time the counter `read` returns moves past its value at
-  /// mount. The first run only records the baseline — so mount, and a remount
-  /// that inherits a prior count, never steal focus; only a later bump does.
-  function onRequestBump(read: () => number, onBump: () => void): void {
-    let last: number | null = null;
-    $effect(() => {
-      const requested = read();
-      if (last === null || requested === last) {
-        last = requested;
-        return;
-      }
-      last = requested;
-      onBump();
-    });
-  }
-
-  // Both requests focus directly, not via rAF. A caller bumps while the compose
-  // box is showing or in the same update that brings it back — the field is bound
-  // before effects run either way. A caller that must land after some other focus
-  // change (a closing dialog restoring its own) waits for that itself.
-  //
-  // A pane Cmd+click (see TranscriptPanes.onPaneClick) targets the pane and then
-  // bumps `focusRequest` so the user can type immediately. Plain mode only, by
-  // design: in prompt/workflow mode there is no message box and the user may be
-  // mid-form, so it leaves their field alone.
-  onRequestBump(
-    () => focusRequest,
-    () => textareaEl?.focus(),
-  );
-  // "First text field" skips a workflow's agent chips — the point is somewhere to
-  // type. The box is absent while a workflow run replaces it, so this no-ops.
-  onRequestBump(
-    () => focusFormRequest,
-    () => composeBoxEl?.querySelector("textarea")?.focus(),
-  );
+  // A pane Cmd+click (see TranscriptPanes.onPaneClick) targets the pane and
+  // then bumps `focusRequest` to take focus so the user can type immediately.
+  // The effect's first run only records the baseline — so mount, and a remount
+  // that inherits a prior count, never steal focus; only a later bump does.
+  // Focused directly (not via rAF): the textarea already exists post-mount,
+  // same as the Mod+K path — the rAF deferral is only for the mount/restore
+  // paths where the element is freshly inserted. Prompt/workflow modes have no
+  // textarea, so this no-ops there by design (focus assist is plain-mode only).
+  let lastFocusRequest: number | null = null;
+  $effect(() => {
+    const requested = focusRequest;
+    if (lastFocusRequest === null || requested === lastFocusRequest) {
+      lastFocusRequest = requested;
+      return;
+    }
+    lastFocusRequest = requested;
+    textareaEl?.focus();
+  });
 
   /// Resolve a saved prompt-mode draft against one coherent backend snapshot.
   /// Every unavailable verdict preserves the structured draft; only the user's
@@ -2246,6 +2224,81 @@
   /// Reading mode hides the compose box (see the template) — the user asked to
   /// be treated as not present in this project.
   const readingMode = $derived(isReadingMode(projectId));
+  // Reading mode hides the compose box, and a workflow run's progress view
+  // replaces it. Whenever it comes back — the user toggled reading mode off, it
+  // turned itself off when the agents finished, a run left the list (finished or
+  // dismissed) — the user is back to type, so the first text field of whatever
+  // form is showing takes focus. It holds back where moving the cursor would cost
+  // the user something:
+  // - focus is already in the box, set by another path (a restored draft);
+  // - focus is in another text field or inside a dialog — they are working there;
+  // - text is highlighted outside the box. Focusing a field clears the page's
+  //   selection, so a highlight the user was about to copy would vanish. A
+  //   highlight also lingers after copying, though, so instead of leaving the
+  //   user unable to type, their first keystroke is routed into the box.
+  // A tick later, so a closing dialog (the command palette's "Turn off reading
+  // mode") has already handed focus back before this checks. Focus, not mere
+  // presence: the palette's element outlives that hand-back by a frame.
+  //
+  // Hiding the box also clears its focus border. WebKit fires no focusout when
+  // the focused textarea is removed, so the border would otherwise come back lit
+  // with no cursor in the box.
+  const composeBoxShown = $derived(!activeWorkflowRun && !readingMode);
+  let composeBoxWasShown: boolean | null = null;
+  $effect(() => {
+    const shown = composeBoxShown;
+    const returned = composeBoxWasShown === false && shown;
+    composeBoxWasShown = shown;
+    if (!shown) {
+      composeFocused = false;
+      return;
+    }
+    if (!returned) return;
+    let cancelled = false;
+    let disarm: (() => void) | null = null;
+    void tick().then(() => {
+      if (cancelled) return;
+      const active = document.activeElement;
+      if (composeBoxEl?.contains(active)) return;
+      if (!focusIsFree(active)) return;
+      const selection = document.getSelection();
+      if (selection !== null && !selection.isCollapsed) {
+        disarm = focusComposeOnFirstKeystroke();
+        return;
+      }
+      composeBoxEl?.querySelector("textarea")?.focus();
+    });
+    return () => {
+      cancelled = true;
+      disarm?.();
+    };
+  });
+
+  /// Whether focus is somewhere the compose box may take it from: not a text
+  /// field and not inside a dialog.
+  function focusIsFree(active: Element | null): boolean {
+    if (active?.closest('[role="dialog"], [role="alertdialog"]')) return false;
+    return !isEditableShortcutTarget(active);
+  }
+
+  /// Route the next typed character into the compose box, leaving the page's
+  /// selection alone until then. Shortcuts (⌘C to copy the highlight) and
+  /// navigation keys pass through and keep it armed. Focusing inside keydown
+  /// sends that same keystroke's character to the newly focused field. Returns
+  /// the disarm function.
+  function focusComposeOnFirstKeystroke(): () => void {
+    function onKeydown(e: KeyboardEvent): void {
+      if (e.metaKey || e.ctrlKey || e.altKey || e.key.length !== 1) return;
+      disarm();
+      if (!focusIsFree(document.activeElement)) return;
+      composeBoxEl?.querySelector("textarea")?.focus();
+    }
+    function disarm(): void {
+      window.removeEventListener("keydown", onKeydown, true);
+    }
+    window.addEventListener("keydown", onKeydown, true);
+    return disarm;
+  }
   // A Stop/Dismiss failure, surfaced inline in the held panel — without this a
   // failed Dismiss is a silent dead button (the run stays held with no feedback).
   let workflowRunError = $state<string | null>(null);

@@ -92,7 +92,9 @@
     /// Called once the first field has taken that focus, so the owner can clear
     /// `focusFirstField`. The intent is one-shot: this component remounts when the
     /// compose box is hidden and shown again (reading mode), and a flag left set
-    /// would pull focus back into the form every time it reappears.
+    /// would refocus the form on every remount — skipping the compose bar's own
+    /// return-focus rules, which hold back while the user is typing elsewhere,
+    /// working in a dialog, or has text highlighted.
     onfirstfieldfocused?: () => void;
     busy?: boolean;
   } = $props();

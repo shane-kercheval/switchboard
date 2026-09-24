@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, ConversationItem, NormalizedEvent } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
@@ -128,6 +128,11 @@ beforeEach(() => {
 const SEND_1 = "00000000-0000-7000-8000-0000000000d1";
 
 afterEach(async () => {
+  // Unmount before resetting stores. The library's own cleanup hook runs after
+  // this one, so without it the previous test's transcript is still mounted
+  // when its stores reset — and reloads its pins into the fresh store, leaking
+  // them into the next test. The later automatic cleanup is then a no-op.
+  cleanup();
   const { _testing } = await loadState();
   _testing.reset();
   previewState.reset();
@@ -2141,6 +2146,8 @@ describe("UnifiedTranscript — per-message copy", () => {
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     const turn = screen.getByTestId("turn");
+    // The pin control renders once pins have loaded.
+    await waitFor(() => expect(turn.querySelector('[data-testid="message-pin"]')).not.toBeNull());
     const pin = turn.querySelector('[data-testid="message-pin"]');
     const copy = turn.querySelector('[data-testid="message-copy"]');
     if (!(pin instanceof HTMLButtonElement) || copy === null) {
@@ -2515,7 +2522,8 @@ describe("UnifiedTranscript — per-message copy", () => {
     copyTextMock.mockClear();
 
     const group = screen.getByTestId("fanout-group");
-    expect(within(group).getAllByTestId("message-pin")).toHaveLength(3);
+    // Pin controls render once pins have loaded.
+    await waitFor(() => expect(within(group).getAllByTestId("message-pin")).toHaveLength(3));
     expect(
       within(screen.getByTestId("fanout-actions-footer")).queryByTestId("message-pin"),
     ).toBeNull();
@@ -5592,8 +5600,10 @@ describe("compaction rows", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     let resolveIpc: (id: string) => void = () => {};
-    invokeMock.mockImplementation(
-      async () => await new Promise<string>((res) => (resolveIpc = res)),
+    // Only the compaction request is held; the transcript's own pin load on
+    // mount must not claim the resolver.
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "compact_agent" ? await new Promise<string>((res) => (resolveIpc = res)) : null,
     );
     const inFlight = state.dispatchCompaction(
       CLAUDE_AGENT.id,

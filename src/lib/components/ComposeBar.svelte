@@ -124,15 +124,20 @@
     agents,
     focusOnMount = false,
     focusRequest = 0,
+    focusFormRequest = 0,
     onConfigurePrompts,
   }: {
     projectId: ProjectId;
     agents: AgentRecord[];
     focusOnMount?: boolean;
-    /// A monotonic counter the parent bumps to pull focus into the composer
-    /// (a pane Cmd+click). Not project state — a transient one-shot signal
+    /// A monotonic counter the parent bumps to pull focus into the plain message
+    /// box (a pane Cmd+click). Not project state — a transient one-shot signal
     /// owned by `App` and delivered as a prop; see the watching effect.
     focusRequest?: number;
+    /// Like `focusRequest`, but lands in whichever form is showing: the message
+    /// box, a prompt's first field, or a workflow's first text field. Bumped when
+    /// the user turns reading mode off — they are back to type, whatever the mode.
+    focusFormRequest?: number;
     /// Open Settings at the prompt-source section.
     onConfigurePrompts?: () => void;
   } = $props();
@@ -151,6 +156,7 @@
   let draft = $state<string>(saved.content.kind === "plain" ? saved.content.draft : "");
   let sendError = $state<string | null>(null);
   let composeEl = $state<HTMLDivElement | undefined>(undefined);
+  let composeBoxEl = $state<HTMLDivElement | undefined>(undefined);
   let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
 
   // ── Attachments ─────────────────────────────────────────────────────────────
@@ -696,24 +702,41 @@
     }
   });
 
-  // A pane Cmd+click (see TranscriptPanes.onPaneClick) targets the pane and
-  // then bumps `focusRequest` to take focus so the user can type immediately.
-  // The effect's first run only records the baseline — so mount, and a remount
-  // that inherits a prior count, never steal focus; only a later bump does.
-  // Focused directly (not via rAF): the textarea already exists post-mount,
-  // same as the Mod+K path — the rAF deferral is only for the mount/restore
-  // paths where the element is freshly inserted. Prompt/workflow modes have no
-  // textarea, so this no-ops there by design (focus assist is plain-mode only).
-  let lastFocusRequest: number | null = null;
-  $effect(() => {
-    const requested = focusRequest;
-    if (lastFocusRequest === null || requested === lastFocusRequest) {
-      lastFocusRequest = requested;
-      return;
-    }
-    lastFocusRequest = requested;
-    textareaEl?.focus();
-  });
+  /// Run `onBump` each time the counter `read` returns moves past its value at
+  /// mount. The first run only records the baseline — so mount, and a remount
+  /// that inherits a prior count, never steal focus; only a later bump does.
+  function onRequestBump(read: () => number, onBump: () => void): void {
+    let last: number | null = null;
+    $effect(() => {
+      const requested = read();
+      if (last === null || requested === last) {
+        last = requested;
+        return;
+      }
+      last = requested;
+      onBump();
+    });
+  }
+
+  // Both requests focus directly, not via rAF. A caller bumps while the compose
+  // box is showing or in the same update that brings it back — the field is bound
+  // before effects run either way. A caller that must land after some other focus
+  // change (a closing dialog restoring its own) waits for that itself.
+  //
+  // A pane Cmd+click (see TranscriptPanes.onPaneClick) targets the pane and then
+  // bumps `focusRequest` so the user can type immediately. Plain mode only, by
+  // design: in prompt/workflow mode there is no message box and the user may be
+  // mid-form, so it leaves their field alone.
+  onRequestBump(
+    () => focusRequest,
+    () => textareaEl?.focus(),
+  );
+  // "First text field" skips a workflow's agent chips — the point is somewhere to
+  // type. The box is absent while a workflow run replaces it, so this no-ops.
+  onRequestBump(
+    () => focusFormRequest,
+    () => composeBoxEl?.querySelector("textarea")?.focus(),
+  );
 
   /// Resolve a saved prompt-mode draft against one coherent backend snapshot.
   /// Every unavailable verdict preserves the structured draft; only the user's
@@ -3402,6 +3425,7 @@
           dragOver ? "border-accent" : composeFocused ? "border-focus" : "",
         )}
         data-testid="compose-box"
+        bind:this={composeBoxEl}
         data-drag-over={dragOver}
         onfocusin={() => (composeFocused = true)}
         onfocusout={(e) => {
@@ -4029,6 +4053,7 @@
             panes={paneLayout.panes}
             {agentReadiness}
             focusFirstField={focusPromptFieldOnMount}
+            onfirstfieldfocused={() => (focusPromptFieldOnMount = false)}
             onremove={removePrompt}
             recipients={recipientChips}
             busy={composerBusy}

@@ -4499,6 +4499,9 @@ describe("App", () => {
 
   it("clears reading mode on the silent path, where a cancelled project never notifies", async () => {
     await openProjectAlpha();
+    // The composer's own mount focus lands a frame late; let it settle so it
+    // can't be mistaken for the focus under test.
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "hi" } });
@@ -4527,12 +4530,22 @@ describe("App", () => {
       ended_at: "2026-05-20T00:00:01Z",
       usage: null,
     });
+    // The user is elsewhere when the mode clears itself, so it must not pull
+    // focus into the returning compose box.
+    const toggle = screen.getByTestId("reading-mode-toggle");
+    toggle.focus();
     fireTo(channel, { type: "agent_idle", agent_id: "ag-1" });
 
     await waitFor(() => expect(screen.getByTestId("compose-box")).toBeInTheDocument());
     // The flush ran and cleared, but stayed silent — a cancel is something the
     // user did while present.
     expect(invokeMock.mock.calls.slice(enabledAt).some(([c]) => c === "notify")).toBe(false);
+    // Long enough for a focus request that waits a tick before bumping, and for
+    // the composer's frame-delayed mount focus, to have landed if either fired.
+    await new Promise(requestAnimationFrame);
+    await new Promise(requestAnimationFrame);
+    await tick();
+    expect(toggle).toHaveFocus();
   });
 
   it("stays on for a project that is already quiet", async () => {
@@ -4554,6 +4567,9 @@ describe("App", () => {
     // The way out matters more than the way in: with the compose box hidden the
     // chord has to keep working, so it must not be gated on the composer.
     await openProjectAlpha();
+    // The composer's own mount focus lands a frame late; let it settle so it
+    // can't be mistaken for the focus under test.
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
 
     await fireEvent.keyDown(window, { key: "R", code: "KeyR", metaKey: true, shiftKey: true });
     await waitFor(() => expect(screen.queryByTestId("compose-box")).toBeNull());
@@ -4562,6 +4578,42 @@ describe("App", () => {
     await fireEvent.keyDown(window, { key: "R", code: "KeyR", metaKey: true, shiftKey: true });
     await waitFor(() => expect(screen.getByTestId("compose-box")).toBeInTheDocument());
     expect(screen.getByTestId("reading-mode-toggle")).toHaveAttribute("aria-pressed", "false");
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
+  });
+
+  it("focuses the compose box when the toggle turns reading mode off", async () => {
+    await openProjectAlpha();
+    // The composer's own mount focus lands a frame late; let it settle so it
+    // can't be mistaken for the focus under test.
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
+    const toggle = screen.getByTestId("reading-mode-toggle");
+    await fireEvent.click(toggle);
+    await waitFor(() => expect(screen.queryByTestId("compose-box")).toBeNull());
+
+    // A real click leaves focus on the button; the returning box must take it.
+    toggle.focus();
+    await fireEvent.click(toggle);
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
+  });
+
+  it("focuses the compose box when the palette turns reading mode off", async () => {
+    // The palette's dialog hands focus back to whatever held it before it
+    // opened, so the compose focus has to land after that restore.
+    await openProjectAlpha();
+    // The composer's own mount focus lands a frame late; let it settle so it
+    // can't be mistaken for the focus under test.
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
+    const toggle = screen.getByTestId("reading-mode-toggle");
+    await fireEvent.click(toggle);
+    await waitFor(() => expect(screen.queryByTestId("compose-box")).toBeNull());
+
+    toggle.focus();
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("command-option-project.reading-mode"));
+    await waitFor(() => expect(screen.queryByTestId("command-palette")).toBeNull());
+
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
   });
 
   it("keeps the way out of reading mode when the project's last agent is removed", async () => {

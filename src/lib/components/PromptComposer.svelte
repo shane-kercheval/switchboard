@@ -50,6 +50,7 @@
     send,
     recipients,
     focusFirstField = false,
+    onfirstfieldfocused,
     busy = false,
     projectId,
     crossProjectBase,
@@ -88,6 +89,11 @@
     /// Focuses the first editable prompt field when a user explicitly selects a
     /// prompt from the picker. Saved/restored prompt drafts leave focus alone.
     focusFirstField?: boolean;
+    /// Called once the first field has taken that focus, so the owner can clear
+    /// `focusFirstField`. The intent is one-shot: this component remounts when the
+    /// compose box is hidden and shown again (reading mode), and a flag left set
+    /// would pull focus back into the form every time it reappears.
+    onfirstfieldfocused?: () => void;
     busy?: boolean;
   } = $props();
 
@@ -186,7 +192,9 @@
     const targetPromptKey = promptKey;
     focusedPromptKey = targetPromptKey;
     void tick().then(() => {
-      if (focusedPromptKey === targetPromptKey) firstPromptField()?.focus();
+      if (focusedPromptKey !== targetPromptKey) return;
+      firstPromptField()?.focus();
+      onfirstfieldfocused?.();
     });
   });
 

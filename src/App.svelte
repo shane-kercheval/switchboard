@@ -287,7 +287,7 @@
       // fastest way back out, so it must not be gated on the composer existing.
       if (readingModeAvailable) {
         event.preventDefault();
-        toggleReadingModeForActiveProject();
+        void toggleReadingModeForActiveProject();
       }
     } else if (key === "b" && event.shiftKey) {
       event.preventDefault();
@@ -666,9 +666,19 @@
       ? "Turn off reading mode"
       : "Reading mode: hide the compose box and stay notified about this project",
   );
-  function toggleReadingModeForActiveProject(): void {
+  // Turning the mode off by hand means the user is back to type, so the returning
+  // compose box takes focus. The wait matters from the command palette: its dialog
+  // closes in the same flush and hands focus back to whatever held it before it
+  // opened, so the request has to land after that. That holds only while
+  // `ui/Dialog.svelte` closes without an animation — with one, the restore would
+  // land after this request. The completion flush's auto-off deliberately does not
+  // do this: it fires on its own schedule and would steal focus from wherever the
+  // user is.
+  async function toggleReadingModeForActiveProject(): Promise<void> {
     if (selection.activeProjectId === null) return;
-    toggleReadingMode(selection.activeProjectId);
+    if (toggleReadingMode(selection.activeProjectId)) return;
+    await tick();
+    composeFormFocusRequest += 1;
   }
   // Reading mode's whole point is being notified about the project you're
   // watching, and that rides on a preference which defaults *off* — so a user on
@@ -936,6 +946,9 @@
   // a module store because it's a transient one-shot signal between two children
   // App already renders, not per-project state anything derives from.
   let composeFocusRequest = $state(0);
+  // The same kind of signal for turning reading mode off by hand, which focuses
+  // whichever compose form is showing rather than only the message box.
+  let composeFormFocusRequest = $state(0);
 
   async function withTranscriptBusy(action: () => void): Promise<void> {
     transcriptBusy = true;
@@ -1844,6 +1857,7 @@
                   agents={activeAgents}
                   focusOnMount={true}
                   focusRequest={composeFocusRequest}
+                  focusFormRequest={composeFormFocusRequest}
                   onConfigurePrompts={openPromptSettings}
                 />
               {/key}

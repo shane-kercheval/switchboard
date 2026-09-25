@@ -16,6 +16,15 @@
   /// requires" rule). Splitting into `DialogContent` / `DialogHeader` /
   /// `DialogFooter` along the shadcn-svelte pattern is reasonable when that
   /// happens; today the single composite is enough.
+  ///
+  /// **Closing is instant, and a caller depends on that.** bits-ui hands focus
+  /// back to the pre-open element when the content unmounts; with no close
+  /// animation that happens in the same update that closes the dialog. The
+  /// compose box, returning when the command palette turns reading mode off,
+  /// takes focus one tick later unless focus is still inside a dialog (see
+  /// `composeBoxShown` in `ComposeBar.svelte`). A close animation delays the
+  /// unmount and its hand-back, so the box would find focus still in the palette
+  /// and leave it there — adding one means revisiting that.
   import type { Snippet } from "svelte";
   import { Dialog as BitsDialog } from "bits-ui";
   import { cn } from "$lib/utils";

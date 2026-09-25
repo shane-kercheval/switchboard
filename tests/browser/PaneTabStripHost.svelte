@@ -1,16 +1,36 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import PaneTabStrip from "$lib/components/PaneTabStrip.svelte";
   import type { HeaderPaneEntry } from "$lib/components/PaneTabStrip.types";
 
-  const entries: HeaderPaneEntry[] = Array.from({ length: 10 }, (_, index) => ({
-    pane: {
-      id: `pane-${index + 1}`,
-      name: `Pane ${index + 1}`,
-      members: [`agent-${index + 1}`],
-      hidden: [],
-    },
-    state: "visible",
-  }));
+  let { count = 10 }: { count?: number } = $props();
+  const initialCount = untrack(() => count);
+  let entries = $state<HeaderPaneEntry[]>(
+    Array.from({ length: initialCount }, (_, index) => ({
+      pane: {
+        id: `pane-${index + 1}`,
+        name: `Pane ${index + 1}`,
+        members: [`agent-${index + 1}`],
+        hidden: [],
+      },
+      state:
+        index === 1 && initialCount > 2
+          ? "minimized"
+          : index === 2
+            ? "behind_maximized"
+            : "visible",
+    })),
+  );
+  let selectCount = $state(0);
+  let openCount = $state(0);
+  let projectId = $state("test-project");
+
+  function reorder(paneId: string, toIndex: number): void {
+    const fromIndex = entries.findIndex((entry) => entry.pane.id === paneId);
+    const next = [...entries];
+    next.splice(toIndex, 0, next.splice(fromIndex, 1)[0]!);
+    entries = next;
+  }
 </script>
 
 <div
@@ -18,14 +38,27 @@
   style="width: 420px;"
   data-testid="pane-strip-header"
 >
-  <div class="min-w-0 flex-1"></div>
+  <div class="h-7 min-w-0 flex-1" data-testid="pane-drag-target-left"></div>
   <PaneTabStrip
     {entries}
+    {projectId}
     paneIsActive={() => false}
     paneIsCompleted={() => false}
-    onSelectVisible={() => undefined}
-    onOpenHidden={() => undefined}
+    onSelectVisible={() => (selectCount += 1)}
+    onOpenHidden={() => (openCount += 1)}
+    onReorder={(_, paneId, toIndex) => reorder(paneId, toIndex)}
   />
   <button class="h-7 w-7 shrink-0" data-testid="fixed-pane-control">+</button>
   <button class="h-7 w-7 shrink-0" data-testid="fixed-view-control">V</button>
 </div>
+<output data-testid="pane-select-count">{selectCount}</output>
+<output data-testid="pane-open-count">{openCount}</output>
+<button
+  data-testid="reorder-pane-externally"
+  onclick={() => reorder(entries[0]!.pane.id, entries.length - 1)}
+>
+  Reorder externally
+</button>
+<button data-testid="change-pane-project" onclick={() => (projectId = "other-project")}
+  >Change project</button
+>

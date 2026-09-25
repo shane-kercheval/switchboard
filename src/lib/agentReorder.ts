@@ -3,9 +3,8 @@
 // jsdom reports zero-size rects, so the component supplies real geometry at
 // runtime and these functions stay geometry-source-agnostic.
 
-/// Distance (px) a grip pointer must travel before the press becomes a drag.
-/// Below it, the gesture resolves to the grip's normal click (collapse
-/// toggle), so an imprecise click never accidentally reorders.
+/// Distance (px) a pointer must travel before the press becomes a drag.
+/// Below it, the pressed control keeps its normal click action.
 export const DRAG_SLOP_PX = 5;
 
 /// `items` with the element at `from` moved to occupy index `to`. Identity and
@@ -22,15 +21,15 @@ export function movedOrder<T>(items: readonly T[], from: number, to: number): T[
   return next;
 }
 
-/// The index a dragged card should occupy, given the vertical midpoints of the
-/// OTHER cards in display order: the count of midpoints above the pointer.
+/// The index a dragged item should occupy, given the midpoints of the OTHER
+/// items in display order: the count of midpoints crossed by the pointer.
 /// Midpoint-crossing (rather than edge-crossing) keeps the swap stable — after
 /// two cards trade places, the pointer sits past the neighbor's new midpoint,
 /// so a one-pixel jitter can't oscillate the order.
-export function dropIndexForPointer(otherMidpoints: readonly number[], pointerY: number): number {
+export function dropIndexForPointer(otherMidpoints: readonly number[], pointer: number): number {
   let index = 0;
   for (const mid of otherMidpoints) {
-    if (pointerY > mid) index++;
+    if (pointer > mid) index++;
   }
   return index;
 }

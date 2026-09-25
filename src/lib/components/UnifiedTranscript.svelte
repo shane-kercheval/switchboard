@@ -8,6 +8,7 @@
   import {
     attachPointerProbe,
     debugInput,
+    debugEvent,
     debugNote,
     debugSample,
     debugTransition,
@@ -40,10 +41,12 @@
     answerTextOf,
     buildUnifiedRows,
     copyTextOf,
+    EXPANDED_RECENT_SENDS,
     groupRenderBlocks,
     INITIAL_WINDOW,
     lastAnswerTextOf,
     type QueuedCompaction,
+    recentSendsStartIndex,
     REVEAL_BATCH,
     type RenderBlock,
     type UnifiedRow,
@@ -87,8 +90,10 @@
     type PinnableMessageIdentity,
   } from "$lib/messageIdentity";
   import {
+    identityPinnedBy,
     isMessagePinned,
     loadMessagePins,
+    pinsFor,
     pinsLoaded,
     pinsUnavailableReason,
     toggleMessagePin,
@@ -318,6 +323,12 @@
 
   $effect(() => {
     if (loadStatus === "complete" && windowIdentity !== frozenIdentity) {
+      debugEvent(
+        "outer",
+        "window re-pin",
+        () =>
+          `pane=${paneId ?? "-"} cursor ${untrack(() => cursor) ?? "null"} -> ${Math.max(0, blocks.length - INITIAL_WINDOW)} blocks=${blocks.length} identity ${frozenIdentity === null ? "unset" : "changed"}`,
+      );
       cursor = Math.max(0, blocks.length - INITIAL_WINDOW);
       frozenIdentity = windowIdentity;
     }
@@ -376,7 +387,7 @@
   }
 
   /// The render key for a turn — matches the key its render site uses, so
-  /// `latestResponseKeys` membership lines up there. A turn whose send fans out
+  /// `expandedByDefaultKeys` membership lines up there. A turn whose send fans out
   /// renders as a column (`fanout:…`); otherwise a standalone row. The render
   /// sites rely on the grouping invariant that a standalone row cannot also
   /// belong to a fan-out block for the same send.
@@ -390,12 +401,32 @@
     return agentPreviewKey(turn.turn_id);
   }
 
-  /// Preview keys of each agent's most-recent collapsible response. When compact,
-  /// these render expanded by default instead of using the height-clipped
-  /// preview. Per agent and by recency (`ended_at ??
-  /// started_at`), so an agent's latest reply keeps this treatment even when
-  /// other agents' replies sit below it.
-  const latestResponseKeys = $derived.by(() => {
+  /// Preview keys that render expanded by default when compact, instead of the
+  /// height-clipped preview:
+  /// - every user message and response in the recent-sends range (the last
+  ///   `EXPANDED_RECENT_SENDS` sends), so the previous exchanges stay readable
+  ///   without an expand click;
+  /// - each agent's most-recent collapsible response, wherever it sits. Per
+  ///   agent and by recency (`ended_at ?? started_at`), so an agent's latest
+  ///   reply keeps this treatment even when it falls outside the recent range or
+  ///   other agents' replies sit below it;
+  /// - every pinned message — pinning marks it worth keeping open. Unpinning
+  ///   returns it to the rules above.
+  ///
+  /// This is what the rules say *now*; `expandedByDefaultKeys` is what renders.
+  const computedExpandedKeys = $derived.by(() => {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const keys = new Set<string>();
+    for (const block of blocks.slice(recentSendsStartIndex(blocks, EXPANDED_RECENT_SENDS))) {
+      if (block.kind === "fanout") {
+        keys.add(userPreviewKey(block.user.key));
+        for (const col of block.columns) keys.add(fanoutPreviewKey(block.send_id, col.agent_id));
+      } else if (block.row.kind === "user") {
+        keys.add(userPreviewKey(block.row.key));
+      } else if (block.row.kind === "agent") {
+        keys.add(agentPreviewKey(block.row.turn.turn_id));
+      }
+    }
     // eslint-disable-next-line svelte/prefer-svelte-reactivity
     const latestPerAgent = new Map<string, { at: string; key: string }>();
     for (const row of rows) {
@@ -407,14 +438,60 @@
         latestPerAgent.set(turn.agent_id, { at, key: previewKeyForTurn(turn) });
       }
     }
-    // eslint-disable-next-line svelte/prefer-svelte-reactivity
-    const keys = new Set<string>();
     for (const v of latestPerAgent.values()) keys.add(v.key);
+    const pinKeys = new Set(pinsFor(projectId).map((pin) => pin.key));
+    if (pinKeys.size > 0) {
+      for (const block of blocks) {
+        if (block.kind === "fanout") {
+          if (isMessagePinnedIn(messageIdentityForRow(block.user), pinKeys)) {
+            keys.add(userPreviewKey(block.user.key));
+          }
+          for (const col of block.columns) {
+            if (isMessagePinnedIn(columnMessageIdentity(col.rows), pinKeys)) {
+              keys.add(fanoutPreviewKey(block.send_id, col.agent_id));
+            }
+          }
+        } else if (block.row.kind === "user") {
+          if (isMessagePinnedIn(messageIdentityForRow(block.row), pinKeys)) {
+            keys.add(userPreviewKey(block.row.key));
+          }
+        } else if (block.row.kind === "agent") {
+          const harness = agentById[block.row.turn.agent_id]?.harness;
+          if (isMessagePinnedIn(messageIdentityForRow(block.row, harness), pinKeys)) {
+            keys.add(agentPreviewKey(block.row.turn.turn_id));
+          }
+        }
+      }
+    }
     return keys;
   });
 
-  function responseDefaultCompact(key: string): boolean {
-    return compactEnabled && !latestResponseKeys.has(key);
+  /// Pinned to the Pins sidebar — not the scroll sense of "pinned" (following
+  /// the bottom) that `outerPin` tracks.
+  function isMessagePinnedIn(identity: MessageIdentity | undefined, pinKeys: Set<string>): boolean {
+    return identity?.kind === "pinnable" && identityPinnedBy(identity, (key) => pinKeys.has(key));
+  }
+
+  /// Keys held expanded so nothing collapses under a reader scrolled up: a send
+  /// starting (a queued message, a workflow step) or a reply finishing moves the
+  /// rules, and a block collapsing mid-read would take the text being read with
+  /// it. While scrolled up this only grows — every key the rules expand joins it,
+  /// so a reply that arrives meanwhile is protected too. Back at the bottom it
+  /// resets to the rules, and the owed collapses happen off-screen above — which
+  /// is also when an unpinned message returns to them, never under the unpin
+  /// click. Maintained by `growRetainedExpanded` / `resetRetainedExpanded`,
+  /// declared after the scroll tracker (`outerPin`) they read.
+  let retainedExpandedKeys = $state<Set<string>>(new Set());
+
+  const expandedByDefaultKeys = $derived.by(() => {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const keys = new Set(computedExpandedKeys);
+    for (const key of retainedExpandedKeys) keys.add(key);
+    return keys;
+  });
+
+  function defaultCompactFor(key: string): boolean {
+    return compactEnabled && !expandedByDefaultKeys.has(key);
   }
 
   // No `content-visibility` containment on transcript blocks: render-windowing
@@ -431,44 +508,66 @@
   // below the ~50 point). Past there, the answer is a true
   // sliding-window/virtualization follow-up, not CSS containment estimates.
 
-  /// Height cap for a clipped preview. Always applied while compact — it is what
-  /// creates the overflow the fade below reports on.
-  const PREVIEW_CLIP = "max-h-[14rem] overflow-hidden";
+  /// Height cap for a clipped preview, in rem. The single source for the clip, its
+  /// fade, and `measureUnclipped` — applied as inline style rather than a
+  /// Tailwind class so a computed value can drive it.
+  const PREVIEW_CAP_REM = 14;
 
-  /// Bottom fade, in absolute stops so the gradient lines up with the cap rather
-  /// than with the message's own height. The `-webkit-` mask is explicit because
-  /// the app runs in WebKit (Tauri/macOS).
-  const PREVIEW_FADE =
-    "[mask-image:linear-gradient(to_bottom,black_7rem,transparent_14rem)] [-webkit-mask-image:linear-gradient(to_bottom,black_7rem,transparent_14rem)]";
-
-  /// The cap and the fade, applied together **only when the content actually
-  /// exceeds the cap**. The fade means "there is more below"; a message between
-  /// the gradient's first stop (7rem) and the cap (14rem) is entirely visible, so
-  /// fading its last lines promised hidden text that did not exist — and, because
-  /// the same measurement decides the expand toggle, it faded with no way to
-  /// expand. A mask has no layout effect, so switching it off cannot disturb the
-  /// measurement that switched it off.
-  function previewClip(key: string): string {
-    return clipOverflow[key] === true ? `${PREVIEW_CLIP} ${PREVIEW_FADE}` : PREVIEW_CLIP;
+  /// The cap, always applied while compact — it is what creates the overflow the
+  /// fade reports on — plus a bottom fade applied **only when the content
+  /// actually exceeds the cap**. The fade means "there is more below"; a message
+  /// between the gradient's first stop (half the cap) and the cap is entirely
+  /// visible, so fading its last lines promised hidden text that did not exist —
+  /// and, because the same measurement decides the expand toggle, it faded with
+  /// no way to expand. A mask has no layout effect, so switching it off cannot
+  /// disturb the measurement that switched it off. Absolute stops line the
+  /// gradient up with the cap rather than the message's own height; the
+  /// `-webkit-` mask is explicit because the app runs in WebKit (Tauri/macOS).
+  function previewClipStyle(key: string): string {
+    const cap = `max-height: ${PREVIEW_CAP_REM}rem;`;
+    if (clipOverflow[key] !== true) return cap;
+    const fade = `linear-gradient(to bottom, black ${PREVIEW_CAP_REM / 2}rem, transparent ${PREVIEW_CAP_REM}rem)`;
+    return `${cap} mask-image: ${fade}; -webkit-mask-image: ${fade};`;
   }
 
-  /// Whether each clipped preview's content actually exceeds the cap, keyed by
-  /// preview key — measured from the DOM. A toggle is only worth showing when
-  /// collapsing differs from expanding; for a clipped preview that means the text
-  /// overflows. jsdom has no layout (stays false there), so the data-derived
-  /// hidden-content check below drives toggles in tests.
+  /// Whether each unit's content exceeds the cap, keyed by preview key —
+  /// measured from the DOM, clipped (`measureClip`) while compact and unclipped
+  /// (`measureUnclipped`) while expanded. A toggle is only worth showing when
+  /// collapsing differs from expanding; for height that means the text overflows.
+  /// jsdom has no layout (stays false there), so the data-derived hidden-content
+  /// check below drives toggles in tests.
   ///
-  /// **Entries are deliberately NOT deleted on `destroy`.** The measurer mounts
-  /// only while clipped, so expanding unmounts it; keeping the `true` is what
-  /// leaves the re-collapse toggle visible on the expanded message. Deleting it
-  /// here would read back `undefined → false` and drop the toggle. Growth is one
-  /// boolean per distinct message — negligible. One observer per clipped preview
-  /// is fine pre-virtualization (observers ≈ on-screen messages); revisit with a
-  /// shared observer if virtualization or very long transcripts land.
+  /// **Entries are deliberately NOT deleted on `destroy`.** Collapsing or
+  /// expanding swaps one measurer for the other, and the new one first reports a
+  /// frame later. The kept entry holds the toggle mounted through that frame;
+  /// deleting it would read back `undefined → false`, unmount the toggle under
+  /// the click, and break the clicked-control hold that keeps it in place. The
+  /// two measurements only disagree when data is hidden, where the toggle shows
+  /// anyway. Growth is one boolean per distinct message — negligible. One
+  /// observer per mounted unit is fine pre-virtualization (observers ≈ mounted
+  /// messages); revisit with a shared observer if virtualization or very long
+  /// transcripts land.
   let clipOverflow = $state<Record<string, boolean>>({});
   function measureClip(node: HTMLElement, key: string) {
     const ro = new ResizeObserver(() => {
       clipOverflow[key] = node.scrollHeight - node.clientHeight > 1;
+    });
+    ro.observe(node);
+    return {
+      destroy(): void {
+        ro.disconnect();
+      },
+    };
+  }
+
+  /// `measureClip` for a message rendered without the clip: whether its content
+  /// is taller than the cap, i.e. whether collapsing it would hide anything.
+  /// Gives an expanded-by-default prompt or reply a collapse toggle only when it
+  /// is long enough to need one.
+  function measureUnclipped(node: HTMLElement, key: string) {
+    const ro = new ResizeObserver(() => {
+      const remPx = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+      clipOverflow[key] = node.scrollHeight - PREVIEW_CAP_REM * remPx > 1;
     });
     ro.observe(node);
     return {
@@ -484,21 +583,22 @@
     );
   }
 
-  function responseHasDataHidden(turn: AgentTurn, isLatestResponse: boolean): boolean {
+  function responseHasDataHidden(turn: AgentTurn, isExpandedResponse: boolean): boolean {
     return (
       turnHasHiddenDetail(turn) ||
-      (isLatestResponse && answerTextOf(turn) !== lastAnswerTextOf(turn))
+      (isExpandedResponse && answerTextOf(turn) !== lastAnswerTextOf(turn))
     );
   }
 
-  /// Whether expanding a response would reveal more than its collapsed view, so a
-  /// toggle is meaningful. A clipped preview hides tool calls / reasoning (and
-  /// clips overflowing text — the `clipOverflow` half); the latest-response view
-  /// is expanded by default, so its toggle means "collapse to the final answer
-  /// block."
-  function responseHasMore(turn: AgentTurn, key: string, isLatestResponse: boolean): boolean {
-    if (responseHasDataHidden(turn, isLatestResponse)) return true;
-    if (isLatestResponse) return false;
+  /// Whether collapsing a response would hide something, so a toggle is
+  /// meaningful. An older response's clipped preview hides tool calls /
+  /// reasoning; a recent or latest one collapses to its final answer block,
+  /// which also drops earlier answer text. Either way the collapsed text is
+  /// height-clipped, so a response taller than the cap has more too (the
+  /// `clipOverflow` half — measured clipped while compact, unclipped while
+  /// expanded).
+  function responseHasMore(turn: AgentTurn, key: string, isExpandedResponse: boolean): boolean {
+    if (responseHasDataHidden(turn, isExpandedResponse)) return true;
     return clipOverflow[key] ?? false;
   }
 
@@ -737,11 +837,15 @@
   // its position on *any* height change — a message collapsing/expanding, a
   // fan-out toggling, the live cap being removed when a turn completes — so
   // nothing jerks and whatever the user clicked stays put. We measure height
-  // changes with a ResizeObserver and re-anchor ourselves: WebKit (the Tauri
-  // webview) exposes no CSS `overflow-anchor` control, and while the engine
-  // does self-adjust for growth above the viewport (see the "anchor"
-  // attribution in $lib/scrollPin.ts), that built-in behavior covers neither
-  // the follow-the-bottom nor the gap-hold contracts.
+  // changes with a ResizeObserver and re-anchor ourselves. The app's WKWebView
+  // does not implement CSS scroll anchoring (`CSS.supports("overflow-anchor",
+  // "none")` is false there), so `reanchor` is the only thing holding the
+  // reading place in production. The browser suite's WebKit DOES anchor
+  // natively, and would quietly cover for a failed hold — which is how the
+  // reveal-stuck bug passed the suite. The suite now turns it off everywhere
+  // (`tests/browser-setup.ts`); the container also sets `overflow-anchor: none`
+  // itself, so it keeps `reanchor` as the single mechanism even if a future
+  // WKWebView ships native anchoring.
   let container = $state<HTMLDivElement | null>(null);
   let content = $state<HTMLDivElement | null>(null);
   // Pin attribution (user-up unpins, user-down near the bottom re-pins,
@@ -749,6 +853,37 @@
   // $lib/scrollPin.ts for the state machine. The inner live caps run their own
   // instances in `liveScroll`, so outer and inner cannot drift apart.
   const outerPin = createPinTracker();
+
+  /// Add every key the rules now expand to `retainedExpandedKeys`. Always safe,
+  /// so it runs straight off a rules change — which can land before the scroll
+  /// tracker reflects a scroll the user just made.
+  function growRetainedExpanded(): void {
+    const computed = untrack(() => computedExpandedKeys);
+    const held = untrack(() => retainedExpandedKeys);
+    if ([...computed].some((key) => !held.has(key))) {
+      retainedExpandedKeys = new Set([...held, ...computed]);
+    }
+  }
+
+  /// Drop held keys the rules no longer expand — the owed collapses. Only for a
+  /// reader at the bottom, and only from paths that have just sampled the scroll
+  /// position: `reanchor`'s at-the-bottom branch and the return-to-bottom
+  /// transition in `syncPin`. A missed
+  /// call only leaves something expanded until the next pass. Assigns only on a
+  /// real change — the pinned pass runs on every streamed chunk, and a fresh set
+  /// each time would re-derive every block's default.
+  function resetRetainedExpanded(): void {
+    const computed = untrack(() => computedExpandedKeys);
+    const held = untrack(() => retainedExpandedKeys);
+    if (computed.size !== held.size || [...computed].some((key) => !held.has(key))) {
+      retainedExpandedKeys = computed;
+    }
+  }
+
+  $effect(() => {
+    void computedExpandedKeys;
+    growRetainedExpanded();
+  });
   // The user's saved gap from the bottom, updated only by real scrolls. Holding
   // it constant across a resize keeps every element whose content-below is
   // unchanged (e.g. the toggle you just clicked) at the same place on screen.
@@ -845,6 +980,7 @@
     const pinnedBefore = outerPin.pinned;
     const attribution = outerPin.onScrollEvent(sampled, source);
     debugSample("outer", attribution, sampled, pinnedBefore, outerPin.pinned);
+    if (!pinnedBefore && outerPin.pinned) resetRetainedExpanded();
     // Genuine user movement relocates the reading position; clamps, elastic
     // overscroll and noise must not overwrite a still-valid anchor OR the
     // stored gap. A collapse's clamp event can fire BEFORE the ResizeObserver
@@ -855,6 +991,12 @@
     // the user moved on.
     if (attribution === "up" || attribution === "down") {
       clearClickIntent();
+      if (revealAwaitingReanchor) {
+        // Not a recapture (see `revealAwaitingReanchor`), but the movement is
+        // the reader's and must survive the restore.
+        revealHeldDelta += outerPin.lastSampleDelta;
+        return;
+      }
       distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
       captureAnchor();
     }
@@ -1020,6 +1162,15 @@
     // nothing — un-gestured movement classifies as "none" and cannot stomp
     // the anchor, and a `"pass"` sample does not age input evidence.
     syncPin("pass");
+    if (revealAwaitingReanchor) {
+      // Restore to the pre-reveal reading place, moved by whatever the reader
+      // scrolled while the batch mounted. Both the anchor and the gap carry it,
+      // so the fallback gap-hold below keeps the movement too. Scrolling up is
+      // a negative delta: the anchor sits lower on screen, the gap grows.
+      anchorOffset -= revealHeldDelta;
+      distanceFromBottom -= revealHeldDelta;
+      endRevealHold();
+    }
     // Consume this pass's provenance inputs up front so every exit path
     // advances them. `untrack` keeps the callers' dependency sets unchanged
     // (the scrollSignal effect already depends on the revision via the signal).
@@ -1045,6 +1196,7 @@
     if (outerPin.pinned) {
       // Auto-follow owns the view; any pending clicked-control hold is moot.
       clearClickIntent();
+      resetRetainedExpanded();
       container.scrollTop = container.scrollHeight;
       outerPin.notifyProgrammaticWrite(geometryOf(container));
       debugWrite("outer", geometryOf(container));
@@ -1197,8 +1349,34 @@
   let revealSentinel = $state<HTMLElement | null>(null);
   let revealing = $state(false);
   let pendingReveal = false;
+  /// Set from the cursor decrement until the reanchor pass that restores the
+  /// reading position. In that window a user-attributed scroll sample must NOT
+  /// recapture the anchor or the gap: the batch has already mounted above the
+  /// reader, so a capture there lands on a just-revealed block at the jumped
+  /// position, and the restore then holds the jump instead of the reader's
+  /// place — with the sentinel still in view, so no further reveal ever fires
+  /// (the observer needs a transition). Trackpad momentum lands scroll events in
+  /// this window routinely: the reveal fires 200px before the top while the
+  /// flick is still running.
+  ///
+  /// The movement itself is kept, not dropped: `revealHeldDelta` accumulates the
+  /// user-attributed samples in the window and `reanchor` applies them on top of
+  /// the pre-reveal place, so the flick carries through the batch landing.
+  let revealAwaitingReanchor = false;
+  let revealHeldDelta = 0;
+
+  function endRevealHold(): void {
+    revealAwaitingReanchor = false;
+    revealHeldDelta = 0;
+  }
 
   function revealOlder(): void {
+    debugEvent(
+      "outer",
+      "reveal",
+      () =>
+        `pane=${paneId ?? "-"} first=${firstVisibleIndex} blocks=${blocks.length} revealing=${revealing} loadStatus=${loadStatus}`,
+    );
     if (firstVisibleIndex === 0) return;
     // A trigger that arrives mid-reveal is REMEMBERED, not dropped: the observer
     // only re-fires on an intersection *change*, so if the sentinel is still in
@@ -1209,6 +1387,9 @@
       return;
     }
     revealing = true;
+    const heightBefore = content?.offsetHeight ?? 0;
+    revealAwaitingReanchor = true;
+    revealHeldDelta = 0;
     // Decrement the absolute cursor (and pin the current identity, so the derived
     // uses the cursor rather than the tail fallback). `firstVisibleIndex` reflects
     // it on the next read.
@@ -1221,6 +1402,18 @@
     // scroll-to-top and drives the brief spinner; released after the frame.
     requestAnimationFrame(() => {
       revealing = false;
+      // No growth means no ResizeObserver pass will end the hold, and nothing
+      // above the reader moved — so where they are now IS their place. Recapture
+      // it: any movement in the window went uncaptured, and a stale anchor would
+      // pull the view back on the next unrelated resize.
+      if (revealAwaitingReanchor && (content?.offsetHeight ?? 0) === heightBefore) {
+        endRevealHold();
+        if (container) {
+          distanceFromBottom =
+            container.scrollHeight - container.scrollTop - container.clientHeight;
+          captureAnchor();
+        }
+      }
       if (pendingReveal) {
         pendingReveal = false;
         revealOlder();
@@ -1236,6 +1429,14 @@
     // view, so the older batch is ready as the user reaches the top.
     const io = new IntersectionObserver(
       (entries) => {
+        for (const entry of entries) {
+          debugEvent(
+            "outer",
+            "sentinel",
+            () =>
+              `pane=${paneId ?? "-"} intersecting=${entry.isIntersecting} top=${(entry.boundingClientRect.top - root.getBoundingClientRect().top).toFixed(0)} scrollTop=${root.scrollTop.toFixed(0)}`,
+          );
+        }
         if (entries.some((entry) => entry.isIntersecting)) revealOlder();
       },
       { root, rootMargin: "200px 0px 0px 0px" },
@@ -1286,17 +1487,17 @@
       if (block.row.kind === "user") {
         return {
           key: userPreviewKey(block.row.key),
-          defaultCompact: compactEnabled,
+          defaultCompact: defaultCompactFor(userPreviewKey(block.row.key)),
           dataHidden: false,
         };
       }
       if (block.row.kind === "agent" && isCollapsibleResponse(block.row.turn)) {
         const previewKey = agentPreviewKey(block.row.turn.turn_id);
-        const latestResponse = latestResponseKeys.has(previewKey);
+        const expandedResponse = expandedByDefaultKeys.has(previewKey);
         return {
           key: previewKey,
-          defaultCompact: responseDefaultCompact(previewKey),
-          dataHidden: responseHasDataHidden(block.row.turn, latestResponse),
+          defaultCompact: defaultCompactFor(previewKey),
+          dataHidden: responseHasDataHidden(block.row.turn, expandedResponse),
         };
       }
       return null;
@@ -1304,7 +1505,7 @@
     if (block.user.key === key) {
       return {
         key: userPreviewKey(block.user.key),
-        defaultCompact: compactEnabled,
+        defaultCompact: defaultCompactFor(userPreviewKey(block.user.key)),
         dataHidden: false,
       };
     }
@@ -1312,12 +1513,12 @@
       if (!col.rows.some((row) => row.kind === "agent" && row.key === key)) continue;
       if (!isCollapsibleColumn(col.rows)) return null;
       const previewKey = fanoutPreviewKey(block.send_id, col.agent_id);
-      const latestResponse = latestResponseKeys.has(previewKey);
+      const expandedResponse = expandedByDefaultKeys.has(previewKey);
       return {
         key: previewKey,
-        defaultCompact: responseDefaultCompact(previewKey),
+        defaultCompact: defaultCompactFor(previewKey),
         dataHidden: col.rows.some(
-          (row) => row.kind === "agent" && responseHasDataHidden(row.turn, latestResponse),
+          (row) => row.kind === "agent" && responseHasDataHidden(row.turn, expandedResponse),
         ),
       };
     }
@@ -1339,6 +1540,7 @@
     const targetKey = blockKey(targetBlock);
     const expansionTarget = untrack(() => expansionTargetForRow(targetBlock, key));
     if (index < untrack(() => firstVisibleIndex)) {
+      debugEvent("outer", "jump", () => `pane=${paneId ?? "-"} cursor -> ${index}`);
       cursor = index;
       frozenIdentity = untrack(() => windowIdentity);
     }
@@ -1501,8 +1703,8 @@
        cap or the static completed view.
      - `"answer"` — answer prose only, for the height-clipped preview of an older
        response (tool calls + reasoning suppressed).
-     - `"final"` — only the final answer prose block, for a latest response the
-       user manually collapsed. The copy button remains independent and can
+     - `"final"` — only the final answer prose block (height-clipped at the call
+       site), for a recent or latest response the user manually collapsed. The copy button remains independent and can
        still copy only the final answer block.
      The hidden-items indicator above the body (call site) signals what `"answer"`
      / `"final"` tuck away, so a tool-only response needs no in-body placeholder.
@@ -1820,6 +2022,10 @@
         {#if messageIdentity?.kind === "pinnable" && pinsLoaded(projectId)}
           {@const pinnableIdentity = messageIdentity as PinnableMessageIdentity}
           {@const pinned = isMessagePinned(projectId, pinnableIdentity)}
+          <!-- A layout toggle: pinning an older collapsed message expands it, so
+               the clicked button must hold its place like any expand control.
+               Unpinning collapses nothing under the click (see
+               `retainedExpandedKeys`). -->
           <Tooltip
             label={pinned ? "Unpin message" : "Pin message"}
             side="bottom"
@@ -1833,6 +2039,7 @@
                 aria-label={pinned ? "Unpin message" : "Pin message"}
                 aria-pressed={pinned}
                 data-testid="message-pin"
+                data-layout-toggle
                 onclick={() => toggleMessagePin(projectId, pinnableIdentity)}
               >
                 <Pin size={15} fill={pinned ? "currentColor" : "none"} aria-hidden="true" />
@@ -1876,7 +2083,7 @@
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
   {@const key = userPreviewKey(row.key)}
-  {@const defaultCompact = compactEnabled}
+  {@const defaultCompact = defaultCompactFor(key)}
   {@const compact = isCompact(projectId, key, defaultCompact)}
   <!-- A user message has nothing hidden behind a collapse — only height — so it
        gets a toggle only when its text actually overflows the clip. -->
@@ -1897,17 +2104,23 @@
     data-preview-key={key}
   >
     <div class="bg-focus-soft w-full max-w-full overflow-hidden rounded-xl px-4 py-2">
-      <!-- Clip wraps the content inside the bubble (not the bubble itself). The
-           clip + `measureClip` mount ONLY while compact (mirroring agent rows): on
-           expand the measurer unmounts and the retained `clipOverflow[key]=true`
-           keeps the re-collapse toggle alive, instead of the observer firing on
-           the now-unclipped div and clearing it. -->
+      <!-- Clip wraps the content inside the bubble (not the bubble itself), and
+           mounts only while compact. Expanded, `measureUnclipped` answers the same
+           question against the cap, so a long prompt always has a toggle (see
+           `clipOverflow` for why the swap keeps the last measurement). -->
       {#if compact}
-        <div class={previewClip(key)} use:measureClip={key} data-testid="preview-clip">
+        <div
+          class="overflow-hidden"
+          style={previewClipStyle(key)}
+          use:measureClip={key}
+          data-testid="preview-clip"
+        >
           {@render userBody(row)}
         </div>
       {:else}
-        {@render userBody(row)}
+        <div use:measureUnclipped={key}>
+          {@render userBody(row)}
+        </div>
       {/if}
     </div>
     {@render messageMeta({
@@ -2081,10 +2294,10 @@
        a genuinely-live streaming turn is excluded — it uses the live-streaming cap. -->
   {@const previewEligible = isCollapsibleResponse(turn)}
   {@const key = agentPreviewKey(turn.turn_id)}
-  {@const latestResponse = latestResponseKeys.has(key)}
-  {@const defaultCompact = responseDefaultCompact(key)}
+  {@const expandedResponse = expandedByDefaultKeys.has(key)}
+  {@const defaultCompact = defaultCompactFor(key)}
   {@const compact = previewEligible && isCompact(projectId, key, defaultCompact)}
-  {@const showToggle = previewEligible && responseHasMore(turn, key, latestResponse)}
+  {@const showToggle = previewEligible && responseHasMore(turn, key, expandedResponse)}
   <div class="group space-y-1.5" data-testid="turn" data-role="agent" data-preview-key={key}>
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
@@ -2097,17 +2310,34 @@
       {#if compact}
         {@const hiddenLabel = hiddenItemsLabel(turn)}
         {#if hiddenLabel}{@render hiddenItemsIndicator(key, hiddenLabel)}{/if}
-        {#if latestResponse}
-          {@render turnBody(turn, false, "final")}
+        {#if expandedResponse}
+          <div
+            class="overflow-hidden"
+            style={previewClipStyle(key)}
+            use:measureClip={key}
+            data-testid="preview-clip"
+          >
+            {@render turnBody(turn, false, "final")}
+          </div>
         {:else}
           <div
-            class={cn("space-y-1.5", previewClip(key))}
+            class="space-y-1.5 overflow-hidden"
+            style={previewClipStyle(key)}
             use:measureClip={key}
             data-testid="preview-clip"
           >
             {@render turnBody(turn, false, "answer")}
           </div>
         {/if}
+      {:else if previewEligible}
+        <!-- Measured against the cap so a long reply offers a collapse toggle.
+             Every finished reply takes this branch, recent or not: branching on
+             recency would remount the body when a reply ages out, closing any
+             tool call or reasoning the user had opened. Not while live — a
+             streaming turn has no collapsed view. -->
+        <div class="space-y-1.5" use:measureUnclipped={key}>
+          {@render turnBody(turn, !ownedByOutcome, "full", false)}
+        </div>
       {:else}
         {@render turnBody(turn, !ownedByOutcome, "full", false)}
       {/if}
@@ -2182,11 +2412,12 @@
   </div>
 {/snippet}
 
+<!-- `overflow-anchor: none`: see the scroll-behaviour comment above `container`. -->
 <div
   bind:this={container}
   onscroll={() => syncPin("scroll")}
   data-testid="unified-transcript"
-  class="bg-transcript [container-type:size] flex-1 overflow-y-auto px-8 py-4"
+  class="bg-transcript [container-type:size] flex-1 overflow-y-auto px-8 py-4 [overflow-anchor:none]"
 >
   {#if loadStatus === "loading" && rows.length === 0}
     <!-- Same centered spinner+title presentation as the project-loading
@@ -2524,7 +2755,7 @@
             .filter((col) => isCollapsibleColumn(col.rows))
             .map((col) => {
               const key = fanoutPreviewKey(block.send_id, col.agent_id);
-              return { key, defaultCompact: responseDefaultCompact(key) };
+              return { key, defaultCompact: defaultCompactFor(key) };
             })}
           {@const fanoutCopyable = fanoutText(block.columns)}
           {@const fanoutLiveCap = !block.columns.some((col) => {
@@ -2557,15 +2788,15 @@
                   {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
                   {@const colKey = fanoutPreviewKey(block.send_id, col.agent_id)}
                   {@const colEligible = isCollapsibleColumn(col.rows)}
-                  {@const colLatestResponse = latestResponseKeys.has(colKey)}
-                  {@const colDefaultCompact = responseDefaultCompact(colKey)}
+                  {@const colExpandedResponse = expandedByDefaultKeys.has(colKey)}
+                  {@const colDefaultCompact = defaultCompactFor(colKey)}
                   {@const colCompact =
                     colEligible && isCompact(projectId, colKey, colDefaultCompact)}
                   {@const colShowToggle =
                     colEligible &&
                     col.rows.some(
                       (r) =>
-                        r.kind === "agent" && responseHasMore(r.turn, colKey, colLatestResponse),
+                        r.kind === "agent" && responseHasMore(r.turn, colKey, colExpandedResponse),
                     )}
                   <div
                     class="group space-y-1.5"
@@ -2600,13 +2831,25 @@
                         {#if colHiddenLabel}
                           {@render hiddenItemsIndicator(colKey, colHiddenLabel)}
                         {/if}
-                        {#if colLatestResponse}
-                          {#each col.rows as r (r.key)}
-                            {#if r.kind === "agent"}{@render turnBody(r.turn, false, "final")}{/if}
-                          {/each}
+                        {#if colExpandedResponse}
+                          <div
+                            class="space-y-1.5 overflow-hidden"
+                            style={previewClipStyle(colKey)}
+                            use:measureClip={colKey}
+                            data-testid="preview-clip"
+                          >
+                            {#each col.rows as r (r.key)}
+                              {#if r.kind === "agent"}{@render turnBody(
+                                  r.turn,
+                                  false,
+                                  "final",
+                                )}{/if}
+                            {/each}
+                          </div>
                         {:else}
                           <div
-                            class={cn("space-y-1.5", previewClip(colKey))}
+                            class="space-y-1.5 overflow-hidden"
+                            style={previewClipStyle(colKey)}
                             use:measureClip={colKey}
                             data-testid="preview-clip"
                           >
@@ -2622,6 +2865,20 @@
                         <!-- Status chip(s) last (after the indicator + body), and
                            outside the clip so a collapsed terminal column keeps
                            its outcome signal — matching the expanded order. -->
+                        {@render columnStatusChips(col.rows, colHasOutcome)}
+                      {:else if colEligible}
+                        <!-- Measured against the cap for the collapse toggle, for
+                             every finished column — see the standalone reply. -->
+                        <div class="space-y-1.5" use:measureUnclipped={colKey}>
+                          {#each col.rows as r (r.key)}
+                            {#if r.kind === "agent"}{@render turnBody(
+                                r.turn,
+                                false,
+                                "full",
+                                fanoutLiveCap,
+                              )}{/if}
+                          {/each}
+                        </div>
                         {@render columnStatusChips(col.rows, colHasOutcome)}
                       {:else}
                         {#each col.rows as r (r.key)}

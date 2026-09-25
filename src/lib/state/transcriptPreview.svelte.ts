@@ -8,11 +8,11 @@
 //
 // **Compact is on by default.** A project the user has never toggled starts
 // compact, so long transcripts open scannable (older units collapsed, the
-// latest response expanded). The header control inverts from there.
+// recent sends and each agent's latest response expanded). The header control inverts from there.
 //
 // **Default vs. override.** A visible transcript unit's *default* compactness is
-// computed by the renderer (compact mode on/off, plus the latest-completed-
-// response exception) and passed in as `defaultCompact`. This module only owns
+// computed by the renderer (compact mode on/off, plus the recent-sends and
+// latest-response exceptions) and passed in as `defaultCompact`. This module only owns
 // the user's deviations from that default: an entry in `overrides` is an
 // explicit per-unit choice that wins over the default. Touching a unit creates a
 // sticky override that persists until a project-level clear (header normalize or

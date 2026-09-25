@@ -151,6 +151,7 @@
   let draft = $state<string>(saved.content.kind === "plain" ? saved.content.draft : "");
   let sendError = $state<string | null>(null);
   let composeEl = $state<HTMLDivElement | undefined>(undefined);
+  let composeBoxEl = $state<HTMLDivElement | undefined>(undefined);
   let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
 
   // ── Attachments ─────────────────────────────────────────────────────────────
@@ -2223,6 +2224,81 @@
   /// Reading mode hides the compose box (see the template) — the user asked to
   /// be treated as not present in this project.
   const readingMode = $derived(isReadingMode(projectId));
+  // Reading mode hides the compose box, and a workflow run's progress view
+  // replaces it. Whenever it comes back — the user toggled reading mode off, it
+  // turned itself off when the agents finished, a run left the list (finished or
+  // dismissed) — the user is back to type, so the first text field of whatever
+  // form is showing takes focus. It holds back where moving the cursor would cost
+  // the user something:
+  // - focus is already in the box, set by another path (a restored draft);
+  // - focus is in another text field or inside a dialog — they are working there;
+  // - text is highlighted outside the box. Focusing a field clears the page's
+  //   selection, so a highlight the user was about to copy would vanish. A
+  //   highlight also lingers after copying, though, so instead of leaving the
+  //   user unable to type, their first keystroke is routed into the box.
+  // A tick later, so a closing dialog (the command palette's "Turn off reading
+  // mode") has already handed focus back before this checks. Focus, not mere
+  // presence: the palette's element outlives that hand-back by a frame.
+  //
+  // Hiding the box also clears its focus border. WebKit fires no focusout when
+  // the focused textarea is removed, so the border would otherwise come back lit
+  // with no cursor in the box.
+  const composeBoxShown = $derived(!activeWorkflowRun && !readingMode);
+  let composeBoxWasShown: boolean | null = null;
+  $effect(() => {
+    const shown = composeBoxShown;
+    const returned = composeBoxWasShown === false && shown;
+    composeBoxWasShown = shown;
+    if (!shown) {
+      composeFocused = false;
+      return;
+    }
+    if (!returned) return;
+    let cancelled = false;
+    let disarm: (() => void) | null = null;
+    void tick().then(() => {
+      if (cancelled) return;
+      const active = document.activeElement;
+      if (composeBoxEl?.contains(active)) return;
+      if (!focusIsFree(active)) return;
+      const selection = document.getSelection();
+      if (selection !== null && !selection.isCollapsed) {
+        disarm = focusComposeOnFirstKeystroke();
+        return;
+      }
+      composeBoxEl?.querySelector("textarea")?.focus();
+    });
+    return () => {
+      cancelled = true;
+      disarm?.();
+    };
+  });
+
+  /// Whether focus is somewhere the compose box may take it from: not a text
+  /// field and not inside a dialog.
+  function focusIsFree(active: Element | null): boolean {
+    if (active?.closest('[role="dialog"], [role="alertdialog"]')) return false;
+    return !isEditableShortcutTarget(active);
+  }
+
+  /// Route the next typed character into the compose box, leaving the page's
+  /// selection alone until then. Shortcuts (⌘C to copy the highlight) and
+  /// navigation keys pass through and keep it armed. Focusing inside keydown
+  /// sends that same keystroke's character to the newly focused field. Returns
+  /// the disarm function.
+  function focusComposeOnFirstKeystroke(): () => void {
+    function onKeydown(e: KeyboardEvent): void {
+      if (e.metaKey || e.ctrlKey || e.altKey || e.key.length !== 1) return;
+      disarm();
+      if (!focusIsFree(document.activeElement)) return;
+      composeBoxEl?.querySelector("textarea")?.focus();
+    }
+    function disarm(): void {
+      window.removeEventListener("keydown", onKeydown, true);
+    }
+    window.addEventListener("keydown", onKeydown, true);
+    return disarm;
+  }
   // A Stop/Dismiss failure, surfaced inline in the held panel — without this a
   // failed Dismiss is a silent dead button (the run stays held with no feedback).
   let workflowRunError = $state<string | null>(null);
@@ -3402,6 +3478,7 @@
           dragOver ? "border-accent" : composeFocused ? "border-focus" : "",
         )}
         data-testid="compose-box"
+        bind:this={composeBoxEl}
         data-drag-over={dragOver}
         onfocusin={() => (composeFocused = true)}
         onfocusout={(e) => {
@@ -4029,6 +4106,7 @@
             panes={paneLayout.panes}
             {agentReadiness}
             focusFirstField={focusPromptFieldOnMount}
+            onfirstfieldfocused={() => (focusPromptFieldOnMount = false)}
             onremove={removePrompt}
             recipients={recipientChips}
             busy={composerBusy}

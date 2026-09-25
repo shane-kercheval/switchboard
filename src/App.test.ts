@@ -3078,6 +3078,59 @@ describe("App", () => {
     expect(layoutA.minimized).toContain(pane2);
   });
 
+  it("dragging a pane tab saves the new order through the app", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    panes._testing.reset();
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    const pane2 = panes.moveAgentToNewPane("p-a", roster, "ag-2");
+    const pane1 = panes.layoutFor("p-a", roster).panes[0]!.id;
+    await waitFor(() => expect(paneChipById(pane2)).toBeInTheDocument());
+    const strip = screen.getByTestId("app-pane-tab-strip");
+    vi.spyOn(strip, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 200, 26));
+    vi.spyOn(paneChipById(pane1), "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 0, 80, 26),
+    );
+    vi.spyOn(paneChipById(pane2), "getBoundingClientRect").mockReturnValue(
+      new DOMRect(84, 0, 80, 26),
+    );
+
+    const pointer = (type: string, x: number): PointerEvent =>
+      new PointerEvent(type, {
+        bubbles: true,
+        button: 0,
+        buttons: type === "pointerup" ? 0 : 1,
+        pointerId: 1,
+        clientX: x,
+        clientY: 13,
+      });
+    paneChipById(pane2).dispatchEvent(pointer("pointerdown", 124));
+    window.dispatchEvent(pointer("pointermove", 20));
+    window.dispatchEvent(pointer("pointerup", 20));
+
+    await waitFor(() =>
+      expect(panes.layoutFor("p-a", roster).panes.map((pane) => pane.id)).toEqual([pane2, pane1]),
+    );
+    const saved = JSON.parse(localStorage.getItem("switchboard-transcript-panes")!) as {
+      projects: Record<string, { panes: { id: string }[] }>;
+    };
+    expect(saved.projects["p-a"]!.panes.map((pane) => pane.id)).toEqual([pane2, pane1]);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  });
+
   it("opening a hidden pane tab checks live maximized state, not the click-time snapshot", async () => {
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const selection = await import("$lib/state/recipientSelection.svelte");
@@ -4499,6 +4552,9 @@ describe("App", () => {
 
   it("clears reading mode on the silent path, where a cancelled project never notifies", async () => {
     await openProjectAlpha();
+    // The composer's own mount focus lands a frame late; let it settle so it
+    // can't be mistaken for the focus under test.
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "hi" } });
@@ -4533,6 +4589,8 @@ describe("App", () => {
     // The flush ran and cleared, but stayed silent — a cancel is something the
     // user did while present.
     expect(invokeMock.mock.calls.slice(enabledAt).some(([c]) => c === "notify")).toBe(false);
+    // The agents are done, so the user is back to type.
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
   });
 
   it("stays on for a project that is already quiet", async () => {
@@ -4554,6 +4612,9 @@ describe("App", () => {
     // The way out matters more than the way in: with the compose box hidden the
     // chord has to keep working, so it must not be gated on the composer.
     await openProjectAlpha();
+    // The composer's own mount focus lands a frame late; let it settle so it
+    // can't be mistaken for the focus under test.
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
 
     await fireEvent.keyDown(window, { key: "R", code: "KeyR", metaKey: true, shiftKey: true });
     await waitFor(() => expect(screen.queryByTestId("compose-box")).toBeNull());
@@ -4562,6 +4623,42 @@ describe("App", () => {
     await fireEvent.keyDown(window, { key: "R", code: "KeyR", metaKey: true, shiftKey: true });
     await waitFor(() => expect(screen.getByTestId("compose-box")).toBeInTheDocument());
     expect(screen.getByTestId("reading-mode-toggle")).toHaveAttribute("aria-pressed", "false");
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
+  });
+
+  it("focuses the compose box when the toggle turns reading mode off", async () => {
+    await openProjectAlpha();
+    // The composer's own mount focus lands a frame late; let it settle so it
+    // can't be mistaken for the focus under test.
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
+    const toggle = screen.getByTestId("reading-mode-toggle");
+    await fireEvent.click(toggle);
+    await waitFor(() => expect(screen.queryByTestId("compose-box")).toBeNull());
+
+    // A real click leaves focus on the button; the returning box must take it.
+    toggle.focus();
+    await fireEvent.click(toggle);
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
+  });
+
+  it("focuses the compose box when the palette turns reading mode off", async () => {
+    // The palette's dialog hands focus back to whatever held it before it
+    // opened, so the compose focus has to land after that restore.
+    await openProjectAlpha();
+    // The composer's own mount focus lands a frame late; let it settle so it
+    // can't be mistaken for the focus under test.
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
+    const toggle = screen.getByTestId("reading-mode-toggle");
+    await fireEvent.click(toggle);
+    await waitFor(() => expect(screen.queryByTestId("compose-box")).toBeNull());
+
+    toggle.focus();
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("command-option-project.reading-mode"));
+    await waitFor(() => expect(screen.queryByTestId("command-palette")).toBeNull());
+
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
   });
 
   it("keeps the way out of reading mode when the project's last agent is removed", async () => {

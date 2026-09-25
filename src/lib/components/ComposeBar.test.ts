@@ -8415,6 +8415,7 @@ describe("ComposeBar — reading mode", () => {
   afterEach(async () => {
     workflowsTesting.reset();
     (await import("$lib/state/readingMode.svelte"))._testing.reset();
+    for (const el of document.querySelectorAll("[data-focus-elsewhere]")) el.remove();
   });
 
   async function enableReadingMode(): Promise<void> {
@@ -8466,6 +8467,141 @@ describe("ComposeBar — reading mode", () => {
     expect(screen.getByTestId("workflow-run-live")).toBeInTheDocument();
     expect(screen.getByTestId("workflow-run-stop")).toBeInTheDocument();
     expect(screen.queryByTestId("compose-box")).toBeNull();
+  });
+
+  /// Let every delayed focus path run — the prompt form focuses after a tick and
+  /// the composer's mount focus after a frame — so an assertion that focus did
+  /// *not* move can't pass just by checking too early.
+  async function settleFocus(): Promise<void> {
+    await new Promise(requestAnimationFrame);
+    await new Promise(requestAnimationFrame);
+    await tick();
+  }
+
+  /// A text field outside the composer that the user is typing in.
+  function typeElsewhere(): HTMLInputElement {
+    const elsewhere = document.createElement("input");
+    elsewhere.dataset.focusElsewhere = "";
+    document.body.appendChild(elsewhere);
+    elsewhere.focus();
+    return elsewhere;
+  }
+
+  /// Hide the box with reading mode and bring it back, the way it turns itself
+  /// off when the agents finish.
+  async function hideAndReturn(): Promise<void> {
+    await enableReadingMode();
+    await enableReadingMode(); // toggles back off
+    await settleFocus();
+  }
+
+  it("puts the cursor in the message box when the box comes back", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await settleFocus();
+
+    await hideAndReturn();
+
+    expect(screen.getByTestId("compose-textarea")).toHaveFocus();
+  });
+
+  it("puts the cursor in a prompt's first field when the box comes back", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    mockPromptBackend({ prompts: [REVIEW] });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-local:review");
+    // Off the field, so landing back in it proves the return put it there.
+    screen.getByTestId("prompt-arg-focus").blur();
+
+    await hideAndReturn();
+
+    expect(screen.getByTestId("prompt-arg-focus")).toHaveFocus();
+  });
+
+  it("puts the cursor in a workflow's first text field, past its agent chips", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const workflow = {
+      name: "review",
+      is_builtin: true,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const descriptor = {
+      name: "review",
+      description: "d",
+      is_builtin: true,
+      invocable: true,
+      inputs: workflow.inputs,
+      steps: [],
+      derived_args: [
+        { name: "context", required: false, description: "Optional", prompts: ["builtin:x"] },
+      ],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [workflow];
+      if (cmd === "describe_workflow_form") return descriptor;
+      if (cmd === "list_prompts") return [];
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review"));
+    await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
+
+    await hideAndReturn();
+
+    expect(screen.getByTestId("workflow-arg-input-context")).toHaveFocus();
+  });
+
+  it("puts the cursor in the message box when a workflow run leaves the list", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    workflowRuns[PROJECT_ID] = [runInfo()];
+    await waitFor(() => expect(screen.queryByTestId("compose-box")).toBeNull());
+
+    workflowRuns[PROJECT_ID] = [];
+    await settleFocus();
+
+    expect(screen.getByTestId("compose-textarea")).toHaveFocus();
+  });
+
+  it("leaves the cursor in another text field the user is typing in", async () => {
+    // Covers the prompt form too: it used to refocus its first field on every
+    // remount, which bypassed this check.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    mockPromptBackend({ prompts: [REVIEW] });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-local:review");
+
+    await enableReadingMode();
+    const elsewhere = typeElsewhere();
+    await enableReadingMode(); // toggles back off
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+    await settleFocus();
+
+    expect(elsewhere).toHaveFocus();
+  });
+
+  it("leaves focus alone while it is inside a dialog", async () => {
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enableReadingMode();
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    dialog.dataset.focusElsewhere = "";
+    const button = document.createElement("button");
+    dialog.appendChild(button);
+    document.body.appendChild(dialog);
+    button.focus();
+
+    await enableReadingMode(); // toggles back off
+    await settleFocus();
+
+    expect(button).toHaveFocus();
   });
 
   it("inerts the window compose chords while the box is hidden", async () => {

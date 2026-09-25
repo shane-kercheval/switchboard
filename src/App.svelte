@@ -42,6 +42,7 @@
     createEmptyPane,
     expandAllPanes,
     layoutFor,
+    movePane,
     paneToCycleTo,
     revealPane,
     type TranscriptPane,
@@ -1341,10 +1342,16 @@
           <div class="flex min-w-0 shrink items-center gap-1" data-tauri-no-drag>
             <PaneTabStrip
               entries={headerPaneEntries}
+              projectId={activeProject?.id ?? ""}
               {paneIsActive}
               paneIsCompleted={paneTabIsCompleted}
               onSelectVisible={targetVisibleHeaderPane}
               onOpenHidden={selectHeaderPane}
+              onReorder={(projectId, paneId, toIndex) => {
+                if (selection.activeProjectId === projectId) {
+                  movePane(projectId, activeRosterIds, paneId, toIndex);
+                }
+              }}
             />
             <!-- Shown whenever more than one pane is hidden — minimized into the
                  tab strip, or hidden behind a maximized pane. -->

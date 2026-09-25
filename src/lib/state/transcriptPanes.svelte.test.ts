@@ -26,6 +26,7 @@ const {
   expandAllPanes,
   revealPane,
   renamePane,
+  movePane,
   setFractions,
   setPaneRowWidth,
   _testing,
@@ -604,6 +605,35 @@ describe("rename", () => {
 });
 
 describe("persistence", () => {
+  it("moves a pane and its width while preserving membership and view state across reload", () => {
+    const p2 = moveAgentToNewPane(P, ROSTER, "b");
+    const p3 = moveAgentToNewPane(P, ROSTER, "c");
+    toggleAgentHidden(P, ROSTER, "c");
+    minimizePane(P, ROSTER, p3);
+    maximizePane(P, ROSTER, p2);
+    setFractions(P, ROSTER, [0.5, 0.3, 0.2]);
+
+    movePane(P, ROSTER, p3, 0);
+    _testing.reloadFromStorage();
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.panes.map((pane) => pane.id)).toEqual([p3, "pane-default", p2]);
+    expect(layout.fractions).toEqual([0.2, 0.5, 0.3]);
+    expect(layout.panes[0]!.members).toEqual(["c"]);
+    expect(layout.panes[0]!.hidden).toEqual(["c"]);
+    expect(layout.minimized).toEqual([p3]);
+    expect(layout.maximized).toBe(p2);
+    assertOptionalMembership(layout, ROSTER);
+  });
+
+  it("ignores invalid pane moves", () => {
+    moveAgentToNewPane(P, ROSTER, "b");
+    const before = layoutFor(P, ROSTER);
+    movePane(P, ROSTER, "missing", 0);
+    movePane(P, ROSTER, before.panes[0]!.id, -1);
+    movePane(P, ROSTER, before.panes[0]!.id, 2);
+    expect(layoutFor(P, ROSTER)).toEqual(before);
+  });
+
   it("round-trips panes, membership, hidden sets, and fractions", () => {
     const p2 = moveAgentToNewPane(P, ROSTER, "b");
     renamePane(P, ROSTER, p2, "reviewers");

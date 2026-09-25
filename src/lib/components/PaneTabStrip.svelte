@@ -323,6 +323,7 @@
 
 {#if dragState?.started}
   <Portal>
+    <div class="fixed inset-0 z-40 cursor-grabbing" data-testid="pane-drag-cursor-layer"></div>
     <div
       class={cn(
         "text-fg pointer-events-none fixed z-50 max-w-36 -translate-x-1/2 truncate rounded-full border px-2 py-1 text-xs font-medium shadow-lg",

@@ -95,6 +95,10 @@ test.each([2, 3])("dragging the last of %i panes before the leftmost pane", asyn
 
   source.dispatchEvent(pointerEvent("pointerdown", sourceRect.left + sourceRect.width / 2, y));
   window.dispatchEvent(pointerEvent("pointermove", x, y));
+  await expect.element(page.getByTestId("pane-drag-cursor-layer")).toBeVisible();
+  const cursorLayer = page.getByTestId("pane-drag-cursor-layer").element() as HTMLElement;
+  expect(document.elementFromPoint(x, y)).toBe(cursorLayer);
+  expect(getComputedStyle(cursorLayer).cursor).toBe("grabbing");
   await expect.element(page.getByTestId("pane-drop-indicator")).toBeVisible();
   const indicator = page.getByTestId("pane-drop-indicator").element() as HTMLElement;
   const indicatorRect = indicator.getBoundingClientRect();
@@ -122,6 +126,7 @@ test.each([2, 3])("dragging the last of %i panes before the leftmost pane", asyn
   window.dispatchEvent(pointerEvent("pointerup", x - 18, y));
   await expect.poll(() => paneOrder()[0]).toBe(`pane-${count}`);
   await expect.element(page.getByTestId("pane-drag-preview")).not.toBeInTheDocument();
+  await expect.element(page.getByTestId("pane-drag-cursor-layer")).not.toBeInTheDocument();
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
 });
 

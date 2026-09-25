@@ -102,9 +102,22 @@ test.each([2, 3])("dragging the last of %i panes before the leftmost pane", asyn
   expect(indicatorRect.right).toBeLessThan(chip("pane-1").getBoundingClientRect().left);
   await expect.element(page.getByTestId("pane-drag-preview")).toHaveTextContent(`Pane ${count}`);
   const preview = page.getByTestId("pane-drag-preview").element() as HTMLElement;
+  await expect
+    .poll(() => {
+      const rect = preview.getBoundingClientRect();
+      return Math.abs(rect.left + rect.width / 2 - x);
+    })
+    .toBeLessThan(1);
+  expect(preview.getBoundingClientRect().top).toBeGreaterThan(y);
   const previewLeft = preview.getBoundingClientRect().left;
   window.dispatchEvent(pointerEvent("pointermove", x - 18, y));
   await expect.poll(() => preview.getBoundingClientRect().left).toBeLessThan(previewLeft);
+  await expect
+    .poll(() => {
+      const rect = preview.getBoundingClientRect();
+      return Math.abs(rect.left + rect.width / 2 - (x - 18));
+    })
+    .toBeLessThan(1);
   await expect.element(page.getByTestId("pane-drop-indicator")).toBeVisible();
   window.dispatchEvent(pointerEvent("pointerup", x - 18, y));
   await expect.poll(() => paneOrder()[0]).toBe(`pane-${count}`);

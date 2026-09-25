@@ -325,10 +325,10 @@
   <Portal>
     <div
       class={cn(
-        "text-fg pointer-events-none fixed z-50 max-w-36 truncate rounded-full border px-2 py-1 text-xs font-medium shadow-lg",
+        "text-fg pointer-events-none fixed z-50 max-w-36 -translate-x-1/2 truncate rounded-full border px-2 py-1 text-xs font-medium shadow-lg",
         dragState.paneState === "visible" ? "border-accent/60 bg-raised" : "border-border bg-panel",
       )}
-      style:left={`${Math.max(8, Math.min(dragState.pointerX + 12, window.innerWidth - 160))}px`}
+      style:left={`${Math.max(72, Math.min(dragState.pointerX, window.innerWidth - 72))}px`}
       style:top={`${Math.max(8, dragState.pointerY + 12)}px`}
       data-testid="pane-drag-preview"
     >

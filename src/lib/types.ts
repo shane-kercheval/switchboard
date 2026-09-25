@@ -693,15 +693,24 @@ export type WorktreeView = {
   warning: WorktreeWarning | null;
 };
 
+// Mirror of Rust `BehindBase` — commits the default branch has that a branch
+// lacks. `not_computed` (an older branch whose count was skipped to keep the
+// read fast) is deliberately distinct from `unknown` (couldn't determine).
+export type BehindBase =
+  | { kind: "count"; commits: number }
+  | { kind: "unknown" }
+  | { kind: "not_computed" };
+
 export type BranchView = {
   name: string;
   upstream: string | null;
   sync: SyncState;
-  behind_base: number | null;
+  behind_base: BehindBase;
   merged: boolean | null;
   dangling: boolean;
   github_url: string | null;
   worktree: WorktreeView | null;
+  last_commit_at: string | null;
 };
 
 // Remote branches carry only the cleanup status signals (merged, behind_base),
@@ -711,7 +720,8 @@ export type RemoteBranchView = {
   name: string;
   github_url: string | null;
   merged: boolean | null;
-  behind_base: number | null;
+  behind_base: BehindBase;
+  last_commit_at: string | null;
 };
 
 export type RepoView = {

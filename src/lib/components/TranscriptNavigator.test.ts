@@ -335,7 +335,8 @@ describe("TranscriptNavigator", () => {
     await tick();
     await fireEvent.pointerMove(toggle);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(screen.getByTestId("tooltip-content")).toHaveAttribute("data-state", "closed");
+    // Tooltip content is mounted only while open, so absence means it stayed closed.
+    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
 
     await fireEvent.pointerLeave(toggle);
     await fireEvent.pointerEnter(toggle);
@@ -366,7 +367,8 @@ describe("TranscriptNavigator", () => {
     await tick();
     await fireEvent.pointerMove(toggle);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(screen.getByTestId("tooltip-content")).toHaveAttribute("data-state", "closed");
+    // Tooltip content is mounted only while open, so absence means it stayed closed.
+    expect(screen.queryByTestId("tooltip-content")).not.toBeInTheDocument();
 
     await fireEvent.pointerLeave(toggle);
     await fireEvent.pointerEnter(toggle);

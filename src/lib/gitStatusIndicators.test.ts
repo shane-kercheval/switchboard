@@ -12,7 +12,8 @@ const branch = (over: Partial<BranchView> = {}): BranchView => ({
   name: "feature",
   upstream: null,
   sync: { kind: "in_sync" },
-  behind_base: null,
+  behind_base: { kind: "unknown" },
+  last_commit_at: null,
   merged: null,
   dangling: false,
   github_url: null,
@@ -51,12 +52,37 @@ describe("localBranchIndicators", () => {
   });
 
   it("behind-base is an attention indicator", () => {
-    const b = localBranchIndicators(branch({ behind_base: 3 }), null);
+    const b = localBranchIndicators(branch({ behind_base: { kind: "count", commits: 3 } }), null);
     expect(keys(b)).toContain("behind_base");
     expect(b.find((x) => x.key === "behind_base")!.tone).toBe("warning");
-    expect(keys(localBranchIndicators(branch({ behind_base: 0 }), null))).not.toContain(
-      "behind_base",
+    expect(
+      keys(localBranchIndicators(branch({ behind_base: { kind: "count", commits: 0 } }), null)),
+    ).not.toContain("behind_base");
+    expect(b.find((x) => x.key === "behind_base")!.description).toBe(
+      "3 commit(s) behind the default branch.",
     );
+  });
+
+  it("shows no behind-base indicator when the count is unknown or was not computed", () => {
+    for (const behind_base of [{ kind: "unknown" }, { kind: "not_computed" }] as const) {
+      expect(keys(localBranchIndicators(branch({ behind_base }), "main"))).not.toContain(
+        "behind_base",
+      );
+      expect(
+        keys(
+          remoteBranchIndicators(
+            {
+              name: "origin/feature",
+              github_url: null,
+              merged: null,
+              behind_base,
+              last_commit_at: null,
+            },
+            "main",
+          ),
+        ),
+      ).not.toContain("behind_base");
+    }
   });
 
   it("ahead/behind/diverged are neutral count indicators, not warnings", () => {
@@ -108,7 +134,7 @@ describe("localBranchIndicators", () => {
           branch({
             upstream: "origin/feature",
             sync: { kind: "in_sync" },
-            behind_base: 2,
+            behind_base: { kind: "count", commits: 2 },
             worktree: worktree({ dirty: true }),
           }),
           "main",
@@ -137,11 +163,14 @@ describe("remoteBranchIndicators", () => {
       name: "origin/feature",
       github_url: null,
       merged: null,
-      behind_base: null,
+      behind_base: { kind: "unknown" },
+      last_commit_at: null,
       ...over,
     });
     expect(remoteBranchIndicators(b(), null)).toEqual([]);
-    expect(keys(remoteBranchIndicators(b({ behind_base: 5 }), null))).toEqual(["behind_base"]);
+    expect(
+      keys(remoteBranchIndicators(b({ behind_base: { kind: "count", commits: 5 } }), null)),
+    ).toEqual(["behind_base"]);
     expect(keys(remoteBranchIndicators(b({ merged: true }), null))).toEqual(["merged"]);
   });
 
@@ -150,7 +179,8 @@ describe("remoteBranchIndicators", () => {
       name: "origin/main",
       github_url: null,
       merged: true,
-      behind_base: null,
+      behind_base: { kind: "unknown" },
+      last_commit_at: null,
       ...over,
     });
     expect(keys(remoteBranchIndicators(b(), "main"))).not.toContain("merged");

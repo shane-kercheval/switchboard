@@ -3,7 +3,7 @@
 // Svelte components so the mapping is unit-testable and reused wherever git
 // state is shown (the Git view now; the project-scoped panel later).
 
-import type { BranchView, RemoteBranchView, SyncState, WorktreeView } from "$lib/types";
+import type { BehindBase, BranchView, RemoteBranchView, SyncState, WorktreeView } from "$lib/types";
 
 /// How an indicator should read visually. `warning` → attention color;
 /// `neutral` → ordinary sync/count info; `muted` → low-emphasis fact.
@@ -162,15 +162,8 @@ export function localBranchIndicators(
   if (branch.worktree) {
     indicators.push(...worktreeIndicators(branch.worktree));
   }
-  if (branch.behind_base != null && branch.behind_base > 0) {
-    indicators.push({
-      key: "behind_base",
-      label: `behind ${defaultBranch ?? "default"}`,
-      tone: "warning",
-      title: `Behind ${defaultBranch ?? "default"}`,
-      description: `${branch.behind_base} commit(s) behind the default branch.`,
-    });
-  }
+  const behindBase = behindBaseIndicator(branch.behind_base, defaultBranch);
+  if (behindBase !== null) indicators.push(behindBase);
   if (branch.merged === true && branch.name !== defaultBranch) {
     indicators.push(mergedIndicator());
   }
@@ -183,20 +176,27 @@ export function remoteBranchIndicators(
   defaultBranch: string | null,
 ): GitStatusIndicator[] {
   const indicators: GitStatusIndicator[] = [];
-  if (branch.behind_base != null && branch.behind_base > 0) {
-    indicators.push({
-      key: "behind_base",
-      label: `behind ${defaultBranch ?? "default"}`,
-      tone: "warning",
-      title: `Behind ${defaultBranch ?? "default"}`,
-      description: `${branch.behind_base} commit(s) behind the default branch.`,
-    });
-  }
+  const behindBase = behindBaseIndicator(branch.behind_base, defaultBranch);
+  if (behindBase !== null) indicators.push(behindBase);
   const isDefaultRemote = defaultBranch != null && branch.name === `origin/${defaultBranch}`;
   if (branch.merged === true && !isDefaultRemote) {
     indicators.push(mergedIndicator());
   }
   return indicators;
+}
+
+function behindBaseIndicator(
+  behindBase: BehindBase,
+  defaultBranch: string | null,
+): GitStatusIndicator | null {
+  if (behindBase.kind !== "count" || behindBase.commits === 0) return null;
+  return {
+    key: "behind_base",
+    label: `behind ${defaultBranch ?? "default"}`,
+    tone: "warning",
+    title: `Behind ${defaultBranch ?? "default"}`,
+    description: `${behindBase.commits} commit(s) behind the default branch.`,
+  };
 }
 
 function mergedIndicator(): GitStatusIndicator {

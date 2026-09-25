@@ -560,7 +560,7 @@ describe("roster reconciliation", () => {
 });
 
 describe("automatic empty-pane assignment", () => {
-  it("fills visible empty panes in creation order", () => {
+  it("fills visible empty panes from left to right", () => {
     const p2 = createEmptyPane(P, ["a"]);
     const p3 = createEmptyPane(P, ["a"]);
 
@@ -569,6 +569,15 @@ describe("automatic empty-pane assignment", () => {
     const layout = layoutFor(P, ["a", "x", "y"]);
     expect(layout.panes.find((pane) => pane.id === p2)?.members).toEqual(["x"]);
     expect(layout.panes.find((pane) => pane.id === p3)?.members).toEqual(["y"]);
+  });
+
+  it("fills the leftmost empty pane after panes are reordered", () => {
+    const p2 = createEmptyPane(P, ["a"]);
+    const p3 = createEmptyPane(P, ["a"]);
+    movePane(P, ["a"], p3, 0);
+
+    expect(assignAgentToFirstVisibleEmptyPane(P, ["a", "x"], "x")).toBe(p3);
+    expect(layoutFor(P, ["a", "x"]).panes.find((pane) => pane.id === p2)?.members).toEqual([]);
   });
 
   it("skips minimized empty panes", () => {
@@ -731,6 +740,15 @@ describe("paneToCycleTo (positional pane cycling)", () => {
   it("cycles to the previous pane by position, wrapping at the start", () => {
     threePanes();
     expect(paneToCycleTo(P, ROSTER, ["b"], -1)?.members).toEqual(["a"]);
+    expect(paneToCycleTo(P, ROSTER, ["a"], -1)?.members).toEqual(["c"]);
+  });
+
+  it("cycles in the saved order after panes are reordered", () => {
+    threePanes();
+    const p3 = layoutFor(P, ROSTER).panes[2]!.id;
+    movePane(P, ROSTER, p3, 0);
+
+    expect(paneToCycleTo(P, ROSTER, ["c"], 1)?.members).toEqual(["a"]);
     expect(paneToCycleTo(P, ROSTER, ["a"], -1)?.members).toEqual(["c"]);
   });
 

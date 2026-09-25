@@ -52,3 +52,9 @@
 </div>
 <output data-testid="pane-select-count">{selectCount}</output>
 <output data-testid="pane-open-count">{openCount}</output>
+<button
+  data-testid="reorder-pane-externally"
+  onclick={() => reorder(entries[0]!.pane.id, entries.length - 1)}
+>
+  Reorder externally
+</button>

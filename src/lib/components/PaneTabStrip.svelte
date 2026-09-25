@@ -1,6 +1,7 @@
 <script lang="ts">
   import { CircleCheck } from "@lucide/svelte";
   import { Portal } from "bits-ui";
+  import { onDestroy } from "svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { DRAG_SLOP_PX, dropIndexForPointer } from "$lib/agentReorder";
@@ -28,6 +29,7 @@
   } = $props();
 
   let stripEl: HTMLDivElement;
+  let activeCleanup: (() => void) | null = null;
   let dragState = $state<{
     paneId: string;
     paneName: string;
@@ -39,6 +41,7 @@
     startOrder: string[];
     startIndex: number;
     targetIndex: number;
+    inDropZone: boolean;
     started: boolean;
     pointerX: number;
     pointerY: number;
@@ -46,12 +49,14 @@
 
   const dropBeforeId = $derived.by(() => {
     const drag = dragState;
-    if (drag === null || !drag.started || drag.targetIndex === drag.startIndex) return null;
+    if (drag === null || !drag.started || !drag.inDropZone || drag.targetIndex === drag.startIndex)
+      return null;
     return drag.startOrder.filter((id) => id !== drag.paneId)[drag.targetIndex] ?? null;
   });
   const dropAtEnd = $derived(
     dragState !== null &&
       dragState.started &&
+      dragState.inDropZone &&
       dragState.targetIndex !== dragState.startIndex &&
       dropBeforeId === null,
   );
@@ -70,6 +75,18 @@
     window.addEventListener("click", swallow, { capture: true });
     setTimeout(() => window.removeEventListener("click", swallow, { capture: true }), 0);
   }
+
+  function inDropZone(clientY: number): boolean {
+    const rect = stripEl.getBoundingClientRect();
+    return clientY >= rect.top - 8 && clientY <= rect.bottom + 8;
+  }
+
+  function cancelStaleDrag(): void {
+    activeCleanup?.();
+    dragState = null;
+  }
+
+  onDestroy(() => activeCleanup?.());
 
   function beginDrag(paneId: string, event: PointerEvent): void {
     if (entries.length < 2 || event.button !== 0 || dragState !== null) return;
@@ -90,17 +107,56 @@
       startOrder,
       startIndex: startOrder.indexOf(paneId),
       targetIndex: startOrder.indexOf(paneId),
+      inDropZone: true,
       started: false,
       pointerX: event.clientX,
       pointerY: event.clientY,
     };
+    let scrollFrame: number | null = null;
+    const updateTarget = (drag: NonNullable<typeof dragState>): void => {
+      const midpoints: number[] = [];
+      for (const chip of stripEl.querySelectorAll<HTMLElement>("[data-pane-id]")) {
+        if (chip.dataset.paneId === paneId) continue;
+        const chipRect = chip.getBoundingClientRect();
+        midpoints.push(chipRect.left + chipRect.width / 2);
+      }
+      drag.targetIndex = dropIndexForPointer(midpoints, drag.pointerX);
+    };
+    const stopScroll = (): void => {
+      if (scrollFrame !== null) cancelAnimationFrame(scrollFrame);
+      scrollFrame = null;
+    };
+    const scrollAtEdge = (): void => {
+      scrollFrame = null;
+      const drag = dragState;
+      if (cancelled || drag === null || !drag.started || !drag.inDropZone) return;
+      if (projectId !== drag.projectId || !sameOrder(drag.startOrder)) {
+        cancelled = true;
+        dragState = null;
+        return;
+      }
+      const rect = stripEl.getBoundingClientRect();
+      const delta = drag.pointerX < rect.left + 28 ? -10 : drag.pointerX > rect.right - 28 ? 10 : 0;
+      if (delta === 0) return;
+      const previous = stripEl.scrollLeft;
+      stripEl.scrollLeft += delta;
+      if (stripEl.scrollLeft === previous) return;
+      updateTarget(drag);
+      scrollFrame = requestAnimationFrame(scrollAtEdge);
+    };
     const onMove = (e: PointerEvent): void => {
-      if (e.pointerId !== pointerId || cancelled) return;
+      if (e.pointerId !== pointerId) return;
+      if (e.buttons === 0) {
+        cancelStaleDrag();
+        return;
+      }
+      if (cancelled) return;
       const drag = dragState;
       if (drag === null) return;
       if (projectId !== drag.projectId || !sameOrder(drag.startOrder)) {
         cancelled = true;
         dragState = null;
+        stopScroll();
         return;
       }
       if (!drag.started) {
@@ -109,23 +165,21 @@
       }
       drag.pointerX = e.clientX;
       drag.pointerY = e.clientY;
-      const rect = stripEl.getBoundingClientRect();
-      if (e.clientX < rect.left + 28) stripEl.scrollLeft -= 10;
-      else if (e.clientX > rect.right - 28) stripEl.scrollLeft += 10;
-      const midpoints: number[] = [];
-      for (const chip of stripEl.querySelectorAll<HTMLElement>("[data-pane-id]")) {
-        if (chip.dataset.paneId === paneId) continue;
-        const chipRect = chip.getBoundingClientRect();
-        midpoints.push(chipRect.left + chipRect.width / 2);
-      }
-      drag.targetIndex = dropIndexForPointer(midpoints, e.clientX);
+      drag.inDropZone = inDropZone(e.clientY);
+      updateTarget(drag);
+      if (drag.inDropZone && scrollFrame === null) scrollAtEdge();
+      else if (!drag.inDropZone) stopScroll();
     };
     const cleanup = (): void => {
+      stopScroll();
       window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerdown", cancelStaleDrag, { capture: true });
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onCancel);
       window.removeEventListener("keydown", onKey, { capture: true });
       window.removeEventListener("blur", onBlur);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      activeCleanup = null;
     };
     const onUp = (e: PointerEvent): void => {
       if (e.pointerId !== pointerId) return;
@@ -141,8 +195,7 @@
         !sameOrder(drag.startOrder)
       )
         return;
-      const rect = stripEl.getBoundingClientRect();
-      if (e.clientY < rect.top - 8 || e.clientY > rect.bottom + 8) return;
+      if (!inDropZone(e.clientY)) return;
       if (drag.targetIndex !== drag.startIndex) onReorder(drag.projectId, paneId, drag.targetIndex);
     };
     const onCancel = (e: PointerEvent): void => {
@@ -155,16 +208,23 @@
       e.preventDefault();
       cancelled = true;
       dragState = null;
+      stopScroll();
     };
     const onBlur = (): void => {
       cleanup();
       dragState = null;
     };
+    const onVisibilityChange = (): void => {
+      if (document.visibilityState === "hidden") cancelStaleDrag();
+    };
     window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerdown", cancelStaleDrag, { capture: true });
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onCancel);
     window.addEventListener("keydown", onKey, { capture: true });
     window.addEventListener("blur", onBlur);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    activeCleanup = cleanup;
   }
 
   function chipDrag(node: HTMLElement, paneId: string): { destroy: () => void } {

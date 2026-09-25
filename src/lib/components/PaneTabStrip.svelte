@@ -219,7 +219,7 @@
 
 <div
   bind:this={stripEl}
-  class="pane-tab-strip flex min-w-0 shrink items-center gap-1 overflow-x-auto"
+  class="pane-tab-strip flex min-w-0 shrink items-center gap-1 overflow-x-auto px-1"
   data-testid="app-pane-tab-strip"
 >
   {#each entries as { pane, state } (pane.id)}
@@ -229,10 +229,7 @@
     <div class="relative shrink-0">
       {#if dropBeforeId === pane.id}
         <span
-          class={cn(
-            "bg-focus pointer-events-none absolute top-0 z-20 h-full w-0.5 rounded-full",
-            entries[0]?.pane.id === pane.id ? "left-0.5" : "-left-0.5",
-          )}
+          class="bg-focus pointer-events-none absolute top-0 -left-[3px] z-20 h-full w-0.5 rounded-full"
           data-testid="pane-drop-indicator"
         ></span>
       {/if}
@@ -316,7 +313,7 @@
       </Tooltip>
       {#if dropAtEnd && entries[entries.length - 1]?.pane.id === pane.id}
         <span
-          class="bg-focus pointer-events-none absolute top-0 right-0.5 z-20 h-full w-0.5 rounded-full"
+          class="bg-focus pointer-events-none absolute top-0 -right-[3px] z-20 h-full w-0.5 rounded-full"
           data-testid="pane-drop-indicator"
         ></span>
       {/if}

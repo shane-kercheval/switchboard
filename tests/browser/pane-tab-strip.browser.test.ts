@@ -97,7 +97,9 @@ test.each([2, 3])("dragging the last of %i panes before the leftmost pane", asyn
   window.dispatchEvent(pointerEvent("pointermove", x, y));
   await expect.element(page.getByTestId("pane-drop-indicator")).toBeVisible();
   const indicator = page.getByTestId("pane-drop-indicator").element() as HTMLElement;
-  expect(indicator.getBoundingClientRect().left).toBeGreaterThanOrEqual(stripRect.left);
+  const indicatorRect = indicator.getBoundingClientRect();
+  expect(indicatorRect.left).toBeGreaterThan(stripRect.left);
+  expect(indicatorRect.right).toBeLessThan(chip("pane-1").getBoundingClientRect().left);
   await expect.element(page.getByTestId("pane-drag-preview")).toHaveTextContent(`Pane ${count}`);
   const preview = page.getByTestId("pane-drag-preview").element() as HTMLElement;
   const previewLeft = preview.getBoundingClientRect().left;
@@ -107,6 +109,51 @@ test.each([2, 3])("dragging the last of %i panes before the leftmost pane", asyn
   window.dispatchEvent(pointerEvent("pointerup", x - 18, y));
   await expect.poll(() => paneOrder()[0]).toBe(`pane-${count}`);
   await expect.element(page.getByTestId("pane-drag-preview")).not.toBeInTheDocument();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+});
+
+test("dragging the first pane to the end keeps the marker clear of the last chip", async () => {
+  render(PaneTabStripHost, { count: 2 });
+  await expect.element(page.getByTestId("app-pane-tab-strip")).toBeInTheDocument();
+  const strip = page.getByTestId("app-pane-tab-strip").element() as HTMLElement;
+  const source = chip("pane-1");
+  const sourceRect = source.getBoundingClientRect();
+  const stripRect = strip.getBoundingClientRect();
+  const y = sourceRect.top + sourceRect.height / 2;
+  const x = stripRect.right + 12;
+
+  source.dispatchEvent(pointerEvent("pointerdown", sourceRect.left + sourceRect.width / 2, y));
+  window.dispatchEvent(pointerEvent("pointermove", x, y));
+  await expect.element(page.getByTestId("pane-drop-indicator")).toBeVisible();
+  const indicatorRect = (
+    page.getByTestId("pane-drop-indicator").element() as HTMLElement
+  ).getBoundingClientRect();
+  expect(indicatorRect.left).toBeGreaterThan(chip("pane-2").getBoundingClientRect().right);
+  expect(indicatorRect.right).toBeLessThan(stripRect.right);
+  window.dispatchEvent(pointerEvent("pointerup", x, y));
+  await expect.poll(() => paneOrder()).toEqual(["pane-2", "pane-1"]);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+});
+
+test("the insertion marker stays in the gap between chips", async () => {
+  render(PaneTabStripHost, { count: 3 });
+  await expect.element(page.getByTestId("app-pane-tab-strip")).toBeInTheDocument();
+  const source = chip("pane-3");
+  const sourceRect = source.getBoundingClientRect();
+  const targetRect = chip("pane-2").getBoundingClientRect();
+  const y = sourceRect.top + sourceRect.height / 2;
+  const x = targetRect.left + 2;
+
+  source.dispatchEvent(pointerEvent("pointerdown", sourceRect.left + sourceRect.width / 2, y));
+  window.dispatchEvent(pointerEvent("pointermove", x, y));
+  await expect.element(page.getByTestId("pane-drop-indicator")).toBeVisible();
+  const indicatorRect = (
+    page.getByTestId("pane-drop-indicator").element() as HTMLElement
+  ).getBoundingClientRect();
+  expect(indicatorRect.left).toBeGreaterThan(chip("pane-1").getBoundingClientRect().right);
+  expect(indicatorRect.right).toBeLessThan(targetRect.left);
+  window.dispatchEvent(pointerEvent("pointerup", x, y));
+  await expect.poll(() => paneOrder()).toEqual(["pane-1", "pane-3", "pane-2"]);
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
 });
 

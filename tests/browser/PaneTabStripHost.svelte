@@ -1,16 +1,24 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import PaneTabStrip from "$lib/components/PaneTabStrip.svelte";
   import type { HeaderPaneEntry } from "$lib/components/PaneTabStrip.types";
 
+  let { count = 10 }: { count?: number } = $props();
+  const initialCount = untrack(() => count);
   let entries = $state<HeaderPaneEntry[]>(
-    Array.from({ length: 10 }, (_, index) => ({
+    Array.from({ length: initialCount }, (_, index) => ({
       pane: {
         id: `pane-${index + 1}`,
         name: `Pane ${index + 1}`,
         members: [`agent-${index + 1}`],
         hidden: [],
       },
-      state: index === 1 ? "minimized" : index === 2 ? "behind_maximized" : "visible",
+      state:
+        index === 1 && initialCount > 2
+          ? "minimized"
+          : index === 2
+            ? "behind_maximized"
+            : "visible",
     })),
   );
   let selectCount = $state(0);

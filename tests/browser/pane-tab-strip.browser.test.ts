@@ -83,6 +83,44 @@ test("dragging a minimized chip reorders the strip without opening or selecting 
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
 });
 
+test.each([2, 3])("dragging the last of %i panes before the leftmost pane", async (count) => {
+  render(PaneTabStripHost, { count });
+  await expect.element(page.getByTestId("app-pane-tab-strip")).toBeInTheDocument();
+  const strip = page.getByTestId("app-pane-tab-strip").element() as HTMLElement;
+  const source = chip(`pane-${count}`);
+  const sourceRect = source.getBoundingClientRect();
+  const stripRect = strip.getBoundingClientRect();
+  const y = sourceRect.top + sourceRect.height / 2;
+  const x = stripRect.left - 12;
+
+  source.dispatchEvent(pointerEvent("pointerdown", sourceRect.left + sourceRect.width / 2, y));
+  window.dispatchEvent(pointerEvent("pointermove", x, y));
+  await expect.element(page.getByTestId("pane-drop-indicator")).toBeVisible();
+  const indicator = page.getByTestId("pane-drop-indicator").element() as HTMLElement;
+  expect(indicator.getBoundingClientRect().left).toBeGreaterThanOrEqual(stripRect.left);
+  await expect.element(page.getByTestId("pane-drag-preview")).toHaveTextContent(`Pane ${count}`);
+  const preview = page.getByTestId("pane-drag-preview").element() as HTMLElement;
+  const previewLeft = preview.getBoundingClientRect().left;
+  window.dispatchEvent(pointerEvent("pointermove", x - 18, y));
+  await expect.poll(() => preview.getBoundingClientRect().left).toBeLessThan(previewLeft);
+  await expect.element(page.getByTestId("pane-drop-indicator")).toBeVisible();
+  window.dispatchEvent(pointerEvent("pointerup", x - 18, y));
+  await expect.poll(() => paneOrder()[0]).toBe(`pane-${count}`);
+  await expect.element(page.getByTestId("pane-drag-preview")).not.toBeInTheDocument();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+});
+
+test("pane tooltip puts chip actions in a muted line below the divider", async () => {
+  render(PaneTabStripHost, { count: 2 });
+  await page.getByTestId("app-pane-tab").first().hover();
+  const tooltip = page.getByTestId("tooltip-content");
+  await expect.element(tooltip).toBeVisible();
+  await expect.element(tooltip).toHaveTextContent("Pane 1 — visible.");
+  const action = page.getByTestId("pane-chip-tooltip-action");
+  await expect.element(action).toHaveTextContent("Click to select. Drag to rearrange.");
+  await expect.element(action).toHaveClass("border-t");
+});
+
 test("Escape cancels a pane drag without opening the chip", async () => {
   render(PaneTabStripHost);
   await expect.element(page.getByTestId("app-pane-tab-strip")).toBeInTheDocument();

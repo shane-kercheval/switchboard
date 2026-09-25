@@ -1,5 +1,6 @@
 <script lang="ts">
   import { CircleCheck } from "@lucide/svelte";
+  import { Portal } from "bits-ui";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { DRAG_SLOP_PX, dropIndexForPointer } from "$lib/agentReorder";
@@ -29,6 +30,8 @@
   let stripEl: HTMLDivElement;
   let dragState = $state<{
     paneId: string;
+    paneName: string;
+    paneState: HeaderPaneState;
     projectId: ProjectId;
     pointerId: number;
     startX: number;
@@ -37,6 +40,8 @@
     startIndex: number;
     targetIndex: number;
     started: boolean;
+    pointerX: number;
+    pointerY: number;
   } | null>(null);
 
   const dropBeforeId = $derived.by(() => {
@@ -70,10 +75,14 @@
     if (entries.length < 2 || event.button !== 0 || dragState !== null) return;
     event.preventDefault();
     const startOrder = entries.map((entry) => entry.pane.id);
+    const source = entries.find((entry) => entry.pane.id === paneId);
+    if (source === undefined) return;
     const pointerId = event.pointerId;
     let cancelled = false;
     dragState = {
       paneId,
+      paneName: source.pane.name,
+      paneState: source.state,
       projectId,
       pointerId,
       startX: event.clientX,
@@ -82,6 +91,8 @@
       startIndex: startOrder.indexOf(paneId),
       targetIndex: startOrder.indexOf(paneId),
       started: false,
+      pointerX: event.clientX,
+      pointerY: event.clientY,
     };
     const onMove = (e: PointerEvent): void => {
       if (e.pointerId !== pointerId || cancelled) return;
@@ -96,6 +107,8 @@
         if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < DRAG_SLOP_PX) return;
         drag.started = true;
       }
+      drag.pointerX = e.clientX;
+      drag.pointerY = e.clientY;
       const rect = stripEl.getBoundingClientRect();
       if (e.clientX < rect.left + 28) stripEl.scrollLeft -= 10;
       else if (e.clientX > rect.right - 28) stripEl.scrollLeft += 10;
@@ -129,13 +142,7 @@
       )
         return;
       const rect = stripEl.getBoundingClientRect();
-      if (
-        e.clientX < rect.left ||
-        e.clientX > rect.right ||
-        e.clientY < rect.top ||
-        e.clientY > rect.bottom
-      )
-        return;
+      if (e.clientY < rect.top - 8 || e.clientY > rect.bottom + 8) return;
       if (drag.targetIndex !== drag.startIndex) onReorder(drag.projectId, paneId, drag.targetIndex);
     };
     const onCancel = (e: PointerEvent): void => {
@@ -175,6 +182,8 @@
     visible: boolean;
     selectable: boolean;
     label: string;
+    title: string;
+    actionDescription: string;
   } {
     const visible = state === "visible";
     const selectable = visible && pane.members.length > 0;
@@ -200,6 +209,10 @@
       label: [`${pane.name} — ${stateDescription}.`, activityDescription, actionDescription]
         .filter((part) => part !== null)
         .join(" "),
+      title: [`${pane.name} — ${stateDescription}.`, activityDescription]
+        .filter((part) => part !== null)
+        .join(" "),
+      actionDescription,
     };
   }
 </script>
@@ -216,18 +229,16 @@
     <div class="relative shrink-0">
       {#if dropBeforeId === pane.id}
         <span
-          class="bg-focus pointer-events-none absolute top-0 -left-0.5 z-20 h-full w-0.5 rounded-full"
+          class={cn(
+            "bg-focus pointer-events-none absolute top-0 z-20 h-full w-0.5 rounded-full",
+            entries[0]?.pane.id === pane.id ? "left-0.5" : "-left-0.5",
+          )}
           data-testid="pane-drop-indicator"
         ></span>
       {/if}
       <!-- The tooltip is where the spinner/✓ semantics are taught: the
          indicator is seen far more often than any empty-state prose. -->
-      <Tooltip
-        label={`${presentation.label} Drag to rearrange.`}
-        side="bottom"
-        suppressed={dragState?.started === true}
-        reopen="fresh-hover"
-      >
+      <Tooltip side="bottom" suppressed={dragState?.started === true} reopen="fresh-hover">
         {#snippet trigger(props)}
           {#snippet contents()}
             {#if active}
@@ -293,13 +304,38 @@
             </button>
           {/if}
         {/snippet}
+        <div class="max-w-64">
+          <div class="text-[13px] font-medium">{presentation.title}</div>
+          <div
+            class="text-primary-fg/70 border-primary-fg/20 mt-2 border-t pt-2 text-[12px]"
+            data-testid="pane-chip-tooltip-action"
+          >
+            {presentation.actionDescription} Drag to rearrange.
+          </div>
+        </div>
       </Tooltip>
       {#if dropAtEnd && entries[entries.length - 1]?.pane.id === pane.id}
         <span
-          class="bg-focus pointer-events-none absolute top-0 -right-0.5 z-20 h-full w-0.5 rounded-full"
+          class="bg-focus pointer-events-none absolute top-0 right-0.5 z-20 h-full w-0.5 rounded-full"
           data-testid="pane-drop-indicator"
         ></span>
       {/if}
     </div>
   {/each}
 </div>
+
+{#if dragState?.started}
+  <Portal>
+    <div
+      class={cn(
+        "text-fg pointer-events-none fixed z-50 max-w-36 truncate rounded-full border px-2 py-1 text-xs font-medium shadow-lg",
+        dragState.paneState === "visible" ? "border-accent/60 bg-raised" : "border-border bg-panel",
+      )}
+      style:left={`${Math.max(8, Math.min(dragState.pointerX + 12, window.innerWidth - 160))}px`}
+      style:top={`${Math.max(8, dragState.pointerY + 12)}px`}
+      data-testid="pane-drag-preview"
+    >
+      {dragState.paneName}
+    </div>
+  </Portal>
+{/if}

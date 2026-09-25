@@ -842,10 +842,10 @@
   // "none")` is false there), so `reanchor` is the only thing holding the
   // reading place in production. The browser suite's WebKit DOES anchor
   // natively, and would quietly cover for a failed hold — which is how the
-  // reveal-stuck bug passed the suite. So the container sets
-  // `overflow-anchor: none`: a no-op in the app, and in the suite it makes the
-  // tests exercise the same single mechanism the app relies on, for every case
-  // the suite covers.
+  // reveal-stuck bug passed the suite. The suite now turns it off everywhere
+  // (`tests/browser-setup.ts`); the container also sets `overflow-anchor: none`
+  // itself, so it keeps `reanchor` as the single mechanism even if a future
+  // WKWebView ships native anchoring.
   let container = $state<HTMLDivElement | null>(null);
   let content = $state<HTMLDivElement | null>(null);
   // Pin attribution (user-up unpins, user-down near the bottom re-pins,

@@ -126,15 +126,18 @@
       if (scrollFrame !== null) cancelAnimationFrame(scrollFrame);
       scrollFrame = null;
     };
+    const cancelIfStale = (drag: NonNullable<typeof dragState>): boolean => {
+      if (projectId === drag.projectId && sameOrder(drag.startOrder)) return false;
+      cancelled = true;
+      dragState = null;
+      stopScroll();
+      return true;
+    };
     const scrollAtEdge = (): void => {
       scrollFrame = null;
       const drag = dragState;
       if (cancelled || drag === null || !drag.started || !drag.inDropZone) return;
-      if (projectId !== drag.projectId || !sameOrder(drag.startOrder)) {
-        cancelled = true;
-        dragState = null;
-        return;
-      }
+      if (cancelIfStale(drag)) return;
       const rect = stripEl.getBoundingClientRect();
       const delta = drag.pointerX < rect.left + 28 ? -10 : drag.pointerX > rect.right - 28 ? 10 : 0;
       if (delta === 0) return;
@@ -146,19 +149,14 @@
     };
     const onMove = (e: PointerEvent): void => {
       if (e.pointerId !== pointerId) return;
-      if (e.buttons === 0) {
+      if ((e.buttons & 1) === 0) {
         cancelStaleDrag();
         return;
       }
       if (cancelled) return;
       const drag = dragState;
       if (drag === null) return;
-      if (projectId !== drag.projectId || !sameOrder(drag.startOrder)) {
-        cancelled = true;
-        dragState = null;
-        stopScroll();
-        return;
-      }
+      if (cancelIfStale(drag)) return;
       if (!drag.started) {
         if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < DRAG_SLOP_PX) return;
         drag.started = true;
@@ -183,12 +181,14 @@
     };
     const onUp = (e: PointerEvent): void => {
       if (e.pointerId !== pointerId) return;
+      const primaryRelease = e.button === 0 && e.buttons === 0;
       const drag = dragState;
       cleanup();
       dragState = null;
       if (cancelled || drag?.started) swallowNextClick();
       if (
         cancelled ||
+        !primaryRelease ||
         drag === null ||
         !drag.started ||
         projectId !== drag.projectId ||

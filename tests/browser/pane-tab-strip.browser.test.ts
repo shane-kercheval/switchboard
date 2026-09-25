@@ -1,6 +1,7 @@
 import { expect, test } from "vitest";
 import { render } from "vitest-browser-svelte";
 import { page, userEvent } from "vitest/browser";
+import { tick } from "svelte";
 import PaneTabStripHost from "./PaneTabStripHost.svelte";
 
 function chip(paneId: string): HTMLButtonElement {
@@ -15,11 +16,17 @@ function paneOrder(): string[] {
   );
 }
 
-function pointerEvent(type: string, x: number, y: number): PointerEvent {
+function pointerEvent(
+  type: string,
+  x: number,
+  y: number,
+  buttons: number = type === "pointerup" ? 0 : 1,
+  button: number = 0,
+): PointerEvent {
   return new PointerEvent(type, {
     bubbles: true,
-    button: 0,
-    buttons: type === "pointerup" ? 0 : 1,
+    button,
+    buttons,
     pointerId: 1,
     clientX: x,
     clientY: y,
@@ -239,6 +246,45 @@ test("a missed release recovers when the pointer moves without a held button", a
   expect(paneOrder()).toEqual(["pane-1", "pane-2"]);
 });
 
+test("releasing the primary button during a chorded drag cancels the drop", async () => {
+  render(PaneTabStripHost, { count: 2 });
+  await expect.element(page.getByTestId("app-pane-tab-strip")).toBeInTheDocument();
+  const sourceRect = chip("pane-2").getBoundingClientRect();
+  const targetRect = chip("pane-1").getBoundingClientRect();
+  const y = sourceRect.top + sourceRect.height / 2;
+  const x = targetRect.left + 2;
+
+  chip("pane-2").dispatchEvent(
+    pointerEvent("pointerdown", sourceRect.left + sourceRect.width / 2, y),
+  );
+  window.dispatchEvent(pointerEvent("pointermove", x, y));
+  await expect.element(page.getByTestId("pane-drop-indicator")).toBeVisible();
+  window.dispatchEvent(pointerEvent("pointermove", x, y, 3, 2));
+  window.dispatchEvent(pointerEvent("pointermove", x, y, 2, 0));
+  await expect.element(page.getByTestId("pane-drag-cursor-layer")).not.toBeInTheDocument();
+  window.dispatchEvent(pointerEvent("pointerup", x, y, 0, 2));
+  expect(paneOrder()).toEqual(["pane-1", "pane-2"]);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+});
+
+test("a non-primary release cannot complete a pane drag", async () => {
+  render(PaneTabStripHost, { count: 2 });
+  await expect.element(page.getByTestId("app-pane-tab-strip")).toBeInTheDocument();
+  const sourceRect = chip("pane-2").getBoundingClientRect();
+  const targetRect = chip("pane-1").getBoundingClientRect();
+  const y = sourceRect.top + sourceRect.height / 2;
+  const x = targetRect.left + 2;
+
+  chip("pane-2").dispatchEvent(
+    pointerEvent("pointerdown", sourceRect.left + sourceRect.width / 2, y),
+  );
+  window.dispatchEvent(pointerEvent("pointermove", x, y));
+  await expect.element(page.getByTestId("pane-drop-indicator")).toBeVisible();
+  window.dispatchEvent(pointerEvent("pointerup", x, y, 0, 2));
+  expect(paneOrder()).toEqual(["pane-1", "pane-2"]);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+});
+
 test("an order change during a drag cancels the pending drop and chip click", async () => {
   render(PaneTabStripHost, { count: 3 });
   await expect.element(page.getByTestId("app-pane-tab-strip")).toBeInTheDocument();
@@ -262,6 +308,29 @@ test("an order change during a drag cancels the pending drop and chip click", as
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
 });
 
+test("a project change during a drag cancels the pending drop and chip click", async () => {
+  render(PaneTabStripHost, { count: 2 });
+  await expect.element(page.getByTestId("app-pane-tab-strip")).toBeInTheDocument();
+  const source = chip("pane-2");
+  const sourceRect = source.getBoundingClientRect();
+  const targetRect = chip("pane-1").getBoundingClientRect();
+  const y = sourceRect.top + sourceRect.height / 2;
+  const x = targetRect.left + 2;
+
+  source.dispatchEvent(pointerEvent("pointerdown", sourceRect.left + sourceRect.width / 2, y));
+  window.dispatchEvent(pointerEvent("pointermove", x, y));
+  await expect.element(page.getByTestId("pane-drop-indicator")).toBeVisible();
+  (page.getByTestId("change-pane-project").element() as HTMLButtonElement).click();
+  await tick();
+  window.dispatchEvent(pointerEvent("pointermove", x, y));
+  await expect.element(page.getByTestId("pane-drag-cursor-layer")).not.toBeInTheDocument();
+  window.dispatchEvent(pointerEvent("pointerup", x, y));
+  source.click();
+  expect(paneOrder()).toEqual(["pane-1", "pane-2"]);
+  await expect.element(page.getByTestId("pane-open-count")).toHaveTextContent("0");
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+});
+
 test("unmounting during a drag removes its window listeners", async () => {
   const host = render(PaneTabStripHost, { count: 2 });
   await expect.element(page.getByTestId("app-pane-tab-strip")).toBeInTheDocument();
@@ -274,8 +343,16 @@ test("unmounting during a drag removes its window listeners", async () => {
   await expect.element(page.getByTestId("pane-drag-cursor-layer")).toBeVisible();
   host.unmount();
   await expect.element(page.getByTestId("pane-drag-cursor-layer")).not.toBeInTheDocument();
-  window.dispatchEvent(pointerEvent("pointermove", sourceRect.left - 30, y));
+  const control = document.createElement("button");
+  let clicks = 0;
+  control.addEventListener("click", (): void => {
+    clicks += 1;
+  });
+  document.body.append(control);
   window.dispatchEvent(pointerEvent("pointerup", sourceRect.left - 30, y));
+  control.click();
+  expect(clicks).toBe(1);
+  control.remove();
 });
 
 test("a real click selects a pane, while a real drag only reorders it", async () => {
@@ -284,7 +361,11 @@ test("a real click selects a pane, while a real drag only reorders it", async ()
   await userEvent.click(chip("pane-1"));
   await expect.element(page.getByTestId("pane-select-count")).toHaveTextContent("1");
 
-  await userEvent.dragAndDrop(chip("pane-2"), chip("pane-1"));
+  const leftTarget = page.getByTestId("pane-drag-target-left").element() as HTMLElement;
+  expect(leftTarget.getBoundingClientRect().right).toBeLessThan(
+    chip("pane-1").getBoundingClientRect().left,
+  );
+  await userEvent.dragAndDrop(chip("pane-2"), leftTarget);
   await expect.poll(() => paneOrder()).toEqual(["pane-2", "pane-1"]);
   await expect.element(page.getByTestId("pane-select-count")).toHaveTextContent("1");
   await expect.element(page.getByTestId("pane-open-count")).toHaveTextContent("0");

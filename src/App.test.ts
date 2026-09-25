@@ -3129,7 +3129,6 @@ describe("App", () => {
     };
     expect(saved.projects["p-a"]!.panes.map((pane) => pane.id)).toEqual([pane2, pane1]);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    panes._testing.reset();
   });
 
   it("opening a hidden pane tab checks live maximized state, not the click-time snapshot", async () => {

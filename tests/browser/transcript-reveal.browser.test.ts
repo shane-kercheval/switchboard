@@ -95,3 +95,44 @@ test("repeated reveals walk back to the start and retire the sentinel", async ()
   // Nothing left above the window → the sentinel is gone.
   await expect.element(page.getByTestId("reveal-sentinel")).not.toBeInTheDocument();
 });
+
+test("a flick landing while the batch mounts keeps its movement, and the next reveal fires", async () => {
+  // Trackpad momentum: the reveal fires 200px before the top while the flick is
+  // still running, so a scroll event lands after the batch is in the DOM but
+  // before the ResizeObserver pass restores the position. That sample must not
+  // re-anchor on a just-revealed block — the restore would hold the jump, the
+  // sentinel would stay in view, and no further reveal would ever fire ("loads
+  // once, then stuck"). The flick's own movement must survive the restore.
+  await registerAgent(ALICE);
+  seedTurns(ALICE.id, buildLargeTranscript({ agentIds: [ALICE.id], exchanges: 120 })[ALICE.id]!);
+
+  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
+  await expect.poll(() => distanceFromBottom()).toBeLessThan(32);
+  const initialCount = blockCount();
+  const c = transcriptContainer();
+
+  // Into the trigger zone, not to the very top: the flick is mid-run.
+  userScrollTo(c, 150);
+  const refEl = page.getByTestId("transcript-block").first().element() as HTMLElement;
+  const before = refEl.getBoundingClientRect().top;
+  const FLICK = 60;
+  const content = refEl.parentElement!;
+  const flick = new MutationObserver(() => {
+    flick.disconnect();
+    userScrollTo(c, c.scrollTop - FLICK);
+  });
+  flick.observe(content, { childList: true });
+
+  await expect.poll(() => blockCount()).toBeGreaterThan(initialCount);
+  // Reading place held, moved by exactly the flick: scrolling up brings the
+  // reference block down the screen.
+  await expect
+    .poll(() => Math.abs(refEl.getBoundingClientRect().top - before - FLICK))
+    .toBeLessThanOrEqual(4);
+
+  // The reported symptom, asserted directly: keep scrolling up — no bounce to
+  // the bottom — and the next batch arrives.
+  const afterFirst = blockCount();
+  userScrollTo(c, 150);
+  await expect.poll(() => blockCount()).toBeGreaterThan(afterFirst);
+});

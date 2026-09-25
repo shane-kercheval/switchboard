@@ -8,6 +8,7 @@
   import {
     attachPointerProbe,
     debugInput,
+    debugEvent,
     debugNote,
     debugSample,
     debugTransition,
@@ -322,6 +323,12 @@
 
   $effect(() => {
     if (loadStatus === "complete" && windowIdentity !== frozenIdentity) {
+      debugEvent(
+        "outer",
+        "window re-pin",
+        () =>
+          `pane=${paneId ?? "-"} cursor ${untrack(() => cursor) ?? "null"} -> ${Math.max(0, blocks.length - INITIAL_WINDOW)} blocks=${blocks.length} identity ${frozenIdentity === null ? "unset" : "changed"}`,
+      );
       cursor = Math.max(0, blocks.length - INITIAL_WINDOW);
       frozenIdentity = windowIdentity;
     }
@@ -830,11 +837,15 @@
   // its position on *any* height change — a message collapsing/expanding, a
   // fan-out toggling, the live cap being removed when a turn completes — so
   // nothing jerks and whatever the user clicked stays put. We measure height
-  // changes with a ResizeObserver and re-anchor ourselves: WebKit (the Tauri
-  // webview) exposes no CSS `overflow-anchor` control, and while the engine
-  // does self-adjust for growth above the viewport (see the "anchor"
-  // attribution in $lib/scrollPin.ts), that built-in behavior covers neither
-  // the follow-the-bottom nor the gap-hold contracts.
+  // changes with a ResizeObserver and re-anchor ourselves. The app's WKWebView
+  // does not implement CSS scroll anchoring (`CSS.supports("overflow-anchor",
+  // "none")` is false there), so `reanchor` is the only thing holding the
+  // reading place in production. The browser suite's WebKit DOES anchor
+  // natively, and would quietly cover for a failed hold — which is how the
+  // reveal-stuck bug passed the suite. So the container sets
+  // `overflow-anchor: none`: a no-op in the app, and in the suite it makes the
+  // tests exercise the same single mechanism the app relies on, for every case
+  // the suite covers.
   let container = $state<HTMLDivElement | null>(null);
   let content = $state<HTMLDivElement | null>(null);
   // Pin attribution (user-up unpins, user-down near the bottom re-pins,
@@ -980,6 +991,12 @@
     // the user moved on.
     if (attribution === "up" || attribution === "down") {
       clearClickIntent();
+      if (revealAwaitingReanchor) {
+        // Not a recapture (see `revealAwaitingReanchor`), but the movement is
+        // the reader's and must survive the restore.
+        revealHeldDelta += outerPin.lastSampleDelta;
+        return;
+      }
       distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
       captureAnchor();
     }
@@ -1145,6 +1162,15 @@
     // nothing — un-gestured movement classifies as "none" and cannot stomp
     // the anchor, and a `"pass"` sample does not age input evidence.
     syncPin("pass");
+    if (revealAwaitingReanchor) {
+      // Restore to the pre-reveal reading place, moved by whatever the reader
+      // scrolled while the batch mounted. Both the anchor and the gap carry it,
+      // so the fallback gap-hold below keeps the movement too. Scrolling up is
+      // a negative delta: the anchor sits lower on screen, the gap grows.
+      anchorOffset -= revealHeldDelta;
+      distanceFromBottom -= revealHeldDelta;
+      endRevealHold();
+    }
     // Consume this pass's provenance inputs up front so every exit path
     // advances them. `untrack` keeps the callers' dependency sets unchanged
     // (the scrollSignal effect already depends on the revision via the signal).
@@ -1323,8 +1349,34 @@
   let revealSentinel = $state<HTMLElement | null>(null);
   let revealing = $state(false);
   let pendingReveal = false;
+  /// Set from the cursor decrement until the reanchor pass that restores the
+  /// reading position. In that window a user-attributed scroll sample must NOT
+  /// recapture the anchor or the gap: the batch has already mounted above the
+  /// reader, so a capture there lands on a just-revealed block at the jumped
+  /// position, and the restore then holds the jump instead of the reader's
+  /// place — with the sentinel still in view, so no further reveal ever fires
+  /// (the observer needs a transition). Trackpad momentum lands scroll events in
+  /// this window routinely: the reveal fires 200px before the top while the
+  /// flick is still running.
+  ///
+  /// The movement itself is kept, not dropped: `revealHeldDelta` accumulates the
+  /// user-attributed samples in the window and `reanchor` applies them on top of
+  /// the pre-reveal place, so the flick carries through the batch landing.
+  let revealAwaitingReanchor = false;
+  let revealHeldDelta = 0;
+
+  function endRevealHold(): void {
+    revealAwaitingReanchor = false;
+    revealHeldDelta = 0;
+  }
 
   function revealOlder(): void {
+    debugEvent(
+      "outer",
+      "reveal",
+      () =>
+        `pane=${paneId ?? "-"} first=${firstVisibleIndex} blocks=${blocks.length} revealing=${revealing} loadStatus=${loadStatus}`,
+    );
     if (firstVisibleIndex === 0) return;
     // A trigger that arrives mid-reveal is REMEMBERED, not dropped: the observer
     // only re-fires on an intersection *change*, so if the sentinel is still in
@@ -1335,6 +1387,9 @@
       return;
     }
     revealing = true;
+    const heightBefore = content?.offsetHeight ?? 0;
+    revealAwaitingReanchor = true;
+    revealHeldDelta = 0;
     // Decrement the absolute cursor (and pin the current identity, so the derived
     // uses the cursor rather than the tail fallback). `firstVisibleIndex` reflects
     // it on the next read.
@@ -1347,6 +1402,18 @@
     // scroll-to-top and drives the brief spinner; released after the frame.
     requestAnimationFrame(() => {
       revealing = false;
+      // No growth means no ResizeObserver pass will end the hold, and nothing
+      // above the reader moved — so where they are now IS their place. Recapture
+      // it: any movement in the window went uncaptured, and a stale anchor would
+      // pull the view back on the next unrelated resize.
+      if (revealAwaitingReanchor && (content?.offsetHeight ?? 0) === heightBefore) {
+        endRevealHold();
+        if (container) {
+          distanceFromBottom =
+            container.scrollHeight - container.scrollTop - container.clientHeight;
+          captureAnchor();
+        }
+      }
       if (pendingReveal) {
         pendingReveal = false;
         revealOlder();
@@ -1362,6 +1429,14 @@
     // view, so the older batch is ready as the user reaches the top.
     const io = new IntersectionObserver(
       (entries) => {
+        for (const entry of entries) {
+          debugEvent(
+            "outer",
+            "sentinel",
+            () =>
+              `pane=${paneId ?? "-"} intersecting=${entry.isIntersecting} top=${(entry.boundingClientRect.top - root.getBoundingClientRect().top).toFixed(0)} scrollTop=${root.scrollTop.toFixed(0)}`,
+          );
+        }
         if (entries.some((entry) => entry.isIntersecting)) revealOlder();
       },
       { root, rootMargin: "200px 0px 0px 0px" },
@@ -1465,6 +1540,7 @@
     const targetKey = blockKey(targetBlock);
     const expansionTarget = untrack(() => expansionTargetForRow(targetBlock, key));
     if (index < untrack(() => firstVisibleIndex)) {
+      debugEvent("outer", "jump", () => `pane=${paneId ?? "-"} cursor -> ${index}`);
       cursor = index;
       frozenIdentity = untrack(() => windowIdentity);
     }
@@ -2336,11 +2412,12 @@
   </div>
 {/snippet}
 
+<!-- `overflow-anchor: none`: see the scroll-behaviour comment above `container`. -->
 <div
   bind:this={container}
   onscroll={() => syncPin("scroll")}
   data-testid="unified-transcript"
-  class="bg-transcript [container-type:size] flex-1 overflow-y-auto px-8 py-4"
+  class="bg-transcript [container-type:size] flex-1 overflow-y-auto px-8 py-4 [overflow-anchor:none]"
 >
   {#if loadStatus === "loading" && rows.length === 0}
     <!-- Same centered spinner+title presentation as the project-loading

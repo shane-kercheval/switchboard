@@ -51,6 +51,15 @@ import { _testing as previewState } from "$lib/state/transcriptPreview.svelte";
 // ---------------------------------------------------------------------------
 
 /** The unified transcript's outer scroll container. */
+/**
+ * Engine difference to keep in mind for scroll-restore specs: this suite's
+ * WebKit implements CSS scroll anchoring and applies it natively, while the
+ * app's WKWebView does not implement it at all (`CSS.supports("overflow-anchor",
+ * "none")` is false there). A spec on a container whose component does its own
+ * anchoring can pass on the engine's correction instead of the component's, so
+ * such a component should set `overflow-anchor: none` (the transcript does). For
+ * other containers, judge case by case which behavior the spec is asserting.
+ */
 export function transcriptContainer(): HTMLElement {
   return page.getByTestId("unified-transcript").element() as HTMLElement;
 }

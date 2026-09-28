@@ -16,6 +16,7 @@
         "title": "Switchboard",
         "width": 1100,
         "height": 720,
+        "create": false,
         "visible": false,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,

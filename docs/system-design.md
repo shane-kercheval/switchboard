@@ -76,6 +76,7 @@ The shape (illustrative):
 ├── workflows/                  # user-global workflow definitions (YAML), shared across every project
 ├── workspace.yaml              # app-managed **view-state only**: which projects are archived.
 │                               #   Nothing here is load-bearing — losing it costs arrangement, never a project.
+├── window.yaml                 # macOS window size and position; follows the dev-isolated config dir
 ├── locks/                      # cross-process harness session locks, one file per (harness, session, cwd).
 │                               #   Deliberately NOT dev-isolated: a dev build and the installed app must
 │                               #   contend on the same file or neither sees the other (see session_lock.rs)

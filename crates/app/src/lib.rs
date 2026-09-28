@@ -174,6 +174,7 @@ async fn finish_orderly_quit(app: tauri::AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
+    save_main_window_geometry(&app);
     let project_ids: Vec<_> = crate::state::lock(&state.projects)
         .keys()
         .copied()
@@ -2278,15 +2279,30 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(move |app| {
-            if let Some(window) = app.get_webview_window("main") {
-                #[cfg(target_os = "macos")]
-                if let Some(path) = window_geometry_path()
-                    && let Err(error) = window_geometry::restore_window_bounds(&window, &path)
-                {
-                    tracing::warn!(path = %path.display(), %error, "could not restore window bounds");
+            let window_config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|config| config.label == "main")
+                .ok_or(tauri::Error::WindowNotFound)?;
+            let mut window_builder = tauri::WebviewWindowBuilder::from_config(app, window_config)?;
+            #[cfg(target_os = "macos")]
+            if let Some(path) = window_geometry_path() {
+                match window_geometry::startup_bounds(app.handle(), &path) {
+                    Ok(Some(bounds)) => {
+                        window_builder = window_builder
+                            .inner_size(bounds.width, bounds.height)
+                            .position(bounds.x, bounds.y);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "could not restore window bounds");
+                    }
                 }
-                window.show()?;
             }
+            let window = window_builder.build()?;
+            window.show()?;
             // Resolve the login-shell PATH in the background, and tell the
             // frontend to re-probe once it lands. Both halves matter: a GUI
             // launch inherits a PATH too minimal to find any harness CLI, and

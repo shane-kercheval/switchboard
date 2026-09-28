@@ -1,16 +1,18 @@
+//! Window bounds live under the app's config dir so parallel dev instances stay isolated.
+
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tauri::{LogicalPosition, LogicalSize, WebviewWindow};
+use tauri::WebviewWindow;
 
 // macOS screen coordinates are points; saving physical pixels can restore at
 // the wrong scale before a newly created window is attached to its monitor.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-struct Bounds {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
+pub(crate) struct Bounds {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) width: f64,
+    pub(crate) height: f64,
 }
 
 impl Bounds {
@@ -23,6 +25,29 @@ impl Bounds {
             && self.height > 0.0
             && self.width <= 16_384.0
             && self.height <= 16_384.0
+            && self.right().is_finite()
+            && self.bottom().is_finite()
+    }
+
+    fn right(self) -> f64 {
+        self.x + self.width
+    }
+
+    fn bottom(self) -> f64 {
+        self.y + self.height
+    }
+
+    fn intersection(self, other: Self) -> Option<Self> {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let width = self.right().min(other.right()) - x;
+        let height = self.bottom().min(other.bottom()) - y;
+        (width > 0.0 && height > 0.0).then_some(Self {
+            x,
+            y,
+            width,
+            height,
+        })
     }
 }
 
@@ -57,18 +82,71 @@ fn restorable_bounds(saved: Bounds, screens: &[Bounds]) -> Option<Bounds> {
     if !saved.valid() {
         return None;
     }
-    screens
+    let screens = screens
         .iter()
+        .copied()
         .filter(|screen| screen.valid())
-        .any(|screen| {
-            // Keep the titlebar reachable; an off-screen window cannot be dragged back.
-            let overlap_left = saved.x.max(screen.x);
-            let overlap_right = (saved.x + saved.width).min(screen.x + screen.width);
-            let titlebar_visible =
-                saved.y >= screen.y && saved.y + 40.0 <= screen.y + screen.height;
-            overlap_right - overlap_left >= saved.width.min(160.0) && titlebar_visible
-        })
-        .then_some(saved)
+        .collect::<Vec<_>>();
+    if fully_covered(saved, &screens) {
+        return Some(saved);
+    }
+
+    let titlebar = Bounds {
+        height: saved.height.min(40.0),
+        ..saved
+    };
+    let screen = screens.into_iter().max_by(|left, right| {
+        let overlap = |screen: Bounds| {
+            titlebar
+                .intersection(screen)
+                .map_or(0.0, |area| area.width * area.height)
+        };
+        overlap(*left).total_cmp(&overlap(*right))
+    })?;
+    titlebar.intersection(screen)?;
+
+    let width = saved.width.min(screen.width);
+    let height = saved.height.min(screen.height);
+    Some(Bounds {
+        x: saved.x.clamp(screen.x, screen.right() - width),
+        y: saved.y.clamp(screen.y, screen.bottom() - height),
+        width,
+        height,
+    })
+}
+
+fn fully_covered(saved: Bounds, screens: &[Bounds]) -> bool {
+    let mut x_edges = vec![saved.x, saved.right()];
+    for screen in screens {
+        if let Some(overlap) = saved.intersection(*screen) {
+            x_edges.extend([overlap.x, overlap.right()]);
+        }
+    }
+    x_edges.sort_by(f64::total_cmp);
+    x_edges.dedup();
+
+    for edges in x_edges.windows(2) {
+        let x_midpoint = edges[0].midpoint(edges[1]);
+        let mut y_ranges = screens
+            .iter()
+            .filter(|screen| screen.x <= x_midpoint && x_midpoint < screen.right())
+            .filter_map(|screen| saved.intersection(*screen))
+            .map(|overlap| (overlap.y, overlap.bottom()))
+            .collect::<Vec<_>>();
+        y_ranges.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+        let mut covered_to = saved.y;
+        for (start, end) in y_ranges {
+            if start > covered_to {
+                return false;
+            }
+            covered_to = covered_to.max(end);
+        }
+        if covered_to < saved.bottom() {
+            return false;
+        }
+    }
+    true
 }
 
 fn monitor_bounds(monitor: &tauri::Monitor) -> Option<Bounds> {
@@ -76,8 +154,8 @@ fn monitor_bounds(monitor: &tauri::Monitor) -> Option<Bounds> {
     if !scale.is_finite() || scale <= 0.0 {
         return None;
     }
-    let position = monitor.position().to_logical::<f64>(scale);
-    let size = monitor.size().to_logical::<f64>(scale);
+    let position = monitor.work_area().position.to_logical::<f64>(scale);
+    let size = monitor.work_area().size.to_logical::<f64>(scale);
     Some(Bounds {
         x: position.x,
         y: position.y,
@@ -87,7 +165,7 @@ fn monitor_bounds(monitor: &tauri::Monitor) -> Option<Bounds> {
 }
 
 pub(crate) fn save_window_bounds(window: &WebviewWindow, path: &Path) -> Result<(), String> {
-    // Fullscreen uses a separate Space and does not describe the normal window frame.
+    // A fullscreen frame does not describe the normal window; keep the last saved frame.
     if window.is_fullscreen().map_err(|error| error.to_string())? {
         return Ok(());
     }
@@ -114,11 +192,14 @@ pub(crate) fn save_window_bounds(window: &WebviewWindow, path: &Path) -> Result<
     )
 }
 
-pub(crate) fn restore_window_bounds(window: &WebviewWindow, path: &Path) -> Result<(), String> {
+pub(crate) fn startup_bounds(
+    app: &tauri::AppHandle,
+    path: &Path,
+) -> Result<Option<Bounds>, String> {
     let Some(saved) = load_bounds(path) else {
-        return Ok(());
+        return Ok(None);
     };
-    let screens = window
+    let screens = app
         .available_monitors()
         .map_err(|error| error.to_string())?
         .iter()
@@ -126,14 +207,9 @@ pub(crate) fn restore_window_bounds(window: &WebviewWindow, path: &Path) -> Resu
         .collect::<Vec<_>>();
     let Some(bounds) = restorable_bounds(saved, &screens) else {
         tracing::warn!(path = %path.display(), "saved window is off-screen; using default placement");
-        return Ok(());
+        return Ok(None);
     };
-    window
-        .set_size(LogicalSize::new(bounds.width, bounds.height))
-        .map_err(|error| error.to_string())?;
-    window
-        .set_position(LogicalPosition::new(bounds.x, bounds.y))
-        .map_err(|error| error.to_string())
+    Ok(Some(bounds))
 }
 
 #[cfg(test)]
@@ -178,6 +254,121 @@ mod tests {
         }];
 
         assert_eq!(restorable_bounds(saved, &remaining_screen), None);
+    }
+
+    #[test]
+    fn partially_offscreen_window_fits_on_the_remaining_display() {
+        let saved = Bounds {
+            x: 1280.0,
+            y: 100.0,
+            width: 1100.0,
+            height: 720.0,
+        };
+        let screens = [Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        }];
+
+        assert_eq!(
+            restorable_bounds(saved, &screens),
+            Some(Bounds { x: 340.0, ..saved })
+        );
+    }
+
+    #[test]
+    fn window_larger_than_the_display_shrinks_to_fit() {
+        let saved = Bounds {
+            x: 100.0,
+            y: 100.0,
+            width: 1600.0,
+            height: 1000.0,
+        };
+        let screens = [Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        }];
+
+        assert_eq!(restorable_bounds(saved, &screens), Some(screens[0]));
+    }
+
+    #[test]
+    fn window_spanning_connected_displays_keeps_its_exact_frame() {
+        let saved = Bounds {
+            x: 700.0,
+            y: 100.0,
+            width: 1100.0,
+            height: 700.0,
+        };
+        let screens = [
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 900.0,
+            },
+            Bounds {
+                x: 1000.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 900.0,
+            },
+        ];
+
+        assert_eq!(restorable_bounds(saved, &screens), Some(saved));
+    }
+
+    #[test]
+    fn mirrored_displays_do_not_double_count_visible_space() {
+        let saved = Bounds {
+            x: 0.0,
+            y: 100.0,
+            width: 1000.0,
+            height: 700.0,
+        };
+        let mirror = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 500.0,
+            height: 900.0,
+        };
+
+        assert_eq!(
+            restorable_bounds(saved, &[mirror, mirror]),
+            Some(Bounds {
+                width: 500.0,
+                ..saved
+            })
+        );
+    }
+
+    #[test]
+    fn secondary_display_to_the_left_keeps_negative_coordinates() {
+        let saved = Bounds {
+            x: -900.0,
+            y: 100.0,
+            width: 800.0,
+            height: 700.0,
+        };
+        let screens = [
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1200.0,
+                height: 900.0,
+            },
+            Bounds {
+                x: -1000.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 900.0,
+            },
+        ];
+
+        assert_eq!(restorable_bounds(saved, &screens), Some(saved));
     }
 
     #[test]

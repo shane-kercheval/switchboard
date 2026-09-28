@@ -15,6 +15,12 @@ pub(crate) struct Bounds {
     pub(crate) height: f64,
 }
 
+#[derive(Clone, Copy)]
+struct DisplayBounds {
+    full: Bounds,
+    work_area: Bounds,
+}
+
 impl Bounds {
     fn valid(self) -> bool {
         self.x.is_finite()
@@ -78,38 +84,50 @@ fn load_bounds(path: &Path) -> Option<Bounds> {
     }
 }
 
-fn restorable_bounds(saved: Bounds, screens: &[Bounds]) -> Option<Bounds> {
+fn restorable_bounds(saved: Bounds, displays: &[DisplayBounds]) -> Option<Bounds> {
     if !saved.valid() {
         return None;
     }
-    let screens = screens
+    let displays = displays
         .iter()
         .copied()
-        .filter(|screen| screen.valid())
+        .filter(|display| display.full.valid() && display.work_area.valid())
         .collect::<Vec<_>>();
-    if fully_covered(saved, &screens) {
-        return Some(saved);
-    }
-
     let titlebar = Bounds {
         height: saved.height.min(40.0),
         ..saved
     };
-    let screen = screens.into_iter().max_by(|left, right| {
-        let overlap = |screen: Bounds| {
-            titlebar
-                .intersection(screen)
-                .map_or(0.0, |area| area.width * area.height)
-        };
-        overlap(*left).total_cmp(&overlap(*right))
-    })?;
-    titlebar.intersection(screen)?;
 
-    let width = saved.width.min(screen.width);
-    let height = saved.height.min(screen.height);
+    let full_bounds = displays
+        .iter()
+        .map(|display| display.full)
+        .collect::<Vec<_>>();
+    let work_areas = displays
+        .iter()
+        .map(|display| display.work_area)
+        .collect::<Vec<_>>();
+    if fully_covered(saved, &full_bounds) && titlebar_reachable(titlebar, &work_areas) {
+        return Some(saved);
+    }
+
+    let work_area = displays
+        .into_iter()
+        .max_by(|left, right| {
+            let overlap = |display: DisplayBounds| {
+                titlebar
+                    .intersection(display.work_area)
+                    .map_or(0.0, |area| area.width * area.height)
+            };
+            overlap(*left).total_cmp(&overlap(*right))
+        })?
+        .work_area;
+    titlebar.intersection(work_area)?;
+
+    let width = saved.width.min(work_area.width);
+    let height = saved.height.min(work_area.height);
     Some(Bounds {
-        x: saved.x.clamp(screen.x, screen.right() - width),
-        y: saved.y.clamp(screen.y, screen.bottom() - height),
+        x: saved.x.min(work_area.right() - width).max(work_area.x),
+        y: saved.y.min(work_area.bottom() - height).max(work_area.y),
         width,
         height,
     })
@@ -149,18 +167,50 @@ fn fully_covered(saved: Bounds, screens: &[Bounds]) -> bool {
     true
 }
 
-fn monitor_bounds(monitor: &tauri::Monitor) -> Option<Bounds> {
+fn titlebar_reachable(titlebar: Bounds, work_areas: &[Bounds]) -> bool {
+    let mut spans = work_areas
+        .iter()
+        .filter(|work_area| work_area.y <= titlebar.y && work_area.bottom() >= titlebar.bottom())
+        .filter_map(|work_area| titlebar.intersection(*work_area))
+        .map(|overlap| (overlap.x, overlap.right()))
+        .collect::<Vec<_>>();
+    spans.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+    let mut span_start = 0.0;
+    let mut span_end = f64::NEG_INFINITY;
+    for (left, right) in spans {
+        if left > span_end {
+            span_start = left;
+            span_end = right;
+        } else {
+            span_end = span_end.max(right);
+        }
+        // A narrow sliver can expose only controls, leaving no place to drag.
+        if span_end - span_start >= titlebar.width.min(160.0) {
+            return true;
+        }
+    }
+    false
+}
+
+fn monitor_bounds(monitor: &tauri::Monitor) -> Option<DisplayBounds> {
     let scale = monitor.scale_factor();
     if !scale.is_finite() || scale <= 0.0 {
         return None;
     }
-    let position = monitor.work_area().position.to_logical::<f64>(scale);
-    let size = monitor.work_area().size.to_logical::<f64>(scale);
-    Some(Bounds {
-        x: position.x,
-        y: position.y,
-        width: size.width,
-        height: size.height,
+    let bounds = |position: tauri::PhysicalPosition<i32>, size: tauri::PhysicalSize<u32>| {
+        let position = position.to_logical::<f64>(scale);
+        let size = size.to_logical::<f64>(scale);
+        Bounds {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+        }
+    };
+    Some(DisplayBounds {
+        full: bounds(*monitor.position(), *monitor.size()),
+        work_area: bounds(monitor.work_area().position, monitor.work_area().size),
     })
 }
 
@@ -214,7 +264,17 @@ pub(crate) fn startup_bounds(
 
 #[cfg(test)]
 mod tests {
-    use super::{Bounds, load_bounds, restorable_bounds, save_bounds};
+    use super::{Bounds, DisplayBounds, load_bounds, restorable_bounds, save_bounds};
+
+    fn displays(screens: &[Bounds]) -> Vec<DisplayBounds> {
+        screens
+            .iter()
+            .map(|screen| DisplayBounds {
+                full: *screen,
+                work_area: *screen,
+            })
+            .collect()
+    }
 
     #[test]
     fn saved_bounds_round_trip_and_restore_on_the_same_screen() {
@@ -235,7 +295,7 @@ mod tests {
         }];
 
         assert_eq!(load_bounds(&path), Some(bounds));
-        assert_eq!(restorable_bounds(bounds, &screens), Some(bounds));
+        assert_eq!(restorable_bounds(bounds, &displays(&screens)), Some(bounds));
     }
 
     #[test]
@@ -253,7 +313,7 @@ mod tests {
             height: 900.0,
         }];
 
-        assert_eq!(restorable_bounds(saved, &remaining_screen), None);
+        assert_eq!(restorable_bounds(saved, &displays(&remaining_screen)), None);
     }
 
     #[test]
@@ -272,7 +332,7 @@ mod tests {
         }];
 
         assert_eq!(
-            restorable_bounds(saved, &screens),
+            restorable_bounds(saved, &displays(&screens)),
             Some(Bounds { x: 340.0, ..saved })
         );
     }
@@ -292,7 +352,113 @@ mod tests {
             height: 900.0,
         }];
 
-        assert_eq!(restorable_bounds(saved, &screens), Some(screens[0]));
+        assert_eq!(
+            restorable_bounds(saved, &displays(&screens)),
+            Some(screens[0])
+        );
+    }
+
+    #[test]
+    fn fractional_display_coordinates_do_not_prevent_launch() {
+        let saved = Bounds {
+            x: 0.3,
+            y: 100.0,
+            width: 1600.0,
+            height: 700.0,
+        };
+        let screen = Bounds {
+            x: 0.3,
+            y: 0.0,
+            width: 1200.6,
+            height: 900.0,
+        };
+
+        assert_eq!(
+            restorable_bounds(saved, &displays(&[screen])),
+            Some(Bounds {
+                width: screen.width,
+                ..saved
+            })
+        );
+    }
+
+    #[test]
+    fn window_partly_behind_the_dock_keeps_its_saved_frame() {
+        let saved = Bounds {
+            x: 100.0,
+            y: 100.0,
+            width: 800.0,
+            height: 700.0,
+        };
+        let work_area = Bounds {
+            x: 0.0,
+            y: 25.0,
+            width: 1000.0,
+            height: 700.0,
+        };
+
+        let full = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 900.0,
+        };
+        assert_eq!(
+            restorable_bounds(saved, &[DisplayBounds { full, work_area }]),
+            Some(saved)
+        );
+    }
+
+    #[test]
+    fn window_partly_behind_a_side_dock_keeps_its_saved_frame() {
+        let saved = Bounds {
+            x: 0.0,
+            y: 100.0,
+            width: 800.0,
+            height: 700.0,
+        };
+        let full = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 900.0,
+        };
+        let work_area = Bounds {
+            x: 80.0,
+            width: 920.0,
+            ..full
+        };
+
+        assert_eq!(
+            restorable_bounds(saved, &[DisplayBounds { full, work_area }]),
+            Some(saved)
+        );
+    }
+
+    #[test]
+    fn inaccessible_titlebar_is_moved_into_the_work_area() {
+        let saved = Bounds {
+            x: 100.0,
+            y: 10.0,
+            width: 800.0,
+            height: 700.0,
+        };
+        let full = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 900.0,
+        };
+        let work_area = Bounds {
+            y: 40.0,
+            height: 860.0,
+            ..full
+        };
+
+        assert_eq!(
+            restorable_bounds(saved, &[DisplayBounds { full, work_area }]),
+            Some(Bounds { y: 40.0, ..saved })
+        );
     }
 
     #[test]
@@ -318,7 +484,7 @@ mod tests {
             },
         ];
 
-        assert_eq!(restorable_bounds(saved, &screens), Some(saved));
+        assert_eq!(restorable_bounds(saved, &displays(&screens)), Some(saved));
     }
 
     #[test]
@@ -337,7 +503,7 @@ mod tests {
         };
 
         assert_eq!(
-            restorable_bounds(saved, &[mirror, mirror]),
+            restorable_bounds(saved, &displays(&[mirror, mirror])),
             Some(Bounds {
                 width: 500.0,
                 ..saved
@@ -368,7 +534,7 @@ mod tests {
             },
         ];
 
-        assert_eq!(restorable_bounds(saved, &screens), Some(saved));
+        assert_eq!(restorable_bounds(saved, &displays(&screens)), Some(saved));
     }
 
     #[test]

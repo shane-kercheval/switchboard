@@ -200,6 +200,7 @@ async fn finish_orderly_quit(app: tauri::AppHandle) {
     .await;
     if let Some(coordinator) = app.try_state::<crate::lifecycle::QuitCoordinator>() {
         coordinator.approve_exit();
+        // Capture a move or resize made while shutdown work was draining.
         save_main_window_geometry(&app);
         app.exit(0);
     }

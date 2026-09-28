@@ -19,6 +19,8 @@ mod secret_store;
 mod session_lock;
 mod state;
 mod wake_lock;
+#[cfg(target_os = "macos")]
+mod window_geometry;
 pub mod workflow;
 mod workflow_commands;
 mod workspace;
@@ -197,7 +199,17 @@ async fn finish_orderly_quit(app: tauri::AppHandle) {
     .await;
     if let Some(coordinator) = app.try_state::<crate::lifecycle::QuitCoordinator>() {
         coordinator.approve_exit();
+        save_main_window_geometry(&app);
         app.exit(0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn save_main_window_geometry(app: &tauri::AppHandle) {
+    if let (Some(window), Some(path)) = (app.get_webview_window("main"), window_geometry_path())
+        && let Err(error) = window_geometry::save_window_bounds(&window, &path)
+    {
+        tracing::warn!(path = %path.display(), %error, "could not save window bounds");
     }
 }
 
@@ -293,6 +305,7 @@ fn handle_macos_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
         } if label == "main" => {
             api.prevent_close();
             if let Some(window) = app.get_webview_window("main") {
+                save_main_window_geometry(app);
                 let _ = window.hide();
             }
         }
@@ -1937,6 +1950,11 @@ fn workspace_config_path() -> Option<std::path::PathBuf> {
     config_dir().map(|dir| dir.join("workspace.yaml"))
 }
 
+#[cfg(target_os = "macos")]
+fn window_geometry_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join("window.yaml"))
+}
+
 /// Root of the user-global project store (`<config-dir>/store/`).
 ///
 /// A **subdirectory** rather than the config dir itself: the store owns its
@@ -2237,6 +2255,7 @@ pub fn run() {
         if CLOSE_WINDOW_MENU_IDS.contains(&event.id().as_ref())
             && let Some(window) = app.get_webview_window("main")
         {
+            save_main_window_geometry(app);
             let _ = window.hide();
         } else if event.id() == QUIT_MENU_ID
             && let Some(coordinator) = app.try_state::<crate::lifecycle::QuitCoordinator>()
@@ -2259,6 +2278,15 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(move |app| {
+            if let Some(window) = app.get_webview_window("main") {
+                #[cfg(target_os = "macos")]
+                if let Some(path) = window_geometry_path()
+                    && let Err(error) = window_geometry::restore_window_bounds(&window, &path)
+                {
+                    tracing::warn!(path = %path.display(), %error, "could not restore window bounds");
+                }
+                window.show()?;
+            }
             // Resolve the login-shell PATH in the background, and tell the
             // frontend to re-probe once it lands. Both halves matter: a GUI
             // launch inherits a PATH too minimal to find any harness CLI, and

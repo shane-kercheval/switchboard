@@ -18,6 +18,7 @@ use crate::git_registry::{self, GitRegistry};
 use crate::harness_usage::{self, HarnessUsage};
 use crate::notification::{Notifier, NullNotifier};
 use crate::preferences::{self, Preferences};
+use crate::wake_lock::WakeLock;
 use crate::workspace::{self, Workspace};
 
 /// A live workflow run's in-memory handle. The on-disk `runs/<run-id>.jsonl` is
@@ -496,6 +497,10 @@ pub struct AppState {
     /// when the window is focused). Defaults to a no-op; production injects the
     /// gated notifier via [`AppState::with_notifier`].
     pub notifier: Arc<dyn Notifier>,
+    /// The app's one wake lock, shared with the `WakeLockEmitter` that feeds it
+    /// turns. A workflow run holds a lease on it for its whole life. Inert until
+    /// production injects the real one via [`AppState::with_wake_lock`].
+    pub wake_lock: WakeLock,
     /// Shared with the notification delivery path so the permission prompt is
     /// requested once and any pending request is awaited before a notification is
     /// posted — see [`crate::notification::AuthorizationGate`].
@@ -579,6 +584,7 @@ impl AppState {
             forwards: Mutex::new(HashMap::new()),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
             notifier: Arc::new(NullNotifier),
+            wake_lock: WakeLock::inert(),
             notification_gate: Arc::new(crate::notification::AuthorizationGate::new(Arc::new(
                 crate::notification::OsAuthorizationRequester,
             ))),
@@ -652,6 +658,15 @@ impl AppState {
     #[must_use]
     pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
         self.notifier = notifier;
+        self
+    }
+
+    /// Builder step that injects the production wake lock — the same one the
+    /// base emitter's `WakeLockEmitter` feeds, so turns and workflow leases count
+    /// together.
+    #[must_use]
+    pub fn with_wake_lock(mut self, wake_lock: WakeLock) -> Self {
+        self.wake_lock = wake_lock;
         self
     }
 

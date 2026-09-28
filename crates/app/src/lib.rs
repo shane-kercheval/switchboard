@@ -2319,16 +2319,17 @@ pub fn run() {
             spawn_path_resolved_emitter(app.handle().clone());
             switchboard_harness::subprocess::warm_path_cache();
 
-            // Wrap the base emitter so any in-flight agent turn holds an OS
+            // Wrap the base emitter so any in-flight agent turn holds the OS
             // wake lock; the decorator counts `turn_start`/`turn_end` across
-            // all agents and releases once the last turn ends.
+            // all agents. The same lock goes into the state below so workflow
+            // runs can hold it between their turns.
+            let wake_lock =
+                wake_lock::WakeLock::new(wake_lock::KeepAwakeInhibitor::new(), wake_lock::ThreadTimer);
             let base_emitter: Arc<dyn EventEmitter> = Arc::new(AppHandleEmitter {
                 app: app.handle().clone(),
             });
-            let emitter: Arc<dyn EventEmitter> = Arc::new(WakeLockEmitter::new(
-                base_emitter,
-                wake_lock::KeepAwakeInhibitor::new(),
-            ));
+            let emitter: Arc<dyn EventEmitter> =
+                Arc::new(WakeLockEmitter::new(base_emitter, wake_lock.clone()));
             // The store is required, so both failures abort startup rather than
             // degrading: with no store the app would accept project creation
             // and silently lose it. Contrast the `Option<PathBuf>` persistence
@@ -2367,6 +2368,7 @@ pub fn run() {
                 lock_root,
             );
             let state = state.with_real_harnesses(spawns_real_harnesses);
+            let state = state.with_wake_lock(wake_lock);
             // Attach all user-global persistence locations (workspace.yaml,
             // git-view.yaml, config.yaml) — see `with_persistence_paths`.
             let state = with_persistence_paths(state);

@@ -116,6 +116,9 @@
   let openActionError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let workflowStopError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let openProjectActionsId = $state<ProjectId | null>(null);
+  // Each row's element, so its directory tooltip can position against the
+  // whole row.
+  const projectRowEls = $state<Record<ProjectId, HTMLElement>>({});
   let openActionSeq = 0;
   let relativeNow = $state(Date.now());
 
@@ -627,6 +630,7 @@
             "group hover:bg-surface flex w-full flex-col rounded-md",
             (highlighted || actionsOpen) && "bg-raised hover:bg-raised",
           )}
+          bind:this={projectRowEls[project.id]}
           data-testid="project-row"
           data-project-id={project.id}
           data-active={highlighted}
@@ -719,10 +723,14 @@
                 {/if}
               </div>
             {:else}
+              <!-- Anchored to the whole row, not this button: the button ends
+                   where the row's actions begin, so "right of the button" put
+                   the tooltip over the menu icon. -->
               <Tooltip
                 label={directoryLabel(project)}
                 delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
                 side="right"
+                anchor={projectRowEls[project.id]}
               >
                 {#snippet trigger(props)}
                   <button

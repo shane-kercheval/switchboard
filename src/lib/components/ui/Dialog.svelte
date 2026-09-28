@@ -24,7 +24,9 @@
   /// takes focus one tick later unless focus is still inside a dialog (see
   /// `composeBoxShown` in `ComposeBar.svelte`). A close animation delays the
   /// unmount and its hand-back, so the box would find focus still in the palette
-  /// and leave it there — adding one means revisiting that.
+  /// and leave it there — adding one means revisiting that. The same goes for
+  /// `handleAddAgent` in `App.svelte`, which closes the add-agent dialog, waits
+  /// one tick for this hand-back, then asks the composer for focus.
   import type { Snippet } from "svelte";
   import { Dialog as BitsDialog } from "bits-ui";
   import { cn } from "$lib/utils";

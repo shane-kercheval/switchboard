@@ -1603,7 +1603,7 @@ describe("App", () => {
     expect(recipients.selectionFor("p-a")).toEqual(["ag-first"]);
   });
 
-  it("add agent via the sidebar fills the oldest visible empty pane", async () => {
+  it("add agent via the sidebar fills the oldest visible empty pane and targets it", async () => {
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const recipients = await import("$lib/state/recipientSelection.svelte");
     seedProject({
@@ -1646,7 +1646,53 @@ describe("App", () => {
     expect(
       panes.layoutFor("p-a", ["ag-1", "ag-2"]).panes.find((pane) => pane.id === pane2)?.members,
     ).toEqual(["ag-2"]);
+    // Same as Cmd+clicking the pane it filled: the new agent is the recipient,
+    // and the cursor is in the composer once the dialog has closed.
+    expect(recipients.selectionFor("p-a")).toEqual(["ag-2"]);
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByTestId("compose-textarea")),
+    );
+  });
+
+  it("add agent via the sidebar leaves the selection alone when no pane is empty", async () => {
+    const recipients = await import("$lib/state/recipientSelection.svelte");
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.agentQueue.push(
+      agent({
+        id: "ag-2",
+        project_id: "p-a",
+        name: "second",
+        harness: "codex",
+        session_locator: null,
+      }),
+    );
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+    recipients.setRecipients("p-a", ["ag-1"]);
+
+    await fireEvent.click(screen.getByTestId("sidebar-add-agent"));
+    await waitFor(() => expect(screen.getByTestId("dialog-content")).toBeInTheDocument());
+    const modal = screen.getByTestId("dialog-content");
+    await fireEvent.input(within(modal).getByTestId("agent-name"), {
+      target: { value: "second" },
+    });
+    await fireEvent.click(within(modal).getByTestId("harness-codex"));
+    await fireEvent.click(within(modal).getByTestId("confirm-create-agent"));
+
+    await waitFor(() => expect(screen.queryByTestId("dialog-content")).not.toBeInTheDocument());
+    await waitFor(() => {
+      const names = screen.getAllByTestId("agent-name");
+      expect(names.some((n) => n.textContent === "second")).toBe(true);
+    });
     expect(recipients.selectionFor("p-a")).toEqual(["ag-1"]);
+    expect(document.activeElement).not.toBe(screen.getByTestId("compose-textarea"));
   });
 
   // --- post-restart merged conversation ---

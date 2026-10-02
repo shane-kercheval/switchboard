@@ -667,22 +667,125 @@ describe("claudeRateLimitView on an overage turn", () => {
     },
   };
 
-  it("leaves the spent window unflagged, so the tone stays neutral", () => {
-    // Flagging it would keep the card permanently amber for anyone routinely in
-    // overage, and make a genuine refusal indistinguishable from being billed.
+  it("flags the spent window even though requests still succeed", () => {
+    // The allowance is gone and paid credits cost far more than it did, so the
+    // card stays in the warning tone for as long as the state lasts. Leaving it
+    // neutral because the turn was served is what hid the expensive state.
     const view = claudeView(overaging, NOW, undefined);
-    expect(view?.windows.every((w) => w.limitReached === undefined)).toBe(true);
+    expect(view?.windows.find((w) => w.key === "seven_day")?.limitReached).toBe(true);
+    expect(view?.windows.find((w) => w.key === "five_hour")?.limitReached).toBeUndefined();
   });
 
-  it("still reports the credits escalation, which is the signal for this state", () => {
+  it("reports the credits escalation, which is what says work is continuing", () => {
     const view = claudeView(overaging, NOW, undefined);
-    expect(view?.overage).not.toBeNull();
+    expect(view?.overage).toEqual({ resetsAtMs: overaging.overageResetsAt * 1000 });
   });
 
-  it("flags the window again once the same status arrives without overage", () => {
-    // The discriminator is the overage flag, not the status: the captured wall
-    // carries `isUsingOverage: false`.
+  it("flags the same window on a refusal, with no escalation beside it", () => {
+    // The captured wall carries `isUsingOverage: false`: the bar reads the same,
+    // and the absent escalation is what separates refused from billed.
     const view = claudeView({ ...overaging, isUsingOverage: false }, NOW, undefined);
     expect(view?.windows.find((w) => w.key === "seven_day")?.limitReached).toBe(true);
+    expect(view?.overage).toBeNull();
+  });
+});
+
+describe("codexAccountUsageView credits escalation", () => {
+  /// The account-wide bucket as a `team` account reports it with the 5-hour
+  /// window spent and credits behind it: `ordinaryUsageAllowed: false` at the
+  /// top level, `credits.hasCredits: true` on the bucket, and every turn still
+  /// completing. Recorded as the `-credits` fixture.
+  const spentOnCredits = {
+    ...ACCOUNT_BUCKET,
+    primary: window(100, 300),
+    secondary: window(41, 10080),
+    credits: { hasCredits: true, unlimited: false, balance: null },
+  };
+  const read = (
+    ordinaryUsageAllowed: unknown,
+    buckets: Record<string, unknown>,
+  ): ReturnType<typeof codexAccountUsageView> =>
+    codexAccountUsageView({ ordinaryUsageAllowed, rateLimitsByLimitId: buckets }, NOW);
+
+  it("reports the escalation when included usage is blocked and credits stand behind it", () => {
+    expect(read(false, { codex: spentOnCredits }).overage).toEqual({ resetsAtMs: null });
+  });
+
+  it("keeps the spent bar flagged beside the escalation", () => {
+    // Both signals, deliberately: the bar says the allowance is gone, the line
+    // says the work is continuing and costing more.
+    const { windows } = read(false, { codex: spentOnCredits });
+    expect(windows.find((w) => w.key === "codex:primary")?.limitReached).toBe(true);
+    expect(windows.find((w) => w.key === "codex:secondary")?.limitReached).toBeUndefined();
+  });
+
+  it("reports nothing when the account has no credits — the refused state", () => {
+    const refused = {
+      ...spentOnCredits,
+      credits: { hasCredits: false, unlimited: false, balance: "0" },
+    };
+    const { windows, overage } = read(false, { codex: refused });
+    expect(overage).toBeNull();
+    expect(windows.find((w) => w.key === "codex:primary")?.limitReached).toBe(true);
+  });
+
+  it("reports nothing while included usage is still allowed, whatever the credits say", () => {
+    // Credits on the account are not credits being spent.
+    expect(read(true, { codex: spentOnCredits }).overage).toBeNull();
+  });
+
+  it.each([
+    ["null", null],
+    ["absent", undefined],
+    ["a string", "false"],
+  ])("reads an %s permission flag as no statement, not as blocked", (_, flag) => {
+    // The schema: "Null means unavailable; clients must not infer recovery from
+    // percentages or reset times." The same holds for the opposite inference.
+    expect(read(flag, { codex: spentOnCredits }).overage).toBeNull();
+  });
+
+  it("ignores credits on a model reserve", () => {
+    // The reserve carries `credits: null` in every capture; a future value there
+    // would describe the reserve, not the allowance the escalation explains.
+    const reserve = { ...RESERVE_BUCKET, credits: { hasCredits: true, unlimited: false } };
+    const allowance = { ...spentOnCredits, credits: null };
+    expect(read(false, { codex: allowance, base_model_inference: reserve }).overage).toBeNull();
+  });
+
+  it("tolerates a malformed credits object", () => {
+    expect(read(false, { codex: { ...spentOnCredits, credits: "yes" } }).overage).toBeNull();
+    expect(read(false, { codex: { ...spentOnCredits, credits: {} } }).overage).toBeNull();
+  });
+});
+
+describe("codexAccountUsageView against the recorded credits-covered response", () => {
+  const captured = JSON.parse(
+    readFileSync(
+      resolve(
+        process.cwd(),
+        "crates/harness/tests/fixtures/codex/account-rate-limits-credits.jsonl",
+      ),
+      "utf8",
+    )
+      .split("\n")
+      .find((line) => line.includes('"id":1'))!,
+  ).result as { rateLimitsByLimitId: Record<string, { primary: { resetsAt: number } }> };
+
+  const justBeforeReset = (captured.rateLimitsByLimitId.codex!.primary.resetsAt - 60) * 1000;
+
+  it("renders the spent 5-hour window beside the healthy weekly one", () => {
+    const { windows } = codexAccountUsageView(captured, justBeforeReset);
+    expect(windows.map((w) => [w.key, w.label, w.usedFraction, w.limitReached])).toEqual([
+      ["codex:primary", "5-hour limit", 1, true],
+      ["codex:secondary", "Weekly · all models", 0.41, undefined],
+    ]);
+  });
+
+  it("reports the credits escalation from the real bytes", () => {
+    expect(codexAccountUsageView(captured, justBeforeReset).overage).toEqual({ resetsAtMs: null });
+  });
+
+  it("reports nothing unreadable", () => {
+    expect(codexAccountUsageView(captured, justBeforeReset).diagnostics).toEqual([]);
   });
 });

@@ -19,7 +19,12 @@
   /// must not disappear with it. This panel is where every other piece of
   /// telemetry already lives.
   import { harnessUsage } from "$lib/state/harnessUsage.svelte";
-  import { claudeRateLimitView, codexAccountUsageView, type UsageWindow } from "$lib/usageWindows";
+  import {
+    claudeRateLimitView,
+    codexAccountUsageView,
+    type CreditsEscalation,
+    type UsageWindow,
+  } from "$lib/usageWindows";
   import { supportsAccountUsageRead } from "$lib/harnessCapabilities";
   import { requestAccountUsageRefresh } from "$lib/state/accountUsage.svelte";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
@@ -42,9 +47,11 @@
   type Row = {
     harness: HarnessKind;
     windows: UsageWindow[];
-    /// Claude's separate billing escalation. Not a window: it says what is being
-    /// charged rather than how full a quota is.
-    overage: { resetsAtMs: number | null } | null;
+    /// The billing escalation, for either harness. Not a window: it says what
+    /// is being charged rather than how full a quota is, and it is drawn beside
+    /// a spent bar rather than instead of one — the bar says the allowance is
+    /// gone, this line says the work is continuing on paid credits.
+    overage: CreditsEscalation | null;
     /// Bare reset line for a Claude payload with no window map at all, dated by
     /// the reading it came from. **The one reading-level instant left**, and it is
     /// not an exception to the per-window rule: this line is not a window, and it
@@ -95,7 +102,7 @@
             // have one shape rather than changing layout depending on whether the
             // values happen to agree — and here they truthfully do.
             windows: view.windows.map((w) => ({ ...w, measuredAt: reading.observed_at })),
-            overage: null,
+            overage: view.overage,
             fallback: null,
           });
         }

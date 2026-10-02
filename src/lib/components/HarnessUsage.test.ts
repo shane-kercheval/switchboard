@@ -142,13 +142,12 @@ describe("Claude rate-limit fallback (no unifiedWindows)", () => {
     expect(overage).toHaveClass("text-warning");
   });
 
-  it("leaves a spent window neutral while the user is paying for overage", async () => {
-    // Requests still succeed on credits here, so the bar must not read as a
-    // block — the escalation beneath it is what explains the state. This is
-    // asserted at the component because the reader cannot see it: the reader
-    // correctly leaves the window unflagged, and the regression this guards
-    // was the *meter template* colouring it anyway on a full-bar rule written
-    // for Codex.
+  it("draws a spent window in the warning tone beside the overage escalation", async () => {
+    // Requests still succeed on credits here, and the bar reads as spent
+    // anyway: the allowance is gone and paid usage costs far more, so the state
+    // must be unmissable. The escalation beneath it is what says the work is
+    // continuing. Asserted at the component because the tone is decided in the
+    // meter template from the reader's flag.
     await renderClaudeWithRateLimit(
       {
         status: "rejected",
@@ -160,7 +159,7 @@ describe("Claude rate-limit fallback (no unifiedWindows)", () => {
       null,
     );
     expect(screen.getByTestId("harness-usage-window")).toHaveTextContent("100%");
-    expect(screen.getByTestId("harness-usage-window-fill")).not.toHaveClass("bg-warning");
+    expect(screen.getByTestId("harness-usage-window-fill")).toHaveClass("bg-warning");
     expect(screen.getByTestId("harness-usage-overage")).toHaveClass("text-warning");
   });
 
@@ -716,6 +715,90 @@ describe("Codex account quotas", () => {
     await renderCodexAccountUsage({ codex: codexBucket({ primary: { usedPercent: 93 } }) });
     expect(screen.getByTestId("harness-usage-window")).toHaveTextContent("93%");
     expect(screen.getByTestId("harness-usage-window-fill")).not.toHaveClass("bg-warning");
+  });
+
+  it("shows the credits escalation under a spent quota that credits are covering", async () => {
+    // The shape a `team` account reports once its 5-hour window is spent and
+    // turns keep completing on paid credits: included usage blocked at the top
+    // level, credits on the account-wide bucket. Same line Claude's row uses.
+    usage.observeUsage("codex", {
+      payload: {
+        ordinaryUsageAllowed: false,
+        rateLimitsByLimitId: {
+          codex: codexBucket({
+            primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: epochFromNow(3600) },
+            secondary: {
+              usedPercent: 41,
+              windowDurationMins: 10080,
+              resetsAt: epochFromNow(86_400),
+            },
+            credits: { hasCredits: true, unlimited: false, balance: null },
+          }),
+        },
+      },
+      observed_at: new Date().toISOString(),
+    });
+    render(HarnessUsage);
+    await tick();
+    const row = within(screen.getByTestId("harness-usage-codex"));
+    const fills = row.getAllByTestId("harness-usage-window-fill");
+    expect(fills[0]).toHaveClass("bg-warning");
+    expect(fills[1]).not.toHaveClass("bg-warning");
+    const overage = row.getByTestId("harness-usage-overage");
+    expect(overage).toHaveTextContent("using credits");
+    expect(overage).toHaveClass("text-warning");
+  });
+
+  it("shows no escalation under a spent quota the account cannot pay for", async () => {
+    // The refused state (the capped `prolite` capture): the bar is the whole
+    // message, and an escalation here would claim work is continuing.
+    usage.observeUsage("codex", {
+      payload: {
+        ordinaryUsageAllowed: false,
+        rateLimitsByLimitId: {
+          codex: codexBucket({
+            primary: {
+              usedPercent: 100,
+              windowDurationMins: 10080,
+              resetsAt: epochFromNow(86_400),
+            },
+            credits: { hasCredits: false, unlimited: false, balance: "0" },
+          }),
+        },
+      },
+      observed_at: new Date().toISOString(),
+    });
+    render(HarnessUsage);
+    await tick();
+    expect(screen.getByTestId("harness-usage-window-fill")).toHaveClass("bg-warning");
+    expect(screen.queryByTestId("harness-usage-overage")).toBeNull();
+  });
+
+  it("names the credits state in the tooltip without a reset it cannot state", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      usage.observeUsage("codex", {
+        payload: {
+          ordinaryUsageAllowed: false,
+          rateLimitsByLimitId: {
+            codex: codexBucket({
+              primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: epochFromNow(3600) },
+              credits: { hasCredits: true, unlimited: false, balance: null },
+            }),
+          },
+        },
+        observed_at: new Date().toISOString(),
+      });
+      render(HarnessUsage);
+      await tick();
+      await fireEvent.pointerEnter(screen.getByTestId("harness-usage-codex"));
+      await vi.advanceTimersByTimeAsync(500);
+      const detail = await waitFor(() => screen.getByTestId("harness-usage-detail-codex"));
+      expect(detail).toHaveTextContent("Spending usage credits");
+      expect(detail).not.toHaveTextContent("Overage window resets");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renders nothing for a Codex entry still holding the old rollout shape", async () => {

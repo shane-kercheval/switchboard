@@ -126,7 +126,7 @@ use switchboard_core::{
 use switchboard_harness::{
     AdapterEvent, CancelSource, ContentKind, ContextWindowSource, DispatchOptions, EventStream,
     FailureKind, HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, SessionInventory,
-    SessionMetaSource, TurnId, TurnOutcome, TurnSpend,
+    SessionMetaSource, TurnId, TurnOutcome, TurnSpend, check_prompt_size,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -1957,6 +1957,31 @@ async fn run_turn(
             attachments,
             emit_user_message: announce_user_message,
         } => {
+            // A message too large for the CLI's argument list is refused here,
+            // ahead of the journal: journaling first would make a message that
+            // can never be sent durable, and reload would show it (and its
+            // failure) on every open. Nothing is journaled, so no send_id.
+            if let Err(e) = check_prompt_size(prompt) {
+                let message = e.to_string();
+                emit_message_failed(
+                    emitter.as_ref(),
+                    channel,
+                    item.message_id,
+                    None,
+                    agent_id,
+                    &message,
+                );
+                fire_completion(
+                    &mut completion,
+                    TurnOutcome::Failed {
+                        kind: FailureKind::AdapterFailure,
+                        message,
+                    },
+                    String::new(),
+                );
+                return TurnAfter::Continue;
+            }
+
             // Fail-closed: journal the send before spawning. On failure, no turn
             // starts, no outcome marker (the journal is what's broken — a marker
             // would orphan), and we surface MessageFailed. Advance the backlog

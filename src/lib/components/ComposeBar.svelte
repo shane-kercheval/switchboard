@@ -72,6 +72,7 @@
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
   import * as api from "$lib/api";
+  import { formatFileSize } from "$lib/diff";
   import type {
     AgentId,
     AgentRecord,
@@ -219,7 +220,7 @@
 
   /// Append a freshly staged file. Reads the snapshot (not `attachmentChips`) as
   /// the base so it stays correct after this bar has unmounted.
-  function addAttachmentChip(staged: { path: string; original_name: string }): void {
+  function addAttachmentChip(staged: { path: string; original_name: string }): Attachment {
     const kind = classifyKind(staged.original_name);
     const existing = getCompose(projectId).attachments ?? [];
     const attachment: Attachment = {
@@ -232,10 +233,83 @@
     if (!unmounted) {
       attachmentChips = [...attachmentChips, { ...attachment, id: crypto.randomUUID() }];
     }
+    return attachment;
   }
 
   function removeAttachmentChip(id: string): void {
     commitChips(attachmentChips.filter((chip) => chip.id !== id));
+  }
+
+  // A paste this large becomes a file attachment rather than message text. Text
+  // this size is pasted output (a log, a dump), not something someone typed: in
+  // the box it makes every keystroke rescan all of it, in the message it fills
+  // the agent's context window, and past about 1 MB the CLI can't take it as an
+  // argument at all. As a file the agent reads only the parts it needs. 50 K
+  // characters is roughly a thousand lines of log output.
+  const LARGE_PASTE_CHARS = 50_000;
+  // The latest large paste, offered back as "Paste as text instead" for as long
+  // as its chip is still in the draft (removing the chip, or sending, retires it).
+  let largePaste = $state<{ text: string; path: string; label: string; lines: number } | null>(
+    null,
+  );
+  const largePasteUndo = $derived.by(() => {
+    const paste = largePaste;
+    if (paste === null) return null;
+    return attachmentChips.some((chip) => chip.path === paste.path) ? paste : null;
+  });
+
+  /// `pasted-<n>.txt`, numbered past any pasted file already in the draft so
+  /// two pastes never share a name (same max-plus-one rule as `nextLabel`).
+  function nextPasteName(existing: readonly { original_name: string }[]): string {
+    let max = 0;
+    for (const { original_name } of existing) {
+      const match = /^pasted-(\d+)\.txt$/.exec(original_name);
+      if (match) max = Math.max(max, Number.parseInt(match[1]!, 10));
+    }
+    return `pasted-${max + 1}.txt`;
+  }
+
+  /// Intercept a paste too large to live in the message and stage it as a file
+  /// instead. Smaller pastes reach the textarea untouched.
+  function onPaste(event: ClipboardEvent): void {
+    const text = event.clipboardData?.getData("text/plain") ?? "";
+    if (text.length <= LARGE_PASTE_CHARS) return;
+    event.preventDefault();
+    // Same rule as file drops: the attachment set is frozen while a send renders.
+    if (composerBusy) {
+      showError(
+        "Couldn't attach the pasted text while a send is in progress. Try again in a moment.",
+      );
+      return;
+    }
+    void stagePastedText(text);
+  }
+
+  async function stagePastedText(text: string): Promise<void> {
+    const gen = sendGeneration;
+    const name = nextPasteName(getCompose(projectId).attachments ?? []);
+    try {
+      const staged = await api.stagePastedText(projectId, name, text);
+      if (gen !== sendGeneration) return;
+      const attachment = addAttachmentChip(staged);
+      let lines = 1;
+      for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) lines += 1;
+      largePaste = { text, path: staged.path, label: attachment.label, lines };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      showError(`Couldn't attach the pasted text: ${message}`);
+    }
+  }
+
+  /// Undo a large paste's conversion: drop its chip and put the text into the
+  /// message at the caret, as the paste would have.
+  function pasteAsTextInstead(): void {
+    const paste = largePasteUndo;
+    if (paste === null) return;
+    commitChips(attachmentChips.filter((chip) => chip.path !== paste.path));
+    const caret = textareaEl?.selectionEnd ?? draft.length;
+    draft = `${draft.slice(0, caret)}${paste.text}${draft.slice(caret)}`;
+    largePaste = null;
   }
 
   /// Drop restored chips whose staged file no longer exists (a manual delete,
@@ -4131,6 +4205,7 @@
                 bind:value={draft}
                 oninput={onInput}
                 onkeydown={handleKey}
+                onpaste={onPaste}
                 class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
               />
             </div>
@@ -4266,6 +4341,27 @@
           >
             Stop waiting
           </Button>
+        </p>
+      {/if}
+      {#if largePasteUndo}
+        <p
+          class="text-muted mt-2 text-xs"
+          data-testid="compose-large-paste-notice"
+          role="status"
+          aria-live="polite"
+        >
+          Pasted text ({largePasteUndo.lines.toLocaleString()} lines, {formatFileSize(
+            largePasteUndo.text.length,
+          )}) was attached as {largePasteUndo.label} instead of being inserted here, so the agent reads
+          it as a file and only the parts it needs.
+          <button
+            type="button"
+            class="text-fg hover:text-accent underline underline-offset-2"
+            data-testid="compose-large-paste-undo"
+            onclick={pasteAsTextInstead}
+          >
+            Paste as text instead
+          </button>
         </p>
       {/if}
       {#if sendNotice}

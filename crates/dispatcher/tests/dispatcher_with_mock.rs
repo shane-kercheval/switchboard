@@ -28,9 +28,9 @@ use switchboard_dispatcher::{
     SessionLocatorSink, TurnKind, TurnPermit,
 };
 use switchboard_harness::{
-    CancelSource, ContextWindowSource, DispatchOptions, FailureKind, HarnessAdapter, MessageId,
-    MockHarnessAdapter, MockScenario, RateLimitSource, SessionInventory, SessionMetaSource, TurnId,
-    TurnOutcome, TurnSpend,
+    CancelSource, ContextWindowSource, DispatchOptions, FailureKind, HarnessAdapter,
+    MAX_PROMPT_BYTES, MessageId, MockHarnessAdapter, MockScenario, RateLimitSource,
+    SessionInventory, SessionMetaSource, TurnId, TurnOutcome, TurnSpend,
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -4773,6 +4773,90 @@ async fn awaited_send_completion_resolves_failure_when_record_send_fails() {
         "a send whose journal write fails resolves the handle as a failure, got {:?}",
         result.outcome
     );
+}
+
+#[tokio::test]
+async fn oversized_prompt_is_refused_before_it_is_journaled() {
+    // A prompt past the CLI argument-list limit would fail at spawn with an
+    // opaque E2BIG. The dispatcher refuses it first, and ahead of the journal:
+    // nothing is recorded, so reload never resurrects a message that can't be
+    // sent, and the failure event carries no send_id for the frontend to attach.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let journal = Arc::new(RecordingJournal::default());
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+    );
+    let prompt = "x".repeat(MAX_PROMPT_BYTES + 1);
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, &prompt, vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    let TurnOutcome::Failed { message, .. } = &result.outcome else {
+        panic!("expected a failed outcome, got {:?}", result.outcome);
+    };
+    assert!(message.contains("at most 768 KB"), "{message}");
+    assert!(
+        journal.sends.lock().unwrap().is_empty(),
+        "a refused prompt is never journaled"
+    );
+    within(
+        &emitter,
+        "message_failed",
+        emitter.wait_for_type("message_failed", 1),
+    )
+    .await;
+    let events = emitter.snapshot();
+    let failed = events
+        .iter()
+        .find(|(_, v)| v["type"] == "message_failed")
+        .map(|(_, v)| v)
+        .expect("message_failed emitted");
+    assert!(
+        failed["send_id"].is_null(),
+        "no journaled send to attach: {failed}"
+    );
+    assert!(
+        !events.iter().any(|(_, v)| v["type"] == "turn_start"),
+        "no turn starts for a refused prompt: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn prompt_at_the_size_limit_is_journaled_and_dispatched() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let journal = Arc::new(RecordingJournal::default());
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+    );
+    let prompt = "x".repeat(MAX_PROMPT_BYTES);
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, &prompt, vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert!(
+        result.outcome == TurnOutcome::Completed,
+        "at the limit the send goes through, got {:?}",
+        result.outcome
+    );
+    assert_eq!(journal.sends.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

@@ -149,6 +149,14 @@ beforeEach(async () => {
           original_name: name,
         };
       }
+      // Echo a staged paste back under the name the frontend chose.
+      if (cmd === "stage_pasted_text") {
+        const name = String((args as { name?: unknown })?.name ?? "pasted.txt");
+        return {
+          path: `/proj/.switchboard/projects/p/attachments/uuid-${name}__${name}`,
+          original_name: name,
+        };
+      }
       // Restored chips are reconciled against disk on mount. Default: every
       // declared path still exists, so nothing is pruned.
       if (cmd === "existing_attachment_paths") {
@@ -8899,5 +8907,123 @@ describe("ComposeBar — unavailable project folder, fork shortcut", () => {
       directory_available: true,
     }));
     await waitFor(() => expect(screen.queryByTestId("compose-fork-send")).not.toBeNull());
+  });
+});
+
+describe("ComposeBar large paste", () => {
+  const BIG = "00:01.626 Default Runner some log line with <tags> & detail\n".repeat(1_000);
+
+  function pasteInto(textarea: HTMLTextAreaElement, text: string): Promise<boolean> {
+    return fireEvent.paste(textarea, { clipboardData: { getData: () => text } });
+  }
+
+  function stagedPastes(): unknown[] {
+    return invokeMock.mock.calls.filter(([c]) => c === "stage_pasted_text").map(([, a]) => a);
+  }
+
+  it("stages a paste over the threshold as a text attachment instead of inserting it", async () => {
+    expect(BIG.length).toBeGreaterThan(50_000);
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+
+    const notCancelled = await pasteInto(textarea, BIG);
+
+    expect(notCancelled).toBe(false);
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-text-1")).not.toBeNull());
+    expect(textarea.value).toBe("");
+    expect(stagedPastes()).toEqual([{ projectId: PROJECT_ID, name: "pasted-1.txt", text: BIG }]);
+    expect(screen.getByTestId("attachment-chip-text-1")).toHaveTextContent("pasted-1.txt");
+    expect(screen.getByTestId("compose-large-paste-notice")).toHaveTextContent(
+      "Pasted text (1,001 lines, 60 KB) was attached as text-1",
+    );
+    // The send carries the chip, not the text.
+    invokeMock.mockResolvedValueOnce("msg-1");
+    await fireEvent.input(textarea, { target: { value: "summarize @text-1" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() => {
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.[1]).toMatchObject({
+        prompt: "summarize @text-1",
+        attachments: [{ label: "text-1", kind: "text", original_name: "pasted-1.txt" }],
+      });
+    });
+    // Sending retires the undo along with the chips.
+    expect(screen.queryByTestId("compose-large-paste-notice")).toBeNull();
+  });
+
+  it("'Paste as text instead' drops the chip and inserts the text at the caret", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "before|after" } });
+    textarea.setSelectionRange(6, 6);
+
+    await pasteInto(textarea, BIG);
+    await waitFor(() => expect(screen.queryByTestId("compose-large-paste-undo")).not.toBeNull());
+
+    await fireEvent.click(screen.getByTestId("compose-large-paste-undo"));
+
+    expect(screen.queryByTestId("attachment-chip-text-1")).toBeNull();
+    expect(screen.queryByTestId("compose-large-paste-notice")).toBeNull();
+    expect(textarea.value).toBe(`before${BIG}|after`);
+  });
+
+  it("retires the undo offer when the chip is removed", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+
+    await pasteInto(textarea, BIG);
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-text-1")).not.toBeNull());
+    await fireEvent.click(screen.getByTestId("attachment-chip-remove-text-1"));
+
+    expect(screen.queryByTestId("compose-large-paste-notice")).toBeNull();
+    expect(textarea.value).toBe("");
+  });
+
+  it("numbers successive pastes and leaves small pastes to the textarea", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+
+    await pasteInto(textarea, BIG);
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-text-1")).not.toBeNull());
+    await pasteInto(textarea, BIG);
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-text-2")).not.toBeNull());
+    expect(stagedPastes().map((a) => (a as { name: string }).name)).toEqual([
+      "pasted-1.txt",
+      "pasted-2.txt",
+    ]);
+
+    const notCancelled = await pasteInto(textarea, "x".repeat(50_000));
+    expect(notCancelled).toBe(true);
+    expect(stagedPastes()).toHaveLength(2);
+  });
+
+  it("reports a staging failure and keeps the draft untouched", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockImplementationOnce(async (cmd: string) => {
+      if (cmd === "stage_pasted_text") throw new Error("disk full");
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+
+    await pasteInto(textarea, BIG);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(
+        "Couldn't attach the pasted text: disk full",
+      ),
+    );
+    expect(screen.queryByTestId("attachment-chip-text-1")).toBeNull();
+    expect(textarea.value).toBe("");
   });
 });

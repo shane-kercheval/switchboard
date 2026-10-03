@@ -3434,6 +3434,54 @@ fn stage_attachment_io(
     })
 }
 
+/// Pure, synchronous staging I/O for pasted text: write `text` into
+/// `attachments_dir` as `<uuid>__<sanitized name>`. The sibling of
+/// [`stage_attachment_io`] for content that has no source file — a large paste
+/// the compose bar turns into an attachment, so the agent reads it from disk
+/// instead of receiving it as a command-line argument it may not fit in.
+fn stage_pasted_text_io(
+    attachments_dir: &Path,
+    name: &str,
+    text: &str,
+) -> Result<StagedAttachment, AppError> {
+    let stage_err = |source: std::io::Error| AppError::AttachmentStage {
+        source_path: name.to_owned(),
+        source,
+    };
+    std::fs::create_dir_all(attachments_dir).map_err(stage_err)?;
+    let original_name = sanitize_basename(name);
+    let dest = attachments_dir.join(format!("{}__{}", Uuid::now_v7(), original_name));
+    std::fs::write(&dest, text).map_err(stage_err)?;
+    Ok(StagedAttachment {
+        path: dest.to_string_lossy().into_owned(),
+        original_name,
+    })
+}
+
+/// Write pasted text into the project's `attachments/` dir as a file called
+/// `name` and return its staged absolute path. Same shape and blocking-pool
+/// discipline as [`stage_attachment_impl`]; the frontend names the file (so the
+/// chip reads `pasted-1.txt`) and assigns the label/kind from that name.
+pub async fn stage_pasted_text_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    name: String,
+    text: String,
+) -> Result<StagedAttachment, AppError> {
+    let project = match lock(&state.projects).get(&project_id).cloned() {
+        Some(loaded) => loaded,
+        None => open_project_from_store(state, project_id)?,
+    };
+    let attachments_dir = project.attachments_dir();
+    let name_display = name.clone();
+    tokio::task::spawn_blocking(move || stage_pasted_text_io(&attachments_dir, &name, &text))
+        .await
+        .map_err(|join_err| AppError::AttachmentStage {
+            source_path: name_display,
+            source: std::io::Error::other(join_err.to_string()),
+        })?
+}
+
 /// Copy a dropped file into the project's `attachments/` dir and return its
 /// staged absolute path. The copy runs in Rust (no frontend fs-plugin
 /// permission) **on the blocking pool**: a user can drop an arbitrarily large
@@ -16980,6 +17028,61 @@ mod tests {
             staged_path.starts_with(project.attachments_dir()),
             "staged under the project attachments dir"
         );
+    }
+
+    #[tokio::test]
+    async fn stage_pasted_text_writes_the_text_under_the_project_dir() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
+        let text = "line one\nline two\n".repeat(1000);
+
+        let staged =
+            stage_pasted_text_impl(&state, project_id, "pasted-1.txt".to_owned(), text.clone())
+                .await
+                .unwrap();
+
+        let staged_path = Path::new(&staged.path);
+        assert!(staged_path.is_absolute(), "staged path is absolute");
+        assert_eq!(std::fs::read_to_string(staged_path).unwrap(), text);
+        assert_eq!(staged.original_name, "pasted-1.txt");
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        assert!(
+            staged_path.starts_with(project.attachments_dir()),
+            "staged under the project attachments dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_pasted_text_sanitizes_the_name_and_never_collides() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
+
+        let first = stage_pasted_text_impl(
+            &state,
+            project_id,
+            "../x/pasted.txt".to_owned(),
+            "a".to_owned(),
+        )
+        .await
+        .unwrap();
+        let second = stage_pasted_text_impl(
+            &state,
+            project_id,
+            "../x/pasted.txt".to_owned(),
+            "b".to_owned(),
+        )
+        .await
+        .unwrap();
+
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        assert_eq!(first.original_name, ".._x_pasted.txt");
+        assert!(Path::new(&first.path).starts_with(project.attachments_dir()));
+        assert_ne!(
+            first.path, second.path,
+            "same name stages to distinct files"
+        );
+        assert_eq!(std::fs::read_to_string(&first.path).unwrap(), "a");
+        assert_eq!(std::fs::read_to_string(&second.path).unwrap(), "b");
     }
 
     #[tokio::test]

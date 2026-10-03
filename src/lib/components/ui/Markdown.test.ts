@@ -1,7 +1,16 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { render, fireEvent, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
 import Markdown from "$lib/components/ui/Markdown.svelte";
+import MarkdownRowHarness from "$lib/components/ui/_MarkdownRowHarness.svelte";
+import { renderMarkdown } from "$lib/markdown";
+
+vi.mock("$lib/markdown", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("$lib/markdown")>();
+  return { ...actual, renderMarkdown: vi.fn(actual.renderMarkdown) };
+});
+const renderMarkdownMock = vi.mocked(renderMarkdown);
 
 const copyTextMock = vi.fn<(t: string) => Promise<void>>();
 vi.mock("$lib/native", () => ({
@@ -14,6 +23,7 @@ vi.mock("$lib/api", () => ({
 }));
 
 beforeEach(() => {
+  renderMarkdownMock.mockClear();
   copyTextMock.mockReset();
   copyTextMock.mockResolvedValue(undefined);
   openExternalUrlMock.mockReset();
@@ -119,5 +129,65 @@ describe("Markdown links", () => {
 
     expect(openExternalUrlMock).toHaveBeenCalledWith("https://example.com");
     expect(notCancelled).toBe(false);
+  });
+});
+
+describe("Markdown parse memoization", () => {
+  it("does not re-parse when the parent hands it a new row with the same text", async () => {
+    // The transcript rebuilds its row objects on every update to the pane, so a
+    // user message would otherwise be re-parsed per streamed chunk of some
+    // other agent's reply. Equal text must mean no parse.
+    const { rerender } = render(MarkdownRowHarness, { props: { row: { text: "**same**" } } });
+    expect(renderMarkdownMock).toHaveBeenCalledTimes(1);
+
+    await rerender({ row: { text: "**same**" } });
+    await tick();
+    expect(renderMarkdownMock).toHaveBeenCalledTimes(1);
+
+    await rerender({ row: { text: "**changed**" } });
+    await tick();
+    expect(renderMarkdownMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Markdown oversized text", () => {
+  const LIMIT = 100_000;
+
+  it("shows text over the limit as truncated plain text without parsing it", () => {
+    const text = "<b>line</b>\n".repeat(20_000);
+    expect(text.length).toBeGreaterThan(LIMIT);
+    const { container } = render(Markdown, { text });
+
+    expect(renderMarkdownMock).not.toHaveBeenCalled();
+    const pre = container.querySelector("pre");
+    if (!pre) throw new Error("expected a <pre> block");
+    expect(pre.textContent).toBe(text.slice(0, LIMIT));
+    // Not parsed: the raw tag survives as text rather than becoming an element.
+    expect(container.querySelector("b")).toBeNull();
+    expect(container.querySelector('[data-testid="markdown-oversized"]')?.textContent).toContain(
+      "Showing the first 100 KB of 240 KB",
+    );
+  });
+
+  it("'Show all' reveals the full text, still as plain text, and toggles back", async () => {
+    const text = "x".repeat(LIMIT + 5);
+    const { container, getByTestId } = render(Markdown, { text });
+    const toggle = getByTestId("markdown-oversized-toggle");
+
+    await fireEvent.click(toggle);
+    expect(container.querySelector("pre")?.textContent).toBe(text);
+    expect(toggle.textContent?.trim()).toBe("Show less");
+    expect(renderMarkdownMock).not.toHaveBeenCalled();
+
+    await fireEvent.click(toggle);
+    expect(container.querySelector("pre")?.textContent).toBe(text.slice(0, LIMIT));
+  });
+
+  it("parses text at the limit normally", () => {
+    const text = "**bold**" + "a".repeat(LIMIT - 8);
+    const { container } = render(Markdown, { text });
+    expect(renderMarkdownMock).toHaveBeenCalledTimes(1);
+    expect(container.querySelector("strong")).not.toBeNull();
+    expect(container.querySelector('[data-testid="markdown-oversized"]')).toBeNull();
   });
 });

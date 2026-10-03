@@ -48,6 +48,21 @@ pub enum DispatchError {
     /// subprocess crash.
     #[error("invalid prompt: {0}")]
     InvalidPrompt(String),
+    /// The prompt is larger than a harness CLI can take. Every adapter hands
+    /// the prompt to its CLI as one command-line argument, and macOS caps a
+    /// process's arguments plus environment at 1 MiB (`ARG_MAX`); past that the
+    /// spawn fails with an opaque "Argument list too long". Refused by the
+    /// dispatcher before the send is journaled — see [`check_prompt_size`] —
+    /// so the user gets a message that says what to do instead, and a message
+    /// that can never be sent is not made durable and re-shown on every open.
+    #[error(
+        "message is {} KB; the agent CLI accepts at most {} KB per message \
+         (macOS limits command-line arguments to 1 MB). Attach the text as a \
+         file instead — pasting it into the compose bar does that automatically.",
+        .bytes / 1024,
+        .limit / 1024
+    )]
+    PromptTooLarge { bytes: usize, limit: usize },
     /// The agent record is internally inconsistent in a way that makes a
     /// correct dispatch impossible — e.g., fork provenance with no session
     /// locator, where spawning anyway would let the harness mint an untracked
@@ -70,6 +85,29 @@ pub enum DispatchError {
         harness: switchboard_core::HarnessKind,
         operation: &'static str,
     },
+}
+
+/// Most bytes a prompt may carry and still be passed to a harness CLI as a
+/// command-line argument. macOS allows 1 MiB for the whole argument list plus
+/// the environment; 768 KiB leaves a quarter of that for the CLI's other flags
+/// and whatever the user's shell environment holds. Nothing near this size is
+/// a typed message (it is roughly 200K tokens), so the limit costs no real use.
+pub const MAX_PROMPT_BYTES: usize = 768 * 1024;
+
+/// Refuse a prompt that would fail at spawn with "Argument list too long".
+///
+/// # Errors
+///
+/// [`DispatchError::PromptTooLarge`] when `prompt` exceeds [`MAX_PROMPT_BYTES`].
+pub fn check_prompt_size(prompt: &str) -> Result<(), DispatchError> {
+    let bytes = prompt.len();
+    if bytes > MAX_PROMPT_BYTES {
+        return Err(DispatchError::PromptTooLarge {
+            bytes,
+            limit: MAX_PROMPT_BYTES,
+        });
+    }
+    Ok(())
 }
 
 /// Per-dispatch options. Plumbed through `HarnessAdapter::dispatch` so
@@ -222,4 +260,38 @@ pub trait HarnessAdapter: Send + Sync {
     /// invoked or reports nothing. Display-only — never load-bearing.
     /// In-process adapters (the mock) return `None`.
     fn version(&self) -> Option<String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_prompt_size_accepts_up_to_the_limit() {
+        assert!(check_prompt_size("").is_ok());
+        assert!(check_prompt_size(&"x".repeat(MAX_PROMPT_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn check_prompt_size_refuses_one_byte_over_with_sizes_in_the_message() {
+        let err = check_prompt_size(&"x".repeat(MAX_PROMPT_BYTES + 1)).unwrap_err();
+        assert!(matches!(
+            err,
+            DispatchError::PromptTooLarge {
+                bytes,
+                limit: MAX_PROMPT_BYTES
+            } if bytes == MAX_PROMPT_BYTES + 1
+        ));
+        let message = err.to_string();
+        assert!(message.contains("768 KB"), "{message}");
+        assert!(message.contains("Attach the text as a file"), "{message}");
+    }
+
+    #[test]
+    fn check_prompt_size_counts_bytes_not_characters() {
+        // A multi-byte character is three bytes of argv; the kernel counts bytes.
+        let prompt = "€".repeat(MAX_PROMPT_BYTES / 3 + 1);
+        assert!(prompt.chars().count() < MAX_PROMPT_BYTES);
+        assert!(check_prompt_size(&prompt).is_err());
+    }
 }

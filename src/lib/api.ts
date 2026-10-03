@@ -567,6 +567,18 @@ export async function stageAttachment(
   return await invoke<StagedAttachment>("stage_attachment", { projectId, sourcePath });
 }
 
+// Write pasted text into the project's attachments dir as a file called `name`,
+// returning its staged absolute path and name. The compose bar uses this for a
+// paste too large to live in the message; the chip is then built exactly as
+// for a dropped file.
+export async function stagePastedText(
+  projectId: ProjectId,
+  name: string,
+  text: string,
+): Promise<StagedAttachment> {
+  return await invoke<StagedAttachment>("stage_pasted_text", { projectId, name, text });
+}
+
 // Narrow staged paths to those that still exist under this project's attachments
 // dir. A restored draft prunes its chips through this, so a chip whose file was
 // removed out-of-band (a manual delete, an interrupted GC) doesn't dangle in the composer.

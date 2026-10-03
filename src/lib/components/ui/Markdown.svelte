@@ -1,9 +1,17 @@
 <script lang="ts">
   /// Renders a Markdown string as sanitized, syntax-highlighted HTML. One
   /// instance per text segment (see UnifiedTranscript): the parse runs in a
-  /// `$derived` keyed on `text`, so during streaming only the growing segment's
-  /// instance re-parses — completed segments keep a stable `text` prop and never
-  /// re-run. That structural memoization is why there's no manual parse cache.
+  /// `$derived` keyed on the text *value*, so during streaming only the growing
+  /// segment's instance re-parses — completed segments keep a stable `text` and
+  /// never re-run. That structural memoization is why there's no manual parse
+  /// cache.
+  ///
+  /// The value, not the prop: a prop is a live getter into the parent, and
+  /// parents that rebuild their row objects on every update (the transcript
+  /// does, per streamed chunk) would otherwise re-run the parse each time even
+  /// though the string is identical. `source` caches the string, and a derived
+  /// whose value compares equal does not dirty its dependents, so `html` stays
+  /// put until the text really changes.
   ///
   /// Code-block chrome (language badge + Copy button) is part of the parsed HTML
   /// string, not injected after render — `{@html}` replaces the whole subtree on
@@ -13,8 +21,20 @@
   import { copyText } from "$lib/native";
   import { openExternalUrl } from "$lib/api";
   import { cn } from "$lib/utils";
+  import { formatFileSize } from "$lib/diff";
 
   let { text = "", class: className = "" }: { text?: string; class?: string } = $props();
+
+  /// Above this many characters the text is shown as plain preformatted text
+  /// rather than parsed. Parsing is the cost: a 1.3 MB pasted log took several
+  /// seconds per parse, long enough to freeze the pane, and nothing that size
+  /// is prose someone wrote in Markdown. 100 K characters is roughly 2,000
+  /// lines of log output and far above any typed message.
+  const MARKDOWN_RENDER_LIMIT = 100_000;
+
+  const source = $derived(text);
+  const oversized = $derived(source.length > MARKDOWN_RENDER_LIMIT);
+  let showAll = $state(false);
 
   // Known limitation: while a segment is still streaming, the whole segment
   // re-parses (and re-highlights) every token, so a partially-typed token in the
@@ -23,7 +43,7 @@
   // Prism is fast, so it's minor. If it ever reads as objectionable, the fallback
   // is to render the live segment's code as plain monospace and highlight only
   // once finalized — not built pre-emptively.
-  const html = $derived(renderMarkdown(text));
+  const html = $derived(oversized ? "" : renderMarkdown(source));
 
   // Per-button reset timers (keyed on the button element) so copying one block
   // doesn't cancel another block's "Copied → Copy" reset. WeakMap doesn't pin
@@ -82,5 +102,29 @@
   }
 </script>
 
-<!-- eslint-disable-next-line svelte/no-at-html-tags -- `html` is DOMPurify-sanitized in renderMarkdown -->
-<div class={cn("markdown-body", className)} use:delegate>{@html html}</div>
+{#if oversized}
+  <!-- Plain text, never parsed: the full string is one text node, which is
+       cheap to lay out even when it is megabytes. "Show all" reveals the rest
+       as the same plain text — not as Markdown. -->
+  <div class={cn("markdown-body", className)} data-testid="markdown-oversized">
+    <pre class="font-mono text-xs break-words whitespace-pre-wrap">{showAll
+        ? source
+        : source.slice(0, MARKDOWN_RENDER_LIMIT)}</pre>
+    <p class="text-muted mt-1 text-xs">
+      {showAll
+        ? `Showing all ${formatFileSize(source.length)} as plain text (too large to format).`
+        : `Showing the first ${formatFileSize(MARKDOWN_RENDER_LIMIT)} of ${formatFileSize(source.length)} as plain text (too large to format).`}
+      <button
+        type="button"
+        class="text-fg hover:text-accent underline underline-offset-2"
+        data-testid="markdown-oversized-toggle"
+        onclick={() => (showAll = !showAll)}
+      >
+        {showAll ? "Show less" : "Show all"}
+      </button>
+    </p>
+  </div>
+{:else}
+  <!-- eslint-disable-next-line svelte/no-at-html-tags -- `html` is DOMPurify-sanitized in renderMarkdown -->
+  <div class={cn("markdown-body", className)} use:delegate>{@html html}</div>
+{/if}

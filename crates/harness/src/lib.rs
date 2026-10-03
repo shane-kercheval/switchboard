@@ -25,7 +25,10 @@ pub mod subprocess;
 pub mod transcript;
 pub mod turnmeta_sidecar;
 
-pub use adapter::{DispatchError, DispatchOptions, EventStream, HarnessAdapter};
+pub use adapter::{
+    DispatchError, DispatchOptions, EventStream, HarnessAdapter, MAX_PROMPT_BYTES,
+    check_prompt_size,
+};
 pub use antigravity::AntigravityAdapter;
 pub use antigravity::session_file::load_antigravity_transcript;
 pub use claude_code::{

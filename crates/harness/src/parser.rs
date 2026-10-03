@@ -459,14 +459,16 @@ impl ParserState {
 /// family word (`some-vendor-opus-proxy`).
 ///
 /// **Probed @ 2.1.241 with Switchboard's exact `-p` flags** (`claude-fable-5-1`
-/// added @ 2.1.257 and `claude-opus-5-5` @ 2.1.280, each when its alias moved to
-/// it) — the requested level is written back verbatim for exactly these five:
+/// added @ 2.1.257, `claude-opus-5-5` @ 2.1.280 and `claude-sonnet-5-5` @
+/// 2.1.284, each when its alias moved to it) — the requested level is written
+/// back verbatim for exactly these six:
 ///
 /// | id | `--effort` sent | recorded |
 /// |---|---|---|
 /// | `claude-opus-5` | `high` | `"high"` |
 /// | `claude-opus-5-5` | `low` / `max` | `"low"` / `"max"` (`max` recorded even with thinking disabled — no clamp) |
 /// | `claude-sonnet-5` | `max` / `low` | `"max"` / `"low"` |
+/// | `claude-sonnet-5-5` | `low` / `max` | `"low"` / `"max"` (`max` recorded even with thinking disabled — no clamp) |
 /// | `claude-fable-5` | `low` | `"low"` (upper bound on disk unprobed; full-id pinning only) |
 /// | `claude-fable-5-1` | `low` / `max` | `"low"` / `"max"` (`max` is the live loop's standing check) |
 /// | `claude-haiku-4-5-20251001` | `max` / `low` | *no key written* |
@@ -483,10 +485,11 @@ impl ParserState {
 /// live-vs-disk mismatch — which is the signal to probe the new id and add it.
 /// See the "Model catalog" step in `harness-update-review.md`.
 fn model_records_effort(model: &str) -> bool {
-    const EFFORT_RECORDING_MODELS: [&str; 5] = [
+    const EFFORT_RECORDING_MODELS: [&str; 6] = [
         "claude-opus-5",
         "claude-opus-5-5",
         "claude-sonnet-5",
+        "claude-sonnet-5-5",
         "claude-fable-5",
         "claude-fable-5-1",
     ];
@@ -1838,6 +1841,7 @@ mod tests {
             "claude-opus-5",
             "claude-opus-5-5",
             "claude-sonnet-5",
+            "claude-sonnet-5-5",
             "claude-fable-5",
             "claude-fable-5-1",
         ] {

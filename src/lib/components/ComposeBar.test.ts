@@ -9387,13 +9387,20 @@ describe("ComposeBar — copies in flight: feedback, stop waiting, late landings
   /// Every staging call returns a promise the test resolves itself, in order.
   function heldStagingMock(): {
     drops: Array<(v: unknown) => void>;
+    dropFailures: Array<(reason: Error) => void>;
     pastes: Array<(v: unknown) => void>;
   } {
     const drops: Array<(v: unknown) => void> = [];
+    const dropFailures: Array<(reason: Error) => void> = [];
     const pastes: Array<(v: unknown) => void> = [];
     invokeMock.mockImplementation(
       async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
-        if (cmd === "stage_attachment") return new Promise((resolve) => drops.push(resolve));
+        if (cmd === "stage_attachment") {
+          return new Promise((resolve, reject) => {
+            drops.push(resolve);
+            dropFailures.push(reject);
+          });
+        }
         if (cmd === "stage_pasted_text") return new Promise((resolve) => pastes.push(resolve));
         if (cmd === "existing_attachment_paths") return (args as { paths?: string[] })?.paths ?? [];
         if (cmd === "search_project_files") return [];
@@ -9401,7 +9408,7 @@ describe("ComposeBar — copies in flight: feedback, stop waiting, late landings
         return null;
       },
     );
-    return { drops, pastes };
+    return { drops, dropFailures, pastes };
   }
 
   function staged(name: string): { path: string; original_name: string } {
@@ -9508,6 +9515,61 @@ describe("ComposeBar — copies in flight: feedback, stop waiting, late landings
 
     drops[1]?.(staged("two.png"));
     await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-2")).not.toBeNull());
+    expect(sendButton().disabled).toBe(false);
+  });
+
+  it("'Stop waiting' covers every file of a drop, and all of them land after a send", async () => {
+    const { drops } = heldStagingMock();
+    await mountWithAgent();
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "go" } });
+
+    fireDrop(["/a/one.png", "/a/two.png", "/a/three.png"]);
+    await waitFor(() => expect(sendButton().disabled).toBe(true));
+    expect(screen.getByTestId("compose-attaching")).toHaveTextContent(
+      "Attaching one.png, two.png, three.png…",
+    );
+    await fireEvent.click(screen.getByTestId("compose-stop-attaching"));
+    expect(sendButton().disabled).toBe(false);
+    await fireEvent.click(sendButton());
+    await waitFor(() => expect(sends()).toHaveLength(1));
+
+    // Each copy finishes in turn; none re-holds Send, none is discarded.
+    drops[0]?.(staged("one.png"));
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).not.toBeNull());
+    expect(screen.queryByTestId("compose-attaching")).toBeNull();
+    expect(sendButton().disabled).toBe(false);
+    await waitFor(() => expect(drops).toHaveLength(2));
+    drops[1]?.(staged("two.png"));
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-2")).not.toBeNull());
+    await waitFor(() => expect(drops).toHaveLength(3));
+    drops[2]?.(staged("three.png"));
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-3")).not.toBeNull());
+    expect(screen.queryByTestId("compose-attaching")).toBeNull();
+    expect(sendButton().disabled).toBe(false);
+  });
+
+  it("a failed copy skips only its own file; the rest of the drop still lands", async () => {
+    const { drops, dropFailures } = heldStagingMock();
+    await mountWithAgent();
+
+    fireDrop(["/a/one.png", "/a/two.png", "/a/three.png"]);
+    await waitFor(() => expect(dropFailures).toHaveLength(1));
+    dropFailures[0]?.(new Error("disk full"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(
+        "Couldn't attach one.png: disk full",
+      ),
+    );
+    await waitFor(() => expect(drops).toHaveLength(2));
+    drops[1]?.(staged("two.png"));
+    await waitFor(() => expect(drops).toHaveLength(3));
+    drops[2]?.(staged("three.png"));
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-2")).not.toBeNull());
+    expect(screen.getByTestId("attachment-chip-image-1")).toHaveTextContent("two.png");
+    expect(screen.getByTestId("attachment-chip-image-2")).toHaveTextContent("three.png");
+    expect(screen.queryByTestId("compose-attaching")).toBeNull();
     expect(sendButton().disabled).toBe(false);
   });
 });

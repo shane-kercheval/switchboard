@@ -505,8 +505,13 @@
   /// send-error line and skips that file rather than aborting the rest.
   async function stageDroppedPaths(paths: string[]): Promise<void> {
     const gen = sendGeneration;
-    for (const path of paths) {
-      const staging = beginStaging(projectId, basename(path));
+    // The whole drop registers before the first copy starts, so "Stop waiting"
+    // covers every file of it: a later file must not re-hold Send after the
+    // user stopped waiting, and must follow the same land-or-discard rule as
+    // the one they stopped on.
+    const handles = paths.map((path) => beginStaging(projectId, basename(path)));
+    for (const [index, path] of paths.entries()) {
+      const staging = handles[index]!;
       try {
         const staged = await api.stageAttachment(projectId, path);
         // The drop's compose session may have been *sent* while the copy was in
@@ -514,8 +519,8 @@
         // composer — unless the user stopped waiting for this copy, in which
         // case it lands wherever they are now. An unmount is not a discard —
         // `addAttachmentChip` writes to the originating project's snapshot
-        // either way.
-        if (gen !== sendGeneration && !staging.abandoned()) return;
+        // either way. One file's outcome never decides the rest of the drop.
+        if (gen !== sendGeneration && !staging.abandoned()) continue;
         addAttachmentChip(staged);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

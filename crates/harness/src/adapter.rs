@@ -58,7 +58,7 @@ pub enum DispatchError {
     #[error(
         "message is {} KB; the agent CLI accepts at most {} KB per message \
          (macOS limits command-line arguments to 1 MB). Attach the text as a \
-         file instead — pasting it into the compose bar does that automatically.",
+         file instead.",
         .bytes / 1024,
         .limit / 1024
     )]
@@ -285,6 +285,36 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("768 KB"), "{message}");
         assert!(message.contains("Attach the text as a file"), "{message}");
+    }
+
+    #[test]
+    fn frontend_mirror_of_the_limit_matches() {
+        // The compose bar refuses an oversized message before clearing the
+        // draft, using its own copy of this constant (`src/lib/promptSize.ts`).
+        // This side stays the authority; the copy must not drift from it.
+        let ts = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../src/lib/promptSize.ts"
+        ))
+        .expect("src/lib/promptSize.ts is readable from the harness crate");
+        assert_eq!(MAX_PROMPT_BYTES, 768 * 1024);
+        assert!(
+            ts.contains("export const MAX_PROMPT_BYTES = 768 * 1024;"),
+            "src/lib/promptSize.ts must define MAX_PROMPT_BYTES = 768 * 1024 to match adapter.rs"
+        );
+        // The two refusals are shown in different places (the compose bar before
+        // Send, the transcript after); they should at least agree on the advice.
+        let advice = "Attach the text as a file instead.";
+        let rust_message = DispatchError::PromptTooLarge {
+            bytes: MAX_PROMPT_BYTES + 1,
+            limit: MAX_PROMPT_BYTES,
+        }
+        .to_string();
+        assert!(rust_message.ends_with(advice), "{rust_message}");
+        assert!(
+            ts.contains(advice),
+            "src/lib/promptSize.ts must give the same advice"
+        );
     }
 
     #[test]

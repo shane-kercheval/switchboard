@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use switchboard_core::{AgentId, AgentRecord, Attachment, HarnessKind, SendId, SessionLocator};
+use switchboard_core::{
+    AgentId, AgentRecord, Attachment, AttachmentKind, HarnessKind, SendId, SessionLocator,
+};
 use switchboard_dispatcher::{
     AwaitableSendOutcome, CancelOutcome, CompletionResult, ConversationJournal, CurrentTurnWait,
     DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter, JournalError, MetadataCache,
@@ -4828,6 +4830,51 @@ async fn oversized_prompt_is_refused_before_it_is_journaled() {
         !events.iter().any(|(_, v)| v["type"] == "turn_start"),
         "no turn starts for a refused prompt: {events:?}"
     );
+}
+
+#[tokio::test]
+async fn prompt_at_the_limit_with_an_attachment_is_refused() {
+    // The CLI receives the prompt plus the attachment footer, so the footer
+    // counts: a prompt that fits alone is refused once one attachment's line
+    // pushes the dispatched text over.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let journal = Arc::new(RecordingJournal::default());
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+    );
+    let prompt = "x".repeat(MAX_PROMPT_BYTES);
+    let attachment = Attachment {
+        label: "text-1".to_owned(),
+        kind: AttachmentKind::Text,
+        path: "/attachments/uuid__pasted-1.txt".to_owned(),
+        original_name: "pasted-1.txt".to_owned(),
+        dispatched_path: None,
+    };
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(
+                agent.id,
+                &prompt,
+                vec![attachment],
+                Uuid::now_v7(),
+                factory,
+            )
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert!(
+        matches!(&result.outcome, TurnOutcome::Failed { message, .. } if message.contains("at most 768 KB")),
+        "refused on the dispatched size, got {:?}",
+        result.outcome
+    );
+    assert!(journal.sends.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

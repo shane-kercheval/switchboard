@@ -172,6 +172,8 @@ afterEach(async () => {
   _testing.reset();
   (await loadComposeStore())._testing.reset();
   (await loadWorkspace())._testing.reset();
+  // A staging copy a test leaves unresolved must not block the next test's sends.
+  (await import("$lib/state/attachmentStaging.svelte"))._testing.reset();
 });
 
 describe("ComposeBar", () => {
@@ -4923,12 +4925,13 @@ describe("ComposeBar — attachments", () => {
 });
 
 describe("ComposeBar — attachment lifecycle", () => {
-  it("discards a staging result that resolves after the message was sent", async () => {
+  it("holds Send while a dropped file is still copying, then sends with its chip", async () => {
+    // A send that went out mid-copy would omit the file and discard the late
+    // result with no notice, so the copy blocks Send instead.
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
-    // Gate stage_attachment so the drop's copy is still in flight at send time.
     let releaseStage: (() => void) | undefined;
     const staged = new Promise<void>((r) => (releaseStage = r));
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
@@ -4943,17 +4946,25 @@ describe("ComposeBar — attachment lifecycle", () => {
     fireDrop(["/a/late.png"]);
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "go" } });
-    await fireEvent.click(screen.getByTestId("compose-send"));
     await waitFor(() =>
-      expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(true),
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true),
     );
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
+    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
 
-    // The staging finishes only now — after the send cleared the composer. Its
-    // chip must NOT resurrect into the next compose session.
     releaseStage?.();
-    await tick();
-    await tick();
-    expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull();
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).not.toBeNull());
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() => {
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.[1]).toMatchObject({
+        prompt: "go",
+        attachments: [{ label: "image-1", original_name: "late.png" }],
+      });
+    });
   });
 
   it("unregisters the drag-drop listener even when it resolves after unmount", async () => {
@@ -9025,5 +9036,478 @@ describe("ComposeBar large paste", () => {
     );
     expect(screen.queryByTestId("attachment-chip-text-1")).toBeNull();
     expect(textarea.value).toBe("");
+  });
+});
+
+describe("ComposeBar large paste — staging in flight", () => {
+  const BIG = "log line\n".repeat(7_000);
+
+  function pasteInto(textarea: HTMLTextAreaElement, text: string): Promise<boolean> {
+    return fireEvent.paste(textarea, { clipboardData: { getData: () => text } });
+  }
+
+  function sendButton(): HTMLButtonElement {
+    return screen.getByTestId("compose-send") as HTMLButtonElement;
+  }
+
+  function seedTurn(state: Awaited<ReturnType<typeof loadState>>, agentId: string): void {
+    state.applyAgentHydrate(agentId, {
+      turns: [
+        {
+          role: "agent",
+          turn_id: `disk-${agentId}`,
+          agent_id: agentId,
+          items: [{ item_kind: "text", kind: "text", text: "earlier reply" }],
+          status: "complete",
+          started_at: "2026-05-15T00:00:00Z",
+          ended_at: "2026-05-15T00:00:01Z",
+          hydration_key: `key-${agentId}`,
+        },
+      ],
+    });
+  }
+
+  /// Hold every `stage_pasted_text` call until the returned release is called.
+  function holdPasteStaging(): () => void {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+        if (cmd === "stage_pasted_text") {
+          await gate;
+          const name = String((args as { name?: unknown })?.name);
+          return { path: `/p/attachments/uuid-${name}__${name}`, original_name: name };
+        }
+        if (cmd === "existing_attachment_paths") return (args as { paths?: string[] })?.paths ?? [];
+        if (cmd === "search_project_files") return [];
+        if (cmd === "send_message") return "msg-1";
+        return null;
+      },
+    );
+    return release;
+  }
+
+  it("holds Send and ⌘↵ until the paste lands, even across a remount", async () => {
+    const release = holdPasteStaging();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "summarize this" } });
+
+    await pasteInto(textarea, BIG);
+    await waitFor(() => expect(sendButton().disabled).toBe(true));
+    await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
+    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
+
+    // A project switch and back remounts the bar while the write is still running.
+    first.unmount();
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    expect(sendButton().disabled).toBe(true);
+
+    release();
+    // The chip lands in the replacement bar, and only then can the send go.
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-text-1")).not.toBeNull());
+    expect(sendButton().disabled).toBe(false);
+    await fireEvent.click(sendButton());
+    await waitFor(() => {
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.[1]).toMatchObject({
+        prompt: "summarize this",
+        attachments: [{ label: "text-1", original_name: "pasted-1.txt" }],
+      });
+    });
+  });
+
+  it("blocks the fork shortcut while a paste is staging, and says why", async () => {
+    const release = holdPasteStaging();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "branch here" } });
+    await pasteInto(textarea, BIG);
+    await waitFor(() => expect(sendButton().disabled).toBe(true));
+
+    textarea.focus();
+    await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
+
+    expect(screen.getByTestId("compose-send-error")).toHaveTextContent("Still attaching a file");
+    expect(invokeMock.mock.calls.some(([c]) => c === "fork_agent")).toBe(false);
+    release();
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-text-1")).not.toBeNull());
+  });
+
+  it("numbers a second paste past one still being written", async () => {
+    const release = holdPasteStaging();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+
+    await pasteInto(textarea, BIG);
+    await pasteInto(textarea, BIG);
+    release();
+
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-text-2")).not.toBeNull());
+    const names = invokeMock.mock.calls
+      .filter(([c]) => c === "stage_pasted_text")
+      .map(([, a]) => (a as { name: string }).name);
+    expect(names).toEqual(["pasted-1.txt", "pasted-2.txt"]);
+    expect(screen.getByTestId("attachment-chip-text-1")).toHaveTextContent("pasted-1.txt");
+    expect(screen.getByTestId("attachment-chip-text-2")).toHaveTextContent("pasted-2.txt");
+  });
+});
+
+describe("ComposeBar large paste — undo", () => {
+  const BIG = "log line\n".repeat(7_000);
+
+  function pasteInto(textarea: HTMLTextAreaElement, text: string): Promise<boolean> {
+    return fireEvent.paste(textarea, { clipboardData: { getData: () => text } });
+  }
+
+  function mockPromptBackend(): void {
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+        if (cmd === "stage_pasted_text") {
+          const name = String((args as { name?: unknown })?.name);
+          return { path: `/p/attachments/uuid-${name}__${name}`, original_name: name };
+        }
+        if (cmd === "existing_attachment_paths") return (args as { paths?: string[] })?.paths ?? [];
+        if (cmd === "search_project_files") return [];
+        if (cmd === "list_prompts") return [SUMMARY];
+        if (cmd === "resolve_saved_prompt" || cmd === "resolve_saved_prompt_fresh") {
+          return { state: "available", prompt: SUMMARY, generation: 0 };
+        }
+        return null;
+      },
+    );
+  }
+
+  it("inserts into the prompt's appended text when a prompt is selected", async () => {
+    mockPromptBackend();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await pasteInto(textarea, BIG);
+    await waitFor(() => expect(screen.queryByTestId("compose-large-paste-undo")).not.toBeNull());
+
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.input(screen.getByTestId("prompt-appended"), { target: { value: "tail" } });
+    await fireEvent.click(screen.getByTestId("compose-large-paste-undo"));
+
+    expect(screen.queryByTestId("attachment-chip-text-1")).toBeNull();
+    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe(
+      `tail\n${BIG}`,
+    );
+    expect(screen.queryByTestId("compose-large-paste-notice")).toBeNull();
+  });
+
+  it("replaces the selected text in the plain box, as the paste would have", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "before|after" } });
+    await pasteInto(textarea, BIG);
+    await waitFor(() => expect(screen.queryByTestId("compose-large-paste-undo")).not.toBeNull());
+    textarea.setSelectionRange(6, 7);
+
+    await fireEvent.click(screen.getByTestId("compose-large-paste-undo"));
+
+    expect(textarea.value).toBe(`before${BIG}after`);
+  });
+
+  it("is not offered for a paste too large to send as message text", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+
+    await pasteInto(textarea, "y".repeat(768 * 1024 + 1));
+
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-text-1")).not.toBeNull());
+    const notice = screen.getByTestId("compose-large-paste-notice");
+    expect(notice).toHaveTextContent("too large to send as message text (the limit is 786 KB)");
+    expect(screen.queryByTestId("compose-large-paste-undo")).toBeNull();
+  });
+});
+
+describe("ComposeBar — oversized messages are refused before anything is cleared", () => {
+  const HUGE = "y".repeat(768 * 1024 + 1);
+
+  function seedTurn(state: Awaited<ReturnType<typeof loadState>>, agentId: string): void {
+    state.applyAgentHydrate(agentId, {
+      turns: [
+        {
+          role: "agent",
+          turn_id: `disk-${agentId}`,
+          agent_id: agentId,
+          items: [{ item_kind: "text", kind: "text", text: "earlier reply" }],
+          status: "complete",
+          started_at: "2026-05-15T00:00:00Z",
+          ended_at: "2026-05-15T00:00:01Z",
+          hydration_key: `key-${agentId}`,
+        },
+      ],
+    });
+  }
+
+  const sends = () => invokeMock.mock.calls.filter(([c]) => c === "send_message");
+  const forks = () => invokeMock.mock.calls.filter(([c]) => c === "fork_agent");
+
+  function mockBackend(opts: { renderText?: string; forwardBody?: string } = {}): void {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return [];
+      if (cmd === "list_prompts") return [SUMMARY];
+      if (cmd === "resolve_saved_prompt" || cmd === "resolve_saved_prompt_fresh") {
+        return { state: "available", prompt: SUMMARY, generation: 0 };
+      }
+      if (cmd === "render_prompt") return { kind: "rendered", text: opts.renderText ?? "RENDERED" };
+      if (cmd === "forward_message")
+        return { status: "resolved", body: opts.forwardBody ?? "composed" };
+      if (cmd === "fork_agent") throw new Error("fork_agent must not be reached");
+      if (cmd === "send_message") return "msg-1";
+      return null;
+    });
+  }
+
+  it("plain send: keeps the draft and says why", async () => {
+    mockBackend();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: HUGE } });
+
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    expect(screen.getByTestId("compose-send-error")).toHaveTextContent(
+      "Not sent: message is 768 KB; the agent CLI accepts at most 768 KB per message",
+    );
+    expect(sends()).toHaveLength(0);
+    expect(textarea.value).toBe(HUGE);
+  });
+
+  it("plain fork: refuses before a branch is created", async () => {
+    mockBackend();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await waitFor(() => expect(screen.queryByTestId("compose-fork-send")).not.toBeNull());
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: HUGE } });
+
+    await fireEvent.click(screen.getByTestId("compose-fork-send"));
+
+    expect(screen.getByTestId("compose-send-error")).toHaveTextContent("Fork not sent: message is");
+    expect(forks()).toHaveLength(0);
+    expect(sends()).toHaveLength(0);
+    expect(textarea.value).toBe(HUGE);
+  });
+
+  it("prompt send: refuses the rendered message and keeps the prompt composer", async () => {
+    mockBackend({ renderText: HUGE });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("Not sent: message is"),
+    );
+    expect(sends()).toHaveLength(0);
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+  });
+
+  it("prompt fork: refuses the rendered message before a branch is created", async () => {
+    mockBackend({ renderText: HUGE });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await waitFor(() => expect(screen.queryByTestId("compose-fork-send")).not.toBeNull());
+
+    await fireEvent.click(screen.getByTestId("compose-fork-send"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(
+        "Fork not sent: message is",
+      ),
+    );
+    expect(forks()).toHaveLength(0);
+    expect(sends()).toHaveLength(0);
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+  });
+
+  it("forward: an oversized resolved body restores the composer instead of sending", async () => {
+    mockBackend({ forwardBody: HUGE });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    seedTurn(state, AGENT_A.id);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+    await waitFor(() => expect(screen.queryByTestId("forward-source-chip-alice")).not.toBeNull());
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "please aggregate" } });
+
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent(
+        "Forward not sent: message is",
+      ),
+    );
+    expect(sends()).toHaveLength(0);
+    expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument();
+    expect(textarea.value).toBe("please aggregate");
+  });
+});
+
+describe("ComposeBar — copies in flight: feedback, stop waiting, late landings", () => {
+  const BIG = "log line\n".repeat(7_000);
+
+  function pasteInto(textarea: HTMLTextAreaElement, text: string): Promise<boolean> {
+    return fireEvent.paste(textarea, { clipboardData: { getData: () => text } });
+  }
+
+  function sendButton(): HTMLButtonElement {
+    return screen.getByTestId("compose-send") as HTMLButtonElement;
+  }
+
+  const sends = () => invokeMock.mock.calls.filter(([c]) => c === "send_message");
+
+  /// Every staging call returns a promise the test resolves itself, in order.
+  function heldStagingMock(): {
+    drops: Array<(v: unknown) => void>;
+    pastes: Array<(v: unknown) => void>;
+  } {
+    const drops: Array<(v: unknown) => void> = [];
+    const pastes: Array<(v: unknown) => void> = [];
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+        if (cmd === "stage_attachment") return new Promise((resolve) => drops.push(resolve));
+        if (cmd === "stage_pasted_text") return new Promise((resolve) => pastes.push(resolve));
+        if (cmd === "existing_attachment_paths") return (args as { paths?: string[] })?.paths ?? [];
+        if (cmd === "search_project_files") return [];
+        if (cmd === "send_message") return "msg-1";
+        return null;
+      },
+    );
+    return { drops, pastes };
+  }
+
+  function staged(name: string): { path: string; original_name: string } {
+    return { path: `/p/attachments/${crypto.randomUUID()}__${name}`, original_name: name };
+  }
+
+  async function mountWithAgent(): Promise<ReturnType<typeof render>> {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    return render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+  }
+
+  it("names the copy, explains a blocked ⌘↵, and 'Stop waiting' frees Send", async () => {
+    const { drops } = heldStagingMock();
+    await mountWithAgent();
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "go" } });
+
+    fireDrop(["/a/big-video.mov"]);
+    await waitFor(() => expect(sendButton().disabled).toBe(true));
+    expect(screen.getByTestId("compose-attaching")).toHaveTextContent("Attaching big-video.mov…");
+    await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
+    expect(screen.getByTestId("compose-send-error")).toHaveTextContent("Still attaching a file");
+    expect(sends()).toHaveLength(0);
+
+    await fireEvent.click(screen.getByTestId("compose-stop-attaching"));
+
+    expect(screen.queryByTestId("compose-attaching")).toBeNull();
+    expect(sendButton().disabled).toBe(false);
+    await fireEvent.click(sendButton());
+    await waitFor(() => expect(sends()).toHaveLength(1));
+    expect(sends()[0]?.[1]).toMatchObject({ prompt: "go", attachments: [] });
+
+    // The copy the user stopped waiting for still lands, as a chip in the
+    // (now cleared) composer, rather than being thrown away.
+    drops[0]?.(staged("big-video.mov"));
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-file-1")).not.toBeNull());
+  });
+
+  it("a stopped copy finishing late cannot release a retry of the same file", async () => {
+    const { drops } = heldStagingMock();
+    await mountWithAgent();
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "go" } });
+
+    fireDrop(["/a/big-video.mov"]);
+    await waitFor(() => expect(sendButton().disabled).toBe(true));
+    await fireEvent.click(screen.getByTestId("compose-stop-attaching"));
+    fireDrop(["/a/big-video.mov"]);
+    await waitFor(() => expect(sendButton().disabled).toBe(true));
+
+    drops[0]?.(staged("big-video.mov"));
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-file-1")).not.toBeNull());
+    expect(sendButton().disabled).toBe(true);
+
+    drops[1]?.(staged("big-video.mov"));
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-file-2")).not.toBeNull());
+    expect(sendButton().disabled).toBe(false);
+  });
+
+  it("a replacement bar shows each paste as it lands, so removing a chip can't erase one", async () => {
+    const { drops, pastes } = heldStagingMock();
+    const first = await mountWithAgent();
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    fireDrop(["/a/diagram.png"]);
+    await waitFor(() => expect(drops).toHaveLength(1));
+    drops[0]?.(staged("diagram.png"));
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).not.toBeNull());
+    await pasteInto(textarea, BIG);
+    await pasteInto(textarea, BIG);
+    await waitFor(() => expect(pastes).toHaveLength(2));
+
+    first.unmount();
+    await mountWithAgent();
+    pastes[0]?.(staged("pasted-1.txt"));
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-text-1")).not.toBeNull());
+    expect(sendButton().disabled).toBe(true);
+    await fireEvent.click(screen.getByTestId("attachment-chip-remove-image-1"));
+    pastes[1]?.(staged("pasted-2.txt"));
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-text-2")).not.toBeNull());
+
+    await fireEvent.click(sendButton());
+    await waitFor(() => expect(sends()).toHaveLength(1));
+    expect(sends()[0]?.[1]).toMatchObject({
+      attachments: [{ original_name: "pasted-1.txt" }, { original_name: "pasted-2.txt" }],
+    });
+  });
+
+  it("a multi-file drop lands file by file in a replacement bar", async () => {
+    // Finishing one copy and starting the next happens in one step, so the
+    // in-flight count never moves; completions must still reach the bar.
+    const { drops } = heldStagingMock();
+    const first = await mountWithAgent();
+    fireDrop(["/a/one.png", "/a/two.png"]);
+    await waitFor(() => expect(drops).toHaveLength(1));
+
+    first.unmount();
+    await mountWithAgent();
+    drops[0]?.(staged("one.png"));
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).not.toBeNull());
+    await waitFor(() => expect(drops).toHaveLength(2));
+    expect(sendButton().disabled).toBe(true);
+    expect(screen.getByTestId("compose-attaching")).toHaveTextContent("Attaching two.png…");
+
+    drops[1]?.(staged("two.png"));
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-2")).not.toBeNull());
+    expect(sendButton().disabled).toBe(false);
   });
 });

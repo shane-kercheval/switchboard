@@ -25,11 +25,14 @@
 
   let { text = "", class: className = "" }: { text?: string; class?: string } = $props();
 
-  /// Above this many characters the text is shown as plain preformatted text
-  /// rather than parsed. Parsing is the cost: a 1.3 MB pasted log took several
-  /// seconds per parse, long enough to freeze the pane, and nothing that size
-  /// is prose someone wrote in Markdown. 100 K characters is roughly 2,000
-  /// lines of log output and far above any typed message.
+  /// Above this many characters (100,000) the text is shown as plain
+  /// preformatted text rather than parsed. Parsing is the cost: a 1.3 MB pasted
+  /// log took several seconds per parse, long enough to freeze the pane, and
+  /// nothing that size is prose someone wrote in Markdown. Applies to every
+  /// block this component renders, including an agent reply whose single
+  /// streaming segment crosses the limit — it switches to plain text at that
+  /// point, which is the same cost being avoided. 100 K characters is roughly
+  /// 2,000 lines of log output and far above any typed message.
   const MARKDOWN_RENDER_LIMIT = 100_000;
 
   const source = $derived(text);

@@ -44,13 +44,22 @@ setup flow from day one.
 ## Properties the decision commits us to
 
 - **Outbound-only from the Mac**, automatic reconnect, no listening socket.
-- **End-to-end encryption**: the relay forwards frames it cannot read. Noise `XXpsk2`
-  (X25519, ChaCha20-Poly1305, BLAKE2s) — `snow` on the Mac, CryptoKit on the phone.
-- **QR-code pairing** with a single-use, short-lived secret mixed in as the Noise PSK, so a
-  photographed QR is useless on its own.
-- **Trust enforced on the Mac**, never delegated to the relay: the Mac accepts frames only
-  from devices in its own registry, and revocation takes effect at the next frame regardless
-  of what the relay knows.
+- **End-to-end encryption**: the relay forwards frames it cannot read. A fresh
+  `Noise_KK_25519_ChaChaPoly_SHA256` handshake on every connection, with both static keys
+  pinned at pairing; no session key or nonce counter is ever persisted. One Rust
+  implementation (`snow`), shared with the iOS app through UniFFI — CryptoKit has neither
+  Noise nor BLAKE2s, so a Swift-only implementation would mean hand-writing Noise. SHA-256
+  rather than BLAKE2s keeps a pure-CryptoKit fallback possible.
+- **QR-code pairing** (`Noise_XXpsk2_25519_ChaChaPoly_SHA256`) with a single-use,
+  short-lived secret as the PSK, plus a confirmation code derived from the handshake and
+  compared on both screens. The code is what defends a photographed QR: without it, pairing
+  is a race won by whoever scans first.
+- **Self-certifying relay identities**: a device id is the hash of an Ed25519 key, and the
+  device proves possession at registration. X25519 keys cannot sign, so the Noise key is not
+  reused for this.
+- **Trust enforced on the Mac**, never delegated to the relay: the Mac completes handshakes
+  only with keys in its own registry, and revocation drops a live session immediately,
+  regardless of what the relay knows.
 - **Refuse, don't queue**: a send while the Mac is offline gets an immediate `mac_offline`
   error. Nothing is stored for later delivery.
 - **The Mac is the source of truth** for history; the phone fetches the tail of the
@@ -58,10 +67,12 @@ setup flow from day one.
 - **The Mac is offline while asleep**; reconnect on wake, with an optional
   keep-awake-while-plugged-in setting (which cannot override a closed lid).
 
-## Open
+## Settled after review (2026-10-03)
 
-- **Who runs the relay** — one hosted instance for everyone (an ongoing service with abuse
-  controls and a cost line) or a per-user deployment (setup friction comparable to Tailscale's).
-  The plan is written for the hosted case and marks the self-hosted deltas.
-- **Push notifications** need an Apple Developer account and an APNs relay endpoint. Deferred;
-  the transport decision doesn't change either way.
+- **Who runs the relay** — the project's developers, for their own use, as a private pilot.
+  This keeps the decision's premise intact: the relay beats Tailscale on setup only when the
+  end user doesn't deploy it. If others ever need to run their own relay, redo this
+  evaluation first.
+- **Push notifications** stay deferred; they need the paid Apple Developer Program (which the
+  TestFlight distribution brings anyway) and an APNs endpoint on the relay. The transport
+  decision doesn't change either way.

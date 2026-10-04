@@ -261,7 +261,6 @@
     text: string;
     path: string;
     label: string;
-    lines: number;
     bytes: number;
   } | null>(null);
   const largePasteUndo = $derived.by(() => {
@@ -336,13 +335,10 @@
       // or not — the file is theirs to remove, not ours to lose.
       if (gen !== sendGeneration && !staging.abandoned()) return;
       const attachment = addAttachmentChip(staged);
-      let lines = 1;
-      for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) lines += 1;
       largePaste = {
         text,
         path: staged.path,
         label: attachment.label,
-        lines,
         bytes: utf8ByteLength(text),
       };
     } catch (err) {
@@ -4506,15 +4502,11 @@
           role="status"
           aria-live="polite"
         >
-          Pasted text ({largePasteUndo.lines.toLocaleString()} lines, {formatFileSize(
-            largePasteUndo.bytes,
+          Pasted text ({formatFileSize(largePasteUndo.bytes)}; limit is {formatFileSize(
+            MAX_PROMPT_BYTES,
           )}) was attached as {largePasteUndo.label} instead of being inserted here, so the agent reads
-          it as a file and only the parts it needs.
-          {#if largePasteUndo.bytes > MAX_PROMPT_BYTES}
-            It is also too large to send as message text (the limit is {formatFileSize(
-              MAX_PROMPT_BYTES,
-            )}).
-          {:else}
+          it as a file.
+          {#if largePasteUndo.bytes <= MAX_PROMPT_BYTES}
             <button
               type="button"
               class="text-fg hover:text-accent underline underline-offset-2 disabled:cursor-not-allowed disabled:opacity-50"

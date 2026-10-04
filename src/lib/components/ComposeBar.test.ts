@@ -8947,7 +8947,7 @@ describe("ComposeBar large paste", () => {
     expect(stagedPastes()).toEqual([{ projectId: PROJECT_ID, name: "pasted-1.txt", text: BIG }]);
     expect(screen.getByTestId("attachment-chip-text-1")).toHaveTextContent("pasted-1.txt");
     expect(screen.getByTestId("compose-large-paste-notice")).toHaveTextContent(
-      "Pasted text (1,001 lines, 60 KB) was attached as text-1",
+      "Pasted text (60 KB; limit is 786 KB) was attached as text-1 instead of being inserted here, so the agent reads it as a file.",
     );
     // The send carries the chip, not the text.
     invokeMock.mockResolvedValueOnce("msg-1");
@@ -9227,11 +9227,13 @@ describe("ComposeBar large paste — undo", () => {
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
 
-    await pasteInto(textarea, "y".repeat(768 * 1024 + 1));
+    await pasteInto(textarea, "y".repeat(1_000_000));
 
     await waitFor(() => expect(screen.queryByTestId("attachment-chip-text-1")).not.toBeNull());
     const notice = screen.getByTestId("compose-large-paste-notice");
-    expect(notice).toHaveTextContent("too large to send as message text (the limit is 786 KB)");
+    expect(notice).toHaveTextContent(
+      "Pasted text (1 MB; limit is 786 KB) was attached as text-1 instead of being inserted here, so the agent reads it as a file.",
+    );
     expect(screen.queryByTestId("compose-large-paste-undo")).toBeNull();
   });
 });

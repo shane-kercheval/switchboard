@@ -151,7 +151,7 @@ describe("Markdown parse memoization", () => {
 });
 
 describe("Markdown oversized text", () => {
-  const LIMIT = 100_000;
+  const LIMIT = 50_000;
 
   it("shows text over the limit as truncated plain text without parsing it", () => {
     const text = "<b>line</b>\n".repeat(20_000);
@@ -165,7 +165,7 @@ describe("Markdown oversized text", () => {
     // Not parsed: the raw tag survives as text rather than becoming an element.
     expect(container.querySelector("b")).toBeNull();
     expect(container.querySelector('[data-testid="markdown-oversized"]')?.textContent).toContain(
-      "Showing the first 100 KB of 240 KB",
+      "Showing the first 50 KB of 240 KB",
     );
   });
 

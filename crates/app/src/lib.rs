@@ -358,9 +358,9 @@ use crate::commands::{
     set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
     set_project_directory_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
     sign_out_mcp_provider_impl, spawn_prompt_resolution_change_notifications,
-    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
-    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
-    workspace_status_impl,
+    stage_attachment_impl, stage_pasted_text_impl, sync_prompts_and_notify, terminal_open_argv,
+    test_mcp_connection_impl, test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots,
+    validate_external_url, workspace_status_impl,
 };
 use crate::error::AppError;
 use crate::harness_usage::HarnessUsage;
@@ -1267,6 +1267,19 @@ async fn stage_attachment(
     // blocking pool) and returns the staged absolute path the frontend stores on
     // the chip and later sends.
     stage_attachment_impl(state.inner(), pid, Path::new(&source_path))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stage_pasted_text(
+    state: State<'_, AppState>,
+    project_id: String,
+    name: String,
+    text: String,
+) -> Result<StagedAttachment, String> {
+    let pid = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    stage_pasted_text_impl(state.inner(), pid, name, text)
         .await
         .map_err(|e| e.to_string())
 }
@@ -2531,6 +2544,7 @@ pub fn run() {
             compact_agent,
             context_report_agent,
             stage_attachment,
+            stage_pasted_text,
             existing_attachment_paths,
             remove_queued_message,
             cancel_turn,

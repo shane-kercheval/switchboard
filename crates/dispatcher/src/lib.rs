@@ -126,7 +126,7 @@ use switchboard_core::{
 use switchboard_harness::{
     AdapterEvent, CancelSource, ContentKind, ContextWindowSource, DispatchOptions, EventStream,
     FailureKind, HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, SessionInventory,
-    SessionMetaSource, TurnId, TurnOutcome, TurnSpend,
+    SessionMetaSource, TurnId, TurnOutcome, TurnSpend, check_prompt_size,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -1957,6 +1957,38 @@ async fn run_turn(
             attachments,
             emit_user_message: announce_user_message,
         } => {
+            // Clean prompt is journaled (below) and queued; the agent-facing
+            // footer of `label: <absolute path>` lines is appended only here, at
+            // the dispatch boundary, so adapters stay attachment-unaware. Empty
+            // attachments → the prompt is returned unchanged.
+            let dispatch_prompt = render_prompt_with_attachments(prompt, attachments);
+
+            // A message too large for the CLI's argument list is refused here,
+            // ahead of the journal: journaling first would make a message that
+            // can never be sent durable, and reload would show it (and its
+            // failure) on every open. Nothing is journaled, so no send_id.
+            // Measured on the text the CLI receives, footer included.
+            if let Err(e) = check_prompt_size(&dispatch_prompt) {
+                let message = e.to_string();
+                emit_message_failed(
+                    emitter.as_ref(),
+                    channel,
+                    item.message_id,
+                    None,
+                    agent_id,
+                    &message,
+                );
+                fire_completion(
+                    &mut completion,
+                    TurnOutcome::Failed {
+                        kind: FailureKind::AdapterFailure,
+                        message,
+                    },
+                    String::new(),
+                );
+                return TurnAfter::Continue;
+            }
+
             // Fail-closed: journal the send before spawning. On failure, no turn
             // starts, no outcome marker (the journal is what's broken — a marker
             // would orphan), and we surface MessageFailed. Advance the backlog
@@ -2001,11 +2033,6 @@ async fn run_turn(
                 );
             }
 
-            // Clean prompt is journaled (above) and queued; the agent-facing footer of
-            // `label: <absolute path>` lines is appended only here, at the dispatch
-            // boundary, so adapters stay attachment-unaware. Empty attachments → the
-            // prompt is returned unchanged.
-            let dispatch_prompt = render_prompt_with_attachments(prompt, attachments);
             adapter
                 .dispatch(&agent, &cwd, &dispatch_prompt, turn_id, options)
                 .await

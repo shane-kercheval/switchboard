@@ -36,7 +36,7 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   /// is recorded in `harness-behavior.md` §3.3.
   codex: [
     { label: "GPT-6 Astra", value: "gpt-6-astra" },
-    { label: "GPT-6 Sol", value: "gpt-6-sol" },
+    { label: "GPT-6.1 Sol", value: "gpt-6.1-sol" },
     { label: "GPT-5.6 Terra", value: "gpt-5.6-terra" },
     { label: "GPT-6 Luna", value: "gpt-6-luna" },
   ],
@@ -247,9 +247,9 @@ export const DEFAULT_AGENT_SELECTIONS: Preferences["agent_defaults"] = {
     default_effort: "medium",
   },
   codex: {
-    model_choices: ["gpt-6-sol", "gpt-5.6-terra"],
+    model_choices: ["gpt-6.1-sol", "gpt-5.6-terra"],
     effort_choices: ["medium", "high"],
-    default_model: "gpt-6-sol",
+    default_model: "gpt-6.1-sol",
     default_effort: "medium",
   },
   // Both carry explicit effort because `agy` rejects these effort-bearing

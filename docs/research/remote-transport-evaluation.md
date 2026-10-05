@@ -76,3 +76,9 @@ setup flow from day one.
 - **Push notifications** stay deferred; they need the paid Apple Developer Program (which the
   TestFlight distribution brings anyway) and an APNs endpoint on the relay. The transport
   decision doesn't change either way.
+
+## Settled after review (2026-10-05)
+
+- **Audience** — the pilot serves the two developers, but users beyond them are a committed
+  goal. That is the premise behind rejecting Tailscale (option 4), so the relay stands. If
+  the goal is dropped, redo this evaluation.

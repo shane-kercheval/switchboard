@@ -4266,7 +4266,7 @@ async fn live_codex_apply_patch_emits_edit_facet() {
     std::fs::write(cwd.path().join("alpha.txt"), "foo\n").unwrap();
     let adapter = CodexAdapter::new();
     let mut agent = live_codex_agent();
-    agent.model = Some("gpt-6-sol".to_owned());
+    agent.model = Some("gpt-6.1-sol".to_owned());
     agent.effort = Some("medium".to_owned());
 
     let events: Vec<AdapterEvent> = adapter

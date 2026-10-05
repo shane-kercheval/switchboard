@@ -230,6 +230,71 @@ describe("visibility filtering in the single default pane", () => {
 });
 
 describe("per-pane content (partition)", () => {
+  it("preserves long user and assistant Markdown when a reply grows while another pane is open", async (): Promise<void> => {
+    await seedTwoAgentTranscripts();
+    const state = await loadState();
+    state.transcripts[ALICE.id] = [
+      {
+        role: "user",
+        turn_id: "long-user",
+        agent_id: ALICE.id,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "**User message**\n\n" + "prose ".repeat(10_000) + "\n\n**User tail**",
+      },
+    ];
+    const bobPaneId = moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    const alicePaneId = layoutFor(PROJECT_ID, ROSTER_IDS).panes[0]!.id;
+    maximizePane(PROJECT_ID, ROSTER_IDS, alicePaneId);
+    const { container } = renderPanes();
+    const listener = listeners.get(`agent:${ALICE.id}`);
+    if (!listener) throw new Error("expected Alice's event listener");
+    const text = "**M3: Read and sync.**\n\n" + "prose ".repeat(8_000);
+    listener({
+      payload: {
+        type: "turn_start",
+        turn_id: "long-reply",
+        message_id: "long-message",
+        send_id: "long-send",
+        started_at: "2026-05-16T00:00:01Z",
+      },
+    });
+    listener({ payload: { type: "content_chunk", turn_id: "long-reply", kind: "text", text } });
+    await tick();
+    expect(screen.getByText("M3: Read and sync.", { selector: "strong" })).toBeInTheDocument();
+
+    maximizePane(PROJECT_ID, ROSTER_IDS, bobPaneId);
+    await tick();
+    expect(
+      screen.queryByText("M3: Read and sync.", { selector: "strong" }),
+    ).not.toBeInTheDocument();
+    listener({
+      payload: {
+        type: "content_chunk",
+        turn_id: "long-reply",
+        kind: "text",
+        text: "\n\n" + "more prose ".repeat(1_000) + "\n\n**Assistant tail**",
+      },
+    });
+    maximizePane(PROJECT_ID, ROSTER_IDS, alicePaneId);
+    await tick();
+    expect(screen.getByText("M3: Read and sync.", { selector: "strong" })).toBeInTheDocument();
+    expect(screen.getByText("Assistant tail", { selector: "strong" })).toBeInTheDocument();
+    expect(container.querySelector('[data-role="user"] strong')?.textContent).toBe("User message");
+    expect(screen.getByText("User tail", { selector: "strong" })).toBeInTheDocument();
+
+    listener({
+      payload: {
+        type: "turn_end",
+        turn_id: "long-reply",
+        outcome: { status: "completed" },
+        ended_at: "2026-05-16T00:00:04Z",
+      },
+    });
+    await tick();
+    expect(screen.getByText("Assistant tail", { selector: "strong" })).toBeInTheDocument();
+    expect(screen.queryByTestId("turn-working")).not.toBeInTheDocument();
+  });
+
   it("each pane shows only its agents' turns and their user messages", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);

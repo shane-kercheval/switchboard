@@ -48,6 +48,14 @@ export default defineConfig({
           name: "jsdom",
           globals: true,
           environment: "jsdom",
+          // Node 25+ defines its own `localStorage` global — a getter that
+          // returns `undefined` unless Node was started with
+          // `--localstorage-file` — and Vitest's jsdom environment leaves an
+          // existing global alone, so every test touching `localStorage`
+          // crashed on the Node this repo pins. The jsdom one is unreachable
+          // from a setup file (`window` is the global itself), so the fix is to
+          // keep Node from defining its own. A no-op on Node 22–24.
+          execArgv: ["--no-experimental-webstorage"],
           setupFiles: ["./tests/setup.ts"],
           include: ["src/**/*.{test,spec}.{ts,svelte}", "tests/**/*.{test,spec}.ts"],
           // Browser specs are partitioned out so no file double-runs.

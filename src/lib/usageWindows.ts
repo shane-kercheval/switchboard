@@ -35,19 +35,51 @@ export type UsageWindow = {
   /// Draw this meter in the warning tone. **The two readers set it on different
   /// grounds, and the weaker one is Codex's.**
   ///
-  /// - **Claude: the payload named this window as the refused one.** Claude
-  ///   reports that window's real utilization alongside the refusal, so the
+  /// - **Claude: the payload named this window as the spent one.** Claude
+  ///   reports that window's real utilization alongside the verdict, so the
   ///   number stands as measured and only the tone is added.
   /// - **Codex: the measurement reached 100%.** That is our inference from a
   ///   number, not something Codex said. Codex does send a reason code, and this
   ///   reader deliberately ignores it — see `codexAccountUsageView`.
   ///
-  /// Both are stated because this milestone exists on account of a field whose
-  /// name implied a claim the data did not support. One name spanning two
-  /// strengths of evidence is exactly that hazard, so the difference is written
-  /// down rather than left to the name.
+  /// **Set whether or not credits are covering the shortfall.** A spent quota is
+  /// spent either way; what differs is whether work continues, and that is the
+  /// credits escalation's claim, drawn beneath the meters. Keeping the bar in the
+  /// warning tone while credits are billed is deliberate: paid usage is far
+  /// more expensive than included usage, so the state has to be unmissable
+  /// rather than softened to neutral because requests still succeed.
+  ///
+  /// Both grounds are stated because this milestone exists on account of a
+  /// field whose name implied a claim the data did not support. One name
+  /// spanning two strengths of evidence is exactly that hazard, so the
+  /// difference is written down rather than left to the name.
   limitReached?: true;
 };
+
+/// The "⚡ using credits" escalation: the harness is billing paid credits for
+/// work it is still doing, because an included allowance is spent. About what
+/// is being *charged* rather than how full a window is, which is why it is not
+/// a window and sits beneath the meters.
+///
+/// One shape for both harnesses so the card renders it once. `resetsAtMs` is
+/// the instant the paid state ends on its own, when the harness states one:
+/// Claude's `overageResetsAt`. Codex's escalation carries `null`: its lifetime
+/// is the spent window's instead (the line is drawn only while that window's
+/// bar is), and the bar directly above already shows that window's countdown,
+/// so a second reset line would restate it under a different name.
+export type CreditsEscalation = { resetsAtMs: number | null };
+
+/// The `rateLimitReachedType` values that state paid work is refused, read as a
+/// veto on the credits escalation and nothing else. The fifth value,
+/// `rate_limit_reached`, is the included allowance being spent — the state the
+/// escalation describes — and is deliberately absent; see
+/// `codexAccountUsageView`.
+const CODEX_PAID_WORK_REFUSED: ReadonlySet<string> = new Set([
+  "workspace_owner_credits_depleted",
+  "workspace_member_credits_depleted",
+  "workspace_owner_usage_limit_reached",
+  "workspace_member_usage_limit_reached",
+]);
 
 /// Shared across both harnesses (decision 10): the same window gets the same
 /// words wherever it came from, so a user reading two cards side by side is
@@ -122,9 +154,12 @@ export type StoredUsageWindow = {
   status?: unknown;
   rate_limit_type?: unknown;
   surpassed_threshold?: unknown;
-  /// Read only to separate a refusal from paid overage, which Claude reports
-  /// under the same `status`. Part of this window's own context for the same
-  /// reason the other three are.
+  /// Whether the delivering reading was a paid-overage turn, which Claude
+  /// reports under the same `rejected` status as a refusal. **Held, no longer
+  /// read by the tone rule**: a spent window is flagged in both states, and the
+  /// escalation drawn from the newest reading is what separates them. Kept in
+  /// the stored context because it is the one per-window record of which state
+  /// each window was measured in, and it is already on disk for every window.
   is_using_overage?: unknown;
   /// When the delivering reading was observed, ISO-8601. **Absent for a window
   /// restored from a file written before instants were held per window**, which
@@ -284,7 +319,11 @@ export function windowResetsAt(stored: StoredUsageWindow): number | null {
 /// window time") is still shown — we can't prove it stale. **Taken from the newest
 /// reading, which assumes it describes the account rather than the window that
 /// triggered it**; unprobeable on the development account and recorded in the gap
-/// register with what would close it.
+/// register (G37) with what would close it. More rides on that assumption now
+/// that a spent window is flagged in overage: a retained paid window outlives
+/// the escalation once an ungated turn reports no overage, leaving a warning
+/// bar with no line — truthful if the flag is per turn, wrong if per account.
+/// The sequence is pinned by a test so a change to it is deliberate.
 ///
 /// Returns `null` when nothing is displayable.
 export function claudeRateLimitView(
@@ -294,7 +333,7 @@ export function claudeRateLimitView(
 ): {
   windows: UsageWindow[];
   fallback: { label: string; resetsAtMs: number } | null;
-  overage: { resetsAtMs: number | null } | null;
+  overage: CreditsEscalation | null;
 } | null {
   if (typeof payload !== "object" || payload === null) return null;
   const p = payload as {
@@ -336,24 +375,22 @@ export function claudeRateLimitView(
     // in the neutral tone. `rateLimitType` names the window that did the blocking
     // in both cases.
     //
-    // **`rejected` is overloaded and does not mean blocked on its own.** An
-    // **overage** turn carries the same status (§1.4: `isUsingOverage:true` plus
+    // **`rejected` covers two states, and both are flagged.** An **overage** turn
+    // carries the same status (§1.4: `isUsingOverage:true` plus
     // `status:"rejected"` plus `overageResetsAt`) and is *served* — the quota is
-    // spent and Anthropic is billing credits for the work it is still doing.
-    // Flagging that window would sit the card permanently in the warning tone for
-    // anyone routinely in overage, and make the one state where work is actually
-    // refused indistinguishable from the state where it is not. The escalation
-    // beneath the meters already says what is happening there.
-    //
-    // The one captured wall (2026-09-18, the Fable weekly cap) reports
-    // `isUsingOverage: false` with overage disabled at the org level, so the two
-    // states separate on this field in the only observation we have.
+    // spent and Anthropic is billing credits for the work it is still doing. The
+    // window is flagged there too: the allowance is gone either way, and paid
+    // usage costs far more than included usage, so a user routinely in overage
+    // should see the card in the warning tone the whole time. Whether work
+    // continues is the credits escalation's claim, beneath the meters, which is
+    // what separates the two states for the reader. Previously the overage case
+    // was left neutral so that "served" and "refused" would not share a tone;
+    // that softened exactly the state that costs the most.
     //
     // **Nothing here overrides the measurement.** Claude reports the blocked
     // window's own utilization in the same payload that refuses, so the number is
     // already right and only the tone was missing.
-    const refused =
-      held.status === "rejected" && held.is_using_overage !== true && held.rate_limit_type === key;
+    const refused = held.status === "rejected" && held.rate_limit_type === key;
     windows.push({
       key,
       label: label ?? modelWeeklyLabel(held.model),
@@ -385,7 +422,7 @@ export function claudeRateLimitView(
     if (resetsAtMs > nowMs) fallback = { label: rateLimitLabel(p.rateLimitType), resetsAtMs };
   }
 
-  let overage: { resetsAtMs: number | null } | null = null;
+  let overage: CreditsEscalation | null = null;
   if (p.isUsingOverage === true) {
     if (typeof p.overageResetsAt === "number") {
       const overageMs = p.overageResetsAt * 1000;
@@ -477,21 +514,69 @@ export type CodexAccountDiagnostic =
 /// corpus; it is *not* evidence that the account read's reason code is
 /// unreliable, since the rollout never emits that field at all.
 ///
-/// `spendControlReached` and `individualLimit` arrive in the same snapshot and
-/// are also not read. They were weighed rather than overlooked: the captured
-/// account reports `spendControlReached: false` with `individualLimit` null, and
-/// neither field's meaning is established well enough to render from — the name
-/// of the second suggests an individual cap but nothing confirms it.
+/// **The credits escalation is drawn when four things hold at once**, all read
+/// from documented fields, and it is withheld — never contradicted — when any
+/// one of them does not:
+///
+/// 1. `ordinaryUsageAllowed === false` at the top level: the backend's own
+///    statement that the included allowance may not be drawn on right now. Its
+///    schema says clients "must not infer recovery from percentages or reset
+///    times", so a `null` is read as "did not say", never as either answer.
+/// 2. `credits.hasCredits === true` on an **account-wide** quota: paid credits
+///    stand behind that allowance. A reserve's credits (`null` in every
+///    capture) would say nothing about the allowance the line explains.
+/// 3. That same quota has a **spent window still on screen.** The bars retire
+///    on their reset; a line gated on account flags alone outlived them, and a
+///    card redrawn from an old reading showed "using credits" under a healthy
+///    weekly bar. A reset passing does not prove included usage is back — it
+///    makes the old billing claim unsupported, which is the same reason the
+///    bar drops. The line returns with the next read if Codex still says so.
+///    Same quota, not any quota: on a plan carrying two account-wide limits,
+///    one's credits must not vouch for the other's spent window. A spent
+///    window Codex reports with no `resetsAt` keeps the line up until the next
+///    reading, exactly as its bar does.
+/// 4. That quota states **no refusal of paid work**: `spendControlReached` is
+///    not `true`, and `rateLimitReachedType` is none of the four workspace
+///    codes (owner/member credits depleted, owner/member usage limit reached),
+///    whose names state that paid work is refused. Without this, a team member
+///    at their monthly credit cap would read "using credits" while every turn
+///    is refused — a state no capture shows, which is why the veto is read
+///    from the fields rather than inferred from `individualLimit`'s numbers.
+///
+/// **`rate_limit_reached` and unknown reason codes do not veto.** The one
+/// credits-covered capture (`team`, 5-hour window at 100%, turns completing)
+/// reports `null` there, and the only `rate_limit_reached` on record is the
+/// creditless `prolite` refusal. Whether Codex would ever emit it *while*
+/// billing is not established, and hiding a true billing warning is the exact
+/// harm this line exists to prevent, whereas a false line is corrected by the
+/// user's next refused turn. So the veto reads only codes whose meaning is in
+/// their name, and still never maps a code onto a bar — the defect the earlier
+/// "ignore the reason code entirely" rule was written against.
+///
+/// **The bar stays in the warning tone either way.** The allowance is spent in
+/// both states; the escalation is what says work continues, and that it costs
+/// more. See `UsageWindow.limitReached`.
+///
+/// `individualLimit` is understood and still not read: it is the member's
+/// running credit spend against a monthly cap, confirmed by watching `used`
+/// move across a single turn. Rendering a spend figure is its own decision.
 export function codexAccountUsageView(
   payload: unknown,
   nowMs: number,
-): { windows: UsageWindow[]; diagnostics: CodexAccountDiagnostic[] } {
-  if (typeof payload !== "object" || payload === null) return { windows: [], diagnostics: [] };
-  const buckets = (payload as { rateLimitsByLimitId?: unknown }).rateLimitsByLimitId;
-  if (typeof buckets !== "object" || buckets === null) return { windows: [], diagnostics: [] };
+): {
+  windows: UsageWindow[];
+  overage: CreditsEscalation | null;
+  diagnostics: CodexAccountDiagnostic[];
+} {
+  const empty = { windows: [], overage: null, diagnostics: [] };
+  if (typeof payload !== "object" || payload === null) return empty;
+  const p = payload as { ordinaryUsageAllowed?: unknown; rateLimitsByLimitId?: unknown };
+  const buckets = p.rateLimitsByLimitId;
+  if (typeof buckets !== "object" || buckets === null) return empty;
 
   const windows: UsageWindow[] = [];
   const diagnostics: CodexAccountDiagnostic[] = [];
+  let billingOnCredits = false;
   for (const [limitId, bucket] of Object.entries(buckets as Record<string, unknown>)) {
     if (typeof bucket !== "object" || bucket === null) continue;
     const b = bucket as {
@@ -499,12 +584,25 @@ export function codexAccountUsageView(
       normalModelSlug?: unknown;
       primary?: unknown;
       secondary?: unknown;
+      credits?: unknown;
+      spendControlReached?: unknown;
+      rateLimitReachedType?: unknown;
     };
     if (!("normalModelSlug" in b)) {
       diagnostics.push({ kind: "bucket-without-model-association", limitId });
       continue;
     }
     if (b.normalModelSlug !== null) continue;
+
+    const hasCredits =
+      typeof b.credits === "object" &&
+      b.credits !== null &&
+      (b.credits as { hasCredits?: unknown }).hasCredits === true;
+    const refusesPaidWork =
+      b.spendControlReached === true ||
+      (typeof b.rateLimitReachedType === "string" &&
+        CODEX_PAID_WORK_REFUSED.has(b.rateLimitReachedType));
+    let spentWindowShown = false;
 
     for (const slot of ["primary", "secondary"] as const) {
       const w = b[slot];
@@ -525,6 +623,8 @@ export function codexAccountUsageView(
         if (ms <= nowMs) continue;
         resetsAtMs = ms;
       }
+      const limitReached = ww.usedPercent >= 100;
+      spentWindowShown ||= limitReached;
       windows.push({
         // Keyed by quota *and* slot: one quota contributes up to two rows, and
         // they must not collide.
@@ -533,14 +633,18 @@ export function codexAccountUsageView(
         usedFraction: ww.usedPercent / 100,
         resetsAtMs,
         // **Decided here rather than in the meter template**, which draws every
-        // harness: a "full bar is a warning" rule written there also caught
-        // Claude, whose reader deliberately leaves a spent window neutral while
-        // the user is paying for overage and requests still succeed.
-        limitReached: ww.usedPercent >= 100 ? true : undefined,
+        // harness: Claude's flag comes from the payload naming the window, not
+        // from the number, and a "full bar is a warning" rule in the template
+        // would overrule that reader with this one's weaker evidence.
+        limitReached: limitReached ? true : undefined,
       });
     }
+
+    billingOnCredits ||= hasCredits && spentWindowShown && !refusesPaidWork;
   }
-  return { windows, diagnostics };
+  const overage =
+    p.ordinaryUsageAllowed === false && billingOnCredits ? { resetsAtMs: null } : null;
+  return { windows, overage, diagnostics };
 }
 
 /// Name an **account-wide** quota's window, using the shared cross-harness

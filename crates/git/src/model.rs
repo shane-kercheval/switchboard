@@ -80,12 +80,12 @@ pub struct BranchView {
     /// Position relative to the branch's *own* upstream.
     pub sync: SyncState,
     /// Commits the default branch has that this branch lacks — "main moved on,
-    /// you're stale." `None` when the default branch can't be resolved. Distinct
-    /// from [`SyncState::Behind`] (which is vs. the branch's own upstream).
-    pub behind_base: Option<u32>,
+    /// you're stale." Distinct from [`SyncState::Behind`] (which is vs. the
+    /// branch's own upstream).
+    pub behind_base: BehindBase,
     /// Whether this branch's tip is an ancestor of the default branch tip
-    /// ("done — safe to delete"). `None` when the default branch can't be
-    /// resolved.
+    /// ("done — safe to delete"). `None` when the default branch (or this tip)
+    /// can't be resolved.
     pub merged: Option<bool>,
     /// The branch had an upstream that no longer exists (the remote branch was
     /// deleted) — a stale-branch cleanup signal.
@@ -95,6 +95,9 @@ pub struct BranchView {
     pub github_url: Option<String>,
     /// The worktree this branch is checked out in, if any.
     pub worktree: Option<WorktreeView>,
+    /// Committer timestamp of the branch tip, as RFC-3339. `None` when the tip
+    /// can't be resolved to a commit.
+    pub last_commit_at: Option<String>,
 }
 
 /// A branch's position relative to its own upstream. Each variant maps 1:1 to an
@@ -134,11 +137,45 @@ pub struct RemoteBranchView {
     /// GitHub-owned remote.
     pub github_url: Option<String>,
     /// Already an ancestor of the default branch? ("stale remote, safe to
-    /// delete"). `None` when the default branch can't be resolved.
+    /// delete"). `None` when the default branch (or this tip) can't be
+    /// resolved, or when a local branch tracks this ref — that ref renders as
+    /// the local branch's row, which carries its own signals. For a ref outside
+    /// the recent set (see [`BehindBase`]) this is effectively "`true` or
+    /// undetermined": `Some(false)` only when the shared history walk covered
+    /// the entire locally available history (a shallow clone's boundary counts
+    /// as its end), and `None` when it stopped first — at the oldest such
+    /// ref's date, at its commit budget, or on an error — or when the tip's
+    /// commit can't be read.
     pub merged: Option<bool>,
-    /// Commits the default branch has that this remote ref lacks. `None` when the
-    /// default branch can't be resolved.
-    pub behind_base: Option<u32>,
+    /// Commits the default branch has that this remote ref lacks.
+    /// `NotComputed` for a ref a local branch tracks, for the same reason.
+    pub behind_base: BehindBase,
+    /// Committer timestamp of the ref's tip, as RFC-3339. `None` when the tip
+    /// can't be resolved to a commit.
+    pub last_commit_at: Option<String>,
+}
+
+/// How far behind the default branch a branch is.
+///
+/// Counting is a history walk from the default tip back to where the branch
+/// forked, so a long-abandoned branch costs as much as the history it missed.
+/// Repos that never prune accumulate hundreds of those, so the count is only
+/// taken for the recent set — every local branch, plus the
+/// [`RECENT_BRANCH_LIMIT`](crate::RECENT_BRANCH_LIMIT) most recently committed
+/// remote refs no local branch tracks and the default branch's remote ref.
+/// Everything else is `NotComputed`, which is deliberately distinct from
+/// `Unknown`: the answer exists, it just wasn't worth the walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BehindBase {
+    Count {
+        commits: u32,
+    },
+    /// The default branch (or this tip) couldn't be resolved, or the walk failed.
+    Unknown,
+    /// An older branch outside the recent set; the count was skipped.
+    NotComputed,
 }
 
 /// A checked-out working directory and its worktree-level status.

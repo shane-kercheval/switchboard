@@ -3,7 +3,13 @@ import "@testing-library/jest-dom/vitest";
 import { tick } from "svelte";
 import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import GitRepoNode from "./GitRepoNode.svelte";
-import type { GitCommitRange, GitCommitSummary, RepoListing } from "$lib/types";
+import type {
+  BranchView,
+  GitCommitRange,
+  GitCommitSummary,
+  RemoteBranchView,
+  RepoListing,
+} from "$lib/types";
 
 const invokeMock = vi.fn();
 const copyTextMock = vi.fn(async (_text: string): Promise<void> => undefined);
@@ -61,7 +67,8 @@ function listing(root: string): RepoListing {
           name: "main",
           upstream: null,
           sync: { kind: "local_only" },
-          behind_base: null,
+          behind_base: { kind: "unknown" },
+          last_commit_at: null,
           merged: null,
           dangling: false,
           github_url: null,
@@ -304,6 +311,192 @@ describe("GitRepoNode actions-trigger hover", () => {
   });
 });
 
+describe("GitRepoNode older branches", () => {
+  // Mirrors the component's RECENT_BRANCH_COUNT (and the backend's limit).
+  const RECENT = 30;
+
+  const remote = (
+    name: string,
+    lastCommitAt: string | null,
+    over: Partial<RemoteBranchView> = {},
+  ): RemoteBranchView => ({
+    name,
+    github_url: null,
+    merged: false,
+    behind_base: { kind: "count", commits: 0 },
+    last_commit_at: lastCommitAt,
+    ...over,
+  });
+
+  const local = (
+    name: string,
+    lastCommitAt: string | null,
+    over: Partial<BranchView> = {},
+  ): BranchView => ({
+    name,
+    upstream: null,
+    sync: { kind: "local_only" },
+    behind_base: { kind: "count", commits: 0 },
+    last_commit_at: lastCommitAt,
+    merged: false,
+    dangling: false,
+    github_url: null,
+    worktree: null,
+    ...over,
+  });
+
+  /// `count` remote refs named `origin/<prefix>NN`, all committed at `at`.
+  const remotes = (prefix: string, count: number, at: string): RemoteBranchView[] =>
+    Array.from({ length: count }, (_, i) =>
+      remote(`origin/${prefix}${String(i).padStart(2, "0")}`, at),
+    );
+
+  // Names deliberately disagree with recency, so an alphabetical list would
+  // fail the order assertions: zulu is newest, alpha next, then the fillers
+  // that complete the recent rows, then the stale refs.
+  function manyBranchProps() {
+    const componentProps = props("/a");
+    componentProps.listing.repo.remote_branches = [
+      remote("origin/alpha", "2026-09-01T00:00:00Z", {
+        behind_base: { kind: "count", commits: 3 },
+      }),
+      ...remotes("filler-", RECENT - 2, "2026-08-01T00:00:00Z"),
+      remote("origin/stale-a", "2024-01-01T00:00:00Z", { behind_base: { kind: "not_computed" } }),
+      remote("origin/stale-b", "2025-01-01T00:00:00Z", { behind_base: { kind: "not_computed" } }),
+      remote("origin/zulu", "2026-09-20T00:00:00Z"),
+    ];
+    return componentProps;
+  }
+
+  const remoteRowNames = (): Array<string | null> =>
+    screen.getAllByTestId("git-remote-branch").map((row) => row.getAttribute("data-branch"));
+  const localRowNames = (): Array<string | null> =>
+    screen.getAllByTestId("git-branch").map((row) => row.getAttribute("data-branch"));
+
+  it("collapses the branches past the most recent ones behind one toggle, newest first", async () => {
+    render(GitRepoNode, { props: manyBranchProps() });
+    await tick();
+
+    const shown = remoteRowNames();
+    expect(shown).toHaveLength(RECENT);
+    expect(shown.slice(0, 3)).toEqual(["origin/zulu", "origin/alpha", "origin/filler-00"]);
+    const toggle = screen.getByTestId("older-branches-toggle");
+    expect(toggle).toHaveTextContent("Show 2 older remote branches");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    await fireEvent.click(toggle);
+    await tick();
+    expect(remoteRowNames().slice(-2)).toEqual(["origin/stale-b", "origin/stale-a"]);
+    expect(toggle).toHaveTextContent("Hide older remote branches");
+
+    await fireEvent.click(toggle);
+    await tick();
+    expect(remoteRowNames()).toHaveLength(RECENT);
+  });
+
+  it("keeps a selected older branch visible while collapsed", async () => {
+    branchSelection.current = { repoRoot: "/a", kind: "remote", name: "origin/stale-a" };
+    render(GitRepoNode, { props: manyBranchProps() });
+    await tick();
+
+    expect(remoteRowNames()).toHaveLength(RECENT + 1);
+    expect(remoteRowNames()).toContain("origin/stale-a");
+    expect(screen.getByTestId("older-branches-toggle")).toHaveTextContent(
+      "Show 1 older remote branch",
+    );
+  });
+
+  it("never collapses local branches, however old", async () => {
+    const componentProps = props("/a");
+    componentProps.listing.repo.local_branches.push(
+      ...Array.from({ length: RECENT }, (_, i) =>
+        local(`recent-${String(i).padStart(2, "0")}`, "2026-09-01T00:00:00Z"),
+      ),
+      local("abandoned", "2024-01-01T00:00:00Z"),
+    );
+    render(GitRepoNode, { props: { ...componentProps, showInactive: true } });
+    await tick();
+
+    expect(localRowNames()).toHaveLength(RECENT + 2);
+    expect(localRowNames()).toContain("abandoned");
+    expect(screen.queryByTestId("older-branches-toggle")).not.toBeInTheDocument();
+  });
+
+  it("shows every pushed local branch under the Remote filter", async () => {
+    const componentProps = props("/a");
+    componentProps.listing.repo.local_branches.push(
+      ...Array.from({ length: RECENT }, (_, i) =>
+        local(`local-only-${String(i).padStart(2, "0")}`, "2026-09-01T00:00:00Z"),
+      ),
+      local("pushed", "2024-01-01T00:00:00Z", { upstream: "origin/pushed" }),
+    );
+    render(GitRepoNode, { props: { ...componentProps, branchFilter: "remote" } });
+    await tick();
+
+    expect(localRowNames()).toEqual(["pushed"]);
+    expect(screen.queryByTestId("older-branches-toggle")).not.toBeInTheDocument();
+  });
+
+  it("collapses by recency even when every behind count is unknown", async () => {
+    // A repo whose default branch can't be resolved reports every count as
+    // unknown; the collapse doesn't depend on the counts.
+    const componentProps = props("/a");
+    componentProps.listing.repo.remote_branches = [
+      ...remotes("new-", RECENT, "2026-09-20T00:00:00Z"),
+      remote("origin/old", "2024-01-01T00:00:00Z"),
+    ].map((b) => ({ ...b, behind_base: { kind: "unknown" } as const }));
+    render(GitRepoNode, { props: componentProps });
+    await tick();
+
+    expect(remoteRowNames()).not.toContain("origin/old");
+    expect(screen.getByTestId("older-branches-toggle")).toHaveTextContent(
+      "Show 1 older remote branch",
+    );
+  });
+
+  // Same shape as the backend's
+  // `recent_branch_names_breaks_ties_by_name_and_ranks_undated_tips_last`: the
+  // rows shown first must be exactly the ones the backend counted.
+  it("picks the same rows as the backend: ties by name, undated last, pinned added", async () => {
+    const componentProps = props("/a");
+    componentProps.listing.repo.default_branch = "z-pinned-undated";
+    componentProps.listing.repo.remote_branches = [
+      ...remotes("b", RECENT + 1, "2026-09-01T00:00:00Z"),
+      remote("origin/a-undated", null),
+      remote("origin/z-pinned-undated", null),
+    ];
+    render(GitRepoNode, { props: componentProps });
+    await tick();
+
+    expect(remoteRowNames()).toEqual([
+      ...Array.from({ length: RECENT }, (_, i) => `origin/b${String(i).padStart(2, "0")}`),
+      "origin/z-pinned-undated",
+    ]);
+    expect(screen.getByTestId("older-branches-toggle")).toHaveTextContent(
+      "Show 2 older remote branches",
+    );
+  });
+
+  it("shows no toggle when every branch is recent", async () => {
+    render(GitRepoNode, { props: props("/a") });
+    await tick();
+    expect(screen.queryByTestId("older-branches-toggle")).not.toBeInTheDocument();
+  });
+
+  it("labels a folderless branch with its last commit age", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-23T00:00:00Z"));
+    const componentProps = props("/a");
+    componentProps.listing.repo.remote_branches = [remote("origin/zulu", "2026-09-20T00:00:00Z")];
+    render(GitRepoNode, { props: componentProps });
+    await tick();
+
+    expect(
+      within(screen.getByTestId("git-remote-branch")).getByTestId("branch-subtitle"),
+    ).toHaveTextContent("No local folder · last commit 3d ago");
+  });
+});
+
 describe("GitRepoNode GitHub actions", () => {
   it("opens a tracked folderless local branch in GitHub", async () => {
     const componentProps = props("/a");
@@ -331,7 +524,8 @@ describe("GitRepoNode GitHub actions", () => {
         name: "fork/feature",
         github_url: "https://github.com/acme/widgets/tree/feature",
         merged: false,
-        behind_base: 0,
+        behind_base: { kind: "count", commits: 0 },
+        last_commit_at: null,
       },
     ];
     render(GitRepoNode, { props: { ...componentProps, branchFilter: "remote" } });
@@ -367,7 +561,8 @@ describe("GitRepoNode GitHub actions", () => {
         name: "upstream/feature",
         github_url: null,
         merged: false,
-        behind_base: 0,
+        behind_base: { kind: "count", commits: 0 },
+        last_commit_at: null,
       },
     ];
     render(GitRepoNode, { props: { ...componentProps, branchFilter: "remote" } });

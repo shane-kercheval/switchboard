@@ -43,7 +43,7 @@ All via `make`:
 - `make clean-stale` — deletes build artifacts nothing has touched in a week, keeping the warm cache. **Run this when builds start feeling slow** — see "Build times are a `target/` problem" below. Needs `cargo install cargo-sweep` once.
 - `make clean` — removes all build artifacts (forces a full rebuild).
 
-Prerequisites: see `README.md`. Rust toolchain pinned in `rust-toolchain.toml`; Node in `.nvmrc`; pnpm via `packageManager` in `package.json` (`corepack enable`).
+Prerequisites: see `README.md`. Rust toolchain pinned in `rust-toolchain.toml`; Node in `.nvmrc`; pnpm version in `packageManager` in `package.json` (install via Homebrew or `npm -g`; Corepack only on Node ≤ 24).
 
 ### Use the `make` targets — do not hand-roll `cargo` commands
 

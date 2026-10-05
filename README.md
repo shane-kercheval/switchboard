@@ -45,14 +45,14 @@ cd switchboard
 
 - **Xcode Command Line Tools** — `xcode-select --install`
 - **Rust** — install [rustup](https://rustup.rs); the pinned toolchain auto-installs on the first build. **After installing, restart your terminal** (or run `source "$HOME/.cargo/env"`) so `cargo` is on your `PATH` — otherwise the build fails with `cargo metadata ... No such file or directory`.
-- **Node** — version **22 or newer**. Use whatever you already have, or install one via [nvm](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), Homebrew, etc. (You don't need a specific patch version — `make install` checks for the minimum and stops with a clear message if it's too old. Contributors: [`.nvmrc`](./.nvmrc) pins the exact version CI runs, picked up with `nvm use`; that exact pin isn't required just to build the app.)
-- **pnpm** — run `corepack enable`. Corepack ships with Node and provides the pnpm version pinned in [`package.json`](./package.json); you do **not** install pnpm separately.
+- **Node** — version **22 or newer**; CI runs the version pinned in [`.nvmrc`](./.nvmrc) (currently 26). Use whatever you already have, or install one via Homebrew, [nvm](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), etc. (You don't need a specific patch version — `make install` checks for the minimum and stops with a clear message if it's too old. Contributors: the `.nvmrc` pin is what CI runs, picked up with `nvm use`; that exact pin isn't required just to build the app.)
+- **pnpm** — the version pinned by `packageManager` in [`package.json`](./package.json). Install it with `brew install pnpm` or `npm install -g pnpm@<that version>`. (On Node 24 or older, `corepack enable` also works; Node 25 stopped shipping Corepack.)
 
 Confirm the toolchain resolves before continuing:
 
 ```sh
 node --version   # 22 or newer
-pnpm --version   # Corepack provides the pinned version on first pnpm call
+pnpm --version   # should match `packageManager` in package.json
 ```
 
 **3. Build, install, and launch:**
@@ -146,6 +146,7 @@ Switchboard drives each agent through its own CLI, so it inherits that CLI's cap
 - **Claude Code and Codex don't show you their reasoning; Antigravity does.** Switchboard displays an agent's chain of thought whenever the CLI hands it over, in a collapsed section above the answer. Anthropic's API strips the reasoning text out of what Claude Code receives, and Codex encrypts it, so for those two the transcript shows the answer and the tool calls but no reasoning — the agent is still reasoning, you just can't read it. Which Claude models strip it has changed several times without warning, so this may come back on its own.
 - **Codex models depend on your plan and CLI version.** When you sign in to Codex with a ChatGPT subscription, only the models your plan includes are available; choosing one your plan doesn't cover fails the turn with Codex's own error. GPT-6 Astra requires Codex 0.153.0 or newer, and GPT-6.1 Sol requires Codex 0.159.0 or newer. An older Codex refuses GPT-6.1 Sol with an error saying the model "is not supported when using Codex with a ChatGPT account", which reads like a plan limit. It usually means Codex needs updating, but on Enterprise and Edu plans it can also mean an administrator hasn't turned GPT-6.1 Sol on yet, since it starts off on those plans.
 - **The Codex usage meter needs a current Codex CLI.** Switchboard asks Codex which usage limits your account holds and how much of each is spent. Older Codex versions can only report one limit at a time, without saying which — not enough to label a meter honestly — so on those the Codex usage card stays empty rather than showing a number that may describe the wrong limit. Update Codex to get it back.
+- **A full Codex or Claude bar with "⚡ using credits" under it means your plan's allowance is spent and the harness is now billing paid credits — not that it has stopped.** Turns keep completing, so the bar stays in the warning color on purpose: paid usage costs far more than included usage, and the line is there so you notice before the bill does. The bar reports how much of the allowance is used; the line reports that the harness has said it is billing credits. A full bar with no line means the harness has not said so — the next turn's own result tells you whether it went through. For Codex the line needs credits on your plan (team and business plans typically have them; a plan without credits refuses instead), and it stays up only while the spent window is still shown, so it disappears with that bar once the window resets. Codex does not report what each turn cost, so Codex messages carry no per-turn cost figure the way Claude's overage turns do.
 - **When your Codex weekly allowance runs out, Switchboard shows it as spent and every model refuses — but the Codex terminal can still finish the job.** The usage card draws the allowance full because Codex reports it full, and no model in the picker will run. Codex also keeps a separate reserve model for exactly this situation, which Switchboard doesn't offer; running `codex` in a terminal will tell you you're out and offer to switch to it, and work started there continues normally. Once the allowance resets, the meter updates the next time a Codex agent finishes a turn, or when you close and reopen the sidebar — it does not refresh on a timer while you watch it, so a card left open keeps showing the reading it last took, labelled with when that was.
 - **Codex agents show a smaller context window than the model advertises.** A Codex agent's context gauge reads about 258K even on models sold as 1M-token, because Codex itself caps every model at that working window by its own policy. Switchboard shows the limit Codex actually enforces, which is when Codex will compact. To raise it, set `model_context_window` in `~/.codex/config.toml`, up to 872,000; the gauge follows automatically.
 - **Gemini is no longer supported.** Google withdrew Gemini CLI access for individual accounts, which left it impossible to test or use here, so support was removed. Use Antigravity — Google's replacement for individual plans — instead.
@@ -178,7 +179,7 @@ The architectural decisions, functional requirements, and open questions are bei
 
 ## Local development
 
-macOS only for v1. The build prerequisites are the same as [Install](#install) above — Xcode Command Line Tools, Rust (rustup), Node (pinned in [`.nvmrc`](./.nvmrc)), and pnpm (`corepack enable`). If you've installed the app, you already have everything.
+macOS only for v1. The build prerequisites are the same as [Install](#install) above — Xcode Command Line Tools, Rust (rustup), Node (pinned in [`.nvmrc`](./.nvmrc)), and pnpm (the version in `package.json`'s `packageManager`). If you've installed the app, you already have everything.
 
 Common commands (run from the repo root):
 

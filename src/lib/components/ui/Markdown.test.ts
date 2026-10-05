@@ -150,44 +150,50 @@ describe("Markdown parse memoization", () => {
   });
 });
 
-describe("Markdown oversized text", () => {
-  const LIMIT = 50_000;
-
-  it("shows text over the limit as truncated plain text without parsing it", () => {
-    const text = "<b>line</b>\n".repeat(20_000);
-    expect(text.length).toBeGreaterThan(LIMIT);
+describe("Markdown long text", () => {
+  it("formats the entire text beyond 50,000 characters", (): void => {
+    const text = "**bold**\n\n" + "plain text ".repeat(6_000) + "\n\n**tail**";
     const { container } = render(Markdown, { text });
 
-    expect(renderMarkdownMock).not.toHaveBeenCalled();
-    const pre = container.querySelector("pre");
-    if (!pre) throw new Error("expected a <pre> block");
-    expect(pre.textContent).toBe(text.slice(0, LIMIT));
-    // Not parsed: the raw tag survives as text rather than becoming an element.
-    expect(container.querySelector("b")).toBeNull();
-    expect(container.querySelector('[data-testid="markdown-oversized"]')?.textContent).toContain(
-      "Showing the first 50 KB of 240 KB",
-    );
+    expect(renderMarkdownMock).toHaveBeenCalledWith(text);
+    expect(Array.from(container.querySelectorAll("strong"), (node) => node.textContent)).toEqual([
+      "bold",
+      "tail",
+    ]);
   });
 
-  it("'Show all' reveals the full text, still as plain text, and toggles back", async () => {
-    const text = "x".repeat(LIMIT + 5);
-    const { container, getByTestId } = render(Markdown, { text });
-    const toggle = getByTestId("markdown-oversized-toggle");
+  it("keeps formatting as text grows past 50,000 characters without re-parsing unchanged text", async (): Promise<void> => {
+    const text = "**bold**\n\n" + "prose ".repeat(8_000);
+    const { container, rerender } = render(MarkdownRowHarness, { row: { text } });
+    expect(container.querySelector("strong")?.textContent).toBe("bold");
 
-    await fireEvent.click(toggle);
-    expect(container.querySelector("pre")?.textContent).toBe(text);
-    expect(toggle.textContent?.trim()).toBe("Show less");
-    expect(renderMarkdownMock).not.toHaveBeenCalled();
+    const grown = text + "\n\n" + "more prose ".repeat(1_000) + "\n\n**tail**";
+    await rerender({ row: { text: grown } });
+    await tick();
+    expect(Array.from(container.querySelectorAll("strong"), (node) => node.textContent)).toEqual([
+      "bold",
+      "tail",
+    ]);
+    expect(renderMarkdownMock).toHaveBeenCalledTimes(2);
 
-    await fireEvent.click(toggle);
-    expect(container.querySelector("pre")?.textContent).toBe(text.slice(0, LIMIT));
+    await rerender({ row: { text: grown } });
+    await tick();
+    expect(renderMarkdownMock).toHaveBeenCalledTimes(2);
   });
 
-  it("parses text at the limit normally", () => {
-    const text = "**bold**" + "a".repeat(LIMIT - 8);
+  it.each([49_999, 50_000, 50_001])("formats text of %i characters", (length: number): void => {
+    const text = "**bold**" + "a".repeat(length - 8);
     const { container } = render(Markdown, { text });
     expect(renderMarkdownMock).toHaveBeenCalledTimes(1);
-    expect(container.querySelector("strong")).not.toBeNull();
-    expect(container.querySelector('[data-testid="markdown-oversized"]')).toBeNull();
+    expect(container.querySelector("strong")?.textContent).toBe("bold");
+    expect(container.textContent).toBe("bold" + "a".repeat(length - 8) + "\n");
+  });
+
+  it("sanitizes HTML in long text", (): void => {
+    const text = "a".repeat(60_000) + '\n\n<img src="x" onerror="alert(1)">\n\n**tail**';
+    const { container } = render(Markdown, { text });
+    expect(container.querySelector("img")).not.toBeNull();
+    expect(container.querySelector("[onerror]")).toBeNull();
+    expect(container.querySelector("strong")?.textContent).toBe("tail");
   });
 });

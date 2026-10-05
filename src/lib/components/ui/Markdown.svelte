@@ -21,25 +21,10 @@
   import { copyText } from "$lib/native";
   import { openExternalUrl } from "$lib/api";
   import { cn } from "$lib/utils";
-  import { formatFileSize } from "$lib/diff";
 
   let { text = "", class: className = "" }: { text?: string; class?: string } = $props();
 
-  /// Above this many characters (50,000) the text is shown as plain
-  /// preformatted text rather than parsed, and only this much of it until the
-  /// user asks for the rest. Parsing is the cost: a 1.3 MB pasted log took
-  /// several seconds per parse, long enough to freeze the pane, and nothing
-  /// that size is prose someone wrote in Markdown. Applies to every block this
-  /// component renders, including an agent reply whose single streaming
-  /// segment crosses the limit — it switches to plain text at that point,
-  /// which is the same cost being avoided. Matches the compose bar's
-  /// large-paste threshold: 50 K characters is roughly a thousand lines of log
-  /// output and far above any typed message.
-  const MARKDOWN_RENDER_LIMIT = 50_000;
-
   const source = $derived(text);
-  const oversized = $derived(source.length > MARKDOWN_RENDER_LIMIT);
-  let showAll = $state(false);
 
   // Known limitation: while a segment is still streaming, the whole segment
   // re-parses (and re-highlights) every token, so a partially-typed token in the
@@ -48,7 +33,7 @@
   // Prism is fast, so it's minor. If it ever reads as objectionable, the fallback
   // is to render the live segment's code as plain monospace and highlight only
   // once finalized — not built pre-emptively.
-  const html = $derived(oversized ? "" : renderMarkdown(source));
+  const html = $derived(renderMarkdown(source));
 
   // Per-button reset timers (keyed on the button element) so copying one block
   // doesn't cancel another block's "Copied → Copy" reset. WeakMap doesn't pin
@@ -107,29 +92,5 @@
   }
 </script>
 
-{#if oversized}
-  <!-- Plain text, never parsed: the full string is one text node, which is
-       cheap to lay out even when it is megabytes. "Show all" reveals the rest
-       as the same plain text — not as Markdown. -->
-  <div class={cn("markdown-body", className)} data-testid="markdown-oversized">
-    <pre class="font-mono text-xs break-words whitespace-pre-wrap">{showAll
-        ? source
-        : source.slice(0, MARKDOWN_RENDER_LIMIT)}</pre>
-    <p class="text-muted mt-1 text-xs">
-      {showAll
-        ? `Showing all ${formatFileSize(source.length)} as plain text (too large to format).`
-        : `Showing the first ${formatFileSize(MARKDOWN_RENDER_LIMIT)} of ${formatFileSize(source.length)} as plain text (too large to format).`}
-      <button
-        type="button"
-        class="text-fg hover:text-accent underline underline-offset-2"
-        data-testid="markdown-oversized-toggle"
-        onclick={() => (showAll = !showAll)}
-      >
-        {showAll ? "Show less" : "Show all"}
-      </button>
-    </p>
-  </div>
-{:else}
-  <!-- eslint-disable-next-line svelte/no-at-html-tags -- `html` is DOMPurify-sanitized in renderMarkdown -->
-  <div class={cn("markdown-body", className)} use:delegate>{@html html}</div>
-{/if}
+<!-- eslint-disable-next-line svelte/no-at-html-tags -- `html` is DOMPurify-sanitized in renderMarkdown -->
+<div class={cn("markdown-body", className)} use:delegate>{@html html}</div>

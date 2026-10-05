@@ -1,7 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Created:** 2026-09-29 · **Revised:** 2026-10-03 after an external
-review (20 findings; all adopted, details below)
+**Status:** proposed · **Revision:** 4 · **Created:** 2026-09-29 · **Revised:** 2026-10-04
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -15,14 +14,61 @@ document is the component inventory — what gets written, where, and against wh
 — followed by the milestones. The iOS app lives in this repository at `SwitchboardMobile/`,
 beside `crates/`, so the protocol fixtures and the shared Rust cryptography are in one tree.
 
-**What the review changed.** The original draft stored per-device session keys and resumed
-them after restarts (impossible with `snow`, and unsafe if forced); hand-wrote Noise in Swift
-on top of CryptoKit (which has neither Noise nor BLAKE2s); and had the phone re-merge per-agent
-transcripts in Swift (duplicating `load_project_conversation_impl`). Those are replaced by
-per-connection handshakes, one Rust crypto crate shared with iOS through UniFFI, and
-Mac-side paging of the already-merged conversation. Pairing gains a confirmation code, relay
-ids become self-certifying, sends become idempotent, and phone sends reuse the dispatcher's
-existing `user_message` event instead of inventing a new one.
+## Changelog
+
+- **Revision 4 (2026-10-04)** — second review, verdict SIMPLIFY (one critical, five major).
+  - Finding 1 (critical): a live turn reaches the phone from one source only. The live
+    snapshot is taken before the disk read, and disk copies of live turns, and of turns that
+    start after the snapshot, are dropped on the Mac (§5.7).
+  - Finding 3: forwarded events carry a per-project `seq` and a tail load carries
+    `through_seq`; the phone drops anything at or below it. One number per project rather than
+    one per turn. Replaces the unspecified "de-duplicated" (§4, §5.6, §7.4).
+  - Finding 2: `ConversationCache` has its own key — the journal plus every agent's session
+    file — instead of `project_session_fingerprints_impl`, which returns nothing for Codex and
+    Antigravity and ignores the journal (§5.7).
+  - Finding 4: `list_agents` uses the existing `list_project_agents_readonly_impl`, so it works
+    for unopened projects in M3. Busy state comes from the dispatcher's existing queries and is
+    carried on `list_projects` and `list_agents`; the `project_status` request is removed. The
+    send handler's order is stated (§4, §5.5, §5.7).
+  - Finding 5: `origin: SendOrigin` on `WorkPayload::Send` replaces the `emit_user_message`
+    flag, and `user_message` is always emitted. **Reverses** revision 2's "add an
+    `emit_user_message` parameter": with compose, phone, and workflow sends all emitting, no
+    caller would pass `false` (§5.8).
+  - Finding 6: the Mac sends its full `paired_devices` set on every registration and change,
+    replacing `pair_added` / `pair_revoked`, so a relay restart loses nothing. The relay stamps
+    `from` (§4, §5.1–5.3, §6).
+  - Finding 7: hidden-window behaviour becomes a done-criterion in M2 and M4 (§5.9, §9).
+  - Minors: `cancel_send` is removed from the first version — **reverses** revision 2's
+    recipient retention in `SendLedger`, because no screen calls it and cancelling queued sends
+    is already the first follow-up. `project_list_changed` and `harness_not_signed_in` are
+    removed. `project_load_timeout` is 10 seconds. `firstHydration` is cleared with its
+    siblings. The transport's receiver comes from its constructor. `AGENTS.md` updates are
+    listed (§8).
+  - Found during triage: `RemoteBackend` lives in `crates/remote`, which cannot name
+    `crates/app` types, so its signatures now use protocol types, and it gains
+    `journaled_recipients` for the receipt fallback revision 3 described (§1).
+- **Revision 3 (2026-10-04)** — revision check of revision 2.
+  - Check 1: the frontend load path is already separable from selection
+    (`ensureProjectLoaded` has one caller, `activateProject`), so milestone 4's spike is
+    dropped. The acknowledgement now waits for the project's *first* hydration, through a
+    retained promise rather than a second `hydrateProject` call, which returns `"skipped"` and
+    would not wait (§5.8).
+  - Check 2: `send_receipt` carries `project_id`, so the post-restart journal fallback knows
+    which journal to read (§4, §5.5).
+  - Check 3: `last_seen` leaves `remote_devices.jsonl` and is held in memory by
+    `SessionManager` (§5.3, §5.4, §5.10).
+  - Check 4: `appendUserTurnImpl`'s `sendId` parameter becomes required; the production
+    wrapper `dispatchUserTurn` already requires it (§5.8).
+  - Check 5: the Debug build carries an App Transport Security local-networking exception and
+    a Local Network usage description for the milestone 2 local relay; Release carries
+    neither (§7.2, §9).
+- **Revision 2 (2026-10-03)** — external review, 20 findings, all adopted: per-connection
+  `Noise_KK` sessions; one Rust crypto crate shared with iOS through UniFFI; Mac-side paging of
+  the merged conversation; pairing confirmation code; self-certifying relay ids; pairing
+  bootstrap token; live-turn snapshot; idempotent sends; fragmentation; `user_message` reuse
+  with a journaled `origin`; `WakeLease` reuse; launch at login; last seen; authentication
+  before send; distribution; milestones. Settled all open decisions.
+- **Revision 1 (2026-09-29)** — component inventory, no milestones.
 
 ## 0. Decisions
 
@@ -34,7 +80,7 @@ existing `user_message` event instead of inventing a new one.
 | Authentication before send | **Required** | Face ID with passcode fallback before each send, with a short reuse window (§7.4). Viewing and cancelling are not gated. |
 | Pairing confirmation | **Required** | A short code derived from the handshake shows on both screens; the user confirms on the Mac (§2, §5.2). |
 | Mac notification for sends from the phone | **None** | Phone sends are not registered with the desktop's send-completion tracking. Removes the hardest frontend integration. |
-| Queued sends visible across devices | **Follow-up** | A send queued behind a busy agent appears on the other device when its turn starts. Showing and cancelling queued sends cross-device is the first follow-up (§8). |
+| Queued sends visible across devices | **Follow-up** | A send queued behind a busy agent appears on the other device when its turn starts. Showing and cancelling queued sends cross-device is the first follow-up (§8); until then the phone can stop a running turn but cannot cancel a queued send. |
 | Launch at login | **Added** | Settings row backed by Tauri's autostart plugin (§5.9). |
 | "Last seen" on the phone | **Added** | Relay-supplied time in the offline banner, with no inferred diagnosis (§6, §7.5). |
 | Sends while the Mac is offline | **Refuse, don't queue** | Relay returns `mac_offline`; nothing is stored for later delivery. |
@@ -69,22 +115,21 @@ bounded channel so a slow phone can never block dispatch.
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn send(&self, to: &DeviceId, frame: Frame) -> Result<(), TransportError>;
-    fn inbound(&self) -> mpsc::Receiver<(DeviceId, Frame)>;
     fn status(&self) -> watch::Receiver<TransportStatus>;
 }
 
 #[async_trait]
 pub trait RemoteBackend: Send + Sync {
-    async fn list_projects(&self) -> Result<Vec<ProjectListing>, BackendError>;
-    async fn list_agents(&self, project: ProjectId) -> Result<Vec<AgentSummary>, BackendError>;
-    async fn load_conversation(&self, project: ProjectId) -> Result<ProjectConversation, BackendError>;
-    async fn session_fingerprints(&self, project: ProjectId) -> Result<SessionFingerprints, BackendError>;
+    async fn list_projects(&self) -> Result<Vec<RemoteProject>, BackendError>;
+    async fn list_agents(&self, project: ProjectId) -> Result<Vec<RemoteAgent>, BackendError>;
+    async fn load_conversation(&self, project: ProjectId, before: Option<Cursor>, limit: usize,
+        live: &LiveSnapshot) -> Result<ConversationWindow, BackendError>;
     async fn ensure_project_loaded(&self, project: ProjectId) -> Result<(), BackendError>;
     async fn send_message(&self, project: ProjectId, agent: AgentId, prompt: &str, send_id: SendId)
         -> Result<MessageId, BackendError>;
     async fn cancel_turn(&self, agent: AgentId) -> Result<(), BackendError>;
-    async fn cancel_send(&self, send: SendId, recipients: &[AgentId]) -> Result<(), BackendError>;
-    async fn project_status(&self, project: ProjectId) -> Result<ProjectStatus, BackendError>;
+    async fn journaled_recipients(&self, project: ProjectId, send_id: SendId)
+        -> Result<Vec<AgentId>, BackendError>;
 }
 
 pub trait KeyStore: Send + Sync {
@@ -94,6 +139,16 @@ pub trait KeyStore: Send + Sync {
 
 `send_message` is one recipient per call; the request handler loops over recipients (one
 `send_message_impl` per recipient, shared `send_id`), exactly as the desktop compose bar does.
+
+A transport's constructor returns the `Arc<dyn Transport>` together with its inbound
+`mpsc::Receiver<(DeviceId, Frame)>`: a receiver has one owner, so it is handed over once rather
+than fetched through `&self`.
+
+`crates/remote` cannot depend on `crates/app`, so the trait speaks in protocol types defined in
+`crates/remote` — `RemoteProject`, `RemoteAgent`, `Cursor`, `LiveSnapshot`,
+`ConversationWindow` — and the app's implementation maps its own types into them. A
+`ConversationWindow`'s items cross as `serde_json::Value`: the same serialization of
+`ConversationItem` the desktop receives over IPC.
 
 ```swift
 protocol Transport {
@@ -216,32 +271,37 @@ Swift.
 **Envelope** — `{ id, type, payload }`. `id` is a sender-minted UUID; responses and errors echo
 it. `type` is snake_case, mirroring `#[serde(tag = "type", rename_all = "snake_case")]`.
 
-**Relay frame** — what crosses the relay is `Frame { to, from, record }`; the relay reads `to`
-and `from` only. Handshake messages and transport records travel the same way.
+**Relay frame** — what crosses the relay is `Frame { to, from, record }`. A client sends `to`
+and `record`; the relay stamps `from` with the sender's registered device id and never trusts a
+client-supplied value. Handshake messages and transport records travel the same way.
 
 **Requests (phone → Mac).** None is accepted before the connection's `KK` handshake completes.
 
 | Type | Payload | Response |
 |---|---|---|
-| `list_projects` | – | `ProjectListing[]`, including `archived` and `directory_available` |
-| `list_agents` | `project_id` | id, name, harness, model/effort, busy/idle |
-| `load_conversation` | `project_id`, `before?`, `limit` | a window of `ConversationItem`s, `next_before?`, and the live-turn snapshot (§5.6) |
+| `list_projects` | – | per project: id, name, directory, `directory_available`, `archived`, last activity, `status` (`busy` / `idle`) |
+| `list_agents` | `project_id` | per agent: id, name, harness, model/effort, `busy` |
+| `load_conversation` | `project_id`, `before?`, `limit` | a window of `ConversationItem`s and `next_before?`; a tail load (no `before`) also carries the live snapshot and `through_seq` (§5.7) |
 | `send_message` | `project_id`, `agent_ids[]`, `prompt`, `send_id` | per-recipient result: `accepted { message_id }` or `rejected { code }` |
-| `send_receipt` | `send_id` | the stored per-recipient results, or `unknown` |
+| `send_receipt` | `project_id`, `send_id` | the stored per-recipient results, or `unknown` |
 | `cancel_turn` | `agent_id` | – |
-| `cancel_send` | `send_id` | – (the Mac supplies the recorded recipients) |
-| `project_status` | `project_id` | `busy` / `idle` |
 
 **Cursors.** `before` is `(at, id)`: `id` is the `send_id` for a user row and the durable
 hydration key for an agent turn. Turns with no durable key fall back to `(at, ordinal within
 at)`, documented as stable only within one cached conversation. Turn ids are never cursors:
 the parser regenerates them on every read.
 
-**Events (Mac → phone)**, wrapped with `project_id` and `agent_id`, forwarded from an explicit
-allowlist: `turn_start`, `user_message` (now carrying `origin`, §5.8), `content_chunk`,
+**Events (Mac → phone)**, wrapped with `project_id`, `agent_id`, and `seq`, forwarded from an
+explicit allowlist: `turn_start`, `user_message` (now carrying `origin`, §5.8), `content_chunk`,
 `turn_identity`, `liveness`, `tool_started`, `tool_completed`, `tool_facet_updated`, `turn_end`,
 `message_failed`, `message_cancelled`, `agent_idle`, `session_meta`, `context_report`,
-`rate_limit_event`. New: `project_list_changed`.
+`rate_limit_event`.
+
+**Live sync.** `seq` is a per-project counter that `RemoteEmitter` assigns to each forwarded
+event in emit order. A tail load's reply carries `through_seq`: every event at or below it is
+already reflected in the reply. The phone subscribes before it loads, buffers what arrives,
+and on the reply drops every event with `seq ≤ through_seq` and applies the rest. A gap in
+`seq` means the phone missed something, and it reloads the tail.
 
 **Control** — `hello` (`protocol_version`), `subscribe` / `unsubscribe` (`project_id`),
 `ping` / `pong`, `error` (`code`, `message`, optional `last_seen`). Pairing: `pairing_hello`,
@@ -250,8 +310,10 @@ allowlist: `turn_start`, `user_message` (now carrying `origin`, §5.8), `content
 **Error codes** — `mac_offline` (from the relay, with `last_seen` when known), `phone_offline`,
 `not_paired`, `pairing_expired`, `directory_missing`, `agent_busy_elsewhere` (the harness
 session lock: `AppError::SessionInUse`), `project_locked` (another Switchboard process holds the
-project: `AppError::ProjectLocked`), `project_load_timeout`, `harness_not_signed_in`,
-`protocol_mismatch` (says which side to update), `unknown_recipient`.
+project: `AppError::ProjectLocked`), `project_load_timeout`, `protocol_mismatch` (says which
+side to update), `unknown_recipient`. A harness that is not signed in is not a request error:
+a send is accepted before its turn starts, so the failure arrives later as `message_failed`
+with its failure kind.
 
 **Rules**
 
@@ -269,9 +331,11 @@ project: `AppError::ProjectLocked`), `project_load_timeout`, `harness_not_signed
 ### `crates/remote/` — Tauri-free
 
 **5.1 `RelayTransport`.** One tokio task owning a `tokio-tungstenite` socket; outbound only.
-Registers with the relay by signing its challenge with the Mac's Ed25519 key. Backoff 1s→60s
-with jitter; reconnects on network change and on wake. Status: `Disabled | Connecting |
-Connected | RelayUnreachable(since)`. Knows nothing about message types.
+Registers with the relay by signing its challenge with the Mac's Ed25519 key, and after every
+successful registration sends `paired_devices { device_ids }` — the full non-revoked set, which
+the relay treats as authoritative. Backoff 1s→60s with jitter; reconnects on network change and
+on wake. Status: `Disabled | Connecting | Connected | RelayUnreachable(since)`. Knows nothing
+about message types.
 
 **5.2 `PairingCoordinator`.**
 
@@ -284,31 +348,39 @@ Connected | RelayUnreachable(since)`. Knows nothing about message types.
    handshake and nothing else. A second device presenting the token is refused.
 4. Both screens show the confirmation code. The Mac shows **Confirm** / **Decline** beside it
    and the phone's reported name, marked as informational.
-5. On **Confirm**, the registry row is written and the Mac sends `pair_added { device_id }` to
-   the relay. On **Decline**, expiry, or a dropped relay connection mid-pairing, the candidate
-   is discarded and the token is dead. Three failed handshakes on one token also kill it.
+5. On **Confirm**, the registry row is written and the Mac sends its updated `paired_devices`
+   set to the relay. On **Decline**, expiry, or a dropped relay connection mid-pairing, the
+   candidate is discarded and the token is dead. Three failed handshakes on one token also kill
+   it.
 
 **5.3 `DeviceRegistry`.** Trait plus JSONL impl over `remote_devices.jsonl` in the config dir:
-`device_id`, `name`, `noise_public_key`, `identity_public_key`, `paired_at`, `last_seen`,
-`revoked_at?`. Public keys only. `revoke(device)` marks the row, tells `SessionManager` to drop
-the live session, and sends `pair_revoked` to the relay.
+`device_id`, `name`, `noise_public_key`, `identity_public_key`, `paired_at`, `revoked_at?`.
+Public keys only. The file records pairing and revocation and nothing that changes per
+connection. `revoke(device)` marks the row, tells `SessionManager` to drop the live session,
+and sends the updated `paired_devices` set to the relay.
 
 **5.4 `SessionManager`.** One live `Session` per connected device. On a handshake from a
 registered device, runs `KK` against that device's pinned key; a new successful handshake from
 the same device replaces the old session, whose further records fail to open. Records are
 opened here and only plaintext envelopes leave the module. Requests arriving before handshake
-completion are refused with `not_paired`.
+completion are refused with `not_paired`. Also holds, in memory, each device's connection
+state and the time of its last disconnect since the app launched; Settings reads it from here.
 
 **5.5 Request side.**
 
-- `RequestHandler` — decode → validate (every recipient belongs to `project_id`) → call
-  `RemoteBackend` → encode the response or `error`.
+- `RequestHandler` — decode, call `RemoteBackend`, encode the response or `error`. For
+  `send_message` the order is fixed: `ensure_project_loaded`, then check that every recipient
+  is in the project's roster (`unknown_recipient` otherwise, with nothing dispatched), then
+  dispatch one recipient at a time. Validation comes second because it needs the roster.
 - `SubscriptionRegistry` — `device_id → set<project_id>`.
-- `SendLedger` — `send_id → { recipients, per-recipient results }`, in memory, bounded by count
-  and age. A repeat `send_message` with a known `send_id` returns the stored results without
-  dispatching; `send_receipt` reads it; `cancel_send` reads the recipients from it. After a Mac
-  restart the ledger is empty, so `send_receipt` answers from the journal (a journaled `Send`
-  for that `send_id` means its turn started) and otherwise returns `unknown`.
+- `SendLedger` — `send_id → per-recipient results`, in memory, bounded by count and age. A
+  repeat `send_message` with a known `send_id` returns the stored results without dispatching,
+  and `send_receipt` reads it. Request-level errors raised before any dispatch
+  (`project_load_timeout`, `project_locked`, `unknown_recipient`) are not recorded, so the same
+  request can be retried. After a Mac restart the ledger is empty, so `send_receipt` asks
+  `RemoteBackend::journaled_recipients` for the request's `project_id`: a journaled `Send` for
+  that `send_id` means that recipient's turn started. Otherwise it returns `unknown`. A send
+  that was queued but never started is lost with the restart and correctly reports `unknown`.
 
 **5.6 `RemoteEmitter`.** An `EventEmitter` decorator over the existing chain, the same shape as
 `WakeLockEmitter` and `SessionMetaObservingEmitter`, installed where `AppState.emitter` is built.
@@ -316,46 +388,102 @@ It forwards everything unchanged, then:
 
 - resolves `AgentId → ProjectId` through `AgentProjectResolver` (agent channels carry no
   project);
-- for allowlisted events, enqueues fan-out to devices subscribed to that project;
-- tracks live turns and buffers each one's chunks and tool events until `turn_end`, so
-  `load_conversation` can include a **live-turn snapshot**. A phone joining mid-turn, or
-  returning from the background, sees the reply so far rather than a sentence fragment.
+- for allowlisted events, assigns the project's next `seq` and enqueues fan-out to devices
+  subscribed to that project. A device whose queue is full has events dropped rather than
+  blocking; the phone sees the gap in `seq` and reloads;
+- tracks each live turn from `turn_start` (agent, turn id, `started_at`) and buffers its
+  forwarded events until `turn_end`, `message_failed`, or `message_cancelled`;
+- answers `snapshot(project) -> LiveSnapshot { through_seq, taken_at, turns }` under one lock,
+  so the snapshot and `through_seq` describe the same instant.
 
 ### `crates/app/` changes
 
-**5.7 Conversation for the phone.**
+**5.7 Listings and conversation for the phone.**
 
-- `RemoteBackend::load_conversation` calls the existing `load_project_conversation_impl`, which
-  merges the journal and every agent's transcript, groups a fan-out's user message once,
-  carries failed and cancelled outcome markers, and opens projects the desktop hasn't loaded.
-- `ConversationCache` — the merged conversation per subscribed project, reused across pages and
-  invalidated when `project_session_fingerprints_impl` reports a change. The loader re-parses
-  every session file, so paging must not call it per page.
-- `TranscriptWindow` — a pure function over `ProjectConversation` producing the window and
-  `next_before`. It lives beside `merge_project_conversation`.
+- **Projects.** `list_projects_impl`, plus a `status` per project: `busy` when any of its agents
+  has work in the dispatcher (`Dispatcher::has_pending_work`, which covers a running turn, a
+  queued backlog, and post-terminal enrichment) or `AppState.workflow_runs` holds a run for it.
+  A project the desktop has not loaded has no registered agents and no run, so it is `idle`.
+- **Agents.** `list_project_agents_readonly_impl`, which lists a roster without loading or
+  locking the project (the desktop's cross-project pickers use it), not `list_agents_impl`,
+  which fails with `ProjectNotLoaded`. `busy` comes from `Dispatcher::running_turn_kind`.
+- **Conversation.** `load_project_conversation_impl` already merges the journal and every
+  agent's transcript, groups a fan-out's user message once, carries failed and cancelled outcome
+  markers, and opens projects the desktop hasn't loaded. `RemoteBackend::load_conversation`
+  wraps it in four steps, in this order:
+  1. The request handler takes `RemoteEmitter::snapshot(project)` **first**.
+  2. `ConversationCache` returns the merged conversation, re-reading only if its key changed.
+  3. **Disk copies of live turns are dropped.** A session file read mid-turn already holds part
+     of the running turn, and only Claude has a key to match it against the live copy; Codex
+     and Antigravity have none, which is why the desktop never re-reads them mid-session
+     (`HarnessKind::supports_refresh`). So the snapshot is the only source for a live turn.
+     Dropped: every disk `AgentTurn` whose agent has a live turn in the snapshot and whose
+     `started_at` is at or after that live turn's `started_at`; and every disk `AgentTurn`
+     whose `started_at` is after the snapshot's `taken_at`, because a turn that begins during
+     the read reaches the phone entirely as events above `through_seq`. One turn in flight per
+     agent is structural, so the first rule cannot catch an earlier turn.
+  4. `TranscriptWindow`, a pure function beside `merge_project_conversation`, cuts the window
+     and `next_before`. A tail load's reply adds the snapshot and its `through_seq`.
+
+  Taking the snapshot before the read is what makes a turn that ends during the read safe: its
+  disk copy is dropped, and its remaining events, including `turn_end`, are above
+  `through_seq`.
+- **`ConversationCache`.** The merged conversation per project, reused across pages because the
+  loader re-parses every session file. Its key is captured before each parse and compared on
+  every load: the journal's length and modification time, plus `fingerprint_of` over
+  `resolve_session_file` for **every** agent, with no `supports_refresh` gate. It is not
+  `project_session_fingerprints_impl`, which returns no fingerprint for Codex or Antigravity and
+  never looks at the journal, and so would miss a finished Codex turn, a new send, and an
+  outcome marker. Every one of those changes a file in the key, so no separate invalidation
+  signal is needed.
 
 **5.8 Sends from the phone.**
 
 - **Loading.** `send_message_impl`, `list_agents_impl`, and `lookup_agent` need the project in
-  `AppState.projects`, which only `open_project_impl` fills, and the desktop's `hydrateProject`
-  assumes no live turns exist at open. So the frontend does the loading: `ensure_project_loaded`
-  emits `remote_load_project { request_id, project_id }`; the frontend runs its load path
-  *without changing the selected project* and calls `remote_project_loaded(request_id, result)`;
-  the backend awaits that with a timeout that yields `project_load_timeout`. It never polls
-  `state.projects`, which fills before the frontend subscribes to agent channels. **Open:** if
-  the frontend's load is not separable from selection today, that split comes first (milestone
-  4 begins with it).
-- **Dispatch.** `Dispatcher::send_message` gains an `emit_user_message` parameter (today it is
-  hardcoded `false`, and the workflow path that sets it rejects busy agents). Phone sends pass
-  `true` with `OnBusy::Enqueue`.
-- **Origin.** `origin: keyboard | remote | workflow` is added to `JournalRecord::Send`,
-  `NormalizedEvent::UserMessage`, and `ConversationItem::UserMessage`, with
-  `#[serde(default)]` producing `keyboard` (the existing `attachments` field is the pattern).
-  The workflow send path sets `workflow`. Only `remote` renders a chip, so old lines that
-  default to `keyboard` change nothing visible. The chip survives reload because it is journaled.
+  `AppState.projects`, which only `open_project_impl` fills, and the desktop's first
+  `hydrateProject` assumes no live turns exist while it reads. So the frontend does the loading:
+  `ensure_project_loaded` emits `remote_load_project { request_id, project_id }`, the frontend
+  loads the project without selecting it, and calls `remote_project_loaded(request_id, result)`;
+  the backend awaits that for up to 10 seconds, which is inside the phone's 15-second send
+  timeout so the phone hears the Mac's answer before giving up, and then answers
+  `project_load_timeout`. The load keeps running, so a retry usually succeeds. It never polls
+  `state.projects`, which fills before the frontend subscribes to agent channels.
+- **Frontend load, precisely.** In `src/lib/state/workspace.svelte.ts`, `ensureProjectLoaded`
+  (whose only caller is `activateProject`, which handles selection separately) stops discarding
+  its hydration: `void hydrateProject(projectId)` becomes
+  `firstHydration.set(projectId, hydrateProject(projectId))`, in a module-level
+  `Map<ProjectId, Promise<HydrateOutcome>>`. A new exported `loadProjectForRemote(projectId)`
+  awaits `ensureProjectLoaded(projectId)`, then awaits `firstHydration.get(projectId)`, then
+  resolves. Calling `hydrateProject` again would not work: it is sticky through
+  `hydrationStarted` and returns `"skipped"` immediately. The `remote_load_project` handler
+  calls `loadProjectForRemote` and acknowledges `ok` once hydration has settled, whether it
+  completed or failed — a failed hydration leaves the desktop showing a load error, but no read
+  is still in flight, so dispatch is safe. If `ensureProjectLoaded` rejects (open, lock, or
+  roster failure), it acknowledges the error. A project the desktop loaded earlier
+  acknowledges immediately, because its stored promise has long settled. `firstHydration` is
+  cleared wherever `loadStarted` and `hydrationStarted` are: on project removal and on state
+  reset.
+- **Origin, end to end.** `WorkPayload::Send` drops its `emit_user_message` flag and gains
+  `origin: SendOrigin` (`Keyboard | Remote | Workflow`, defined in `crates/core` beside
+  `JournalRecord`). `Dispatcher::send_message` takes it (compose passes `Keyboard`, the phone
+  `Remote` with `OnBusy::Enqueue`); the two awaiting wrappers, which differed only by the flag,
+  become one that takes it (workflows pass `Workflow`). The actor hands it to
+  `JournalSink::record_send` and then **always** emits `user_message` carrying it — the journal
+  write is inside the actor, so the payload is the only way the origin can reach it.
+  `JournalRecord::Send`, `NormalizedEvent::UserMessage`, and `ConversationItem::UserMessage`
+  gain the field with `#[serde(default)]` producing `keyboard` (the existing `attachments`
+  field is the pattern), and `src/lib/types.ts` gains it on the `user_message` event and the
+  conversation item. Only `remote` renders a chip, so old lines that default to `keyboard`
+  change nothing visible, and the chip survives reload because it is journaled.
+  `user_message` carries no attachments, so a send with attachments shows its chips on the
+  other device only after a reload; accepted for the first version.
 - **Desktop sends reach the phone.** Compose sends also emit `user_message`. The desktop reducer's
   `user_message` branch becomes a no-op when a user turn with that `send_id` and agent already
-  exists, since compose's optimistic turn already rendered it.
+  exists, since compose's optimistic turn already rendered it. The dedupe depends on the
+  optimistic turn carrying its `send_id`: the production wrapper `dispatchUserTurn`
+  (`src/lib/state/index.svelte.ts`) already requires it, and `appendUserTurnImpl`'s `sendId`
+  parameter (`src/lib/state/reducers.ts`) changes from optional to required so no future caller
+  can omit it.
 - **No Mac notification** for phone sends: they are never registered with
   `sendCompletion`, which registers compose sends with their recipients before any IPC call.
 
@@ -374,37 +502,55 @@ It forwards everything unchanged, then:
 - **Launch at login** — a Settings row backed by Tauri's autostart plugin, added with `cargo
   add` and `pnpm add`. Closing the window already hides it rather than quitting
   (`handle_macos_run_event`), so remote access survives a closed window; quitting or rebooting
-  ends it, and the Settings copy says so.
+  ends it, and the Settings copy says so. **Unverified:** the app holds no activity assertion
+  while idle (its sleep assertion exists only during turns), so macOS App Nap may throttle a
+  hidden window's webview and timers — and loading a project for a phone send runs in the
+  webview. M2 and M4 test this; if it fails, the app holds an `NSProcessInfo` activity while
+  remote access is enabled.
 
 **5.10 Frontend (Svelte).**
 
 - Settings → Remote access: `Switch` to enable; connection status; launch-at-login and
-  keep-awake rows; paired devices with last seen and **Revoke**.
+  keep-awake rows; paired devices with "connected" or the last disconnect time since launch
+  (from `SessionManager`), and **Revoke**.
 - Pairing modal: QR (`qrcode` package → SVG), 5-minute countdown, then the confirmation code
   with **Confirm** / **Decline** and the phone's reported name.
-- The `remote_load_project` handler (§5.8).
+- The `remote_load_project` handler and `loadProjectForRemote` (§5.8).
 - Transcript: an "iPhone" chip on user messages whose `origin` is `remote`, live and after reload.
 - The `user_message` reducer de-duplication (§5.8).
 
 **5.11 Tests**
 
 - Unit: registry read/write; `TranscriptWindow` (fan-out yields one user row, outcome markers
-  appear in their window, cursor past the end is empty, keyless-turn fallback); `SendLedger`
-  bounds; `WakeLease` toggling with the fake inhibitor and fake `PowerSource`, including revoking
-  the last device while a turn holds its own lease.
-- Fixture-driven: `RequestHandler` against the mock backend (recipient validation, idempotent
-  repeat, concurrent repeat, partial fan-out rejection, cancel with recorded recipients);
-  `RemoteEmitter` with `RecordingEmitter` (allowlist, subscription isolation, live-turn
-  snapshot mid-turn and cleared at `turn_end`, a stalled phone channel does not block emit);
-  second page served from cache (count loader calls with a stub); paging across a fingerprint
-  change; protocol fixtures.
+  appear in their window, cursor past the end is empty, keyless-turn fallback); the live-turn
+  drop rule, with one fixture per harness (Claude, Codex, Antigravity) of a session file read
+  mid-turn — the window holds no disk agent turn for the live turn and keeps the earlier ones —
+  and a turn that started after `taken_at`; the cache key changes on a journal append and on a
+  Codex or Antigravity session-file change; `SendLedger` bounds; `WakeLease` toggling with the
+  fake inhibitor and fake `PowerSource`, including revoking the last device while a turn holds
+  its own lease.
+- Fixture-driven: `RequestHandler` against the mock backend (a send calls
+  `ensure_project_loaded` before validating recipients, an unknown recipient dispatches
+  nothing, idempotent repeat, concurrent repeat, partial fan-out rejection, a request-level
+  error is retryable); `RemoteEmitter` with `RecordingEmitter` (allowlist, subscription
+  isolation, `seq` contiguous per project, a snapshot's `through_seq` equals the last `seq`
+  assigned, the buffer cleared at each terminal, a full device queue drops without blocking
+  emit); second page served from cache (count loader calls with a stub); `send_receipt` after a
+  simulated restart reads the named project's journal; `list_agents` and `list_projects` for a
+  project the desktop has not loaded; protocol fixtures.
 - Integration (in-process relay, real local WebSocket): pair with confirmation → connect →
   subscribe → load → send → events → revoke mid-session → next frame refused; restart either
-  endpoint and reconnect; replay a connection-1 frame into connection 2; a second device with
-  the same pairing token refused; a pending candidate's `send_message` refused; unloaded-project
-  send waits for the frontend acknowledgement; acknowledgement timeout; `project_locked`.
-- Frontend: the load handler loads without changing selection and reports failure; compose send
-  plus its echoed `user_message` renders one row; old journal lines without `origin` parse.
+  endpoint and reconnect; **restart the relay** — the Mac re-registers, resends
+  `paired_devices`, and the phone reconnects without re-pairing; replay a connection-1 frame
+  into connection 2; a second device with the same pairing token refused; a pending candidate's
+  `send_message` refused; unloaded-project send waits for the frontend acknowledgement;
+  acknowledgement timeout; `project_locked`.
+- Frontend: the load handler loads without changing selection; the acknowledgement is not sent
+  until the first hydration has settled (hold the hydrate's `api` call open and assert no
+  acknowledgement); a failed hydration still acknowledges `ok`; an open failure acknowledges the
+  error; an already-loaded project acknowledges immediately; removing a project clears its
+  `firstHydration` entry; compose send plus its echoed `user_message` renders one row; a
+  workflow send still renders one row; old journal lines without `origin` parse.
 
 ## 6. Relay server — `crates/relay/` (separate binary)
 
@@ -418,12 +564,15 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   map, so a relay restart gives an impostor nothing.
 - **Session table**: in memory, `device_id → sender`. A new registration for an id replaces the
   stale socket. A restart makes everyone reconnect.
-- **Forwarding**: forward a pair's frames verbatim and in order. If `to` is not connected,
-  reply `error { mac_offline | phone_offline }`, with `last_seen` for a Mac. Nothing is queued.
-- **Pair scoping**: a phone may address a Mac only if that Mac announced it with `pair_added`
-  (and not since `pair_revoked`), or if its frame carries a token matching an open
-  `pairing_open` from that Mac. A token is bound to the first device presenting it and cleared
-  on expiry, first confirmation, or the Mac's disconnect.
+- **Forwarding**: stamp `from` with the sender's registered id, then forward a pair's records
+  unchanged and in order. If `to` is not connected, reply
+  `error { mac_offline | phone_offline }`, with `last_seen` for a Mac. Nothing is queued.
+- **Pair scoping**: a phone may address a Mac only if it is in that Mac's current
+  `paired_devices` set, or if its frame carries a token matching an open `pairing_open` from
+  that Mac. The Mac sends the full set after every registration and whenever it changes, and
+  the relay replaces what it held — so a relay restart loses nothing: the set arrives again
+  when the Mac reconnects. A token is bound to the first device presenting it and cleared on
+  expiry, first confirmation, or the Mac's disconnect.
 - **Last seen**: per Mac id, the time of its last disconnect, in memory; documented as
   observational and absent after a relay restart.
 - **Limits from day one**: per-device message rate, `MAX_FRAME_BYTES`, idle timeout,
@@ -432,8 +581,9 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   frames. Frame contents are never logged.
 - **Deployment** of the shared pilot instance is a separately approved action, not part of a
   PR.
-- **Tests**: forward and ordering; offline error with `last_seen`; wrong signature refused;
-  impostor refused after a restart; unannounced phone refused; token forwarding, expiry, and
+- **Tests**: forward and ordering; a client-supplied `from` is overwritten; offline error with
+  `last_seen`; wrong signature refused; impostor refused after a restart; a phone outside the
+  set refused; a new `paired_devices` set replaces the old one; token forwarding, expiry, and
   second-device refusal; rate and frame limits; reconnect replaces the stale session; the
   container builds and answers `/healthz` locally.
 
@@ -453,6 +603,13 @@ though the phone cannot send attachments.
 - `RelayTransport` — `URLSessionWebSocketTask`; registration signs the relay challenge through
   the binding; backoff; disconnects after a grace period in the background, reconnects on
   foreground.
+- **Local relay in development.** iOS App Transport Security blocks plain `ws://`, and iOS asks
+  for Local Network permission before reaching a device on the LAN. The **Debug** build
+  configuration's Info.plist carries `NSAppTransportSecurity` → `NSAllowsLocalNetworking = YES`
+  and an `NSLocalNetworkUsageDescription`, and the dev relay URL uses the Mac's `.local`
+  hostname (`ws://<mac-name>.local:<port>`). The **Release** configuration, which TestFlight
+  builds use, carries neither and accepts only `wss://`. A test asserts the Release Info.plist
+  has no ATS exception.
 - `SecureSession` — wraps the binding's `Session`: runs `KK` on every connection, seals and
   opens records, reassembles fragments.
 - `LiveRequestBroker` — matches responses by `id`; a 15-second timeout on `send_message` yields
@@ -471,13 +628,16 @@ though the phone cannot send attachments.
 **7.4 `Stores/`**
 
 - `ConnectionStore` — `connected | relayUnreachable | macOffline(lastSeen?) | notPaired`.
-- `ProjectsStore` — `list_projects`, archived hidden by default with a toggle; per-project
-  `project_status`; reacts to `project_list_changed`.
-- `TranscriptReducer` — pure: layers live events over the Mac's merged window and live-turn
-  snapshot. Overlapping snapshot and live chunks are de-duplicated; a terminal event for an
-  unknown turn is ignored; a `user_message` already present by `send_id` and agent is a no-op.
-- `TranscriptStore` — coordinator. Order on open, reconnect, and foreground: **subscribe, then
-  `load_conversation`, then reconcile**. Pages backward with `next_before`.
+- `ProjectsStore` — `list_projects`, which carries each project's status; archived hidden by
+  default with a toggle. Refreshes on open, on return to the foreground, and on pull-to-refresh.
+- `TranscriptReducer` — pure. A tail load **replaces** the project's live state with the reply's
+  window and snapshot; events are then applied only when their `seq` is above the reply's
+  `through_seq`. A terminal event for an unknown turn is ignored; a `user_message` already
+  present by `send_id` and agent is a no-op.
+- `TranscriptStore` — coordinator. Order on open, reconnect, and foreground: **subscribe, buffer
+  what arrives, `load_conversation`, then apply the buffer through the reducer**. A gap in `seq`
+  triggers a tail reload. Pages backward with `next_before`; an older page touches no live
+  state.
 - `RecipientSelection` — one-agent projects preselect that agent; otherwise the user picks and
   may pick several. Remembers the last recipient set per project and drops agents that no
   longer exist.
@@ -506,13 +666,15 @@ though the phone cannot send attachments.
 **7.6 Tests**
 
 - Unit: `Protocol/` against the shared fixtures, including an unknown future event and history
-  with attachments; `TranscriptReducer` (snapshot plus overlapping chunks, duplicate
-  `user_message`, terminal event for an unknown turn); `RecipientSelection` (zero, one, many
-  agents; remembered agent deleted); `SendGate` (cancelled, failed, biometrics unavailable,
-  edit during authentication).
-- Coordinator: `TranscriptStore` with a stub broker — events before the load reply resolves,
-  reconnect during a load, suspend mid-turn and miss `turn_end`, the Mac restarting mid-session;
-  `send_message` timeout resolved by receipt; partial fan-out failure.
+  with attachments; `TranscriptReducer` (buffered events at or below `through_seq` dropped and
+  those above applied, a turn that started after the snapshot applied from its `turn_start`,
+  duplicate `user_message`, terminal event for an unknown turn); `RecipientSelection` (zero,
+  one, many agents; remembered agent deleted); `SendGate` (cancelled, failed, biometrics
+  unavailable, edit during authentication).
+- Coordinator: `TranscriptStore` with a stub broker — events before the load reply resolves, a
+  `seq` gap triggering a reload, reconnect during a load, suspend mid-turn and miss `turn_end`,
+  the Mac restarting mid-session; `send_message` timeout resolved by receipt; partial fan-out
+  failure.
 - UI: XCTest pair → projects → transcript → send against the in-memory transport.
 - Physical device: pairing and a send on a real iPhone are part of the definition of done; a
   simulator pass is not evidence that signing or distribution works.
@@ -534,13 +696,18 @@ no App Group or push entitlements until then.
   cadence of at least one build per quarter keeps the app usable.
 - **Docs.** `docs/system-design.md` gains Remote access (the §2 threat model, what the relay can
   and cannot see, what the Mac enforces, the window-hide and quit behaviour). README gains the
-  §2 disclosure.
+  §2 disclosure. `AGENTS.md` gains the three crates in its architecture overview (each in the
+  milestone that creates it), `remote_devices.jsonl` in its filesystem layout, and a corrected
+  `make check` line: once `check-ios` is its own CI job, `make check` is no longer everything
+  CI runs.
 - **Not in the first version.** Approvals; attachments (sending); model or effort changes;
   creating agents or projects; workflows; forwarding; saved prompts; queuing while the Mac is
-  offline; more than one Mac per phone; push notifications.
+  offline; more than one Mac per phone; push notifications; cancelling a queued send from the
+  phone; a project list that updates without a refresh; attachment chips on a user message
+  that arrived live from the other device.
 - **First follow-up.** Queued sends visible and cancellable on both devices: a `send_accepted`
-  event at enqueue, queued sends included in the live-turn snapshot, recipients tracked per
-  send.
+  event at enqueue, queued sends included in the live snapshot, recipients tracked per send,
+  and a `cancel_send` request.
 
 ## 9. Milestones
 
@@ -559,28 +726,34 @@ Proving the build first matters because everything after depends on it.
 confirmation (§5.9–5.10, minus keep-awake and launch at login); the iOS pairing flow and
 Keychain storage (§7.3); the protocol fixtures and `make protocol-fixtures`.
 *Done when:* the in-process integration test covers pair → confirm → connect → revoke mid-session,
-restart either side, cross-connection replay, and token misuse; and a real iPhone pairs with a
-dev build through a locally run relay.
+restart either side, restart the relay, cross-connection replay, and token misuse; a real iPhone
+pairs with a dev build through a locally run relay (Debug configuration, §7.2); and with the
+Mac's window closed for 30 minutes the relay connection is still up and the phone still
+connects. If that last check fails, the app holds an `NSProcessInfo` activity while remote
+access is enabled, and the check is repeated.
 *Review:* the pairing confirmation flow, `DeviceRegistry`, `SessionManager`, Swift key storage.
 
 **M3 — Read and sync.**
-`load_conversation` with `ConversationCache`, `TranscriptWindow`, and stable cursors (§5.7);
-`RemoteEmitter` with the allowlist and live-turn snapshot (§5.6); subscriptions; the iOS
-projects and transcript screens, read-only, with subscribe-load-reconcile (§7.4–7.5); the relay
-`last_seen` and the offline banner.
-*Done when:* the reducer and coordinator race tests pass and, on a real iPhone, opening a project
-mid-turn shows the reply so far and backgrounding mid-turn then returning shows the finished
-turn.
+The listings, `load_conversation` with snapshot-first ordering, the live-turn drop rule,
+`ConversationCache` with its own key, `TranscriptWindow`, and stable cursors (§5.7);
+`RemoteEmitter` with the allowlist, `seq`, and the live snapshot (§5.6); subscriptions; the iOS
+projects and transcript screens, read-only, with subscribe-buffer-load-apply (§7.4–7.5); the
+relay `last_seen` and the offline banner.
+*Done when:* the per-harness drop-rule fixtures and the reducer and coordinator race tests pass;
+and on a real iPhone, for a project the desktop has not opened, the agent list appears, opening
+it mid-turn shows the running reply exactly once for a Claude agent and for a Codex agent, and
+backgrounding mid-turn then returning shows the finished turn once.
 *Review:* the event allowlist (what leaves the Mac).
 
 **M4 — Send and cancel.**
-Begins with the frontend spike: make project loading separable from selection if it is not
-already. Then `remote_load_project` (§5.8), `SendLedger` and receipts (§5.5), the dispatcher's
-`emit_user_message` parameter, `origin` through journal, events, and conversation, the desktop
-reducer de-duplication, `SendGate`, recipient defaults, error display, cancel.
+`loadProjectForRemote` and the retained first-hydration promise, then `remote_load_project`
+(§5.8), `SendLedger` and receipts (§5.5), `SendOrigin` through the dispatcher, journal, events,
+conversation, and `types.ts`, the desktop reducer de-duplication with the required `sendId`,
+`SendGate`, recipient defaults, error display, `cancel_turn`.
 *Done when:* integration and frontend tests in §5.11 for sends pass; on a real iPhone, a send to
 a project the desktop hasn't opened succeeds, shows the iPhone chip on the Mac live and after
-relaunch, and a desktop send appears on the phone.
+relaunch, and a desktop send appears on the phone; and the same send succeeds after the Mac's
+window has been closed for 30 minutes.
 *Review:* `SendGate`'s binding of the approval to the request.
 
 **M5 — Distribution and operation.**

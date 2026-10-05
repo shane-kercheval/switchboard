@@ -45,14 +45,14 @@ cd switchboard
 
 - **Xcode Command Line Tools** — `xcode-select --install`
 - **Rust** — install [rustup](https://rustup.rs); the pinned toolchain auto-installs on the first build. **After installing, restart your terminal** (or run `source "$HOME/.cargo/env"`) so `cargo` is on your `PATH` — otherwise the build fails with `cargo metadata ... No such file or directory`.
-- **Node** — version **22 or newer**. Use whatever you already have, or install one via [nvm](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), Homebrew, etc. (You don't need a specific patch version — `make install` checks for the minimum and stops with a clear message if it's too old. Contributors: [`.nvmrc`](./.nvmrc) pins the exact version CI runs, picked up with `nvm use`; that exact pin isn't required just to build the app.)
-- **pnpm** — run `corepack enable`. Corepack ships with Node and provides the pnpm version pinned in [`package.json`](./package.json); you do **not** install pnpm separately.
+- **Node** — version **22 or newer**; CI runs the version pinned in [`.nvmrc`](./.nvmrc) (currently 26). Use whatever you already have, or install one via Homebrew, [nvm](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), etc. (You don't need a specific patch version — `make install` checks for the minimum and stops with a clear message if it's too old. Contributors: the `.nvmrc` pin is what CI runs, picked up with `nvm use`; that exact pin isn't required just to build the app.)
+- **pnpm** — the version pinned by `packageManager` in [`package.json`](./package.json). Install it with `brew install pnpm` or `npm install -g pnpm@<that version>`. (On Node 24 or older, `corepack enable` also works; Node 25 stopped shipping Corepack.)
 
 Confirm the toolchain resolves before continuing:
 
 ```sh
 node --version   # 22 or newer
-pnpm --version   # Corepack provides the pinned version on first pnpm call
+pnpm --version   # should match `packageManager` in package.json
 ```
 
 **3. Build, install, and launch:**
@@ -178,7 +178,7 @@ The architectural decisions, functional requirements, and open questions are bei
 
 ## Local development
 
-macOS only for v1. The build prerequisites are the same as [Install](#install) above — Xcode Command Line Tools, Rust (rustup), Node (pinned in [`.nvmrc`](./.nvmrc)), and pnpm (`corepack enable`). If you've installed the app, you already have everything.
+macOS only for v1. The build prerequisites are the same as [Install](#install) above — Xcode Command Line Tools, Rust (rustup), Node (pinned in [`.nvmrc`](./.nvmrc)), and pnpm (the version in `package.json`'s `packageManager`). If you've installed the app, you already have everything.
 
 Common commands (run from the repo root):
 

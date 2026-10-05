@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 9 · **Created:** 2026-09-29 · **Revised:** 2026-10-05
+**Status:** proposed · **Revision:** 10 · **Created:** 2026-09-29 · **Revised:** 2026-10-05
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -16,6 +16,11 @@ beside `crates/`, so the protocol fixtures and the shared Rust cryptography are 
 
 ## Changelog
 
+- **Revision 10 (2026-10-05)** — seventh review, verdict GO (one minor).
+  - Finding 1: **Reset remote identity** revokes every device before it disables remote
+    access. Disabling drops the relay connection, so in the old order the relay never got
+    the empty set and kept answering the old phones `mac_offline` instead of `not_paired`
+    (§5.9, §5.11).
 - **Revision 9 (2026-10-05)** — sixth review, verdict SIMPLIFY (one major, two minor).
   - Finding 1: the relay answers `not_paired` only when it holds a set for the Mac and the
     phone is not in it. With no set held, which is every Mac's state after a relay restart
@@ -685,9 +690,15 @@ It forwards everything unchanged, then:
   Dropping the lease never affects leases held by running turns or workflows. Settings copy:
   this prevents idle sleep, not lid-close sleep (except on AC with an external display), and
   the phone cannot wake a sleeping Mac.
-- **Reset remote identity** — a Settings action, behind a confirmation dialog. It disables
-  remote access, revokes every device, and deletes both Mac keys through `KeyStore::delete`.
-  Enabling again generates new keys and a new device id, so every phone must pair again.
+- **Reset remote identity** — a Settings action, behind a confirmation dialog. In this order,
+  it revokes every device, which ends their sessions and sends the relay an empty
+  `paired_devices` set (§5.3); then disables remote access; then deletes both Mac keys
+  through `KeyStore::delete`. The order matters: disabling drops the relay connection, and
+  the relay keeps the old id's set while the Mac is disconnected (§6). Emptying the set
+  first is what lets the relay answer the old phones `not_paired`, so they offer pairing
+  again. If the relay is unreachable when the reset runs, the empty set cannot be sent, and
+  those phones show "Mac offline" until they are paired again. Enabling again generates new
+  keys and a new device id, so every phone must pair again.
 - **Launch at login** — a Settings row backed by Tauri's autostart plugin, added with `cargo
   add` and `pnpm add`. The plugin is registered with a `--hidden` argument, and setup leaves
   the main window hidden when that argument is present, which is the closed-window state
@@ -729,7 +740,8 @@ It forwards everything unchanged, then:
   project; `SendLedger` bounds; `WakeLease` toggling with the
   fake inhibitor and fake `PowerSource`, including revoking the last device while a turn holds
   its own lease, and a connected session holding the lease on battery with the preference off;
-  reset identity deletes both keys and revokes every row.
+  reset identity revokes every row and sends the empty set before the connection is
+  dropped, then deletes both keys.
 - Fixture-driven: `RequestHandler` against the mock backend (a send calls
   `ensure_project_loaded` before validating recipients, an unknown recipient dispatches
   nothing, idempotent repeat, concurrent repeat, partial fan-out rejection, a request-level
@@ -751,17 +763,18 @@ It forwards everything unchanged, then:
   endpoint and reconnect; **restart the relay** — the phone reconnects first and is answered
   `mac_offline`, not `not_paired`; then the Mac re-registers, resends `paired_devices`, and
   the phone connects without re-pairing; with two phones connected, `phone_offline` for one
-  ends only that phone's session; replay a connection-1 frame
-  into connection 2; a second device with the same pairing token refused; a wrong typed code
-  writes no row and a third wrong code kills the token; a pending candidate's
-  `send_message` discarded with nothing dispatched; a client that stops answering pings is reconnected; the phone's
-  connection closes and the Mac's session, its subscriptions, and the connected-session wake
-  lease are all released; the Mac's relay connection drops and the phone receives
-  `peer_disconnected`, then reconnects with a new handshake; the phone reconnects while its
-  old socket is still open on the relay, the old socket then closes, and the new session
-  keeps delivering events; removing an agent whose turn has
-  ended but not idled leaves no snapshot entry; unloaded-project send waits for the frontend
-  acknowledgement; acknowledgement timeout; `project_locked`.
+  ends only that phone's session; after a reset of the Mac's identity, a previously paired
+  phone is answered `not_paired`; replay a connection-1 frame into connection 2; a second
+  device with the same pairing token refused; a wrong typed code writes no row and a third
+  wrong code kills the token; a pending candidate's `send_message` discarded with nothing
+  dispatched; a client that stops answering pings is reconnected; the phone's connection
+  closes and the Mac's session, its subscriptions, and the connected-session wake lease are
+  all released; the Mac's relay connection drops and the phone receives `peer_disconnected`,
+  then reconnects with a new handshake; the phone reconnects while its old socket is still
+  open on the relay, the old socket then closes, and the new session keeps delivering
+  events; removing an agent whose turn has ended but not idled leaves no snapshot entry;
+  unloaded-project send waits for the frontend acknowledgement; acknowledgement timeout;
+  `project_locked`.
 - Frontend: the load handler loads without changing selection; the acknowledgement is not sent
   until the first hydration has settled (hold the hydrate's `api` call open and assert no
   acknowledgement); a retry after a failed first hydration delays the acknowledgement until the
@@ -808,8 +821,8 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   `not_paired`. If the relay holds no set, the answer is `mac_offline` without `last_seen`,
   the same as for any Mac it does not know: after a relay restart, a paired phone that
   reconnects before its Mac is told the Mac is offline, not that it is unpaired. Neither
-  answer says whether the Mac is connected. A token is bound to the first device presenting it and cleared on
-  expiry, first confirmation, or the Mac's disconnect.
+  answer says whether the Mac is connected. A token is bound to the first device presenting
+  it and cleared on expiry, first confirmation, or the Mac's disconnect.
 - **Peer notices**: the relay sends `peer_disconnected { device_id }` **exactly once for each
   registration that ends**, to every connected device paired with it: to the Mac for a phone,
   and to each connected phone in the Mac's set for a Mac. A registration ends when a newer
@@ -962,8 +975,7 @@ though the phone cannot send attachments.
   mid-session, signalled by `peer_disconnected` with no request in flight; a connection that
   drops in the background is not reopened until foreground; `not_paired` keeps the keys and
   keeps retrying, and a later answered handshake restores `connected`; `send_message` timeout
-  resolved
-  by receipt; partial fan-out failure.
+  resolved by receipt; partial fan-out failure.
 - UI: XCTest pair → projects → transcript → send against the in-memory transport.
 - Physical device: pairing and a send on a real iPhone are part of the definition of done; a
   simulator pass is not evidence that signing or distribution works.

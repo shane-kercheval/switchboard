@@ -688,6 +688,48 @@ describe("claudeRateLimitView on an overage turn", () => {
     expect(view?.windows.find((w) => w.key === "seven_day")?.limitReached).toBe(true);
     expect(view?.overage).toBeNull();
   });
+
+  it("keeps a retained paid window flagged after an ungated turn drops the escalation", () => {
+    // **Pins current behavior on an unresolved question (harness-behavior.md
+    // G37), so a later change to it is deliberate.** An Opus turn is billed on
+    // its model-gated cap; a Sonnet turn then reports no overage and never
+    // touches that cap. The cap stays flagged (its own context says
+    // `rejected`) and the escalation, read from the newest reading only, goes
+    // away. That is truthful if `isUsingOverage` describes the turn that
+    // reported it — the Sonnet turn was not billed — and wrong if it describes
+    // the account, which no capture can settle while overage is disabled on
+    // the development org. A red bar with no line claims the allowance is
+    // spent and nothing more; the README says so.
+    const opusOverage = {
+      status: "rejected",
+      rateLimitType: "seven_day_opus",
+      isUsingOverage: true,
+      overageResetsAt: future(6 * 86400),
+      unifiedWindows: {
+        five_hour: { utilization: 0.4, resetsAt: future(3600) },
+        seven_day_opus: { utilization: 1, resetsAt: future(5 * 86400) },
+      },
+    };
+    const sonnetLater = {
+      status: "allowed",
+      isUsingOverage: false,
+      unifiedWindows: { five_hour: { utilization: 0.41, resetsAt: future(3600) } },
+    };
+    const retained: Record<string, StoredUsageWindow> = {
+      ...claudeStoredWindows(opusOverage, {
+        model: "claude-opus-5-5",
+        observedAt: "2026-09-17T11:00:00.000Z",
+      }),
+      ...claudeStoredWindows(sonnetLater, {
+        model: "claude-sonnet-5",
+        observedAt: "2026-09-17T11:30:00.000Z",
+      }),
+    };
+    const view = claudeRateLimitView(sonnetLater, retained, NOW);
+    expect(view?.windows.find((w) => w.key === "seven_day_opus")?.limitReached).toBe(true);
+    expect(view?.windows.find((w) => w.key === "five_hour")?.limitReached).toBeUndefined();
+    expect(view?.overage).toBeNull();
+  });
 });
 
 describe("codexAccountUsageView credits escalation", () => {
@@ -756,6 +798,85 @@ describe("codexAccountUsageView credits escalation", () => {
     expect(read(false, { codex: { ...spentOnCredits, credits: "yes" } }).overage).toBeNull();
     expect(read(false, { codex: { ...spentOnCredits, credits: {} } }).overage).toBeNull();
   });
+
+  it("retires with the spent window once that window's reset has passed", () => {
+    // The bars drop on their reset; a line gated on the account flags alone
+    // outlived them, and a card redrawn from an old reading showed "using
+    // credits" under a healthy weekly bar. The reset does not prove included
+    // usage is back — it makes the old claim unsupported, same as the bar.
+    const cycled = { ...spentOnCredits, primary: window(100, 300, -60) };
+    const { windows, overage } = read(false, { codex: cycled });
+    expect(windows.map((w) => w.key)).toEqual(["codex:secondary"]);
+    expect(overage).toBeNull();
+  });
+
+  it("stays up for a spent window that reports no reset, as its bar does", () => {
+    const unreset = { ...spentOnCredits, primary: { usedPercent: 100, windowDurationMins: 300 } };
+    expect(read(false, { codex: unreset }).overage).toEqual({ resetsAtMs: null });
+  });
+
+  it("needs a spent window on screen, not merely blocked included usage", () => {
+    // Blocked below 100% is a state no plan has produced; if one does, the
+    // card makes no billing claim rather than a possibly false one.
+    const belowFull = { ...spentOnCredits, primary: window(99, 300) };
+    expect(read(false, { codex: belowFull }).overage).toBeNull();
+  });
+
+  it("reads credits and the spent window off the same quota", () => {
+    // A plan carrying two account-wide limits: one's credits must not vouch
+    // for the other's spent window.
+    const spentNoCredits = { ...spentOnCredits, limitId: "five_hour", credits: null };
+    const creditsNotSpent = {
+      ...ACCOUNT_BUCKET,
+      limitId: "weekly",
+      primary: window(41, 10080),
+      credits: { hasCredits: true, unlimited: false, balance: null },
+    };
+    expect(read(false, { five_hour: spentNoCredits, weekly: creditsNotSpent }).overage).toBeNull();
+    const creditsAndSpent = { ...creditsNotSpent, primary: window(100, 10080) };
+    expect(read(false, { five_hour: spentNoCredits, weekly: creditsAndSpent }).overage).toEqual({
+      resetsAtMs: null,
+    });
+  });
+
+  it.each([
+    "workspace_owner_credits_depleted",
+    "workspace_member_credits_depleted",
+    "workspace_owner_usage_limit_reached",
+    "workspace_member_usage_limit_reached",
+  ])("is vetoed by the %s reason code, which states paid work is refused", (code) => {
+    const { windows, overage } = read(false, {
+      codex: { ...spentOnCredits, rateLimitReachedType: code },
+    });
+    expect(overage).toBeNull();
+    // The veto reads the code as a veto and nothing else: the bars are untouched.
+    expect(windows.find((w) => w.key === "codex:primary")?.limitReached).toBe(true);
+  });
+
+  it.each([
+    ["rate_limit_reached", "rate_limit_reached"],
+    ["an unknown code", "some_future_value"],
+  ])("is not vetoed by %s", (_, code) => {
+    // `rate_limit_reached` is the included allowance being spent — the state
+    // the line describes — and the credits capture reports `null` there, so
+    // neither is evidence of refused paid work. Hiding a true billing warning
+    // is the harm this line exists to prevent; a false one is corrected by the
+    // user's next refused turn.
+    expect(
+      read(false, { codex: { ...spentOnCredits, rateLimitReachedType: code } }).overage,
+    ).toEqual({ resetsAtMs: null });
+  });
+
+  it("is vetoed by a reported spend control, and by nothing weaker", () => {
+    expect(
+      read(false, { codex: { ...spentOnCredits, spendControlReached: true } }).overage,
+    ).toBeNull();
+    for (const notReached of [false, null, undefined, "true"]) {
+      expect(
+        read(false, { codex: { ...spentOnCredits, spendControlReached: notReached } }).overage,
+      ).toEqual({ resetsAtMs: null });
+    }
+  });
 });
 
 describe("codexAccountUsageView against the recorded credits-covered response", () => {
@@ -783,6 +904,16 @@ describe("codexAccountUsageView against the recorded credits-covered response", 
 
   it("reports the credits escalation from the real bytes", () => {
     expect(codexAccountUsageView(captured, justBeforeReset).overage).toEqual({ resetsAtMs: null });
+  });
+
+  it("drops the escalation with the 5-hour bar once its reset has passed", () => {
+    // The same reading a minute after the reset, which is what a card redrawn
+    // before a fresh read sees: the weekly bar alone, and no billing claim the
+    // reading can no longer support.
+    const justAfterReset = (captured.rateLimitsByLimitId.codex!.primary.resetsAt + 60) * 1000;
+    const { windows, overage } = codexAccountUsageView(captured, justAfterReset);
+    expect(windows.map((w) => [w.key, w.limitReached])).toEqual([["codex:secondary", undefined]]);
+    expect(overage).toBeNull();
   });
 
   it("reports nothing unreadable", () => {

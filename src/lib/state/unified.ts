@@ -193,6 +193,36 @@ export type RenderBlock =
 export const INITIAL_WINDOW = 20;
 export const REVEAL_BATCH = 20;
 
+/// How many of the most recent sends open expanded in compact mode: the current
+/// one plus the two before it, so the exchange the user was just reading doesn't
+/// collapse the moment they send a follow-up.
+export const EXPANDED_RECENT_SENDS = 3;
+
+/// A send no recipient has started yet — queued everywhere it was sent.
+function isFullyPendingSend(row: Extract<UnifiedRow, { kind: "user" }>): boolean {
+  return row.pending_agent_ids.length === row.agent_ids.length;
+}
+
+/// Index of the first block in the recent-sends range: the block holding the
+/// oldest of the last `count` started sends, or `blocks.length` (an empty range)
+/// when nothing has started. The range is positional — every block from there to
+/// the end, whichever send it belongs to. A send no recipient has started is not
+/// counted, so queuing follow-ups doesn't push the exchange being read out of
+/// range.
+export function recentSendsStartIndex(blocks: RenderBlock[], count: number): number {
+  let start = blocks.length;
+  let seen = 0;
+  for (let i = blocks.length - 1; i >= 0 && seen < count; i -= 1) {
+    const block = blocks[i]!;
+    const user =
+      block.kind === "fanout" ? block.user : block.row.kind === "user" ? block.row : null;
+    if (user === null || isFullyPendingSend(user)) continue;
+    seen += 1;
+    start = i;
+  }
+  return start;
+}
+
 /// One accepted-but-unstarted compaction, as the caller reads it off an agent's
 /// pending-send list.
 export type QueuedCompaction = {
@@ -497,8 +527,7 @@ export function buildUnifiedRows(
   const anchorOf = (row: UnifiedRow): string =>
     (row.send_id !== undefined ? sendAnchor.get(row.send_id) : undefined) ?? row.at;
   const isPending = (row: UnifiedRow): boolean =>
-    row.kind === "queued_compaction" ||
-    (row.kind === "user" && row.pending_agent_ids.length === row.agent_ids.length);
+    row.kind === "queued_compaction" || (row.kind === "user" && isFullyPendingSend(row));
   // Where a row counts as started work: a user row only on the recipients that
   // have started it (a waiting recipient takes it into the queue pass instead).
   const startedAgentsOf = (row: UnifiedRow): readonly AgentId[] => {

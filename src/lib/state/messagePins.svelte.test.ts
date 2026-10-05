@@ -79,6 +79,19 @@ beforeEach(() => {
   invokeMock.mockClear();
 });
 
+describe("identityPinnedBy", () => {
+  it("matches a pin stored under an alias as well as under the canonical key", () => {
+    // A reply pinned while streaming is stored under its send alias until it
+    // migrates to the durable hydration key; both must read as pinned.
+    const reply = identity("agent:hydration:a:hk", ["agent:send:s:a"]);
+    const pinned = (keys: string[]) => (key: string) => keys.includes(key);
+
+    expect(pins.identityPinnedBy(reply, pinned(["agent:hydration:a:hk"]))).toBe(true);
+    expect(pins.identityPinnedBy(reply, pinned(["agent:send:s:a"]))).toBe(true);
+    expect(pins.identityPinnedBy(reply, pinned(["agent:send:other:a"]))).toBe(false);
+  });
+});
+
 describe("message pins state", () => {
   it("removes a batch of stored pins once without touching other pins", async () => {
     persisted = [

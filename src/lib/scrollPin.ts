@@ -123,6 +123,11 @@ export interface PinTracker {
   /// correction (the pre-sample that keeps a chunk's follow-write from
   /// erasing the movement a pending `scroll` event is about to report).
   readonly gesturePending: boolean;
+  /// How far the most recent `onScrollEvent` sample moved from the baseline it
+  /// was measured against (signed like `scrollTop`). Lets a caller that defers
+  /// its own bookkeeping for a moment account for movement it declined to act
+  /// on, without keeping a second copy of the baseline.
+  readonly lastSampleDelta: number;
   /// Classify a scroll sample. `source` is REQUIRED and not defaulted: only
   /// `"scroll"` (the scroller's own `scroll` listener) ages input evidence,
   /// because only that is coalesced to one per rendering update. `"pass"` is
@@ -173,6 +178,7 @@ export const GESTURE_GRACE = 2;
 export function createPinTracker(): PinTracker {
   let pinned = true;
   let lastTop = 0;
+  let lastSampleDelta = 0;
   let lastMax = 0;
   // Net signed input awaiting attribution; sign is matched against movement.
   let gesture = 0;
@@ -216,10 +222,14 @@ export function createPinTracker(): PinTracker {
     get gesturePending(): boolean {
       return pendingGesture;
     },
+    get lastSampleDelta(): number {
+      return lastSampleDelta;
+    },
     onScrollEvent(g: ScrollGeometry, source: SampleSource): ScrollAttribution {
       const max = g.scrollHeight - g.clientHeight;
       const gap = max - g.scrollTop;
       const delta = g.scrollTop - lastTop;
+      lastSampleDelta = delta;
       // The bottom as of the previous baseline — the one the user was moving
       // toward if content grew under the gesture. Negative means the view
       // landed far past it, which only the engine does.

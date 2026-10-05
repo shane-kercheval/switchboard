@@ -11,6 +11,7 @@ vi.mock("$lib/native", () => ({ copyText: vi.fn(async () => undefined) }));
 import { mountTranscript } from "./mount";
 import { registerAgent, seedTurns, resetState, userScrollTo } from "./harness";
 import { ALICE, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
+import { setManyOverrides } from "$lib/state/transcriptPreview.svelte";
 
 // Behavior 7: expanding a mid-list message keeps its footer anchored on screen —
 // the "the place I clicked stays put" contract. Expanding grows content ABOVE the
@@ -29,9 +30,10 @@ beforeEach(() => {
 test("expanding a mid-list message keeps its toggle anchored on screen", async () => {
   await registerAgent(ALICE);
   // A long (clipped → toggled) user message at the top, with a tall response
-  // below it so the message is mid-list and the transcript scrolls. The latest
-  // agent response renders as the full latest-response view (no toggle of its own),
-  // so the user message owns the only toggle.
+  // below it so the message is mid-list and the transcript scrolls. The message
+  // is in the recent-sends range (expanded by default), so it starts explicitly
+  // collapsed; padding sends would instead add toggles of their own below it.
+  // The long response has its own Collapse toggle, so the lookup is scoped.
   seedTurns(ALICE.id, [
     userTurn({ id: "user-1", agentId: ALICE.id, text: longText(30) }),
     agentTurn({
@@ -42,6 +44,8 @@ test("expanding a mid-list message keeps its toggle anchored on screen", async (
     }),
   ]);
 
+  setManyOverrides(PROJECT_ID, ["user:u:user-1"], true);
+
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
 
   // Scroll to the top so the user message and its footer are on screen, then
@@ -49,7 +53,8 @@ test("expanding a mid-list message keeps its toggle anchored on screen", async (
   await expect.poll(() => transcript().scrollHeight > transcript().clientHeight + 100).toBe(true);
   userScrollTo(transcript(), 0);
 
-  const toggle = page.getByTestId("turn-preview-toggle");
+  // The user message is the first turn.
+  const toggle = page.getByTestId("turn").first().getByTestId("turn-preview-toggle");
   await expect.element(toggle).toBeInTheDocument();
   const before = (toggle.element() as HTMLElement).getBoundingClientRect().top;
 

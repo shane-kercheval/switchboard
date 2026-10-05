@@ -85,6 +85,10 @@
 
   type Common = {
     side?: "top" | "bottom" | "left" | "right";
+    /// Position against this element instead of the trigger — for a trigger
+    /// that is only part of a larger card, so `side` clears the whole card
+    /// rather than landing on the card's other controls.
+    anchor?: HTMLElement | null;
     delayDuration?: number;
     skipDelayDuration?: number;
     disableHoverableContent?: boolean;
@@ -126,6 +130,7 @@
 
   let {
     side = "top",
+    anchor = null,
     delayDuration = 700,
     skipDelayDuration = 300,
     disableHoverableContent = true,
@@ -282,6 +287,7 @@
         <Bits.Content
           {side}
           sideOffset={6}
+          customAnchor={anchor}
           data-testid="tooltip-content"
           class={`bg-primary text-primary-fg z-50 rounded-lg px-2.5 py-1.5 shadow-[0_10px_28px_rgba(0,0,0,0.20)]${disableHoverableContent ? " pointer-events-none" : ""}`}
         >

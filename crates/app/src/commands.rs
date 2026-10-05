@@ -3434,6 +3434,54 @@ fn stage_attachment_io(
     })
 }
 
+/// Pure, synchronous staging I/O for pasted text: write `text` into
+/// `attachments_dir` as `<uuid>__<sanitized name>`. The sibling of
+/// [`stage_attachment_io`] for content that has no source file — a large paste
+/// the compose bar turns into an attachment, so the agent reads it from disk
+/// instead of receiving it as a command-line argument it may not fit in.
+fn stage_pasted_text_io(
+    attachments_dir: &Path,
+    name: &str,
+    text: &str,
+) -> Result<StagedAttachment, AppError> {
+    let stage_err = |source: std::io::Error| AppError::AttachmentStage {
+        source_path: name.to_owned(),
+        source,
+    };
+    std::fs::create_dir_all(attachments_dir).map_err(stage_err)?;
+    let original_name = sanitize_basename(name);
+    let dest = attachments_dir.join(format!("{}__{}", Uuid::now_v7(), original_name));
+    std::fs::write(&dest, text).map_err(stage_err)?;
+    Ok(StagedAttachment {
+        path: dest.to_string_lossy().into_owned(),
+        original_name,
+    })
+}
+
+/// Write pasted text into the project's `attachments/` dir as a file called
+/// `name` and return its staged absolute path. Same shape and blocking-pool
+/// discipline as [`stage_attachment_impl`]; the frontend names the file (so the
+/// chip reads `pasted-1.txt`) and assigns the label/kind from that name.
+pub async fn stage_pasted_text_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    name: String,
+    text: String,
+) -> Result<StagedAttachment, AppError> {
+    let project = match lock(&state.projects).get(&project_id).cloned() {
+        Some(loaded) => loaded,
+        None => open_project_from_store(state, project_id)?,
+    };
+    let attachments_dir = project.attachments_dir();
+    let name_display = name.clone();
+    tokio::task::spawn_blocking(move || stage_pasted_text_io(&attachments_dir, &name, &text))
+        .await
+        .map_err(|join_err| AppError::AttachmentStage {
+            source_path: name_display,
+            source: std::io::Error::other(join_err.to_string()),
+        })?
+}
+
 /// Copy a dropped file into the project's `attachments/` dir and return its
 /// staged absolute path. The copy runs in Rust (no frontend fs-plugin
 /// permission) **on the blocking pool**: a user can drop an arbitrarily large
@@ -16983,6 +17031,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_pasted_text_writes_the_text_under_the_project_dir() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
+        let text = "line one\nline two\n".repeat(1000);
+
+        let staged =
+            stage_pasted_text_impl(&state, project_id, "pasted-1.txt".to_owned(), text.clone())
+                .await
+                .unwrap();
+
+        let staged_path = Path::new(&staged.path);
+        assert!(staged_path.is_absolute(), "staged path is absolute");
+        assert_eq!(std::fs::read_to_string(staged_path).unwrap(), text);
+        assert_eq!(staged.original_name, "pasted-1.txt");
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        assert!(
+            staged_path.starts_with(project.attachments_dir()),
+            "staged under the project attachments dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_pasted_text_sanitizes_the_name_and_never_collides() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp);
+
+        let first = stage_pasted_text_impl(
+            &state,
+            project_id,
+            "../x/pasted.txt".to_owned(),
+            "a".to_owned(),
+        )
+        .await
+        .unwrap();
+        let second = stage_pasted_text_impl(
+            &state,
+            project_id,
+            "../x/pasted.txt".to_owned(),
+            "b".to_owned(),
+        )
+        .await
+        .unwrap();
+
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        assert_eq!(first.original_name, ".._x_pasted.txt");
+        assert!(Path::new(&first.path).starts_with(project.attachments_dir()));
+        assert_ne!(
+            first.path, second.path,
+            "same name stages to distinct files"
+        );
+        assert_eq!(std::fs::read_to_string(&first.path).unwrap(), "a");
+        assert_eq!(std::fs::read_to_string(&second.path).unwrap(), "b");
+    }
+
+    #[tokio::test]
     async fn stage_attachment_is_collision_safe_for_same_filename() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let (_agent, project_id) = project_with_agent(&state, &tmp);
@@ -24435,6 +24538,8 @@ mod tests {
 
     // --- Workflow commands ----------------------------------------------------
 
+    use crate::wake_lock::WakeLock;
+    use crate::wake_lock::test_support::{FakeInhibitor, ManualTimer};
     use crate::workflow_commands::{
         AvailabilityIssueKind, FormCompatibility, abandon_workflow_run_impl,
         cancel_workflow_run_impl, copy_builtin_workflow_impl,
@@ -24442,6 +24547,7 @@ mod tests {
         describe_workflow_form_impl, invoke_workflow_impl, list_workflow_runs_impl,
         list_workflows_impl, user_workflows_dir, validate_workflow_invocation_impl,
     };
+    use switchboard_harness::MockScenario;
     use switchboard_workflow::{InputValue, RunRecord, TerminalStatus};
 
     /// Write a user workflow file into the workspace's user-global workflows dir.
@@ -26088,6 +26194,106 @@ mod tests {
             !project.run_path(run_id).exists(),
             "a complete run file is pruned"
         );
+    }
+
+    #[tokio::test]
+    async fn a_workflow_run_holds_the_machine_awake_across_its_steps() {
+        // Every turn parks until signalled, so the test can hold the run with its
+        // second step in flight.
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let (tmp, state, emitter) =
+            fresh_state_with_scenario(MockScenario::CompletesOnSignal(Arc::clone(&signal)));
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let (inhibitor, timer) = (FakeInhibitor::default(), ManualTimer::default());
+        let state = state
+            .with_prompts(switchboard_prompts::PromptService::new(
+                tmp.path().join("config.yaml"),
+                prompts_dir,
+                None,
+                Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+            ))
+            .with_workflows_dir(tmp.path().join("workflows"))
+            .with_wake_lock(WakeLock::new(inhibitor.clone(), timer.clone()));
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        create_agent_impl(
+            &state,
+            "alice",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        seed_workflow(
+            &state,
+            "two-step",
+            "name: two-step\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - {label: First, send: {to: \"{{ a }}\", text: one}}\n  - {label: Wait, wait_for: {agent: \"{{ a }}\"}}\n  - {label: Second, send: {to: \"{{ a }}\", text: two}}\n",
+        );
+        state.prompts.sync().await;
+
+        let run_id = invoke_workflow_impl(
+            &state,
+            project.id,
+            "two-step",
+            false,
+            &inputs(vec![("a", text("alice"))]),
+            Path::new("/nonexistent-home"),
+        )
+        .unwrap();
+
+        // Held as soon as the run is accepted — before its task has even been
+        // polled on this single-threaded runtime — and not already on its way out.
+        assert!(lock(&inhibitor.state).engaged);
+        assert_eq!(timer.pending(), 0, "the hold must outlive acceptance");
+
+        // Finish the first step and let the run move on to the second.
+        within(
+            &emitter,
+            "first step",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        signal.notify_one();
+        within(
+            &emitter,
+            "second step",
+            emitter.wait_for_type("turn_start", 2),
+        )
+        .await;
+
+        // **This state's emitter doesn't feed the wake lock**, so turns hold
+        // nothing here and the run's lease is the only hold. That is what makes
+        // the checks below mean anything — a dropped lease would look identical
+        // to a held one if the open turn were holding the lock itself. Keep it
+        // that way.
+        //
+        // The run crossed a step boundary without going idle once, and the grace
+        // passing mid-run releases nothing.
+        assert_eq!(timer.pending(), 0, "no release across the step boundary");
+        timer.elapse();
+        assert!(
+            lock(&inhibitor.state).engaged,
+            "held while the second step runs"
+        );
+
+        signal.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !lock(&state.workflow_runs).contains_key(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("run did not terminalize");
+
+        assert_eq!(timer.pending(), 1, "released once the run has finished");
+        timer.elapse();
+        let s = lock(&inhibitor.state);
+        assert!(!s.engaged, "a finished run lets the machine sleep");
+        assert_eq!((s.engage_calls, s.release_calls), (1, 1));
     }
 
     #[tokio::test]

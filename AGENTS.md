@@ -43,7 +43,7 @@ All via `make`:
 - `make clean-stale` — deletes build artifacts nothing has touched in a week, keeping the warm cache. **Run this when builds start feeling slow** — see "Build times are a `target/` problem" below. Needs `cargo install cargo-sweep` once.
 - `make clean` — removes all build artifacts (forces a full rebuild).
 
-Prerequisites: see `README.md`. Rust toolchain pinned in `rust-toolchain.toml`; Node in `.nvmrc`; pnpm via `packageManager` in `package.json` (`corepack enable`).
+Prerequisites: see `README.md`. Rust toolchain pinned in `rust-toolchain.toml`; Node in `.nvmrc`; pnpm version in `packageManager` in `package.json` (install via Homebrew or `npm -g`; Corepack only on Node ≤ 24).
 
 ### Use the `make` targets — do not hand-roll `cargo` commands
 
@@ -173,7 +173,7 @@ Project-wide rules that apply across all milestones. Milestone-specific mechanic
 - **Harness registries (MCP servers, skills) are harness-owned, like transcripts.** They come from each harness's config files and skills directories (see system-design §9 for per-harness sources and the per-harness research docs in `docs/research/` for file shapes). Switchboard reads them as inputs; it does not maintain its own copies. Loader failures degrade to empty lists with a warning — these registries are display-only, not load-bearing for dispatch.
 - **Filesystem layout — Switchboard writes nothing into a working directory.** All Switchboard-owned state is user-global, in the OS-conventional config dir resolved via the `directories` crate (illustrative `~/.config/switchboard/` on Linux; `~/Library/Application Support/switchboard/` on macOS). A working directory holds the user's code and nothing of ours, so deleting or moving a checkout costs no project state. The old `<directory>/.switchboard/` layout is gone; `switchboard_core::paths` deliberately holds no constant for it so a read path cannot grow back, and a one-off tool (`crates/migrate`) is the only code that knows the shape.
 
-  Under the config dir: `store/` (the project store — the `projects.jsonl` index, where each row records the project's working directory, and `projects/<project-id>/{config.yaml, registry.jsonl, journal.jsonl, pins.jsonl, attachments/, sessions/, runs/, instance.lock}`), `locks/` (cross-process harness session locks — deliberately **not** dev-isolated, see `crates/app/src/session_lock.rs`), personal `config.yaml`, `prompts/`, `workflows/`, and `workspace.yaml` (view-state only: the archived set). Workflow definitions and local prompts are user-global rather than directory-scoped (system-design §3/§6). See system-design §3 for the full layout.
+  Under the config dir: `store/` (the project store — the `projects.jsonl` index, where each row records the project's working directory, and `projects/<project-id>/{config.yaml, registry.jsonl, journal.jsonl, pins.jsonl, attachments/, sessions/, runs/, instance.lock}`), `locks/` (cross-process harness session locks — deliberately **not** dev-isolated, see `crates/app/src/session_lock.rs`), personal `config.yaml`, `prompts/`, `workflows/`, `workspace.yaml` (view-state only: the archived set), and `window.yaml` (macOS window size and position, following the dev-isolated config dir). Workflow definitions and local prompts are user-global rather than directory-scoped (system-design §3/§6). See system-design §3 for the full layout.
 
 ## Authoritative docs
 

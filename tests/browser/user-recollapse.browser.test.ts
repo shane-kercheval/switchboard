@@ -10,7 +10,8 @@ vi.mock("$lib/native", () => ({ copyText: vi.fn(async () => undefined) }));
 
 import { mountTranscript } from "./mount";
 import { registerAgent, seedTurns, resetState } from "./harness";
-import { ALICE, PROJECT_ID, longText, userTurn } from "./fixtures";
+import { ALICE, PROJECT_ID, longText, paddingSends, userTurn } from "./fixtures";
+import { EXPANDED_RECENT_SENDS } from "$lib/state/unified";
 
 // Behavior 2 — BUG GUARD: a long user message, once expanded, KEEPS its toggle
 // and can be re-collapsed. A user message's toggle is driven purely by measured
@@ -30,7 +31,12 @@ beforeEach(() => {
 
 test("expanding a long user message keeps the toggle and allows re-collapse", async () => {
   await registerAgent(ALICE);
-  seedTurns(ALICE.id, [userTurn({ id: "user-1", agentId: ALICE.id, text: longText() })]);
+  // Padding sends put the message outside the recent-sends range, so it opens
+  // clipped (the compact default for older prompts).
+  seedTurns(ALICE.id, [
+    userTurn({ id: "user-1", agentId: ALICE.id, text: longText() }),
+    ...paddingSends(ALICE.id, EXPANDED_RECENT_SENDS),
+  ]);
 
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
 

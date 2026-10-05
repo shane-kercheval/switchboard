@@ -41,3 +41,13 @@ window.addEventListener(
   },
   true,
 );
+
+// Emulate the app's engine: WKWebView does not implement CSS scroll anchoring
+// (`CSS.supports("overflow-anchor", "none")` is false there), but this suite's
+// WebKit does, and applies it to every scroller. Left on, it quietly holds
+// scroll positions the app never holds — which is how a stuck upward reveal in
+// the transcript passed this suite. Off everywhere, a spec only passes if the
+// component's own code keeps the reader's place.
+const noNativeAnchoring = document.createElement("style");
+noNativeAnchoring.textContent = "* { overflow-anchor: none !important; }";
+document.head.appendChild(noNativeAnchoring);

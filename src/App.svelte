@@ -42,6 +42,7 @@
     createEmptyPane,
     expandAllPanes,
     layoutFor,
+    movePane,
     paneToCycleTo,
     revealPane,
     type TranscriptPane,
@@ -931,8 +932,10 @@
   /// `animate-spin` is a compositable transform animation.
   let transcriptBusy = $state(false);
 
-  // A monotonic counter bumped when a pane Cmd+click asks the composer to take
-  // focus (see TranscriptPanes.onRequestComposeFocus). Owned here rather than in
+  // A monotonic counter bumped when a gesture that targets a pane asks the
+  // composer to take focus — a pane Cmd+click (see
+  // TranscriptPanes.onRequestComposeFocus), a header tab, or a new agent filling
+  // an empty pane. Owned here rather than in
   // a module store because it's a transient one-shot signal between two children
   // App already renders, not per-project state anything derives from.
   let composeFocusRequest = $state(0);
@@ -1013,8 +1016,12 @@
 
   /// Create or attach an agent, register its listeners, and add it to the
   /// roster named by the returned record. Attach kicks off per-agent hydration
-  /// so the brought-in harness session's history appears.
-  async function createOrAttachAndRegister(submission: AgentFormSubmit): Promise<AgentRecord> {
+  /// so the brought-in harness session's history appears. `filledEmptyPane`
+  /// reports whether the agent landed in a visible empty pane, as its only
+  /// member.
+  async function createOrAttachAndRegister(
+    submission: AgentFormSubmit,
+  ): Promise<{ agent: AgentRecord; filledEmptyPane: boolean }> {
     const agent =
       submission.mode === "create"
         ? await api.createAgent(submission.name, submission.harness, submission.selection)
@@ -1022,11 +1029,11 @@
     await registerAgent(agent);
     addAgentToProjectRoster(agent);
     const rosterIds = (agentsByProject[agent.project_id] ?? []).map((item) => item.id);
-    assignAgentToFirstVisibleEmptyPane(agent.project_id, rosterIds, agent.id);
+    const paneId = assignAgentToFirstVisibleEmptyPane(agent.project_id, rosterIds, agent.id);
     if (submission.mode === "attach") {
       void hydrateAgent(agent.id);
     }
-    return agent;
+    return { agent, filledEmptyPane: paneId !== null };
   }
 
   // First-agent form (center, when the active project has no agents).
@@ -1037,7 +1044,7 @@
     firstAgentError = null;
     firstAgentBusy = true;
     try {
-      const agent = await createOrAttachAndRegister(submission);
+      const { agent } = await createOrAttachAndRegister(submission);
       targetRecipients(agent.project_id, [agent.id]);
     } catch (err) {
       firstAgentError = err instanceof Error ? err.message : String(err);
@@ -1055,8 +1062,19 @@
     addAgentError = null;
     addAgentBusy = true;
     try {
-      await createOrAttachAndRegister(submission);
+      const { agent, filledEmptyPane } = await createOrAttachAndRegister(submission);
+      // An agent that fills an empty pane is that pane's only member, so treat
+      // it like a Cmd+click on the pane: target it and put the cursor in the
+      // composer. Refused like any targeting gesture while a send is building
+      // its message, and then focus stays put too.
+      const targeted = filledEmptyPane && targetRecipients(agent.project_id, [agent.id]);
       addAgentOpen = false;
+      if (targeted) {
+        // Closing the dialog hands focus back to the "+" that opened it, on
+        // the update that unmounts it. Ask for compose focus only after that.
+        await tick();
+        composeFocusRequest += 1;
+      }
     } catch (err) {
       addAgentError = err instanceof Error ? err.message : String(err);
     } finally {
@@ -1341,10 +1359,16 @@
           <div class="flex min-w-0 shrink items-center gap-1" data-tauri-no-drag>
             <PaneTabStrip
               entries={headerPaneEntries}
+              projectId={activeProject?.id ?? ""}
               {paneIsActive}
               paneIsCompleted={paneTabIsCompleted}
               onSelectVisible={targetVisibleHeaderPane}
               onOpenHidden={selectHeaderPane}
+              onReorder={(projectId, paneId, toIndex) => {
+                if (selection.activeProjectId === projectId) {
+                  movePane(projectId, activeRosterIds, paneId, toIndex);
+                }
+              }}
             />
             <!-- Shown whenever more than one pane is hidden — minimized into the
                  tab strip, or hidden behind a maximized pane. -->

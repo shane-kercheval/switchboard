@@ -1,7 +1,16 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { render, fireEvent, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
 import Markdown from "$lib/components/ui/Markdown.svelte";
+import MarkdownRowHarness from "$lib/components/ui/_MarkdownRowHarness.svelte";
+import { renderMarkdown } from "$lib/markdown";
+
+vi.mock("$lib/markdown", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("$lib/markdown")>();
+  return { ...actual, renderMarkdown: vi.fn(actual.renderMarkdown) };
+});
+const renderMarkdownMock = vi.mocked(renderMarkdown);
 
 const copyTextMock = vi.fn<(t: string) => Promise<void>>();
 vi.mock("$lib/native", () => ({
@@ -14,6 +23,7 @@ vi.mock("$lib/api", () => ({
 }));
 
 beforeEach(() => {
+  renderMarkdownMock.mockClear();
   copyTextMock.mockReset();
   copyTextMock.mockResolvedValue(undefined);
   openExternalUrlMock.mockReset();
@@ -119,5 +129,71 @@ describe("Markdown links", () => {
 
     expect(openExternalUrlMock).toHaveBeenCalledWith("https://example.com");
     expect(notCancelled).toBe(false);
+  });
+});
+
+describe("Markdown parse memoization", () => {
+  it("does not re-parse when the parent hands it a new row with the same text", async () => {
+    // The transcript rebuilds its row objects on every update to the pane, so a
+    // user message would otherwise be re-parsed per streamed chunk of some
+    // other agent's reply. Equal text must mean no parse.
+    const { rerender } = render(MarkdownRowHarness, { props: { row: { text: "**same**" } } });
+    expect(renderMarkdownMock).toHaveBeenCalledTimes(1);
+
+    await rerender({ row: { text: "**same**" } });
+    await tick();
+    expect(renderMarkdownMock).toHaveBeenCalledTimes(1);
+
+    await rerender({ row: { text: "**changed**" } });
+    await tick();
+    expect(renderMarkdownMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Markdown long text", () => {
+  it("formats the entire text beyond 50,000 characters", (): void => {
+    const text = "**bold**\n\n" + "plain text ".repeat(6_000) + "\n\n**tail**";
+    const { container } = render(Markdown, { text });
+
+    expect(renderMarkdownMock).toHaveBeenCalledWith(text);
+    expect(Array.from(container.querySelectorAll("strong"), (node) => node.textContent)).toEqual([
+      "bold",
+      "tail",
+    ]);
+  });
+
+  it("keeps formatting as text grows past 50,000 characters without re-parsing unchanged text", async (): Promise<void> => {
+    const text = "**bold**\n\n" + "prose ".repeat(8_000);
+    const { container, rerender } = render(MarkdownRowHarness, { row: { text } });
+    expect(container.querySelector("strong")?.textContent).toBe("bold");
+
+    const grown = text + "\n\n" + "more prose ".repeat(1_000) + "\n\n**tail**";
+    await rerender({ row: { text: grown } });
+    await tick();
+    expect(Array.from(container.querySelectorAll("strong"), (node) => node.textContent)).toEqual([
+      "bold",
+      "tail",
+    ]);
+    expect(renderMarkdownMock).toHaveBeenCalledTimes(2);
+
+    await rerender({ row: { text: grown } });
+    await tick();
+    expect(renderMarkdownMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([49_999, 50_000, 50_001])("formats text of %i characters", (length: number): void => {
+    const text = "**bold**" + "a".repeat(length - 8);
+    const { container } = render(Markdown, { text });
+    expect(renderMarkdownMock).toHaveBeenCalledTimes(1);
+    expect(container.querySelector("strong")?.textContent).toBe("bold");
+    expect(container.textContent).toBe("bold" + "a".repeat(length - 8) + "\n");
+  });
+
+  it("sanitizes HTML in long text", (): void => {
+    const text = "a".repeat(60_000) + '\n\n<img src="x" onerror="alert(1)">\n\n**tail**';
+    const { container } = render(Markdown, { text });
+    expect(container.querySelector("img")).not.toBeNull();
+    expect(container.querySelector("[onerror]")).toBeNull();
+    expect(container.querySelector("strong")?.textContent).toBe("tail");
   });
 });

@@ -1328,9 +1328,18 @@ pub fn invoke_workflow_impl(
         cancel,
     };
 
+    // Held for the run's whole life, so the machine can't sleep while a step
+    // prepares its next turn (an MCP prompt render, the harness launch) — gaps no
+    // turn covers. Taken here rather than inside the task so an accepted run is
+    // held from the moment it's registered; moved in so a panicking run still
+    // drops it. See `WakeLock::lease` before adding a step that waits on the user.
+    let awake = state.wake_lock.lease();
     let workflow_runs = Arc::clone(&state.workflow_runs);
     tokio::spawn(async move {
         let status = run.execute().await;
+        // Released before the registry entry goes, so a run that has left the
+        // registry is never still holding the machine awake.
+        drop(awake);
         // The run is terminal: drop the registry entry, apply retention, then
         // signal completion (`notify_one` so a teardown waiter that hasn't parked
         // yet still gets the wakeup).

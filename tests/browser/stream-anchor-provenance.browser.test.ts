@@ -17,7 +17,11 @@ import {
   distanceFromBottom,
   userScrollTo,
 } from "./harness";
-import { setProjectCompact, toggleKey } from "$lib/state/transcriptPreview.svelte";
+import {
+  setManyOverrides,
+  setProjectCompact,
+  toggleKey,
+} from "$lib/state/transcriptPreview.svelte";
 import { ALICE, BOB, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
 
 // Provenance for in-anchor height changes while a stream is live. A fan-out
@@ -164,6 +168,9 @@ test("a clicked prompt expand wins over a stream chunk landing in the same pass"
     ...column(ALICE.id, "alice-streaming", 50),
   ]);
   seedTurns(BOB.id, column(BOB.id, "bob-streaming", 50));
+  // The in-flight fan-out's prompt is in the recent-sends range (expanded by
+  // default); start it collapsed so the click under test is an expand.
+  setManyOverrides(PROJECT_ID, ["user:u:send-fanout"], true);
 
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE, BOB] });
   // Both columns capped and overflowing (fanoutLiveCap is on while all stream).
@@ -316,9 +323,12 @@ test("a settled toggle click does not tax a later chunk", async () => {
     }),
   ];
   seedTurns(ALICE.id, turns(60));
+  // The in-flight prompt is in the recent-sends range (expanded by default);
+  // start it collapsed so the click under test is an expand.
+  setManyOverrides(PROJECT_ID, ["user:u:user-long"], true);
 
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
-  // Compact default clips the long user message and gives it the only toggle.
+  // The collapsed long user message owns the only toggle.
   const toggle = page.getByTestId("turn-preview-toggle");
   await expect.element(toggle).toBeInTheDocument();
   await expect.poll(() => transcript().scrollHeight > transcript().clientHeight + 400).toBe(true);

@@ -19,6 +19,8 @@ mod secret_store;
 mod session_lock;
 mod state;
 mod wake_lock;
+#[cfg(target_os = "macos")]
+mod window_geometry;
 pub mod workflow;
 mod workflow_commands;
 mod workspace;
@@ -172,6 +174,7 @@ async fn finish_orderly_quit(app: tauri::AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
+    save_main_window_geometry(&app);
     let project_ids: Vec<_> = crate::state::lock(&state.projects)
         .keys()
         .copied()
@@ -197,7 +200,18 @@ async fn finish_orderly_quit(app: tauri::AppHandle) {
     .await;
     if let Some(coordinator) = app.try_state::<crate::lifecycle::QuitCoordinator>() {
         coordinator.approve_exit();
+        // Capture a move or resize made while shutdown work was draining.
+        save_main_window_geometry(&app);
         app.exit(0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn save_main_window_geometry(app: &tauri::AppHandle) {
+    if let (Some(window), Some(path)) = (app.get_webview_window("main"), window_geometry_path())
+        && let Err(error) = window_geometry::save_window_bounds(&window, &path)
+    {
+        tracing::warn!(path = %path.display(), %error, "could not save window bounds");
     }
 }
 
@@ -293,6 +307,7 @@ fn handle_macos_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
         } if label == "main" => {
             api.prevent_close();
             if let Some(window) = app.get_webview_window("main") {
+                save_main_window_geometry(app);
                 let _ = window.hide();
             }
         }
@@ -343,9 +358,9 @@ use crate::commands::{
     set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
     set_project_directory_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
     sign_out_mcp_provider_impl, spawn_prompt_resolution_change_notifications,
-    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
-    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
-    workspace_status_impl,
+    stage_attachment_impl, stage_pasted_text_impl, sync_prompts_and_notify, terminal_open_argv,
+    test_mcp_connection_impl, test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots,
+    validate_external_url, workspace_status_impl,
 };
 use crate::error::AppError;
 use crate::harness_usage::HarnessUsage;
@@ -1257,6 +1272,19 @@ async fn stage_attachment(
 }
 
 #[tauri::command]
+async fn stage_pasted_text(
+    state: State<'_, AppState>,
+    project_id: String,
+    name: String,
+    text: String,
+) -> Result<StagedAttachment, String> {
+    let pid = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    stage_pasted_text_impl(state.inner(), pid, name, text)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn existing_attachment_paths(
     state: State<'_, AppState>,
     project_id: String,
@@ -1937,6 +1965,11 @@ fn workspace_config_path() -> Option<std::path::PathBuf> {
     config_dir().map(|dir| dir.join("workspace.yaml"))
 }
 
+#[cfg(target_os = "macos")]
+fn window_geometry_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join("window.yaml"))
+}
+
 /// Root of the user-global project store (`<config-dir>/store/`).
 ///
 /// A **subdirectory** rather than the config dir itself: the store owns its
@@ -2237,6 +2270,7 @@ pub fn run() {
         if CLOSE_WINDOW_MENU_IDS.contains(&event.id().as_ref())
             && let Some(window) = app.get_webview_window("main")
         {
+            save_main_window_geometry(app);
             let _ = window.hide();
         } else if event.id() == QUIT_MENU_ID
             && let Some(coordinator) = app.try_state::<crate::lifecycle::QuitCoordinator>()
@@ -2259,6 +2293,30 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(move |app| {
+            let window_config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|config| config.label == "main")
+                .ok_or(tauri::Error::WindowNotFound)?;
+            let mut window_builder = tauri::WebviewWindowBuilder::from_config(app, window_config)?;
+            #[cfg(target_os = "macos")]
+            if let Some(path) = window_geometry_path() {
+                match window_geometry::startup_bounds(app.handle(), &path) {
+                    Ok(Some(bounds)) => {
+                        window_builder = window_builder
+                            .inner_size(bounds.width, bounds.height)
+                            .position(bounds.x, bounds.y);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "could not restore window bounds");
+                    }
+                }
+            }
+            let window = window_builder.build()?;
+            window.show()?;
             // Resolve the login-shell PATH in the background, and tell the
             // frontend to re-probe once it lands. Both halves matter: a GUI
             // launch inherits a PATH too minimal to find any harness CLI, and
@@ -2274,16 +2332,17 @@ pub fn run() {
             spawn_path_resolved_emitter(app.handle().clone());
             switchboard_harness::subprocess::warm_path_cache();
 
-            // Wrap the base emitter so any in-flight agent turn holds an OS
+            // Wrap the base emitter so any in-flight agent turn holds the OS
             // wake lock; the decorator counts `turn_start`/`turn_end` across
-            // all agents and releases once the last turn ends.
+            // all agents. The same lock goes into the state below so workflow
+            // runs can hold it between their turns.
+            let wake_lock =
+                wake_lock::WakeLock::new(wake_lock::KeepAwakeInhibitor::new(), wake_lock::ThreadTimer);
             let base_emitter: Arc<dyn EventEmitter> = Arc::new(AppHandleEmitter {
                 app: app.handle().clone(),
             });
-            let emitter: Arc<dyn EventEmitter> = Arc::new(WakeLockEmitter::new(
-                base_emitter,
-                wake_lock::KeepAwakeInhibitor::new(),
-            ));
+            let emitter: Arc<dyn EventEmitter> =
+                Arc::new(WakeLockEmitter::new(base_emitter, wake_lock.clone()));
             // The store is required, so both failures abort startup rather than
             // degrading: with no store the app would accept project creation
             // and silently lose it. Contrast the `Option<PathBuf>` persistence
@@ -2322,6 +2381,7 @@ pub fn run() {
                 lock_root,
             );
             let state = state.with_real_harnesses(spawns_real_harnesses);
+            let state = state.with_wake_lock(wake_lock);
             // Attach all user-global persistence locations (workspace.yaml,
             // git-view.yaml, config.yaml) — see `with_persistence_paths`.
             let state = with_persistence_paths(state);
@@ -2484,6 +2544,7 @@ pub fn run() {
             compact_agent,
             context_report_agent,
             stage_attachment,
+            stage_pasted_text,
             existing_attachment_paths,
             remove_queued_message,
             cancel_turn,

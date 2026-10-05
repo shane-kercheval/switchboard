@@ -273,9 +273,8 @@ export function unassignedAgentIds(projectId: ProjectId, rosterIds: AgentId[]): 
   return rosterIds.filter((id) => !assigned.includes(id));
 }
 
-/// Place an unassigned agent into the oldest visible empty pane, if one exists.
-/// Pane order is creation order, so repeated additions fill waiting panes from
-/// left to right. A maximized pane is the only visible candidate while focus
+/// Place an unassigned agent into the leftmost visible empty pane, if one exists.
+/// A maximized pane is the only visible candidate while focus
 /// mode is active; minimized panes are never filled behind the user's back.
 export function assignAgentToFirstVisibleEmptyPane(
   projectId: ProjectId,
@@ -673,6 +672,27 @@ export function renamePane(
     ...layout,
     panes: layout.panes.map((pane) => (pane.id === paneId ? { ...pane, name: trimmed } : pane)),
   }));
+}
+
+/// Move a pane to a new position, carrying its width share with it. Pane ids,
+/// membership, and display state stay attached to the same pane.
+export function movePane(
+  projectId: ProjectId,
+  rosterIds: AgentId[],
+  paneId: PaneId,
+  toIndex: number,
+): void {
+  update(projectId, rosterIds, (layout) => {
+    const fromIndex = layout.panes.findIndex((pane) => pane.id === paneId);
+    if (fromIndex < 0 || toIndex < 0 || toIndex >= layout.panes.length || fromIndex === toIndex) {
+      return layout;
+    }
+    const panes = [...layout.panes];
+    const fractions = [...layout.fractions];
+    panes.splice(toIndex, 0, panes.splice(fromIndex, 1)[0]!);
+    fractions.splice(toIndex, 0, fractions.splice(fromIndex, 1)[0]!);
+    return { ...layout, panes, fractions };
+  });
 }
 
 /// Replace the row's width fractions (the gutter-drag commit). The caller

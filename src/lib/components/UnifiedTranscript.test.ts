@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, ConversationItem, NormalizedEvent } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
@@ -16,7 +16,7 @@ import {
   _testing as previewState,
 } from "$lib/state/transcriptPreview.svelte";
 import type { Turn } from "$lib/state/index.svelte";
-import { INITIAL_WINDOW, REVEAL_BATCH } from "$lib/state/unified";
+import { EXPANDED_RECENT_SENDS, INITIAL_WINDOW, REVEAL_BATCH } from "$lib/state/unified";
 import { WORKFLOW_AUTHORING_GUIDE_URL } from "$lib/workflowAuthoring";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
@@ -128,6 +128,11 @@ beforeEach(() => {
 const SEND_1 = "00000000-0000-7000-8000-0000000000d1";
 
 afterEach(async () => {
+  // Unmount before resetting stores. The library's own cleanup hook runs after
+  // this one, so without it the previous test's transcript is still mounted
+  // when its stores reset — and reloads its pins into the fresh store, leaking
+  // them into the next test. The later automatic cleanup is then a no-op.
+  cleanup();
   const { _testing } = await loadState();
   _testing.reset();
   previewState.reset();
@@ -2141,6 +2146,8 @@ describe("UnifiedTranscript — per-message copy", () => {
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     const turn = screen.getByTestId("turn");
+    // The pin control renders once pins have loaded.
+    await waitFor(() => expect(turn.querySelector('[data-testid="message-pin"]')).not.toBeNull());
     const pin = turn.querySelector('[data-testid="message-pin"]');
     const copy = turn.querySelector('[data-testid="message-copy"]');
     if (!(pin instanceof HTMLButtonElement) || copy === null) {
@@ -2515,7 +2522,8 @@ describe("UnifiedTranscript — per-message copy", () => {
     copyTextMock.mockClear();
 
     const group = screen.getByTestId("fanout-group");
-    expect(within(group).getAllByTestId("message-pin")).toHaveLength(3);
+    // Pin controls render once pins have loaded.
+    await waitFor(() => expect(within(group).getAllByTestId("message-pin")).toHaveLength(3));
     expect(
       within(screen.getByTestId("fanout-actions-footer")).queryByTestId("message-pin"),
     ).toBeNull();
@@ -3027,6 +3035,38 @@ describe("UnifiedTranscript — attachments", () => {
   });
 });
 
+/// `count` plain exchanges (prompt + one-line answer, nothing to expand) for
+/// `agent`, one per second from `fromSecond`. Compact-mode tests use them to push
+/// the units under test out of the recent-sends range, which opens expanded.
+function paddingSends(agent: AgentRecord, count: number, fromSecond: number): Turn[] {
+  const turns: Turn[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const id = `pad-${agent.name}-${fromSecond + i}`;
+    const at = `2026-05-16T00:00:${String(fromSecond + i).padStart(2, "0")}Z`;
+    turns.push(
+      {
+        role: "user",
+        turn_id: `u-${id}`,
+        agent_id: agent.id,
+        send_id: `send-${id}`,
+        started_at: at,
+        text: "padding",
+      },
+      {
+        role: "agent",
+        turn_id: `a-${id}`,
+        agent_id: agent.id,
+        send_id: `send-${id}`,
+        started_at: at,
+        ended_at: at,
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: `padding ${id}` }],
+      },
+    );
+  }
+  return turns;
+}
+
 describe("UnifiedTranscript compact mode", () => {
   type AgentTurn = Extract<Turn, { role: "agent" }>;
   type Item = AgentTurn["items"][number];
@@ -3046,7 +3086,12 @@ describe("UnifiedTranscript compact mode", () => {
     completed_at: "2026-05-16T00:00:02Z",
   });
 
-  function user(agent: AgentRecord, sendId: string, turnId: string, at: string): Turn {
+  function user(
+    agent: AgentRecord,
+    sendId: string,
+    turnId: string,
+    at: string,
+  ): Extract<Turn, { role: "user" }> {
     return {
       role: "user",
       turn_id: turnId,
@@ -3063,7 +3108,7 @@ describe("UnifiedTranscript compact mode", () => {
     startedAt: string,
     endedAt: string,
     items: Item[],
-  ): Turn {
+  ): AgentTurn {
     return {
       role: "agent",
       turn_id: turnId,
@@ -3097,6 +3142,7 @@ describe("UnifiedTranscript compact mode", () => {
         TOOL("t1"),
         ANSWER("old last"),
       ]),
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS - 1, 3),
       user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
       done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
         ANSWER("new first"),
@@ -3108,7 +3154,8 @@ describe("UnifiedTranscript compact mode", () => {
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    const [older, newest] = agentTurns();
+    const older = agentTurns()[0];
+    const newest = agentTurns().at(-1);
     // Latest → expanded by default, including all answer prose and tool widgets.
     expect(within(newest!).getByText("new first")).toBeInTheDocument();
     expect(within(newest!).getByText("new last")).toBeInTheDocument();
@@ -3120,6 +3167,469 @@ describe("UnifiedTranscript compact mode", () => {
     // Older is collapsed by default; latest is expanded and can be collapsed.
     expect(toggleLabel(older!)).toBe("Expand");
     expect(toggleLabel(newest!)).toBe("Collapse");
+  });
+
+  it("keeps the recent sends expanded and clips the send just before them", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const turns: Turn[] = [];
+    for (let i = 0; i <= EXPANDED_RECENT_SENDS; i += 1) {
+      const at = `2026-05-16T00:00:${String(i * 10).padStart(2, "0")}Z`;
+      turns.push(
+        { ...user(CLAUDE_AGENT, `send-${i}`, `u-${i}`, at), text: "long prompt\n".repeat(40) },
+        done(CLAUDE_AGENT, `send-${i}`, `a-${i}`, at, at, [TOOL(`t-${i}`), ANSWER(`answer ${i}`)]),
+      );
+    }
+    state.transcripts[CLAUDE_AGENT.id] = turns;
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const userTurns = screen
+      .getAllByTestId("turn")
+      .filter((el) => el.getAttribute("data-role") === "user");
+    const [oldestUser, ...recentUsers] = userTurns;
+    const [oldestResponse, ...recentResponses] = agentTurns();
+    expect(recentUsers).toHaveLength(EXPANDED_RECENT_SENDS);
+    expect(recentResponses).toHaveLength(EXPANDED_RECENT_SENDS);
+
+    // The send just outside the range: prompt clipped, response a clipped preview.
+    expect(within(oldestUser!).getByTestId("preview-clip")).toBeInTheDocument();
+    expect(within(oldestResponse!).queryByTestId("tool-done")).toBeNull();
+    expect(toggleLabel(oldestResponse!)).toBe("Expand");
+    // Every send in the range: prompt unclipped, response fully expanded.
+    for (const el of recentUsers) expect(within(el).queryByTestId("preview-clip")).toBeNull();
+    for (const el of recentResponses) {
+      expect(within(el).getByTestId("tool-done")).toBeInTheDocument();
+      expect(toggleLabel(el)).toBe("Collapse");
+    }
+  });
+
+  it("does not count a queued send toward the recent range", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const turns: Turn[] = [];
+    for (let i = 0; i < EXPANDED_RECENT_SENDS; i += 1) {
+      const at = `2026-05-16T00:00:${String(i * 10).padStart(2, "0")}Z`;
+      turns.push(
+        user(CLAUDE_AGENT, `send-${i}`, `u-${i}`, at),
+        done(CLAUDE_AGENT, `send-${i}`, `a-${i}`, at, at, [TOOL(`t-${i}`), ANSWER(`answer ${i}`)]),
+      );
+    }
+    // Queued behind the others: nothing has started, so it must not push the
+    // oldest exchange out of the range the user is reading.
+    turns.push({ ...user(CLAUDE_AGENT, "send-q", "u-q", "2026-05-16T00:00:50Z"), pending: true });
+    state.transcripts[CLAUDE_AGENT.id] = turns;
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const oldest = agentTurns()[0]!;
+    expect(within(oldest).getByTestId("tool-done")).toBeInTheDocument();
+    expect(toggleLabel(oldest)).toBe("Collapse");
+  });
+
+  it("expands a fan-out in the recent range even when no column is its agent's latest", async () => {
+    // A later fan-out needs two sends in range, so a smaller range can't hold both.
+    expect(EXPANDED_RECENT_SENDS).toBeGreaterThanOrEqual(2);
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // Two fan-outs to both agents: each agent's latest response is in the later
+    // one, so only the recent range can keep the earlier one open.
+    const fanout = (agent: AgentRecord, sendId: string, second: number, text: string): Turn[] => {
+      const at = `2026-05-16T00:00:${String(second).padStart(2, "0")}Z`;
+      return [
+        { ...user(agent, sendId, `u-${sendId}-${agent.name}`, at), text: "fan" },
+        done(agent, sendId, `a-${sendId}-${agent.name}`, at, at, [
+          TOOL(`t-${sendId}`),
+          ANSWER(text),
+        ]),
+      ];
+    };
+    state.transcripts[CLAUDE_AGENT.id] = [
+      ...fanout(CLAUDE_AGENT, "send-f", 0, "Alice"),
+      ...fanout(CLAUDE_AGENT, "send-g", 10, "Alice later"),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      ...fanout(CODEX_AGENT, "send-f", 0, "Bob"),
+      ...fanout(CODEX_AGENT, "send-g", 10, "Bob later"),
+      ...paddingSends(CODEX_AGENT, EXPANDED_RECENT_SENDS - 2, 20),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const [alice, bob] = screen.getAllByTestId("fanout-column");
+    expect(within(alice!).getByTestId("tool-done")).toBeInTheDocument();
+    expect(within(bob!).getByTestId("tool-done")).toBeInTheDocument();
+    expect(toggleLabel(alice!)).toBe("Collapse");
+    expect(toggleLabel(bob!)).toBe("Collapse");
+  });
+
+  it("collapses the oldest recent exchange when a queued send starts at the bottom", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const turns: Turn[] = [];
+    for (let i = 0; i < EXPANDED_RECENT_SENDS; i += 1) {
+      const at = `2026-05-16T00:00:${String(i * 10).padStart(2, "0")}Z`;
+      turns.push(
+        user(CLAUDE_AGENT, `send-${i}`, `u-${i}`, at),
+        done(CLAUDE_AGENT, `send-${i}`, `a-${i}`, at, at, [TOOL(`t-${i}`), ANSWER(`answer ${i}`)]),
+      );
+    }
+    const queued = {
+      ...user(CLAUDE_AGENT, "send-q", "u-q", "2026-05-16T00:00:50Z"),
+      pending: true as const,
+    };
+    state.transcripts[CLAUDE_AGENT.id] = [...turns, queued];
+    setProjectCompact(PROJECT_ID, true);
+
+    // A fresh transcript follows the bottom — the pinned view, where the range
+    // moves as soon as a send starts.
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const oldest = agentTurns()[0]!;
+    expect(toggleLabel(oldest)).toBe("Collapse");
+
+    // Through the store writer, as the app does: it bumps the transcript
+    // revision, which runs the scroll pass that applies the owed collapse.
+    const { pending: _started, ...started } = queued;
+    state.setTranscript(CLAUDE_AGENT.id, [...turns, started]);
+    await tick();
+
+    expect(within(oldest).queryByTestId("tool-done")).toBeNull();
+    expect(toggleLabel(oldest)).toBe("Expand");
+  });
+
+  it("holds an exchange expanded while scrolled up, collapsing it back at the bottom", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    const turns: Turn[] = [];
+    for (let i = 0; i < EXPANDED_RECENT_SENDS; i += 1) {
+      const at = `2026-05-16T00:00:${String(i * 10).padStart(2, "0")}Z`;
+      turns.push(
+        user(CLAUDE_AGENT, `send-${i}`, `u-${i}`, at),
+        done(CLAUDE_AGENT, `send-${i}`, `a-${i}`, at, at, [TOOL(`t-${i}`), ANSWER(`answer ${i}`)]),
+      );
+    }
+    state.transcripts[CLAUDE_AGENT.id] = turns;
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], paneId: "pane-x" },
+    });
+    const oldest = agentTurns()[0]!;
+
+    // Jumping to the oldest reply scrolls up to it — the reader leaves the bottom.
+    jump.requestJump(PROJECT_ID, "pane-x", "a:a-0");
+    await tick();
+    await tick();
+    expect(hasOverrides(PROJECT_ID)).toBe(false);
+
+    // A new send starts elsewhere (not a local send, so the view stays put) and
+    // replies: the rules now collapse the oldest exchange, but not under the reader.
+    state.transcripts[CLAUDE_AGENT.id] = [...turns, ...paddingSends(CLAUDE_AGENT, 1, 40)];
+    await tick();
+    expect(within(oldest).getByTestId("tool-done")).toBeInTheDocument();
+    const heldReply = agentTurns().at(-1)!;
+    expect(toggleLabel(heldReply)).toBeNull(); // short, single block: nothing to collapse
+
+    // A local send returns the view to the bottom; the owed collapse happens.
+    state.noteLocalSend(PROJECT_ID, "send-local", [CLAUDE_AGENT.id]);
+    await tick();
+    expect(within(oldest).queryByTestId("tool-done")).toBeNull();
+    expect(toggleLabel(oldest)).toBe("Expand");
+  });
+
+  it("keeps holding replies that arrive while scrolled up, until back at the bottom", async () => {
+    const state = await loadState();
+    const jump = await import("$lib/state/transcriptJump.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    const turns: Turn[] = [];
+    for (let i = 0; i < EXPANDED_RECENT_SENDS; i += 1) {
+      const at = `2026-05-16T00:00:${String(i * 10).padStart(2, "0")}Z`;
+      turns.push(
+        user(CLAUDE_AGENT, `send-${i}`, `u-${i}`, at),
+        done(CLAUDE_AGENT, `send-${i}`, `a-${i}`, at, at, [TOOL(`t-${i}`), ANSWER(`answer ${i}`)]),
+      );
+    }
+    state.setTranscript(CLAUDE_AGENT.id, turns);
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], paneId: "pane-x" },
+    });
+    jump.requestJump(PROJECT_ID, "pane-x", "a:a-0");
+    await tick();
+    await tick();
+
+    // A reply arrives while scrolled up, then later sends push it out of the
+    // range — it was never expanded when the reader left the bottom, but it
+    // is held all the same.
+    const arriving: Turn[] = [
+      user(CLAUDE_AGENT, "send-new", "u-new", "2026-05-16T00:00:40Z"),
+      done(CLAUDE_AGENT, "send-new", "a-new", "2026-05-16T00:00:40Z", "2026-05-16T00:00:40Z", [
+        TOOL("t-new"),
+        ANSWER("arrived"),
+      ]),
+    ];
+    state.setTranscript(CLAUDE_AGENT.id, [...turns, ...arriving]);
+    await tick();
+    state.setTranscript(CLAUDE_AGENT.id, [
+      ...turns,
+      ...arriving,
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS, 50),
+    ]);
+    await tick();
+
+    const arrived = screen
+      .getAllByTestId("turn")
+      .find((el) => el.getAttribute("data-preview-key") === "agent:a-new")!;
+    expect(within(arrived).getByTestId("tool-done")).toBeInTheDocument();
+
+    state.noteLocalSend(PROJECT_ID, "send-local", [CLAUDE_AGENT.id]);
+    await tick();
+    expect(within(arrived).queryByTestId("tool-done")).toBeNull();
+    expect(toggleLabel(arrived)).toBe("Expand");
+  });
+
+  it("keeps a tool call the user opened open when its reply ages out", async () => {
+    // Compact off (the suite default): the reply stays expanded throughout, so
+    // leaving the recent range must not rebuild it.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const reply: Turn[] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("ta"),
+        ANSWER("A"),
+      ]),
+    ];
+    state.setTranscript(CLAUDE_AGENT.id, reply);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const target = agentTurns()[0]!;
+    await fireEvent.click(within(target).getByTestId("tool-row"));
+    expect(within(target).getByTestId("tool-body")).toBeInTheDocument();
+
+    state.setTranscript(CLAUDE_AGENT.id, [
+      ...reply,
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS, 10),
+    ]);
+    state.noteLocalSend(PROJECT_ID, "send-local", [CLAUDE_AGENT.id]);
+    await tick();
+
+    expect(within(target).getByTestId("tool-body")).toBeInTheDocument();
+  });
+
+  it("keeps a tool call the user opened open when its fan-out column ages out", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    const column = (agent: AgentRecord): Turn[] => [
+      { ...user(agent, "send-f", `u-f-${agent.name}`, "2026-05-16T00:00:00Z"), text: "fan" },
+      done(agent, "send-f", `a-f-${agent.name}`, "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL(`t-${agent.name}`),
+        ANSWER(agent.name),
+      ]),
+    ];
+    state.setTranscript(CODEX_AGENT.id, column(CODEX_AGENT));
+    state.setTranscript(CLAUDE_AGENT.id, column(CLAUDE_AGENT));
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+    const alice = screen.getAllByTestId("fanout-column")[0]!;
+    await fireEvent.click(within(alice).getByTestId("tool-row"));
+    expect(within(alice).getByTestId("tool-body")).toBeInTheDocument();
+
+    // Later replies from both agents: the column is neither in range nor either
+    // agent's latest.
+    state.setTranscript(CODEX_AGENT.id, [
+      ...column(CODEX_AGENT),
+      ...paddingSends(CODEX_AGENT, 1, 5),
+    ]);
+    state.setTranscript(CLAUDE_AGENT.id, [
+      ...column(CLAUDE_AGENT),
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS, 10),
+    ]);
+    state.noteLocalSend(PROJECT_ID, "send-local", [CLAUDE_AGENT.id]);
+    await tick();
+
+    expect(within(alice).getByTestId("tool-body")).toBeInTheDocument();
+  });
+
+  describe("pinned messages", () => {
+    const HYDRATION = "hk-a";
+    const PIN_KEY = `agent:hydration:${CLAUDE_AGENT.id}:${HYDRATION}`;
+
+    function pinnedReplyTranscript(): Turn[] {
+      return [
+        user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+        {
+          ...done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+            TOOL("ta"),
+            ANSWER("pinned answer"),
+          ]),
+          hydration_key: HYDRATION,
+        },
+        ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS, 10),
+      ];
+    }
+
+    function mockPins(initial: string[]): void {
+      invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+        if (cmd === "list_message_pins") {
+          return initial.map((key) => ({ key, pinned_at: "2026-05-16T00:01:00Z" }));
+        }
+        if (cmd === "set_message_pin") {
+          return args?.pinned === true
+            ? [{ key: args.key, pinned_at: "2026-05-16T00:01:00Z" }]
+            : [];
+        }
+        return null;
+      });
+    }
+
+    it("keeps a pinned reply expanded after it leaves the recent range", async () => {
+      mockPins([PIN_KEY]);
+      const state = await loadState();
+      await state.registerAgent(CLAUDE_AGENT);
+      state.setTranscript(CLAUDE_AGENT.id, pinnedReplyTranscript());
+      setProjectCompact(PROJECT_ID, true);
+
+      render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+      const pinned = agentTurns()[0]!;
+      await waitFor(() => expect(within(pinned).getByTestId("tool-done")).toBeInTheDocument());
+      expect(toggleLabel(pinned)).toBe("Collapse");
+    });
+
+    it("keeps a manual collapse on a pinned reply", async () => {
+      mockPins([PIN_KEY]);
+      const state = await loadState();
+      await state.registerAgent(CLAUDE_AGENT);
+      state.setTranscript(CLAUDE_AGENT.id, pinnedReplyTranscript());
+      setProjectCompact(PROJECT_ID, true);
+
+      render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+      const pinned = agentTurns()[0]!;
+      await waitFor(() => expect(toggleLabel(pinned)).toBe("Collapse"));
+      await fireEvent.click(pinned.querySelector('[data-testid="turn-preview-toggle"]')!);
+      expect(within(pinned).queryByTestId("tool-done")).toBeNull();
+
+      state.setTranscript(CLAUDE_AGENT.id, [
+        ...pinnedReplyTranscript(),
+        ...paddingSends(CLAUDE_AGENT, 1, 30),
+      ]);
+      await tick();
+      expect(within(pinned).queryByTestId("tool-done")).toBeNull();
+      expect(toggleLabel(pinned)).toBe("Expand");
+    });
+
+    it("returns an unpinned reply to the normal rules", async () => {
+      mockPins([PIN_KEY]);
+      const state = await loadState();
+      await state.registerAgent(CLAUDE_AGENT);
+      state.setTranscript(CLAUDE_AGENT.id, pinnedReplyTranscript());
+      setProjectCompact(PROJECT_ID, true);
+
+      render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+      const pinned = agentTurns()[0]!;
+      // Queried fresh: the pin control re-renders once pins load.
+      const pinButton = (): Element => pinned.querySelector('[data-testid="message-pin"]')!;
+      await waitFor(() => expect(pinButton()).toHaveAttribute("aria-pressed", "true"));
+      expect(within(pinned).getByTestId("tool-done")).toBeInTheDocument();
+
+      await fireEvent.click(pinButton());
+      await waitFor(() => expect(pinButton()).toHaveAttribute("aria-pressed", "false"));
+      await tick();
+      expect(within(pinned).getByTestId("tool-done")).toBeInTheDocument();
+      // Nothing collapses under the unpin click itself; the next update at the
+      // bottom applies the rules, which no longer hold it open.
+      state.setTranscript(CLAUDE_AGENT.id, [
+        ...pinnedReplyTranscript(),
+        ...paddingSends(CLAUDE_AGENT, 1, 30),
+      ]);
+      await tick();
+      expect(within(pinned).queryByTestId("tool-done")).toBeNull();
+      expect(toggleLabel(pinned)).toBe("Expand");
+    });
+
+    it("keeps a pinned prompt unclipped after it leaves the recent range", async () => {
+      mockPins(["user:send:send-a"]);
+      const state = await loadState();
+      await state.registerAgent(CLAUDE_AGENT);
+      state.setTranscript(CLAUDE_AGENT.id, [
+        { ...user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"), text: "pinned prompt" },
+        ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS, 10),
+      ]);
+      setProjectCompact(PROJECT_ID, true);
+
+      render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+      const prompt = screen.getAllByTestId("turn")[0]!;
+      await waitFor(() => expect(within(prompt).queryByTestId("preview-clip")).toBeNull());
+    });
+  });
+
+  it("collapses a recent, non-latest reply to its final answer block", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        ANSWER("first block"),
+        TOOL("ta"),
+        ANSWER("final block"),
+      ]),
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS - 1, 3),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const recent = agentTurns()[0]!;
+    expect(toggleLabel(recent)).toBe("Collapse");
+    await fireEvent.click(recent.querySelector('[data-testid="turn-preview-toggle"]')!);
+
+    expect(within(recent).queryByText("first block")).toBeNull();
+    expect(within(recent).getByText("final block")).toBeInTheDocument();
+    expect(within(recent).queryByTestId("tool-done")).toBeNull();
+  });
+
+  it("shows a manually collapsed reply as the standard older preview once it ages out", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const reply: Turn[] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        ANSWER("first block"),
+        TOOL("ta"),
+        ANSWER("final block"),
+      ]),
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS - 1, 3),
+    ];
+    state.transcripts[CLAUDE_AGENT.id] = reply;
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const target = agentTurns()[0]!;
+    await fireEvent.click(target.querySelector('[data-testid="turn-preview-toggle"]')!);
+    expect(within(target).queryByText("first block")).toBeNull();
+
+    // One more send (at the bottom) moves it out of the recent range: it keeps
+    // the user's collapse, now in the older preview that shows all answer prose.
+    state.transcripts[CLAUDE_AGENT.id] = [...reply, ...paddingSends(CLAUDE_AGENT, 1, 20)];
+    await tick();
+
+    expect(toggleLabel(target)).toBe("Expand");
+    expect(within(target).getByText("first block")).toBeInTheDocument();
+    expect(within(target).getByText("final block")).toBeInTheDocument();
+    expect(within(target).queryByTestId("tool-done")).toBeNull();
   });
 
   it("keeps each agent's most-recent response full even when another agent replied later", async () => {
@@ -3158,6 +3668,7 @@ describe("UnifiedTranscript compact mode", () => {
   it("picks each agent's latest response by completion recency, not rendered order", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
     // send-a is anchored earlier (renders first) but finishes last within the
     // same second, using a different fractional precision than send-b.
     state.transcripts[CLAUDE_AGENT.id] = [
@@ -3179,9 +3690,14 @@ describe("UnifiedTranscript compact mode", () => {
         ANSWER("invalid last"),
       ]),
     ];
+    // Later sends to another agent take the recent range, so only the
+    // latest-response rule can keep one of CLAUDE's responses expanded.
+    state.transcripts[CODEX_AGENT.id] = paddingSends(CODEX_AGENT, EXPANDED_RECENT_SENDS, 8);
     setProjectCompact(PROJECT_ID, true);
 
-    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
 
     const [first, second, invalid] = agentTurns();
     // send-a is the latest by recency → full answer prose.
@@ -3206,6 +3722,7 @@ describe("UnifiedTranscript compact mode", () => {
         ANSWER("solo first"),
         ANSWER("solo last"),
       ]),
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS - 1, 3),
       user(CLAUDE_AGENT, "send-b", "u-bc", "2026-05-16T00:00:10Z"),
       done(CLAUDE_AGENT, "send-b", "a-bc", "2026-05-16T00:00:11Z", "2026-05-16T00:00:13Z", [
         ANSWER("alice first"),
@@ -3251,6 +3768,7 @@ describe("UnifiedTranscript compact mode", () => {
         TOOL("tb"),
         ANSWER("B"),
       ]),
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS - 1, 13),
       user(CLAUDE_AGENT, "send-c", "u-c", "2026-05-16T00:00:20Z"),
       done(CLAUDE_AGENT, "send-c", "a-c", "2026-05-16T00:00:21Z", "2026-05-16T00:00:22Z", [
         TOOL("tc"),
@@ -3261,7 +3779,8 @@ describe("UnifiedTranscript compact mode", () => {
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    const [a, b, c] = agentTurns();
+    const [a, b] = agentTurns();
+    const c = agentTurns().at(-1);
     // Older responses are collapsed by default; the latest response is expanded.
     expect(toggleLabel(a!)).toBe("Expand");
     expect(toggleLabel(b!)).toBe("Expand");
@@ -3287,6 +3806,7 @@ describe("UnifiedTranscript compact mode", () => {
         TOOL("tb"),
         ANSWER("B"),
       ]),
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS - 1, 13),
       user(CLAUDE_AGENT, "send-c", "u-c", "2026-05-16T00:00:20Z"),
       done(CLAUDE_AGENT, "send-c", "a-c", "2026-05-16T00:00:21Z", "2026-05-16T00:00:22Z", [
         TOOL("tc"),
@@ -3324,6 +3844,7 @@ describe("UnifiedTranscript compact mode", () => {
         started_at: "2026-05-16T00:00:00Z",
         text: "long prompt\n".repeat(40),
       },
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS, 1),
     ];
     setProjectCompact(PROJECT_ID, true);
 
@@ -3331,7 +3852,7 @@ describe("UnifiedTranscript compact mode", () => {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], paneId: "pane-x" },
     });
 
-    const userTurn = screen.getByTestId("turn");
+    const userTurn = screen.getAllByTestId("turn")[0]!;
     const clip = within(userTurn).getByTestId("preview-clip");
     Object.defineProperties(clip, {
       scrollHeight: { configurable: true, value: 400 },
@@ -3419,13 +3940,14 @@ describe("UnifiedTranscript compact mode", () => {
     await tick();
     expect(hasOverrides(PROJECT_ID)).toBe(false);
 
+    // Later sends age it out. The jump left the view scrolled up, where nothing
+    // collapses; a local send returns it to the bottom, where it must — no
+    // override from the jump holds it open.
     state.transcripts[CLAUDE_AGENT.id] = [
       ...state.transcripts[CLAUDE_AGENT.id]!,
-      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
-        TOOL("tb"),
-        ANSWER("B"),
-      ]),
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS, 11),
     ];
+    state.noteLocalSend(PROJECT_ID, "send-local", [CLAUDE_AGENT.id]);
     await tick();
 
     expect(within(response).queryByTestId("tool-row")).toBeNull();
@@ -3569,6 +4091,7 @@ describe("UnifiedTranscript compact mode", () => {
         TOOL("t2"),
         ANSWER("done"),
       ]),
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS - 1, 3),
       user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
       done(CLAUDE_AGENT, "send-b", "a-2", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
         ANSWER("newest"),
@@ -3596,6 +4119,7 @@ describe("UnifiedTranscript compact mode", () => {
         TOOL("t1"),
         ANSWER("older answer"),
       ]),
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS - 1, 3),
       user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
       done(CLAUDE_AGENT, "send-b", "a-new", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
         ANSWER("newest"),
@@ -3609,7 +4133,7 @@ describe("UnifiedTranscript compact mode", () => {
     const older = agentTurns()[0]!;
     expect(within(older).getByTestId("hidden-items-indicator")).toHaveTextContent("1 tool call");
     // The newest (latest-response view, no tools) hides nothing non-text → no indicator.
-    expect(within(agentTurns()[1]!).queryByTestId("hidden-items-indicator")).toBeNull();
+    expect(within(agentTurns().at(-1)!).queryByTestId("hidden-items-indicator")).toBeNull();
   });
 
   it("shows no toggle when collapsing would hide nothing (short, no tools)", async () => {
@@ -4039,8 +4563,9 @@ describe("UnifiedTranscript fan-out group control", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
-    // Two fan-outs, plus a later standalone send so neither fan-out is the
-    // latest set → both groups' columns start compact by default.
+    // Two fan-outs, plus later standalone sends so neither fan-out is the
+    // latest set or in the recent-sends range → both groups' columns start
+    // compact by default.
     state.transcripts[CLAUDE_AGENT.id] = [
       u(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
       a(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z"),
@@ -4088,6 +4613,7 @@ describe("UnifiedTranscript fan-out group control", () => {
         status: "complete",
         items: [text("latest solo codex")],
       },
+      ...paddingSends(CODEX_AGENT, EXPANDED_RECENT_SENDS, 23),
     ];
 
     render(UnifiedTranscript, {
@@ -5592,8 +6118,10 @@ describe("compaction rows", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     let resolveIpc: (id: string) => void = () => {};
-    invokeMock.mockImplementation(
-      async () => await new Promise<string>((res) => (resolveIpc = res)),
+    // Only the compaction request is held; the transcript's own pin load on
+    // mount must not claim the resolver.
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "compact_agent" ? await new Promise<string>((res) => (resolveIpc = res)) : null,
     );
     const inFlight = state.dispatchCompaction(
       CLAUDE_AGENT.id,

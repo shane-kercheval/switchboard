@@ -94,12 +94,15 @@ function record(text: string): void {
   if (trace.length > TRACE_MAX) trace.shift();
 }
 
-function dumpTail(reason: string, count = TRACE_TAIL): void {
+function formatTail(count: number): string {
   const start = Math.max(0, trace.length - count);
   const slice = trace.slice(start);
   const base = slice[0]?.t ?? 0;
-  const body = slice.map((e) => `  +${(e.t - base).toFixed(1)}ms  ${e.text}`).join("\n");
-  console.log(`[pin] ===== ${reason} =====\n${body}`);
+  return slice.map((e) => `  +${(e.t - base).toFixed(1)}ms  ${e.text}`).join("\n");
+}
+
+function dumpTail(reason: string, count = TRACE_TAIL): void {
+  console.log(`[pin] ===== ${reason} =====\n${formatTail(count)}`);
 }
 
 function bump(key: string): number {
@@ -195,6 +198,16 @@ export function debugNote(scope: PinScope, label: string, value?: number): void 
   record(`${scope} NOTE   ${label}${value === undefined ? "" : ` ${value.toFixed(1)}`}`);
 }
 
+/// `debugNote` for an event whose useful context is more than one number.
+/// `label` is the counter key, so it must be fixed; the per-event context goes
+/// in `detail`, which runs only while debugging is on — building it can touch
+/// layout, and that must cost nothing when nobody is looking.
+export function debugEvent(scope: PinScope, label: string, detail: () => string): void {
+  if (!enabled) return;
+  bump(`${scope}:note:${label}`);
+  record(`${scope} NOTE   ${label} ${detail()}`);
+}
+
 /// Record real input the scroller received, with its magnitude. The magnitude
 /// matters: a 3px upward tick in the middle of a downward flick is a different
 /// event from a deliberate 100px scroll away, and only the raw number tells
@@ -258,6 +271,8 @@ interface PinDebugConsole {
   /// Dump the recorded tail on demand, for when something looked wrong but the
   /// pin never flipped.
   tail(count?: number): void;
+  /// The recorded tail as one string, for `copy(switchboardPinDebug.dump())`.
+  dump(count?: number): string;
   summary(): Record<string, number>;
   reset(): void;
 }
@@ -282,6 +297,9 @@ if (typeof globalThis !== "undefined") {
     },
     tail(count = TRACE_TAIL): void {
       dumpTail("tail on request", count);
+    },
+    dump(count = TRACE_MAX): string {
+      return formatTail(count);
     },
     disable(): void {
       enabled = false;

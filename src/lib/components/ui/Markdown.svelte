@@ -1,9 +1,17 @@
 <script lang="ts">
   /// Renders a Markdown string as sanitized, syntax-highlighted HTML. One
   /// instance per text segment (see UnifiedTranscript): the parse runs in a
-  /// `$derived` keyed on `text`, so during streaming only the growing segment's
-  /// instance re-parses — completed segments keep a stable `text` prop and never
-  /// re-run. That structural memoization is why there's no manual parse cache.
+  /// `$derived` keyed on the text *value*, so during streaming only the growing
+  /// segment's instance re-parses — completed segments keep a stable `text` and
+  /// never re-run. That structural memoization is why there's no manual parse
+  /// cache.
+  ///
+  /// The value, not the prop: a prop is a live getter into the parent, and
+  /// parents that rebuild their row objects on every update (the transcript
+  /// does, per streamed chunk) would otherwise re-run the parse each time even
+  /// though the string is identical. `source` caches the string, and a derived
+  /// whose value compares equal does not dirty its dependents, so `html` stays
+  /// put until the text really changes.
   ///
   /// Code-block chrome (language badge + Copy button) is part of the parsed HTML
   /// string, not injected after render — `{@html}` replaces the whole subtree on
@@ -16,6 +24,8 @@
 
   let { text = "", class: className = "" }: { text?: string; class?: string } = $props();
 
+  const source = $derived(text);
+
   // Known limitation: while a segment is still streaming, the whole segment
   // re-parses (and re-highlights) every token, so a partially-typed token in the
   // live code block can briefly change color as more characters arrive. It's
@@ -23,7 +33,7 @@
   // Prism is fast, so it's minor. If it ever reads as objectionable, the fallback
   // is to render the live segment's code as plain monospace and highlight only
   // once finalized — not built pre-emptively.
-  const html = $derived(renderMarkdown(text));
+  const html = $derived(renderMarkdown(source));
 
   // Per-button reset timers (keyed on the button element) so copying one block
   // doesn't cancel another block's "Copied → Copy" reset. WeakMap doesn't pin

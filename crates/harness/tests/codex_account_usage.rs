@@ -130,6 +130,40 @@ async fn a_recovered_account_clears_the_exhaustion_flag_rather_than_leaving_it_s
 }
 
 #[tokio::test]
+async fn a_spent_account_with_credits_behind_it_reports_both_facts() {
+    // Captured from a `team` account with its 5-hour window spent and every
+    // turn still completing: the one capture where the allowance is blocked and
+    // work continues. Worth a fixture because the only other capped capture is
+    // a creditless `prolite` account, whose turns were refused, and the two
+    // differ on exactly the fields the frontend's credits escalation reads.
+    //
+    // Recorded here as the bytes the frontend's rule depends on, so a renamed
+    // field fails this test rather than quietly rendering as "no escalation".
+    let dir = tempfile::TempDir::new().unwrap();
+    let shim = recorded_shim(dir.path(), "account-rate-limits-credits");
+
+    let usage = read_account_usage(&shim, AMPLE).await.expect("a reading");
+
+    // Included usage is blocked, as on the refused capture …
+    assert_eq!(usage.ordinary_usage_allowed, Some(false));
+
+    let codex = &usage.rate_limits_by_limit_id["codex"];
+    assert_eq!(codex["primary"]["usedPercent"], 100);
+    assert_eq!(codex["primary"]["windowDurationMins"], 300);
+    assert_eq!(codex["secondary"]["usedPercent"], 41);
+    // … and the three fields that differ from it. The reason code is null even
+    // though a window is at 100%: Codex counts a credits-covered account as
+    // not having reached a limit.
+    assert_eq!(codex["credits"]["hasCredits"], true);
+    assert_eq!(codex["rateLimitReachedType"], serde_json::Value::Null);
+    assert_eq!(codex["planType"], "team");
+    // The member's running spend against a monthly cap — observed to move
+    // across a single turn, which is what established what the field is.
+    assert_eq!(codex["individualLimit"]["limit"], "2500");
+    assert!(codex["individualLimit"]["used"].is_string());
+}
+
+#[tokio::test]
 async fn the_answer_is_found_behind_unrelated_server_traffic() {
     // The recorded stream carries the `initialize` response and an unsolicited
     // `remoteControl/status/changed` notification ahead of the answer. Reading

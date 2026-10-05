@@ -72,6 +72,15 @@
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
   import * as api from "$lib/api";
+  import { formatFileSize } from "$lib/diff";
+  import { MAX_PROMPT_BYTES, promptTooLarge, utf8ByteLength } from "$lib/promptSize";
+  import {
+    abandonStaging,
+    beginStaging,
+    reservedStagingNames,
+    stagingBlocking,
+    stagingCompletions,
+  } from "$lib/state/attachmentStaging.svelte";
   import type {
     AgentId,
     AgentRecord,
@@ -151,6 +160,7 @@
   let draft = $state<string>(saved.content.kind === "plain" ? saved.content.draft : "");
   let sendError = $state<string | null>(null);
   let composeEl = $state<HTMLDivElement | undefined>(undefined);
+  let composeBoxEl = $state<HTMLDivElement | undefined>(undefined);
   let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
 
   // ── Attachments ─────────────────────────────────────────────────────────────
@@ -218,7 +228,7 @@
 
   /// Append a freshly staged file. Reads the snapshot (not `attachmentChips`) as
   /// the base so it stays correct after this bar has unmounted.
-  function addAttachmentChip(staged: { path: string; original_name: string }): void {
+  function addAttachmentChip(staged: { path: string; original_name: string }): Attachment {
     const kind = classifyKind(staged.original_name);
     const existing = getCompose(projectId).attachments ?? [];
     const attachment: Attachment = {
@@ -231,10 +241,129 @@
     if (!unmounted) {
       attachmentChips = [...attachmentChips, { ...attachment, id: crypto.randomUUID() }];
     }
+    return attachment;
   }
 
   function removeAttachmentChip(id: string): void {
     commitChips(attachmentChips.filter((chip) => chip.id !== id));
+  }
+
+  // A paste this large becomes a file attachment rather than message text. Text
+  // this size is pasted output (a log, a dump), not something someone typed: in
+  // the box it makes every keystroke rescan all of it, in the message it fills
+  // the agent's context window, and past about 1 MB the CLI can't take it as an
+  // argument at all. As a file the agent reads only the parts it needs. 50 K
+  // characters is roughly a thousand lines of log output.
+  const LARGE_PASTE_CHARS = 50_000;
+  // The latest large paste, offered back as "Paste as text instead" for as long
+  // as its chip is still in the draft (removing the chip, or sending, retires it).
+  let largePaste = $state<{
+    text: string;
+    path: string;
+    label: string;
+    bytes: number;
+  } | null>(null);
+  const largePasteUndo = $derived.by(() => {
+    const paste = largePaste;
+    if (paste === null) return null;
+    return attachmentChips.some((chip) => chip.path === paste.path) ? paste : null;
+  });
+
+  // Copies still being written for this project — a drop's file copy or a
+  // paste's write — that the user has not stopped waiting for. Every send path
+  // waits for them: a message dispatched mid-copy goes out without the file.
+  const stagingNames = $derived(stagingBlocking(projectId));
+  const stagingPending = $derived(stagingNames.length > 0);
+  // A copy that finishes after a project switch lands its chip in the store from
+  // the dead instance that started it (see `addAttachmentChip`). The bar mounted
+  // since merges it in on every completion, so a chip the user removes meanwhile
+  // can't take a landed-but-unseen one with it (`commitChips` rewrites the
+  // store's list from this bar's). Keyed on the completion counter, not the
+  // in-flight count: a multi-file drop finishes one copy and starts the next in
+  // the same step, so the count never moves. Chips only; the mode and text are
+  // left alone, unlike `reprojectFromStore`.
+  let seenCompletions = untrack(() => stagingCompletions(projectId));
+  $effect(() => {
+    const count = stagingCompletions(projectId);
+    if (count === seenCompletions) return;
+    seenCompletions = count;
+    untrack(() => {
+      const have = new Set(attachmentChips.map((chip) => chip.path));
+      const missing = (getCompose(projectId).attachments ?? []).filter((a) => !have.has(a.path));
+      if (missing.length > 0) attachmentChips = [...attachmentChips, ...restoreChips(missing)];
+    });
+  });
+
+  /// `pasted-<n>.txt`, numbered past any pasted file already in the draft or
+  /// still being written, so two pastes never share a name (same max-plus-one
+  /// rule as `nextLabel`).
+  function nextPasteName(names: readonly string[]): string {
+    let max = 0;
+    for (const name of names) {
+      const match = /^pasted-(\d+)\.txt$/.exec(name);
+      if (match) max = Math.max(max, Number.parseInt(match[1]!, 10));
+    }
+    return `pasted-${max + 1}.txt`;
+  }
+
+  /// Intercept a paste too large to live in the message and stage it as a file
+  /// instead. Smaller pastes reach the textarea untouched.
+  function onPaste(event: ClipboardEvent): void {
+    const text = event.clipboardData?.getData("text/plain") ?? "";
+    if (text.length <= LARGE_PASTE_CHARS) return;
+    event.preventDefault();
+    // Same rule as file drops: the attachment set is frozen while a send renders.
+    if (composerBusy) {
+      showError(
+        "Couldn't attach the pasted text while a send is in progress. Try again in a moment.",
+      );
+      return;
+    }
+    void stagePastedText(text);
+  }
+
+  async function stagePastedText(text: string): Promise<void> {
+    const gen = sendGeneration;
+    const name = nextPasteName([
+      ...(getCompose(projectId).attachments ?? []).map((a) => a.original_name),
+      ...reservedStagingNames(projectId),
+    ]);
+    const staging = beginStaging(projectId, name);
+    try {
+      const staged = await api.stagePastedText(projectId, name, text);
+      // A copy the user stopped waiting for lands wherever they are now, sent
+      // or not — the file is theirs to remove, not ours to lose.
+      if (gen !== sendGeneration && !staging.abandoned()) return;
+      const attachment = addAttachmentChip(staged);
+      largePaste = {
+        text,
+        path: staged.path,
+        label: attachment.label,
+        bytes: utf8ByteLength(text),
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      showError(`Couldn't attach the pasted text: ${message}`);
+    } finally {
+      staging.release();
+    }
+  }
+
+  /// Undo a large paste's conversion: drop its chip and put the text into the
+  /// field that is sending — the plain box at the caret (replacing a selection,
+  /// as the paste would have), or prompt mode's appended text.
+  function pasteAsTextInstead(): void {
+    const paste = largePasteUndo;
+    if (paste === null || composerBusy) return;
+    commitChips(attachmentChips.filter((chip) => chip.path !== paste.path));
+    if (mode === "prompt") {
+      appendedText = appendedText === "" ? paste.text : `${appendedText}\n${paste.text}`;
+    } else {
+      const start = textareaEl?.selectionStart ?? draft.length;
+      const end = textareaEl?.selectionEnd ?? start;
+      draft = `${draft.slice(0, start)}${paste.text}${draft.slice(end)}`;
+    }
+    largePaste = null;
   }
 
   /// Drop restored chips whose staged file no longer exists (a manual delete,
@@ -372,18 +501,28 @@
   /// send-error line and skips that file rather than aborting the rest.
   async function stageDroppedPaths(paths: string[]): Promise<void> {
     const gen = sendGeneration;
-    for (const path of paths) {
+    // The whole drop registers before the first copy starts, so "Stop waiting"
+    // covers every file of it: a later file must not re-hold Send after the
+    // user stopped waiting, and must follow the same land-or-discard rule as
+    // the one they stopped on.
+    const handles = paths.map((path) => beginStaging(projectId, basename(path)));
+    for (const [index, path] of paths.entries()) {
+      const staging = handles[index]!;
       try {
         const staged = await api.stageAttachment(projectId, path);
         // The drop's compose session may have been *sent* while the copy was in
         // flight; if so, discard rather than resurrecting a chip into a cleared
-        // composer. An unmount is not a discard — `addAttachmentChip` writes to
-        // the originating project's snapshot either way.
-        if (gen !== sendGeneration) return;
+        // composer — unless the user stopped waiting for this copy, in which
+        // case it lands wherever they are now. An unmount is not a discard —
+        // `addAttachmentChip` writes to the originating project's snapshot
+        // either way. One file's outcome never decides the rest of the drop.
+        if (gen !== sendGeneration && !staging.abandoned()) continue;
         addAttachmentChip(staged);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         showError(`Couldn't attach ${basename(path)}: ${message}`);
+      } finally {
+        staging.release();
       }
     }
   }
@@ -1266,6 +1405,9 @@
         ? selectedPrompt === null || missingRequired.length > 0
         : draft.trim() === "" && attachmentChips.length === 0;
     if (nothingToSend) return { kind: "nothing-to-send" };
+    if (stagingPending) {
+      return { kind: "blocked", reason: STILL_ATTACHING };
+    }
     // No `showStop` arm: it requires an empty composer and no attachments, which
     // the check above already answers. A send in flight with text typed leaves
     // `showStop` false and falls through to the checks below.
@@ -1517,7 +1659,7 @@
 
   /// with all required arguments filled, and is blocked while a render is in
   /// flight. **Not** gated on run_status — send-while-busy queues.
-  const sendDisabled = $derived(
+  const sendDisabledExceptStaging = $derived(
     !projectAvailable ||
       (mode === "prompt"
         ? selectedPrompt === null ||
@@ -1528,6 +1670,8 @@
           composerBusy ||
           !allRecipientsHydrated),
   );
+  const sendDisabled = $derived(sendDisabledExceptStaging || stagingPending);
+  const STILL_ATTACHING = "Still attaching a file — try again in a moment.";
 
   // Every live send across this project's agents, mapped to the agents it's
   // live for. The composer stop cancels *all* of it, not just the most recent
@@ -2223,6 +2367,81 @@
   /// Reading mode hides the compose box (see the template) — the user asked to
   /// be treated as not present in this project.
   const readingMode = $derived(isReadingMode(projectId));
+  // Reading mode hides the compose box, and a workflow run's progress view
+  // replaces it. Whenever it comes back — the user toggled reading mode off, it
+  // turned itself off when the agents finished, a run left the list (finished or
+  // dismissed) — the user is back to type, so the first text field of whatever
+  // form is showing takes focus. It holds back where moving the cursor would cost
+  // the user something:
+  // - focus is already in the box, set by another path (a restored draft);
+  // - focus is in another text field or inside a dialog — they are working there;
+  // - text is highlighted outside the box. Focusing a field clears the page's
+  //   selection, so a highlight the user was about to copy would vanish. A
+  //   highlight also lingers after copying, though, so instead of leaving the
+  //   user unable to type, their first keystroke is routed into the box.
+  // A tick later, so a closing dialog (the command palette's "Turn off reading
+  // mode") has already handed focus back before this checks. Focus, not mere
+  // presence: the palette's element outlives that hand-back by a frame.
+  //
+  // Hiding the box also clears its focus border. WebKit fires no focusout when
+  // the focused textarea is removed, so the border would otherwise come back lit
+  // with no cursor in the box.
+  const composeBoxShown = $derived(!activeWorkflowRun && !readingMode);
+  let composeBoxWasShown: boolean | null = null;
+  $effect(() => {
+    const shown = composeBoxShown;
+    const returned = composeBoxWasShown === false && shown;
+    composeBoxWasShown = shown;
+    if (!shown) {
+      composeFocused = false;
+      return;
+    }
+    if (!returned) return;
+    let cancelled = false;
+    let disarm: (() => void) | null = null;
+    void tick().then(() => {
+      if (cancelled) return;
+      const active = document.activeElement;
+      if (composeBoxEl?.contains(active)) return;
+      if (!focusIsFree(active)) return;
+      const selection = document.getSelection();
+      if (selection !== null && !selection.isCollapsed) {
+        disarm = focusComposeOnFirstKeystroke();
+        return;
+      }
+      composeBoxEl?.querySelector("textarea")?.focus();
+    });
+    return () => {
+      cancelled = true;
+      disarm?.();
+    };
+  });
+
+  /// Whether focus is somewhere the compose box may take it from: not a text
+  /// field and not inside a dialog.
+  function focusIsFree(active: Element | null): boolean {
+    if (active?.closest('[role="dialog"], [role="alertdialog"]')) return false;
+    return !isEditableShortcutTarget(active);
+  }
+
+  /// Route the next typed character into the compose box, leaving the page's
+  /// selection alone until then. Shortcuts (⌘C to copy the highlight) and
+  /// navigation keys pass through and keep it armed. Focusing inside keydown
+  /// sends that same keystroke's character to the newly focused field. Returns
+  /// the disarm function.
+  function focusComposeOnFirstKeystroke(): () => void {
+    function onKeydown(e: KeyboardEvent): void {
+      if (e.metaKey || e.ctrlKey || e.altKey || e.key.length !== 1) return;
+      disarm();
+      if (!focusIsFree(document.activeElement)) return;
+      composeBoxEl?.querySelector("textarea")?.focus();
+    }
+    function disarm(): void {
+      window.removeEventListener("keydown", onKeydown, true);
+    }
+    window.addEventListener("keydown", onKeydown, true);
+    return disarm;
+  }
   // A Stop/Dismiss failure, surfaced inline in the held panel — without this a
   // failed Dismiss is a silent dead button (the run stays held with no feedback).
   let workflowRunError = $state<string | null>(null);
@@ -2398,6 +2617,15 @@
         );
         removeHeldForward(forwardProjectId, forwardId);
         if (outcome.status === "resolved") {
+          // The forwarded replies can make the message too large for the CLI.
+          // The composer was cleared when the hold began, so hand everything
+          // back the way a failed forward does.
+          const tooLarge = promptTooLarge(outcome.body, attachments);
+          if (tooLarge !== null) {
+            restoreForward(body, orderedSources, attachments);
+            showError(`Forward not sent: ${tooLarge}`);
+            return;
+          }
           // Dispatch the composed body as a normal send under this forward's
           // send_id — the user message + responses render and group via the
           // existing machinery. The forward marker is derived from the body's
@@ -2442,6 +2670,14 @@
   /// survives remounts — that's why the `heldForwards` store works), so neither
   /// cleanup, activity, nor restore depends on the submitting component being
   /// alive. Deferred until forward-lifecycle code is next touched.
+  ///
+  /// The same gap covers every path that ends here — cancelled, invalidated,
+  /// IPC error, and a resolved body too large to dispatch — and has two more
+  /// faces that need no navigation: the "don't clobber" rules below restore
+  /// nothing into a draft the user started meanwhile (the sources are still
+  /// re-added to it), and the write-through at the end persists this instance's
+  /// locals, which after a remount are stale. The hoisting fix should close all
+  /// three at once rather than one failure mode at a time.
   function restoreForward(body: string, sources: ForwardSource[], attachments: Attachment[]): void {
     for (const source of sources) addForwardSource(source);
     if (draft.trim() === "" && body !== "") {
@@ -2529,6 +2765,19 @@
         );
         removeHeldForward(forwardProjectId, forwardId);
         if (outcome.status === "resolved") {
+          const tooLarge = promptTooLarge(outcome.body, attachments);
+          if (tooLarge !== null) {
+            restoreForwardPrompt(
+              prompt,
+              typedArgs,
+              appended,
+              argSources,
+              appendedSources,
+              attachments,
+            );
+            showError(`Forward not sent: ${tooLarge}`);
+            return;
+          }
           dispatchToRecipients(outcome.body, attachments, targets, sendId, forwardProjectId);
         } else {
           restoreForwardPrompt(
@@ -2707,6 +2956,14 @@
     text: string,
     attachments: Attachment[],
   ): Promise<void> {
+    // Refused before the branch exists: a fork is committed once registered and
+    // its first message must then go, so an oversized one is caught here, with
+    // the composer untouched.
+    const tooLargeFork = promptTooLarge(text, attachments);
+    if (tooLargeFork !== null) {
+      showError(`Fork not sent: ${tooLargeFork}`);
+      return;
+    }
     // **Single-flight, project-scoped.** Two submits across this await would each
     // register a branch and each dispatch the same text — two agents, the message
     // sent twice, quota spent twice. Claiming rather than setting a local flag is
@@ -2978,6 +3235,13 @@
         return;
       }
 
+      // Same rule as the plain fork: the branch is committed once registered,
+      // so an oversized rendering is refused here, before anything durable.
+      const tooLargeFork = promptTooLarge(finalText, attachments);
+      if (tooLargeFork !== null) {
+        outcome = { message: `Fork not sent: ${tooLargeFork}`, tone: "error" };
+        return;
+      }
       // ---- Pre-registration divergence: abort. Nothing durable exists yet. ----
       if (!composeUnchangedSince(snapshot)) {
         outcome = {
@@ -3048,7 +3312,12 @@
   }
 
   async function handleSubmit(): Promise<void> {
-    if (sendDisabled) return;
+    if (sendDisabled) {
+      // Plain ⌘↵ on an empty composer is deliberately silent; a composer that
+      // only a running copy is holding back should say so.
+      if (!sendDisabledExceptStaging) showError(STILL_ATTACHING);
+      return;
+    }
     clearStatus();
     // Snapshot the whole chip set once, up front (before any await), so a
     // mid-render chip edit can't change what gets sent — same discipline as the
@@ -3188,6 +3457,13 @@
           };
           return;
         }
+        // The rendered template plus appended text can exceed what the CLI
+        // takes; refuse while the prompt is still intact in the composer.
+        const tooLarge = promptTooLarge(finalText, attachments);
+        if (tooLarge !== null) {
+          outcomeForClaim = { message: `Not sent: ${tooLarge}`, tone: "error" };
+          return;
+        }
         dispatchToRecipients(finalText, attachments, targets);
         // Prompt selection is not sticky: a successful send returns to the plain
         // composer (recipients stay selected). Appended text is consumed, not
@@ -3203,6 +3479,15 @@
         // user abandoned the wait, in which case the slot is someone else's now.
         if (!abandoned) finishOperation(projectId, claim, outcomeForClaim);
       }
+    }
+
+    // Refused before the box is cleared, so the text stays where the user can
+    // shorten it or attach it. The backend refuses too, but by then the draft
+    // would be gone.
+    const tooLarge = promptTooLarge(draft.trim(), attachments);
+    if (tooLarge !== null) {
+      showError(`Not sent: ${tooLarge}`);
+      return;
     }
 
     // A send with ≥1 forward source goes through the cross-agent forward path
@@ -3402,6 +3687,7 @@
           dragOver ? "border-accent" : composeFocused ? "border-focus" : "",
         )}
         data-testid="compose-box"
+        bind:this={composeBoxEl}
         data-drag-over={dragOver}
         onfocusin={() => (composeFocused = true)}
         onfocusout={(e) => {
@@ -4029,6 +4315,7 @@
             panes={paneLayout.panes}
             {agentReadiness}
             focusFirstField={focusPromptFieldOnMount}
+            onfirstfieldfocused={() => (focusPromptFieldOnMount = false)}
             onremove={removePrompt}
             recipients={recipientChips}
             busy={composerBusy}
@@ -4053,6 +4340,7 @@
                 bind:value={draft}
                 oninput={onInput}
                 onkeydown={handleKey}
+                onpaste={onPaste}
                 class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
               />
             </div>
@@ -4164,6 +4452,23 @@
           </div>
         {/if}
       </div>
+      {#if stagingPending}
+        <p class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="compose-attaching">
+          <span>Attaching {stagingNames.join(", ")}…</span>
+          <!-- Same shape as the sign-in wait below: the copy keeps running and
+               still attaches when it finishes; what stops is the composer
+               waiting for it, so one stalled copy (a network drive) can't hold
+               the project's sends until the app restarts. -->
+          <Button
+            size="sm"
+            variant="ghost"
+            data-testid="compose-stop-attaching"
+            onclick={() => abandonStaging(projectId)}
+          >
+            Stop waiting
+          </Button>
+        </p>
+      {/if}
       {#if abandonableOperation !== undefined}
         <p class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="compose-signing-in">
           <span>Waiting for browser sign-in to {abandonableOperation.provider}…</span>
@@ -4188,6 +4493,30 @@
           >
             Stop waiting
           </Button>
+        </p>
+      {/if}
+      {#if largePasteUndo && mode !== "workflow"}
+        <p
+          class="text-muted mt-2 text-xs"
+          data-testid="compose-large-paste-notice"
+          role="status"
+          aria-live="polite"
+        >
+          Pasted text ({formatFileSize(largePasteUndo.bytes)}; limit is {formatFileSize(
+            MAX_PROMPT_BYTES,
+          )}) was attached as {largePasteUndo.label} instead of being inserted here, so the agent reads
+          it as a file.
+          {#if largePasteUndo.bytes <= MAX_PROMPT_BYTES}
+            <button
+              type="button"
+              class="text-fg hover:text-accent underline underline-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              data-testid="compose-large-paste-undo"
+              disabled={composerBusy}
+              onclick={pasteAsTextInstead}
+            >
+              Paste as text instead
+            </button>
+          {/if}
         </p>
       {/if}
       {#if sendNotice}
@@ -4255,9 +4584,11 @@
         ? liveSends.size > 1
           ? "Cancel all sends"
           : "Cancel send"
-        : projectAvailable
-          ? "Send"
-          : "Project folder unavailable"}
+        : !projectAvailable
+          ? "Project folder unavailable"
+          : stagingPending
+            ? `Attaching ${stagingNames[0]}…`
+            : "Send"}
       shortcut={shortcut("mod", "enter")}
       disableHoverableContent
     >

@@ -119,13 +119,13 @@ pub struct CodexAccountUsage {
     /// clients "must not infer recovery from percentages or reset times", so an
     /// absent value is absence, never a healthy default.
     ///
-    /// **Carried and deliberately unread.** This crate extracts it and the IPC
-    /// layer transports it, but no rendering or decision logic consumes it: the
-    /// meter draws bars from each quota's measured percentage and makes no
-    /// account-level claim about whether work is permitted. Kept because
-    /// forwarding it costs nothing and it is the field to reach for if such a
-    /// statement is ever wanted — so its extraction does not read as arbitrary
-    /// to the next person here.
+    /// **Read by the frontend for one claim only**: together with the
+    /// account-wide quota's `credits.hasCredits`, a `false` here is what draws
+    /// the "using credits" escalation — included usage is blocked and paid
+    /// credits are covering the work. The meter's bars still come from each
+    /// quota's measured percentage; this field never decides how full a bar
+    /// is, only whether that line appears beneath it
+    /// (`src/lib/usageWindows.ts::codexAccountUsageView`).
     pub ordinary_usage_allowed: Option<bool>,
     /// Every metered quota, keyed by Codex's `limit_id` (`codex`,
     /// `base_model_inference`, …).

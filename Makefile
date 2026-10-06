@@ -37,13 +37,13 @@ DEV_PORT ?= $(DEFAULT_DEV_PORT)
 DEV_SUFFIX := $(if $(filter-out $(DEFAULT_DEV_PORT),$(DEV_PORT)),-$(DEV_PORT))
 DEV_CONFIG_DIR := $(HOME)/Library/Application Support/switchboard-dev$(DEV_SUFFIX)
 
-dev:
+dev: install
 	SWITCHBOARD_CONFIG_DIR="$(DEV_CONFIG_DIR)" VITE_DEV_PORT=$(DEV_PORT) VITE_GIT_BRANCH=$(shell git branch --show-current) $(DESKTOP) tauri dev --config '{"build":{"devUrl":"http://localhost:$(DEV_PORT)"}}'
 
 # Release build of the macOS .app bundle (the only artifact that carries the
 # bundled icon). `--bundles app` skips the .dmg packaging step. Output:
 # target/release/bundle/macos/Switchboard.app
-build:
+build: install
 	$(DESKTOP) tauri build --bundles app
 	# Guards a *runtime* precondition, not a distribution one: UNUserNotificationCenter
 	# silently refuses to deliver from a bundle without a real signature, so losing
@@ -92,7 +92,7 @@ DEBUG_APP_ID ?= com.switchboard.desktop.debug
 DEBUG_APP := $(HOME)/Applications/$(DEBUG_APP_NAME).app
 DEBUG_APP_CONFIG := {"productName":"$(DEBUG_APP_NAME)","identifier":"$(DEBUG_APP_ID)"}
 
-debug-app:
+debug-app: install
 	$(DESKTOP) tauri build --debug --bundles app --config '$(DEBUG_APP_CONFIG)'
 	codesign --verify --deep --strict "target/debug/bundle/macos/$(DEBUG_APP_NAME).app"
 	rm -rf "$(DEBUG_APP)"
@@ -247,4 +247,4 @@ clean-stale:
 
 clean:
 	cargo clean
-	rm -rf node_modules dist
+	rm -rf node_modules dist desktop/node_modules desktop/dist

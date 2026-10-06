@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "desktop/src-tauri"]
+# `crates/app` is a retired path: the Tauri crate moved to `desktop/src-tauri`.
+# A checkout from before the move can keep its gitignored `crates/app/gen/`
+# after pulling, and the `crates/*` glob would then fail every cargo command on
+# a member with no manifest. Don't reuse the name.
+exclude = ["crates/app"]
 
 [workspace.package]
 version = "0.0.1"

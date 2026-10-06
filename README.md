@@ -177,51 +177,16 @@ If you miss it, Settings → Notifications tells you macOS is blocking notificat
 
 The architectural decisions, functional requirements, and open questions are being worked through in [`docs/`](./docs), starting with [`docs/system-design.md`](./docs/system-design.md). Comments and pushback welcome via issues.
 
-## Local development
+## Repository layout and development
 
-macOS only for v1. The build prerequisites are the same as [Install](#install) above — Xcode Command Line Tools, Rust (rustup), Node (pinned in [`.nvmrc`](./.nvmrc)), and pnpm (the version in `package.json`'s `packageManager`). If you've installed the app, you already have everything.
+| Path                     | What it is                                                                     | Developer guide                                    |
+| ------------------------ | ------------------------------------------------------------------------------ | -------------------------------------------------- |
+| [`desktop/`](./desktop/) | The macOS app: Svelte frontend and Tauri shell                                 | [`desktop/README.md`](./desktop/README.md)         |
+| [`ios/`](./ios/)         | The iPhone app (early scaffolding)                                             | [`ios/README.md`](./ios/README.md)                 |
+| [`crates/`](./crates/)   | Shared Rust: agent CLI adapters, dispatcher, persistence, remote-access crypto | [`AGENTS.md`](./AGENTS.md)                         |
+| [`docs/`](./docs/)       | Design, implementation plans, research                                         | [`docs/system-design.md`](./docs/system-design.md) |
 
-Common commands (run from the repo root):
-
-```sh
-make install     # one-time: pnpm install --frozen-lockfile
-make dev         # run the Tauri dev shell
-make test         # run all Rust + frontend tests (fast, offline jsdom suite)
-make test-browser # real-WebKit frontend suite (Vitest browser mode); installs WebKit if needed
-make lint         # clippy, eslint, svelte-check
-make check        # the desktop gate (incl. the browser suite) — run before opening a PR
-make check-ios    # the iOS app: build, Swift tests on a simulator, Release build checks
-make test-live    # live-harness suite against the real agent CLIs (developer-local)
-```
-
-`make test-live` exercises the adapters against the real `claude` / `codex` / `antigravity` CLIs to catch upstream drift. See [`crates/harness/tests/README.md`](./crates/harness/tests/README.md) for what it covers and how to set it up.
-
-`make test-browser` (and `make check`) run the frontend suite in a real WebKit engine via Vitest browser mode. The target installs a Playwright-managed WebKit build on demand — the first run downloads ~100 MB (cached afterward), so it needs network access once; no extra system packages are required on macOS. The default `make test` stays jsdom-only and needs none of this.
-
-See [`AGENTS.md`](./AGENTS.md) for project orientation and conventions, and [`docs/implementation_plans/`](./docs/implementation_plans/) for the roadmap and per-phase implementation plans.
-
-### The iOS app
-
-`SwitchboardMobile/` is an iPhone app for driving Switchboard remotely; it is early scaffolding, not yet usable. Working on it needs full **Xcode 16 or newer** (not just the Command Line Tools) with at least one iPhone simulator installed. The pinned Rust toolchain adds the two iOS targets it builds for on its own.
-
-```sh
-make ios-crypto   # build the shared Rust crypto library and its Swift bindings
-make check-ios    # build the app and run its tests on the newest iPhone simulator
-```
-
-Run `make ios-crypto` before opening `SwitchboardMobile/SwitchboardMobile.xcodeproj` in Xcode, and again after changing `crates/remote-crypto`: the library and bindings it generates are not committed, so the project won't resolve its package without them. `check-ios` runs as its own CI job, so `make check` doesn't cover it — run it when a change touches `SwitchboardMobile/` or `crates/remote-crypto`. Pass `IOS_SIMULATOR_ID=<udid>` to pick a simulator.
-
-None of this needs an Apple Developer account: simulator builds aren't signed. To run the app on your own iPhone, copy `SwitchboardMobile/Config/Local.xcconfig.example` to `Local.xcconfig` (gitignored) and set your team id and a bundle id of your own there. A free Apple ID's personal team works for your own device, with apps expiring after 7 days.
-
-### Developing without an agent CLI installed
-
-If no agent CLI is on your `PATH` (or you don't want to burn quota during UI iteration), launch with the mock harness:
-
-```sh
-SWITCHBOARD_HARNESS=mock make dev
-```
-
-The mock emits canned streaming responses (`Mock response to: <prompt> — replied by mock harness.`) — identical event-stream shape to a real harness, so the UI exercises every code path, and the startup binary-not-found banner stays hidden.
+Every command runs from the repo root through `make`. [`AGENTS.md`](./AGENTS.md) has project orientation and conventions for humans and AI agents alike.
 
 ## License
 

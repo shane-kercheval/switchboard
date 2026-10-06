@@ -1082,8 +1082,13 @@ at login, starting hidden; README and system-design documentation; the pilot rel
 denylist procedure written down; the App Store Connect export-compliance answer
 (`ITSAppUsesNonExemptEncryption`), decided and recorded. The app implements its own
 end-to-end encryption, so the "exempt encryption only" answer cannot be assumed. TestFlight
-internal testing for both developers.
+internal testing for both developers. A release build of the xcframework, separate from the
+development one: only the development build carries a deliberately panicking export, and a
+Swift test calls it to prove a Rust panic arrives as a thrown error. That is what the `ios`
+Cargo profile's `panic = "unwind"` exists for, and nothing else catches a regression to abort.
 *Done when:* a TestFlight build installed on both developers' phones pairs with the deployed
-relay and completes a send from outside the home network; and adding a test phone's id to
-`DENY_DEVICE_IDS` on the deployed relay cuts it off.
+relay and completes a send from outside the home network; adding a test phone's id to
+`DENY_DEVICE_IDS` on the deployed relay cuts it off; the panic test passes against the
+development build; and `check-ios` confirms the release build does not export the panicking
+function.
 *Review:* none new; confirm earlier boundaries are unchanged.

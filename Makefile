@@ -190,14 +190,13 @@ ios-crypto:
 	rm -rf $(IOS_GENERATED)
 	mv $(IOS_STAGING)/Generated $(IOS_GENERATED)
 
-# Builds the app and runs the package's tests on a simulator, builds Release,
-# and checks both built Info.plists. A separate CI job, so `check` (and its wall
+# Checks that only Crypto/ imports the generated bindings, builds the app and
+# runs the package's tests on a simulator, builds Release, and checks both
+# built Info.plists. A separate CI job, so `check` (and its wall
 # time) is unchanged; `check` is therefore no longer everything CI runs.
 check-ios: ios-crypto
 	@test -n "$(IOS_SIMULATOR_ID)" || { echo "No available iPhone simulator. Install one in Xcode, or pass IOS_SIMULATOR_ID=<udid>."; exit 1; }
-	@! grep -rlE '^[[:space:]]*([a-z]+[[:space:]]+)?import[[:space:]]+SwitchboardRemoteCrypto\b' $(IOS_KIT)/Sources $(IOS_KIT)/Tests SwitchboardMobile/SwitchboardMobile \
-		| grep -v '^$(IOS_KIT)/Sources/SwitchboardMobileKit/Crypto/' \
-		| sed 's/^/Only SwitchboardMobileKit\/Crypto\/ may import the generated bindings: /' | grep .
+	SwitchboardMobile/scripts/check-binding-imports.sh
 	xcodebuild test -quiet -project $(IOS_PROJECT) -scheme SwitchboardMobile -configuration Debug \
 		-destination '$(IOS_DESTINATION)' -derivedDataPath $(IOS_DERIVED_DATA) CODE_SIGNING_ALLOWED=NO
 	xcodebuild build -quiet -project $(IOS_PROJECT) -scheme SwitchboardMobile -configuration Release \

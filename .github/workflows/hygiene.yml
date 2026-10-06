@@ -1,10 +1,17 @@
 name: hygiene
 
+# A change confined to docs/ touches nothing CI checks: prettier ignores docs/
+# and no test reads it. Root Markdown (README.md, AGENTS.md) still triggers CI
+# because `pnpm format:check` covers it.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
 
 concurrency:
   group: hygiene-${{ github.workflow }}-${{ github.ref }}

@@ -13,6 +13,8 @@ Switchboard is a macOS desktop app for orchestrating multiple AI coding agents (
   - `crates/core/` — pure-Rust persistence: `Directory`, `Project`, `AgentRecord`, name validation, JSONL/YAML I/O. No Tauri dependency, no async.
   - `crates/harness/` — per-harness adapters (`HarnessAdapter` trait + `ClaudeCodeAdapter`, `CodexAdapter`, `MockHarnessAdapter`), event types, stream parsers, session-file parsers. No Tauri dependency.
   - `crates/dispatcher/` — `Dispatcher`, `EventEmitter` trait, per-agent actor tasks. Drives adapters; owns per-agent in-memory state + `TurnId` generation. "One turn in flight per agent" is structural (a single consumer per agent), not a status flag or guard. No Tauri dependency.
+  - `crates/remote-crypto/` — remote-access cryptography shared with the iOS app through UniFFI (one implementation for both ends of a handshake). No tokio, no Tauri. Its `uniffi-bindgen` binary sits behind the `bindgen` feature and is run only by `make ios-crypto`.
+- **iOS app** (`SwitchboardMobile/`) — SwiftUI, iOS 17+, Swift 6 language mode, no third-party Swift packages. A thin app target (`@main` composition root, `Views/`, per-configuration Info.plists) over the local package `SwitchboardMobileKit`, which holds everything else and links `crates/remote-crypto` as an xcframework. Only the package's `Crypto/` imports the generated bindings. The project uses synchronized folders, so adding a Swift file needs no `project.pbxproj` edit. Design: `docs/implementation_plans/2026-09-29-remote-control.md` §7.
 - **Frontend** — Svelte 5 + Vite + TypeScript + Tailwind v4, with shadcn-svelte components. Lives at repo root (`src/`, `index.html`, `vite.config.ts`).
 - **Tauri shell** bridges frontend ↔ Rust via `#[tauri::command]` handlers and per-agent event channels.
 
@@ -22,6 +24,8 @@ For each crate's internal mechanics, read the source (the `*_impl` functions are
 
 - `crates/app/` — Tauri Rust crate.
 - `crates/core/`, `crates/harness/`, `crates/dispatcher/` — workspace members.
+- `crates/remote-crypto/` — workspace member shared with the iOS app.
+- `SwitchboardMobile/` — the iOS app: `SwitchboardMobile.xcodeproj`, the app target, and the `SwitchboardMobileKit` package. `SwitchboardMobileKit/Generated/` is written by `make ios-crypto` and is not committed — run it before opening the project in Xcode.
 - `src/` — frontend Svelte/TS sources.
 - `tests/` — frontend test setup + integration tests.
 - `docs/` — design docs, milestone plans, research notes. Read before changing scope.
@@ -39,7 +43,9 @@ All via `make`:
 - `make test-browser` — runs the real-WebKit frontend suite (Vitest browser mode); ensures the WebKit binary first. Slower than `make test`; kept separate so the jsdom inner loop stays quick.
 - `make lint` — runs clippy, eslint, svelte-check.
 - `make fmt` — formats Rust + frontend.
-- `make check` — everything CI runs (fmt check, lint, test, type-check, **and** the browser suite). Run this before opening a PR.
+- `make check` — the desktop gate: fmt check, lint, test, type-check, **and** the browser suite. Run this before opening a PR. It is **not** everything CI runs: the iOS app is a separate CI job (`check-ios`), so run that too when a change touches `SwitchboardMobile/` or `crates/remote-crypto`.
+- `make ios-crypto` — builds `crates/remote-crypto` for `aarch64-apple-ios` and `aarch64-apple-ios-sim`, packages it as an xcframework, and generates the Swift bindings into `SwitchboardMobile/SwitchboardMobileKit/Generated/`. Rerun after changing the crate.
+- `make check-ios` — `ios-crypto`, then `xcodebuild test` of the app scheme (builds the app and runs the package's tests) on the newest available iPhone simulator; pass `IOS_SIMULATOR_ID=<udid>` to choose one. Needs Xcode 16 or later.
 - `make clean-stale` — deletes build artifacts nothing has touched in a week, keeping the warm cache. **Run this when builds start feeling slow** — see "Build times are a `target/` problem" below. Needs `cargo install cargo-sweep` once.
 - `make clean` — removes all build artifacts (forces a full rebuild).
 

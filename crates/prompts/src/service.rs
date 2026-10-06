@@ -1,4 +1,4 @@
-//! The prompt service: the single entry point `crates/app` drives through its
+//! The prompt service: the single entry point `desktop/src-tauri` drives through its
 //! Tauri command shims. Owns the resolved (injected) config path, default
 //! prompts directory, home directory, the secret store, and the **build-once
 //! prompt cache**.
@@ -207,7 +207,7 @@ impl PromptResolutionSnapshot {
 }
 
 /// Resolves prompts from user-global config. Construct with [`PromptService::new`]
-/// in production (paths + secret store injected by `crates/app`);
+/// in production (paths + secret store injected by `desktop/src-tauri`);
 /// [`PromptService::disabled`] yields an inert service (lists nothing, render
 /// fails) for contexts with no configured prompt store.
 #[derive(Clone)]

@@ -35,13 +35,13 @@ out/
 **/__screenshots__/
 
 # Tauri generated
-crates/app/gen/
+desktop/src-tauri/gen/
 
 # iOS: `make ios-crypto` output, and Xcode per-user state
-SwitchboardMobile/SwitchboardMobileKit/Generated/
-SwitchboardMobile/SwitchboardMobileKit/.swiftpm/
-SwitchboardMobile/SwitchboardMobileKit/.build/
-SwitchboardMobile/Config/Local.xcconfig
+ios/SwitchboardMobileKit/Generated/
+ios/SwitchboardMobileKit/.swiftpm/
+ios/SwitchboardMobileKit/.build/
+ios/Config/Local.xcconfig
 xcuserdata/
 DerivedData/
 

@@ -1,11 +1,11 @@
 //! Shared types for transcript hydration from harness session files.
 //!
 //! `Turn::User`/`Turn::Agent` and `TurnItem` mirror the TS shape in
-//! `src/lib/state/types.ts` verbatim — they round-trip through the per-agent
+//! `desktop/src/lib/state/types.ts` verbatim — they round-trip through the per-agent
 //! hydration path (`load_transcript`) onto the frontend's `LoadedTurn`.
 //! `Turn::System` is the exception: it has **no** frontend `Turn`/`LoadedTurn`
 //! analog. It reaches the UI only as a `ConversationItem` via the project
-//! conversation merge, and `load_transcript_impl` (`crates/app/src/commands.rs`)
+//! conversation merge, and `load_transcript_impl` (`desktop/src-tauri/src/commands.rs`)
 //! filters it out before the per-agent IPC. A new caller that serializes
 //! `LoadedTranscript` straight to the frontend must filter `Turn::System` too,
 //! or it re-introduces a `role:"system"` turn the frontend can't model.

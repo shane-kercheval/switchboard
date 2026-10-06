@@ -1,0 +1,18 @@
+{
+  "name": "switchboard",
+  "version": "0.0.1",
+  "description": "Switchboard: a macOS app for orchestrating AI coding agents, and its iPhone companion",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.1.1",
+  "scripts": {
+    "format": "prettier --write \"**/*.{ts,js,svelte,css,html,json,md}\"",
+    "format:check": "prettier --check \"**/*.{ts,js,svelte,css,html,json,md}\""
+  },
+  "devDependencies": {
+    "prettier": "^3.8.3",
+    "prettier-plugin-svelte": "^3.5.2",
+    "prettier-plugin-tailwindcss": "^0.8.0"
+  }
+}

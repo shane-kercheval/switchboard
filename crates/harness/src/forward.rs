@@ -122,8 +122,8 @@ pub fn compose_forwarded_message(body: &str, blocks: &[ForwardedBlock<'_>]) -> S
     for block in blocks {
         // SYNCHRONIZED WIRE SHAPE: the frontend bands this block by string-matching
         // `=== START forwarded from … ===` (`FORWARD_SENTINEL` in
-        // `src/lib/state/heldForwards.svelte.ts`, `QUOTED_BLOCK` in
-        // `src/lib/components/UnifiedTranscript.svelte`). Changing this string
+        // `desktop/src/lib/state/heldForwards.svelte.ts`, `QUOTED_BLOCK` in
+        // `desktop/src/lib/components/UnifiedTranscript.svelte`). Changing this string
         // breaks transcript styling unless both languages change together.
         sections.push(format!(
             "=== START forwarded from {name} ===\n{text}\n=== END forwarded from {name} ===",

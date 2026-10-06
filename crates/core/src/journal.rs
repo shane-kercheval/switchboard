@@ -13,7 +13,7 @@
 //! A [`JournalRecord::TurnLink`] now records a stable per-turn id
 //! (`hydration_key`) for a content-bearing turn, so the merge joins that turn to
 //! its send by key instead of counting — see [`JournalRecord::TurnLink`] and
-//! `crates/app/src/commands.rs::merge_project_conversation`. It carries a harness
+//! `desktop/src-tauri/src/commands.rs::merge_project_conversation`. It carries a harness
 //! **identifier**, never agent content, so the "no agent content" invariant holds
 //! (same category as the `message.id` the cost sidecar already joins on).
 //! Positional correlation remains the fallback for turns/harnesses with no such

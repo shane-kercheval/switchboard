@@ -4494,7 +4494,7 @@ describe("App", () => {
   // Reading mode's notification half is one clause in `visibleProjectId`: the
   // project reports as *not* on screen, so the Rust gate treats its completion
   // like a background project's. These tests own the frontend end of that — the
-  // gate itself is tested in `crates/app`.
+  // gate itself is tested in `desktop/src-tauri`.
 
   async function openProjectAlpha(): Promise<void> {
     seedProject({

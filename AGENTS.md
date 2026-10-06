@@ -41,7 +41,7 @@ For each crate's internal mechanics, read the source (the `*_impl` functions are
 All via `make`:
 
 - `make install` — `pnpm install --frozen-lockfile` for the whole pnpm workspace (one-time / after lockfile changes).
-- `make dev` — runs the Tauri dev shell. Pass `DEV_PORT=<port>` (default 1420) to run a second instance side by side — e.g. two worktrees, or comparing a change against `main`. Each port gets its own isolated dev config, so concurrent instances don't clobber each other's project list. The default port shares one config with a bare `cargo run`; `docs/implementation_plans/2026-05-30-macos-release-distribution.md` (M1) has the isolation rules.
+- `make dev` — runs the Tauri dev shell. Pass `DEV_PORT=<port>` (default 1420) to run a second instance side by side — e.g. two worktrees, or comparing a change against `main`. Each port gets its own isolated dev config, so concurrent instances don't clobber each other's project list. The default port shares one config with a bare `cargo run`; `docs/implementation_plans/2026-05-30-macos-release-distribution.md` (M1) has the isolation rules. `dev` (like `build` and `debug-app`) runs `make install` first; to start two instances in one checkout right after a dependency change, wait for the first one's install to finish, because two concurrent installs can make one of them fail (rerun it).
 - `make test` — runs all Rust + frontend tests (the fast, offline jsdom suite — **not** the browser suite).
 - `make test-browser` — runs the real-WebKit frontend suite (Vitest browser mode); ensures the WebKit binary first. Slower than `make test`; kept separate so the jsdom inner loop stays quick.
 - `make lint` — runs clippy, eslint, svelte-check.

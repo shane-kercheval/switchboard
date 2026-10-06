@@ -23,4 +23,4 @@ Run `make ios-crypto` before opening `ios/SwitchboardMobile.xcodeproj` in Xcode,
 
 ## Running on your iPhone
 
-None of the above needs an Apple Developer account: simulator builds aren't signed. To run the app on your own iPhone, copy `Config/Local.xcconfig.example` to `Config/Local.xcconfig` (gitignored) and set your team id and a bundle id of your own there. A free Apple ID's personal team works for your own device, with apps expiring after 7 days.
+None of the above needs an Apple Developer account: simulator builds aren't signed. To run the app on your own iPhone, copy `Config/Local.xcconfig.example` to `Config/Local.xcconfig` (gitignored) and set your team id and a bundle id of your own there. A free Apple ID's personal team works for your own device, with apps expiring after 7 days. If you set one up before the app moved to `ios/`, it is still at `SwitchboardMobile/Config/Local.xcconfig`, because git doesn't move ignored files: move it to `ios/Config/`.

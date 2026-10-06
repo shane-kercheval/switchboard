@@ -37,6 +37,14 @@ out/
 # Tauri generated
 crates/app/gen/
 
+# iOS: `make ios-crypto` output, and Xcode per-user state
+SwitchboardMobile/SwitchboardMobileKit/Generated/
+SwitchboardMobile/SwitchboardMobileKit/.swiftpm/
+SwitchboardMobile/SwitchboardMobileKit/.build/
+SwitchboardMobile/Config/Local.xcconfig
+xcuserdata/
+DerivedData/
+
 # Local switchboard state
 .switchboard/
 /.antigravitycli

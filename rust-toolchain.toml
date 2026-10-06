@@ -1,4 +1,6 @@
 [toolchain]
 channel = "1.95.0"
 components = ["rustfmt", "clippy"]
+# The iOS app links `crates/remote-crypto` as a static library (`make ios-crypto`).
+targets = ["aarch64-apple-ios", "aarch64-apple-ios-sim"]
 profile = "minimal"

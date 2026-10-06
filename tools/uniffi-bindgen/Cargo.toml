@@ -1,0 +1,15 @@
+# Generates the Swift bindings for `crates/remote-crypto`; run only by
+# `make ios-crypto`. A workspace of its own, so the desktop gates
+# (`--workspace --all-features`) never build UniFFI's command-line tool. Its
+# `uniffi` must equal the crate's exactly: `make ios-crypto` checks the two
+# lockfiles agree.
+[package]
+name = "uniffi-bindgen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+uniffi = { version = "=0.32.2", features = ["cli"] }

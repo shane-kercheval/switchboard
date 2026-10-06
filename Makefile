@@ -1,4 +1,4 @@
-.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check check-rust check-frontend clean clean-stale install test-live test-live-claude test-live-codex test-live-antigravity
+.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check check-rust check-frontend clean clean-stale install ios-crypto check-ios test-live test-live-claude test-live-codex test-live-antigravity
 
 # Crates that carry live (`#[ignore]`-gated) harness tests.
 LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
@@ -140,6 +140,70 @@ check-frontend:
 	pnpm test:browser
 
 check: check-rust check-frontend
+
+# The iOS app (`SwitchboardMobile/`) links `crates/remote-crypto` as an
+# xcframework with UniFFI-generated Swift bindings. Both are build products,
+# written into the package's gitignored `Generated/` directory; run
+# `ios-crypto` once before opening the project in Xcode, and again after
+# changing the crate.
+IOS_PROJECT := SwitchboardMobile/SwitchboardMobile.xcodeproj
+IOS_KIT := SwitchboardMobile/SwitchboardMobileKit
+IOS_GENERATED := $(IOS_KIT)/Generated
+IOS_STAGING := target/ios-crypto
+IOS_DERIVED_DATA := target/ios-derived-data
+IOS_CRYPTO_LIB := libswitchboard_remote_crypto.a
+IOS_CRYPTO_FFI := switchboard_remote_cryptoFFI
+IOS_RUST_TARGETS := aarch64-apple-ios aarch64-apple-ios-sim
+UNIFFI_BINDGEN := tools/uniffi-bindgen/Cargo.toml
+
+# The newest available iPhone simulator, unless overridden with
+# `IOS_SIMULATOR_ID=<udid>`. Resolved lazily, so only `check-ios` pays for it.
+IOS_SIMULATOR_ID ?= $(shell xcrun simctl list devices available | grep -E '^ +iPhone' | tail -1 | grep -oE '[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}')
+IOS_DESTINATION = platform=iOS Simulator,id=$(IOS_SIMULATOR_ID)
+
+# Everything is generated into the staging directory and moved into
+# `Generated/` only once every output exists, so a failed run leaves the last
+# working package in place.
+ios-crypto:
+	@lock_version() { awk '/^name = "uniffi"$$/ { getline; print $$3 }' "$$1"; }; \
+	crate=$$(lock_version Cargo.lock); tool=$$(lock_version tools/uniffi-bindgen/Cargo.lock); \
+	[ -n "$$crate" ] && [ "$$crate" = "$$tool" ] || { \
+		echo "uniffi differs: crates/remote-crypto has $$crate, tools/uniffi-bindgen has $$tool. Pin the tool to the crate's version."; exit 1; }
+	for target in $(IOS_RUST_TARGETS); do \
+		$(NO_INCR) cargo rustc -p switchboard-remote-crypto --lib --profile ios --locked --target $$target --crate-type staticlib || exit 1; \
+	done
+	rm -rf $(IOS_STAGING)
+	$(NO_INCR) cargo run -q --manifest-path $(UNIFFI_BINDGEN) --target-dir target --locked -- \
+		generate --library target/aarch64-apple-ios/ios/$(IOS_CRYPTO_LIB) --language swift --out-dir $(IOS_STAGING)/bindings
+	# Each xcframework's headers sit in a directory named for their module, so a
+	# second Rust xcframework can never collide on `module.modulemap`.
+	mkdir -p $(IOS_STAGING)/headers/$(IOS_CRYPTO_FFI) $(IOS_STAGING)/Generated/SwitchboardRemoteCrypto
+	cp $(IOS_STAGING)/bindings/$(IOS_CRYPTO_FFI).h $(IOS_STAGING)/headers/$(IOS_CRYPTO_FFI)/
+	cp $(IOS_STAGING)/bindings/$(IOS_CRYPTO_FFI).modulemap $(IOS_STAGING)/headers/$(IOS_CRYPTO_FFI)/module.modulemap
+	cp $(IOS_STAGING)/bindings/switchboard_remote_crypto.swift $(IOS_STAGING)/Generated/SwitchboardRemoteCrypto/
+	xcodebuild -create-xcframework \
+		-library target/aarch64-apple-ios/ios/$(IOS_CRYPTO_LIB) -headers $(IOS_STAGING)/headers \
+		-library target/aarch64-apple-ios-sim/ios/$(IOS_CRYPTO_LIB) -headers $(IOS_STAGING)/headers \
+		-output $(IOS_STAGING)/Generated/SwitchboardRemoteCryptoFFI.xcframework
+	test -s $(IOS_STAGING)/Generated/SwitchboardRemoteCrypto/switchboard_remote_crypto.swift
+	test -f $(IOS_STAGING)/Generated/SwitchboardRemoteCryptoFFI.xcframework/Info.plist
+	rm -rf $(IOS_GENERATED)
+	mv $(IOS_STAGING)/Generated $(IOS_GENERATED)
+
+# Checks that only Crypto/ imports the generated bindings and that a simulator
+# exists before the slow Rust build, then builds the app and runs the package's
+# tests on a simulator, builds Release, and checks both built Info.plists. A separate CI job, so `check` (and its wall
+# time) is unchanged; `check` is therefore no longer everything CI runs.
+check-ios:
+	SwitchboardMobile/scripts/check-binding-imports.sh
+	@test -n "$(IOS_SIMULATOR_ID)" || { echo "No available iPhone simulator. Install one in Xcode, or pass IOS_SIMULATOR_ID=<udid>."; exit 1; }
+	$(MAKE) ios-crypto
+	xcodebuild test -quiet -project $(IOS_PROJECT) -scheme SwitchboardMobile -configuration Debug \
+		-destination '$(IOS_DESTINATION)' -derivedDataPath $(IOS_DERIVED_DATA) CODE_SIGNING_ALLOWED=NO
+	xcodebuild build -quiet -project $(IOS_PROJECT) -scheme SwitchboardMobile -configuration Release \
+		-destination '$(IOS_DESTINATION)' -derivedDataPath $(IOS_DERIVED_DATA) CODE_SIGNING_ALLOWED=NO
+	SwitchboardMobile/scripts/check-info-plist.sh $(IOS_DERIVED_DATA)/Build/Products/Debug-iphonesimulator/SwitchboardMobile.app/Info.plist Debug
+	SwitchboardMobile/scripts/check-info-plist.sh $(IOS_DERIVED_DATA)/Build/Products/Release-iphonesimulator/SwitchboardMobile.app/Info.plist Release
 
 test-live:
 	cargo test --locked $(LIVE_PKGS) -- --ignored

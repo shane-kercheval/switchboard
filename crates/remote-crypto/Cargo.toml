@@ -1,0 +1,17 @@
+[package]
+name = "switchboard-remote-crypto"
+description = "Switchboard remote-access cryptography, shared with the iOS app through UniFFI (pure Rust, no tokio, no Tauri)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sha2 = "0.11.0"
+thiserror.workspace = true
+uniffi = "0.32.2"

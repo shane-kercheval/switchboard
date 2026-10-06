@@ -72,3 +72,25 @@ jobs:
 
       - name: make check-frontend
         run: make check-frontend
+
+  ios:
+    name: iOS build + test (macos-15)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the pinned toolchain, including the two iOS targets listed in
+      # `rust-toolchain.toml`.
+      - name: Resolve pinned Rust toolchain
+        run: rustc --version --verbose
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ios
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: make check-ios
+        run: make check-ios

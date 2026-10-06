@@ -3,7 +3,8 @@
 # UniFFI-generated module or the C module under it. Generated types stop at
 # Crypto/, so regenerating the bindings can only ever break that directory.
 #
-# A grep, not a parser: two imports on one line separated by `;` get past it.
+# A grep, not a parser: it catches every conventional import form, but two
+# imports on one line separated by `;` get past it.
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -38,11 +39,41 @@ none|import SwitchboardRemoteCryptoExtras
 CASES
 [ "$self_check_failures" -eq 0 ] || exit 1
 
-violations=$(grep -rlE --include='*.swift' "$pattern" \
-	"$root/SwitchboardMobileKit/Sources" "$root/SwitchboardMobileKit/Tests" "$root/SwitchboardMobile" |
-	grep -v "^$allowed")
+# One recursive grep over the whole app tree, so a new target or folder is
+# covered without editing this list, and grep's own status separates "no
+# match" (1) from an error (2) such as an unreadable file. `Generated/` holds
+# the bindings themselves.
+matches=$(grep -rlE --include='*.swift' \
+	--exclude-dir=Generated --exclude-dir=.build --exclude-dir=.swiftpm --exclude-dir=DerivedData \
+	"$pattern" "$root")
+status=$?
+if [ "$status" -gt 1 ]; then
+	echo "check-binding-imports: the scan failed (grep exit $status), so nothing was checked." >&2
+	exit 1
+fi
+
+found_allowed=no
+violations=
+while IFS= read -r file; do
+	[ -n "$file" ] || continue
+	case $file in
+	"$allowed"*) found_allowed=yes ;;
+	*) violations="$violations$file
+" ;;
+	esac
+done <<SCAN
+$matches
+SCAN
+
 if [ -n "$violations" ]; then
 	echo "Only SwitchboardMobileKit/Sources/SwitchboardMobileKit/Crypto/ may import the generated bindings:" >&2
-	echo "$violations" >&2
+	printf '%s' "$violations" >&2
+	exit 1
+fi
+
+# Crypto/ itself imports the bindings, so finding no import there means the
+# scan is not looking where the bindings are used.
+if [ "$found_allowed" = no ]; then
+	echo "check-binding-imports: found no import of the bindings in $allowed, so the scan is not covering the package." >&2
 	exit 1
 fi

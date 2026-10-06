@@ -992,7 +992,9 @@ no App Group or push entitlements until then.
   `ios-crypto`; `xcodebuild test`), `make protocol-fixtures` (regenerate). CI runs `check-ios`
   as a separate job on the existing `macos-15` runner so the main gate's time is unchanged.
 - **Distribution.** Bundle id `<team-prefix>.switchboard.mobile` and signing team are
-  placeholders until the owner's Apple Developer Program account is set up. TestFlight internal
+  placeholders until the owner's Apple Developer Program account is set up. Developers sign
+  their own device builds through a gitignored `Local.xcconfig`; the distribution identity is
+  committed separately, in M5's distribution build configuration. TestFlight internal
   testing; both developers are internal testers. Builds expire after 90 days, so a release
   cadence of at least one build per quarter keeps the app usable.
 - **Docs.** `docs/system-design.md` gains Remote access (the §2 threat model, what the relay can
@@ -1082,13 +1084,12 @@ at login, starting hidden; README and system-design documentation; the pilot rel
 denylist procedure written down; the App Store Connect export-compliance answer
 (`ITSAppUsesNonExemptEncryption`), decided and recorded. The app implements its own
 end-to-end encryption, so the "exempt encryption only" answer cannot be assumed. TestFlight
-internal testing for both developers. A release build of the xcframework, separate from the
-development one: only the development build carries a deliberately panicking export, and a
-Swift test calls it to prove a Rust panic arrives as a thrown error. That is what the `ios`
-Cargo profile's `panic = "unwind"` exists for, and nothing else catches a regression to abort.
+internal testing for both developers. A committed distribution identity: a dedicated
+distribution build configuration carrying the owner's team id and the App Store bundle id,
+which does not include a developer's `Local.xcconfig`, so a TestFlight archive never depends
+on one developer's local settings. Only ids are committed, never a certificate or key.
 *Done when:* a TestFlight build installed on both developers' phones pairs with the deployed
 relay and completes a send from outside the home network; adding a test phone's id to
-`DENY_DEVICE_IDS` on the deployed relay cuts it off; the panic test passes against the
-development build; and `check-ios` confirms the release build does not export the panicking
-function.
+`DENY_DEVICE_IDS` on the deployed relay cuts it off; and an archive from a clean checkout with
+no `Local.xcconfig` carries the committed team and bundle id.
 *Review:* none new; confirm earlier boundaries are unchanged.

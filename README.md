@@ -211,6 +211,8 @@ make check-ios    # build the app and run its tests on the newest iPhone simulat
 
 Run `make ios-crypto` before opening `SwitchboardMobile/SwitchboardMobile.xcodeproj` in Xcode, and again after changing `crates/remote-crypto`: the library and bindings it generates are not committed, so the project won't resolve its package without them. `check-ios` runs as its own CI job, so `make check` doesn't cover it — run it when a change touches `SwitchboardMobile/` or `crates/remote-crypto`. Pass `IOS_SIMULATOR_ID=<udid>` to pick a simulator.
 
+None of this needs an Apple Developer account: simulator builds aren't signed. To run the app on your own iPhone, copy `SwitchboardMobile/Config/Local.xcconfig.example` to `Local.xcconfig` (gitignored) and set your team id and a bundle id of your own there. A free Apple ID's personal team works for your own device, with apps expiring after 7 days.
+
 ### Developing without an agent CLI installed
 
 If no agent CLI is on your `PATH` (or you don't want to burn quota during UI iteration), launch with the mock harness:

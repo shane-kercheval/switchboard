@@ -25,7 +25,7 @@ For each crate's internal mechanics, read the source (the `*_impl` functions are
 - `crates/app/` — Tauri Rust crate.
 - `crates/core/`, `crates/harness/`, `crates/dispatcher/` — workspace members.
 - `crates/remote-crypto/` — workspace member shared with the iOS app.
-- `SwitchboardMobile/` — the iOS app: `SwitchboardMobile.xcodeproj`, the app target, and the `SwitchboardMobileKit` package. `SwitchboardMobileKit/Generated/` is written by `make ios-crypto` and is not committed — run it before opening the project in Xcode.
+- `SwitchboardMobile/` — the iOS app: `SwitchboardMobile.xcodeproj`, the app target, and the `SwitchboardMobileKit` package. `SwitchboardMobileKit/Generated/` is written by `make ios-crypto` and is not committed — run it before opening the project in Xcode. Signing is per developer: `Config/Signing.xcconfig` holds teamless defaults and includes a gitignored `Config/Local.xcconfig`, so no one's team id is committed.
 - `src/` — frontend Svelte/TS sources.
 - `tests/` — frontend test setup + integration tests.
 - `docs/` — design docs, milestone plans, research notes. Read before changing scope.

@@ -41,6 +41,7 @@ crates/app/gen/
 SwitchboardMobile/SwitchboardMobileKit/Generated/
 SwitchboardMobile/SwitchboardMobileKit/.swiftpm/
 SwitchboardMobile/SwitchboardMobileKit/.build/
+SwitchboardMobile/Config/Local.xcconfig
 xcuserdata/
 DerivedData/
 

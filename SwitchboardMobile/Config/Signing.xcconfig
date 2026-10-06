@@ -1,0 +1,11 @@
+// Signing defaults for the app target. They sign nothing: simulator builds,
+// `make check-ios`, and CI need no team.
+//
+// To run on your own iPhone, copy Local.xcconfig.example to Local.xcconfig
+// (gitignored) and set your team there, so no one's team id lands in the
+// project.
+
+PRODUCT_BUNDLE_IDENTIFIER = com.switchboard.mobile
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

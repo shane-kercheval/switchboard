@@ -11,6 +11,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		5B5B00000000000000000015 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Signing.xcconfig; sourceTree = "<group>"; };
 		5B5B00000000000000000014 /* SwitchboardMobileKit */ = {isa = PBXFileReference; lastKnownFileType = wrapper; path = SwitchboardMobileKit; sourceTree = "<group>"; };
 		5B5B00000000000000000004 /* SwitchboardMobile.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SwitchboardMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -54,8 +55,17 @@
 			children = (
 				5B5B00000000000000000014 /* SwitchboardMobileKit */,
 				5B5B00000000000000000005 /* SwitchboardMobile */,
+				5B5B00000000000000000016 /* Config */,
 				5B5B00000000000000000003 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		5B5B00000000000000000016 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				5B5B00000000000000000015 /* Signing.xcconfig */,
+			);
+			path = Config;
 			sourceTree = "<group>";
 		};
 		5B5B00000000000000000003 /* Products */ = {
@@ -185,6 +195,7 @@
 		};
 		5B5B00000000000000000012 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 5B5B00000000000000000015 /* Signing.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -199,7 +210,6 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.0.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.switchboard.mobile;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -211,6 +221,7 @@
 		};
 		5B5B00000000000000000013 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 5B5B00000000000000000015 /* Signing.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -225,7 +236,6 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.0.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.switchboard.mobile;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;

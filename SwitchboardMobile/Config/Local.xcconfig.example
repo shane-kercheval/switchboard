@@ -1,0 +1,9 @@
+// Copy to Local.xcconfig (gitignored) to sign for your own iPhone.
+
+// Your team id: Xcode → Settings → Accounts, or developer.apple.com →
+// Membership. A free Apple ID's personal team works for your own device.
+DEVELOPMENT_TEAM = ABCDE12345
+
+// A bundle id is registered to one team, so each developer signing with their
+// own team needs a distinct one.
+PRODUCT_BUNDLE_IDENTIFIER = com.example.switchboard.mobile

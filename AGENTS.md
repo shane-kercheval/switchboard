@@ -31,7 +31,7 @@ For each crate's internal mechanics, read the source (the `*_impl` functions are
 - `ios/` — the iPhone app ([`ios/README.md`](ios/README.md)): `SwitchboardMobile.xcodeproj`, the app target, and the `SwitchboardMobileKit` package. `SwitchboardMobileKit/Generated/` is written by `make ios-crypto` and is not committed — run it before opening the project in Xcode. Signing is per developer: `Config/Signing.xcconfig` holds teamless defaults and includes a gitignored `Config/Local.xcconfig`, so no one's team id is committed.
 - `crates/` — shared Rust workspace members (`core`, `harness`, `dispatcher`, `git`, `prompts`, `workflow`, `migrate`, `remote-crypto`).
 - `tools/uniffi-bindgen/` — generates the iOS Swift bindings; its own Cargo workspace.
-- `docs/` — design docs, milestone plans, research notes. Read before changing scope. Implementation plans are historical records: paths in plans written before the `desktop/` and `ios/` move still name the old locations.
+- `docs/` — design docs, milestone plans, research notes. Read before changing scope. Completed implementation plans are historical records: paths in those written before the `desktop/` and `ios/` move still name the old locations. The active plan's paths are kept current.
 - `docs/implementation_plans/` — per-milestone plans. The current milestone's plan is the ground truth for what to build.
 - `.github/workflows/` — CI definitions.
 - `Makefile` — single source of truth for dev commands. Run every command from the repo root.

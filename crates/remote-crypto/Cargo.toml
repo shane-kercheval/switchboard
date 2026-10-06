@@ -11,16 +11,6 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
-[features]
-# Builds the `uniffi-bindgen` binary that `make ios-crypto` runs to generate the
-# Swift bindings. Off by default so the library never pulls in the CLI.
-bindgen = ["uniffi/cli"]
-
-[[bin]]
-name = "uniffi-bindgen"
-path = "src/bin/uniffi-bindgen.rs"
-required-features = ["bindgen"]
-
 [dependencies]
 sha2 = "0.11.0"
 thiserror.workspace = true

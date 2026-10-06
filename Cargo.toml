@@ -63,3 +63,11 @@ lto = true
 opt-level = "s"
 panic = "abort"
 strip = true
+
+# The iOS static library from `crates/remote-crypto` (`make ios-crypto`). UniFFI
+# turns a Rust panic into a Swift error only by unwinding it, so under the
+# desktop's `panic = "abort"` a panic in code reading relay bytes would kill
+# the app rather than fail the one frame.
+[profile.ios]
+inherits = "release"
+panic = "unwind"

@@ -9,13 +9,11 @@ public enum BindingSelfCheck: Equatable, Sendable {
 
     static let sampleHandshakeHash = Data(repeating: 0, count: 32)
 
-    private static let logger = Logger(subsystem: "com.switchboard.mobile", category: "crypto")
-
     public init(using codes: some ConfirmationCodeDeriving) {
         do {
             self = .derived(code: try codes.confirmationCode(handshakeHash: Self.sampleHandshakeHash))
         } catch {
-            Self.logger.error("Confirmation code binding failed: \(String(describing: error), privacy: .public)")
+            Logger.crypto.error("Confirmation code binding failed: \(String(describing: error), privacy: .public)")
             self = .failed(error)
         }
     }

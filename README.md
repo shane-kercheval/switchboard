@@ -189,7 +189,8 @@ make dev         # run the Tauri dev shell
 make test         # run all Rust + frontend tests (fast, offline jsdom suite)
 make test-browser # real-WebKit frontend suite (Vitest browser mode); installs WebKit if needed
 make lint         # clippy, eslint, svelte-check
-make check        # everything CI runs (incl. the browser suite) — run before opening a PR
+make check        # the desktop gate (incl. the browser suite) — run before opening a PR
+make check-ios    # the iOS app: build, Swift tests on a simulator, Release build checks
 make test-live    # live-harness suite against the real agent CLIs (developer-local)
 ```
 
@@ -198,6 +199,17 @@ make test-live    # live-harness suite against the real agent CLIs (developer-lo
 `make test-browser` (and `make check`) run the frontend suite in a real WebKit engine via Vitest browser mode. The target installs a Playwright-managed WebKit build on demand — the first run downloads ~100 MB (cached afterward), so it needs network access once; no extra system packages are required on macOS. The default `make test` stays jsdom-only and needs none of this.
 
 See [`AGENTS.md`](./AGENTS.md) for project orientation and conventions, and [`docs/implementation_plans/`](./docs/implementation_plans/) for the roadmap and per-phase implementation plans.
+
+### The iOS app
+
+`SwitchboardMobile/` is an iPhone app for driving Switchboard remotely; it is early scaffolding, not yet usable. Working on it needs full **Xcode 16 or newer** (not just the Command Line Tools) with at least one iPhone simulator installed. The pinned Rust toolchain adds the two iOS targets it builds for on its own.
+
+```sh
+make ios-crypto   # build the shared Rust crypto library and its Swift bindings
+make check-ios    # build the app and run its tests on the newest iPhone simulator
+```
+
+Run `make ios-crypto` before opening `SwitchboardMobile/SwitchboardMobile.xcodeproj` in Xcode, and again after changing `crates/remote-crypto`: the library and bindings it generates are not committed, so the project won't resolve its package without them. `check-ios` runs as its own CI job, so `make check` doesn't cover it — run it when a change touches `SwitchboardMobile/` or `crates/remote-crypto`. Pass `IOS_SIMULATOR_ID=<udid>` to pick a simulator.
 
 ### Developing without an agent CLI installed
 

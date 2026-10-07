@@ -15,7 +15,7 @@
 //! pure and Tauri-free. The interpreter that actually *runs* a workflow is a
 //! conductor over app-owned machinery (the `Dispatcher`, `PromptService`,
 //! transcript loading, checkpoint file IO, the event emitter), so it lives in
-//! `crates/app`, not here. Keeping the language pure is what makes the spec's
+//! `desktop/src-tauri`, not here. Keeping the language pure is what makes the spec's
 //! three worked examples testable as fixtures with no app present.
 //!
 //! ## Output scope is resolved text, not turn ids

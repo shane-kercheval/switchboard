@@ -35,7 +35,7 @@ export type TurnOutcome =
   | { status: "cancelled"; source: CancelSource };
 
 // Result of resolving a manual cross-agent forward (`forward_message`). Mirrors
-// `ForwardOutcome` in `crates/app/src/commands.rs` (`tag = "status"`). The
+// `ForwardOutcome` in `desktop/src-tauri/src/commands.rs` (`tag = "status"`). The
 // backend resolves + composes but does NOT dispatch; the frontend dispatches the
 // returned `resolved.body` through the normal send path (so the forward groups,
 // cancels, and renders exactly like any send). `resolved.body` is the composed
@@ -524,7 +524,7 @@ export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
 // `src/lib/state/types.ts`. This file is wire-format-only.
 
 /// One forward source as the backend receives it — the agent plus the project
-/// that owns it. Mirrors `ForwardSourceRef` in `crates/app/src/commands.rs`.
+/// that owns it. Mirrors `ForwardSourceRef` in `desktop/src-tauri/src/commands.rs`.
 /// Lives here rather than in the held-forward UI store because it is a wire
 /// shape: `api.ts` must not import its request types from a UI module.
 export type ForwardSourceRef = { agent_id: AgentId; project_id: ProjectId };
@@ -636,7 +636,7 @@ export type ProjectSummary = {
   created_at: string;
 };
 
-// Mirror of Rust `ProjectListing` (`crates/app/src/commands.rs`) — one row of
+// Mirror of Rust `ProjectListing` (`desktop/src-tauri/src/commands.rs`) — one row of
 // the flat cross-directory project list. `directory` is the project's working
 // directory (label + spawn cwd), recorded whether or not it currently exists;
 // `directory_available` says whether it does. `last_activity` is the
@@ -667,7 +667,7 @@ export type WorkspaceStatus = {
   persistable: boolean;
 };
 
-// --- Git view (mirror of `switchboard_git` model + `crates/app` RepoListing) --
+// --- Git view (mirror of `switchboard_git` model + `desktop/src-tauri` RepoListing) --
 // Branch-primary, two-level status (see the crate docs): branch-level signals on
 // BranchView/RemoteBranchView, worktree-level on WorktreeView. `null` fields are
 // the Rust `Option::None` ("couldn't determine") wire form.
@@ -855,7 +855,7 @@ export type BranchKind = "local" | "remote";
 // How the diff panel lays out a file's changes. Persisted in `config.yaml`.
 export type DiffStyle = "side_by_side" | "unified";
 
-// Mirror of Rust `Preferences` (`crates/app/src/preferences.rs`) — backend-owned
+// Mirror of Rust `Preferences` (`desktop/src-tauri/src/preferences.rs`) — backend-owned
 // `config.yaml`. `editor_command` defaults to "code"; null → OS default
 // folder-open. `terminal_app` defaults to "Terminal"; `diff_style` defaults to
 // "unified". `show_builtins` defaults to true (the read-only built-in prompts &
@@ -886,7 +886,7 @@ export type Preferences = {
   >;
 };
 
-// Mirror of Rust `NotificationAvailability` (`crates/app/src/notification.rs`).
+// Mirror of Rust `NotificationAvailability` (`desktop/src-tauri/src/notification.rs`).
 // Whether macOS will actually show a notification — distinct from the in-app
 // preference, and the only way to explain the silent failures: a denied
 // permission, every presentation channel switched off in System Settings, and an
@@ -899,7 +899,7 @@ export type NotificationAvailability =
   | "unavailable";
 
 // Mirror of Rust `ProjectConversation` / `ConversationItem` / `OutcomeStatus` /
-// `AgentConversationMeta` (`crates/app/src/commands.rs`). The post-restart
+// `AgentConversationMeta` (`desktop/src-tauri/src/commands.rs`). The post-restart
 // unified history: the three `ConversationItem` kinds are disjoint sources
 // (user messages ← journal, agent content ← harness files, outcome markers ←
 // journal), so there is no cross-source dedup. Items arrive pre-sorted by
@@ -1074,7 +1074,7 @@ export type ProjectConversation = {
 };
 
 // Mirror of Rust `SessionFingerprint` / `AgentSessionFingerprint`
-// (`crates/app/src/commands.rs`). The staleness-refresh gate: a cheap per-agent
+// (`desktop/src-tauri/src/commands.rs`). The staleness-refresh gate: a cheap per-agent
 // stat (no parse) the frontend diffs against the value stored at last hydration
 // to decide whether to re-read a session file the user may have continued in the
 // harness's own TUI.
@@ -1188,7 +1188,7 @@ export type PromptSource = {
 };
 
 // ── Workflows (system-design §7) ──────────────────────────────────────────────
-// Mirror the Rust types in `crates/app/src/workflow_commands.rs`.
+// Mirror the Rust types in `desktop/src-tauri/src/workflow_commands.rs`.
 
 // One declared workflow input as the invocation form renders it. `ty` is the
 // base type; `text?` is `ty: "text"` with `optional: true`. List inputs

@@ -97,7 +97,7 @@
 //! `CompletionResult`, so a forward/aggregate consumer never reads it back from
 //! disk. This sidesteps identity entirely: the dispatcher's `turn_id` is **not**
 //! joinable to the harness session file's own turn ids (they are different id
-//! spaces — `crates/app` correlates them only positionally), and the one stable
+//! spaces — `desktop/src-tauri` correlates them only positionally), and the one stable
 //! per-turn key that does exist (`hydration_key`) is absent for some harnesses.
 //! "Hold a `turn_id`, then find the matching turn on disk" therefore cannot work
 //! for the just-awaited turn; capturing the text at completion is the only
@@ -111,7 +111,7 @@
 //!
 //! The `EventEmitter` trait keeps the dispatcher unit-testable without a Tauri
 //! app — `RecordingEmitter` collects emissions (and offers an async wait) for
-//! assertions; production wiring (in `crates/app`) provides a Tauri-backed
+//! assertions; production wiring (in `desktop/src-tauri`) provides a Tauri-backed
 //! implementation.
 
 use std::collections::{HashMap, VecDeque};

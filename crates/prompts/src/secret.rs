@@ -1,6 +1,6 @@
 //! A keyed secret store for provider bearer tokens. The store is the abstraction
 //! `PromptService` resolves MCP bearers through; the concrete backend is injected
-//! by `crates/app` (same "app owns side effects, pure crate takes a dependency"
+//! by `desktop/src-tauri` (same "app owns side effects, pure crate takes a dependency"
 //! pattern as config-path resolution).
 //!
 //! This milestone ships the trait + an in-memory implementation (the only

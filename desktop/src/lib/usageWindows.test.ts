@@ -528,8 +528,8 @@ describe("codexAccountUsageView against the recorded account response", () => {
   const captured = JSON.parse(
     readFileSync(
       resolve(
-        process.cwd(),
-        "crates/harness/tests/fixtures/codex/account-rate-limits-healthy.jsonl",
+        import.meta.dirname,
+        "../../../crates/harness/tests/fixtures/codex/account-rate-limits-healthy.jsonl",
       ),
       "utf8",
     )
@@ -883,8 +883,8 @@ describe("codexAccountUsageView against the recorded credits-covered response", 
   const captured = JSON.parse(
     readFileSync(
       resolve(
-        process.cwd(),
-        "crates/harness/tests/fixtures/codex/account-rate-limits-credits.jsonl",
+        import.meta.dirname,
+        "../../../crates/harness/tests/fixtures/codex/account-rate-limits-credits.jsonl",
       ),
       "utf8",
     )

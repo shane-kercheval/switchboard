@@ -18758,11 +18758,11 @@ mod tests {
     /// fork-merge claims falsifiable against the actual on-disk shape.
     const FORK_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../harness/tests/fixtures/claude/forked-session.jsonl"
+        "/../../crates/harness/tests/fixtures/claude/forked-session.jsonl"
     ));
     const FORK_PARENT_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../harness/tests/fixtures/claude/forked-session.parent.jsonl"
+        "/../../crates/harness/tests/fixtures/claude/forked-session.parent.jsonl"
     ));
     const FORK_SESSION: &str = "a2319443-8b29-46bd-a79d-fa1e405bf177";
     const FORK_PARENT_SESSION: &str = "2e18d035-181f-4ba3-8845-b070ca88bffb";

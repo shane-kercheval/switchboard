@@ -31,7 +31,7 @@ export default defineConfig({
         }
       : undefined,
     watch: {
-      ignored: ["**/crates/**", "**/target/**"],
+      ignored: ["**/src-tauri/**"],
     },
   },
   test: {

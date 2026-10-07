@@ -11,11 +11,16 @@ the same code path serves the same Wi-Fi and the other side of the world.
 Transport alternatives and the reasons for the relay are in
 [research/remote-transport-evaluation.md](../research/remote-transport-evaluation.md). This
 document is the component inventory — what gets written, where, and against which interfaces
-— followed by the milestones. The iOS app lives in this repository at `SwitchboardMobile/`,
-beside `crates/`, so the protocol fixtures and the shared Rust cryptography are in one tree.
+— followed by the milestones. The iOS app lives in this repository at `ios/`, beside the
+desktop app in `desktop/` and the shared Rust in `crates/`, so the protocol fixtures and the
+shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Paths (2026-10-06)** — file paths updated for the repository's move to `desktop/` and
+  `ios/`: `crates/app` is now `desktop/src-tauri`, the frontend's `src/` is `desktop/src/`,
+  and the iOS app is in `ios/`. No content change; the revision is unchanged, and the entries
+  below keep the paths they were written with.
 - **Revision 10 (2026-10-05)** — seventh review, verdict GO (one minor).
   - Finding 1: **Reset remote identity** revokes every device before it disables remote
     access. Disabling drops the relay connection, so in the old order the relay never got
@@ -176,7 +181,7 @@ beside `crates/`, so the protocol fixtures and the shared Rust cryptography are 
 | Macs per phone | **One** | Stated as a limit; replacing the paired Mac is a deliberate action. |
 | Archived projects on the phone | **Hidden by default** | Matches the desktop. |
 | Push notifications | **Deferred** | No APNs entitlement in the first build. |
-| iOS app location | **This repository, `SwitchboardMobile/`** | Shared fixtures and crypto crate; one PR can change both sides. |
+| iOS app location | **This repository, `ios/`** | Shared fixtures and crypto crate; one PR can change both sides. |
 
 ## 1. Interfaces and their test doubles
 
@@ -186,12 +191,12 @@ directly — abstract where a second implementation or a test needs it, not ever
 | Interface | Production | Test double | Where |
 |---|---|---|---|
 | `Transport` | `RelayTransport` (WebSocket to relay) | in-memory pair | `crates/remote`; Swift `Transport/` |
-| `RemoteBackend` | impl over `AppState` | recording mock | `crates/remote` (trait), `crates/app` (impl) |
-| `EventEmitter` *(existing)* | `RemoteEmitter` decorating the existing chain | `RecordingEmitter` *(existing)* | `crates/remote`, installed in `crates/app` |
-| `KeyStore` | over the existing secret store | in-memory | `crates/remote` (two-method trait), `crates/app` (impl) |
+| `RemoteBackend` | impl over `AppState` | recording mock | `crates/remote` (trait), `desktop/src-tauri` (impl) |
+| `EventEmitter` *(existing)* | `RemoteEmitter` decorating the existing chain | `RecordingEmitter` *(existing)* | `crates/remote`, installed in `desktop/src-tauri` |
+| `KeyStore` | over the existing secret store | in-memory | `crates/remote` (two-method trait), `desktop/src-tauri` (impl) |
 | `DeviceRegistry` | JSONL-backed | in-memory | `crates/remote` |
-| `AgentProjectResolver` | over `AppState.agents_by_id` | map | `crates/remote` (trait), `crates/app` (impl) |
-| `PowerSource` | IOKit AC-power observer | toggled fake | `crates/app` |
+| `AgentProjectResolver` | over `AppState.agents_by_id` | map | `crates/remote` (trait), `desktop/src-tauri` (impl) |
+| `PowerSource` | IOKit AC-power observer | toggled fake | `desktop/src-tauri` |
 | `RequestBroker` | over `Transport` | stub returning fixtures | Swift |
 
 **Ownership model**, matching `HarnessAdapter`: async traits use `#[async_trait]` and are held as
@@ -232,7 +237,7 @@ A transport's constructor returns the `Arc<dyn Transport>` together with its inb
 `mpsc::Receiver<(DeviceId, Frame)>`: a receiver has one owner, so it is handed over once rather
 than fetched through `&self`.
 
-`crates/remote` cannot depend on `crates/app`, so the trait speaks in protocol types defined in
+`crates/remote` cannot depend on `desktop/src-tauri`, so the trait speaks in protocol types defined in
 `crates/remote` — `RemoteProject`, `RemoteAgent`, `Cursor`, `LiveSnapshot`,
 `ConversationWindow` — and the app's implementation maps its own types into them. A
 `ConversationWindow`'s items cross as `serde_json::Value`: the same serialization of
@@ -540,12 +545,12 @@ It forwards everything unchanged, then:
 - `forget_agent(agent)` removes that agent's turns from the snapshot. The actor's shutdown
   paths (`TurnAfter::Shutdown`, `IdleAfter::Shutdown`) break out of `agent_actor` without
   emitting `agent_idle`, so an agent shut down after its turn ended would otherwise hold that
-  turn forever. `crates/app` gains one helper that calls `Dispatcher::shutdown_agent` and then
+  turn forever. `desktop/src-tauri` gains one helper that calls `Dispatcher::shutdown_agent` and then
   `forget_agent`, and the four existing callers of `shutdown_agent` use it:
   `set_project_directory_impl`, `delete_project_impl`, `remove_agent_impl`, and
   `drain_agents_then_release_locks`.
 
-### `crates/app/` changes
+### `desktop/src-tauri/` changes
 
 **5.7 Listings and conversation for the phone.**
 
@@ -632,7 +637,7 @@ It forwards everything unchanged, then:
   timeout so the phone hears the Mac's answer before giving up, and then answers
   `project_load_timeout`. The load keeps running, so a retry usually succeeds. It never polls
   `state.projects`, which fills before the frontend subscribes to agent channels.
-- **Frontend load, precisely.** In `src/lib/state/workspace.svelte.ts`, every conversation read
+- **Frontend load, precisely.** In `desktop/src/lib/state/workspace.svelte.ts`, every conversation read
   after a project's first already runs through `chainProjectLoad`: a retry after a failed
   hydration, a staleness refresh, a fork-history read. `ensureProjectLoaded` (whose only caller
   is `activateProject`, which handles selection separately) joins the first one to it:
@@ -657,7 +662,7 @@ It forwards everything unchanged, then:
   write is inside the actor, so the payload is the only way the origin can reach it.
   `JournalRecord::Send`, `NormalizedEvent::UserMessage`, and `ConversationItem::UserMessage`
   gain the field with `#[serde(default)]` producing `keyboard` (the existing `attachments`
-  field is the pattern), and `src/lib/types.ts` gains it on the `user_message` event and the
+  field is the pattern), and `desktop/src/lib/types.ts` gains it on the `user_message` event and the
   conversation item. Only `remote` renders a chip, so old lines that default to `keyboard`
   change nothing visible, and the chip survives reload because it is journaled.
   `user_message` carries no attachments, so a send with attachments shows its chips on the
@@ -666,8 +671,8 @@ It forwards everything unchanged, then:
   `user_message` branch becomes a no-op when a user turn with that `send_id` and agent already
   exists, since compose's optimistic turn already rendered it. The dedupe depends on the
   optimistic turn carrying its `send_id`: the production wrapper `dispatchUserTurn`
-  (`src/lib/state/index.svelte.ts`) already requires it, and `appendUserTurnImpl`'s `sendId`
-  parameter (`src/lib/state/reducers.ts`) changes from optional to required so no future caller
+  (`desktop/src/lib/state/index.svelte.ts`) already requires it, and `appendUserTurnImpl`'s `sendId`
+  parameter (`desktop/src/lib/state/reducers.ts`) changes from optional to required so no future caller
   can omit it.
 - **No Mac notification** for phone sends: they are never registered with
   `sendCompletion`, which registers compose sends with their recipients before any IPC call.
@@ -856,14 +861,15 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   second-device refusal; rate and frame limits; reconnect replaces the stale session; the
   container builds and answers `/healthz` locally.
 
-## 7. iOS app — SwiftUI, `SwitchboardMobile/`
+## 7. iOS app — SwiftUI, `ios/`
 
 iOS 17+. No third-party Swift packages; the only non-Apple code is the Rust xcframework from
 §3. One `@Observable` store per screen over pure reducers, mirroring the desktop's
 reducer-plus-component split.
 
-**Layout.** `SwitchboardMobile/` holds a hand-created Xcode project with one thin app target
-(the `@main` entry, `Views/`, `Info.plist`, entitlements), plus a local Swift package,
+**Layout.** `ios/` holds a hand-created Xcode project, `SwitchboardMobile.xcodeproj`, with one
+thin app target in `ios/SwitchboardMobile/` (the `@main` entry, `Views/`, `Info.plist`,
+entitlements), plus a local Swift package,
 `SwitchboardMobileKit`, holding `Protocol/`, `Transport/`, `Pairing/` (except the camera
 view), and `Stores/`, and depending on the §3 xcframework as a `binaryTarget`. Most code
 changes then touch the package, not the `.xcodeproj`. The package's tests still run through

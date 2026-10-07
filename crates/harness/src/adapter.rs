@@ -290,17 +290,17 @@ mod tests {
     #[test]
     fn frontend_mirror_of_the_limit_matches() {
         // The compose bar refuses an oversized message before clearing the
-        // draft, using its own copy of this constant (`src/lib/promptSize.ts`).
+        // draft, using its own copy of this constant (`desktop/src/lib/promptSize.ts`).
         // This side stays the authority; the copy must not drift from it.
         let ts = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../src/lib/promptSize.ts"
+            "/../../desktop/src/lib/promptSize.ts"
         ))
-        .expect("src/lib/promptSize.ts is readable from the harness crate");
+        .expect("desktop/src/lib/promptSize.ts is readable from the harness crate");
         assert_eq!(MAX_PROMPT_BYTES, 768 * 1024);
         assert!(
             ts.contains("export const MAX_PROMPT_BYTES = 768 * 1024;"),
-            "src/lib/promptSize.ts must define MAX_PROMPT_BYTES = 768 * 1024 to match adapter.rs"
+            "desktop/src/lib/promptSize.ts must define MAX_PROMPT_BYTES = 768 * 1024 to match adapter.rs"
         );
         // The two refusals are shown in different places (the compose bar before
         // Send, the transcript after); they should at least agree on the advice.
@@ -313,7 +313,7 @@ mod tests {
         assert!(rust_message.ends_with(advice), "{rust_message}");
         assert!(
             ts.contains(advice),
-            "src/lib/promptSize.ts must give the same advice"
+            "desktop/src/lib/promptSize.ts must give the same advice"
         );
     }
 

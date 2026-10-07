@@ -73,7 +73,7 @@ export function isForeignSource(source: ForwardSource, currentProjectId: Project
 /// The chip / waiting-row label: bare agent name in-project, `project · agent`
 /// when foreign (falling back to the bare name if the project name is unknown).
 ///
-/// Project first, matching [`qualified_source_name`] in `crates/app/src/commands.rs`
+/// Project first, matching [`qualified_source_name`] in `desktop/src-tauri/src/commands.rs`
 /// — the two must read the same, because a chip the user picked and the backend's
 /// invalidation copy about that same source appear a few lines apart. Widest scope
 /// first also lets a column of chips be scanned by project, and puts the part that
@@ -370,7 +370,7 @@ export function sourceReadinessFor(
 
 /// Classify what a source will contribute, from that agent's turns.
 ///
-/// The rule comes from `forward_message_impl` (crates/app/src/commands.rs), which
+/// The rule comes from `forward_message_impl` (desktop/src-tauri/src/commands.rs), which
 /// "holds outside any queue while each source agent's current in-flight turn
 /// settles, then composes … each source's latest **completed** output."
 /// Three consequences the shape of this function depends on:

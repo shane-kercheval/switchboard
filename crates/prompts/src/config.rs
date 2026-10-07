@@ -1,7 +1,7 @@
 //! The user-global prompt config (`config.yaml`) model and local-directory
 //! resolution. Prompt config is user-global — there is no directory- or
 //! project-scope (`docs/system-design.md` §6). The config file's path is
-//! resolved and injected by `crates/app`; this module only parses and resolves.
+//! resolved and injected by `desktop/src-tauri`; this module only parses and resolves.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

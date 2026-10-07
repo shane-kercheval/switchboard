@@ -1,10 +1,10 @@
 # UI conventions
 
-The durable rules for Switchboard's frontend — the things you can't infer by reading a single file. Per-component prop shapes live in the components' own doc-comments (`src/lib/components/ui/`) and the token list lives in `src/app.css`; this doc deliberately does not restate them, so it can't drift out of sync. The look-and-feel ("calm utility": restrained, dense, native-macOS-feeling, color carries meaning) is described in the UI-foundation plan.
+The durable rules for Switchboard's frontend — the things you can't infer by reading a single file. Per-component prop shapes live in the components' own doc-comments (`desktop/src/lib/components/ui/`) and the token list lives in `desktop/src/app.css`; this doc deliberately does not restate them, so it can't drift out of sync. The look-and-feel ("calm utility": restrained, dense, native-macOS-feeling, color carries meaning) is described in the UI-foundation plan.
 
 ## The one rule: name a semantic role, not a hue
 
-A component that needs a color references a **semantic token**, never a raw palette value or a one-off Tailwind color (`text-amber-700`, `bg-blue-100`). Tokens are defined once in `src/app.css` as CSS custom properties, with light and dark as two mappings of the *same* names, exposed to Tailwind v4 via `@theme inline`. Because the utilities reference the variables by name (not by build-time value), dark mode is "just use the token" — a `.dark`-scoped override re-themes everything with no per-component work.
+A component that needs a color references a **semantic token**, never a raw palette value or a one-off Tailwind color (`text-amber-700`, `bg-blue-100`). Tokens are defined once in `desktop/src/app.css` as CSS custom properties, with light and dark as two mappings of the *same* names, exposed to Tailwind v4 via `@theme inline`. Because the utilities reference the variables by name (not by build-time value), dark mode is "just use the token" — a `.dark`-scoped override re-themes everything with no per-component work.
 
 The token groups (see `app.css` for the exact names/values): **neutral surfaces** (the four-role ramp + interaction fills — see "The neutral ramp" below), **primary** (monochrome high-contrast action/selection), **accent** (a single restrained teal, reserved for links and selected-state emphasis — not decoration, and no longer focus rings), **focus** (the app's one blue — the focus ring and the pale user-input surfaces; see the ramp section), **destructive** / **warning**, **status** (`status-{idle,processing,failed,cancelled}`, each a strong fg + a `-soft` bg), and **syntax** (`syntax-{comment,keyword,string,function,constant,tag}`).
 
@@ -38,7 +38,7 @@ Keep the ramp to these. It was once ~15 near-identical grays (several within a p
 - Don't use `bg-active` as a general stronger-hover fallback. Its hover use is limited to nested row actions; otherwise reserve it for pressed/latched states, tracks, grooves, and resize seams.
 - **One documented exception:** a row on a `panel` sidebar whose *selected* state is already `raised` (the projects sidebar) can't use `raised` for hover — it would be indistinguishable from selected — so it lightens to `surface`, the off-white step between panel and white. This is the *only* sanctioned use of `surface` as a hover fill; don't generalize it.
 
-**Two banned patterns, both mechanically enforced** by `tests/token-ramp-scan.test.ts`:
+**Two banned patterns, both mechanically enforced** by `desktop/tests/token-ramp-scan.test.ts`:
 
 1. **No opacity modifier on a surface token** — `bg-{surface,raised,panel,border}/<n>` is out. A translucent fill composes differently over every parent and yields a shade nobody named. Pick the solid role that means what you want.
 2. **`border` is a line, never a fill** — `bg-border` in any form is out. A hovered fill is `bg-hover`, a control/track fill is `bg-active`, a divider is an actual `border-*` line.
@@ -51,7 +51,7 @@ Segmented controls share one color system regardless of size: a `raised` track, 
 
 ## Reach for a primitive before hand-rolling
 
-Primitives live in `src/lib/components/ui/`. Adopt the existing one rather than re-styling inline; extend a primitive (a new variant/size) rather than forking it. When something is needed in 2–3+ places, extract a primitive (rule of three) — but don't pre-build primitives for milestones whose needs aren't yet visible.
+Primitives live in `desktop/src/lib/components/ui/`. Adopt the existing one rather than re-styling inline; extend a primitive (a new variant/size) rather than forking it. When something is needed in 2–3+ places, extract a primitive (rule of three) — but don't pre-build primitives for milestones whose needs aren't yet visible.
 
 The non-obvious "which primitive for what":
 

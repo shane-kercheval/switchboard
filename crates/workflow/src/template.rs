@@ -278,7 +278,7 @@ fn register_helpers(env: &mut Environment<'_>, outputs: &Arc<OutputScope>) {
             let text = lookup(&scope, name)?;
             // SYNCHRONIZED WIRE SHAPE: the frontend bands this block by
             // string-matching `=== START response from … ===` (`QUOTED_BLOCK` in
-            // `src/lib/components/UnifiedTranscript.svelte`). Changing this string
+            // `desktop/src/lib/components/UnifiedTranscript.svelte`). Changing this string
             // breaks transcript styling unless both languages change together.
             blocks.push(format!(
                 "=== START response from {name} ===\n{text}\n=== END response from {name} ==="

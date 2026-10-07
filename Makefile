@@ -9,6 +9,16 @@ LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
 install:
 	@node -e 'const m=Number(process.versions.node.split(".")[0]); if(m<22){console.error("Switchboard needs Node >= 22 (you have "+process.versions.node+"). Switch Node versions and retry.");process.exit(1)}'
 	pnpm install --frozen-lockfile
+	@touch $(PNPM_STAMP)
+
+# Targets that run the frontend depend on this stamp rather than on `install`,
+# so they reinstall the pnpm workspace only when a manifest or the lockfile is
+# newer than the last install: current after a pull (including the README's
+# `git pull && make deploy`), free otherwise. `clean` removes it with
+# node_modules.
+PNPM_STAMP := node_modules/.install-stamp
+$(PNPM_STAMP): package.json desktop/package.json pnpm-workspace.yaml pnpm-lock.yaml
+	@$(MAKE) --no-print-directory install
 
 # Incremental compilation is off for the whole-workspace targets below.
 # It exists to speed up rebuilding one changed crate; for a target that builds
@@ -16,6 +26,12 @@ install:
 # here before the 2026-08-25 cleanup). `make dev` deliberately does NOT set
 # this — the edit-rebuild loop is exactly the case incremental is for.
 NO_INCR := CARGO_INCREMENTAL=0
+
+# The desktop frontend is the `desktop/` package of the pnpm workspace rooted
+# here; its scripts (and the Tauri CLI, which finds `desktop/src-tauri`) run
+# from that directory. Formatting stays at the root, where it covers the root
+# Markdown too.
+DESKTOP := pnpm --dir desktop
 
 DEFAULT_DEV_PORT := 1420
 DEV_PORT ?= $(DEFAULT_DEV_PORT)
@@ -27,18 +43,18 @@ DEV_PORT ?= $(DEFAULT_DEV_PORT)
 # doesn't silently swap dev registries. Only additional instances on other
 # ports get a `-<port>` suffix, so two simultaneous dev builds don't share one
 # `workspace.yaml`. Read only by debug builds (see `workspace_config_path` in
-# crates/app/src/lib.rs). macOS path; v1 is macOS-only.
+# desktop/src-tauri/src/lib.rs). macOS path; v1 is macOS-only.
 DEV_SUFFIX := $(if $(filter-out $(DEFAULT_DEV_PORT),$(DEV_PORT)),-$(DEV_PORT))
 DEV_CONFIG_DIR := $(HOME)/Library/Application Support/switchboard-dev$(DEV_SUFFIX)
 
-dev:
-	SWITCHBOARD_CONFIG_DIR="$(DEV_CONFIG_DIR)" VITE_DEV_PORT=$(DEV_PORT) VITE_GIT_BRANCH=$(shell git branch --show-current) pnpm tauri dev --config '{"build":{"devUrl":"http://localhost:$(DEV_PORT)"}}'
+dev: $(PNPM_STAMP)
+	SWITCHBOARD_CONFIG_DIR="$(DEV_CONFIG_DIR)" VITE_DEV_PORT=$(DEV_PORT) VITE_GIT_BRANCH=$(shell git branch --show-current) $(DESKTOP) tauri dev --config '{"build":{"devUrl":"http://localhost:$(DEV_PORT)"}}'
 
 # Release build of the macOS .app bundle (the only artifact that carries the
 # bundled icon). `--bundles app` skips the .dmg packaging step. Output:
 # target/release/bundle/macos/Switchboard.app
-build:
-	pnpm tauri build --bundles app
+build: $(PNPM_STAMP)
+	$(DESKTOP) tauri build --bundles app
 	# Guards a *runtime* precondition, not a distribution one: UNUserNotificationCenter
 	# silently refuses to deliver from a bundle without a real signature, so losing
 	# the ad-hoc signingIdentity would ship an app whose notifications just stop with
@@ -86,8 +102,8 @@ DEBUG_APP_ID ?= com.switchboard.desktop.debug
 DEBUG_APP := $(HOME)/Applications/$(DEBUG_APP_NAME).app
 DEBUG_APP_CONFIG := {"productName":"$(DEBUG_APP_NAME)","identifier":"$(DEBUG_APP_ID)"}
 
-debug-app:
-	pnpm tauri build --debug --bundles app --config '$(DEBUG_APP_CONFIG)'
+debug-app: $(PNPM_STAMP)
+	$(DESKTOP) tauri build --debug --bundles app --config '$(DEBUG_APP_CONFIG)'
 	codesign --verify --deep --strict "target/debug/bundle/macos/$(DEBUG_APP_NAME).app"
 	rm -rf "$(DEBUG_APP)"
 	mkdir -p "$(HOME)/Applications"
@@ -101,24 +117,24 @@ uninstall-debug-app:
 deploy: build install-app
 	open /Applications/Switchboard.app
 
-test:
+test: $(PNPM_STAMP)
 	$(NO_INCR) cargo test --workspace --all-features --locked
-	pnpm test
+	$(DESKTOP) test
 
 # Real-WebKit frontend tests (Vitest browser mode) for the layout-coupled slice
 # jsdom can't see. Kept out of `test` so the fast jsdom inner loop stays offline
 # and quick. Ensures the WebKit binary first (idempotent, near-instant when
 # already present) so this target — and `check`, which inlines it — is
 # self-sufficient on a checkout that never ran `playwright install` by hand.
-test-browser:
-	pnpm exec playwright install webkit
-	pnpm test:browser
+test-browser: $(PNPM_STAMP)
+	$(DESKTOP) exec playwright install webkit
+	$(DESKTOP) test:browser
 
-lint:
+lint: $(PNPM_STAMP)
 	cargo fmt --all -- --check
 	$(NO_INCR) cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-	pnpm lint
-	pnpm check
+	$(DESKTOP) lint
+	$(DESKTOP) check
 	pnpm format:check
 
 fmt:
@@ -132,22 +148,22 @@ check-rust:
 
 check-frontend:
 	pnpm install --frozen-lockfile
-	pnpm lint
-	pnpm check
+	$(DESKTOP) lint
+	$(DESKTOP) check
 	pnpm format:check
-	pnpm test
-	pnpm exec playwright install webkit
-	pnpm test:browser
+	$(DESKTOP) test
+	$(DESKTOP) exec playwright install webkit
+	$(DESKTOP) test:browser
 
 check: check-rust check-frontend
 
-# The iOS app (`SwitchboardMobile/`) links `crates/remote-crypto` as an
+# The iOS app (`ios/`) links `crates/remote-crypto` as an
 # xcframework with UniFFI-generated Swift bindings. Both are build products,
 # written into the package's gitignored `Generated/` directory; run
 # `ios-crypto` once before opening the project in Xcode, and again after
 # changing the crate.
-IOS_PROJECT := SwitchboardMobile/SwitchboardMobile.xcodeproj
-IOS_KIT := SwitchboardMobile/SwitchboardMobileKit
+IOS_PROJECT := ios/SwitchboardMobile.xcodeproj
+IOS_KIT := ios/SwitchboardMobileKit
 IOS_GENERATED := $(IOS_KIT)/Generated
 IOS_STAGING := target/ios-crypto
 IOS_DERIVED_DATA := target/ios-derived-data
@@ -195,15 +211,15 @@ ios-crypto:
 # tests on a simulator, builds Release, and checks both built Info.plists. A separate CI job, so `check` (and its wall
 # time) is unchanged; `check` is therefore no longer everything CI runs.
 check-ios:
-	SwitchboardMobile/scripts/check-binding-imports.sh
+	ios/scripts/check-binding-imports.sh
 	@test -n "$(IOS_SIMULATOR_ID)" || { echo "No available iPhone simulator. Install one in Xcode, or pass IOS_SIMULATOR_ID=<udid>."; exit 1; }
 	$(MAKE) ios-crypto
 	xcodebuild test -quiet -project $(IOS_PROJECT) -scheme SwitchboardMobile -configuration Debug \
 		-destination '$(IOS_DESTINATION)' -derivedDataPath $(IOS_DERIVED_DATA) CODE_SIGNING_ALLOWED=NO
 	xcodebuild build -quiet -project $(IOS_PROJECT) -scheme SwitchboardMobile -configuration Release \
 		-destination '$(IOS_DESTINATION)' -derivedDataPath $(IOS_DERIVED_DATA) CODE_SIGNING_ALLOWED=NO
-	SwitchboardMobile/scripts/check-info-plist.sh $(IOS_DERIVED_DATA)/Build/Products/Debug-iphonesimulator/SwitchboardMobile.app/Info.plist Debug
-	SwitchboardMobile/scripts/check-info-plist.sh $(IOS_DERIVED_DATA)/Build/Products/Release-iphonesimulator/SwitchboardMobile.app/Info.plist Release
+	ios/scripts/check-info-plist.sh $(IOS_DERIVED_DATA)/Build/Products/Debug-iphonesimulator/SwitchboardMobile.app/Info.plist Debug
+	ios/scripts/check-info-plist.sh $(IOS_DERIVED_DATA)/Build/Products/Release-iphonesimulator/SwitchboardMobile.app/Info.plist Release
 
 test-live:
 	cargo test --locked $(LIVE_PKGS) -- --ignored
@@ -241,4 +257,4 @@ clean-stale:
 
 clean:
 	cargo clean
-	rm -rf node_modules dist
+	rm -rf node_modules dist desktop/node_modules desktop/dist

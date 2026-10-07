@@ -9,9 +9,9 @@
 //! pool the last turn happened to mention, labelled with a guess. This call
 //! returns all of them at once, each with its own identity.
 //!
-//! **Why it lives in `crates/harness` rather than `crates/app`.** The nearest
+//! **Why it lives in `crates/harness` rather than `desktop/src-tauri`.** The nearest
 //! precedent for a harness question with no turn behind it is
-//! `check_codex_auth_impl`, which sits in `crates/app` — but that is a file
+//! `check_codex_auth_impl`, which sits in `desktop/src-tauri` — but that is a file
 //! existence check that knows nothing about Codex beyond a path. This speaks
 //! Codex's own JSON-RPC protocol and parses Codex's own wire shapes, which is
 //! what this crate is for.
@@ -52,7 +52,7 @@
 //! **Nothing here interprets the payload.** Rust confirms a JSON-RPC success
 //! arrived and lifts out the two fields the frontend needs, verbatim. Which
 //! buckets to render, how to label them and whether one is exhausted are
-//! decided in `src/lib/usageWindows.ts`, which stays the single interpreting
+//! decided in `desktop/src/lib/usageWindows.ts`, which stays the single interpreting
 //! layer.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -125,7 +125,7 @@ pub struct CodexAccountUsage {
     /// credits are covering the work. The meter's bars still come from each
     /// quota's measured percentage; this field never decides how full a bar
     /// is, only whether that line appears beneath it
-    /// (`src/lib/usageWindows.ts::codexAccountUsageView`).
+    /// (`desktop/src/lib/usageWindows.ts::codexAccountUsageView`).
     pub ordinary_usage_allowed: Option<bool>,
     /// Every metered quota, keyed by Codex's `limit_id` (`codex`,
     /// `base_model_inference`, …).

@@ -4,7 +4,7 @@
 
 `docs/images/single-agent-5.png` — 1024×1024 RGBA, transparent background, squircle
 shape baked in. This is the master the app icons are generated from. Regenerate from
-this file (or its replacement); don't hand-edit the files in `crates/app/icons/`.
+this file (or its replacement); don't hand-edit the files in `desktop/src-tauri/icons/`.
 
 Earlier iterations (`single-agent-3.png`, `single-agent-4.png`) were rejected:
 `-3` was a photorealistic scene (mesh/screws/cable + a baked drop shadow) that turned to
@@ -14,7 +14,7 @@ simplified style that survives downscaling.
 
 ## How the icons are generated
 
-`pnpm tauri icon docs/images/single-agent-5.png -o crates/app/icons` produces every size
+`pnpm --dir desktop tauri icon ../docs/images/single-agent-5.png -o src-tauri/icons` produces every size
 and format the bundle references (`tauri.conf.json` → `bundle.icon`): `32x32.png`,
 `128x128.png`, `128x128@2x.png`, `icon.icns`, `icon.ico`, plus the Windows `Square*Logo`
 set. Tauri also emits `ios/`, `android/`, and `64x64.png` — delete those; this is a

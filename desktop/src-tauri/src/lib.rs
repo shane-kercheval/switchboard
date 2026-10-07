@@ -1297,7 +1297,7 @@ async fn existing_attachment_paths(
 /// No frontend caller today. Wiring one makes it a path by which a queued send
 /// leaves the queue, and the frontend's live user row for that send carries a
 /// `pending` flag that every such path must settle or drop — see the flag's doc
-/// on the user `Turn` in `src/lib/state/types.ts`.
+/// on the user `Turn` in `desktop/src/lib/state/types.ts`.
 #[tauri::command]
 async fn remove_queued_message(
     state: State<'_, AppState>,

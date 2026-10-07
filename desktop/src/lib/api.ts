@@ -1,5 +1,5 @@
 // Thin wrapper around Tauri's `invoke` for type safety. Each function maps
-// 1:1 onto a `#[tauri::command]` in `crates/app/src/lib.rs`.
+// 1:1 onto a `#[tauri::command]` in `desktop/src-tauri/src/lib.rs`.
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";

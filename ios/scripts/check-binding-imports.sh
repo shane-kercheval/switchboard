@@ -41,10 +41,11 @@ CASES
 
 # One recursive grep over the whole app tree, so a new target or folder is
 # covered without editing this list, and grep's own status separates "no
-# match" (1) from an error (2) such as an unreadable file. `Generated/` holds
-# the bindings themselves.
+# match" (1) from an error (2) such as an unreadable file. Matches in the
+# bindings themselves, under SwitchboardMobileKit/Generated/, are skipped by
+# exact path.
 matches=$(grep -rlE --include='*.swift' \
-	--exclude-dir=Generated --exclude-dir=.build --exclude-dir=.swiftpm --exclude-dir=DerivedData \
+	--exclude-dir=.build --exclude-dir=.swiftpm --exclude-dir=DerivedData \
 	"$pattern" "$root")
 status=$?
 if [ "$status" -gt 1 ]; then
@@ -57,6 +58,7 @@ violations=
 while IFS= read -r file; do
 	[ -n "$file" ] || continue
 	case $file in
+	"$root/SwitchboardMobileKit/Generated/"*) ;;
 	"$allowed"*) found_allowed=yes ;;
 	*) violations="$violations$file
 " ;;

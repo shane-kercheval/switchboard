@@ -19,9 +19,9 @@ workspace = true
 tauri-build = { workspace = true }
 
 [dependencies]
-switchboard-core = { path = "../core" }
-switchboard-harness = { path = "../harness" }
-switchboard-dispatcher = { path = "../dispatcher" }
+switchboard-core = { path = "../../crates/core" }
+switchboard-harness = { path = "../../crates/harness" }
+switchboard-dispatcher = { path = "../../crates/dispatcher" }
 tauri = { workspace = true, features = ["protocol-asset"] }
 tauri-plugin-dialog = { workspace = true }
 tauri-plugin-single-instance = { workspace = true }
@@ -38,13 +38,13 @@ futures.workspace = true
 tauri-plugin-clipboard-manager = "2.3.2"
 url = "2.5.8"
 ignore = "0.4.25"
-switchboard-git = { version = "0.0.1", path = "../git" }
-switchboard-prompts = { version = "0.0.1", path = "../prompts" }
+switchboard-git = { version = "0.0.1", path = "../../crates/git" }
+switchboard-prompts = { version = "0.0.1", path = "../../crates/prompts" }
 shlex = "2.0.1"
 keyring = { version = "3", features = ["apple-native"] }
 serde_norway.workspace = true
 tokio-util.workspace = true
-switchboard-workflow = { version = "0.0.1", path = "../workflow" }
+switchboard-workflow = { version = "0.0.1", path = "../../crates/workflow" }
 keepawake = "0.6.0"
 mac-usernotifications = "0.3.1"
 async-trait.workspace = true

@@ -8,7 +8,7 @@
 //! the local and MCP providers share one type. See `docs/system-design.md` §6
 //! and the milestone plan for the design.
 //!
-//! Config-directory resolution and the secret-store backend live in `crates/app`
+//! Config-directory resolution and the secret-store backend live in `desktop/src-tauri`
 //! (it owns the `directories`/`SWITCHBOARD_CONFIG_DIR` logic and the keychain);
 //! this crate takes already-resolved paths and an injected [`SecretStore`] so
 //! dev-instance isolation and test hermeticity stay intact.

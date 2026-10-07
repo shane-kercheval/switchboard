@@ -60,7 +60,7 @@ pub struct Attachment {
     /// It exists because a journal entry has two jobs that pull apart the moment
     /// a file moves. Reading it back to *find the file* wants the current path;
     /// reconstructing *what was sent* wants the original. The surplus-case
-    /// send↔turn correlation (`align_surplus_candidates` in `crates/app/src/commands.rs`)
+    /// send↔turn correlation (`align_surplus_candidates` in `desktop/src-tauri/src/commands.rs`)
     /// re-renders the exact prompt text the harness recorded and matches it
     /// character-for-character — so if a migration rewrote `path`, every
     /// attachment-bearing send before the move would stop reconstructing and its

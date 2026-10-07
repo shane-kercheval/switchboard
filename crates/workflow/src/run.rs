@@ -1,6 +1,6 @@
 //! Workflow-run record types — the format of a run's `runs/<run-id>.jsonl`.
 //! Defined here (with the language) per architecture decision #1; the interpreter
-//! in `crates/app` writes them and the app owns the path.
+//! in `desktop/src-tauri` writes them and the app owns the path.
 //!
 //! **Progress bookkeeping, not replay state.** Resume/retry is deferred beyond v1
 //! (a crashed or failed run is *abandoned*, not resumed — see the v1 plan and

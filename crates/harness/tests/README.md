@@ -48,7 +48,7 @@ per-test response size, not test count.
   here: `live.rs` (happy-path event vocabulary), `tool_use.rs` (tool
   lifecycle), `transcript_load.rs` (hydration round-trip). Dispatcher-layer
   end-to-end lives in `crates/dispatcher/tests/live_end_to_end.rs`; the
-  binary/auth availability probes live inline in `crates/app/src/commands.rs`.
+  binary/auth availability probes live inline in `desktop/src-tauri/src/commands.rs`.
   Add a file when a category has a distinct focus; extend `live.rs` for new
   event types on the happy path.
 - **Tiny, deterministic prompts.** Assert on structure and contracts, never on

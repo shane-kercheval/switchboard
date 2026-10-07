@@ -30,7 +30,7 @@
 //! code. Errors surface the server's `error`/`error_description` text, never
 //! `code` or `state` values. (rmcp itself debug-logs the raw code during the
 //! exchange; the app's logging layer denies that module's debug output — see
-//! `crates/app`.)
+//! `desktop/src-tauri`.)
 
 use std::sync::Arc;
 use std::time::Duration;

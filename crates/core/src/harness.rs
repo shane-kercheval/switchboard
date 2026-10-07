@@ -57,7 +57,7 @@ impl HarnessKind {
     /// the valid set differs by model (Gemini 3.1 Pro has low/high; the Flash
     /// models add medium). This flag only says the axis is drivable; which
     /// levels a given model accepts is the picker's business — see
-    /// `effortOptionsFor` in `src/lib/agentSelection.ts`.
+    /// `effortOptionsFor` in `desktop/src/lib/agentSelection.ts`.
     ///
     /// A *separate* axis from model selection, kept as its own gate even though
     /// every current harness supports both: the axes are independent (a harness

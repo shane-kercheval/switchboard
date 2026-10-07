@@ -35,13 +35,22 @@ out/
 **/__screenshots__/
 
 # Tauri generated
-crates/app/gen/
+desktop/src-tauri/gen/
 
-# iOS: `make ios-crypto` output, and Xcode per-user state
+# Retired paths: a checkout from before the move to desktop/ and ios/ keeps
+# these ignored files after pulling. Ignoring them still keeps them out of
+# `git add -A`, Local.xcconfig (a personal team id) above all.
+crates/app/gen/
 SwitchboardMobile/SwitchboardMobileKit/Generated/
 SwitchboardMobile/SwitchboardMobileKit/.swiftpm/
 SwitchboardMobile/SwitchboardMobileKit/.build/
 SwitchboardMobile/Config/Local.xcconfig
+
+# iOS: `make ios-crypto` output, and Xcode per-user state
+ios/SwitchboardMobileKit/Generated/
+ios/SwitchboardMobileKit/.swiftpm/
+ios/SwitchboardMobileKit/.build/
+ios/Config/Local.xcconfig
 xcuserdata/
 DerivedData/
 

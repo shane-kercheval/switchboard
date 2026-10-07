@@ -1,7 +1,7 @@
 //! The workflow interpreter: executes a parsed, bound [`Workflow`] against a
 //! project's live agents by driving the real [`Dispatcher`]. It is a *conductor*
 //! over app-owned machinery (the dispatcher, `PromptService`, run-record IO), so
-//! it lives in `crates/app`, not the pure workflow crate.
+//! it lives in `desktop/src-tauri`, not the pure workflow crate.
 //!
 //! ## Model
 //!

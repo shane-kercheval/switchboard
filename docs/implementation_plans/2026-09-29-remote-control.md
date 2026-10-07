@@ -30,8 +30,8 @@ shared Rust cryptography are in one tree.
   - Concurrency: `Session` and `PairingHandshake` keep their state behind a lock, `seal`
     fragments and seals a whole envelope under one acquisition, and a poisoned lock reports
     the session dead. The Swift `SecureSession` actor seals and sends in one step.
-  - Libraries: `snow`, `ed25519-dalek`, `data-encoding`, `zeroize`; randomness from the
-    operating system.
+  - Libraries: `snow`, `ed25519-dalek` 3, `data-encoding`, `zeroize`; randomness from the
+    operating system through `getrandom`. Signatures are domain-separated by purpose.
 - **Paths (2026-10-06)** — file paths updated for the repository's move to `desktop/` and
   `ios/`: `crates/app` is now `desktop/src-tauri`, the frontend's `src/` is `desktop/src/`,
   and the iOS app is in `ios/`. No content change; the revision is unchanged, and the entries
@@ -376,9 +376,12 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
   reassembler accepts at most **8 MiB** per message and at most **4** incomplete messages, and
   discards partial state on disconnect. The fragmenter does not truncate. Payload size is
   bounded higher up, by the window budget and tool-output cap in §5.7.
-- `identity` — Ed25519 challenge signing and verification, and
+- `identity` — Ed25519 signing and strict verification, and
   `device_id = base32(sha256(public_key))[..26]`: lower-case RFC 4648 base32 without padding,
-  26 characters (130 bits), always compared as an exact string, never case-folded.
+  26 characters (130 bits), always compared as an exact string, never case-folded. Every
+  signature is domain-separated by purpose — the relay challenge and the pairing binding sign
+  different length-prefixed contexts — so a signature made for one never verifies for the
+  other.
 
 **Concurrency.** UniFFI objects can be called from any thread. `PairingHandshake` and
 `Session` keep their state behind a `Mutex`; a call out of order, or on a finished handshake,
@@ -389,10 +392,10 @@ Records must be transmitted in the order `seal` returns them: the Swift `SecureS
 is an actor that seals and sends in one step.
 
 **Libraries.** `snow` with its default pure-Rust resolver (X25519, ChaChaPoly, SHA-256), so iOS
-uses no system crypto library; `ed25519-dalek` with `rand_core` and `zeroize`; `data-encoding`
-for the base32 alphabet; `zeroize`. Randomness comes from the operating system through
-`rand_core`'s `OsRng`. `ed25519-dalek` brings its own `sha2` major version, so the build carries
-two; that is expected.
+uses no system crypto library; `ed25519-dalek` 3 with its default `zeroize` feature;
+`data-encoding` for base32; `zeroize`. Key seeds come from the operating system's generator
+through `getrandom`, because `ed25519-dalek` 3's `rand_core` 0.10 has no `OsRng`. Both
+`ed25519-dalek` 3 and this crate use `sha2` 0.11, so the build carries one copy.
 
 **Ordering assumption.** `snow`'s transport requires in-order delivery. One WebSocket per side
 through one relay preserves order; the relay must forward a pair's frames in arrival order and

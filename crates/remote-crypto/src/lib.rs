@@ -6,6 +6,7 @@
 mod confirmation;
 mod error;
 pub mod fragment;
+pub mod frame;
 pub mod identity;
 pub mod keys;
 pub mod pairing;

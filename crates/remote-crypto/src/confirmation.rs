@@ -7,15 +7,16 @@ pub const HANDSHAKE_HASH_LEN: usize = 32;
 
 const CODE_SPACE: u64 = 1_000_000;
 
-/// Domain separation, so the code can never coincide with another value
+/// Domain separation: keeps this derivation independent of any other value
 /// derived from the same handshake hash.
 const DOMAIN: &[u8] = b"switchboard pairing confirmation code v1";
 
 /// The six-digit code both screens show during pairing.
 ///
-/// Both ends of one handshake share its hash, so they derive the same code; an
-/// attacker who completed a different handshake derives a different one. The
-/// derivation is part of the pairing protocol: a Mac and a phone built from
+/// Both ends of one handshake share its hash, so they derive the same code. An
+/// attacker who completed a different handshake derives an independent code,
+/// which matches by chance about one time in a million — six digits are a
+/// check a person can compare, not a unique identifier. The derivation is part of the pairing protocol: a Mac and a phone built from
 /// different versions must still agree, so changing it needs a new `DOMAIN`.
 #[uniffi::export]
 #[expect(
@@ -53,7 +54,7 @@ mod tests {
     }
 
     #[test]
-    fn different_hashes_yield_different_codes() {
+    fn a_one_bit_change_in_the_hash_changes_this_code() {
         let mut other = hash(7);
         other[HANDSHAKE_HASH_LEN - 1] ^= 1;
         assert_ne!(

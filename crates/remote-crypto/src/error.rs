@@ -23,6 +23,21 @@ pub enum CryptoError {
     InvalidPayload,
     #[error("message of {length} bytes is too large to send")]
     MessageTooLarge { length: u64 },
-    #[error("a record could not be opened, so the session is closed")]
+    /// A frame of the wrong type, of no known type, or longer than any Noise
+    /// message. Refused before any handshake or session state is touched, so
+    /// an open session stays open.
+    #[error("the frame is not of the expected type")]
+    UnexpectedFrame,
+    /// The record did not decrypt under this session's keys. The session is
+    /// closed. The record may belong to another session of the same device.
+    #[error("the record did not authenticate, so the session is closed")]
+    RecordRejected,
+    /// The record decrypted, so the peer holds this session's keys, but its
+    /// contents broke the fragment rules. The session is closed. The record
+    /// belongs to no other session.
+    #[error("the peer sent a malformed record, so the session is closed")]
+    ProtocolViolation,
+    /// A call on a session that an earlier failure already closed.
+    #[error("the session is closed")]
     SessionClosed,
 }

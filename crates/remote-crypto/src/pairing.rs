@@ -13,6 +13,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use snow::{Builder, HandshakeState};
 use zeroize::Zeroizing;
 
+use crate::frame::{self, FrameKind};
 use crate::identity::{self, SignaturePurpose};
 use crate::keys::{DeviceKeys, KEY_LEN};
 use crate::{CryptoError, HANDSHAKE_HASH_LEN};
@@ -112,6 +113,7 @@ impl PhoneAwaitingResponse {
             &[u8; KEY_LEN],
         ) -> Result<Vec<u8>, CryptoError>,
     ) -> Result<(UnconfirmedMac, Vec<u8>), CryptoError> {
+        let message_2 = frame::body(FrameKind::Pairing, message_2)?;
         let payload = read(&mut self.handshake, message_2)?;
         let mac_key = remote_static(&self.handshake)?;
         if mac_key != self.expected_mac_key {
@@ -127,7 +129,7 @@ impl PhoneAwaitingResponse {
                 name: mac_name,
                 handshake_hash: handshake_hash(&self.handshake)?,
             },
-            message_3,
+            frame::tagged(FrameKind::Pairing, &message_3),
         ))
     }
 }
@@ -136,6 +138,7 @@ impl MacAwaitingFinish {
     /// Reads the phone's message 3: its keys, its name, and the signature
     /// proving it holds the identity key it registers.
     pub fn finish(mut self, message_3: &[u8]) -> Result<PairingCandidate, CryptoError> {
+        let message_3 = frame::body(FrameKind::Pairing, message_3)?;
         let payload = read(&mut self.handshake, message_3)?;
         let phone_noise_key = remote_static(&self.handshake)?;
         let (identity_public_key, signature, name) = decode_message_3(&payload)?;
@@ -170,7 +173,7 @@ fn phone_start_with(
             identity: keys.identity_signing_key().clone(),
             noise_public_key: keys.noise_public_key(),
         },
-        message_1,
+        frame::tagged(FrameKind::Pairing, &message_1),
     ))
 }
 
@@ -184,6 +187,7 @@ fn mac_respond_with(
     let mut handshake = builder(keys, psk, ephemeral)?
         .build_responder()
         .map_err(|_| CryptoError::HandshakeFailed)?;
+    let message_1 = frame::body(FrameKind::Pairing, message_1)?;
     if !read(&mut handshake, message_1)?.is_empty() {
         return Err(CryptoError::InvalidPayload);
     }
@@ -196,7 +200,7 @@ fn mac_respond_with(
             handshake,
             hash_before_message_3,
         },
-        message_2,
+        frame::tagged(FrameKind::Pairing, &message_2),
     ))
 }
 
@@ -451,6 +455,17 @@ mod tests {
         assert_eq!(
             confirmation_code(paired_mac.handshake_hash.to_vec()).unwrap(),
             "112950"
+        );
+    }
+
+    #[test]
+    fn pairing_steps_refuse_frames_of_another_kind() {
+        let party = party();
+        let (_, mut message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
+        message_1[0] = FrameKind::SessionRequest as u8;
+        assert_eq!(
+            mac_respond(&party.mac, &party.psk, "Mac", &message_1).err(),
+            Some(CryptoError::UnexpectedFrame)
         );
     }
 

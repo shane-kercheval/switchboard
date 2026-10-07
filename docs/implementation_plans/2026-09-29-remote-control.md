@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 12 · **Created:** 2026-09-29 · **Revised:** 2026-10-07
+**Status:** proposed · **Revision:** 13 · **Created:** 2026-09-29 · **Revised:** 2026-10-07
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,21 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 13 (2026-10-07)** — second review of the pairing and session implementation (§3,
+  §4, §5.4, §7.2).
+  - Frames are typed. Every frame `remote-crypto` produces starts with one byte —
+    pairing message, connection request, connection reply, or record — and each step accepts
+    only its own type. Before this, nothing told a connection request from a record, and the
+    two can be the same length, so revision 12's replay rule had nothing to route on. **This
+    changes every frame on the wire**: the regression vectors are re-pinned with the type byte
+    in front of unchanged Noise bytes. Confirmation codes are unchanged, because the byte is
+    outside the handshake. The pairing token stays a relay-level field of `Frame`.
+  - `open` reports three failures instead of one: `RecordRejected` (did not decrypt; the
+    record may belong to the device's other session), `ProtocolViolation` (decrypted but
+    malformed; it belongs to no other session), and `UnexpectedFrame` (wrong type or oversize;
+    nothing touched). §5.4 falls back to the confirmed session only after `RecordRejected`.
+  - "A replay costs the real session nothing" now says as well that the relay can still end
+    any session, which §2 accepts.
 - **Revision 12 (2026-10-07)** — review of the pairing and session implementation (§2, §3,
   §5.4, §5.9, §5.10, §7.5).
   - A session the Mac accepts starts **unconfirmed**: a `Noise_KK` message 1 can be replayed
@@ -24,7 +39,8 @@ shared Rust cryptography are in one tree.
     record that opens confirms it. §5.4 holds at most one confirmed and one unconfirmed
     session per device and routes each record to the unconfirmed one first, falling back to
     the confirmed one with the same record. A failed decryption does not advance `snow`'s
-    nonce, so the fallback is exact and a replay costs the real session nothing. Only a
+    nonce, so the fallback is exact and a replay costs the real session nothing; the relay can
+    still end any session, which §2 accepts. Only a
     confirmed session replaces another or counts as connected for the wake lease (§5.9).
   - Reassembly is strictly sequential: one message in progress, fragments contiguous and in
     order. **Replaces** "at most 4 incomplete messages", which only a misbehaving peer could
@@ -405,7 +421,10 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
   Noise maximum is refused before anything is allocated for it. The phone's session is
   **confirmed** when created, because the Mac's message 2 carries a fresh ephemeral. The Mac's
   is not: whoever saw a message 1 can replay it, and `respond` accepts the replay. The Mac's
-  session becomes confirmed when its first record opens (§5.4).
+  session becomes confirmed when its first record decrypts (§5.4). Every frame carries its
+  type (§4), and each step and `open` refuse another type without touching any state.
+  `open` distinguishes a record that did not decrypt (`RecordRejected`) from one that
+  decrypted but broke the fragment rules (`ProtocolViolation`); both close the session.
 - `fragment` — splits a serialized envelope into records that each fit the Noise limit
   (65,535 bytes on the wire, so 65,519 bytes of plaintext after the tag). Each record's header —
   message id, index, count — is inside the encrypted payload, so it is authenticated. Records
@@ -472,6 +491,13 @@ it. `type` is snake_case, mirroring `#[serde(tag = "type", rename_all = "snake_c
 **Relay frame** — what crosses the relay is `Frame { to, from, record }`. A client sends `to`
 and `record`; the relay stamps `from` with the sender's registered device id and never trusts a
 client-supplied value. Handshake messages and transport records travel the same way.
+
+**Frame body** — `record` is produced and parsed only by `remote-crypto` (§3). Its first byte
+is the frame type: `1` pairing message, `2` connection request (`KK` message 1), `3`
+connection reply (`KK` message 2), `4` record. The Noise message follows. The byte is outside
+the encryption; a relay that changes it only makes the frame fail. Relay-level data — the
+pairing token above all, which the relay must read to decide whether to forward a pairing
+frame (§6) — is a field of `Frame`, never part of these bytes.
 
 **Requests (phone → Mac).** None is accepted before the connection's `KK` handshake completes.
 
@@ -581,13 +607,24 @@ and sends the updated `paired_devices` set to the relay.
 registered device, runs `KK` against that device's pinned key; a new successful handshake from
 the same device becomes that device's **unconfirmed** session, replacing any earlier
 unconfirmed one, never the confirmed one (§3: message 1 may be a replay). A device thus has at
-most one confirmed and one unconfirmed session. Each record from it goes to the unconfirmed
-session first: if it opens, that session is confirmed and replaces the old one; if not, the
-unconfirmed session is discarded and the same record goes to the confirmed session, which the
-failed attempt left untouched (a failed decryption does not advance `snow`'s nonce). An
-unconfirmed session that opens no record within 10 seconds is discarded; the phone's first
+most one confirmed and one unconfirmed session. Frames are routed by their type (§4): a
+connection request starts a handshake and is never offered to a session; a record is never
+offered to a handshake. Each record goes to the unconfirmed session first, and `open`'s
+outcome decides what happens:
+- **It opens:** that session is confirmed and replaces the old one.
+- **`RecordRejected`** (did not decrypt): the unconfirmed session is discarded and the same
+  record goes to the confirmed session, which the failed attempt left untouched (a failed
+  decryption does not advance `snow`'s nonce).
+- **`ProtocolViolation`** (decrypted, but malformed): the unconfirmed session is discarded and
+  the record is **not** retried, since it belongs to no other session. The confirmed session
+  is kept; if the phone has really moved on, it ends as any session does.
+- **`UnexpectedFrame`** (wrong type, or oversize): the frame is dropped and no session is
+  touched. This is the only failure that leaves every session open.
+
+An unconfirmed session that opens no record within 10 seconds is discarded; the phone's first
 envelope, `hello`, confirms it at once. A replayed handshake therefore costs the real session
-nothing. Records are opened here and only plaintext envelopes leave the module. A transport record from a device
+nothing; the relay can still end any session, by sending one bad record of the right type,
+which §2 accepts. Records are opened here and only plaintext envelopes leave the module. A transport record from a device
 with no session cannot be opened, so it is discarded without a reply; that includes records
 sent while a handshake is still in progress. A handshake from a device that is not in the
 registry, or is revoked, is answered with `not_paired`. Also holds, in memory, each device's
@@ -1005,7 +1042,9 @@ though the phone cannot send attachments.
   one that drops during the grace period stays down until the app returns, because the keys
   the handshake needs are readable only while the phone is unlocked (§2). On
   `peer_disconnected` for the paired Mac it discards the session and retries the handshake
-  with the same backoff.
+  with the same backoff. It routes frames by type (§4) and ignores a connection reply when it
+  is not waiting for one — the Mac sends one in answer to a replayed request — without
+  touching its session.
 - **Local relay in development.** iOS App Transport Security blocks plain `ws://`, and iOS asks
   for Local Network permission before reaching a device on the LAN. The **Debug** build
   configuration's Info.plist carries `NSAppTransportSecurity` → `NSAllowsLocalNetworking = YES`

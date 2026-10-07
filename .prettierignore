@@ -3,7 +3,6 @@ target/
 node_modules/
 crates/
 desktop/src-tauri/
-ios/
 .github/
 # Untracked local Claude Code settings (gitignored globally).
 .claude/settings.local.json

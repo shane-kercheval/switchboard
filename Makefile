@@ -9,6 +9,16 @@ LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
 install:
 	@node -e 'const m=Number(process.versions.node.split(".")[0]); if(m<22){console.error("Switchboard needs Node >= 22 (you have "+process.versions.node+"). Switch Node versions and retry.");process.exit(1)}'
 	pnpm install --frozen-lockfile
+	@touch $(PNPM_STAMP)
+
+# Targets that run the frontend depend on this stamp rather than on `install`,
+# so they reinstall the pnpm workspace only when a manifest or the lockfile is
+# newer than the last install: current after a pull (including the README's
+# `git pull && make deploy`), free otherwise. `clean` removes it with
+# node_modules.
+PNPM_STAMP := node_modules/.install-stamp
+$(PNPM_STAMP): package.json desktop/package.json pnpm-workspace.yaml pnpm-lock.yaml
+	@$(MAKE) --no-print-directory install
 
 # Incremental compilation is off for the whole-workspace targets below.
 # It exists to speed up rebuilding one changed crate; for a target that builds
@@ -37,13 +47,13 @@ DEV_PORT ?= $(DEFAULT_DEV_PORT)
 DEV_SUFFIX := $(if $(filter-out $(DEFAULT_DEV_PORT),$(DEV_PORT)),-$(DEV_PORT))
 DEV_CONFIG_DIR := $(HOME)/Library/Application Support/switchboard-dev$(DEV_SUFFIX)
 
-dev: install
+dev: $(PNPM_STAMP)
 	SWITCHBOARD_CONFIG_DIR="$(DEV_CONFIG_DIR)" VITE_DEV_PORT=$(DEV_PORT) VITE_GIT_BRANCH=$(shell git branch --show-current) $(DESKTOP) tauri dev --config '{"build":{"devUrl":"http://localhost:$(DEV_PORT)"}}'
 
 # Release build of the macOS .app bundle (the only artifact that carries the
 # bundled icon). `--bundles app` skips the .dmg packaging step. Output:
 # target/release/bundle/macos/Switchboard.app
-build: install
+build: $(PNPM_STAMP)
 	$(DESKTOP) tauri build --bundles app
 	# Guards a *runtime* precondition, not a distribution one: UNUserNotificationCenter
 	# silently refuses to deliver from a bundle without a real signature, so losing
@@ -92,7 +102,7 @@ DEBUG_APP_ID ?= com.switchboard.desktop.debug
 DEBUG_APP := $(HOME)/Applications/$(DEBUG_APP_NAME).app
 DEBUG_APP_CONFIG := {"productName":"$(DEBUG_APP_NAME)","identifier":"$(DEBUG_APP_ID)"}
 
-debug-app: install
+debug-app: $(PNPM_STAMP)
 	$(DESKTOP) tauri build --debug --bundles app --config '$(DEBUG_APP_CONFIG)'
 	codesign --verify --deep --strict "target/debug/bundle/macos/$(DEBUG_APP_NAME).app"
 	rm -rf "$(DEBUG_APP)"
@@ -107,7 +117,7 @@ uninstall-debug-app:
 deploy: build install-app
 	open /Applications/Switchboard.app
 
-test:
+test: $(PNPM_STAMP)
 	$(NO_INCR) cargo test --workspace --all-features --locked
 	$(DESKTOP) test
 
@@ -116,11 +126,11 @@ test:
 # and quick. Ensures the WebKit binary first (idempotent, near-instant when
 # already present) so this target — and `check`, which inlines it — is
 # self-sufficient on a checkout that never ran `playwright install` by hand.
-test-browser:
+test-browser: $(PNPM_STAMP)
 	$(DESKTOP) exec playwright install webkit
 	$(DESKTOP) test:browser
 
-lint:
+lint: $(PNPM_STAMP)
 	cargo fmt --all -- --check
 	$(NO_INCR) cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 	$(DESKTOP) lint

@@ -21,7 +21,7 @@ import type { Turn } from "$lib/state/types";
 // numbers are never asserted (per the plan's conventions); this file gathers
 // them on demand, in the same real WebKit the behavioral suite uses:
 //
-//   VITE_PERF=1 pnpm vitest run --project browser tests/browser/perf-baseline.browser.test.ts
+//   VITE_PERF=1 pnpm --dir desktop vitest run --project browser tests/browser/perf-baseline.browser.test.ts
 //
 // Results are dumped through a deliberately failing assertion (browser-mode
 // console output doesn't reach the terminal reliably). Without VITE_PERF the

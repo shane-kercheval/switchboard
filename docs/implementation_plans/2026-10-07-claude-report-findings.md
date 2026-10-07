@@ -21,9 +21,9 @@ These are settled. Carry the reasons into code comments and commit messages, bec
 - **A later outcome report renders as its own card.** A model can call `ReportFindings` again after fixing things, with each finding carrying an `outcome` (`fixed`, `skipped`, `no_change_needed`). Desktop matches those against the earlier card and updates its badges in place. Switchboard renders the second call as a separate card with outcome badges and never edits the earlier card. Matching findings across calls is fragile because the model can reword them. Without the environment variable, outcome reports only happen when a model decides on its own, so they are rare.
 - **Findings count as answer text everywhere a turn's text is read.** That covers the copy button, manual forward, workflow output (`forward_from`, `last_output`, `responses_from`), forward's disk fallback, and forward readiness.
 - **One Rust function turns findings into text, and the frontend uses that text.** The Rust facet carries the finished markdown (the `text` field, defined in milestone 1), and the copy button uses it. Copy and forward therefore produce the same findings text, and the conversion has no TypeScript twin to drift from it.
-- **Findings text also feeds the transcript navigator's search and preview.** Searching for a file named in a finding finds the review. A review-only turn previews as "Code review · 7 findings": `previewLine` in `src/lib/markdown.ts` strips the `**`.
+- **Findings text also feeds the transcript navigator's search and preview.** Searching for a file named in a finding finds the review. A review-only turn previews as "Code review · 7 findings": `previewLine` in `desktop/src/lib/markdown.ts` strips the `**`.
 - **When the model also writes the findings as prose, copy and forward carry both.** Models often follow a `ReportFindings` call with prose covering the same issues. Copy and forward then include the review markdown and the prose, so a receiving agent reads each issue twice. The prose usually adds fix suggestions, reproduction steps and verification evidence. Detecting which paragraphs merely restate the findings would be guesswork, and a wrong guess deletes useful text. So nothing is de-duplicated.
-- **Collapsed responses keep their normal height limit.** In a collapsed response the card is part of the preview, like answer text. It isn't folded into the "N tool calls" label, but it is subject to the existing 14rem preview cap (`PREVIEW_CAP_REM` in `UnifiedTranscript.svelte`). A tall card, or one after long prose, is partly hidden behind the usual fade and Expand control. Finding rows aren't expandable while the response is collapsed.
+- **Collapsed responses keep their normal height limit.** In a collapsed response the card is part of the preview, like answer text. It isn't folded into the "N tool calls" label, but it is subject to the existing 14rem preview cap (`PREVIEW_CAP_REM` in `desktop/src/lib/components/UnifiedTranscript.svelte`). A tall card, or one after long prose, is partly hidden behind the usual fade and Expand control. Finding rows aren't expandable while the response is collapsed.
 - **No Codex or Antigravity work.** Neither harness has an equivalent tool.
 
 ### Rejected alternatives
@@ -40,7 +40,7 @@ Keep these and their reasons so later review rounds don't reopen them.
 - `crates/harness/src/facets.rs` (the `ToolFacet` contract) and `crates/harness/src/claude_code/facets.rs` (the Claude classifier).
 - `crates/harness/src/forward.rs`, whose module comment explains why the live capture and the disk read must produce byte-identical text.
 - `docs/harness-behavior.md` §3.6 (tool vocabularies and facet mapping).
-- `docs/ui-conventions.md` (semantic color tokens and `src/lib/components/ui/` primitives).
+- `docs/ui-conventions.md` (semantic color tokens and `desktop/src/lib/components/ui/` primitives).
 - `docs/harness-update-review.md` §3 (the dependency surface list you will extend).
 - The real call in the `coder-1` session file named above. Its `ReportFindings` record is line 284 and its tool result is line 285.
 
@@ -148,7 +148,7 @@ Give Switchboard a typed, tested representation of a review, built once in Rust,
   - every badge combination order
   - a multi-line `failure_scenario` (indented continuation)
   - ten or more findings where a value contains a blank line, asserting 4-space indentation under `10. ` and checking that the app's `marked` settings keep the paragraph inside item 10
-- Extend the existing live-versus-disk facet agreement test (`stream_and_session_file_facets_agree_per_tool_use_id` in `claude_code/facets.rs`) with the new paired fixture.
+- Extend the existing live-versus-disk facet agreement test (`stream_and_session_file_facets_agree_per_tool_use_id` in `crates/harness/src/claude_code/facets.rs`) with the new paired fixture.
 - `make test-live-claude` passes, including the new live test. Paste its output in the summary.
 - `docs/harness-behavior.md` §3.6 gets a Claude paragraph on `ReportFindings`. It covers:
   - the input schema
@@ -229,9 +229,9 @@ Make the review visible and copyable.
 
 ### Implementation outline
 
-1. **Types.** Add the `findings` variant to `ToolFacet` in `src/lib/types.ts`, mirroring the Rust shape.
+1. **Types.** Add the `findings` variant to `ToolFacet` in `desktop/src/lib/types.ts`, mirroring the Rust shape.
 
-2. **One rule for "answer items".** Today `src/lib/state/unified.ts` decides what counts as the answer (`answerTextOf`, `lastAnswerTextOf`, `copyTextOf`), and its doc comment says every consumer must route through it. Keep that single place and extend it:
+2. **One rule for "answer items".** Today `desktop/src/lib/state/unified.ts` decides what counts as the answer (`answerTextOf`, `lastAnswerTextOf`, `copyTextOf`), and its doc comment says every consumer must route through it. Keep that single place and extend it:
    - A findings report is a tool item with `facet_kind === "findings"` and `is_error === false`. This is milestone 2's rule: only a confirmed-successful call counts as answer content.
    - Full answer: every non-empty answer text item and every findings report, in turn order.
    - Last answer block: every findings report plus the last non-empty answer text item, in turn order. Findings are included because the last text block usually refers to them ("listed above").
@@ -239,7 +239,7 @@ Make the review visible and copyable.
 
    Expose the item selection itself, not only the joined string, because rendering needs the items (step 4).
 
-3. **The card.** A new component renders the facet. `AgentMessageBody.svelte` renders it in place of `ToolCallWidget` when a findings call either succeeded (`is_error === false`) or is still waiting for its result while the turn is streaming. Every other findings call uses `ToolCallWidget`, which shows the failed or cancelled status. That covers a failed call, a call stopped by a cancelled or failed turn, and a reopened completed turn whose call never got a result. Every non-findings tool also keeps `ToolCallWidget`. With this rule the card is never shown for a call that copy and forward leave out.
+3. **The card.** A new component renders the facet. `desktop/src/lib/components/AgentMessageBody.svelte` renders it in place of `ToolCallWidget` when a findings call either succeeded (`is_error === false`) or is still waiting for its result while the turn is streaming. Every other findings call uses `ToolCallWidget`, which shows the failed or cancelled status. That covers a failed call, a call stopped by a cancelled or failed turn, and a reopened completed turn whose call never got a result. Every non-findings tool also keeps `ToolCallWidget`. With this rule the card is never shown for a call that copy and forward leave out.
    - The card renders as soon as `tool_started` arrives, because the input is complete at that point. Show no pending spinner on it.
    - Badges: an outcome badge (`Fixed`, `Skipped`, `No change needed`) when present, else a verdict badge (`Confirmed`, `Plausible`) when present. Show the category as a muted tag.
    - Pick colors from semantic tokens per `docs/ui-conventions.md`. Desktop uses danger for Confirmed, warning for Plausible, success for Fixed and neutral for the rest.
@@ -250,9 +250,9 @@ Make the review visible and copyable.
    - In both modes the card renders its rows without the expand control, because expanding a row inside the clip would grow hidden content. Expanding the response gives the full card.
    - `turnHasHiddenDetail` and `hiddenItemsLabel` must not count findings reports as hidden tool calls, because they aren't hidden. One consequence: a tool call used to make a response's Expand control appear regardless of height, and a review-only response loses that. Its Expand control now depends only on the measured height (`clipOverflow`), which is why the definition of done includes a WebKit browser test.
 
-5. **Rows and previews.** In `src/lib/toolRow.ts`, give the `findings` facet a verb (`Code review`), a detail (`medium · 7 findings`) and an icon. A failed call's generic row and the navigator's tool fallback preview then read sensibly. `agentProse` in `src/lib/transcriptIndex.ts` uses the full-answer selection from step 2, so findings text becomes searchable and previews a findings-only turn.
+5. **Rows and previews.** In `desktop/src/lib/toolRow.ts`, give the `findings` facet a verb (`Code review`), a detail (`medium · 7 findings`) and an icon. A failed call's generic row and the navigator's tool fallback preview then read sensibly. `agentProse` in `desktop/src/lib/transcriptIndex.ts` uses the full-answer selection from step 2, so findings text becomes searchable and previews a findings-only turn.
 
-6. **Forward readiness.** `heldForwards.svelte.ts` checks `answerTextOf`, so a findings-only turn becomes "ready" with no extra change. This matches milestone 2's Rust rule.
+6. **Forward readiness.** `desktop/src/lib/state/heldForwards.svelte.ts` checks `answerTextOf`, so a findings-only turn becomes "ready" with no extra change. This matches milestone 2's Rust rule.
 
 ### Definition of done
 
@@ -281,7 +281,7 @@ Make the review visible and copyable.
   - the card renders in both collapsed modes, without row-expand controls
   - the hidden-items label excludes it
   - the copy button's text includes the review
-- A WebKit browser test (`tests/browser/`, using the existing mount helper) collapses a review-only response whose card is taller than the preview cap. It asserts the response's Expand control appears, and that expanding reveals every finding row.
+- A WebKit browser test (`desktop/tests/browser/`, using the existing mount helper) collapses a review-only response whose card is taller than the preview cap. It asserts the response's Expand control appears, and that expanding reveals every finding row.
 - `make check` passes.
 - To check the real result, run `make dev`. In a project with a Claude agent, give the milestone-1 live-test prompt, then confirm by looking:
   - The card appears with correct rows.

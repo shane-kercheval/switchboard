@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 11 · **Created:** 2026-09-29 · **Revised:** 2026-10-07
+**Status:** proposed · **Revision:** 12 · **Created:** 2026-09-29 · **Revised:** 2026-10-07
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,25 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 12 (2026-10-07)** — review of the pairing and session implementation (§2, §3,
+  §5.4, §5.9, §5.10, §7.5).
+  - A session the Mac accepts starts **unconfirmed**: a `Noise_KK` message 1 can be replayed
+    by whoever saw it, so `respond` succeeding proves nothing about the phone. The first
+    record that opens confirms it. §5.4 holds at most one confirmed and one unconfirmed
+    session per device and routes each record to the unconfirmed one first, falling back to
+    the confirmed one with the same record. A failed decryption does not advance `snow`'s
+    nonce, so the fallback is exact and a replay costs the real session nothing. Only a
+    confirmed session replaces another or counts as connected for the wake lease (§5.9).
+  - Reassembly is strictly sequential: one message in progress, fragments contiguous and in
+    order. **Replaces** "at most 4 incomplete messages", which only a misbehaving peer could
+    ever use.
+  - Dependencies: `snow` without its `std` feature, which had pulled in `ring` and `blake2`;
+    `ed25519-dalek` 2 and `sha2` 0.10, matching `snow`'s own Curve25519 and SHA-256, so the
+    library carries one implementation of each primitive. **Corrects** revision 11's claims
+    about both.
+  - Names lose the `Bidi_Control` set and zero-width spaces as well as control characters, and
+    both apps render them as isolated, single-line text. Confirmation codes are described as
+    matching another handshake's only by chance (about one in a million), not never.
 - **Revision 11 (2026-10-07)** — four M1 design decisions, approved before implementation (§2,
   §3, §5.2, §7.5).
   - Keys: one opaque `DeviceKeys` object owned by Rust holds a device's X25519 and Ed25519
@@ -285,7 +304,7 @@ making sure only the right phone, held by the right person, can do it.
 | Relay operator injects or alters a frame | Yes | Noise transport messages are authenticated; a forged or altered frame fails to open |
 | Relay operator replays a frame | Yes | Per-connection keys: a frame from an earlier connection fails to open; within a connection, `snow`'s implicit in-order nonces reject a repeat |
 | Relay operator impersonates the Mac or the phone | Yes | Every connection runs `Noise_KK` with both static keys pinned at pairing |
-| Someone photographs the QR code and pairs first | Yes | The confirmation code comes from the handshake hash, so the user's phone shows a code the attacker's session cannot match. The user types the phone's code into the Mac, and the registry row is written only if it equals the Mac's own code. Three wrong entries kill the token |
+| Someone photographs the QR code and pairs first | Yes | The confirmation code comes from the handshake hash, so the user's phone shows a code the attacker's session matches only by chance, about one in a million. The user types the phone's code into the Mac, and the registry row is written only if it equals the Mac's own code. Three wrong entries kill the token |
 | An unpaired device probes whether a Mac is online, or sends it frames | Yes | The relay forwards to a Mac only from devices it announced, or from the holder of an open pairing token; the Mac independently refuses unknown devices |
 | Someone claims an existing device id on the relay | Yes | Self-certifying ids: `device_id` is a hash of an Ed25519 public key, and registration signs the relay's challenge |
 | A revoked phone that is still connected | Yes | Revocation drops the device's live session; its next frame fails to open and future handshakes are refused |
@@ -368,21 +387,32 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
   - The phone refuses a Mac whose static key differs from the one in the QR code, and the
     Mac refuses a non-empty message 1. The prologue is `switchboard pairing v1`.
   - Either side rejects a wrong version, a bad signature, a short or over-long field,
-    invalid UTF-8, and trailing bytes. Names are informational: control characters are
-    stripped before display.
+    invalid UTF-8, and trailing bytes. Names are informational. Decoding strips control
+    characters, the Unicode `Bidi_Control` set, zero-width spaces and invisible operators;
+    zero-width joiners stay, for scripts and emoji. Both apps also render names as isolated,
+    single-line text (§5.10, §7.5).
+  - The results are a phone-side `UnconfirmedMac` and a Mac-side `PairingCandidate`. Only
+    the pairing coordinator turns a candidate into a trusted device, after the typed code
+    matches.
 - `confirmation_code(handshake_hash) -> String` — six digits, identical on both ends of one
-  handshake and different for any other.
+  handshake; another handshake's code matches only by chance, about one in a million.
 - `session` — the `KK` handshake and the resulting transport: `seal(envelope) -> Vec<Record>`,
   `open(record) -> Option<Envelope>`. Handshake payloads are empty, and the prologue is
   `switchboard session v1`. The first record that fails to open — tampered, repeated, out of
   order, from an earlier connection, or a malformed fragment — closes the session for good;
   every later call returns `SessionClosed`, and the caller reconnects with a new handshake. An
-  envelope above the size limit is refused without closing the session.
+  envelope above the size limit is refused without closing the session, and a record over the
+  Noise maximum is refused before anything is allocated for it. The phone's session is
+  **confirmed** when created, because the Mac's message 2 carries a fresh ephemeral. The Mac's
+  is not: whoever saw a message 1 can replay it, and `respond` accepts the replay. The Mac's
+  session becomes confirmed when its first record opens (§5.4).
 - `fragment` — splits a serialized envelope into records that each fit the Noise limit
   (65,535 bytes on the wire, so 65,519 bytes of plaintext after the tag). Each record's header —
-  message id, index, count — is inside the encrypted payload, so it is authenticated. The
-  reassembler accepts at most **8 MiB** per message and at most **4** incomplete messages, and
-  discards partial state on disconnect. The fragmenter does not truncate. Payload size is
+  message id, index, count — is inside the encrypted payload, so it is authenticated. Records
+  arrive in order and one `seal` produces all of an envelope's fragments, so the reassembler
+  accepts only the first fragment of a new message or the next fragment of the one in
+  progress, with the same count; anything else closes the session. It holds at most one
+  message, of at most **8 MiB**, and discards it on disconnect. The fragmenter does not truncate. Payload size is
   bounded higher up, by the window budget and tool-output cap in §5.7.
 - `identity` — Ed25519 signing and strict verification, and
   `device_id = base32(sha256(public_key))[..26]`: lower-case RFC 4648 base32 without padding,
@@ -400,10 +430,13 @@ Records must be transmitted in the order `seal` returns them: the Swift `SecureS
 is an actor that seals and sends in one step.
 
 **Libraries.** `snow` with its pure-Rust resolver limited to the primitives in use (X25519,
-ChaChaPoly, SHA-256), so iOS links no system crypto library and no unused cipher; `ed25519-dalek` 3 with its default `zeroize` feature;
+ChaChaPoly, SHA-256) and without its `std` feature, which would pull in `ring` and `blake2`,
+so iOS links no system crypto library and no unused cipher. `ed25519-dalek` 2 and `sha2` 0.10,
+deliberately not the latest majors: they match `snow`'s `curve25519-dalek` 4 and `sha2` 0.10,
+so the library carries one implementation of each primitive. Move them with `snow`.
 `data-encoding` for base32; `zeroize`. Key seeds come from the operating system's generator
-through `getrandom`, because `ed25519-dalek` 3's `rand_core` 0.10 has no `OsRng`. Both
-`ed25519-dalek` 3 and this crate use `sha2` 0.11, so the build carries one copy.
+through `getrandom`, at `snow`'s version. A second `getrandom` reaches the build only through
+UniFFI's code-generation tooling, never the crypto path.
 
 **Ordering assumption.** `snow`'s transport requires in-order delivery. One WebSocket per side
 through one relay preserves order; the relay must forward a pair's frames in arrival order and
@@ -418,9 +451,11 @@ Swift.
 
 - Rust: known-answer vectors for both handshakes; negative vectors (wrong PSK, wrong static
   key, tampered handshake message, tampered transport record, record from a previous
-  connection, repeated record); confirmation codes equal for one handshake and different across
-  two; fragmentation round trip for a large envelope; missing, duplicate, out-of-range, and
-  oversize fragments rejected; a message above 8 MiB and a fifth incomplete message rejected;
+  connection, repeated record); confirmation codes equal for one handshake, and handshake
+  hashes different across two; the Mac's session unconfirmed after a replayed message 1 and
+  confirmed by its first record; fragmentation round trip for a large envelope; missing,
+  repeated, out-of-sequence, out-of-range, and oversize fragments rejected; a message above
+  8 MiB rejected;
   signature verification with a wrong key fails; `DeviceKeys` round-trips through
   `storage_bytes` and `restore` rejects an unknown version and a wrong length; a device id is
   26 lower-case characters; pairing payloads with a wrong version, a bad or misbound signature,
@@ -544,8 +579,15 @@ and sends the updated `paired_devices` set to the relay.
 
 **5.4 `SessionManager`.** One live `Session` per connected device. On a handshake from a
 registered device, runs `KK` against that device's pinned key; a new successful handshake from
-the same device replaces the old session, whose further records fail to open. Records are
-opened here and only plaintext envelopes leave the module. A transport record from a device
+the same device becomes that device's **unconfirmed** session, replacing any earlier
+unconfirmed one, never the confirmed one (§3: message 1 may be a replay). A device thus has at
+most one confirmed and one unconfirmed session. Each record from it goes to the unconfirmed
+session first: if it opens, that session is confirmed and replaces the old one; if not, the
+unconfirmed session is discarded and the same record goes to the confirmed session, which the
+failed attempt left untouched (a failed decryption does not advance `snow`'s nonce). An
+unconfirmed session that opens no record within 10 seconds is discarded; the phone's first
+envelope, `hello`, confirms it at once. A replayed handshake therefore costs the real session
+nothing. Records are opened here and only plaintext envelopes leave the module. A transport record from a device
 with no session cannot be opened, so it is discarded without a reply; that includes records
 sent while a handshake is still in progress. A handshake from a device that is not in the
 registry, or is revoked, is answered with `not_paired`. Also holds, in memory, each device's
@@ -755,7 +797,8 @@ It forwards everything unchanged, then:
 - **Keep-awake** reuses the existing `WakeLease` from `wake_lock.rs`. The remote lease is held
   in either of two cases. The first is when all four of these hold: the preference is on,
   remote access is enabled, at least one device is paired, and `PowerSource` reports AC. The
-  second is when any device has a live session in `SessionManager`, on any power source. A
+  second is when any device has a **confirmed** session in `SessionManager`, on any power
+  source; an unconfirmed one, possibly a replay, does not count. A
   session ends when the phone's connection does (§5.4), and a phone disconnects shortly after
   it goes to the background (§7.2), so that second case lasts only while someone is looking
   at the app, which covers a follow-up after a turn ends.
@@ -788,7 +831,8 @@ It forwards everything unchanged, then:
   keep-awake rows; paired devices with "connected" or the last disconnect time since launch
   (from `SessionManager`), and **Revoke**; **Reset remote identity**.
 - Pairing modal: QR (`qrcode` package → SVG), 5-minute countdown, then a six-digit entry field
-  ("Enter the code shown on your iPhone"), **Decline**, the phone's reported name, and the
+  ("Enter the code shown on your iPhone"), **Decline**, the phone's reported name (rendered as
+  isolated, single-line text), and the
   mismatch message.
 - The `remote_load_project` handler and `loadProjectForRemote` (§5.8).
 - Transcript: an "iPhone" chip on user messages whose `origin` is `remote`, live and after reload.
@@ -1030,7 +1074,8 @@ though the phone cannot send attachments.
 - `AgentChip` — Stop while its agent has a live turn.
 - `ConnectionBanner` — "Mac offline since 14:32" when the relay supplies `last_seen`, with no
   guessed cause; **Retry**; a route to `PairView` when not paired.
-- `SettingsView` — the paired Mac's name (from pairing message 2), relay URL, **Unpair** (wipes Keychain entries).
+- `SettingsView` — the paired Mac's name (from pairing message 2, shown as isolated,
+  single-line text), relay URL, **Unpair** (wipes Keychain entries).
 
 **7.6 Tests**
 
@@ -1105,7 +1150,8 @@ modal with typed confirmation, and **Reset remote identity** (§5.9–5.10, minu
 launch at login); the iOS pairing flow, Keychain storage, and `NSCameraUsageDescription`
 (§7, §7.3); the protocol fixtures and `make protocol-fixtures`.
 *Done when:* the in-process integration test covers pair → typed confirm → connect → revoke
-mid-session, a wrong typed code, restart either side, restart the relay with the phone
+mid-session, a replayed handshake during a live session losing none of the phone's records,
+a wrong typed code, restart either side, restart the relay with the phone
 reconnecting before the Mac, a client that stops
 answering pings, a phone disconnect ending its session on the Mac, a replaced socket's late
 close leaving the new session intact, cross-connection replay, and token misuse; a real iPhone

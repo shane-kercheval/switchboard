@@ -5,15 +5,18 @@
 //! session encrypts header and chunk together, so the header is authenticated.
 //! The reassembler trusts nothing about it: a fragment that breaks a rule is an
 //! error, and the caller tears the connection down.
-
-use std::collections::HashMap;
+//!
+//! Records arrive in order (the transport rejects anything else) and one
+//! `seal` produces all of an envelope's fragments together, so an honest peer
+//! only ever sends a message's fragments contiguously and in order. The
+//! reassembler accepts exactly that and nothing else.
 
 use thiserror::Error;
 
 /// Largest Noise transport message on the wire.
 pub const MAX_RECORD_LEN: usize = 65_535;
 /// The `ChaChaPoly` authentication tag every record carries.
-const TAG_LEN: usize = 16;
+pub const TAG_LEN: usize = 16;
 /// Largest plaintext one record can carry.
 pub const MAX_FRAGMENT_LEN: usize = MAX_RECORD_LEN - TAG_LEN;
 /// Message id (u32), index (u16), count (u16), all big-endian.
@@ -22,8 +25,6 @@ const HEADER_LEN: usize = 8;
 pub const MAX_CHUNK_LEN: usize = MAX_FRAGMENT_LEN - HEADER_LEN;
 /// Largest message the reassembler accepts.
 pub const MAX_MESSAGE_LEN: usize = 8 * 1024 * 1024;
-/// Most messages the reassembler holds partially at once.
-pub const MAX_INCOMPLETE_MESSAGES: usize = 4;
 /// Most fragments a message within `MAX_MESSAGE_LEN` can need.
 const MAX_FRAGMENT_COUNT: usize = MAX_MESSAGE_LEN.div_ceil(MAX_CHUNK_LEN);
 
@@ -39,16 +40,8 @@ pub enum FragmentError {
     InvalidCount { count: u16 },
     #[error("fragment index {index} is outside a message of {count} fragments")]
     IndexOutOfRange { index: u16, count: u16 },
-    #[error("message {message_id} was announced with {expected} fragments, not {found}")]
-    CountMismatch {
-        message_id: u32,
-        expected: u16,
-        found: u16,
-    },
-    #[error("fragment {index} of message {message_id} arrived twice")]
-    Duplicate { message_id: u32, index: u16 },
-    #[error("more than {MAX_INCOMPLETE_MESSAGES} messages are incomplete")]
-    TooManyIncomplete,
+    #[error("fragment {index} of message {message_id} is out of sequence")]
+    OutOfSequence { message_id: u32, index: u16 },
 }
 
 /// Numbers the messages it splits; one per sending direction of a session.
@@ -92,19 +85,19 @@ impl Fragmenter {
 }
 
 /// Collects fragments into messages; one per receiving direction of a
-/// session. Drop it, or call `reset`, when the connection ends: partial
-/// messages never survive a disconnect.
+/// session. At most one message is in progress. Drop it, or call `reset`, when
+/// the connection ends: a partial message never survives a disconnect.
 #[derive(Debug, Default)]
 pub struct Reassembler {
-    incomplete: HashMap<u32, Partial>,
+    in_progress: Option<Partial>,
 }
 
 #[derive(Debug)]
 struct Partial {
+    message_id: u32,
     count: u16,
-    chunks: Vec<Option<Vec<u8>>>,
-    received: usize,
-    len: usize,
+    next_index: u16,
+    message: Vec<u8>,
 }
 
 struct Header {
@@ -115,25 +108,26 @@ struct Header {
 
 impl Reassembler {
     /// Takes one decrypted fragment. Returns the whole message once its last
-    /// fragment arrives, `None` while it is still incomplete. On an error the
-    /// message the fragment belonged to is discarded; the caller should end
-    /// the session, because an authenticated peer sent something malformed.
+    /// fragment arrives, `None` while it is still incomplete. A fragment must be
+    /// the first of a new message, or the next fragment of the one in progress
+    /// with the same count. On any error the message in progress is discarded;
+    /// the caller should end the session, because an authenticated peer sent
+    /// something malformed.
     pub fn accept(&mut self, fragment: &[u8]) -> Result<Option<Vec<u8>>, FragmentError> {
-        let (header, chunk) = parse(fragment)?;
-        let result = self.accept_chunk(&header, chunk);
+        let result = parse(fragment).and_then(|(header, chunk)| self.accept_chunk(&header, chunk));
         if result.is_err() {
-            self.incomplete.remove(&header.message_id);
+            self.in_progress = None;
         }
         result
     }
 
-    /// Discards every partial message.
+    /// Discards the message in progress.
     pub fn reset(&mut self) {
-        self.incomplete.clear();
+        self.in_progress = None;
     }
 
-    pub fn incomplete_messages(&self) -> usize {
-        self.incomplete.len()
+    pub fn is_assembling(&self) -> bool {
+        self.in_progress.is_some()
     }
 
     fn accept_chunk(
@@ -141,54 +135,41 @@ impl Reassembler {
         header: &Header,
         chunk: &[u8],
     ) -> Result<Option<Vec<u8>>, FragmentError> {
-        if header.count == 1 && !self.incomplete.contains_key(&header.message_id) {
-            return Ok(Some(chunk.to_vec()));
-        }
-        if !self.incomplete.contains_key(&header.message_id)
-            && self.incomplete.len() >= MAX_INCOMPLETE_MESSAGES
-        {
-            return Err(FragmentError::TooManyIncomplete);
-        }
-        let partial = self
-            .incomplete
-            .entry(header.message_id)
-            .or_insert_with(|| Partial {
+        let out_of_sequence = FragmentError::OutOfSequence {
+            message_id: header.message_id,
+            index: header.index,
+        };
+        let Some(partial) = self.in_progress.as_mut() else {
+            if header.index != 0 {
+                return Err(out_of_sequence);
+            }
+            if header.count == 1 {
+                return Ok(Some(chunk.to_vec()));
+            }
+            self.in_progress = Some(Partial {
+                message_id: header.message_id,
                 count: header.count,
-                chunks: vec![None; usize::from(header.count)],
-                received: 0,
-                len: 0,
+                next_index: 1,
+                message: chunk.to_vec(),
             });
-        if partial.count != header.count {
-            return Err(FragmentError::CountMismatch {
-                message_id: header.message_id,
-                expected: partial.count,
-                found: header.count,
-            });
-        }
-        let slot = &mut partial.chunks[usize::from(header.index)];
-        if slot.is_some() {
-            return Err(FragmentError::Duplicate {
-                message_id: header.message_id,
-                index: header.index,
-            });
-        }
-        partial.len += chunk.len();
-        if partial.len > MAX_MESSAGE_LEN {
-            return Err(FragmentError::MessageTooLarge { len: partial.len });
-        }
-        *slot = Some(chunk.to_vec());
-        partial.received += 1;
-        if partial.received < usize::from(partial.count) {
-            return Ok(None);
-        }
-        let Some(partial) = self.incomplete.remove(&header.message_id) else {
             return Ok(None);
         };
-        let mut message = Vec::with_capacity(partial.len);
-        for chunk in partial.chunks.into_iter().flatten() {
-            message.extend_from_slice(&chunk);
+        if header.message_id != partial.message_id
+            || header.index != partial.next_index
+            || header.count != partial.count
+        {
+            return Err(out_of_sequence);
         }
-        Ok(Some(message))
+        let len = partial.message.len() + chunk.len();
+        if len > MAX_MESSAGE_LEN {
+            return Err(FragmentError::MessageTooLarge { len });
+        }
+        partial.message.extend_from_slice(chunk);
+        partial.next_index += 1;
+        if partial.next_index < partial.count {
+            return Ok(None);
+        }
+        Ok(self.in_progress.take().map(|partial| partial.message))
     }
 }
 
@@ -277,42 +258,70 @@ mod tests {
         );
     }
 
+    fn assert_out_of_sequence(
+        reassembler: &mut Reassembler,
+        fragment: &[u8],
+        message_id: u32,
+        index: u16,
+    ) {
+        assert_eq!(
+            reassembler.accept(fragment),
+            Err(FragmentError::OutOfSequence { message_id, index })
+        );
+        assert!(!reassembler.is_assembling());
+    }
+
     #[test]
-    fn a_message_missing_a_fragment_never_completes() {
-        let mut fragments = Fragmenter::default()
+    fn a_message_missing_a_fragment_is_rejected_at_the_gap() {
+        let fragments = Fragmenter::default()
             .fragment(&message(2 * MAX_CHUNK_LEN + 5))
             .unwrap();
-        fragments.remove(1);
         let mut reassembler = Reassembler::default();
-        for fragment in &fragments {
-            assert_eq!(reassembler.accept(fragment), Ok(None));
-        }
-        assert_eq!(reassembler.incomplete_messages(), 1);
+        assert_eq!(reassembler.accept(&fragments[0]), Ok(None));
+        assert_out_of_sequence(&mut reassembler, &fragments[2], 0, 2);
     }
 
     #[test]
-    fn fragments_arriving_out_of_order_still_assemble_in_order() {
-        let original = message(3 * MAX_CHUNK_LEN);
-        let mut fragments = Fragmenter::default().fragment(&original).unwrap();
-        fragments.reverse();
-        assert_eq!(reassemble(&fragments), Ok(Some(original)));
+    fn a_message_must_start_at_its_first_fragment() {
+        let fragments = Fragmenter::default()
+            .fragment(&message(2 * MAX_CHUNK_LEN))
+            .unwrap();
+        assert_out_of_sequence(&mut Reassembler::default(), &fragments[1], 0, 1);
     }
 
     #[test]
-    fn a_duplicate_fragment_is_rejected_and_discards_its_message() {
+    fn a_repeated_fragment_is_rejected() {
         let fragments = Fragmenter::default()
             .fragment(&message(2 * MAX_CHUNK_LEN))
             .unwrap();
         let mut reassembler = Reassembler::default();
         assert_eq!(reassembler.accept(&fragments[0]), Ok(None));
-        assert_eq!(
-            reassembler.accept(&fragments[0]),
-            Err(FragmentError::Duplicate {
-                message_id: 0,
-                index: 0
-            })
-        );
-        assert_eq!(reassembler.incomplete_messages(), 0);
+        assert_out_of_sequence(&mut reassembler, &fragments[0], 0, 0);
+    }
+
+    #[test]
+    fn a_new_message_before_the_current_one_completes_is_rejected() {
+        let mut reassembler = Reassembler::default();
+        assert_eq!(reassembler.accept(&header(7, 0, 2)), Ok(None));
+        assert_out_of_sequence(&mut reassembler, &header(8, 0, 2), 8, 0);
+        assert_eq!(reassembler.accept(&header(7, 0, 2)), Ok(None));
+        assert_out_of_sequence(&mut reassembler, &header(8, 0, 1), 8, 0);
+    }
+
+    #[test]
+    fn a_fragment_changing_its_message_count_is_rejected() {
+        let mut reassembler = Reassembler::default();
+        assert_eq!(reassembler.accept(&header(7, 0, 3)), Ok(None));
+        assert_out_of_sequence(&mut reassembler, &header(7, 1, 2), 7, 1);
+    }
+
+    #[test]
+    fn reset_discards_the_message_in_progress() {
+        let mut reassembler = Reassembler::default();
+        assert_eq!(reassembler.accept(&header(0, 0, 2)), Ok(None));
+        reassembler.reset();
+        assert!(!reassembler.is_assembling());
+        assert_out_of_sequence(&mut reassembler, &header(0, 1, 2), 0, 1);
     }
 
     #[test]
@@ -333,20 +342,6 @@ mod tests {
                 Err(FragmentError::InvalidCount { count })
             );
         }
-    }
-
-    #[test]
-    fn a_fragment_disagreeing_on_its_message_count_is_rejected() {
-        let mut reassembler = Reassembler::default();
-        assert_eq!(reassembler.accept(&header(7, 0, 3)), Ok(None));
-        assert_eq!(
-            reassembler.accept(&header(7, 1, 2)),
-            Err(FragmentError::CountMismatch {
-                message_id: 7,
-                expected: 3,
-                found: 2
-            })
-        );
     }
 
     #[test]
@@ -390,30 +385,7 @@ mod tests {
             matches!(result, Err(FragmentError::MessageTooLarge { len }) if len > MAX_MESSAGE_LEN),
             "{result:?}"
         );
-        assert_eq!(reassembler.incomplete_messages(), 0);
-    }
-
-    #[test]
-    fn a_fifth_incomplete_message_is_rejected() {
-        let mut reassembler = Reassembler::default();
-        for message_id in 0..4 {
-            assert_eq!(reassembler.accept(&header(message_id, 0, 2)), Ok(None));
-        }
-        assert_eq!(
-            reassembler.accept(&header(4, 0, 2)),
-            Err(FragmentError::TooManyIncomplete)
-        );
-        assert_eq!(reassembler.incomplete_messages(), 4);
-        assert_eq!(reassembler.accept(&header(4, 0, 1)), Ok(Some(Vec::new())));
-    }
-
-    #[test]
-    fn reset_discards_partial_messages() {
-        let mut reassembler = Reassembler::default();
-        assert_eq!(reassembler.accept(&header(0, 0, 2)), Ok(None));
-        reassembler.reset();
-        assert_eq!(reassembler.incomplete_messages(), 0);
-        assert_eq!(reassembler.accept(&header(0, 1, 2)), Ok(None));
+        assert!(!reassembler.is_assembling());
     }
 
     #[test]

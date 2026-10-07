@@ -33,19 +33,23 @@ pub struct PairingOffer {
     pub psk: Zeroizing<[u8; PSK_LEN]>,
 }
 
-/// The phone's result: the Mac to pin, and the hash its confirmation code
-/// comes from.
+/// The phone's result: the Mac it would pin, and the hash its confirmation
+/// code comes from. Not trusted yet: the phone stores these keys only when the
+/// Mac reports that the user typed the matching code.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PairedMac {
+pub struct UnconfirmedMac {
     pub noise_public_key: [u8; KEY_LEN],
     pub name: String,
     pub handshake_hash: [u8; HANDSHAKE_HASH_LEN],
 }
 
-/// The Mac's result: the phone to pin, once the user has typed the matching
-/// confirmation code.
+/// The Mac's result: a phone asking to be trusted. Only the pairing
+/// coordinator turns a candidate into a trusted device, and only after the
+/// user has typed the confirmation code the phone shows and it matches the
+/// code derived here — the check that defeats someone who photographed the QR
+/// code and pairs first.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PairedPhone {
+pub struct PairingCandidate {
     pub noise_public_key: [u8; KEY_LEN],
     pub identity_public_key: VerifyingKey,
     pub name: String,
@@ -93,7 +97,7 @@ impl PhoneAwaitingResponse {
         self,
         phone_name: &str,
         message_2: &[u8],
-    ) -> Result<(PairedMac, Vec<u8>), CryptoError> {
+    ) -> Result<(UnconfirmedMac, Vec<u8>), CryptoError> {
         self.respond_with(message_2, |identity, hash, noise_key| {
             message_3_payload(identity, hash, noise_key, phone_name)
         })
@@ -107,7 +111,7 @@ impl PhoneAwaitingResponse {
             &[u8; HANDSHAKE_HASH_LEN],
             &[u8; KEY_LEN],
         ) -> Result<Vec<u8>, CryptoError>,
-    ) -> Result<(PairedMac, Vec<u8>), CryptoError> {
+    ) -> Result<(UnconfirmedMac, Vec<u8>), CryptoError> {
         let payload = read(&mut self.handshake, message_2)?;
         let mac_key = remote_static(&self.handshake)?;
         if mac_key != self.expected_mac_key {
@@ -118,7 +122,7 @@ impl PhoneAwaitingResponse {
         let payload = build_payload(&self.identity, &hash, &self.noise_public_key)?;
         let message_3 = write(&mut self.handshake, &payload)?;
         Ok((
-            PairedMac {
+            UnconfirmedMac {
                 noise_public_key: mac_key,
                 name: mac_name,
                 handshake_hash: handshake_hash(&self.handshake)?,
@@ -131,7 +135,7 @@ impl PhoneAwaitingResponse {
 impl MacAwaitingFinish {
     /// Reads the phone's message 3: its keys, its name, and the signature
     /// proving it holds the identity key it registers.
-    pub fn finish(mut self, message_3: &[u8]) -> Result<PairedPhone, CryptoError> {
+    pub fn finish(mut self, message_3: &[u8]) -> Result<PairingCandidate, CryptoError> {
         let payload = read(&mut self.handshake, message_3)?;
         let phone_noise_key = remote_static(&self.handshake)?;
         let (identity_public_key, signature, name) = decode_message_3(&payload)?;
@@ -141,7 +145,7 @@ impl MacAwaitingFinish {
             &binding_statement(&self.hash_before_message_3, &phone_noise_key),
             &signature,
         )?;
-        Ok(PairedPhone {
+        Ok(PairingCandidate {
             noise_public_key: phone_noise_key,
             identity_public_key,
             name,
@@ -214,11 +218,14 @@ fn builder<'a>(
 }
 
 pub(crate) fn read(handshake: &mut HandshakeState, message: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let mut payload = vec![0u8; MAX_MESSAGE_LEN];
+    // A handshake payload is never longer than its message, and a message
+    // longer than the Noise maximum is refused before decryption.
+    let mut payload = vec![0u8; message.len().min(MAX_MESSAGE_LEN)];
     let len = handshake
         .read_message(message, &mut payload)
         .map_err(|_| CryptoError::HandshakeFailed)?;
     payload.truncate(len);
+    payload.shrink_to_fit();
     Ok(payload)
 }
 
@@ -231,6 +238,7 @@ pub(crate) fn write(
         .write_message(payload, &mut message)
         .map_err(|_| CryptoError::HandshakeFailed)?;
     message.truncate(len);
+    message.shrink_to_fit();
     Ok(message)
 }
 
@@ -287,8 +295,12 @@ fn encode_name(name: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(bytes);
 }
 
-/// Reads a name written by `encode_name` and returns it with control
-/// characters removed, since the names are only ever displayed.
+/// Reads a name written by `encode_name` and returns it without characters
+/// that can disguise text next to the confirmation code: control characters,
+/// the Unicode `Bidi_Control` set (which reorders text), and the zero-width
+/// spaces and invisible operators (which hide it). Zero-width joiners stay,
+/// because scripts and emoji sequences need them. Apps still render names as
+/// isolated, single-line text, which covers anything this misses.
 fn decode_name(input: &[u8]) -> Result<(String, &[u8]), CryptoError> {
     let (&len, rest) = input.split_first().ok_or(CryptoError::InvalidPayload)?;
     let len = usize::from(len);
@@ -297,7 +309,19 @@ fn decode_name(input: &[u8]) -> Result<(String, &[u8]), CryptoError> {
     }
     let (bytes, rest) = rest.split_at(len);
     let name = std::str::from_utf8(bytes).map_err(|_| CryptoError::InvalidPayload)?;
-    Ok((name.chars().filter(|c| !c.is_control()).collect(), rest))
+    Ok((name.chars().filter(|&c| is_displayable(c)).collect(), rest))
+}
+
+fn is_displayable(c: char) -> bool {
+    !c.is_control()
+        && !matches!(
+            c,
+            // Bidi_Control.
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            // Zero-width space, word joiner and invisible operators, and the
+            // byte order mark.
+            | '\u{200B}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}'
+        )
 }
 
 fn decode_message_2(payload: &[u8]) -> Result<String, CryptoError> {
@@ -359,7 +383,7 @@ mod tests {
         }
     }
 
-    fn pair(party: &Party) -> (PairedMac, PairedPhone) {
+    fn pair(party: &Party) -> (UnconfirmedMac, PairingCandidate) {
         let (phone, message_1) = phone_start(&party.phone, &offer(party)).unwrap();
         let (mac, message_2) =
             mac_respond(&party.mac, &party.psk, "Studio Mac", &message_1).unwrap();
@@ -389,15 +413,16 @@ mod tests {
         );
     }
 
+    /// Fresh ephemerals make each pairing's handshake hash, and so its code,
+    /// different. Six digits can still coincide by chance (about one in a
+    /// million), so this compares the hashes; the code derivation itself is
+    /// pinned in `confirmation`.
     #[test]
-    fn two_pairings_of_the_same_devices_yield_different_codes() {
+    fn two_pairings_of_the_same_devices_have_different_handshake_hashes() {
         let party = party();
         let (first, _) = pair(&party);
         let (second, _) = pair(&party);
-        assert_ne!(
-            confirmation_code(first.handshake_hash.to_vec()).unwrap(),
-            confirmation_code(second.handshake_hash.to_vec()).unwrap()
-        );
+        assert_ne!(first.handshake_hash, second.handshake_hash);
     }
 
     /// Regression vector: with every key and ephemeral fixed, the handshake is
@@ -523,6 +548,26 @@ mod tests {
         let mut out = Vec::new();
         encode_name("Jo\u{1b}[2J's\n iPhone\u{7}", &mut out);
         assert_eq!(decode_name(&out).unwrap().0, "Jo[2J's iPhone");
+    }
+
+    #[test]
+    fn decoded_names_lose_reordering_and_invisible_characters() {
+        let mut out = Vec::new();
+        encode_name(
+            "Jo\u{202E}enohPi\u{202C}\u{200B}\u{2066}x\u{2069}\u{FEFF}",
+            &mut out,
+        );
+        assert_eq!(decode_name(&out).unwrap().0, "JoenohPix");
+    }
+
+    #[test]
+    fn decoded_names_keep_zero_width_joiners() {
+        let mut out = Vec::new();
+        encode_name("Jo's \u{1F469}\u{200D}\u{1F4BB}", &mut out);
+        assert_eq!(
+            decode_name(&out).unwrap().0,
+            "Jo's \u{1F469}\u{200D}\u{1F4BB}"
+        );
     }
 
     #[test]

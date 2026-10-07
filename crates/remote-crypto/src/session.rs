@@ -7,7 +7,7 @@
 use snow::{Builder, HandshakeState, TransportState};
 
 use crate::CryptoError;
-use crate::fragment::{FragmentError, Fragmenter, MAX_FRAGMENT_LEN, MAX_RECORD_LEN, Reassembler};
+use crate::fragment::{FragmentError, Fragmenter, MAX_RECORD_LEN, Reassembler, TAG_LEN};
 use crate::keys::{DeviceKeys, KEY_LEN};
 use crate::pairing::{read, write};
 
@@ -24,10 +24,18 @@ pub struct SessionInitiator {
 /// transmitted in the order `seal` returns them. The first record that fails
 /// to open closes the session for good: every later call returns
 /// `SessionClosed`, and the caller reconnects.
+///
+/// A session is *confirmed* once it has evidence the peer is live and holds
+/// the session's keys. The phone's session is confirmed when it is created,
+/// because the Mac's message 2 carries a fresh ephemeral. The Mac's is not: a
+/// `Noise_KK` message 1 can be replayed by whoever saw it, and `respond`
+/// accepts the replay. It becomes confirmed when its first record opens.
+/// Treat an unconfirmed session as a candidate, never as "this phone is here".
 pub struct Session {
     transport: TransportState,
     fragmenter: Fragmenter,
     reassembler: Reassembler,
+    confirmed: bool,
     closed: bool,
 }
 
@@ -40,7 +48,8 @@ pub fn initiate(
 }
 
 /// Mac: accept a connection from the paired phone whose key it pinned. A phone
-/// holding any other key fails here.
+/// holding any other key fails here. The session starts unconfirmed, because
+/// message 1 may be a replay.
 pub fn respond(
     keys: &DeviceKeys,
     peer_noise_public_key: &[u8; KEY_LEN],
@@ -54,7 +63,7 @@ impl SessionInitiator {
         if !read(&mut self.handshake, message_2)?.is_empty() {
             return Err(CryptoError::InvalidPayload);
         }
-        Session::from_handshake(self.handshake)
+        Session::from_handshake(self.handshake, true)
     }
 }
 
@@ -64,18 +73,16 @@ impl Session {
         if self.closed {
             return Err(CryptoError::SessionClosed);
         }
-        let fragments = self
-            .fragmenter
-            .fragment(envelope)
-            .map_err(|error| match error {
-                FragmentError::MessageTooLarge { len } => {
-                    CryptoError::MessageTooLarge { length: len as u64 }
-                }
-                _ => CryptoError::SessionClosed,
-            })?;
+        let fragments = match self.fragmenter.fragment(envelope) {
+            Ok(fragments) => fragments,
+            Err(FragmentError::MessageTooLarge { len }) => {
+                return Err(CryptoError::MessageTooLarge { length: len as u64 });
+            }
+            Err(_) => return Err(self.close()),
+        };
         let mut records = Vec::with_capacity(fragments.len());
         for fragment in fragments {
-            let mut record = vec![0u8; MAX_RECORD_LEN];
+            let mut record = vec![0u8; fragment.len() + TAG_LEN];
             match self.transport.write_message(&fragment, &mut record) {
                 Ok(len) => {
                     record.truncate(len);
@@ -88,30 +95,41 @@ impl Session {
     }
 
     /// Decrypts one record. Returns the envelope once its last record arrives,
-    /// `None` while it is still incomplete.
+    /// `None` while it is still incomplete. The first record that opens
+    /// confirms the session.
     pub fn open(&mut self, record: &[u8]) -> Result<Option<Vec<u8>>, CryptoError> {
         if self.closed {
             return Err(CryptoError::SessionClosed);
         }
-        let mut fragment = vec![0u8; MAX_FRAGMENT_LEN];
+        // Checked before allocating: the record comes straight off the relay.
+        if record.len() > MAX_RECORD_LEN {
+            return Err(self.close());
+        }
+        let mut fragment = vec![0u8; record.len()];
         let Ok(len) = self.transport.read_message(record, &mut fragment) else {
             return Err(self.close());
         };
+        self.confirmed = true;
         fragment.truncate(len);
         self.reassembler.accept(&fragment).map_err(|_| self.close())
+    }
+
+    pub fn is_confirmed(&self) -> bool {
+        self.confirmed
     }
 
     pub fn is_closed(&self) -> bool {
         self.closed
     }
 
-    fn from_handshake(handshake: HandshakeState) -> Result<Self, CryptoError> {
+    fn from_handshake(handshake: HandshakeState, confirmed: bool) -> Result<Self, CryptoError> {
         Ok(Self {
             transport: handshake
                 .into_transport_mode()
                 .map_err(|_| CryptoError::HandshakeFailed)?,
             fragmenter: Fragmenter::default(),
             reassembler: Reassembler::default(),
+            confirmed,
             closed: false,
         })
     }
@@ -148,7 +166,7 @@ fn respond_with(
         return Err(CryptoError::InvalidPayload);
     }
     let message_2 = write(&mut handshake, &[])?;
-    Ok((Session::from_handshake(handshake)?, message_2))
+    Ok((Session::from_handshake(handshake, false)?, message_2))
 }
 
 fn builder<'a>(
@@ -248,6 +266,58 @@ mod tests {
             initiator.finish(&forged).err(),
             Some(CryptoError::HandshakeFailed)
         );
+    }
+
+    #[test]
+    fn the_phone_is_confirmed_at_once_and_the_mac_on_its_first_record() {
+        let (mut phone, mut mac) = connect(&keys(1), &keys(2));
+        assert!(phone.is_confirmed());
+        assert!(!mac.is_confirmed());
+        deliver(&mut phone, &mut mac, b"hello");
+        assert!(mac.is_confirmed());
+    }
+
+    /// `Noise_KK` lets anyone who saw message 1 replay it to the Mac. The
+    /// replay yields a session, but one that stays unconfirmed: it cannot
+    /// open the real phone's records, and the first one it is offered closes
+    /// it.
+    #[test]
+    fn a_replayed_first_message_yields_only_an_unconfirmed_session() {
+        let (phone_keys, mac_keys) = (keys(1), keys(2));
+        let (initiator, message_1) = initiate(&phone_keys, &mac_keys.noise_public_key()).unwrap();
+        let (mut real, message_2) =
+            respond(&mac_keys, &phone_keys.noise_public_key(), &message_1).unwrap();
+        let mut phone = initiator.finish(&message_2).unwrap();
+        let (mut replayed, _) =
+            respond(&mac_keys, &phone_keys.noise_public_key(), &message_1).unwrap();
+        assert!(!replayed.is_confirmed());
+
+        let record = phone.seal(b"hello").unwrap().remove(0);
+        assert_eq!(
+            replayed.open(&record).err(),
+            Some(CryptoError::SessionClosed)
+        );
+        assert!(!replayed.is_confirmed());
+        // The failed attempt leaves the real session untouched, so the same
+        // record still opens there.
+        assert_eq!(real.open(&record), Ok(Some(b"hello".to_vec())));
+        assert!(real.is_confirmed());
+    }
+
+    #[test]
+    fn an_oversize_record_is_refused_before_anything_is_allocated_for_it() {
+        let (_, mut mac) = connect(&keys(1), &keys(2));
+        assert_eq!(
+            mac.open(&vec![0; MAX_RECORD_LEN + 1]).err(),
+            Some(CryptoError::SessionClosed)
+        );
+    }
+
+    #[test]
+    fn records_are_sized_to_their_content() {
+        let (mut phone, _) = connect(&keys(1), &keys(2));
+        let record = phone.seal(b"small").unwrap().remove(0);
+        assert!(record.capacity() < 128, "{}", record.capacity());
     }
 
     #[test]

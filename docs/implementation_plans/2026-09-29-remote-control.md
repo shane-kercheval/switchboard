@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 10 · **Created:** 2026-09-29 · **Revised:** 2026-10-05
+**Status:** proposed · **Revision:** 11 · **Created:** 2026-09-29 · **Revised:** 2026-10-07
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,21 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 11 (2026-10-07)** — four M1 design decisions, approved before implementation (§2,
+  §3, §5.2, §7.5).
+  - Keys: one opaque `DeviceKeys` object owned by Rust holds a device's X25519 and Ed25519
+    private keys and is zeroized on drop. Swift handles its storage blob only inside the
+    Keychain wrapper; the Mac stores the same blob, base64-encoded, under one `KeyStore`
+    entry, so the §2 table's two Mac rows become one.
+  - Pairing payloads: a fixed binary layout with a version byte. Message 2 carries the Mac's
+    name, which nothing delivered to the phone before; message 3 carries the phone's identity
+    key, a signature over the handshake hash and the phone's Noise key proving it holds that
+    identity key, and the phone's name.
+  - Concurrency: `Session` and `PairingHandshake` keep their state behind a lock, `seal`
+    fragments and seals a whole envelope under one acquisition, and a poisoned lock reports
+    the session dead. The Swift `SecureSession` actor seals and sends in one step.
+  - Libraries: `snow`, `ed25519-dalek`, `data-encoding`, `zeroize`; randomness from the
+    operating system.
 - **Paths (2026-10-06)** — file paths updated for the repository's move to `desktop/` and
   `ios/`: `crates/app` is now `desktop/src-tauri`, the frontend's `src/` is `desktop/src/`,
   and the iOS app is in `ios/`. No content change; the revision is unchanged, and the entries
@@ -289,9 +304,8 @@ execute anything.
 
 | Key | Where it lives | Secret? |
 |---|---|---|
-| Mac Noise static key (X25519) | `KeyStore` (Keychain in release, dev store in debug) | Yes |
-| Mac identity key (Ed25519) | `KeyStore` | Yes |
-| Phone Noise static key, phone identity key | iOS Keychain, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` (the app has no background work until push arrives) | Yes |
+| Mac Noise static key (X25519) and identity key (Ed25519) | One `KeyStore` entry (Keychain in release, dev store in debug): the `DeviceKeys` storage blob, base64-encoded | Yes |
+| Phone Noise static key, phone identity key | One iOS Keychain item, the same `DeviceKeys` storage blob, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` (the app has no background work until push arrives) | Yes |
 | Paired phones' public keys (both kinds) | `remote_devices.jsonl` | No |
 | Pairing token and pairing PSK | Mac memory only, for the 5-minute window | Yes |
 | Per-connection transport keys | Memory only, discarded on disconnect | Yes |
@@ -327,8 +341,31 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
 
 **Contents**
 
-- `pairing` — the `XXpsk2` handshake as a state machine over bytes. Output: the peer's Noise
-  static key, the peer's Ed25519 identity key, and the handshake hash.
+- `keys` — `DeviceKeys`, an opaque object holding one device's X25519 Noise static key and
+  Ed25519 identity key, zeroized on drop. Created only by `generate()` (operating-system
+  randomness) or `restore(bytes)`; exposes `device_id()`, `noise_public_key()`,
+  `identity_public_key()`, and `storage_bytes()`, a versioned blob. `restore` rejects an
+  unknown version byte or a wrong length with a typed `CryptoError`. No accessor returns a
+  private key, and the handshakes take `DeviceKeys`, never key bytes. The Mac stores the blob
+  base64-encoded under one `KeyStore` entry (the store holds strings). On iOS, Swift handles
+  the blob only inside the Keychain wrapper and treats it as opaque; Swift's `Data` cannot be
+  zeroized, so the bytes exist in Swift memory for that one call.
+- `pairing` — the `XXpsk2` handshake as a state machine over bytes, the phone initiating.
+  Output: the peer's Noise static key, the phone's Ed25519 identity key, both names, and the
+  handshake hash. Payloads, in a fixed binary layout produced and parsed only here:
+  - message 1 (phone → Mac): empty; it is not yet encrypted.
+  - message 2 (Mac → phone): version byte `1`, then the Mac's name as a one-byte length and at
+    most 64 bytes of UTF-8. Encrypted, because the PSK is mixed in before it.
+  - message 3 (phone → Mac): version byte `1`; the phone's 32-byte Ed25519 public key; a
+    64-byte Ed25519 signature over the handshake hash as it stands before message 3,
+    concatenated with the phone's Noise static public key; the phone's name, encoded as in
+    message 2. The phone signs after reading message 2; the Mac takes the hash after writing
+    message 2 and before reading message 3, because reading message 3 changes it. The
+    signature proves the phone holds the identity key it registers, and says by itself that
+    this identity key vouches for this Noise key.
+  - Either side rejects a wrong version, a bad signature, a short or over-long field,
+    invalid UTF-8, and trailing bytes. Names are informational: control characters are
+    stripped before display.
 - `confirmation_code(handshake_hash) -> String` — six digits, identical on both ends of one
   handshake and different for any other.
 - `session` — the `KK` handshake and the resulting transport: `seal(envelope) -> Vec<Record>`,
@@ -339,8 +376,23 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
   reassembler accepts at most **8 MiB** per message and at most **4** incomplete messages, and
   discards partial state on disconnect. The fragmenter does not truncate. Payload size is
   bounded higher up, by the window budget and tool-output cap in §5.7.
-- `identity` — Ed25519 keygen, `device_id = base32(sha256(public_key))[..26]`, challenge
-  signing and verification.
+- `identity` — Ed25519 challenge signing and verification, and
+  `device_id = base32(sha256(public_key))[..26]`: lower-case RFC 4648 base32 without padding,
+  26 characters (130 bits), always compared as an exact string, never case-folded.
+
+**Concurrency.** UniFFI objects can be called from any thread. `PairingHandshake` and
+`Session` keep their state behind a `Mutex`; a call out of order, or on a finished handshake,
+returns a typed error rather than panicking. `seal` fragments and seals all of an envelope's
+records under one lock acquisition, so concurrent calls can never interleave records. A
+poisoned lock reports the session dead through a typed error, and the caller reconnects.
+Records must be transmitted in the order `seal` returns them: the Swift `SecureSession` (§7.2)
+is an actor that seals and sends in one step.
+
+**Libraries.** `snow` with its default pure-Rust resolver (X25519, ChaChaPoly, SHA-256), so iOS
+uses no system crypto library; `ed25519-dalek` with `rand_core` and `zeroize`; `data-encoding`
+for the base32 alphabet; `zeroize`. Randomness comes from the operating system through
+`rand_core`'s `OsRng`. `ed25519-dalek` brings its own `sha2` major version, so the build carries
+two; that is expected.
 
 **Ordering assumption.** `snow`'s transport requires in-order delivery. One WebSocket per side
 through one relay preserves order; the relay must forward a pair's frames in arrival order and
@@ -348,7 +400,7 @@ never fan them across workers.
 
 **UniFFI binding.** `make ios-crypto` builds an xcframework for `aarch64-apple-ios` and
 `aarch64-apple-ios-sim`; both targets are added to `rust-toolchain.toml`. Swift gets opaque
-`PairingHandshake` and `Session` objects plus the free functions. Keychain access stays in
+`DeviceKeys`, `PairingHandshake`, and `Session` objects plus the free functions. Keychain access stays in
 Swift.
 
 **Tests**
@@ -358,7 +410,11 @@ Swift.
   connection, repeated record); confirmation codes equal for one handshake and different across
   two; fragmentation round trip for a large envelope; missing, duplicate, out-of-range, and
   oversize fragments rejected; a message above 8 MiB and a fifth incomplete message rejected;
-  signature verification with a wrong key fails.
+  signature verification with a wrong key fails; `DeviceKeys` round-trips through
+  `storage_bytes` and `restore` rejects an unknown version and a wrong length; a device id is
+  26 lower-case characters; pairing payloads with a wrong version, a bad or misbound signature,
+  a short or over-long name, invalid UTF-8, or trailing bytes are rejected; concurrent `seal`
+  calls never interleave records.
 - Swift: the binding only — a round trip through `Session`, and a Rust error surfacing as a
   Swift `throw`.
 
@@ -963,7 +1019,7 @@ though the phone cannot send attachments.
 - `AgentChip` — Stop while its agent has a live turn.
 - `ConnectionBanner` — "Mac offline since 14:32" when the relay supplies `last_seen`, with no
   guessed cause; **Retry**; a route to `PairView` when not paired.
-- `SettingsView` — paired Mac, relay URL, **Unpair** (wipes Keychain entries).
+- `SettingsView` — the paired Mac's name (from pairing message 2), relay URL, **Unpair** (wipes Keychain entries).
 
 **7.6 Tests**
 

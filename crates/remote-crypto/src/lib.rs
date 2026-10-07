@@ -7,6 +7,11 @@ mod confirmation;
 mod error;
 pub mod fragment;
 pub mod identity;
+pub mod keys;
+pub mod pairing;
+pub mod session;
+#[cfg(test)]
+mod test_support;
 
 // UniFFI turns a Rust panic into a Swift error only by unwinding it; under
 // `panic = "abort"` the same panic kills the app.
@@ -17,5 +22,6 @@ compile_error!(
 
 pub use confirmation::{HANDSHAKE_HASH_LEN, confirmation_code};
 pub use error::CryptoError;
+pub use keys::DeviceKeys;
 
 uniffi::setup_scaffolding!();

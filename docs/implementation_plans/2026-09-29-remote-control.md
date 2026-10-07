@@ -344,8 +344,10 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
 - `keys` — `DeviceKeys`, an opaque object holding one device's X25519 Noise static key and
   Ed25519 identity key, zeroized on drop. Created only by `generate()` (operating-system
   randomness) or `restore(bytes)`; exposes `device_id()`, `noise_public_key()`,
-  `identity_public_key()`, and `storage_bytes()`, a versioned blob. `restore` rejects an
-  unknown version byte or a wrong length with a typed `CryptoError`. No accessor returns a
+  `identity_public_key()`, and `storage_bytes()`, a versioned blob — version byte, the X25519
+  private key, the Ed25519 seed — from which the public keys are re-derived, the X25519 one by
+  `snow`'s own resolver. `restore` rejects an unknown version byte or a wrong length with a
+  typed `CryptoError`. No accessor returns a
   private key, and the handshakes take `DeviceKeys`, never key bytes. The Mac stores the blob
   base64-encoded under one `KeyStore` entry (the store holds strings). On iOS, Swift handles
   the blob only inside the Keychain wrapper and treats it as opaque; Swift's `Data` cannot be
@@ -363,13 +365,19 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
     message 2 and before reading message 3, because reading message 3 changes it. The
     signature proves the phone holds the identity key it registers, and says by itself that
     this identity key vouches for this Noise key.
+  - The phone refuses a Mac whose static key differs from the one in the QR code, and the
+    Mac refuses a non-empty message 1. The prologue is `switchboard pairing v1`.
   - Either side rejects a wrong version, a bad signature, a short or over-long field,
     invalid UTF-8, and trailing bytes. Names are informational: control characters are
     stripped before display.
 - `confirmation_code(handshake_hash) -> String` — six digits, identical on both ends of one
   handshake and different for any other.
 - `session` — the `KK` handshake and the resulting transport: `seal(envelope) -> Vec<Record>`,
-  `open(record) -> Option<Envelope>`.
+  `open(record) -> Option<Envelope>`. Handshake payloads are empty, and the prologue is
+  `switchboard session v1`. The first record that fails to open — tampered, repeated, out of
+  order, from an earlier connection, or a malformed fragment — closes the session for good;
+  every later call returns `SessionClosed`, and the caller reconnects with a new handshake. An
+  envelope above the size limit is refused without closing the session.
 - `fragment` — splits a serialized envelope into records that each fit the Noise limit
   (65,535 bytes on the wire, so 65,519 bytes of plaintext after the tag). Each record's header —
   message id, index, count — is inside the encrypted payload, so it is authenticated. The
@@ -391,8 +399,8 @@ poisoned lock reports the session dead through a typed error, and the caller rec
 Records must be transmitted in the order `seal` returns them: the Swift `SecureSession` (§7.2)
 is an actor that seals and sends in one step.
 
-**Libraries.** `snow` with its default pure-Rust resolver (X25519, ChaChaPoly, SHA-256), so iOS
-uses no system crypto library; `ed25519-dalek` 3 with its default `zeroize` feature;
+**Libraries.** `snow` with its pure-Rust resolver limited to the primitives in use (X25519,
+ChaChaPoly, SHA-256), so iOS links no system crypto library and no unused cipher; `ed25519-dalek` 3 with its default `zeroize` feature;
 `data-encoding` for base32; `zeroize`. Key seeds come from the operating system's generator
 through `getrandom`, because `ed25519-dalek` 3's `rand_core` 0.10 has no `OsRng`. Both
 `ed25519-dalek` 3 and this crate use `sha2` 0.11, so the build carries one copy.

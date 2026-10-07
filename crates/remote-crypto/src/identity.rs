@@ -73,9 +73,8 @@ pub fn verify(
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write;
-
     use super::*;
+    use crate::test_support::hex;
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
@@ -117,13 +116,6 @@ mod tests {
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
         );
         assert_eq!(device_id(&public), "eh7ddx5bksrgcytl7bkai36se4");
-    }
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().fold(String::new(), |mut out, b| {
-            let _ = write!(out, "{b:02x}");
-            out
-        })
     }
 
     #[test]

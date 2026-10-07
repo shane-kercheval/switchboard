@@ -14,6 +14,9 @@ workspace = true
 [dependencies]
 data-encoding = "2.11.1"
 ed25519-dalek = "3.0.0"
+getrandom = "0.4.3"
 sha2 = "0.11.0"
+snow = { version = "0.10.0", default-features = false, features = ["std", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
 thiserror.workspace = true
 uniffi = "0.32.2"
+zeroize = "1.9.1"

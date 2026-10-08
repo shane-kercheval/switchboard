@@ -37,6 +37,9 @@
   --fg: #18181b;
   --muted: #71717a;
 
+  /* Review prose needs less contrast than code blocks and sidebar panels. */
+  --review-detail: color-mix(in srgb, var(--surface) 50%, var(--panel));
+
   /* neutral interaction — the fill under hovered/pressed rows and controls.
      Named for the interaction so no component reaches for `border` (a line) as
      a fill. `hover` is deliberately a *subtle* wash (barely off white) — it sits
@@ -141,6 +144,7 @@
   --border: #27272a;
   --fg: #fafafa;
   --muted: #a1a1aa;
+  --review-detail: var(--panel);
 
   --hover: #26262a;
   --control-hover: #2b2b30;
@@ -201,6 +205,7 @@
   --color-surface: var(--surface);
   --color-transcript: var(--transcript-bg);
   --color-panel: var(--panel);
+  --color-review-detail: var(--review-detail);
   --color-raised: var(--raised);
   --color-border: var(--border);
   --color-fg: var(--fg);

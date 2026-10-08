@@ -54,6 +54,7 @@ describe("FindingsCard", () => {
     const { getByTestId, queryByTestId } = render(FindingsCard, { facet: facet([]) });
     expect(getByTestId("findings-header")).toHaveTextContent("Code review · low · no findings");
     expect(queryByTestId("findings-list")).toBeNull();
+    expect(queryByTestId("findings-toggle-all")).toBeNull();
   });
 
   it("titles a row with the short summary when present, else the summary", () => {
@@ -62,7 +63,7 @@ describe("FindingsCard", () => {
     expect(within(first!).getByTestId("finding-title")).toHaveTextContent(
       "Off-by-one in loop bound",
     );
-    // The row shows the file name and line; the folders are in the detail.
+    // Collapsed rows show the file name and line without the folders.
     expect(within(first!).getByTestId("finding-location")).toHaveTextContent(/^app\.py:12$/);
     expect(within(second!).getByTestId("finding-title")).toHaveTextContent(
       "Outdated install command.",
@@ -78,7 +79,8 @@ describe("FindingsCard", () => {
     await fireEvent.click(within(row).getByTestId("finding-toggle"));
 
     const detail = within(row).getByTestId("finding-detail");
-    expect(within(detail).getByTestId("finding-full-location")).toHaveTextContent("src/app.py:12");
+    expect(within(row).getByTestId("finding-location")).toHaveTextContent(/^src\/app\.py:12$/);
+    expect(detail).not.toHaveTextContent("src/app.py:12");
     expect(detail).toHaveTextContent("Off-by-one in the loop bound.");
     const scenario = within(detail).getByTestId("finding-scenario");
     expect(scenario).toHaveTextContent("Failure scenario");
@@ -93,6 +95,31 @@ describe("FindingsCard", () => {
     const detail = within(row).getByTestId("finding-detail");
     expect(detail).not.toHaveTextContent("Outdated install command.");
     expect(detail).toHaveTextContent("Following the README fails on a fresh machine.");
+  });
+
+  it("expands all findings from a mixed state and then collapses them all", async () => {
+    const { getAllByTestId, getByTestId, queryAllByTestId } = render(FindingsCard, {
+      facet: facet([FULL, REQUIRED_ONLY]),
+    });
+    const rows = getAllByTestId("finding-toggle");
+    await fireEvent.click(rows[0]!);
+
+    const toggleAll = getByTestId("findings-toggle-all");
+    expect(toggleAll).toHaveAccessibleName("Expand all findings");
+    await fireEvent.click(toggleAll);
+
+    expect(getAllByTestId("finding-detail")).toHaveLength(2);
+    for (const row of rows) expect(row).toHaveAttribute("aria-expanded", "true");
+    expect(toggleAll).toHaveAccessibleName("Collapse all findings");
+
+    await fireEvent.click(rows[1]!);
+    expect(toggleAll).toHaveAccessibleName("Expand all findings");
+    await fireEvent.click(toggleAll);
+    await fireEvent.click(toggleAll);
+
+    expect(queryAllByTestId("finding-detail")).toHaveLength(0);
+    for (const row of rows) expect(row).toHaveAttribute("aria-expanded", "false");
+    expect(toggleAll).toHaveAccessibleName("Expand all findings");
   });
 
   it("drops code-span backticks from a row title and renders them in the detail", async () => {
@@ -117,6 +144,7 @@ describe("FindingsCard", () => {
     });
     expect(getAllByTestId("finding-row")).toHaveLength(1);
     expect(queryByTestId("finding-toggle")).toBeNull();
+    expect(queryByTestId("findings-toggle-all")).toBeNull();
   });
 
   it.each([

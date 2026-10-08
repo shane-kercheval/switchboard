@@ -83,19 +83,18 @@ Give Switchboard a typed, tested representation of a review, built once in Rust,
 1. **Add a `Findings` variant to `ToolFacet`** in `crates/harness/src/facets.rs`, serialized with `facet_kind: "findings"`. This is an additive change. `ToolFacet` is `#[non_exhaustive]` and the frontend already defaults unknown `facet_kind`s to the generic row, so nothing breaks for older builds or the planned iOS client. Shape:
 
    ```rust
-   Findings {
-       level: Option<String>,
-       findings: Vec<Finding>,
-       /// The review as markdown: the single text form used by copy, forward
-       /// and workflow output. Built once here so those paths cannot drift.
-       text: String,
-   }
+   Findings(Box<FindingsReport>)
+   // FindingsReport: level: Option<String>, findings: Vec<Finding>,
+   //   text: String (the review as markdown: the single text form used by
+   //   copy, forward and workflow output, built once so those paths cannot drift)
    // Finding: file, line: Option<u32>, summary, short_summary: Option<String>,
    // failure_scenario, category: Option<String>,
-   // verdict: Option<Verdict>, outcome: Option<FindingOutcome>
+   // verdict: Option<FindingVerdict>, outcome: Option<FindingOutcome>
    ```
 
-   `Verdict` serializes as the wire values `CONFIRMED` / `PLAUSIBLE`. `FindingOutcome` serializes as `fixed` / `skipped` / `no_change_needed`.
+   The payload is boxed because an unboxed variant grows every `ToolFacet`, which pushes `TurnItem` past clippy's `large_enum_variant` limit. The box is transparent to serde, so the JSON still has `level`, `findings` and `text` beside `facet_kind`.
+
+   `FindingVerdict` serializes as the wire values `CONFIRMED` / `PLAUSIBLE`. `FindingOutcome` serializes as `fixed` / `skipped` / `no_change_needed`.
 
 2. **Update the `ToolFacet` contract comment.** It currently promises "Paths are absolute" and "No line numbers". Both still hold for file-operation facets. A finding's `file` is a repo-relative display label carried verbatim, and its `line` is the model's claim, not a position Switchboard resolves. Scope those two contract notes to the facets they describe, and say why findings differ.
 

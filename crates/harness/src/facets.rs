@@ -39,15 +39,19 @@ pub const MCP_MUTATION_TARGET_CAP: usize = 240;
 ///
 /// Contract notes that every consumer can rely on:
 ///
-/// - **Paths are absolute** wherever the harness supplies them (probe result:
-///   every harness already emits absolute paths — §3.6). Adapters with a
-///   known cwd resolve relative spellings lexically before constructing the
-///   facet; there is exactly one path field per file, and a project-relative
-///   *display* path is derived at render time, never carried on the wire.
-/// - **No line numbers.** Neither Claude's `Edit` input nor Codex's patches
-///   carry absolute file positions, so edit rendering is snippet-scoped: the
-///   reader sees the change, not its location. Deliberate accepted
-///   limitation.
+/// - **File-operation paths are absolute** wherever the harness supplies them
+///   (probe result: every harness already emits absolute paths — §3.6).
+///   Adapters with a known cwd resolve relative spellings lexically before
+///   constructing the facet; there is exactly one path field per file, and a
+///   project-relative *display* path is derived at render time, never carried
+///   on the wire. [`ToolFacet::Findings`] is the exception: a [`Finding`]'s
+///   `file` is the model's repo-relative label, carried verbatim, because it
+///   names what a reviewer pointed at rather than a file an operation touched.
+/// - **File operations carry no line numbers.** Neither Claude's `Edit` input
+///   nor Codex's patches carry absolute file positions, so edit rendering is
+///   snippet-scoped: the reader sees the change, not its location. Deliberate
+///   accepted limitation. A [`Finding`]'s `line` is likewise the model's
+///   claim, displayed as given and never resolved against the file.
 /// - The facet is computed at tool *start*; failure is carried by
 ///   `ToolCompleted::is_error`, so `Shell` carries no exit code.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,9 +95,74 @@ pub enum ToolFacet {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mutation: Option<Box<McpMutation>>,
     },
+    /// A code review delivered as structured data rather than reply text
+    /// (Claude Code's `ReportFindings`). The model is told the host renders
+    /// it and may write nothing else, so this is often the only place the
+    /// review exists — consumers treat a successful call as answer content.
+    /// Boxed so the rarely-used review payload doesn't inflate every facet
+    /// (and every `TurnItem`); the box is transparent on the wire, so the
+    /// report's fields sit beside `facet_kind`.
+    Findings(Box<FindingsReport>),
     /// Graceful degradation for any unmapped tool. Renders via the generic
     /// raw-input path.
     Other,
+}
+
+/// The payload of [`ToolFacet::Findings`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FindingsReport {
+    /// The review's effort level (`low` … `max`), when the model gave one.
+    pub level: Option<String>,
+    /// Most severe first, as reported. Empty means the review found nothing.
+    pub findings: Vec<Finding>,
+    /// The review as markdown: the single text form that copy, forward and
+    /// workflow output use. Built once here so those paths cannot drift from
+    /// each other, and self-contained because forward sends it to another
+    /// agent.
+    pub text: String,
+}
+
+/// One code-review finding in a [`ToolFacet::Findings`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Finding {
+    /// Repo-relative path as the model wrote it (see the path contract on
+    /// [`ToolFacet`]).
+    pub file: String,
+    /// 1-indexed line the finding anchors to.
+    pub line: Option<u32>,
+    /// One-sentence statement of the defect.
+    pub summary: String,
+    /// The claim compressed for a one-line row (the tool caps it at 60
+    /// characters).
+    pub short_summary: Option<String>,
+    /// Concrete inputs or state that lead to the wrong result. Empty when the
+    /// model omitted it.
+    pub failure_scenario: String,
+    /// Kebab-case slug such as `correctness` or `test-coverage`.
+    pub category: Option<String>,
+    pub verdict: Option<FindingVerdict>,
+    /// Set only when the model re-reports findings after fixing them.
+    pub outcome: Option<FindingOutcome>,
+}
+
+/// Whether a verification pass confirmed a [`Finding`]. Serialized with the
+/// tool's own wire values.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
+pub enum FindingVerdict {
+    Confirmed,
+    Plausible,
+}
+
+/// What happened to a [`Finding`] when the model re-reports it after fixes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FindingOutcome {
+    Fixed,
+    Skipped,
+    NoChangeNeeded,
 }
 
 /// One file touched by an [`ToolFacet::Edit`].

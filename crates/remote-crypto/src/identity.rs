@@ -17,9 +17,11 @@ pub const DEVICE_ID_LEN: usize = 26;
 /// What a signature is for. Each purpose signs a different message prefix, so
 /// a signature made for one purpose never verifies for another: a relay
 /// cannot turn a registration signature into a pairing binding, or back.
+/// Crate-private: each purpose has exactly one public producer and one public
+/// verifier (`DeviceKeys::sign_relay_challenge` and `verify_relay_challenge`
+/// for the relay; the pairing handshake for the binding).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SignaturePurpose {
+pub(crate) enum SignaturePurpose {
     RelayChallenge,
     PairingBinding,
 }
@@ -69,9 +71,19 @@ pub(crate) fn sign(key: &SigningKey, purpose: SignaturePurpose, payload: &[u8]) 
     key.sign(&purpose.message(payload))
 }
 
+/// The relay's check of a registration: `signature` is the device's answer to
+/// `challenge`, from `DeviceKeys::sign_relay_challenge`.
+pub fn verify_relay_challenge(
+    key: &VerifyingKey,
+    challenge: &[u8],
+    signature: &Signature,
+) -> Result<(), CryptoError> {
+    verify(key, SignaturePurpose::RelayChallenge, challenge, signature)
+}
+
 /// Strict verification: rejects non-canonical signatures and small-order
 /// keys, so one statement has exactly one valid signature encoding.
-pub fn verify(
+pub(crate) fn verify(
     key: &VerifyingKey,
     purpose: SignaturePurpose,
     payload: &[u8],

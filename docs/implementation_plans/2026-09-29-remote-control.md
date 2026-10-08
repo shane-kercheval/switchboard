@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 14 · **Created:** 2026-09-29 · **Revised:** 2026-10-08
+**Status:** proposed · **Revision:** 15 · **Created:** 2026-09-29 · **Revised:** 2026-10-08
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,21 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 15 (2026-10-08)** — second review of the pairing and session implementation (§2,
+  §3, §5.4).
+  - **Routing moves into `remote-crypto` as `DeviceSessions`**, one device's confirmed and
+    unconfirmed sessions with §5.4's rule, synchronous and tested once inside the crypto
+    review. `SessionManager` keeps one per device and adds timers, I/O, and the wake lease.
+    Each wrong branch has a security or liveness cost, so the rule is not written a second
+    time in async code. `Session`'s two flags become one three-state lifecycle.
+  - `DeviceKeys::sign_relay_challenge` and `identity::verify_relay_challenge` are the one
+    public producer and verifier of a relay-challenge signature; nothing public could sign one
+    before. The generic sign and verify are crate-private.
+  - `snow`'s fixed-ephemeral override, which `snow` does not gate, is reachable only from
+    tests: release builds have no handshake builder that takes one.
+  - Zeroization covers `DeviceKeys`' own storage, not the copies inside `snow`; recorded, and
+    `snow`'s secret handling added to the security-review scope.
+  - §2's review boundary names `DeviceSessions` and `SessionManager`.
 - **Revision 14 (2026-10-08)** — review of the typed frames and session routing (§3, §5.4).
   - **A record that does not decrypt no longer closes the session it was offered to.**
     Revision 13's rule discarded the unconfirmed session on `RecordRejected`, so a phone that
@@ -380,8 +395,9 @@ commands on your Mac. Revoke lost devices in Settings → Remote access."*
 `docs/system-design.md` gains a Remote access section carrying this threat model.
 
 **Review boundary.** `crates/remote-crypto` (handshakes, sealer, fragmentation, code
-derivation), the pairing confirmation flow, `DeviceRegistry`, and the Swift key storage get a
-dedicated security review, separate from the feature review. The repo's `/security-review` skill
+derivation, `DeviceSessions`' routing, and how `snow` holds secrets), the pairing confirmation
+flow, `DeviceRegistry`, `SessionManager`, and the Swift key storage get a dedicated security
+review, separate from the feature review. The repo's `/security-review` skill
 is the gate; each milestone names which of these it touches.
 
 ## 3. Shared cryptography — `crates/remote-crypto/`
@@ -400,7 +416,14 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
   private key, and the handshakes take `DeviceKeys`, never key bytes. The Mac stores the blob
   base64-encoded under one `KeyStore` entry (the store holds strings). On iOS, Swift handles
   the blob only inside the Keychain wrapper and treats it as opaque; Swift's `Data` cannot be
-  zeroized, so the bytes exist in Swift memory for that one call.
+  zeroized, so the bytes exist in Swift memory for that one call. Zeroization covers
+  `DeviceKeys`' own storage, not `snow`'s internal copies: `snow` 0.10's X25519 state keeps
+  the private key in a plain array with no wipe on drop, both in the public-key derivation and
+  inside every handshake. The threat model excludes a compromised device, so this is a
+  hardening gap, not a hole; the fix is a custom resolver wrapping that state with zeroize on
+  drop, keeping the RFC 7748 test. `sign_relay_challenge(challenge)` is the only public
+  producer of a relay-challenge signature, and `identity::verify_relay_challenge` the relay's
+  check; the generic sign and verify are crate-private.
 - `pairing` — the `XXpsk2` handshake as a state machine over bytes, the phone initiating.
   Output: the peer's Noise static key, the phone's Ed25519 identity key, both names, and the
   handshake hash. Payloads, in a fixed binary layout produced and parsed only here:
@@ -458,6 +481,18 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
   signature is domain-separated by purpose — the relay challenge and the pairing binding sign
   different length-prefixed contexts — so a signature made for one never verifies for the
   other.
+
+**`DeviceSessions`.** The Mac's container for one phone's sessions, owning §5.4's routing
+rule: `accept_handshake` creates the unconfirmed session; `open` offers a record to the
+unconfirmed session, then the confirmed one, promotes on success, drops a session on a
+`ProtocolViolation`, and ends both (`SessionsEnded`) when neither opens it; `seal` uses only
+the confirmed session (`NotConnected` without one); `expire_unconfirmed` drops a candidate.
+It is synchronous and does no I/O, so every branch is tested here.
+
+**Test-only hooks.** `snow`'s `fixed_ephemeral_key_for_testing_only` is not gated by `snow`.
+Release code has no handshake builder that accepts one; only the regression-vector tests add
+it. Likewise, forging a misbound signature in tests goes through private steps, not a hook in
+the release path.
 
 **Concurrency.** UniFFI objects can be called from any thread. `PairingHandshake` and
 `Session` keep their state behind a `Mutex`; a call out of order, or on a finished handshake,
@@ -626,9 +661,10 @@ Public keys only. The file records pairing and revocation and nothing that chang
 connection. `revoke(device)` marks the row, tells `SessionManager` to drop the live session,
 and sends the updated `paired_devices` set to the relay.
 
-**5.4 `SessionManager`.** One live `Session` per connected device. On a handshake from a
-registered device, runs `KK` against that device's pinned key; a new successful handshake from
-the same device becomes that device's **unconfirmed** session, replacing any earlier
+**5.4 `SessionManager`.** One `DeviceSessions` (§3) per connected device, which owns the
+routing below; `SessionManager` adds the timers, the I/O, and the wake lease. On a handshake
+from a registered device, runs `KK` against that device's pinned key; a new successful
+handshake from the same device becomes that device's **unconfirmed** session, replacing any earlier
 unconfirmed one, never the confirmed one (§3: message 1 may be a replay). A device thus has at
 most one confirmed and one unconfirmed session. Frames are routed by their type (§4): a
 connection request starts a handshake and is never offered to a session; a record is never

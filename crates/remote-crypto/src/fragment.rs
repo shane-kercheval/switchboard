@@ -50,13 +50,21 @@ pub struct Fragmenter {
     next_message_id: u32,
 }
 
+/// The one way fragmenting fails: the message is over `MAX_MESSAGE_LEN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("message of {len} bytes exceeds the {MAX_MESSAGE_LEN}-byte limit")]
+pub struct TooLarge {
+    pub len: usize,
+}
+
 impl Fragmenter {
     /// Splits `message` into fragments of at most `MAX_FRAGMENT_LEN` bytes. It
     /// never truncates: a message the reassembler would refuse is an error
     /// here. An empty message is one empty fragment.
-    pub fn fragment(&mut self, message: &[u8]) -> Result<Vec<Vec<u8>>, FragmentError> {
+    pub fn fragment(&mut self, message: &[u8]) -> Result<Vec<Vec<u8>>, TooLarge> {
+        let too_large = TooLarge { len: message.len() };
         if message.len() > MAX_MESSAGE_LEN {
-            return Err(FragmentError::MessageTooLarge { len: message.len() });
+            return Err(too_large);
         }
         let message_id = self.next_message_id;
         self.next_message_id = self.next_message_id.wrapping_add(1);
@@ -67,12 +75,10 @@ impl Fragmenter {
             message.chunks(MAX_CHUNK_LEN).collect()
         };
         // At most MAX_FRAGMENT_COUNT (129), so both conversions hold.
-        let count = u16::try_from(chunks.len())
-            .map_err(|_| FragmentError::MessageTooLarge { len: message.len() })?;
+        let count = u16::try_from(chunks.len()).map_err(|_| too_large)?;
         let mut fragments = Vec::with_capacity(chunks.len());
         for (index, chunk) in chunks.into_iter().enumerate() {
-            let index = u16::try_from(index)
-                .map_err(|_| FragmentError::MessageTooLarge { len: message.len() })?;
+            let index = u16::try_from(index).map_err(|_| too_large)?;
             let mut fragment = Vec::with_capacity(HEADER_LEN + chunk.len());
             fragment.extend_from_slice(&message_id.to_be_bytes());
             fragment.extend_from_slice(&index.to_be_bytes());
@@ -257,7 +263,7 @@ mod tests {
     fn a_message_above_the_limit_is_refused_rather_than_truncated() {
         assert_eq!(
             Fragmenter::default().fragment(&message(MAX_MESSAGE_LEN + 1)),
-            Err(FragmentError::MessageTooLarge {
+            Err(TooLarge {
                 len: MAX_MESSAGE_LEN + 1
             })
         );

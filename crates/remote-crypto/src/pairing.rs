@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 use crate::frame::{self, FrameKind};
 use crate::identity::{self, SignaturePurpose};
 use crate::keys::{DeviceKeys, KEY_LEN};
+use crate::noise::{self, Peer, handshake_hash, read, remote_static, write};
 use crate::{CryptoError, HANDSHAKE_HASH_LEN};
 
 const PATTERN: &str = "Noise_XXpsk2_25519_ChaChaPoly_SHA256";
@@ -26,7 +27,6 @@ const PAYLOAD_VERSION: u8 = 1;
 /// Longest name either side sends, in bytes of UTF-8.
 pub const MAX_NAME_LEN: usize = 64;
 const SIGNATURE_LEN: usize = 64;
-const MAX_MESSAGE_LEN: usize = 65_535;
 
 /// What the phone reads from the Mac's QR code.
 pub struct PairingOffer {
@@ -80,7 +80,7 @@ pub fn phone_start(
     keys: &DeviceKeys,
     offer: &PairingOffer,
 ) -> Result<(PhoneAwaitingResponse, Vec<u8>), CryptoError> {
-    phone_start_with(keys, offer, None)
+    phone_start_from(builder(keys, &offer.psk)?, keys, offer)
 }
 
 /// Mac: answer a phone's first message with this Mac's name.
@@ -90,7 +90,7 @@ pub fn mac_respond(
     mac_name: &str,
     message_1: &[u8],
 ) -> Result<(MacAwaitingFinish, Vec<u8>), CryptoError> {
-    mac_respond_with(keys, psk, mac_name, message_1, None)
+    mac_respond_from(builder(keys, psk)?, mac_name, message_1)
 }
 
 impl PhoneAwaitingResponse {
@@ -101,16 +101,17 @@ impl PhoneAwaitingResponse {
         phone_name: &str,
         message_2: &[u8],
     ) -> Result<(UnconfirmedMac, Vec<u8>), CryptoError> {
-        self.respond_with(message_2, |identity, hash, noise_key| {
-            message_3_payload(identity, hash, noise_key, phone_name)
-        })
+        let read = self.read_message_2(message_2)?;
+        let payload = message_3_payload(
+            &self.identity,
+            &read.hash,
+            &self.noise_public_key,
+            phone_name,
+        );
+        write_message_3(read, &payload)
     }
 
-    fn respond_with(
-        &mut self,
-        message_2: &[u8],
-        build_payload: impl FnOnce(&SigningKey, &[u8; HANDSHAKE_HASH_LEN], &[u8; KEY_LEN]) -> Vec<u8>,
-    ) -> Result<(UnconfirmedMac, Vec<u8>), CryptoError> {
+    fn read_message_2(&mut self, message_2: &[u8]) -> Result<Message2, CryptoError> {
         let message_2 = frame::body(FrameKind::Pairing, message_2)?;
         let mut handshake = self.handshake.take().ok_or(CryptoError::HandshakeFailed)?;
         let payload = read(&mut handshake, message_2)?;
@@ -120,17 +121,43 @@ impl PhoneAwaitingResponse {
         }
         let mac_name = decode_message_2(&payload)?;
         let hash = handshake_hash(&handshake)?;
-        let payload = build_payload(&self.identity, &hash, &self.noise_public_key);
-        let message_3 = write(&mut handshake, &payload)?;
-        Ok((
-            UnconfirmedMac {
-                noise_public_key: mac_key,
-                name: mac_name,
-                handshake_hash: handshake_hash(&handshake)?,
-            },
-            frame::tagged(FrameKind::Pairing, &message_3),
-        ))
+        Ok(Message2 {
+            handshake,
+            mac_key,
+            mac_name,
+            hash,
+        })
     }
+}
+
+/// The phone's state between reading message 2 and writing message 3.
+struct Message2 {
+    handshake: HandshakeState,
+    mac_key: [u8; KEY_LEN],
+    mac_name: String,
+    /// The hash message 3's binding signature covers.
+    hash: [u8; HANDSHAKE_HASH_LEN],
+}
+
+fn write_message_3(
+    read: Message2,
+    payload: &[u8],
+) -> Result<(UnconfirmedMac, Vec<u8>), CryptoError> {
+    let Message2 {
+        mut handshake,
+        mac_key,
+        mac_name,
+        ..
+    } = read;
+    let message_3 = write(&mut handshake, payload)?;
+    Ok((
+        UnconfirmedMac {
+            noise_public_key: mac_key,
+            name: mac_name,
+            handshake_hash: handshake_hash(&handshake)?,
+        },
+        frame::tagged(FrameKind::Pairing, &message_3),
+    ))
 }
 
 impl MacAwaitingFinish {
@@ -157,12 +184,12 @@ impl MacAwaitingFinish {
     }
 }
 
-fn phone_start_with(
+fn phone_start_from(
+    builder: Builder<'_>,
     keys: &DeviceKeys,
     offer: &PairingOffer,
-    ephemeral: Option<&[u8; KEY_LEN]>,
 ) -> Result<(PhoneAwaitingResponse, Vec<u8>), CryptoError> {
-    let mut handshake = builder(keys, &offer.psk, ephemeral)?
+    let mut handshake = builder
         .build_initiator()
         .map_err(|_| CryptoError::HandshakeFailed)?;
     let message_1 = write(&mut handshake, &[])?;
@@ -177,14 +204,12 @@ fn phone_start_with(
     ))
 }
 
-fn mac_respond_with(
-    keys: &DeviceKeys,
-    psk: &[u8; PSK_LEN],
+fn mac_respond_from(
+    builder: Builder<'_>,
     mac_name: &str,
     message_1: &[u8],
-    ephemeral: Option<&[u8; KEY_LEN]>,
 ) -> Result<(MacAwaitingFinish, Vec<u8>), CryptoError> {
-    let mut handshake = builder(keys, psk, ephemeral)?
+    let mut handshake = builder
         .build_responder()
         .map_err(|_| CryptoError::HandshakeFailed)?;
     let message_1 = frame::body(FrameKind::Pairing, message_1)?;
@@ -204,60 +229,16 @@ fn mac_respond_with(
     ))
 }
 
-fn builder<'a>(
-    keys: &'a DeviceKeys,
-    psk: &'a [u8; PSK_LEN],
-    ephemeral: Option<&'a [u8; KEY_LEN]>,
-) -> Result<Builder<'a>, CryptoError> {
-    let params = PATTERN.parse().map_err(|_| CryptoError::HandshakeFailed)?;
-    let mut builder = Builder::new(params)
-        .local_private_key(keys.noise_private_key())
-        .and_then(|b| b.prologue(PROLOGUE))
-        .and_then(|b| b.psk(PSK_LOCATION, psk))
-        .map_err(|_| CryptoError::HandshakeFailed)?;
-    if let Some(ephemeral) = ephemeral {
-        builder = builder.fixed_ephemeral_key_for_testing_only(ephemeral);
-    }
-    Ok(builder)
-}
-
-pub(crate) fn read(handshake: &mut HandshakeState, message: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    // A handshake payload is never longer than its message, and a message
-    // longer than the Noise maximum is refused before decryption.
-    let mut payload = vec![0u8; message.len().min(MAX_MESSAGE_LEN)];
-    let len = handshake
-        .read_message(message, &mut payload)
-        .map_err(|_| CryptoError::HandshakeFailed)?;
-    payload.truncate(len);
-    payload.shrink_to_fit();
-    Ok(payload)
-}
-
-pub(crate) fn write(
-    handshake: &mut HandshakeState,
-    payload: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
-    let mut message = vec![0u8; MAX_MESSAGE_LEN];
-    let len = handshake
-        .write_message(payload, &mut message)
-        .map_err(|_| CryptoError::HandshakeFailed)?;
-    message.truncate(len);
-    message.shrink_to_fit();
-    Ok(message)
-}
-
-fn remote_static(handshake: &HandshakeState) -> Result<[u8; KEY_LEN], CryptoError> {
-    handshake
-        .get_remote_static()
-        .and_then(|key| <[u8; KEY_LEN]>::try_from(key).ok())
-        .ok_or(CryptoError::HandshakeFailed)
-}
-
-pub(crate) fn handshake_hash(
-    handshake: &HandshakeState,
-) -> Result<[u8; HANDSHAKE_HASH_LEN], CryptoError> {
-    <[u8; HANDSHAKE_HASH_LEN]>::try_from(handshake.get_handshake_hash())
-        .map_err(|_| CryptoError::HandshakeFailed)
+fn builder<'a>(keys: &'a DeviceKeys, psk: &'a [u8; PSK_LEN]) -> Result<Builder<'a>, CryptoError> {
+    noise::builder(
+        PATTERN,
+        PROLOGUE,
+        keys,
+        Peer::Psk {
+            location: PSK_LOCATION,
+            key: psk,
+        },
+    )
 }
 
 /// What the phone's identity key signs: this handshake, as far as it has
@@ -328,6 +309,10 @@ fn is_displayable(c: char) -> bool {
             // Zero-width space, word joiner and invisible operators, and the
             // byte order mark.
             | '\u{200B}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}'
+            // Hangul fillers, soft hyphen, interlinear annotation, and tag
+            // characters, which also render as nothing.
+            | '\u{00AD}' | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}'
         )
 }
 
@@ -439,14 +424,21 @@ mod tests {
     #[test]
     fn the_handshake_is_pinned() {
         let party = party();
-        let (mut phone, message_1) =
-            phone_start_with(&party.phone, &offer(&party), Some(&[6; KEY_LEN])).unwrap();
-        let (mut mac, message_2) = mac_respond_with(
-            &party.mac,
-            &party.psk,
+        let offer = offer(&party);
+        let (mut phone, message_1) = phone_start_from(
+            builder(&party.phone, &offer.psk)
+                .unwrap()
+                .fixed_ephemeral_key_for_testing_only(&[6; KEY_LEN]),
+            &party.phone,
+            &offer,
+        )
+        .unwrap();
+        let (mut mac, message_2) = mac_respond_from(
+            builder(&party.mac, &party.psk)
+                .unwrap()
+                .fixed_ephemeral_key_for_testing_only(&[7; KEY_LEN]),
             "Mac",
             &message_1,
-            Some(&[7; KEY_LEN]),
         )
         .unwrap();
         let (paired_mac, message_3) = phone.respond("Phone", &message_2).unwrap();
@@ -545,11 +537,9 @@ mod tests {
         let party = party();
         let (mut phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
         let (mut mac, message_2) = mac_respond(&party.mac, &party.psk, "Mac", &message_1).unwrap();
-        let (_, message_3) = phone
-            .respond_with(&message_2, |identity, hash, _| {
-                message_3_payload(identity, hash, &[0xAA; KEY_LEN], "Phone")
-            })
-            .unwrap();
+        let read = phone.read_message_2(&message_2).unwrap();
+        let forged = message_3_payload(&phone.identity, &read.hash, &[0xAA; KEY_LEN], "Phone");
+        let (_, message_3) = write_message_3(read, &forged).unwrap();
         assert_eq!(
             mac.finish(&message_3).err(),
             Some(CryptoError::InvalidSignature)
@@ -561,11 +551,14 @@ mod tests {
         let party = party();
         let (mut phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
         let (mut mac, message_2) = mac_respond(&party.mac, &party.psk, "Mac", &message_1).unwrap();
-        let (_, message_3) = phone
-            .respond_with(&message_2, |identity, _, noise_key| {
-                message_3_payload(identity, &[0; HANDSHAKE_HASH_LEN], noise_key, "Phone")
-            })
-            .unwrap();
+        let read = phone.read_message_2(&message_2).unwrap();
+        let forged = message_3_payload(
+            &phone.identity,
+            &[0; HANDSHAKE_HASH_LEN],
+            &phone.noise_public_key,
+            "Phone",
+        );
+        let (_, message_3) = write_message_3(read, &forged).unwrap();
         assert_eq!(
             mac.finish(&message_3).err(),
             Some(CryptoError::InvalidSignature)
@@ -606,6 +599,16 @@ mod tests {
         let mut out = Vec::new();
         encode_name("Jo's Mac\u{2028}Verified\u{2029}code 000000", &mut out);
         assert_eq!(decode_name(&out).unwrap().0, "Jo's MacVerifiedcode 000000");
+    }
+
+    #[test]
+    fn decoded_names_lose_characters_that_render_as_nothing() {
+        let mut out = Vec::new();
+        encode_name(
+            "\u{3164}Jo\u{00AD}'s\u{115F} Mac\u{E0041}\u{FFF9}",
+            &mut out,
+        );
+        assert_eq!(decode_name(&out).unwrap().0, "Jo's Mac");
     }
 
     #[test]

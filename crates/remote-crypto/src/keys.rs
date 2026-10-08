@@ -7,7 +7,7 @@ use snow::resolvers::{CryptoResolver, DefaultResolver};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::CryptoError;
-use crate::identity;
+use crate::identity::{self, Signature, SignaturePurpose};
 
 pub const KEY_LEN: usize = 32;
 const BLOB_VERSION: u8 = 1;
@@ -68,6 +68,13 @@ impl DeviceKeys {
 
     pub fn device_id(&self) -> String {
         identity::device_id(&self.identity.verifying_key())
+    }
+
+    /// Proves to the relay that this device holds the identity key behind its
+    /// device id. The only public producer of a relay-challenge signature;
+    /// `identity::verify_relay_challenge` is the matching check.
+    pub fn sign_relay_challenge(&self, challenge: &[u8]) -> Signature {
+        identity::sign(&self.identity, SignaturePurpose::RelayChallenge, challenge)
     }
 
     pub(crate) fn noise_private_key(&self) -> &[u8; KEY_LEN] {
@@ -173,6 +180,30 @@ mod tests {
         assert_eq!(
             DeviceKeys::restore(&[]).unwrap_err(),
             CryptoError::InvalidKeyBlob
+        );
+    }
+
+    #[test]
+    fn a_relay_challenge_signature_verifies_only_as_one() {
+        let keys = DeviceKeys::generate().unwrap();
+        let signature = keys.sign_relay_challenge(b"challenge");
+        let public = keys.identity_public_key();
+        assert_eq!(
+            identity::verify_relay_challenge(&public, b"challenge", &signature),
+            Ok(())
+        );
+        assert_eq!(
+            identity::verify_relay_challenge(&public, b"other", &signature),
+            Err(CryptoError::InvalidSignature)
+        );
+        assert_eq!(
+            identity::verify(
+                &public,
+                SignaturePurpose::PairingBinding,
+                b"challenge",
+                &signature
+            ),
+            Err(CryptoError::InvalidSignature)
         );
     }
 

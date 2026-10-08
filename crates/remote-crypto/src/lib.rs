@@ -6,10 +6,12 @@
 mod confirmation;
 mod error;
 // Only a session fragments, so records are always produced under its lock.
+pub mod device;
 pub(crate) mod fragment;
 pub mod frame;
 pub mod identity;
 pub mod keys;
+mod noise;
 pub mod pairing;
 pub mod session;
 #[cfg(test)]

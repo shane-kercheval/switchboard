@@ -44,4 +44,14 @@ pub enum CryptoError {
     /// A call on a session that an earlier failure already closed.
     #[error("the session is closed")]
     SessionClosed,
+    /// Encrypting a record failed, so the session is closed.
+    #[error("a record could not be encrypted, so the session is closed")]
+    SendFailed,
+    /// No session of the device opened the record: its stream is broken, and
+    /// the device's sessions have ended.
+    #[error("no session opened the record, so the device's sessions ended")]
+    SessionsEnded,
+    /// The device has no session to open or seal with.
+    #[error("the device is not connected")]
+    NotConnected,
 }

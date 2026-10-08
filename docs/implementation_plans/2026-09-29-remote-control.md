@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 13 · **Created:** 2026-09-29 · **Revised:** 2026-10-07
+**Status:** proposed · **Revision:** 14 · **Created:** 2026-09-29 · **Revised:** 2026-10-08
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,18 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 14 (2026-10-08)** — review of the typed frames and session routing (§3, §5.4).
+  - **A record that does not decrypt no longer closes the session it was offered to.**
+    Revision 13's rule discarded the unconfirmed session on `RecordRejected`, so a phone that
+    reconnected with records still in flight on its old keys lost both sessions: the in-flight
+    record killed the new one, and the phone's next record then killed the old one. A failed
+    decryption changes nothing, so the record is offered to each of the device's sessions in
+    turn; only a record none of them opens ends them.
+  - A closed session never reports itself confirmed, so the wake lease and session
+    replacement cannot key on a dead session.
+  - A handshake step offered a frame of another type leaves its state waiting for the real
+    message, instead of being used up.
+  - Names also lose U+2028 and U+2029, which text views break lines on.
 - **Revision 13 (2026-10-07)** — second review of the pairing and session implementation (§3,
   §4, §5.4, §7.2).
   - Frames are typed. Every frame `remote-crypto` produces starts with one byte —
@@ -416,17 +428,20 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
   handshake; another handshake's code matches only by chance, about one in a million.
 - `session` — the `KK` handshake and the resulting transport: `seal(envelope) -> Vec<Record>`,
   `open(record) -> Option<Envelope>`. Handshake payloads are empty, and the prologue is
-  `switchboard session v1`. The first record that fails to open — tampered, repeated, out of
-  order, from an earlier connection, or a malformed fragment — closes the session for good;
-  every later call returns `SessionClosed`, and the caller reconnects with a new handshake. An
-  envelope above the size limit is refused without closing the session, and a record over the
+  `switchboard session v1`. A record that does not decrypt — tampered, repeated, out of
+  order, or from an earlier connection — changes nothing, because a failed decryption does not
+  advance the nonce and the record may be another session's (§5.4). A record that decrypts but
+  breaks the fragment rules closes the session for good: every later call returns
+  `SessionClosed`, and the caller reconnects with a new handshake. A closed session is never
+  confirmed. An envelope above the size limit is refused without closing the session, and a record over the
   Noise maximum is refused before anything is allocated for it. The phone's session is
   **confirmed** when created, because the Mac's message 2 carries a fresh ephemeral. The Mac's
   is not: whoever saw a message 1 can replay it, and `respond` accepts the replay. The Mac's
   session becomes confirmed when its first record decrypts (§5.4). Every frame carries its
-  type (§4), and each step and `open` refuse another type without touching any state.
-  `open` distinguishes a record that did not decrypt (`RecordRejected`) from one that
-  decrypted but broke the fragment rules (`ProtocolViolation`); both close the session.
+  type (§4), and each step and `open` refuse another type without touching any state; a
+  handshake step so refused keeps waiting for its real message. `open` distinguishes a record
+  that did not decrypt (`RecordRejected`, nothing changed) from one that decrypted but broke
+  the fragment rules (`ProtocolViolation`, the session closed).
 - `fragment` — splits a serialized envelope into records that each fit the Noise limit
   (65,535 bytes on the wire, so 65,519 bytes of plaintext after the tag). Each record's header —
   message id, index, count — is inside the encrypted payload, so it is authenticated. Records
@@ -617,17 +632,22 @@ the same device becomes that device's **unconfirmed** session, replacing any ear
 unconfirmed one, never the confirmed one (§3: message 1 may be a replay). A device thus has at
 most one confirmed and one unconfirmed session. Frames are routed by their type (§4): a
 connection request starts a handshake and is never offered to a session; a record is never
-offered to a handshake. Each record goes to the unconfirmed session first, and `open`'s
-outcome decides what happens:
-- **It opens:** that session is confirmed and replaces the old one.
-- **`RecordRejected`** (did not decrypt): the unconfirmed session is discarded and the same
-  record goes to the confirmed session, which the failed attempt left untouched (a failed
-  decryption does not advance `snow`'s nonce).
-- **`ProtocolViolation`** (decrypted, but malformed): the unconfirmed session is discarded and
-  the record is **not** retried, since it belongs to no other session. The confirmed session
-  is kept; if the phone has really moved on, it ends as any session does.
+offered to a handshake. Each record goes to the unconfirmed session first, then to the
+confirmed one, and `open`'s outcome decides what happens:
+- **It opens:** on the unconfirmed session, that session is confirmed and replaces the old
+  one; on the confirmed session, nothing else changes. A phone that reconnects with records
+  still in flight on its old keys therefore loses none of them: each is rejected by the new
+  session, harmlessly, and opens on the old one.
+- **`RecordRejected`** (did not decrypt): nothing changed — a failed decryption does not
+  advance `snow`'s nonce — so the record goes to the next session. A record that **no**
+  session of the device opens means its stream is broken (a lost or forged record), and the
+  device's sessions end.
+- **`ProtocolViolation`** (decrypted, but malformed): that session is closed and the record
+  is **not** offered to another, since it belongs to no other session. If it was the
+  unconfirmed one, the confirmed session is kept; if the phone has really moved on, it ends
+  as any session does.
 - **`UnexpectedFrame`** (wrong type, or oversize): the frame is dropped and no session is
-  touched. This is the only failure that leaves every session open.
+  touched.
 
 An unconfirmed session that opens no record within 10 seconds is discarded; the phone's first
 envelope, `hello`, confirms it at once. A replayed handshake therefore costs the real session

@@ -31,9 +31,10 @@ pub enum CryptoError {
     /// an open session stays open.
     #[error("the frame is not of the expected type")]
     UnexpectedFrame,
-    /// The record did not decrypt under this session's keys. The session is
-    /// closed. The record may belong to another session of the same device.
-    #[error("the record did not authenticate, so the session is closed")]
+    /// The record did not decrypt under this session's keys. Nothing changed:
+    /// the record may belong to another session of the same device. If no
+    /// session of the device opens it, the caller ends them.
+    #[error("the record did not authenticate under this session's keys")]
     RecordRejected,
     /// The record decrypted, so the peer holds this session's keys, but its
     /// contents broke the fragment rules. The session is closed. The record

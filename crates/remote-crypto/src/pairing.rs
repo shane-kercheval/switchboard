@@ -57,17 +57,19 @@ pub struct PairingCandidate {
     pub handshake_hash: [u8; HANDSHAKE_HASH_LEN],
 }
 
-/// The phone's state after sending message 1.
+/// The phone's state after sending message 1. A frame of another type leaves
+/// it waiting; reading a pairing message, whatever the outcome, uses it up.
 pub struct PhoneAwaitingResponse {
-    handshake: HandshakeState,
+    handshake: Option<HandshakeState>,
     expected_mac_key: [u8; KEY_LEN],
     identity: SigningKey,
     noise_public_key: [u8; KEY_LEN],
 }
 
-/// The Mac's state after sending message 2.
+/// The Mac's state after sending message 2. Like `PhoneAwaitingResponse`, a
+/// frame of another type leaves it waiting.
 pub struct MacAwaitingFinish {
-    handshake: HandshakeState,
+    handshake: Option<HandshakeState>,
     /// The hash as it stood before message 3, which the phone's binding
     /// signature covers. Reading message 3 changes it.
     hash_before_message_3: [u8; HANDSHAKE_HASH_LEN],
@@ -95,7 +97,7 @@ impl PhoneAwaitingResponse {
     /// Reads the Mac's message 2 and writes message 3, which ends the
     /// handshake on this side.
     pub fn respond(
-        self,
+        &mut self,
         phone_name: &str,
         message_2: &[u8],
     ) -> Result<(UnconfirmedMac, Vec<u8>), CryptoError> {
@@ -105,25 +107,26 @@ impl PhoneAwaitingResponse {
     }
 
     fn respond_with(
-        mut self,
+        &mut self,
         message_2: &[u8],
         build_payload: impl FnOnce(&SigningKey, &[u8; HANDSHAKE_HASH_LEN], &[u8; KEY_LEN]) -> Vec<u8>,
     ) -> Result<(UnconfirmedMac, Vec<u8>), CryptoError> {
         let message_2 = frame::body(FrameKind::Pairing, message_2)?;
-        let payload = read(&mut self.handshake, message_2)?;
-        let mac_key = remote_static(&self.handshake)?;
+        let mut handshake = self.handshake.take().ok_or(CryptoError::HandshakeFailed)?;
+        let payload = read(&mut handshake, message_2)?;
+        let mac_key = remote_static(&handshake)?;
         if mac_key != self.expected_mac_key {
             return Err(CryptoError::UnexpectedPeerKey);
         }
         let mac_name = decode_message_2(&payload)?;
-        let hash = handshake_hash(&self.handshake)?;
+        let hash = handshake_hash(&handshake)?;
         let payload = build_payload(&self.identity, &hash, &self.noise_public_key);
-        let message_3 = write(&mut self.handshake, &payload)?;
+        let message_3 = write(&mut handshake, &payload)?;
         Ok((
             UnconfirmedMac {
                 noise_public_key: mac_key,
                 name: mac_name,
-                handshake_hash: handshake_hash(&self.handshake)?,
+                handshake_hash: handshake_hash(&handshake)?,
             },
             frame::tagged(FrameKind::Pairing, &message_3),
         ))
@@ -133,10 +136,11 @@ impl PhoneAwaitingResponse {
 impl MacAwaitingFinish {
     /// Reads the phone's message 3: its keys, its name, and the signature
     /// proving it holds the identity key it registers.
-    pub fn finish(mut self, message_3: &[u8]) -> Result<PairingCandidate, CryptoError> {
+    pub fn finish(&mut self, message_3: &[u8]) -> Result<PairingCandidate, CryptoError> {
         let message_3 = frame::body(FrameKind::Pairing, message_3)?;
-        let payload = read(&mut self.handshake, message_3)?;
-        let phone_noise_key = remote_static(&self.handshake)?;
+        let mut handshake = self.handshake.take().ok_or(CryptoError::HandshakeFailed)?;
+        let payload = read(&mut handshake, message_3)?;
+        let phone_noise_key = remote_static(&handshake)?;
         let (identity_public_key, signature, name) = decode_message_3(&payload)?;
         identity::verify(
             &identity_public_key,
@@ -148,7 +152,7 @@ impl MacAwaitingFinish {
             noise_public_key: phone_noise_key,
             identity_public_key,
             name,
-            handshake_hash: handshake_hash(&self.handshake)?,
+            handshake_hash: handshake_hash(&handshake)?,
         })
     }
 }
@@ -164,7 +168,7 @@ fn phone_start_with(
     let message_1 = write(&mut handshake, &[])?;
     Ok((
         PhoneAwaitingResponse {
-            handshake,
+            handshake: Some(handshake),
             expected_mac_key: offer.mac_noise_public_key,
             identity: keys.identity_signing_key().clone(),
             noise_public_key: keys.noise_public_key(),
@@ -193,7 +197,7 @@ fn mac_respond_with(
     let hash_before_message_3 = handshake_hash(&handshake)?;
     Ok((
         MacAwaitingFinish {
-            handshake,
+            handshake: Some(handshake),
             hash_before_message_3,
         },
         frame::tagged(FrameKind::Pairing, &message_2),
@@ -318,6 +322,9 @@ fn is_displayable(c: char) -> bool {
             c,
             // Bidi_Control.
             '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            // Line and paragraph separators (`Zl`, `Zp`), which text views
+            // honour as line breaks but `is_control` does not cover.
+            | '\u{2028}' | '\u{2029}'
             // Zero-width space, word joiner and invisible operators, and the
             // byte order mark.
             | '\u{200B}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}'
@@ -384,8 +391,8 @@ mod tests {
     }
 
     fn pair(party: &Party) -> (UnconfirmedMac, PairingCandidate) {
-        let (phone, message_1) = phone_start(&party.phone, &offer(party)).unwrap();
-        let (mac, message_2) =
+        let (mut phone, message_1) = phone_start(&party.phone, &offer(party)).unwrap();
+        let (mut mac, message_2) =
             mac_respond(&party.mac, &party.psk, "Studio Mac", &message_1).unwrap();
         let (paired_mac, message_3) = phone.respond("Jo's iPhone", &message_2).unwrap();
         (paired_mac, mac.finish(&message_3).unwrap())
@@ -432,9 +439,9 @@ mod tests {
     #[test]
     fn the_handshake_is_pinned() {
         let party = party();
-        let (phone, message_1) =
+        let (mut phone, message_1) =
             phone_start_with(&party.phone, &offer(&party), Some(&[6; KEY_LEN])).unwrap();
-        let (mac, message_2) = mac_respond_with(
+        let (mut mac, message_2) = mac_respond_with(
             &party.mac,
             &party.psk,
             "Mac",
@@ -465,10 +472,31 @@ mod tests {
         );
     }
 
+    /// Both waiting states survive a frame of another type and complete when
+    /// the real message arrives.
+    #[test]
+    fn a_stray_frame_leaves_a_pairing_step_waiting() {
+        let party = party();
+        let stray = frame::tagged(FrameKind::Record, b"stray");
+        let (mut phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
+        let (mut mac, message_2) = mac_respond(&party.mac, &party.psk, "Mac", &message_1).unwrap();
+        assert_eq!(
+            phone.respond("Phone", &stray).err(),
+            Some(CryptoError::UnexpectedFrame)
+        );
+        let (_, message_3) = phone.respond("Phone", &message_2).unwrap();
+        assert_eq!(mac.finish(&stray).err(), Some(CryptoError::UnexpectedFrame));
+        assert!(mac.finish(&message_3).is_ok());
+        assert_eq!(
+            mac.finish(&message_3).err(),
+            Some(CryptoError::HandshakeFailed)
+        );
+    }
+
     #[test]
     fn a_wrong_psk_fails_the_handshake() {
         let party = party();
-        let (phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
+        let (mut phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
         let (_, message_2) = mac_respond(&party.mac, &[9; PSK_LEN], "Mac", &message_1).unwrap();
         assert_eq!(
             phone.respond("Phone", &message_2).err(),
@@ -480,7 +508,7 @@ mod tests {
     fn a_mac_other_than_the_one_in_the_qr_code_is_refused() {
         let party = party();
         let impostor = DeviceKeys::from_secrets(&[8; KEY_LEN], &[8; KEY_LEN]).unwrap();
-        let (phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
+        let (mut phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
         let (_, message_2) = mac_respond(&impostor, &party.psk, "Mac", &message_1).unwrap();
         assert_eq!(
             phone.respond("Phone", &message_2).err(),
@@ -491,7 +519,7 @@ mod tests {
     #[test]
     fn a_tampered_message_fails_the_handshake() {
         let party = party();
-        let (phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
+        let (mut phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
         let (_, mut message_2) = mac_respond(&party.mac, &party.psk, "Mac", &message_1).unwrap();
         let last = message_2.len() - 1;
         message_2[last] ^= 1;
@@ -500,8 +528,8 @@ mod tests {
             Some(CryptoError::HandshakeFailed)
         );
 
-        let (phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
-        let (mac, message_2) = mac_respond(&party.mac, &party.psk, "Mac", &message_1).unwrap();
+        let (mut phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
+        let (mut mac, message_2) = mac_respond(&party.mac, &party.psk, "Mac", &message_1).unwrap();
         let (_, mut message_3) = phone.respond("Phone", &message_2).unwrap();
         message_3[10] ^= 1;
         assert_eq!(
@@ -515,8 +543,8 @@ mod tests {
     #[test]
     fn a_signature_binding_a_different_noise_key_is_refused() {
         let party = party();
-        let (phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
-        let (mac, message_2) = mac_respond(&party.mac, &party.psk, "Mac", &message_1).unwrap();
+        let (mut phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
+        let (mut mac, message_2) = mac_respond(&party.mac, &party.psk, "Mac", &message_1).unwrap();
         let (_, message_3) = phone
             .respond_with(&message_2, |identity, hash, _| {
                 message_3_payload(identity, hash, &[0xAA; KEY_LEN], "Phone")
@@ -531,8 +559,8 @@ mod tests {
     #[test]
     fn a_signature_over_a_different_handshake_is_refused() {
         let party = party();
-        let (phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
-        let (mac, message_2) = mac_respond(&party.mac, &party.psk, "Mac", &message_1).unwrap();
+        let (mut phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
+        let (mut mac, message_2) = mac_respond(&party.mac, &party.psk, "Mac", &message_1).unwrap();
         let (_, message_3) = phone
             .respond_with(&message_2, |identity, _, noise_key| {
                 message_3_payload(identity, &[0; HANDSHAKE_HASH_LEN], noise_key, "Phone")
@@ -569,6 +597,15 @@ mod tests {
             &mut out,
         );
         assert_eq!(decode_name(&out).unwrap().0, "JoenohPix");
+    }
+
+    /// U+2028 and U+2029 are not `Cc`, but text views break lines on them, so
+    /// a hostile name could otherwise put a fake line beside the real code.
+    #[test]
+    fn decoded_names_lose_line_and_paragraph_separators() {
+        let mut out = Vec::new();
+        encode_name("Jo's Mac\u{2028}Verified\u{2029}code 000000", &mut out);
+        assert_eq!(decode_name(&out).unwrap().0, "Jo's MacVerifiedcode 000000");
     }
 
     #[test]

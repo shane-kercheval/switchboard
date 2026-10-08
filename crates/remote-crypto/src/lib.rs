@@ -6,15 +6,16 @@
 mod confirmation;
 mod error;
 // Only a session fragments, so records are always produced under its lock.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only the tests call it until the session module does"
-    )
-)]
+pub mod device;
 pub(crate) mod fragment;
+pub mod frame;
 pub mod identity;
+pub mod keys;
+mod noise;
+pub mod pairing;
+pub mod session;
+#[cfg(test)]
+mod test_support;
 
 // UniFFI turns a Rust panic into a Swift error only by unwinding it; under
 // `panic = "abort"` the same panic kills the app.
@@ -25,5 +26,6 @@ compile_error!(
 
 pub use confirmation::{HANDSHAKE_HASH_LEN, confirmation_code};
 pub use error::CryptoError;
+pub use keys::DeviceKeys;
 
 uniffi::setup_scaffolding!();

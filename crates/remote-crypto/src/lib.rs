@@ -5,7 +5,15 @@
 
 mod confirmation;
 mod error;
-pub mod fragment;
+// Only a session fragments, so records are always produced under its lock.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "only the tests call it until the session module does"
+    )
+)]
+pub(crate) mod fragment;
 pub mod identity;
 
 // UniFFI turns a Rust panic into a Swift error only by unwinding it; under

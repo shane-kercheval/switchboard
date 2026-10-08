@@ -9,6 +9,7 @@
 // tense would assert something false.
 
 import {
+  ClipboardCheck,
   FilePen,
   FilePlus,
   FileSymlink,
@@ -22,6 +23,7 @@ import {
 } from "@lucide/svelte";
 import type { ToolCall } from "$lib/state/types";
 import type { EditedFile, McpMutation, ToolFacet } from "$lib/types";
+import { findingsHeader } from "$lib/findings";
 import { redactDisplay, toolInputPreview } from "$lib/toolInput";
 
 /// All lucide icons share one component shape; alias it off a concrete icon
@@ -59,6 +61,8 @@ export function toolVerb(facet: ToolFacet, rawName: string): string {
       return "Todos";
     case "mcp":
       return `${facet.server} · ${facet.tool}`;
+    case "findings":
+      return "Code review";
     case "other":
       return rawName;
     default:
@@ -108,6 +112,8 @@ export function toolDetail(facet: ToolFacet, input: unknown): string | undefined
       return facet.path ? `${facet.pattern} in ${facet.path}` : nonEmpty(facet.pattern);
     case "todo":
       return todoSummary(facet.items);
+    case "findings":
+      return findingsHeader(facet).replace(/^Code review · /, "");
     case "mcp": {
       const mutation = knownMcpMutation(facet);
       return mutation
@@ -160,6 +166,9 @@ function nonEmpty(value: string): string | undefined {
 /// reveal). MCP is deliberately in this set: it has a specialized label and
 /// icon even though it has no body renderer, so it keeps its
 /// raw-behind-a-toggle behavior — a known kind, not a degradation case.
+/// `findings` is deliberately absent: a successful review renders as its own
+/// card, so the tool row only shows a failed or stopped call, where the raw
+/// input and error output are the useful body.
 const SPECIALIZED_FACET_KINDS = new Set([
   "shell",
   "edit",
@@ -201,6 +210,8 @@ export function toolIcon(facet: ToolFacet): ToolIconComponent {
       return ListChecks;
     case "mcp":
       return Plug;
+    case "findings":
+      return ClipboardCheck;
     default:
       return Wrench;
   }

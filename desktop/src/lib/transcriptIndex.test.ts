@@ -156,3 +156,48 @@ describe("filterEntries", () => {
     expect(filterEntries(entries, "fix", "agent").map((e) => e.attribution)).toEqual(["alice"]);
   });
 });
+
+describe("navigator entries for a delivered code review", () => {
+  const reviewMarkdown =
+    "**Code review · low · 1 finding**\n\n1. `src/payments/refund.py:40` · correctness\n   Off-by-one.";
+
+  function reviewTurn(isError: boolean): Turn {
+    return agentTurn(A, "turn-review", "2026-05-16T00:00:01Z", [
+      {
+        item_kind: "tool",
+        tool_use_id: "r1",
+        kind: "builtin",
+        name: "ReportFindings",
+        input: {},
+        facet: {
+          facet_kind: "findings",
+          level: "low",
+          findings: [
+            {
+              file: "src/payments/refund.py",
+              line: 40,
+              summary: "Off-by-one.",
+              failure_scenario: "",
+            },
+          ],
+          text: reviewMarkdown,
+        },
+        is_error: isError,
+        output: "",
+        started_at: "2026-05-16T00:00:01Z",
+        completed_at: "2026-05-16T00:00:02Z",
+      },
+    ]);
+  }
+
+  it("finds the review by a file it names, and previews it by its header", () => {
+    const entries = buildNavigatorEntries(buildUnifiedRows([reviewTurn(false)], []), NAMES);
+    expect(entries[0]!.preview).toBe("Code review · low · 1 finding");
+    expect(filterEntries(entries, "refund.py", "all")).toHaveLength(1);
+  });
+
+  it("does not search a rejected review's content", () => {
+    const entries = buildNavigatorEntries(buildUnifiedRows([reviewTurn(true)], []), NAMES);
+    expect(filterEntries(entries, "refund.py", "all")).toHaveLength(0);
+  });
+});

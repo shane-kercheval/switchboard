@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { ConversationItem } from "$lib/types";
 import {
+  answerItemsOf,
   answerTextOf,
   buildUnifiedRows,
   copyTextOf,
   groupRenderBlocks,
+  lastAnswerItemsOf,
   lastAnswerTextOf,
   recentSendsStartIndex,
   type RenderBlock,
@@ -196,6 +198,67 @@ describe("copyTextOf", () => {
     };
     expect(copyTextOf(turn, "full_answer")).toBe("Step one.\n\nStep two.");
     expect(copyTextOf(turn, "last_answer_block")).toBe("Step two.");
+  });
+});
+
+describe("delivered code reviews in the answer", () => {
+  type AgentTurn = Extract<Turn, { role: "agent" }>;
+  type Item = AgentTurn["items"][number];
+
+  const text = (t: string): Item => ({ item_kind: "text", kind: "text", text: t });
+  function review(id: string, markdown: string, isError: boolean | undefined): Item {
+    return {
+      item_kind: "tool",
+      tool_use_id: id,
+      kind: "builtin",
+      name: "ReportFindings",
+      input: {},
+      facet: { facet_kind: "findings", level: null, findings: [], text: markdown },
+      started_at: "2026-05-16T00:00:01Z",
+      ...(isError === undefined
+        ? {}
+        : { is_error: isError, output: "", completed_at: "2026-05-16T00:00:02Z" }),
+    };
+  }
+  function turnOf(items: Item[]): AgentTurn {
+    return {
+      role: "agent",
+      turn_id: TURN_1,
+      agent_id: AGENT_A,
+      started_at: "2026-05-16T00:00:00Z",
+      status: "complete",
+      items,
+    };
+  }
+
+  it("places a review between text blocks in both copy modes", () => {
+    const turn = turnOf([text("Intro."), review("r1", "REVIEW", false), text("Listed above.")]);
+    expect(answerTextOf(turn)).toBe("Intro.\n\nREVIEW\n\nListed above.");
+    // The closing block usually refers to the review, so last-block copy keeps it.
+    expect(lastAnswerTextOf(turn)).toBe("REVIEW\n\nListed above.");
+  });
+
+  it("answers a review-only turn with the review", () => {
+    const turn = turnOf([review("r1", "REVIEW", false)]);
+    expect(answerTextOf(turn)).toBe("REVIEW");
+    expect(lastAnswerTextOf(turn)).toBe("REVIEW");
+  });
+
+  it("excludes a rejected call and one that never got a result", () => {
+    const turn = turnOf([
+      review("r1", "REJECTED", true),
+      review("r2", "REVIEW", false),
+      review("r3", "UNANSWERED", undefined),
+      text("Done."),
+    ]);
+    expect(answerTextOf(turn)).toBe("REVIEW\n\nDone.");
+    expect(answerItemsOf(turn).map((i) => i.item_kind)).toEqual(["tool", "text"]);
+  });
+
+  it("keeps two reviews in turn order", () => {
+    const turn = turnOf([review("r1", "FIRST", false), review("r2", "SECOND", false), text("ack")]);
+    expect(answerTextOf(turn)).toBe("FIRST\n\nSECOND\n\nack");
+    expect(lastAnswerItemsOf(turn)).toHaveLength(3);
   });
 });
 

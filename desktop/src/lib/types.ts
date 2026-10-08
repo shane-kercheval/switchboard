@@ -77,7 +77,30 @@ export type ToolFacet =
   | { facet_kind: "search"; pattern: string; path?: string | null }
   | { facet_kind: "todo"; items: TodoItem[] }
   | { facet_kind: "mcp"; server: string; tool: string; mutation?: McpMutation }
+  | FindingsFacet
   | { facet_kind: "other" };
+
+// A code review delivered as tool input (Claude Code's `ReportFindings`).
+// `text` is the review as markdown, built once in Rust: copy uses it verbatim
+// so it matches what forward and workflows send. `file` is the model's
+// repo-relative label and `line` its claim — display them, never resolve them.
+export type FindingsFacet = {
+  facet_kind: "findings";
+  level?: string | null;
+  findings: Finding[];
+  text: string;
+};
+
+export type Finding = {
+  file: string;
+  line?: number | null;
+  summary: string;
+  short_summary?: string | null;
+  failure_scenario: string;
+  category?: string | null;
+  verdict?: "CONFIRMED" | "PLAUSIBLE" | null;
+  outcome?: "fixed" | "skipped" | "no_change_needed" | null;
+};
 
 // Input-derived requested changes for structurally recognized MCP tools. The
 // target is a bounded display label, not a filesystem path or authoritative

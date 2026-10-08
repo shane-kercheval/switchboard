@@ -8,7 +8,7 @@
 // resolution, and precompute their searchable text once so typing in the
 // filter doesn't re-normalize every message per keystroke.
 
-import type { UnifiedRow } from "$lib/state/unified";
+import { answerItemsOf, type UnifiedRow } from "$lib/state/unified";
 import type { Turn } from "$lib/state/types";
 import type { AgentId, HarnessKind } from "$lib/types";
 import { toolDetail, toolVerb } from "$lib/toolRow";
@@ -46,10 +46,12 @@ function collapseWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
+/// The turn's answer for search and preview, from the canonical answer rule —
+/// so a delivered code review is searchable by the files it names, and a
+/// review-only turn previews as its header.
 function agentProse(turn: AgentTurn): string {
-  return turn.items
-    .filter((item) => item.item_kind === "text" && item.kind === "text")
-    .map((item) => (item.item_kind === "text" ? item.text : ""))
+  return answerItemsOf(turn)
+    .map((item) => (item.item_kind === "text" ? item.text : item.facet.text))
     .join("\n");
 }
 

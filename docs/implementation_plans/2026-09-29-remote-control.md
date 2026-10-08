@@ -64,7 +64,9 @@ shared Rust cryptography are in one tree.
     identity key, and the phone's name.
   - Concurrency: `Session` and `PairingHandshake` keep their state behind a lock, `seal`
     fragments and seals a whole envelope under one acquisition, and a poisoned lock reports
-    the session dead. The Swift `SecureSession` actor seals and sends in one step.
+    the session dead. The Swift `SecureSession` sends through one outbound queue with a
+    single consumer, which seals an envelope and sends all its records before the next — an
+    actor alone would let a second call seal and send while the first awaits its send.
   - Libraries: `snow`, `ed25519-dalek` 3, `data-encoding`, `zeroize`; randomness from the
     operating system through `getrandom`. Signatures are domain-separated by purpose.
 - **Paths (2026-10-06)** — file paths updated for the repository's move to `desktop/` and
@@ -428,10 +430,12 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
 - `fragment` — splits a serialized envelope into records that each fit the Noise limit
   (65,535 bytes on the wire, so 65,519 bytes of plaintext after the tag). Each record's header —
   message id, index, count — is inside the encrypted payload, so it is authenticated. Records
-  arrive in order and one `seal` produces all of an envelope's fragments, so the reassembler
-  accepts only the first fragment of a new message or the next fragment of the one in
-  progress, with the same count; anything else closes the session. It holds at most one
-  message, of at most **8 MiB**, and discards it on disconnect. The fragmenter does not truncate. Payload size is
+  arrive in order and one `seal` produces all of an envelope's fragments, so the reassembler is
+  strictly sequential: it accepts at most **8 MiB** per message, holds one message in progress,
+  and takes only the next fragment of that message or the first of the next message, numbered
+  one past the last. Anything else, and any malformed fragment, clears all state and closes the
+  session (`ProtocolViolation`); a disconnect discards it too. Only `Session` fragments, so the
+  module is crate-private. The fragmenter does not truncate. Payload size is
   bounded higher up, by the window budget and tool-output cap in §5.7.
 - `identity` — Ed25519 signing and strict verification, and
   `device_id = base32(sha256(public_key))[..26]`: lower-case RFC 4648 base32 without padding,
@@ -445,8 +449,11 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
 returns a typed error rather than panicking. `seal` fragments and seals all of an envelope's
 records under one lock acquisition, so concurrent calls can never interleave records. A
 poisoned lock reports the session dead through a typed error, and the caller reconnects.
-Records must be transmitted in the order `seal` returns them: the Swift `SecureSession` (§7.2)
-is an actor that seals and sends in one step.
+Records must be transmitted in the order `seal` returns them. A Swift actor alone cannot
+guarantee that, because an actor method that awaits a send lets another call seal and send
+meanwhile. So the Swift `SecureSession` (§7.2) owns one outbound queue with exactly one
+consumer: callers enqueue envelopes, and the consumer seals one envelope and awaits the send of
+all its records before taking the next. A send failure after sealing discards the session.
 
 **Libraries.** `snow` with its pure-Rust resolver limited to the primitives in use (X25519,
 ChaChaPoly, SHA-256) and without its `std` feature, which would pull in `ring` and `blake2`,
@@ -472,9 +479,10 @@ Swift.
   key, tampered handshake message, tampered transport record, record from a previous
   connection, repeated record); confirmation codes equal for one handshake, and handshake
   hashes different across two; the Mac's session unconfirmed after a replayed message 1 and
-  confirmed by its first record; fragmentation round trip for a large envelope; missing,
-  repeated, out-of-sequence, out-of-range, and oversize fragments rejected; a message above
-  8 MiB rejected;
+  confirmed by its first record; fragmentation round trip for a large envelope; a wrong
+  message id, a skipped, repeated, or out-of-range index, malformed input after a message has
+  started, and oversize fragments each rejected and clearing state; a message above 8 MiB
+  rejected;
   signature verification with a wrong key fails; `DeviceKeys` round-trips through
   `storage_bytes` and `restore` rejects an unknown version and a wrong length; a device id is
   26 lower-case characters; pairing payloads with a wrong version, a bad or misbound signature,
@@ -1053,7 +1061,9 @@ though the phone cannot send attachments.
   builds use, carries neither and accepts only `wss://`. A test asserts the Release Info.plist
   has no ATS exception.
 - `SecureSession` — wraps the binding's `Session`: runs `KK` on every connection, seals and
-  opens records, reassembles fragments.
+  opens records, reassembles fragments. Outbound envelopes go through one queue with exactly
+  one consumer, which seals an envelope and awaits the send of all its records before taking
+  the next (§3).
 - `LiveRequestBroker` — matches responses by `id`; a 15-second timeout on `send_message` yields
   **outcome unknown**, resolved by `send_receipt`, never by resubmitting.
 - `EventBus` — publishes decoded events to subscribed stores.
@@ -1125,6 +1135,9 @@ though the phone cannot send attachments.
   one, many agents; remembered agent deleted); `SendGate` (cancelled, failed, biometrics
   unavailable, edit during authentication); a test that both configurations' Info.plists
   carry the camera and Face ID usage descriptions.
+- Coordinator: `SecureSession`'s outbound queue — suspend the first envelope's send, submit a
+  second envelope, and assert every record of the first is transmitted before any of the
+  second.
 - Coordinator: `TranscriptStore` with a stub broker — events before the load reply resolves, a
   `seq` gap triggering a reload, a `resync` with no later event triggering a reload, repeated
   triggers during a reload yielding exactly one more reload no sooner than 2 seconds later,

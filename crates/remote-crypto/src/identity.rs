@@ -19,19 +19,27 @@ pub enum SignaturePurpose {
     PairingBinding,
 }
 
+const RELAY_CHALLENGE_CONTEXT: &[u8] = b"switchboard relay challenge v1";
+const PAIRING_BINDING_CONTEXT: &[u8] = b"switchboard pairing binding v1";
+// The length prefix in `message` is one byte; a longer context would be
+// mis-prefixed and weaken the separation.
+const _: () = assert!(RELAY_CHALLENGE_CONTEXT.len() <= u8::MAX as usize);
+const _: () = assert!(PAIRING_BINDING_CONTEXT.len() <= u8::MAX as usize);
+
 impl SignaturePurpose {
     fn context(self) -> &'static [u8] {
         match self {
-            Self::RelayChallenge => b"switchboard relay challenge v1",
-            Self::PairingBinding => b"switchboard pairing binding v1",
+            Self::RelayChallenge => RELAY_CHALLENGE_CONTEXT,
+            Self::PairingBinding => PAIRING_BINDING_CONTEXT,
         }
     }
 
     fn message(self, payload: &[u8]) -> Vec<u8> {
         let context = self.context();
         let mut message = Vec::with_capacity(1 + context.len() + payload.len());
-        // Contexts are short constants; the length prefix keeps one context
-        // from being a prefix of another.
+        // The length prefix keeps one context from being a prefix of another.
+        // Every context fits in a byte, asserted above, so the fallback is
+        // unreachable.
         message.push(u8::try_from(context.len()).unwrap_or(u8::MAX));
         message.extend_from_slice(context);
         message.extend_from_slice(payload);
@@ -50,13 +58,10 @@ pub fn device_id(identity_public_key: &VerifyingKey) -> String {
     id
 }
 
-pub fn sign(
-    key: &SigningKey,
-    purpose: SignaturePurpose,
-    payload: &[u8],
-) -> Result<Signature, CryptoError> {
-    key.try_sign(&purpose.message(payload))
-        .map_err(|_| CryptoError::InvalidSignature)
+/// Crate-private: no caller outside this crate handles a private key.
+/// Signing with an in-memory Ed25519 key cannot fail.
+pub(crate) fn sign(key: &SigningKey, purpose: SignaturePurpose, payload: &[u8]) -> Signature {
+    key.sign(&purpose.message(payload))
 }
 
 /// Strict verification: rejects non-canonical signatures and small-order
@@ -121,7 +126,7 @@ mod tests {
     #[test]
     fn a_signature_verifies_for_its_key_payload_and_purpose() {
         let signing = key(3);
-        let signature = sign(&signing, SignaturePurpose::RelayChallenge, b"nonce").unwrap();
+        let signature = sign(&signing, SignaturePurpose::RelayChallenge, b"nonce");
         assert_eq!(
             verify(
                 &signing.verifying_key(),
@@ -135,7 +140,7 @@ mod tests {
 
     #[test]
     fn verification_fails_for_a_wrong_key() {
-        let signature = sign(&key(3), SignaturePurpose::RelayChallenge, b"nonce").unwrap();
+        let signature = sign(&key(3), SignaturePurpose::RelayChallenge, b"nonce");
         assert_eq!(
             verify(
                 &key(4).verifying_key(),
@@ -150,7 +155,7 @@ mod tests {
     #[test]
     fn verification_fails_for_a_changed_payload() {
         let signing = key(3);
-        let signature = sign(&signing, SignaturePurpose::RelayChallenge, b"nonce").unwrap();
+        let signature = sign(&signing, SignaturePurpose::RelayChallenge, b"nonce");
         assert_eq!(
             verify(
                 &signing.verifying_key(),
@@ -165,7 +170,7 @@ mod tests {
     #[test]
     fn a_signature_for_one_purpose_does_not_verify_for_another() {
         let signing = key(3);
-        let signature = sign(&signing, SignaturePurpose::RelayChallenge, b"payload").unwrap();
+        let signature = sign(&signing, SignaturePurpose::RelayChallenge, b"payload");
         assert_eq!(
             verify(
                 &signing.verifying_key(),

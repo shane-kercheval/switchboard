@@ -107,11 +107,7 @@ impl PhoneAwaitingResponse {
     fn respond_with(
         mut self,
         message_2: &[u8],
-        build_payload: impl FnOnce(
-            &SigningKey,
-            &[u8; HANDSHAKE_HASH_LEN],
-            &[u8; KEY_LEN],
-        ) -> Result<Vec<u8>, CryptoError>,
+        build_payload: impl FnOnce(&SigningKey, &[u8; HANDSHAKE_HASH_LEN], &[u8; KEY_LEN]) -> Vec<u8>,
     ) -> Result<(UnconfirmedMac, Vec<u8>), CryptoError> {
         let message_2 = frame::body(FrameKind::Pairing, message_2)?;
         let payload = read(&mut self.handshake, message_2)?;
@@ -121,7 +117,7 @@ impl PhoneAwaitingResponse {
         }
         let mac_name = decode_message_2(&payload)?;
         let hash = handshake_hash(&self.handshake)?;
-        let payload = build_payload(&self.identity, &hash, &self.noise_public_key)?;
+        let payload = build_payload(&self.identity, &hash, &self.noise_public_key);
         let message_3 = write(&mut self.handshake, &payload)?;
         Ok((
             UnconfirmedMac {
@@ -274,17 +270,17 @@ fn message_3_payload(
     hash: &[u8; HANDSHAKE_HASH_LEN],
     noise_public_key: &[u8; KEY_LEN],
     phone_name: &str,
-) -> Result<Vec<u8>, CryptoError> {
+) -> Vec<u8> {
     let signature = identity::sign(
         identity,
         SignaturePurpose::PairingBinding,
         &binding_statement(hash, noise_public_key),
-    )?;
+    );
     let mut payload = vec![PAYLOAD_VERSION];
     payload.extend_from_slice(identity.verifying_key().as_bytes());
     payload.extend_from_slice(&signature.to_bytes());
     encode_name(phone_name, &mut payload);
-    Ok(payload)
+    payload
 }
 
 /// Appends a one-byte length and the name, cut at a character boundary to at
@@ -616,7 +612,7 @@ mod tests {
 
         let identity = SigningKey::from_bytes(&[2; KEY_LEN]);
         let valid_3 =
-            message_3_payload(&identity, &[0; HANDSHAKE_HASH_LEN], &[1; KEY_LEN], "Phone").unwrap();
+            message_3_payload(&identity, &[0; HANDSHAKE_HASH_LEN], &[1; KEY_LEN], "Phone");
         assert!(decode_message_3(&valid_3).is_ok());
         let mut trailing = valid_3.clone();
         trailing.push(0);

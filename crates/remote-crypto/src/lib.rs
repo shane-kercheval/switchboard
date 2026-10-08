@@ -5,7 +5,8 @@
 
 mod confirmation;
 mod error;
-pub mod fragment;
+// Only a session fragments, so records are always produced under its lock.
+pub(crate) mod fragment;
 pub mod frame;
 pub mod identity;
 pub mod keys;

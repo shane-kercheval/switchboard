@@ -85,11 +85,13 @@ impl Fragmenter {
 }
 
 /// Collects fragments into messages; one per receiving direction of a
-/// session. At most one message is in progress. Drop it, or call `reset`, when
+/// session. At most one message is in progress, and messages arrive in the
+/// order the peer's `Fragmenter` numbered them. Drop it, or call `reset`, when
 /// the connection ends: a partial message never survives a disconnect.
 #[derive(Debug, Default)]
 pub struct Reassembler {
     in_progress: Option<Partial>,
+    next_message_id: u32,
 }
 
 #[derive(Debug)]
@@ -109,23 +111,25 @@ struct Header {
 impl Reassembler {
     /// Takes one decrypted fragment. Returns the whole message once its last
     /// fragment arrives, `None` while it is still incomplete. A fragment must be
-    /// the first of a new message, or the next fragment of the one in progress
-    /// with the same count. On any error the message in progress is discarded;
-    /// the caller should end the session, because an authenticated peer sent
-    /// something malformed.
+    /// the first of the next message — its id one past the last message's,
+    /// wrapping — or the next fragment of the one in progress, with the same
+    /// count. Any other fragment, and any malformed one, clears all state and is
+    /// an error; the caller ends the session, because an authenticated peer sent
+    /// something its `Fragmenter` never produces.
     pub fn accept(&mut self, fragment: &[u8]) -> Result<Option<Vec<u8>>, FragmentError> {
         let result = parse(fragment).and_then(|(header, chunk)| self.accept_chunk(&header, chunk));
         if result.is_err() {
-            self.in_progress = None;
+            self.reset();
         }
         result
     }
 
-    /// Discards the message in progress.
+    /// Discards all state, as at the start of a connection.
     pub fn reset(&mut self) {
-        self.in_progress = None;
+        *self = Self::default();
     }
 
+    #[cfg(test)]
     pub fn is_assembling(&self) -> bool {
         self.in_progress.is_some()
     }
@@ -140,9 +144,10 @@ impl Reassembler {
             index: header.index,
         };
         let Some(partial) = self.in_progress.as_mut() else {
-            if header.index != 0 {
+            if header.index != 0 || header.message_id != self.next_message_id {
                 return Err(out_of_sequence);
             }
+            self.next_message_id = header.message_id.wrapping_add(1);
             if header.count == 1 {
                 return Ok(Some(chunk.to_vec()));
             }
@@ -302,17 +307,64 @@ mod tests {
     #[test]
     fn a_new_message_before_the_current_one_completes_is_rejected() {
         let mut reassembler = Reassembler::default();
-        assert_eq!(reassembler.accept(&header(7, 0, 2)), Ok(None));
-        assert_out_of_sequence(&mut reassembler, &header(8, 0, 2), 8, 0);
-        assert_eq!(reassembler.accept(&header(7, 0, 2)), Ok(None));
-        assert_out_of_sequence(&mut reassembler, &header(8, 0, 1), 8, 0);
+        assert_eq!(reassembler.accept(&header(0, 0, 2)), Ok(None));
+        assert_out_of_sequence(&mut reassembler, &header(1, 0, 2), 1, 0);
+        assert_eq!(reassembler.accept(&header(0, 0, 2)), Ok(None));
+        assert_out_of_sequence(&mut reassembler, &header(1, 0, 1), 1, 0);
     }
 
     #[test]
     fn a_fragment_changing_its_message_count_is_rejected() {
         let mut reassembler = Reassembler::default();
-        assert_eq!(reassembler.accept(&header(7, 0, 3)), Ok(None));
-        assert_out_of_sequence(&mut reassembler, &header(7, 1, 2), 7, 1);
+        assert_eq!(reassembler.accept(&header(0, 0, 3)), Ok(None));
+        assert_out_of_sequence(&mut reassembler, &header(0, 1, 2), 0, 1);
+    }
+
+    #[test]
+    fn messages_must_arrive_in_the_order_they_were_numbered() {
+        assert_out_of_sequence(&mut Reassembler::default(), &header(5, 0, 1), 5, 0);
+
+        let mut reassembler = Reassembler::default();
+        assert_eq!(reassembler.accept(&header(0, 0, 1)), Ok(Some(Vec::new())));
+        assert_out_of_sequence(&mut reassembler, &header(0, 0, 1), 0, 0);
+
+        let mut reassembler = Reassembler::default();
+        assert_eq!(reassembler.accept(&header(0, 0, 1)), Ok(Some(Vec::new())));
+        assert_out_of_sequence(&mut reassembler, &header(2, 0, 1), 2, 0);
+    }
+
+    #[test]
+    fn message_ids_wrap_like_the_fragmenter_s() {
+        let mut reassembler = Reassembler {
+            next_message_id: u32::MAX,
+            ..Reassembler::default()
+        };
+        assert_eq!(
+            reassembler.accept(&header(u32::MAX, 0, 1)),
+            Ok(Some(Vec::new()))
+        );
+        assert_eq!(reassembler.accept(&header(0, 0, 1)), Ok(Some(Vec::new())));
+    }
+
+    #[test]
+    fn a_skipped_index_is_rejected() {
+        let mut reassembler = Reassembler::default();
+        assert_eq!(reassembler.accept(&header(0, 0, 3)), Ok(None));
+        assert_out_of_sequence(&mut reassembler, &header(0, 2, 3), 0, 2);
+    }
+
+    #[test]
+    fn malformed_input_after_a_message_has_started_clears_it() {
+        let mut reassembler = Reassembler::default();
+        assert_eq!(reassembler.accept(&header(0, 0, 2)), Ok(None));
+        assert_eq!(
+            reassembler.accept(&[0; HEADER_LEN - 1]),
+            Err(FragmentError::Truncated {
+                len: HEADER_LEN - 1
+            })
+        );
+        assert!(!reassembler.is_assembling());
+        assert_out_of_sequence(&mut reassembler, &header(0, 1, 2), 0, 1);
     }
 
     #[test]

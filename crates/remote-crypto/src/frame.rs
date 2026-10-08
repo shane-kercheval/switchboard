@@ -12,6 +12,7 @@ use crate::fragment::MAX_RECORD_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum FrameKind {
     /// Any of the three pairing handshake messages.
     Pairing = 1,

@@ -2,7 +2,11 @@
 //! device id derived from it, and domain-separated signatures.
 
 use data_encoding::BASE32_NOPAD;
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
+// Re-exported because the public functions take them: a consumer such as the
+// relay uses this crate's `ed25519-dalek`, deliberately pinned to match
+// `snow`'s, rather than declaring its own and relying on Cargo to unify them.
+pub use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::CryptoError;
@@ -14,6 +18,7 @@ pub const DEVICE_ID_LEN: usize = 26;
 /// a signature made for one purpose never verifies for another: a relay
 /// cannot turn a registration signature into a pairing binding, or back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SignaturePurpose {
     RelayChallenge,
     PairingBinding,

@@ -4258,7 +4258,8 @@ async fn live_claude_edit_emits_edit_facet() {
 /// `ReportFindings` delivers a code review as tool input, and its tool result
 /// carries none of the findings, so this facet is the only way Switchboard sees
 /// the review. Guards the tool's name and input fields. In `-p` mode the tool
-/// is deferred (observed @ 2.1.289), so the prompt allows a `ToolSearch` load.
+/// is sometimes deferred (observed @ 2.1.289), so the prompt allows a
+/// `ToolSearch` load.
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_report_findings_emits_findings_facet() {

@@ -613,7 +613,7 @@ mod tests {
             .collect()
     }
 
-    /// Recorded live @ 2.1.289: the model loads the deferred tool through
+    /// Recorded live @ 2.1.289: the model loads the (here deferred) tool through
     /// `ToolSearch`, calls `ReportFindings` with one fully-populated and one
     /// required-fields-only finding, then replies `ack`.
     #[test]

@@ -52,8 +52,8 @@ pub use facets::{
     McpMutation, McpMutationField, TodoItem, ToolFacet,
 };
 pub use forward::{
-    ForwardedBlock, compose_forwarded_message, empty_sources_reason, is_forwardable_text,
-    latest_completed_agent_text,
+    ForwardedBlock, TextCapture, compose_forwarded_message, empty_sources_reason,
+    is_forwardable_text, latest_completed_agent_text,
 };
 pub use mock::{MockHarnessAdapter, MockScenario};
 pub use resume::interactive_resume_command;

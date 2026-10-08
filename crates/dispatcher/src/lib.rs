@@ -124,9 +124,9 @@ use switchboard_core::{
     AgentId, AgentRecord, Attachment, SendId, SessionLocator, render_prompt_with_attachments,
 };
 use switchboard_harness::{
-    AdapterEvent, CancelSource, ContentKind, ContextWindowSource, DispatchOptions, EventStream,
-    FailureKind, HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, SessionInventory,
-    SessionMetaSource, TurnId, TurnOutcome, TurnSpend, check_prompt_size,
+    AdapterEvent, CancelSource, ContextWindowSource, DispatchOptions, EventStream, FailureKind,
+    HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, SessionInventory,
+    SessionMetaSource, TextCapture, TurnId, TurnOutcome, TurnSpend, check_prompt_size,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -2174,15 +2174,16 @@ async fn drain_turn(
     let mut cancel_source: Option<CancelSource> = None;
     let mut shutdown_reply: Option<oneshot::Sender<()>> = None;
     let mut channel_closed = false;
-    // Accumulated `Text`-kind output for the turn — the text a forward/aggregate
+    // Accumulated answer content for the turn — the text a forward/aggregate
     // consumer reads, delivered to both the completion handle and the
     // current-turn waiters. Captured for **every** turn from its start, not only
     // awaited ones: a current-turn waiter (manual forward) registers *mid-turn*,
     // so the prefix it would otherwise miss must already be buffered. The cost is
     // one bounded `String` per in-flight turn — negligible for a desktop app, and
-    // it removes the disk-flush race the manual path would otherwise hit.
-    // `Thinking` text and tool output are deliberately excluded.
-    let mut captured_text = String::new();
+    // it removes the disk-flush race the manual path would otherwise hit. What
+    // counts as answer content lives in `TextCapture`, beside the disk read it
+    // must match byte-for-byte.
+    let mut captured_text = TextCapture::default();
     // Diagnostic-only record of whether the adapter produced anything the
     // transcript can render. A completed turn without content or tool activity
     // may be valid for a future harness shape, so it remains Completed; the
@@ -2263,12 +2264,11 @@ async fn drain_turn(
                     }
                     continue;
                 }
-                // Accumulate the turn's text output (see the `captured_text`
-                // declaration for why this is always-on). Only `Text` kind, no
-                // `Thinking`; tool output never arrives as a `ContentChunk`.
-                if let AdapterEvent::ContentChunk { kind: ContentKind::Text, text, .. } = &event {
-                    captured_text.push_str(text);
-                }
+                // Accumulate the turn's answer content (see the `captured_text`
+                // declaration for why this is always-on). Placed after the
+                // force-failed and post-terminal drops above, so nothing that
+                // arrives once the turn is over reaches a forward.
+                captured_text.observe(&event);
                 if matches!(
                     &event,
                     AdapterEvent::ContentChunk { .. }
@@ -2431,7 +2431,7 @@ async fn drain_turn(
                     // outcome. Only a completed turn carries forwardable text; a
                     // failed terminal has none.
                     let text = if matches!(outcome, TurnOutcome::Completed) {
-                        std::mem::take(&mut captured_text)
+                        std::mem::take(&mut captured_text).finish()
                     } else {
                         String::new()
                     };

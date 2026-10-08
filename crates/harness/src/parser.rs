@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use switchboard_core::AgentId;
@@ -7,6 +9,7 @@ use crate::events::{
     SessionMetaSource, SettingPair, SkillEntry, ToolKind, TurnId, TurnOutcome, TurnSpend,
     TurnUsage,
 };
+use crate::facets::ToolFacet;
 
 /// Authored auth-failure message for Claude. Replaces Claude's
 /// `"Not logged in · Please run /login"` (which refers to the
@@ -47,11 +50,16 @@ pub enum ParseOutcome {
 /// `"...what can I help with today?Saved your name to memory..."`.
 #[derive(Debug, Default)]
 pub struct ParserState {
-    /// Whether at least one text-kind `ContentChunk` has been emitted in
-    /// this turn. (Tool events don't drive separator logic; only text-block
-    /// boundaries do.) A leading separator is only sensible *between* text
-    /// blocks, never before the first one.
-    text_chunk_emitted_in_turn: bool,
+    /// Whether this turn has produced answer content yet: a text-kind
+    /// `ContentChunk`, or a code review delivered by a findings tool call that
+    /// completed successfully (forwarded text includes the review's markdown —
+    /// see `forward.rs`). Other tool events don't drive separator logic. A
+    /// leading separator is only sensible *between* answer pieces, never
+    /// before the first one.
+    answer_emitted_in_turn: bool,
+    /// `tool_use_id`s of findings calls that started but have no result yet.
+    /// A successful result marks the turn as having answer content.
+    pending_findings_calls: HashSet<String>,
     /// Set true when a new text block opens *after* prior text has already
     /// been emitted. Cleared when the next `ContentChunk` is emitted (the
     /// separator is prepended onto that chunk's text).
@@ -566,7 +574,7 @@ pub fn parse_line(
             parse_context_report_envelope(&value, agent_id)
         }
         Some("assistant") => parse_assistant_envelope(&value, turn_id, state),
-        Some("user") => parse_user_envelope(&value, turn_id),
+        Some("user") => parse_user_envelope(&value, turn_id, state),
         Some("rate_limit_event") => parse_rate_limit_event(&value, agent_id, state),
         _ => ParseOutcome::Skip,
     }
@@ -592,7 +600,7 @@ fn parse_stream_event(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> 
                 .and_then(|cb| cb.get("type"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if block_type == "text" && state.text_chunk_emitted_in_turn {
+            if block_type == "text" && state.answer_emitted_in_turn {
                 // A new text block is opening after prior text — separator
                 // will be prepended onto its first emitted chunk.
                 state.pending_separator = true;
@@ -669,7 +677,7 @@ fn parse_content_block_delta(
     } else {
         text.to_owned()
     };
-    state.text_chunk_emitted_in_turn = true;
+    state.answer_emitted_in_turn = true;
 
     ParseOutcome::Event(AdapterEvent::ContentChunk {
         turn_id,
@@ -1483,11 +1491,15 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
                 };
                 let name = block.get("name").and_then(Value::as_str).unwrap_or("");
                 let input = block.get("input").cloned().unwrap_or(Value::Null);
+                let facet = crate::claude_code::facets::classify_claude_tool_facet(name, &input);
+                if matches!(facet, ToolFacet::Findings(_)) {
+                    state.pending_findings_calls.insert(id.to_owned());
+                }
                 events.push(AdapterEvent::ToolStarted {
                     turn_id,
                     tool_use_id: id.to_owned(),
                     kind: classify_claude_tool_kind(name),
-                    facet: crate::claude_code::facets::classify_claude_tool_facet(name, &input),
+                    facet,
                     name: name.to_owned(),
                     input,
                 });
@@ -1567,7 +1579,7 @@ fn append_synthetic_text_events(
             },
         });
         emitted_text = true;
-        state.text_chunk_emitted_in_turn = true;
+        state.answer_emitted_in_turn = true;
     }
 }
 
@@ -1589,8 +1601,10 @@ pub(crate) fn classify_claude_tool_kind(name: &str) -> ToolKind {
 
 /// Parse a `user` envelope: emit `ToolCompleted` for each `tool_result`
 /// content block. (User envelopes also carry plain user messages, but
-/// those don't drive any adapter event.)
-fn parse_user_envelope(obj: &Value, turn_id: TurnId) -> ParseOutcome {
+/// those don't drive any adapter event.) A successful result for a findings
+/// call counts as answer content, so the next text block opens with a
+/// separator.
+fn parse_user_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseOutcome {
     let Some(content) = obj
         .get("message")
         .and_then(|m| m.get("content"))
@@ -1610,6 +1624,9 @@ fn parse_user_envelope(obj: &Value, turn_id: TurnId) -> ParseOutcome {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let output = stringify_tool_result_content(block.get("content"));
+            if state.pending_findings_calls.remove(tool_use_id) && !is_error {
+                state.answer_emitted_in_turn = true;
+            }
             events.push(AdapterEvent::ToolCompleted {
                 turn_id,
                 tool_use_id: tool_use_id.to_owned(),
@@ -3247,6 +3264,33 @@ mod tests {
             r#"{"type":"stream_event","event":{"type":"content_block_stop","index":2}}"#,
         ]);
         assert_eq!(out, "first\n\nsecond");
+    }
+
+    const REPORT_FINDINGS_CALL: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_review","name":"ReportFindings","input":{"findings":[{"file":"a.rs","summary":"s","failure_scenario":"f"}]}}]}}"#;
+    const ACK_TEXT_BLOCK: [&str; 3] = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ack"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ];
+
+    /// Forwarded text includes a successful review's markdown, so the first
+    /// text after it needs the same `\n\n` a second text block gets.
+    #[test]
+    fn text_after_a_successful_review_opens_with_a_separator() {
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_review","content":"1 finding reported."}]}}"#;
+        let mut lines = vec![REPORT_FINDINGS_CALL, result];
+        lines.extend(ACK_TEXT_BLOCK);
+        assert_eq!(run_turn(&lines), "\n\nack");
+    }
+
+    /// A rejected review contributes no forwarded text, so it must not cause a
+    /// leading separator either.
+    #[test]
+    fn text_after_a_rejected_review_has_no_separator() {
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_review","is_error":true,"content":"InputValidationError"}]}}"#;
+        let mut lines = vec![REPORT_FINDINGS_CALL, result];
+        lines.extend(ACK_TEXT_BLOCK);
+        assert_eq!(run_turn(&lines), "ack");
     }
 
     #[test]

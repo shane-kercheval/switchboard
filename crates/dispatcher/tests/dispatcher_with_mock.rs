@@ -30,9 +30,10 @@ use switchboard_dispatcher::{
     SessionLocatorSink, TurnKind, TurnPermit,
 };
 use switchboard_harness::{
-    CancelSource, ContextWindowSource, DispatchOptions, FailureKind, HarnessAdapter,
-    MAX_PROMPT_BYTES, MessageId, MockHarnessAdapter, MockScenario, RateLimitSource,
-    SessionInventory, SessionMetaSource, TurnId, TurnOutcome, TurnSpend,
+    AdapterEvent, CancelSource, ContentKind, ContextWindowSource, DispatchOptions, FailureKind,
+    FindingsReport, HarnessAdapter, MAX_PROMPT_BYTES, MessageId, MockHarnessAdapter, MockScenario,
+    RateLimitSource, SessionInventory, SessionMetaSource, ToolFacet, ToolKind, TurnId, TurnOutcome,
+    TurnSpend,
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -545,6 +546,75 @@ impl HarnessAdapter for DispatchRecordingAdapter {
         self.inner
             .dispatch(agent, cwd, prompt, turn_id, options)
             .await
+    }
+}
+
+/// Emits one turn that delivers a code review through a findings tool call and
+/// then replies `ack` — the event shape a real Claude review turn produces.
+/// Test-only rather than a `MockScenario`, which ships in the app.
+struct ReviewTurnAdapter;
+
+const REVIEW_TEXT: &str = "**Code review · 1 finding**\n\n1. `a.rs:3`\n   Probe finding.";
+
+#[async_trait::async_trait]
+impl HarnessAdapter for ReviewTurnAdapter {
+    fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
+        Ok(())
+    }
+
+    fn version(&self) -> Option<String> {
+        None
+    }
+
+    async fn dispatch(
+        &self,
+        _agent: &AgentRecord,
+        _cwd: &std::path::Path,
+        _prompt: &str,
+        turn_id: TurnId,
+        _options: DispatchOptions,
+    ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError> {
+        let review = ToolFacet::Findings(Box::new(FindingsReport {
+            level: None,
+            findings: Vec::new(),
+            text: REVIEW_TEXT.to_owned(),
+        }));
+        let events = vec![
+            AdapterEvent::ToolStarted {
+                turn_id,
+                tool_use_id: "toolu_review".to_owned(),
+                kind: ToolKind::Builtin,
+                name: "ReportFindings".to_owned(),
+                input: serde_json::json!({}),
+                facet: review,
+            },
+            AdapterEvent::ToolCompleted {
+                turn_id,
+                tool_use_id: "toolu_review".to_owned(),
+                output: "1 finding reported.".to_owned(),
+                is_error: false,
+            },
+            // The parser bakes the separator into the first chunk after a
+            // successful review.
+            AdapterEvent::ContentChunk {
+                turn_id,
+                kind: ContentKind::Text,
+                text: "\n\nack".to_owned(),
+            },
+            AdapterEvent::TurnEnd {
+                turn_id,
+                outcome: TurnOutcome::Completed,
+                ended_at: Utc::now(),
+                usage: None,
+                context_window_source: None,
+                stable_message_id: None,
+                first_message_id: None,
+                spend: None,
+                model: None,
+                effort: None,
+            },
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
     }
 }
 
@@ -4671,6 +4741,32 @@ async fn awaited_send_completion_excludes_thinking_text() {
     // Only the two `Text` chunks — the interleaved `Thinking` chunk
     // ("secret reasoning") must not appear in forwardable output.
     assert_eq!(result.text, "visible-one visible-two");
+}
+
+/// A waiting workflow gets a delivered review as part of the turn's text, so
+/// forwarding a review turn sends the review, not just "ack".
+#[tokio::test]
+async fn awaited_send_completion_includes_a_delivered_review() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let adapter: Arc<dyn HarnessAdapter> = Arc::new(ReviewTurnAdapter);
+    let factory = TestFactory::with_adapters(
+        [adapter],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "review", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert_eq!(result.outcome, TurnOutcome::Completed);
+    assert_eq!(result.text, format!("{REVIEW_TEXT}\n\nack"));
 }
 
 #[tokio::test]

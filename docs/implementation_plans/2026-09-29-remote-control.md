@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 15 · **Created:** 2026-09-29 · **Revised:** 2026-10-08
+**Status:** proposed · **Revision:** 16 · **Created:** 2026-09-29 · **Revised:** 2026-10-08
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,17 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 16 (2026-10-08)** — the Swift binding (§3, §7).
+  - Only the phone's side crosses into Swift, through `remote-crypto`'s `ffi` module: thin
+    `DeviceKeys`, `PairingHandshake`, `SessionHandshake`, and `Session` objects over the
+    unchanged core, plus `frame_kind`. The Mac uses the core directly, through
+    `DeviceSessions`.
+  - The Mac's half of a session handshake, `accept_session`, is exported too, so the Swift
+    round trip in M1's done-criterion runs through the same code the Mac runs. The app never
+    calls it; it is the audited Mac path, not a test hook.
+  - The Swift side wraps these in `PhoneKeys`, `PhonePairing`, `ConnectionHandshake`, and
+    `EncryptedSession`, mapping binding errors to `RemoteCryptoError`; `accept` is internal,
+    so only tests reach it.
 - **Revision 15 (2026-10-08)** — second review of the pairing and session implementation (§2,
   §3, §5.4).
   - **Routing moves into `remote-crypto` as `DeviceSessions`**, one device's confirmed and
@@ -519,9 +530,15 @@ through one relay preserves order; the relay must forward a pair's frames in arr
 never fan them across workers.
 
 **UniFFI binding.** `make ios-crypto` builds an xcframework for `aarch64-apple-ios` and
-`aarch64-apple-ios-sim`; both targets are added to `rust-toolchain.toml`. Swift gets opaque
-`DeviceKeys`, `PairingHandshake`, and `Session` objects plus the free functions. Keychain access stays in
-Swift.
+`aarch64-apple-ios-sim`; both targets are added to `rust-toolchain.toml`. Only the phone's side
+crosses: the `ffi` module exports opaque `DeviceKeys` (generate, restore, storage blob, device
+id, public keys, relay-challenge signature), `PairingHandshake` (message 1, then `respond`
+returning the Mac's key and name, the confirmation code, and message 3), `SessionHandshake`
+(message 1, then `finish` returning a `Session`), `Session` (`seal`, `open`, `is_closed`), and
+`frame_kind`, each over the unchanged core. `accept_session`, the Mac's half of a session
+handshake, is exported only so the Swift round trip can run on the device. Bytes returned to
+Swift are Swift-owned and cannot be wiped by this crate; only the storage blob is secret, and
+Swift hands it straight to the Keychain. Keychain access stays in Swift.
 
 **Tests**
 

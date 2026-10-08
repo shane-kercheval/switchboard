@@ -7,6 +7,7 @@ mod confirmation;
 mod error;
 // Only a session fragments, so records are always produced under its lock.
 pub mod device;
+pub mod ffi;
 pub(crate) mod fragment;
 pub mod frame;
 pub mod identity;

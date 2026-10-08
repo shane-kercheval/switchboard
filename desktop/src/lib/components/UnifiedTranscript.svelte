@@ -38,12 +38,14 @@
   } from "$lib/state/index.svelte";
   import { agentsByProject, isAwaitingForkHistory } from "$lib/state/workspace.svelte";
   import {
+    answerItemsOf,
     answerTextOf,
     buildUnifiedRows,
     copyTextOf,
     EXPANDED_RECENT_SENDS,
     groupRenderBlocks,
     INITIAL_WINDOW,
+    lastAnswerItemsOf,
     lastAnswerTextOf,
     type QueuedCompaction,
     recentSendsStartIndex,
@@ -63,6 +65,8 @@
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
   import AgentMessageBody from "$lib/components/AgentMessageBody.svelte";
+  import FindingsCard from "$lib/components/FindingsCard.svelte";
+  import { isDeliveredReview } from "$lib/findings";
   import CompactionMarker from "$lib/components/CompactionMarker.svelte";
   import CompactionTurn from "$lib/components/CompactionTurn.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
@@ -577,9 +581,22 @@
     };
   }
 
+  /// A tool call a collapsed preview hides. A delivered code review is answer
+  /// content: the preview shows its card, so it isn't hidden.
+  function isHiddenTool(item: AgentTurn["items"][number]): boolean {
+    return item.item_kind === "tool" && !isDeliveredReview(item);
+  }
+
+  /// Whether a collapsed preview hides anything beyond its height: a tool
+  /// call, reasoning, or a review's finding details (its rows don't open while
+  /// collapsed, so even a short review needs the response's Expand to reach
+  /// them). A review is still not a hidden tool *call* for the label.
   function turnHasHiddenDetail(turn: AgentTurn): boolean {
     return turn.items.some(
-      (i) => i.item_kind === "tool" || (i.item_kind === "text" && i.kind === "thinking"),
+      (i) =>
+        isHiddenTool(i) ||
+        (i.item_kind === "text" && i.kind === "thinking") ||
+        (i.item_kind === "tool" && isDeliveredReview(i) && i.facet.findings.length > 0),
     );
   }
 
@@ -607,7 +624,7 @@
   /// tool calls / reasoning are tucked away — a clip's fade only signals hidden
   /// *text*.
   function hiddenItemsLabel(turn: AgentTurn): string | null {
-    const tools = turn.items.filter((i) => i.item_kind === "tool").length;
+    const tools = turn.items.filter(isHiddenTool).length;
     const hasReasoning = turn.items.some((i) => i.item_kind === "text" && i.kind === "thinking");
     const parts: string[] = [];
     if (tools > 0) parts.push(`${tools} tool ${tools === 1 ? "call" : "calls"}`);
@@ -1716,15 +1733,15 @@
   mode: "full" | "answer" | "final" = "full",
   liveCap: boolean = true,
 )}
-  {#if mode === "final"}
-    {@const answer = lastAnswerTextOf(turn)}
-    {#if answer.length > 0}
-      <Markdown text={answer} />
-    {/if}
-  {:else if mode === "answer"}
-    {#each turn.items as item, i (i)}
-      {#if item.item_kind === "text" && item.kind === "text"}
+  {#if mode === "final" || mode === "answer"}
+    <!-- Collapsed previews sit inside a fixed-height clip, so review cards
+         render without expandable rows; expanding the response shows the full
+         card. -->
+    {#each mode === "final" ? lastAnswerItemsOf(turn) : answerItemsOf(turn) as item, i (i)}
+      {#if item.item_kind === "text"}
         <Markdown text={item.text} />
+      {:else}
+        <FindingsCard facet={item.facet} expandable={false} />
       {/if}
     {/each}
   {:else if turn.status === "streaming" && live}

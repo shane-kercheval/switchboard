@@ -4,7 +4,8 @@ use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, ClaudeCodeAdapter, ContentKind, DispatchError, DispatchOptions, FailureKind,
-    HarnessAdapter, ToolKind, TurnOutcome, TurnUsage, claude_session_file_path,
+    HarnessAdapter, TextCapture, ToolFacet, ToolKind, TurnOutcome, TurnUsage,
+    claude_session_file_path, latest_completed_agent_text, load_claude_transcript,
 };
 use uuid::Uuid;
 
@@ -1007,4 +1008,73 @@ async fn a_first_dispatch_subtracts_nothing() {
 
     assert_eq!(usage.output_tokens, 280, "reported unchanged");
     assert!((usage.total_cost_usd.expect("cost") - 0.208_556_8).abs() < 1e-9);
+}
+
+/// Run a recorded stream through the real adapter and parser into the
+/// dispatcher's capture type, and read the paired session file the same run
+/// wrote. Returns `(live, disk)`.
+async fn live_and_disk_text(recording: &str) -> (String, String) {
+    let agent = fake_agent();
+    let events = collect_events(&adapter(), &agent, &fixture(recording)).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::ToolStarted {
+                facet: ToolFacet::Findings(_),
+                ..
+            }
+        )),
+        "{recording} must reach the capture as a findings call"
+    );
+    let mut capture = TextCapture::default();
+    for event in &events {
+        capture.observe(event);
+    }
+
+    let home = tempfile::TempDir::new().expect("home");
+    let cwd = tempfile::TempDir::new().expect("cwd");
+    let session_id = Uuid::now_v7();
+    let path = claude_session_file_path(
+        home.path(),
+        &cwd.path().canonicalize().unwrap(),
+        &session_id,
+    );
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::copy(format!("{FIXTURES}/{recording}.session.jsonl"), &path).unwrap();
+    let loaded = load_claude_transcript(home.path(), cwd.path(), session_id, agent.id)
+        .expect("load the paired session file");
+    let disk = latest_completed_agent_text(&loaded.turns).expect("a completed agent turn");
+    (capture.finish(), disk)
+}
+
+/// The forwarded-text contract end to end, on real recorded turns: the text a
+/// forward gets from a busy agent (live capture) must equal what it gets from
+/// an idle one (session-file read), byte-for-byte. This recording has the
+/// review first and text after, so it proves the parser's separator after a
+/// review fits the capture.
+#[tokio::test]
+async fn report_findings_live_capture_matches_the_session_file_read() {
+    let (live, disk) = live_and_disk_text("report-findings").await;
+    assert!(
+        live.starts_with("**Code review · low · 2 findings**"),
+        "{live}"
+    );
+    assert!(live.ends_with("\n\nack"), "{live}");
+    assert_eq!(live, disk);
+}
+
+/// Text, then a review, then text: proves the capture's separator before a
+/// review and the parser's separator after it fit together.
+#[tokio::test]
+async fn text_first_report_findings_live_capture_matches_the_session_file_read() {
+    let (live, disk) = live_and_disk_text("report-findings-text-first").await;
+    assert!(
+        live.starts_with("I'm starting the review now.\n\n**Code review · medium · 1 finding**\n\n1. `src/probe.py:7` · correctness\n"),
+        "{live}"
+    );
+    assert!(
+        live.ends_with("Failure scenario: Probe scenario.\n\nack"),
+        "{live}"
+    );
+    assert_eq!(live, disk);
 }

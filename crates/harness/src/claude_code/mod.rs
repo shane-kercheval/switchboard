@@ -1,5 +1,6 @@
 pub mod config;
 pub(crate) mod facets;
+pub(crate) mod report_findings;
 pub mod session_file;
 pub mod skills;
 

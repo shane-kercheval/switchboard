@@ -6150,3 +6150,227 @@ describe("compaction rows", () => {
     expect(rows[0]).toHaveTextContent(/declined to compact/i);
   });
 });
+
+describe("UnifiedTranscript — code review cards", () => {
+  const REVIEW_FACET = {
+    facet_kind: "findings",
+    level: "low",
+    findings: [
+      {
+        file: "src/app.py",
+        line: 12,
+        summary: "Off-by-one in the loop bound.",
+        short_summary: "Off-by-one in loop bound",
+        failure_scenario: "Drops the last item.",
+        category: "correctness",
+        verdict: "CONFIRMED",
+        outcome: null,
+      },
+    ],
+    text: "REVIEW MARKDOWN",
+  } as const;
+
+  function agentTurnEls(): HTMLElement[] {
+    return screen.getAllByTestId("turn").filter((el) => el.getAttribute("data-role") === "agent");
+  }
+
+  it("renders a live review as a card, keeps it when collapsed, and copies it", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const channel = `agent:${CLAUDE_AGENT.id}`;
+
+    fireTo(channel, {
+      type: "turn_start",
+      turn_id: "turn-r",
+      message_id: "msg-r",
+      send_id: "msg-r",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(channel, { type: "content_chunk", turn_id: "turn-r", kind: "text", text: "Intro." });
+    fireTo(channel, {
+      type: "tool_started",
+      turn_id: "turn-r",
+      tool_use_id: "toolu_review",
+      kind: "builtin",
+      name: "ReportFindings",
+      input: {},
+      facet: { ...REVIEW_FACET, findings: [...REVIEW_FACET.findings] },
+    });
+    // The input is complete at start, so the card shows before the result.
+    await waitFor(() => expect(screen.getByTestId("findings-card")).toBeInTheDocument());
+
+    fireTo(channel, {
+      type: "tool_completed",
+      turn_id: "turn-r",
+      tool_use_id: "toolu_review",
+      output: "1 finding reported.",
+      is_error: false,
+    });
+    fireTo(channel, { type: "content_chunk", turn_id: "turn-r", kind: "text", text: "\n\nack" });
+    fireTo(channel, {
+      type: "turn_end",
+      turn_id: "turn-r",
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:05Z",
+    });
+
+    await waitFor(() => expect(screen.queryByTestId("turn-working")).toBeNull());
+    const turn = agentTurnEls()[0]!;
+    expect(within(turn).getByTestId("findings-card")).toBeInTheDocument();
+    expect(within(turn).getAllByTestId("finding-toggle")).toHaveLength(1);
+    expect(within(turn).queryByTestId("turn-tool")).toBeNull();
+
+    // The last-answer-block copy (the default mode) keeps the review the
+    // closing text refers to.
+    copyTextMock.mockClear();
+    await fireEvent.click(turn.querySelector('[data-testid="message-copy"]')!);
+    expect(copyTextMock).toHaveBeenCalledWith("REVIEW MARKDOWN\n\nack");
+
+    // Collapsing to the final answer keeps the card, without row expansion,
+    // and the review is not counted as a hidden tool call.
+    await fireEvent.click(within(turn).getByTestId("turn-preview-toggle"));
+    await waitFor(() => expect(within(turn).queryByTestId("finding-toggle")).toBeNull());
+    expect(within(turn).getByTestId("findings-card")).toBeInTheDocument();
+    expect(within(turn).queryByText("Intro.")).toBeNull();
+    expect(within(turn).queryByTestId("hidden-items-indicator")).toBeNull();
+  });
+
+  function seedOlderReviewOnly(
+    state: Awaited<ReturnType<typeof loadState>>,
+    findings: (typeof REVIEW_FACET)["findings"][number][],
+  ): void {
+    const at = (s: number): string => `2026-05-16T00:00:${String(s).padStart(2, "0")}Z`;
+    {
+      state.transcripts[CLAUDE_AGENT.id] = [
+        {
+          role: "user",
+          turn_id: "u-old",
+          agent_id: CLAUDE_AGENT.id,
+          send_id: "send-old",
+          started_at: at(0),
+          text: "review it",
+        },
+        {
+          role: "agent",
+          turn_id: "a-old",
+          agent_id: CLAUDE_AGENT.id,
+          send_id: "send-old",
+          started_at: at(1),
+          ended_at: at(2),
+          status: "complete",
+          items: [
+            {
+              item_kind: "tool",
+              tool_use_id: "t-review",
+              kind: "builtin",
+              name: "ReportFindings",
+              input: {},
+              facet: { ...REVIEW_FACET, findings: [...findings] },
+              output: "reported",
+              is_error: false,
+              started_at: at(1),
+              completed_at: at(2),
+            },
+          ],
+        },
+        ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS, 3),
+      ];
+    }
+  }
+
+  it("lets a short, older review-only response expand so its finding details stay reachable", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedOlderReviewOnly(state, [...REVIEW_FACET.findings]);
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const older = agentTurnEls()[0]!;
+    expect(within(older).queryByTestId("finding-toggle")).toBeNull();
+    // The review is not a hidden tool call, so no "N tool calls" label…
+    expect(within(older).queryByTestId("hidden-items-indicator")).toBeNull();
+    // …but its finding details are hidden, so the response can expand.
+    const toggle = within(older).getByTestId("turn-preview-toggle");
+    expect(toggle).toHaveAttribute("aria-label", "Expand");
+    await fireEvent.click(toggle);
+    await fireEvent.click(await within(older).findByTestId("finding-toggle"));
+    expect(within(older).getByTestId("finding-scenario")).toHaveTextContent("Drops the last item.");
+  });
+
+  it("offers no expand for an older review with no findings", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedOlderReviewOnly(state, []);
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const older = agentTurnEls()[0]!;
+    expect(within(older).getByTestId("findings-card")).toBeInTheDocument();
+    expect(within(older).queryByTestId("turn-preview-toggle")).toBeNull();
+  });
+
+  it("shows an older clipped response's review card and counts only other tools as hidden", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const at = (s: number): string => `2026-05-16T00:00:${String(s).padStart(2, "0")}Z`;
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-old",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-old",
+        started_at: at(0),
+        text: "review it",
+      },
+      {
+        role: "agent",
+        turn_id: "a-old",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-old",
+        started_at: at(1),
+        ended_at: at(2),
+        status: "complete",
+        items: [
+          {
+            item_kind: "tool",
+            tool_use_id: "t-bash",
+            kind: "builtin",
+            name: "Bash",
+            input: { command: "git diff" },
+            facet: { facet_kind: "shell", command: "git diff", cwd: null },
+            output: "diff",
+            is_error: false,
+            started_at: at(1),
+            completed_at: at(1),
+          },
+          {
+            item_kind: "tool",
+            tool_use_id: "t-review",
+            kind: "builtin",
+            name: "ReportFindings",
+            input: {},
+            facet: { ...REVIEW_FACET, findings: [...REVIEW_FACET.findings] },
+            output: "1 finding reported.",
+            is_error: false,
+            started_at: at(2),
+            completed_at: at(2),
+          },
+          { item_kind: "text", kind: "text", text: "Listed above." },
+        ],
+      },
+      ...paddingSends(CLAUDE_AGENT, EXPANDED_RECENT_SENDS, 3),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const older = agentTurnEls()[0]!;
+    expect(within(older).getByTestId("findings-card")).toBeInTheDocument();
+    expect(within(older).queryByTestId("finding-toggle")).toBeNull();
+    expect(within(older).getByText("Listed above.")).toBeInTheDocument();
+    expect(within(older).getByTestId("hidden-items-indicator")).toHaveTextContent("1 tool call");
+  });
+});

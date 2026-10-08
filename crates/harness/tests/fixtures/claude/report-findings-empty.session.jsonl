@@ -1,0 +1,4 @@
+{"type":"user","message":{"role":"user","content":"Review the diff"},"timestamp":"2026-10-07T12:00:00Z"}
+{"type":"assistant","message":{"model":"claude-sonnet-5-5","id":"msg_review_empty","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_review_empty","name":"ReportFindings","input":{"level":"medium","findings":[]}}],"stop_reason":"tool_use"},"timestamp":"2026-10-07T12:00:01Z"}
+{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_review_empty","type":"tool_result","content":"No findings reported."}]},"timestamp":"2026-10-07T12:00:02Z"}
+{"type":"assistant","message":{"model":"claude-sonnet-5-5","id":"msg_review_empty_text","type":"message","role":"assistant","content":[{"type":"text","text":"No issues found."}],"stop_reason":"end_turn"},"timestamp":"2026-10-07T12:00:03Z"}

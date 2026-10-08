@@ -4255,6 +4255,93 @@ async fn live_claude_edit_emits_edit_facet() {
     );
 }
 
+/// `ReportFindings` delivers a code review as tool input, and its tool result
+/// carries none of the findings, so this facet is the only way Switchboard sees
+/// the review. Guards the tool's name and input fields. In `-p` mode the tool
+/// is sometimes deferred (observed @ 2.1.289), so the prompt allows a
+/// `ToolSearch` load.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_report_findings_emits_findings_facet() {
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let Some(switchboard_core::SessionLocator::Uuid(session_id)) = agent.session_locator else {
+        panic!("live_agent carries a Uuid locator");
+    };
+
+    let events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Call the ReportFindings tool exactly once. If it is not in your tool list yet, \
+             load it with ToolSearch first. Use exactly one finding: file \"src/probe.py\", \
+             line 7, summary \"Probe finding.\", failure_scenario \"Probe scenario.\", \
+             verdict \"PLAUSIBLE\". Then reply with the single word ack.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch")
+        .collect()
+        .await;
+
+    let live = tool_started_facets(&events);
+    let calls: Vec<_> = live
+        .iter()
+        .filter(|(_, name, _)| name == "ReportFindings")
+        .collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "expected exactly one ReportFindings call; got tools {:?}. Either the model ignored \
+         \"exactly once\" or the CLI rejected a call and the model retried — the completion \
+         check below tells the two apart",
+        live.iter().map(|(_, n, _)| n).collect::<Vec<_>>()
+    );
+    let (id, _, facet) = calls[0];
+    // The model copies the field names from the prompt, so a renamed or newly
+    // required field shows up only as the CLI rejecting the call. The result
+    // text itself is not asserted: Switchboard never reads it.
+    let completed_ok = events.iter().find_map(|e| match e {
+        AdapterEvent::ToolCompleted {
+            tool_use_id,
+            is_error,
+            ..
+        } if tool_use_id == id => Some(!is_error),
+        _ => None,
+    });
+    assert_eq!(
+        completed_ok,
+        Some(true),
+        "Claude Code did not accept the ReportFindings call (None = no result) — its input \
+         schema may have changed"
+    );
+    let ToolFacet::Findings(report) = facet else {
+        panic!("ReportFindings must classify as Findings — its input shape drifted: {facet:?}");
+    };
+    let (findings, text) = (&report.findings, &report.text);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].file, "src/probe.py");
+    assert_eq!(findings[0].line, Some(7));
+    assert_eq!(findings[0].summary, "Probe finding.");
+    assert_eq!(findings[0].failure_scenario, "Probe scenario.");
+    assert_eq!(
+        findings[0].verdict,
+        Some(switchboard_harness::FindingVerdict::Plausible)
+    );
+    assert!(text.contains("`src/probe.py:7`"), "{text}");
+
+    let hydrated =
+        load_claude_transcript(&home_dir(), cwd.path(), session_id, agent.id).expect("hydrate");
+    let disk = hydrated_tool_facets(&hydrated);
+    let (_, disk_facet) = disk
+        .iter()
+        .find(|(did, _)| did == id)
+        .expect("the session file must hold the same ReportFindings call");
+    assert_eq!(facet, disk_facet, "live and session-file facets diverged");
+}
+
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_apply_patch_emits_edit_facet() {

@@ -35,7 +35,8 @@ import type {
 } from "$lib/types";
 import type { AgentCopyMode } from "$lib/agentCopyMode";
 import { compareIsoTimestampsAscending, isIsoTimestampBefore } from "$lib/utils";
-import type { Turn } from "./types";
+import { isDeliveredReview, type FindingsToolCall } from "$lib/findings";
+import type { Turn, TurnItem } from "./types";
 
 type AgentTurn = Extract<Turn, { role: "agent" }>;
 
@@ -50,38 +51,74 @@ function trimBlankOuterLines(text: string): string {
   return lines.slice(start, end).join("\n");
 }
 
-/// The canonical "answer prose" of an agent turn: its `text`-kind chunks joined,
-/// with tool calls AND reasoning (`kind: "thinking"`) excluded.
+/// One piece of an agent turn's answer: an answer-text block, or a code
+/// review the agent delivered through a successful findings tool call.
+export type AnswerItem = Extract<TurnItem, { item_kind: "text" }> | FindingsToolCall;
+
+function answerPieceText(item: AnswerItem): string {
+  return item.item_kind === "text" ? trimBlankOuterLines(item.text) : item.facet.text;
+}
+
+function isAnswerText(item: TurnItem): item is Extract<TurnItem, { item_kind: "text" }> {
+  return (
+    item.item_kind === "text" && item.kind === "text" && trimBlankOuterLines(item.text).length > 0
+  );
+}
+
+/// The canonical answer of an agent turn, in turn order: every non-empty
+/// answer-text block plus every delivered code review (see
+/// `isDeliveredReview`). Tool calls and reasoning (`kind: "thinking"`) are
+/// excluded.
 ///
-/// Use this for ANY "what is the response" extraction — copy today; forwarding
-/// one agent's reply into another's prompt, export, and search later. The trap
-/// it guards: `item_kind: "text"` spans both answer text and reasoning (the
-/// inner `kind` discriminates), so an ad-hoc `filter(item_kind === "text")` that
-/// forgets the inner `kind === "text"` check silently leaks the model's private
-/// reasoning into the response. Route every such consumer through here so that
-/// rule lives in exactly one place. Empty outer lines are removed from each
-/// answer block, while indentation and trailing spaces on meaningful lines are
-/// preserved for Markdown fidelity. See docs/harness-behavior.md §3.2.
-export function answerTextOf(turn: AgentTurn): string {
-  return turn.items
-    .filter((i) => i.item_kind === "text")
-    .filter((i) => i.kind === "text")
-    .map((i) => trimBlankOuterLines(i.text))
+/// Use this for ANY "what is the response" extraction — copy, navigator search,
+/// forward readiness. The trap it guards: `item_kind: "text"` spans both answer
+/// text and reasoning (the inner `kind` discriminates), so an ad-hoc
+/// `filter(item_kind === "text")` that forgets the inner `kind === "text"` check
+/// silently leaks the model's private reasoning into the response. Route every
+/// such consumer through here so that rule lives in exactly one place. See
+/// docs/harness-behavior.md §3.2. A review counts because the model is told the
+/// host renders it, so it is often the only copy of the review; Rust's
+/// forwarded text applies the same rule (`forward.rs`).
+export function answerItemsOf(turn: AgentTurn): AnswerItem[] {
+  return turn.items.filter(
+    (item): item is AnswerItem =>
+      isAnswerText(item) || (item.item_kind === "tool" && isDeliveredReview(item)),
+  );
+}
+
+/// The turn's final answer: its last non-empty answer-text block, plus every
+/// delivered review in the turn, kept in turn order. Reviews ride along
+/// because the closing text usually refers to them ("listed above").
+export function lastAnswerItemsOf(turn: AgentTurn): AnswerItem[] {
+  const items = answerItemsOf(turn);
+  let lastText = -1;
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (items[i]!.item_kind === "text") {
+      lastText = i;
+      break;
+    }
+  }
+  return items.filter((item, i) => item.item_kind === "tool" || i === lastText);
+}
+
+function joinAnswer(items: AnswerItem[]): string {
+  return items
+    .map(answerPieceText)
     .filter((text) => text.length > 0)
     .join("\n\n");
 }
 
-/// The final answer-prose block of an agent turn: scan backward for the last
-/// non-empty answer text item, skipping tools and model reasoning.
+/// `answerItemsOf` as text: blocks joined with a blank line, a review as its
+/// Rust-built markdown. Empty outer lines are removed from each text block,
+/// while indentation and trailing spaces on meaningful lines are preserved for
+/// Markdown fidelity.
+export function answerTextOf(turn: AgentTurn): string {
+  return joinAnswer(answerItemsOf(turn));
+}
+
+/// `lastAnswerItemsOf` as text.
 export function lastAnswerTextOf(turn: AgentTurn): string {
-  for (let i = turn.items.length - 1; i >= 0; i--) {
-    const item = turn.items[i]!;
-    if (item.item_kind === "text" && item.kind === "text") {
-      const text = trimBlankOuterLines(item.text);
-      if (text.length > 0) return text;
-    }
-  }
-  return "";
+  return joinAnswer(lastAnswerItemsOf(turn));
 }
 
 export function copyTextOf(turn: AgentTurn, mode: AgentCopyMode): string {

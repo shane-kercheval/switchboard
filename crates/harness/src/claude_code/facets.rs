@@ -20,6 +20,8 @@ use crate::facets::{
     split_mcp_name,
 };
 
+use super::report_findings::{REPORT_FINDINGS_TOOL, report_findings_facet};
+
 /// Classify one Claude tool call. Missing or malformed required fields on
 /// built-in tools fall to `Other`. MCP names retain their server/tool identity;
 /// malformed mutation arguments only suppress semantic enrichment.
@@ -93,6 +95,7 @@ pub(crate) fn classify_claude_tool_facet(name: &str, input: &Value) -> ToolFacet
             None => ToolFacet::Other,
         },
         "TodoWrite" | "TaskCreate" | "TaskUpdate" => todo_facet(name, input),
+        REPORT_FINDINGS_TOOL => report_findings_facet(input),
         // Includes `Task` (subagent dispatch), deliberately unmapped — it
         // renders via the generic path; a facet for it is additive later.
         _ => ToolFacet::Other,
@@ -438,6 +441,7 @@ mod tests {
     use switchboard_core::AgentId;
     use uuid::Uuid;
 
+    use crate::facets::FindingsReport;
     use crate::parser::{ParseOutcome, ParserState, parse_line};
     use crate::transcript::{Turn, TurnItem};
     use crate::{AdapterEvent, load_claude_transcript};
@@ -598,6 +602,92 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn report_findings_tools(
+        tools: Vec<(String, String, Value, ToolFacet)>,
+    ) -> Vec<(String, String, Value, ToolFacet)> {
+        tools
+            .into_iter()
+            .filter(|(_, name, _, _)| name == "ReportFindings")
+            .collect()
+    }
+
+    /// Recorded live @ 2.1.289: the model loads the (here deferred) tool through
+    /// `ToolSearch`, calls `ReportFindings` with one fully-populated and one
+    /// required-fields-only finding, then replies `ack`.
+    #[test]
+    fn report_findings_fixture_agrees_live_and_after_reopen() {
+        let stream = report_findings_tools(stream_tools("report-findings.jsonl"));
+        let session = report_findings_tools(session_tools("report-findings.session.jsonl"));
+
+        assert_eq!(stream.len(), 1);
+        assert_eq!(stream, session);
+
+        let ToolFacet::Findings(report) = &stream[0].3 else {
+            panic!(
+                "ReportFindings must classify as Findings: {:?}",
+                stream[0].3
+            );
+        };
+        let FindingsReport {
+            level,
+            findings,
+            text,
+        } = report.as_ref();
+        assert_eq!(level.as_deref(), Some("low"));
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].line, Some(12));
+        assert_eq!(
+            findings[0].verdict,
+            Some(crate::facets::FindingVerdict::Confirmed)
+        );
+        assert_eq!(findings[1].short_summary, None);
+        assert!(
+            text.starts_with("**Code review · low · 2 findings**"),
+            "{text}"
+        );
+    }
+
+    /// A real `/code-review` report (7 findings, no level) from a model that
+    /// wrote only "listed above" as text — the case that made the review
+    /// invisible before this facet existed.
+    #[test]
+    fn real_code_review_report_reopens_as_findings() {
+        let session = report_findings_tools(session_tools("report-findings-coder1.session.jsonl"));
+        assert_eq!(session.len(), 1);
+        let ToolFacet::Findings(report) = &session[0].3 else {
+            panic!("expected Findings: {:?}", session[0].3);
+        };
+        let FindingsReport {
+            level,
+            findings,
+            text,
+        } = report.as_ref();
+        assert_eq!(*level, None);
+        assert_eq!(findings.len(), 7);
+        assert_eq!(findings[0].file, ".gitignore");
+        assert_eq!(findings[0].line, Some(44));
+        assert!(
+            text.starts_with(
+                "**Code review · 7 findings**\n\n1. `.gitignore:44` · correctness · Confirmed\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn empty_report_reopens_as_a_no_findings_review() {
+        let session = report_findings_tools(session_tools("report-findings-empty.session.jsonl"));
+        assert_eq!(session.len(), 1);
+        assert_eq!(
+            session[0].3,
+            ToolFacet::Findings(Box::new(FindingsReport {
+                level: Some("medium".to_owned()),
+                findings: Vec::new(),
+                text: "**Code review · medium · no findings**".to_owned(),
+            }))
+        );
     }
 
     #[test]

@@ -23,6 +23,8 @@ Three fills and one line, each with exactly one job:
 | `panel` | sidebars + recessed / inset — the side panels, code blocks, inputs, expanded tool output |
 | `border` | lines only, never a fill |
 
+Expanded review prose uses `review-detail`, an opaque midpoint between `surface` and `panel` in light mode and the inset `panel` fill in dark mode. This prose-specific exception to the neutral ramp keeps long explanations visually separate from their headers with less contrast than code blocks or sidebar panels.
+
 Note that **sidebars are `panel`, not `surface`** (`SidebarPanel` paints `bg-panel`): they read as recessed side rails against the `raised` content pane, and `surface` is the shell behind everything.
 
 Plus three neutral **interaction** fills — `hover` (the subtle wash under a large row or menu item), `control-hover` (the more visible fill under a compact icon or pill control), and `active` (the strongest interaction step, used for pressed controls, tracks/grooves, and compact actions nested in an already-hovered row) — and the blue `focus` token (below).

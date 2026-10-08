@@ -1,5 +1,7 @@
 use sha2::{Digest, Sha256};
 
+use crate::CryptoError;
+
 /// Length of a `Noise_*_SHA256` handshake hash.
 pub const HANDSHAKE_HASH_LEN: usize = 32;
 
@@ -8,12 +10,6 @@ const CODE_SPACE: u64 = 1_000_000;
 /// Domain separation, so the code can never coincide with another value
 /// derived from the same handshake hash.
 const DOMAIN: &[u8] = b"switchboard pairing confirmation code v1";
-
-#[derive(Debug, PartialEq, Eq, thiserror::Error, uniffi::Error)]
-pub enum CryptoError {
-    #[error("handshake hash must be {HANDSHAKE_HASH_LEN} bytes, got {length}")]
-    InvalidHandshakeHash { length: u64 },
-}
 
 /// The six-digit code both screens show during pairing.
 ///

@@ -163,7 +163,7 @@ impl Session {
         })
     }
 
-    fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         self.state = State::Closed;
         self.reassembler.reset();
     }

@@ -17,12 +17,16 @@ public enum RemoteCryptoError: Error, Equatable, Sendable {
     case messageTooLarge(length: Int)
     /// A frame of the wrong type, or oversize. Nothing was touched.
     case unexpectedFrame
-    /// A record did not decrypt. The session is unchanged.
+    /// A record did not decrypt before the session had opened any: a stale
+    /// record from the Mac's previous session. The session is unchanged.
     case recordRejected
     /// A record decrypted but was malformed. The session is closed.
     case protocolViolation
     case sessionClosed
     case sendFailed
+    /// A record did not decrypt after the session had opened one: the stream
+    /// from the Mac is broken. The session is closed; reconnect.
+    case streamBroken
     /// The Rust library failed in a way its API does not describe, such as a
     /// panic or a binding built from a different version of the crate.
     case bindingFailure
@@ -41,6 +45,7 @@ public enum RemoteCryptoError: Error, Equatable, Sendable {
         case CryptoError.ProtocolViolation: self = .protocolViolation
         case CryptoError.SessionClosed: self = .sessionClosed
         case CryptoError.SendFailed: self = .sendFailed
+        case CryptoError.StreamBroken: self = .streamBroken
         default:
             Logger.crypto.error("Unexpected error from the Rust library: \(String(describing: error), privacy: .private)")
             self = .bindingFailure

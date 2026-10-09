@@ -46,11 +46,16 @@ pub fn kind(frame: &[u8]) -> Result<FrameKind, CryptoError> {
     if frame.len() > 1 + MAX_RECORD_LEN {
         return Err(CryptoError::UnexpectedFrame);
     }
-    let byte = frame.first().copied().ok_or(CryptoError::UnexpectedFrame)?;
+    kind_of_tag(*frame.first().ok_or(CryptoError::UnexpectedFrame)?)
+}
+
+/// The kind a frame's first byte names. Only classifies: the step that
+/// consumes the frame still checks it in full, length included.
+pub fn kind_of_tag(tag: u8) -> Result<FrameKind, CryptoError> {
     FrameKind::ALL
         .iter()
         .copied()
-        .find(|kind| *kind as u8 == byte)
+        .find(|kind| *kind as u8 == tag)
         .ok_or(CryptoError::UnexpectedFrame)
 }
 

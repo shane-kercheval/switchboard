@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 16 · **Created:** 2026-09-29 · **Revised:** 2026-10-08
+**Status:** proposed · **Revision:** 17 · **Created:** 2026-09-29 · **Revised:** 2026-10-08
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,21 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 17 (2026-10-08)** — review of the Swift binding (§3, §7.2, §7.6).
+  - **The phone's session ends when its in-order stream breaks.** The phone has one session,
+    so a record it cannot decrypt has nowhere else to go. Before its first record opens, such
+    a record is ignored: after a reconnect the Mac keeps sending on its old session until the
+    phone's `hello` confirms the new one, and those stale records arrive first. Ending the
+    session on them would reconnect in a loop for as long as an agent streams. After the first
+    record opens, one that does not decrypt closes the session with `StreamBroken`, so a lost
+    or damaged record no longer leaves the phone looking connected and receiving nothing.
+  - The transport bounds the first window: a session that has opened no record within 10
+    seconds of the handshake is closed and the phone reconnects, mirroring the Mac's rule for
+    unconfirmed sessions. The deadline lives in the Swift transport, which reads
+    `has_opened_record`; the crate stays free of clocks.
+  - `frame_kind` classifies by the first byte alone; the consuming step still checks the frame
+    in full. The Swift wrappers expose the identity public key the relay registration needs,
+    and the single-use handshake and session wrappers are reference types.
 - **Revision 16 (2026-10-08)** — the Swift binding (§3, §7).
   - Only the phone's side crosses into Swift, through `remote-crypto`'s `ffi` module: thin
     `DeviceKeys`, `PairingHandshake`, `SessionHandshake`, and `Session` objects over the
@@ -538,7 +553,11 @@ returning the Mac's key and name, the confirmation code, and message 3), `Sessio
 `frame_kind`, each over the unchanged core. `accept_session`, the Mac's half of a session
 handshake, is exported only so the Swift round trip can run on the device. Bytes returned to
 Swift are Swift-owned and cannot be wiped by this crate; only the storage blob is secret, and
-Swift hands it straight to the Keychain. Keychain access stays in Swift.
+Swift hands it straight to the Keychain. `UniFFI` also lowers it into a `RustBuffer` that is
+freed unwiped: one more copy per Keychain write. The phone's `Session` adds one rule to the
+core's: a record that does not decrypt is ignored until the session has opened a record, and
+afterwards closes it with `StreamBroken` (revision 17); `has_opened_record` lets the transport
+bound the first window. `frame_kind` takes only a frame's first byte. Keychain access stays in Swift.
 
 **Tests**
 
@@ -1123,7 +1142,9 @@ though the phone cannot send attachments.
   one that drops during the grace period stays down until the app returns, because the keys
   the handshake needs are readable only while the phone is unlocked (§2). On
   `peer_disconnected` for the paired Mac it discards the session and retries the handshake
-  with the same backoff. It routes frames by type (§4) and ignores a connection reply when it
+  with the same backoff. A session that has opened no record within 10 seconds of its
+  handshake is discarded and the handshake retried, since a damaged or lost first record
+  would otherwise leave it waiting; `streamBroken` from `open` does the same at once. It routes frames by type (§4) and ignores a connection reply when it
   is not waiting for one — the Mac sends one in answer to a replayed request — without
   touching its session.
 - **Local relay in development.** iOS App Transport Security blocks plain `ws://`, and iOS asks
@@ -1208,6 +1229,9 @@ though the phone cannot send attachments.
   one, many agents; remembered agent deleted); `SendGate` (cancelled, failed, biometrics
   unavailable, edit during authentication); a test that both configurations' Info.plists
   carry the camera and Face ID usage descriptions.
+- Coordinator: `RelayTransport`'s session deadline — a session whose first record never
+  opens is discarded after 10 seconds and the handshake retried; a stale record before the
+  first open does not end the session; `streamBroken` reconnects at once.
 - Coordinator: `SecureSession`'s outbound queue — suspend the first envelope's send, submit a
   second envelope, and assert every record of the first is transmitted before any of the
   second.

@@ -54,4 +54,9 @@ pub enum CryptoError {
     /// The device has no session to open or seal with.
     #[error("the device is not connected")]
     NotConnected,
+    /// The phone's session, having already opened a record, met one it could
+    /// not decrypt: the in-order stream from the Mac is broken. The session is
+    /// closed, and the phone reconnects.
+    #[error("a record did not decrypt after the stream began, so the session is closed")]
+    StreamBroken,
 }

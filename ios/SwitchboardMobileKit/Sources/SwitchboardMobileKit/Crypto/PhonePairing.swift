@@ -1,8 +1,9 @@
 import Foundation
 internal import SwitchboardRemoteCrypto
 
-/// The phone's side of pairing, from the QR code to message 3.
-public struct PhonePairing: Sendable {
+/// The phone's side of pairing, from the QR code to message 3. A reference
+/// type because it is single-use: its first real message 2 uses it up.
+public final class PhonePairing: Sendable {
     private let handshake: PairingHandshake
 
     /// What the phone learns from the Mac's message 2, and the message 3 to

@@ -29,6 +29,10 @@ public struct PhoneKeys: Sendable {
 
     public var noisePublicKey: Data { keys.noisePublicKey() }
 
+    /// The Ed25519 key the relay checks `deviceID` and challenge signatures
+    /// against at registration.
+    public var identityPublicKey: Data { keys.identityPublicKey() }
+
     /// Answers the relay's registration challenge.
     public func signRelayChallenge(_ challenge: Data) -> Data {
         keys.signRelayChallenge(challenge: challenge)

@@ -41,12 +41,27 @@ struct EncryptedSessionTests {
         #expect(try deliver(Data("reply".utf8), from: connection2.mac, to: connection2.phone) == Data("reply".utf8))
     }
 
-    @Test func aTamperedRecordIsRejectedWithoutClosingTheSession() throws {
+    /// Before any record opens, an undecryptable one may be a stale record from
+    /// the Mac's previous session, so it is ignored.
+    @Test func anUndecryptableRecordBeforeTheFirstOpenIsIgnored() throws {
         let connection = try connect()
-        var record = try #require(try connection.phone.seal(Data("hello".utf8)).first)
+        var record = try #require(try connection.mac.seal(Data("hello".utf8)).first)
         record[record.count - 1] ^= 1
-        #expect(throws: RemoteCryptoError.recordRejected) { try connection.mac.open(record) }
-        #expect(!connection.mac.isClosed)
+        #expect(throws: RemoteCryptoError.recordRejected) { try connection.phone.open(record) }
+        #expect(!connection.phone.isClosed)
+        #expect(!connection.phone.hasOpenedRecord)
+    }
+
+    /// After a record opens, an undecryptable one means the stream is broken:
+    /// the session closes rather than waiting forever on a missing record.
+    @Test func anUndecryptableRecordAfterTheFirstOpenBreaksTheStream() throws {
+        let connection = try connect()
+        #expect(try deliver(Data("one".utf8), from: connection.mac, to: connection.phone) == Data("one".utf8))
+        #expect(connection.phone.hasOpenedRecord)
+        _ = try connection.mac.seal(Data("lost".utf8))
+        let next = try #require(try connection.mac.seal(Data("three".utf8)).first)
+        #expect(throws: RemoteCryptoError.streamBroken) { try connection.phone.open(next) }
+        #expect(connection.phone.isClosed)
     }
 
     @Test func aReplyOfTheWrongTypeLeavesTheHandshakeWaiting() throws {
@@ -69,6 +84,7 @@ struct EncryptedSessionTests {
         let handshake = try ConnectionHandshake(keys: phoneKeys, macNoisePublicKey: macKeys.noisePublicKey)
         #expect(try FrameType(of: handshake.message1) == .sessionRequest)
         #expect(throws: RemoteCryptoError.unexpectedFrame) { try FrameType(of: Data()) }
+        #expect(throws: RemoteCryptoError.unexpectedFrame) { try FrameType(of: Data([9, 1, 2])) }
     }
 
     @Test func storedKeysRestoreToTheSameDevice() throws {
@@ -76,7 +92,18 @@ struct EncryptedSessionTests {
         let restored = try PhoneKeys(restoringFrom: keys.storageBytes)
         #expect(restored.deviceID == keys.deviceID)
         #expect(restored.noisePublicKey == keys.noisePublicKey)
+        #expect(restored.identityPublicKey == keys.identityPublicKey)
+        #expect(keys.identityPublicKey.count == 32)
+        #expect(keys.identityPublicKey != keys.noisePublicKey)
         #expect(keys.deviceID.count == 26)
+    }
+
+    @Test func relayChallengeSignaturesAreDeterministicPerChallenge() throws {
+        let keys = try PhoneKeys.generate()
+        let signature = keys.signRelayChallenge(Data("challenge".utf8))
+        #expect(signature.count == 64)
+        #expect(keys.signRelayChallenge(Data("challenge".utf8)) == signature)
+        #expect(keys.signRelayChallenge(Data("another".utf8)) != signature)
     }
 
     @Test func aMalformedKeyBlobIsRefused() {

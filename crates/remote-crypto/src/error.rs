@@ -27,8 +27,9 @@ pub enum CryptoError {
     #[error("message of {length} bytes is too large to send")]
     MessageTooLarge { length: u64 },
     /// A frame of the wrong type, of no known type, or longer than any Noise
-    /// message. Refused before any handshake or session state is touched, so
-    /// an open session stays open.
+    /// message, or a handshake reply that answers another attempt. Refused
+    /// before any handshake or session state is touched, so an open session
+    /// stays open and a waiting handshake keeps waiting.
     #[error("the frame is not of the expected type")]
     UnexpectedFrame,
     /// The record did not decrypt under this session's keys. Nothing changed:

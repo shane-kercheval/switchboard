@@ -2,7 +2,10 @@
 //! Mac's QR code. The phone initiates; three messages:
 //!
 //! 1. phone → Mac: empty payload (nothing is encrypted yet).
-//! 2. Mac → phone: version, the Mac's name.
+//! 2. Mac → phone: version, the Mac's name. Only this frame's body starts
+//!    with an echo of message 1's ephemeral key, ahead of the Noise message,
+//!    so the phone can tell its own reply from one to an attempt it gave up
+//!    on; messages 1 and 3 are the Noise message alone.
 //! 3. phone → Mac: version, the phone's Ed25519 identity key, a signature
 //!    binding that identity key to the phone's Noise key and this handshake,
 //!    the phone's name.
@@ -16,7 +19,10 @@ use zeroize::Zeroizing;
 use crate::frame::{self, FrameKind};
 use crate::identity::{self, SignaturePurpose};
 use crate::keys::{DeviceKeys, KEY_LEN};
-use crate::noise::{self, Peer, handshake_hash, read, remote_static, write};
+use crate::noise::{
+    self, ECHO_LEN, Peer, echo_of, handshake_hash, read, remote_static, strip_echo, with_echo,
+    write,
+};
 use crate::{CryptoError, HANDSHAKE_HASH_LEN};
 
 const PATTERN: &str = "Noise_XXpsk2_25519_ChaChaPoly_SHA256";
@@ -57,10 +63,12 @@ pub struct PairingCandidate {
     pub handshake_hash: [u8; HANDSHAKE_HASH_LEN],
 }
 
-/// The phone's state after sending message 1. A frame of another type leaves
-/// it waiting; reading a pairing message, whatever the outcome, uses it up.
+/// The phone's state after sending message 1. A frame of another type, or a
+/// message 2 answering another attempt, leaves it waiting; reading its own
+/// message 2, whatever the outcome, uses it up.
 pub struct PhoneAwaitingResponse {
     handshake: Option<HandshakeState>,
+    echo: [u8; ECHO_LEN],
     expected_mac_key: [u8; KEY_LEN],
     identity: SigningKey,
     noise_public_key: [u8; KEY_LEN],
@@ -95,7 +103,8 @@ pub fn mac_respond(
 
 impl PhoneAwaitingResponse {
     /// Reads the Mac's message 2 and writes message 3, which ends the
-    /// handshake on this side.
+    /// handshake on this side. A message 2 answering another attempt returns
+    /// `UnexpectedFrame` and leaves this one waiting.
     pub fn respond(
         &mut self,
         phone_name: &str,
@@ -112,7 +121,7 @@ impl PhoneAwaitingResponse {
     }
 
     fn read_message_2(&mut self, message_2: &[u8]) -> Result<Message2, CryptoError> {
-        let message_2 = frame::body(FrameKind::Pairing, message_2)?;
+        let message_2 = strip_echo(&self.echo, frame::body(FrameKind::Pairing, message_2)?)?;
         let mut handshake = self.handshake.take().ok_or(CryptoError::HandshakeFailed)?;
         let payload = read(&mut handshake, message_2)?;
         let mac_key = remote_static(&handshake)?;
@@ -196,6 +205,7 @@ fn phone_start_from(
     Ok((
         PhoneAwaitingResponse {
             handshake: Some(handshake),
+            echo: echo_of(&message_1)?,
             expected_mac_key: offer.mac_noise_public_key,
             identity: keys.identity_signing_key().clone(),
             noise_public_key: keys.noise_public_key(),
@@ -225,7 +235,10 @@ fn mac_respond_from(
             handshake: Some(handshake),
             hash_before_message_3,
         },
-        frame::tagged(FrameKind::Pairing, &message_2),
+        frame::tagged(
+            FrameKind::Pairing,
+            &with_echo(&echo_of(message_1)?, &message_2),
+        ),
     ))
 }
 
@@ -444,6 +457,11 @@ mod tests {
         let (paired_mac, message_3) = phone.respond("Phone", &message_2).unwrap();
         mac.finish(&message_3).unwrap();
         assert_eq!(
+            message_2[1..=ECHO_LEN],
+            message_1[1..=ECHO_LEN],
+            "message 2 starts with message 1's ephemeral key"
+        );
+        assert_eq!(
             hex(&paired_mac.handshake_hash),
             "bd9825c8a15e126ec2bba9657131df16443f944e770120544625cbb67710e85c"
         );
@@ -483,6 +501,28 @@ mod tests {
             mac.finish(&message_3).err(),
             Some(CryptoError::HandshakeFailed)
         );
+    }
+
+    /// A rescan of the same QR code starts a second attempt; the Mac's late
+    /// message 2 for the first must not use it up, whether it arrives as sent
+    /// or with its echo altered.
+    #[test]
+    fn a_message_2_for_another_attempt_leaves_the_phone_waiting() {
+        let party = party();
+        let (_, abandoned) = phone_start(&party.phone, &offer(&party)).unwrap();
+        let (mut phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
+        let (_, late) = mac_respond(&party.mac, &party.psk, "Mac", &abandoned).unwrap();
+        let (mut mac, message_2) = mac_respond(&party.mac, &party.psk, "Mac", &message_1).unwrap();
+        let mut altered = message_2.clone();
+        altered[1] ^= 1;
+        for other in [&late, &altered] {
+            assert_eq!(
+                phone.respond("Phone", other).err(),
+                Some(CryptoError::UnexpectedFrame)
+            );
+        }
+        let (_, message_3) = phone.respond("Phone", &message_2).unwrap();
+        assert!(mac.finish(&message_3).is_ok());
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod identity;
 pub mod keys;
 mod noise;
 pub mod pairing;
+pub mod phone;
 pub mod session;
 #[cfg(test)]
 mod test_support;

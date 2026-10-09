@@ -11,15 +11,17 @@ use crate::CryptoError;
 use crate::fragment::{Fragmenter, Reassembler, TAG_LEN};
 use crate::frame::{self, FrameKind};
 use crate::keys::{DeviceKeys, KEY_LEN};
-use crate::noise::{self, Peer, read, write};
+use crate::noise::{self, ECHO_LEN, Peer, echo_of, read, strip_echo, with_echo, write};
 
 const PATTERN: &str = "Noise_KK_25519_ChaChaPoly_SHA256";
 const PROLOGUE: &[u8] = b"switchboard session v1";
 
-/// The phone's state after sending message 1. A frame of another type leaves
-/// it waiting; any other failure, or success, uses it up.
+/// The phone's state after sending message 1. A frame of another type, or a
+/// reply to another attempt, leaves it waiting; any other failure, or
+/// success, uses it up.
 pub struct SessionInitiator {
     handshake: Option<HandshakeState>,
+    echo: [u8; ECHO_LEN],
 }
 
 /// An established connection. `seal` and `open` take `&mut self`, so a whole
@@ -72,11 +74,13 @@ pub fn respond(
 }
 
 impl SessionInitiator {
-    /// Reads the Mac's message 2. A frame of another type returns
-    /// `UnexpectedFrame` and leaves the initiator waiting for the real reply;
-    /// once a reply is read, the initiator is used up, whatever the outcome.
+    /// Reads the Mac's message 2. A frame of another type, or a reply to an
+    /// earlier attempt (one this initiator's message 1 did not ask for),
+    /// returns `UnexpectedFrame` and leaves the initiator waiting for its own
+    /// reply; once that is read, the initiator is used up, whatever the
+    /// outcome.
     pub fn finish(&mut self, message_2: &[u8]) -> Result<Session, CryptoError> {
-        let message_2 = frame::body(FrameKind::SessionReply, message_2)?;
+        let message_2 = strip_echo(&self.echo, frame::body(FrameKind::SessionReply, message_2)?)?;
         let mut handshake = self.handshake.take().ok_or(CryptoError::HandshakeFailed)?;
         if !read(&mut handshake, message_2)?.is_empty() {
             return Err(CryptoError::InvalidPayload);
@@ -191,6 +195,7 @@ fn initiate_from(builder: Builder<'_>) -> Result<(SessionInitiator, Vec<u8>), Cr
     Ok((
         SessionInitiator {
             handshake: Some(handshake),
+            echo: echo_of(&message_1)?,
         },
         frame::tagged(FrameKind::SessionRequest, &message_1),
     ))
@@ -207,7 +212,10 @@ fn respond_from(builder: Builder<'_>, message_1: &[u8]) -> Result<(Session, Vec<
     let message_2 = write(&mut handshake, &[])?;
     Ok((
         Session::from_handshake(handshake, State::Unconfirmed)?,
-        frame::tagged(FrameKind::SessionReply, &message_2),
+        frame::tagged(
+            FrameKind::SessionReply,
+            &with_echo(&echo_of(message_1)?, &message_2),
+        ),
     ))
 }
 
@@ -293,7 +301,7 @@ mod tests {
         );
         let (_, message_2) = respond(&mac, &phone.noise_public_key(), &message_1).unwrap();
         let mut forged = message_2.clone();
-        forged[5] ^= 1;
+        forged[1 + ECHO_LEN + 4] ^= 1;
         assert_eq!(
             initiator.finish(&forged).err(),
             Some(CryptoError::HandshakeFailed)
@@ -474,6 +482,50 @@ mod tests {
         );
     }
 
+    /// The phone gave up on one attempt and started another; the Mac's late
+    /// answer to the first must not use up the second.
+    #[test]
+    fn a_reply_to_an_abandoned_attempt_leaves_the_initiator_waiting() {
+        let (phone_keys, mac_keys) = (keys(1), keys(2));
+        let (_, abandoned) = initiate(&phone_keys, &mac_keys.noise_public_key()).unwrap();
+        let (mut initiator, message_1) =
+            initiate(&phone_keys, &mac_keys.noise_public_key()).unwrap();
+        let (_, late) = respond(&mac_keys, &phone_keys.noise_public_key(), &abandoned).unwrap();
+        let (mut mac, message_2) =
+            respond(&mac_keys, &phone_keys.noise_public_key(), &message_1).unwrap();
+        assert_eq!(
+            initiator.finish(&late).err(),
+            Some(CryptoError::UnexpectedFrame)
+        );
+        let mut phone = initiator.finish(&message_2).unwrap();
+        assert_eq!(
+            deliver(&mut phone, &mut mac, b"hello"),
+            Some(b"hello".to_vec())
+        );
+    }
+
+    /// The echo is not authenticated: a relay that alters it only gets the
+    /// reply ignored, and the initiator still completes on the real one.
+    #[test]
+    fn a_reply_with_an_altered_echo_is_ignored() {
+        let (phone_keys, mac_keys) = (keys(1), keys(2));
+        let (mut initiator, message_1) =
+            initiate(&phone_keys, &mac_keys.noise_public_key()).unwrap();
+        let (_, message_2) =
+            respond(&mac_keys, &phone_keys.noise_public_key(), &message_1).unwrap();
+        let mut altered = message_2.clone();
+        altered[1] ^= 1;
+        assert_eq!(
+            initiator.finish(&altered).err(),
+            Some(CryptoError::UnexpectedFrame)
+        );
+        assert_eq!(
+            initiator.finish(&message_2[..ECHO_LEN]).err(),
+            Some(CryptoError::UnexpectedFrame)
+        );
+        assert!(initiator.finish(&message_2).is_ok());
+    }
+
     #[test]
     fn records_are_sized_to_their_content() {
         let (mut phone, _) = connect(&keys(1), &keys(2));
@@ -532,7 +584,8 @@ mod tests {
     /// the first record are deterministic. Pinned from this implementation, so
     /// it catches a change to the pattern, prologue, frame type, or record
     /// layout; `snow` itself is checked against the published Noise test
-    /// vectors. Each frame is its one-byte type followed by the Noise message.
+    /// vectors. Each frame is its one-byte type followed by the Noise message;
+    /// the reply has message 1's ephemeral key between the two.
     #[test]
     fn the_handshake_and_first_record_are_pinned() {
         let (phone_keys, mac_keys) = (keys(1), keys(2));
@@ -558,7 +611,7 @@ mod tests {
         );
         assert_eq!(
             hex(&message_2),
-            "0313be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6db1c3c32ce0efa125eeb87c45de97f9de"
+            "03f5b2d6e60f9477e310c2982daaa6c9136c108a1777c5947e448fa37d6817455713be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6db1c3c32ce0efa125eeb87c45de97f9de"
         );
         assert_eq!(
             hex(&phone.seal(b"pinned").unwrap()[0]),

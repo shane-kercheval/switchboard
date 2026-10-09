@@ -9,6 +9,8 @@
 # imports on one line separated by `;` get past it.
 set -u
 
+. "$(dirname "$0")/lib/guard.sh"
+
 root=$(cd "$(dirname "$0")/.." && pwd)
 allowed="$root/SwitchboardMobileKit/Sources/SwitchboardMobileKit/Crypto/"
 tests="$root/SwitchboardMobileKit/Tests/"
@@ -16,14 +18,7 @@ pattern='^[[:space:]]*(@[A-Za-z_]+(\([^)]*\))?[[:space:]]+)*([a-z]+[[:space:]]+)
 
 # The pattern is checked against known lines first, so this guard cannot pass
 # by matching nothing.
-self_check_failures=0
-while IFS='|' read -r expected line; do
-	if printf '%s\n' "$line" | grep -qE "$pattern"; then actual=match; else actual=none; fi
-	if [ "$actual" != "$expected" ]; then
-		echo "check-binding-imports self-check: expected $expected for: $line" >&2
-		self_check_failures=$((self_check_failures + 1))
-	fi
-done <<'CASES'
+self_test check-binding-imports "$pattern" <<'CASES' || exit 1
 match|import SwitchboardRemoteCrypto
 match|internal import SwitchboardRemoteCrypto
 match|    public import SwitchboardRemoteCrypto
@@ -40,21 +35,11 @@ none|let source = "import SwitchboardRemoteCrypto"
 none|import SwitchboardMobileKit
 none|import SwitchboardRemoteCryptoExtras
 CASES
-[ "$self_check_failures" -eq 0 ] || exit 1
 
-# One recursive grep over the whole app tree, so a new target or folder is
-# covered without editing this list, and grep's own status separates "no
-# match" (1) from an error (2) such as an unreadable file. Matches in the
-# bindings themselves, under SwitchboardMobileKit/Generated/, are skipped by
-# exact path.
-matches=$(grep -rlE --include='*.swift' \
-	--exclude-dir=.build --exclude-dir=.swiftpm --exclude-dir=DerivedData \
-	"$pattern" "$root")
-status=$?
-if [ "$status" -gt 1 ]; then
-	echo "check-binding-imports: the scan failed (grep exit $status), so nothing was checked." >&2
-	exit 1
-fi
+# The scan covers the whole app tree, so a new target or folder is covered
+# without editing this list. Matches in the bindings themselves, under
+# SwitchboardMobileKit/Generated/, are skipped by exact path.
+matches=$(scan check-binding-imports "$pattern" "$root") || exit 1
 
 found_allowed=no
 violations=

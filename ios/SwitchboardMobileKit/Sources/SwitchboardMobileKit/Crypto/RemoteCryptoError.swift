@@ -15,7 +15,9 @@ public enum RemoteCryptoError: Error, Equatable, Sendable {
     case unexpectedPeerKey
     case invalidPayload
     case messageTooLarge(length: Int)
-    /// A frame of the wrong type, or oversize. Nothing was touched.
+    /// A frame of the wrong type, or oversize, or a handshake reply that
+    /// answers another attempt. Nothing was touched: a waiting handshake keeps
+    /// waiting.
     case unexpectedFrame
     /// A record did not decrypt before the session had opened any: a stale
     /// record from the Mac's previous session. The session is unchanged.

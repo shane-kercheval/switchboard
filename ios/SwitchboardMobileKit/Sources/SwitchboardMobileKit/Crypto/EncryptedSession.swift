@@ -12,8 +12,9 @@ public final class ConnectionHandshake: Sendable {
 
     public var message1: Data { handshake.message1() }
 
-    /// Reads the Mac's reply. A frame of another type throws `unexpectedFrame`
-    /// and leaves the handshake waiting; a real reply uses it up.
+    /// Reads the Mac's reply. A frame of another type, or a reply to an
+    /// attempt this handshake replaced, throws `unexpectedFrame` and leaves it
+    /// waiting; its own reply uses it up.
     public func finish(message2: Data) throws(RemoteCryptoError) -> EncryptedSession {
         EncryptedSession(session: try bridging { try handshake.finish(message2: message2) })
     }

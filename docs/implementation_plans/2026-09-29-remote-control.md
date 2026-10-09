@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 19 · **Created:** 2026-09-29 · **Revised:** 2026-10-09
+**Status:** proposed · **Revision:** 20 · **Created:** 2026-09-29 · **Revised:** 2026-10-09
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,24 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 20 (2026-10-09)** — third review of the Swift binding (§3, §4, §5.4, §5.11, §7.2,
+  §7.3, §7.6).
+  - **A handshake reply names the attempt it answers.** The connection reply and pairing
+    message 2 now start, after the type byte, with the 32-byte ephemeral public key that opens
+    message 1 in the clear; the phone compares it before reading the reply, and a reply to
+    another attempt is `UnexpectedFrame`, leaving the handshake waiting. Revision 19's "a reply
+    to an abandoned attempt is ignored" could not be built without it: the phone could tell
+    the late reply from its own only by reading it, which uses the handshake up. **This
+    changes both reply frames on the wire.** The echo is unauthenticated; a relay that alters
+    it only gets the reply ignored.
+  - **The Mac answers `hello`.** Its first record on a promoted session is
+    `hello { protocol_version }`, or `protocol_mismatch`. Nothing else guaranteed the Mac
+    sends anything, so revision 17's 10-second first-record deadline would have reconnected
+    an idle phone — one on the project list after a relay blip — every 10 seconds. The
+    deadline still waits for any record to open, not for `hello` by name.
+  - The phone's stream rule moves from the binding into the core as `phone::PhoneSession`, next
+    to the Mac's `DeviceSessions`; the binding's `Session` is a lock around it.
+  - The phone's relay socket caps incoming messages at a size fixed by the protocol.
 - **Revision 19 (2026-10-09)** — second review of the Swift binding (§3, §5.4, §5.11, §7.2,
   §7.3, §7.6).
   - **A handshake that fails or goes unanswered no longer leaves the phone waiting.** A real
@@ -582,15 +600,16 @@ returning the Mac's key and name, the confirmation code, and message 3), `Sessio
 halves of the session and pairing handshakes, are exported only so the Swift round trips can
 run on the device. Their Swift wrappers live in the package's test target, not the package,
 and `ios/scripts/check-test-only-calls.sh` fails `make check-ios` if any Swift outside the
-tests names either generated function. That check is a grep for the names, not a module
-boundary: the xcframework ships both to the app, and a Mac-only function exported later must
-be added to it. Bytes returned to
+tests names the generated `MacPairingHandshake` class or `accept_session` function. That
+check is a grep for the names, not a module boundary: the xcframework ships both to the app,
+and a Mac-only export added later must be added to it. Bytes returned to
 Swift are Swift-owned and cannot be wiped by this crate; only the storage blob is secret, and
 Swift hands it straight to the Keychain. `UniFFI` also lowers it into a `RustBuffer` that is
-freed unwiped: one more copy per Keychain write. The phone's `Session` adds one rule to the
-core's: a record that does not decrypt is ignored until the session has opened a record, and
-afterwards closes it with `StreamBroken` (revision 17); `has_opened_record` lets the transport
-bound the first window. `frame_kind` takes only a frame's first byte. Keychain access stays in Swift.
+freed unwiped: one more copy per Keychain write. The phone's session adds one rule to the
+core's, in `phone::PhoneSession`, which the binding's `Session` wraps in a lock: a record that
+does not decrypt is ignored until the session has opened a record, and afterwards closes it
+with `StreamBroken` (revision 17); `has_opened_record` lets the transport bound the first
+window. `frame_kind` takes only a frame's first byte. Keychain access stays in Swift.
 
 **Tests**
 
@@ -621,8 +640,14 @@ client-supplied value. Handshake messages and transport records travel the same 
 
 **Frame body** — `record` is produced and parsed only by `remote-crypto` (§3). Its first byte
 is the frame type: `1` pairing message, `2` connection request (`KK` message 1), `3`
-connection reply (`KK` message 2), `4` record. The Noise message follows. The byte is outside
-the encryption; a relay that changes it only makes the frame fail. Relay-level data — the
+connection reply (`KK` message 2), `4` record. The Noise message follows. The two replies — the
+connection reply, and pairing message 2 — put an echo between the two: the 32-byte ephemeral
+public key that starts message 1 in the clear, fresh per attempt. So the pairing frame's body
+depends on which message it is: messages 1 and 3 carry the Noise message alone. The phone
+compares the echo before reading a reply, so a reply to an attempt it abandoned, or to a
+replayed request, is refused as `UnexpectedFrame` and its waiting handshake is untouched. The
+type byte and the echo are outside the encryption; a relay that changes either only makes the
+frame fail or be ignored. Relay-level data — the
 pairing token above all, which the relay must read to decide whether to forward a pairing
 frame (§6) — is a field of `Frame`, never part of these bytes.
 
@@ -658,8 +683,11 @@ event, such as a `turn_end` followed by silence, is still followed by a signal. 
 reloads the tail on `resync`, and also on a gap in `seq`, which is what it sees first when
 events keep flowing after a drop.
 
-**Control** — `hello` (`protocol_version`), `subscribe` / `unsubscribe` (`project_id`),
-`resync` (`project_id`), `error` (`code`, `message`, optional `last_seen`; an error the relay
+**Control** — `hello` (`protocol_version`): the phone's first envelope on a connection, which
+the Mac answers at once with its own `hello { protocol_version }`, or with
+`protocol_mismatch`. Only the Mac answers, so the two never echo each other. Either answer is
+the phone's first record on the session, which its 10-second deadline (§7.2) waits for. The
+others: `subscribe` / `unsubscribe` (`project_id`), `resync` (`project_id`), `error` (`code`, `message`, optional `last_seen`; an error the relay
 generates also carries `device_id`, the device the failed frame was addressed to). Pairing:
 `pairing_hello`, `pairing_confirmed`, `pairing_declined`. Connection liveness is WebSocket
 ping/pong between each client and the relay (§5.1, §7.2), not an envelope. From the relay,
@@ -766,7 +794,11 @@ cannot decrypt after its first open as a broken stream (§3), so an old-session 
 followed a new one would end the phone's fresh session. Nothing new recovers the dropped
 envelope: an event is recovered when the phone reloads the tail after reconnecting (§7.4),
 and a reply is lost as any reply is on a reconnect, with `send_message`'s outcome recovered
-by `send_receipt` (§7.2). Records are opened here and only plaintext envelopes leave the module. A transport record from a device
+by `send_receipt` (§7.2). The new session's first record is the Mac's answer to the phone's
+`hello` (§4), queued once the old writer has stopped; old-session records already queued
+ahead of it are harmless, since the phone ignores records until one opens on its new session.
+
+Records are opened here and only plaintext envelopes leave the module. A transport record from a device
 with no session cannot be opened, so it is discarded without a reply; that includes records
 sent while a handshake is still in progress. A handshake from a device that is not in the
 registry, or is revoked, is answered with `not_paired`. Also holds, in memory, each device's
@@ -1039,7 +1071,8 @@ It forwards everything unchanged, then:
   dropped, then deletes both keys.
 - Unit: `SessionManager` — pause a multi-record send on the confirmed session, promote the
   unconfirmed one, and assert the paused writer sends no further record on the replaced
-  session.
+  session; promotion's first record on the new session is the answer to `hello`, and a
+  `hello` with another `protocol_version` is answered `protocol_mismatch`.
 - Fixture-driven: `RequestHandler` against the mock backend (a send calls
   `ensure_project_loaded` before validating recipients, an unknown recipient dispatches
   nothing, idempotent repeat, concurrent repeat, partial fan-out rejection, a request-level
@@ -1189,18 +1222,24 @@ though the phone cannot send attachments.
   `peer_disconnected` for the paired Mac it discards the session and retries the handshake
   with the same backoff. A session that has opened no record within 10 seconds of its
   handshake is discarded and the handshake retried, since a damaged or lost first record
-  would otherwise leave it waiting. A handshake whose reply has not arrived within 10 seconds
+  would otherwise leave it waiting. The deadline waits for any record to open, not for a
+  particular envelope; the Mac answers `hello` at once (§4), so a live, idle session always
+  opens one. A handshake whose reply has not arrived within 10 seconds
   of sending message 1 is abandoned and retried the same way, so a lost reply does not leave
   the phone connecting forever. Each deadline belongs to one attempt: one that fires after a
-  newer attempt has started is ignored, and so is a reply to an abandoned attempt. Any error
+  newer attempt has started is ignored, and so is a reply to an abandoned attempt: the
+  binding returns `unexpectedFrame` for a reply whose echo (§4) is not this attempt's. Any error
   whose `isTerminal` is true, from the session or from its handshake — `streamBroken`,
   `protocolViolation`, `sendFailed`, `sessionClosed`, `handshakeFailed`, `invalidPayload` —
   does the same. All of these start a new handshake on the same relay connection, which stays
   up, and retry with the same backoff, so a relay that keeps injecting bad records cannot spin
   the phone in a handshake loop. A construction error (`invalidKey`, `invalidKeyBlob`) is not
-  terminal and is not retried: no retry fixes a corrupt stored key, so it is shown. It routes frames by type (§4) and ignores a connection reply when it
-  is not waiting for one — the Mac sends one in answer to a replayed request — without
-  touching its session.
+  terminal and is not retried: no retry fixes a corrupt stored key, so it is shown. It routes
+  frames by type (§4) and ignores a connection reply when it is not waiting for one — the Mac
+  sends one in answer to a replayed request — without touching its session. Its socket's
+  `maximumMessageSize` is a constant sized from the protocol (one 65,535-byte Noise record,
+  its type byte, and the relay frame around it), not the relay's configurable
+  `MAX_FRAME_BYTES`, which the phone cannot know.
 - **Local relay in development.** iOS App Transport Security blocks plain `ws://`, and iOS asks
   for Local Network permission before reaching a device on the LAN. The **Debug** build
   configuration's Info.plist carries `NSAppTransportSecurity` → `NSAllowsLocalNetworking = YES`
@@ -1222,7 +1261,8 @@ though the phone cannot send attachments.
 - `PairingFlow` — runs the binding's `XXpsk2` handshake with the token, shows the confirmation
   code with "Type this code on your Mac", waits for `pairing_confirmed` / `pairing_declined`, then
   stores the phone's keys and the Mac's pinned keys in the Keychain. Handles expired offers,
-  decline, wrong relay, and Mac not connected. An `isTerminal` error from `respond` ends the
+  decline, wrong relay, and Mac not connected. A message 2 for an earlier attempt on the same
+  QR code is refused by its echo (§4) and the pairing keeps waiting. An `isTerminal` error from `respond` ends the
   attempt, and so does no message 2 within 10 seconds of message 1: either is shown as a failed
   pairing with a rescan offered, never retried in the background, since the token is
   single-use and the user is watching.
@@ -1288,13 +1328,16 @@ though the phone cannot send attachments.
   carry the camera and Face ID usage descriptions.
 - Coordinator: `RelayTransport`'s session deadline — a session whose first record never
   opens is discarded after 10 seconds and the handshake retried; a stale record before the
-  first open does not end the session; every `isTerminal` error from the session or its handshake starts a new handshake, and repeated
-  stream breaks back off rather than looping.
+  first open does not end the session; every `isTerminal` error from the session or its
+  handshake starts a new handshake, and repeated stream breaks back off rather than looping;
+  a connected, idle session survives past 10 seconds, because the Mac's answer to `hello`
+  opens.
 - Coordinator: `RelayTransport`'s handshake deadline — a connection handshake with no reply in
   10 seconds is abandoned and retried with backoff; a reply arriving after that, while a newer
   attempt is running, does not touch the newer attempt; a stale deadline from an earlier
   attempt does not abandon the current one. `PairingFlow` shows a pairing with no reply
-  within its deadline as failed.
+  within its deadline as failed, and a rescan of the same QR code completes despite the
+  first attempt's late message 2.
 - Coordinator: `SecureSession`'s outbound queue — suspend the first envelope's send, submit a
   second envelope, and assert every record of the first is transmitted before any of the
   second.

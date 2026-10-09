@@ -25,7 +25,8 @@ use zeroize::Zeroizing;
 use crate::frame::{self, FrameKind as CoreFrameKind};
 use crate::keys::{DeviceKeys as CoreKeys, KEY_LEN};
 use crate::pairing::{self, MacAwaitingFinish, PSK_LEN, PairingOffer, PhoneAwaitingResponse};
-use crate::session::{self, Session as CoreSession, SessionInitiator};
+use crate::phone::PhoneSession;
+use crate::session::{self, SessionInitiator};
 use crate::{CryptoError, confirmation_code};
 
 /// A device's long-term keys. Swift never sees a private key: only the
@@ -109,12 +110,9 @@ impl PairingHandshake {
         mac_noise_public_key: Vec<u8>,
         psk: Vec<u8>,
     ) -> Result<Arc<Self>, CryptoError> {
-        let psk = Zeroizing::new(psk);
         let offer = PairingOffer {
             mac_noise_public_key: key(&mac_noise_public_key)?,
-            psk: Zeroizing::new(
-                <[u8; PSK_LEN]>::try_from(psk.as_slice()).map_err(|_| CryptoError::InvalidKey)?,
-            ),
+            psk: pre_shared_key(psk)?,
         };
         let (state, message_1) = pairing::phone_start(&keys.keys, &offer)?;
         Ok(Arc::new(Self {
@@ -176,9 +174,7 @@ impl MacPairingHandshake {
         mac_name: String,
         message_1: Vec<u8>,
     ) -> Result<Arc<Self>, CryptoError> {
-        let psk = Zeroizing::new(psk);
-        let psk = <[u8; PSK_LEN]>::try_from(psk.as_slice()).map_err(|_| CryptoError::InvalidKey)?;
-        let psk = Zeroizing::new(psk);
+        let psk = pre_shared_key(psk)?;
         let (state, message_2) = pairing::mac_respond(&keys.keys, &psk, &mac_name, &message_1)?;
         Ok(Arc::new(Self {
             state: Mutex::new(state),
@@ -261,37 +257,19 @@ pub fn accept_session(
     })
 }
 
-/// An established connection. One `seal` call produces all of an envelope's
-/// records under the lock, so concurrent calls never interleave records; the
-/// caller must still transmit them in the order returned, one envelope at a
-/// time.
-///
-/// The phone has one session, so a record it cannot decrypt has nowhere else
-/// to go. Before the session has opened any record, such a record is
-/// ignored: after a reconnect the Mac keeps sending on its old session until
-/// the phone's first record confirms the new one, and the relay delivers those
-/// stale records first. After the first record opens, the Mac sends only on
-/// this session, so a record that does not decrypt means the stream is broken:
-/// the session closes and `open` returns `StreamBroken`. The transport bounds
-/// the first window with a deadline (`has_opened_record`), since a damaged
-/// first record would otherwise leave it waiting.
+/// An established connection: the phone's session rule (`PhoneSession`)
+/// behind a lock. One `seal` call produces all of an envelope's records under
+/// the lock, so concurrent calls never interleave records; the caller must
+/// still transmit them in the order returned, one envelope at a time.
 #[derive(uniffi::Object)]
 pub struct Session {
-    state: Mutex<SessionState>,
-}
-
-struct SessionState {
-    session: CoreSession,
-    opened_record: bool,
+    state: Mutex<PhoneSession>,
 }
 
 impl Session {
-    fn new(session: CoreSession) -> Self {
+    fn new(session: session::Session) -> Self {
         Self {
-            state: Mutex::new(SessionState {
-                session,
-                opened_record: false,
-            }),
+            state: Mutex::new(PhoneSession::new(session)),
         }
     }
 }
@@ -299,34 +277,22 @@ impl Session {
 #[uniffi::export]
 impl Session {
     pub fn seal(&self, envelope: Vec<u8>) -> Result<Vec<Vec<u8>>, CryptoError> {
-        lock(&self.state, CryptoError::SessionClosed)?
-            .session
-            .seal(&envelope)
+        lock(&self.state, CryptoError::SessionClosed)?.seal(&envelope)
     }
 
-    /// The envelope once its last record arrives, `None` before then.
-    /// `RecordRejected` before the first record opens leaves the session as it
-    /// was; after it, a record that does not decrypt closes the session and
-    /// returns `StreamBroken`.
+    /// See `PhoneSession::open`: `RecordRejected` before the first record
+    /// opens leaves the session as it was; after it, a record that does not
+    /// decrypt closes the session and returns `StreamBroken`.
     pub fn open(&self, record: Vec<u8>) -> Result<Option<Vec<u8>>, CryptoError> {
-        let mut state = lock(&self.state, CryptoError::SessionClosed)?;
-        match state.session.open(&record) {
-            Ok(envelope) => {
-                state.opened_record = true;
-                Ok(envelope)
-            }
-            Err(CryptoError::RecordRejected) if state.opened_record => {
-                state.session.close();
-                Err(CryptoError::StreamBroken)
-            }
-            Err(error) => Err(error),
-        }
+        lock(&self.state, CryptoError::SessionClosed)?.open(&record)
     }
 
     /// Whether any record has decrypted on this session. The transport ends a
     /// session that has not opened one within its deadline.
     pub fn has_opened_record(&self) -> bool {
-        self.state.lock().is_ok_and(|state| state.opened_record)
+        self.state
+            .lock()
+            .is_ok_and(|session| session.has_opened_record())
     }
 
     /// Closed by a malformed record, a broken stream, or a failed send, or
@@ -334,7 +300,7 @@ impl Session {
     pub fn is_closed(&self) -> bool {
         self.state
             .lock()
-            .map_or(true, |state| state.session.is_closed())
+            .map_or(true, |session| session.is_closed())
     }
 }
 
@@ -363,6 +329,15 @@ pub fn frame_kind(tag: u8) -> Result<FrameKind, CryptoError> {
 
 fn key(bytes: &[u8]) -> Result<[u8; KEY_LEN], CryptoError> {
     <[u8; KEY_LEN]>::try_from(bytes).map_err(|_| CryptoError::InvalidKey)
+}
+
+/// Takes the bytes from Swift by value, so they are wiped here whether or not
+/// they are the right length.
+fn pre_shared_key(bytes: Vec<u8>) -> Result<Zeroizing<[u8; PSK_LEN]>, CryptoError> {
+    let bytes = Zeroizing::new(bytes);
+    <[u8; PSK_LEN]>::try_from(bytes.as_slice())
+        .map(Zeroizing::new)
+        .map_err(|_| CryptoError::InvalidKey)
 }
 
 fn lock<T>(mutex: &Mutex<T>, poisoned: CryptoError) -> Result<MutexGuard<'_, T>, CryptoError> {
@@ -399,16 +374,26 @@ mod tests {
         }
     }
 
-    /// Several threads seal multi-record envelopes on one session. If any
-    /// envelope's records were interleaved with another's, the nonces would
-    /// not run contiguously within it, and no order of envelopes would open.
-    /// The receiver is the core session, on which a record that does not
-    /// decrypt changes nothing, so it can try each remaining envelope in turn
-    /// and must always find the next one. (The FFI session's phone rule would
-    /// end the stream at the first wrong guess; this test is about `seal`.)
+    /// Several threads seal multi-record envelopes on one FFI session, whose
+    /// lock is what is under test. If any envelope's records were interleaved
+    /// with another's, the nonces would not run contiguously within it, and no
+    /// order of envelopes would open. The receiver is a core session, on which
+    /// a record that does not decrypt changes nothing, so it can try each
+    /// remaining envelope in turn and must always find the next one.
     #[test]
     fn concurrent_seals_never_interleave_records() {
-        let Pair { phone, mac } = connect();
+        let phone_keys = DeviceKeys::generate().unwrap();
+        let mac_keys = CoreKeys::generate().unwrap();
+        let handshake =
+            SessionHandshake::new(phone_keys.clone(), mac_keys.noise_public_key().to_vec())
+                .unwrap();
+        let (mut receiver, message_2) = session::respond(
+            &mac_keys,
+            &key(&phone_keys.noise_public_key()).unwrap(),
+            &handshake.message_1(),
+        )
+        .unwrap();
+        let phone = handshake.finish(message_2).unwrap();
         let batches: Vec<Vec<Vec<u8>>> = thread::scope(|scope| {
             let handles: Vec<_> = (0..8u8)
                 .map(|n| {
@@ -420,8 +405,7 @@ mod tests {
         });
         assert!(batches.iter().all(|records| records.len() == 3));
 
-        let mut receiver = mac.state.lock().unwrap();
-        let mut open = |record: &Vec<u8>| receiver.session.open(record);
+        let mut open = |record: &Vec<u8>| receiver.open(record);
         let mut remaining: Vec<usize> = (0..batches.len()).collect();
         let mut opened = HashSet::new();
         while !remaining.is_empty() {
@@ -563,58 +547,6 @@ mod tests {
         for tag in [0, 5, u8::MAX] {
             assert_eq!(frame_kind(tag), Err(CryptoError::UnexpectedFrame));
         }
-    }
-
-    /// After a reconnect the Mac keeps sending on its old session until the
-    /// phone's first record confirms the new one, and those records reach the
-    /// phone first. They are ignored, and the new session then works.
-    #[test]
-    fn stale_records_before_the_first_open_are_ignored() {
-        let phone_keys = DeviceKeys::generate().unwrap();
-        let mac_keys = DeviceKeys::generate().unwrap();
-        let first = SessionHandshake::new(phone_keys.clone(), mac_keys.noise_public_key()).unwrap();
-        let old = accept_session(
-            mac_keys.clone(),
-            phone_keys.noise_public_key(),
-            first.message_1(),
-        )
-        .unwrap();
-        first.finish(old.message_2).unwrap();
-
-        let second =
-            SessionHandshake::new(phone_keys.clone(), mac_keys.noise_public_key()).unwrap();
-        let new =
-            accept_session(mac_keys, phone_keys.noise_public_key(), second.message_1()).unwrap();
-        let phone = second.finish(new.message_2).unwrap();
-
-        for stale in old.session.seal(b"on the old session".to_vec()).unwrap() {
-            assert_eq!(phone.open(stale), Err(CryptoError::RecordRejected));
-        }
-        assert!(!phone.is_closed());
-        assert!(!phone.has_opened_record());
-        let record = new
-            .session
-            .seal(b"on the new one".to_vec())
-            .unwrap()
-            .remove(0);
-        assert_eq!(phone.open(record), Ok(Some(b"on the new one".to_vec())));
-        assert!(phone.has_opened_record());
-    }
-
-    /// Once a record has opened, the Mac sends only on this session, so a
-    /// record that does not decrypt — here, one lost in transit, leaving the
-    /// next a nonce ahead — means the stream is broken. Without this the phone
-    /// would wait forever, every later record rejected.
-    #[test]
-    fn a_rejected_record_after_the_first_open_breaks_the_stream() {
-        let Pair { phone, mac } = connect();
-        let first = mac.seal(b"one".to_vec()).unwrap().remove(0);
-        assert_eq!(phone.open(first), Ok(Some(b"one".to_vec())));
-        let _lost = mac.seal(b"two".to_vec()).unwrap();
-        let third = mac.seal(b"three".to_vec()).unwrap().remove(0);
-        assert_eq!(phone.open(third.clone()), Err(CryptoError::StreamBroken));
-        assert!(phone.is_closed());
-        assert_eq!(phone.open(third), Err(CryptoError::SessionClosed));
     }
 
     #[test]

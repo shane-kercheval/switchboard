@@ -25,9 +25,9 @@ public final class PhonePairing: Sendable {
 
     public var message1: Data { handshake.message1() }
 
-    /// Reads the Mac's message 2. A frame of another type throws
-    /// `unexpectedFrame` and leaves the pairing waiting; a real message 2 uses
-    /// it up, whatever the outcome.
+    /// Reads the Mac's message 2. A frame of another type, or a message 2 for
+    /// an earlier attempt, throws `unexpectedFrame` and leaves the pairing
+    /// waiting; its own message 2 uses it up, whatever the outcome.
     public func respond(phoneName: String, message2: Data) throws(RemoteCryptoError) -> Response {
         let response = try bridging { try handshake.respond(phoneName: phoneName, message2: message2) }
         return Response(

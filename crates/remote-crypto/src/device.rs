@@ -7,22 +7,43 @@
 //! A device has at most one confirmed session and one unconfirmed one. A
 //! connection request only ever creates the unconfirmed one, because a
 //! `Noise_KK` message 1 can be replayed: a replay must never displace the live
-//! session. Each record is offered to the unconfirmed session first, then the
-//! confirmed one:
+//! session. Each record names its session (see `session`), so it goes to the
+//! session with that id:
 //! - it opens on the unconfirmed session: that session is confirmed and
 //!   replaces the old one;
 //! - it opens on the confirmed session: nothing else changes, so a phone that
 //!   reconnects with records still in flight on its old keys loses none;
-//! - it does not decrypt on a session: nothing changed there (a failed
-//!   decryption does not advance the nonce), so it goes to the next;
-//! - it decrypts but is malformed: that session is closed and dropped, and the
-//!   record goes no further, since it belongs to no other session;
-//! - no session opens it: the stream is broken, and both sessions end.
+//! - it names neither: it is stale, and nothing changes;
+//! - it names a session but does not decrypt there: that session's in-order
+//!   stream is broken, so that session is dropped (`StreamBroken`);
+//! - it decrypts but is malformed: that session is dropped too.
+//!
+//! Only the session a record names is ever affected, so a forged or stale
+//! record cannot end the other one.
 
 use crate::CryptoError;
 use crate::frame::{self, FrameKind};
 use crate::keys::{DeviceKeys, KEY_LEN};
 use crate::session::{self, Session};
+
+/// A record that opened on one of the device's sessions.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Opened {
+    /// The envelope once its last record arrives, `None` before then.
+    pub envelope: Option<Vec<u8>>,
+    /// The record confirmed the unconfirmed session, which replaced the old
+    /// one: the device has moved to its new connection.
+    pub promoted: bool,
+}
+
+/// A session that failed on a record naming it is dropped; a record that did
+/// not decrypt there means its stream is broken.
+fn broken(error: CryptoError) -> CryptoError {
+    match error {
+        CryptoError::RecordRejected => CryptoError::StreamBroken,
+        other => other,
+    }
+}
 
 #[derive(Default)]
 pub struct DeviceSessions {
@@ -50,15 +71,16 @@ impl DeviceSessions {
         Ok(message_2)
     }
 
-    /// Routes one record by the rule in the module documentation. Returns the
-    /// envelope once its last record arrives, `None` while it is still
-    /// incomplete. Errors:
+    /// Routes one record by the rule in the module documentation. Returns
+    /// what happened, with the envelope once its last record arrives. Errors:
     /// - `UnexpectedFrame`: not a record, or oversize; nothing changed.
     /// - `NotConnected`: the device has no session; nothing changed.
-    /// - `ProtocolViolation`: a session decrypted it but it was malformed; that
-    ///   session is gone.
-    /// - `SessionsEnded`: no session opened it; both are gone.
-    pub fn open(&mut self, record: &[u8]) -> Result<Option<Vec<u8>>, CryptoError> {
+    /// - `StaleRecord`: it names neither session; nothing changed.
+    /// - `StreamBroken`: it names a session but did not decrypt; that session
+    ///   is gone.
+    /// - `ProtocolViolation`: it decrypted but was malformed; that session is
+    ///   gone.
+    pub fn open(&mut self, record: &[u8]) -> Result<Opened, CryptoError> {
         frame::body(FrameKind::Record, record)?;
         if self.confirmed.is_none() && self.unconfirmed.is_none() {
             return Err(CryptoError::NotConnected);
@@ -67,27 +89,34 @@ impl DeviceSessions {
             match candidate.open(record) {
                 Ok(envelope) => {
                     self.confirmed = self.unconfirmed.take();
-                    return Ok(envelope);
+                    return Ok(Opened {
+                        envelope,
+                        promoted: true,
+                    });
                 }
-                Err(CryptoError::RecordRejected) => {}
+                Err(CryptoError::StaleRecord) => {}
                 Err(error) => {
                     self.unconfirmed = None;
-                    return Err(error);
+                    return Err(broken(error));
                 }
             }
         }
         if let Some(live) = self.confirmed.as_mut() {
             match live.open(record) {
-                Ok(envelope) => return Ok(envelope),
-                Err(CryptoError::RecordRejected) => {}
+                Ok(envelope) => {
+                    return Ok(Opened {
+                        envelope,
+                        promoted: false,
+                    });
+                }
+                Err(CryptoError::StaleRecord) => {}
                 Err(error) => {
                     self.confirmed = None;
-                    return Err(error);
+                    return Err(broken(error));
                 }
             }
         }
-        self.end();
-        Err(CryptoError::SessionsEnded)
+        Err(CryptoError::StaleRecord)
     }
 
     /// Seals an envelope on the confirmed session. With no confirmed session —
@@ -178,7 +207,7 @@ mod tests {
         ) -> Result<Option<Vec<u8>>, CryptoError> {
             let mut result = Ok(None);
             for record in phone.seal(envelope).unwrap() {
-                result = self.device.open(&record);
+                result = self.device.open(&record).map(|opened| opened.envelope);
             }
             result
         }
@@ -196,9 +225,13 @@ mod tests {
         let mut phone = pair.connect();
         assert!(!pair.device.is_connected());
         assert!(pair.device.has_unconfirmed());
+        let record = phone.seal(b"hello").unwrap().remove(0);
         assert_eq!(
-            pair.deliver(&mut phone, b"hello"),
-            Ok(Some(b"hello".to_vec()))
+            pair.device.open(&record),
+            Ok(Opened {
+                envelope: Some(b"hello".to_vec()),
+                promoted: true
+            })
         );
         assert!(pair.device.is_connected());
         assert!(!pair.device.has_unconfirmed());
@@ -250,7 +283,10 @@ mod tests {
         let mut new_phone = pair.connect();
         assert_eq!(
             pair.device.open(&in_flight),
-            Ok(Some(b"in flight".to_vec()))
+            Ok(Opened {
+                envelope: Some(b"in flight".to_vec()),
+                promoted: false
+            })
         );
         assert!(pair.device.has_unconfirmed());
 
@@ -283,20 +319,47 @@ mod tests {
         );
     }
 
+    /// A record naming no session of the device — here, one whose id was
+    /// altered — is stale: it touches neither session.
     #[test]
-    fn a_record_no_session_opens_ends_them_all() {
+    fn a_record_naming_no_session_changes_nothing() {
         let mut pair = Pair::new();
         let mut phone = pair.connect();
         pair.deliver(&mut phone, b"hello").unwrap();
         pair.connect();
-        let mut forged = phone.seal(b"x").unwrap().remove(0);
-        forged[1] ^= 1;
+        let mut stale = phone.seal(b"x").unwrap().remove(0);
+        stale[1] ^= 1;
+        assert_eq!(
+            pair.device.open(&stale).err(),
+            Some(CryptoError::StaleRecord)
+        );
+        assert!(pair.device.is_connected());
+        assert!(pair.device.has_unconfirmed());
+    }
+
+    /// A record naming the live session that does not decrypt means that
+    /// session's stream is broken. Only it is dropped: the phone's new
+    /// connection, if it has one, is untouched.
+    #[test]
+    fn a_record_that_fails_on_the_session_it_names_drops_only_that_session() {
+        let mut pair = Pair::new();
+        let mut old_phone = pair.connect();
+        pair.deliver(&mut old_phone, b"hello").unwrap();
+        let mut new_phone = pair.connect();
+        let mut forged = old_phone.seal(b"x").unwrap().remove(0);
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
         assert_eq!(
             pair.device.open(&forged).err(),
-            Some(CryptoError::SessionsEnded)
+            Some(CryptoError::StreamBroken)
         );
         assert!(!pair.device.is_connected());
-        assert!(!pair.device.has_unconfirmed());
+        assert!(pair.device.has_unconfirmed());
+        assert_eq!(
+            pair.deliver(&mut new_phone, b"again"),
+            Ok(Some(b"again".to_vec()))
+        );
+        assert!(pair.device.is_connected());
     }
 
     #[test]
@@ -309,6 +372,47 @@ mod tests {
             pair.device.open(&record).err(),
             Some(CryptoError::NotConnected)
         );
+    }
+
+    /// A record the Mac sent, reflected back to it, names the live session
+    /// but was sealed under the other direction's key, so it does not
+    /// decrypt: that session's stream is broken, and only it is dropped.
+    #[test]
+    fn a_reflected_record_breaks_only_the_session_it_names() {
+        let mut pair = Pair::new();
+        let mut old_phone = pair.connect();
+        pair.deliver(&mut old_phone, b"hello").unwrap();
+        let mut new_phone = pair.connect();
+        let reflected = pair.device.seal(b"to the phone").unwrap().remove(0);
+        assert_eq!(
+            pair.device.open(&reflected).err(),
+            Some(CryptoError::StreamBroken)
+        );
+        assert!(!pair.device.is_connected());
+        assert!(pair.device.has_unconfirmed());
+        assert_eq!(
+            pair.deliver(&mut new_phone, b"again"),
+            Ok(Some(b"again".to_vec()))
+        );
+    }
+
+    /// A reply reflected back to the Mac as a request is refused by type.
+    #[test]
+    fn a_reflected_reply_is_not_a_request() {
+        let mut pair = Pair::new();
+        let (_, message_1) = pair.request();
+        let message_2 = pair.accept(&message_1);
+        assert_eq!(
+            pair.device
+                .accept_handshake(
+                    &pair.mac_keys,
+                    &pair.phone_keys.noise_public_key(),
+                    &message_2
+                )
+                .err(),
+            Some(CryptoError::UnexpectedFrame)
+        );
+        assert!(pair.device.has_unconfirmed());
     }
 
     #[test]

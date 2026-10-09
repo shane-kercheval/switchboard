@@ -29,6 +29,7 @@ public final class PhonePairing: Sendable {
     /// an earlier attempt, throws `unexpectedFrame` and leaves the pairing
     /// waiting; its own message 2 uses it up, whatever the outcome.
     public func respond(phoneName: String, message2: Data) throws(RemoteCryptoError) -> Response {
+        try FrameType.checkLength(of: message2)
         let response = try bridging { try handshake.respond(phoneName: phoneName, message2: message2) }
         return Response(
             macNoisePublicKey: response.macNoisePublicKey,

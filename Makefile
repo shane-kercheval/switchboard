@@ -206,10 +206,13 @@ ios-crypto:
 	rm -rf $(IOS_GENERATED)
 	mv $(IOS_STAGING)/Generated $(IOS_GENERATED)
 
-# Checks that only Crypto/ imports the generated bindings and that a simulator
-# exists before the slow Rust build, then builds the app and runs the package's
-# tests on a simulator, builds Release, and checks both built Info.plists. A separate CI job, so `check` (and its wall
-# time) is unchanged; `check` is therefore no longer everything CI runs.
+# Before the slow Rust build, checks that only Crypto/ (and, among the tests,
+# MacHalves.swift) imports the generated bindings, that nothing outside the
+# tests names the Mac's test-only handshake halves, and that a simulator
+# exists. Then builds the app and runs the package's tests on a simulator,
+# builds Release, and checks both built Info.plists. A separate CI job, so
+# `check` (and its wall time) is unchanged; `check` is therefore no longer
+# everything CI runs.
 check-ios:
 	ios/scripts/check-binding-imports.sh
 	ios/scripts/check-test-only-calls.sh

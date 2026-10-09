@@ -9,10 +9,13 @@
 //! `HandshakeFailed` for a handshake, `SessionClosed` for a session.
 //!
 //! Bytes crossing to Swift are copied into Swift-owned memory, which this
-//! crate cannot wipe. Only `DeviceKeys::storage_bytes` returns secret bytes,
-//! and the Swift side hands them straight to the Keychain. On the way, `UniFFI`
-//! also lowers them into a `RustBuffer`, which is freed without being wiped:
-//! one more unwiped copy per Keychain write.
+//! crate cannot wipe, and `UniFFI` moves them through `RustBuffer`s and
+//! intermediate `Vec`s that it frees without wiping. So unwiped copies of the
+//! storage blob exist on every read (`restore` lifts it from a buffer) and
+//! every write (`storage_bytes` hands its `Vec` to `UniFFI`, which lowers it
+//! into a buffer), and of the pre-shared key on input. `Zeroizing` here wipes
+//! only the copies this crate owns. The threat model accepts this: exploiting
+//! it needs local memory access.
 #![allow(
     clippy::needless_pass_by_value,
     reason = "UniFFI lifts arguments from Swift as owned values"
@@ -58,7 +61,9 @@ impl DeviceKeys {
     /// The versioned blob the Keychain stores. Opaque: Swift stores and
     /// returns it, nothing more.
     pub fn storage_bytes(&self) -> Vec<u8> {
-        self.keys.storage_bytes().to_vec()
+        // Moved out rather than cloned, so this crate makes no copy of its
+        // own; the wiping wrapper is left holding an empty `Vec`.
+        std::mem::take(&mut *self.keys.storage_bytes())
     }
 
     pub fn device_id(&self) -> String {
@@ -127,9 +132,9 @@ impl PairingHandshake {
         self.message_1.clone()
     }
 
-    /// Reads the Mac's message 2. A frame of another type returns
-    /// `UnexpectedFrame` and leaves the handshake waiting; a real message 2
-    /// uses it up, whatever the outcome.
+    /// Reads the Mac's message 2. A frame of another type, or a message 2
+    /// answering another attempt, returns `UnexpectedFrame` and leaves the
+    /// handshake waiting; its own message 2 uses it up, whatever the outcome.
     pub fn respond(
         &self,
         phone_name: String,
@@ -286,9 +291,9 @@ impl Session {
         lock(&self.state, CryptoError::SessionClosed)?.seal(&envelope)
     }
 
-    /// See `PhoneSession::open`: `RecordRejected` before the first record
-    /// opens leaves the session as it was; after it, a record that does not
-    /// decrypt closes the session and returns `StreamBroken`.
+    /// See `PhoneSession::open`: a record for another session is
+    /// `StaleRecord` and changes nothing; one for this session that does not
+    /// decrypt closes it and returns `StreamBroken`.
     pub fn open(&self, record: Vec<u8>) -> Result<Option<Vec<u8>>, CryptoError> {
         lock(&self.state, CryptoError::SessionClosed)?.open(&record)
     }
@@ -316,6 +321,7 @@ impl Session {
 #[non_exhaustive]
 pub enum FrameKind {
     Pairing,
+    PairingReply,
     SessionRequest,
     SessionReply,
     Record,
@@ -328,10 +334,25 @@ pub enum FrameKind {
 pub fn frame_kind(tag: u8) -> Result<FrameKind, CryptoError> {
     Ok(match frame::kind_of_tag(tag)? {
         CoreFrameKind::Pairing => FrameKind::Pairing,
+        CoreFrameKind::PairingReply => FrameKind::PairingReply,
         CoreFrameKind::SessionRequest => FrameKind::SessionRequest,
         CoreFrameKind::SessionReply => FrameKind::SessionReply,
         CoreFrameKind::Record => FrameKind::Record,
     })
+}
+
+/// The longest frame any step accepts, so Swift can refuse a longer one before
+/// copying it into Rust.
+#[uniffi::export]
+pub fn max_frame_len() -> u32 {
+    u32::try_from(frame::MAX_FRAME_LEN).unwrap_or(u32::MAX)
+}
+
+/// `CryptoError::is_terminal`, so Swift asks Rust rather than keeping its own
+/// table of which errors use up their handshake or session.
+#[uniffi::export]
+pub fn crypto_error_is_terminal(error: CryptoError) -> bool {
+    error.is_terminal()
 }
 
 fn key(bytes: &[u8]) -> Result<[u8; KEY_LEN], CryptoError> {
@@ -548,10 +569,11 @@ mod tests {
             (2, FrameKind::SessionRequest),
             (3, FrameKind::SessionReply),
             (4, FrameKind::Record),
+            (5, FrameKind::PairingReply),
         ] {
             assert_eq!(frame_kind(tag), Ok(kind));
         }
-        for tag in [0, 5, u8::MAX] {
+        for tag in [0, 6, u8::MAX] {
             assert_eq!(frame_kind(tag), Err(CryptoError::UnexpectedFrame));
         }
     }

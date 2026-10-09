@@ -9,6 +9,12 @@
 
 use crate::CryptoError;
 use crate::fragment::MAX_RECORD_LEN;
+use crate::noise::ECHO_LEN;
+
+/// Longest frame any step accepts: the type byte, the longest prefix a frame
+/// carries before its Noise message (a reply's echo), and the longest Noise
+/// message. Anything longer is refused before anything is allocated for it.
+pub const MAX_FRAME_LEN: usize = 1 + ECHO_LEN + MAX_RECORD_LEN;
 
 /// Declares `FrameKind` and the list of every kind from one table, so a new
 /// kind is encoded by `tagged` and decoded by `kind` without a second edit.
@@ -29,7 +35,7 @@ macro_rules! frame_kinds {
 }
 
 frame_kinds! {
-    /// Any of the three pairing handshake messages.
+    /// The phone's pairing messages, 1 and 3.
     Pairing = 1,
     /// A phone opening a connection: `Noise_KK` message 1.
     SessionRequest = 2,
@@ -37,13 +43,18 @@ frame_kinds! {
     SessionReply = 3,
     /// An encrypted fragment on an established session.
     Record = 4,
+    /// The Mac's pairing message 2. Its own type, like `SessionReply`, so a
+    /// phone's message 1 sent back to it is refused by type rather than read
+    /// as the Mac's answer.
+    PairingReply = 5,
 }
 
 /// Classifies a frame without touching any handshake or session state. Fails
-/// for an empty frame, an unknown type, or a frame longer than any Noise
-/// message — the last is refused here, before anything is allocated for it.
+/// for an empty frame, an unknown type, or a frame longer than
+/// `MAX_FRAME_LEN` — the last is refused here, before anything is allocated
+/// for it.
 pub fn kind(frame: &[u8]) -> Result<FrameKind, CryptoError> {
-    if frame.len() > 1 + MAX_RECORD_LEN {
+    if frame.len() > MAX_FRAME_LEN {
         return Err(CryptoError::UnexpectedFrame);
     }
     kind_of_tag(*frame.first().ok_or(CryptoError::UnexpectedFrame)?)
@@ -107,7 +118,9 @@ mod tests {
             }
         }
         let mut oversize = vec![FrameKind::Record as u8];
-        oversize.resize(2 + MAX_RECORD_LEN, 0);
+        oversize.resize(MAX_FRAME_LEN + 1, 0);
         assert_eq!(kind(&oversize), Err(CryptoError::UnexpectedFrame));
+        oversize.truncate(MAX_FRAME_LEN);
+        assert_eq!(kind(&oversize), Ok(FrameKind::Record));
     }
 }

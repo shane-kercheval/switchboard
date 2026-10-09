@@ -2,16 +2,14 @@
 //! in-order stream from the Mac breaks. The Mac's half of the same routing is
 //! `DeviceSessions`.
 //!
-//! The phone has one session, so a record it cannot decrypt has nowhere else
-//! to go. Before the session has opened any record, such a record is ignored:
-//! after a reconnect the Mac keeps sending on its old session until the
-//! phone's first record confirms the new one, and the relay delivers those
-//! stale records first. The Mac then sends nothing more on the old session,
-//! and its first record on the new one is its `hello`. So after the first
-//! record opens, a record that does not decrypt means the stream is broken:
-//! the session closes and `open` returns `StreamBroken`. The phone's transport
-//! bounds the first window with a deadline (`has_opened_record`), since a
-//! damaged first record would otherwise leave it waiting.
+//! Every record names its session, so the phone needs no guess about where a
+//! record came from. A record naming another session — a leftover from the
+//! Mac's previous connection, which it may keep sending on until the phone's
+//! `hello` confirms the new one — is `StaleRecord` and ignored. A record
+//! naming this session that does not decrypt means the stream has a gap or a
+//! forgery: the session closes and `open` returns `StreamBroken`. The Mac
+//! answers `hello` at once, so the phone's transport ends a session that has
+//! opened no record within its deadline (`has_opened_record`).
 
 use crate::CryptoError;
 use crate::session::Session;
@@ -34,17 +32,17 @@ impl PhoneSession {
         self.session.seal(envelope)
     }
 
-    /// The envelope once its last record arrives, `None` before then.
-    /// `RecordRejected` before the first record opens leaves the session as it
-    /// was; after it, a record that does not decrypt closes the session and
-    /// returns `StreamBroken`. Every other outcome is `Session::open`'s.
+    /// The envelope once its last record arrives, `None` before then. A
+    /// record for another session is `StaleRecord` and changes nothing; one
+    /// for this session that does not decrypt closes it and returns
+    /// `StreamBroken`. Every other outcome is `Session::open`'s.
     pub fn open(&mut self, record: &[u8]) -> Result<Option<Vec<u8>>, CryptoError> {
         match self.session.open(record) {
             Ok(envelope) => {
                 self.opened_record = true;
                 Ok(envelope)
             }
-            Err(CryptoError::RecordRejected) if self.opened_record => {
+            Err(CryptoError::RecordRejected) => {
                 self.session.close();
                 Err(CryptoError::StreamBroken)
             }
@@ -87,19 +85,37 @@ mod tests {
         )
     }
 
+    /// Records from the Mac's old session are ignored whenever they arrive,
+    /// before the new session's first record or after it.
     #[test]
-    fn stale_records_before_the_first_open_are_ignored() {
+    fn records_for_another_session_are_ignored() {
         let (phone_keys, mac_keys) = keys();
         let (_, mut old) = connect(&phone_keys, &mac_keys);
         let (mut phone, mut new) = connect(&phone_keys, &mac_keys);
         for stale in old.seal(b"on the old session").unwrap() {
-            assert_eq!(phone.open(&stale), Err(CryptoError::RecordRejected));
+            assert_eq!(phone.open(&stale), Err(CryptoError::StaleRecord));
         }
         assert!(!phone.is_closed());
         assert!(!phone.has_opened_record());
         let record = new.seal(b"hello").unwrap().remove(0);
         assert_eq!(phone.open(&record), Ok(Some(b"hello".to_vec())));
         assert!(phone.has_opened_record());
+        let late = old.seal(b"late").unwrap().remove(0);
+        assert_eq!(phone.open(&late), Err(CryptoError::StaleRecord));
+        assert!(!phone.is_closed());
+    }
+
+    /// A damaged first record needs no deadline to be noticed: it names this
+    /// session, so it breaks the stream at once.
+    #[test]
+    fn a_damaged_first_record_breaks_the_stream() {
+        let (phone_keys, mac_keys) = keys();
+        let (mut phone, mut mac) = connect(&phone_keys, &mac_keys);
+        let mut record = mac.seal(b"hello").unwrap().remove(0);
+        let last = record.len() - 1;
+        record[last] ^= 1;
+        assert_eq!(phone.open(&record), Err(CryptoError::StreamBroken));
+        assert!(phone.is_closed());
     }
 
     /// A record lost in transit leaves the next a nonce ahead. Without this

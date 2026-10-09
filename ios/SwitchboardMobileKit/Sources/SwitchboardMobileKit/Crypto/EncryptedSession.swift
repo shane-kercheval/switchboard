@@ -16,7 +16,8 @@ public final class ConnectionHandshake: Sendable {
     /// attempt this handshake replaced, throws `unexpectedFrame` and leaves it
     /// waiting; its own reply uses it up.
     public func finish(message2: Data) throws(RemoteCryptoError) -> EncryptedSession {
-        EncryptedSession(session: try bridging { try handshake.finish(message2: message2) })
+        try FrameType.checkLength(of: message2)
+        return EncryptedSession(session: try bridging { try handshake.finish(message2: message2) })
     }
 }
 
@@ -28,11 +29,11 @@ public final class ConnectionHandshake: Sendable {
 /// across envelopes as well as within one. Seal and send from one place — a
 /// single queue with one consumer — never from several threads.
 ///
-/// Until a record opens, a record that does not decrypt (`recordRejected`) is
-/// a stale one from the Mac's previous session and is ignored; the transport
-/// gives up on a session that opens nothing within its deadline. After the
-/// first record opens, one that does not decrypt closes the session
-/// (`streamBroken`), and the transport reconnects.
+/// Every record names its session. One for another session — a leftover from
+/// the Mac's previous connection — is `staleRecord` and ignored. One for this
+/// session that does not decrypt closes it (`streamBroken`), and the transport
+/// reconnects. The Mac answers `hello` at once, so the transport gives up on a
+/// session that opens nothing within its deadline.
 public final class EncryptedSession: Sendable {
     private let session: Session
 
@@ -46,7 +47,8 @@ public final class EncryptedSession: Sendable {
 
     /// The envelope once its last record arrives, `nil` before then.
     public func open(_ record: Data) throws(RemoteCryptoError) -> Data? {
-        try bridging { try session.open(record: record) }
+        try FrameType.checkLength(of: record)
+        return try bridging { try session.open(record: record) }
     }
 
     /// Whether any record has decrypted yet. The transport ends a session that

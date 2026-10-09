@@ -73,8 +73,8 @@ pub(crate) const ECHO_LEN: usize = KEY_LEN;
 /// ignored, which it could do by dropping the reply.
 pub(crate) fn echo_of(message_1: &[u8]) -> Result<[u8; ECHO_LEN], CryptoError> {
     message_1
-        .get(..ECHO_LEN)
-        .and_then(|echo| <[u8; ECHO_LEN]>::try_from(echo).ok())
+        .first_chunk::<ECHO_LEN>()
+        .copied()
         .ok_or(CryptoError::HandshakeFailed)
 }
 
@@ -88,7 +88,10 @@ pub(crate) fn with_echo(echo: &[u8; ECHO_LEN], message: &[u8]) -> Vec<u8> {
 
 /// The handshake message in a reply to the attempt that sent `echo`. A reply
 /// to any other attempt is `UnexpectedFrame`, so the caller's handshake is
-/// untouched and still waiting.
+/// untouched and still waiting. This sorts honest late replies; it is not an
+/// authenticity check. The echo is public, so whoever saw message 1 can send
+/// garbage behind the right one, and that uses the handshake up — no more than
+/// dropping the real reply would cost.
 pub(crate) fn strip_echo<'a>(
     echo: &[u8; ECHO_LEN],
     body: &'a [u8],

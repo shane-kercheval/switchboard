@@ -1,5 +1,4 @@
 import Foundation
-import os
 internal import SwitchboardRemoteCrypto
 
 /// The Rust implementation from `crates/remote-crypto`, the same code the Mac
@@ -14,7 +13,7 @@ public struct RemoteCryptoBinding: ConfirmationCodeDeriving {
         } catch CryptoError.InvalidHandshakeHash(let length) {
             throw .invalidHandshakeHash(length: Int(clamping: length))
         } catch {
-            Logger.crypto.error("Unexpected error from the Rust library: \(String(describing: error), privacy: .private)")
+            logUnexpectedRustError(error)
             throw .bindingFailure
         }
     }

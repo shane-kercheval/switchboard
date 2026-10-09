@@ -3,8 +3,17 @@
 //! stream. The phone initiates. A new connection is a new handshake, so no
 //! key or nonce outlives it, and a record from an earlier connection never
 //! opens. The Mac routes a phone's records between its sessions with
-//! `DeviceSessions`.
+//! `DeviceSessions`; the phone keeps its one session in `PhoneSession`.
+//!
+//! Every record frame names its session: after the type byte comes an
+//! 8-byte id both sides derive from the handshake hash, then the Noise
+//! message. So each side knows which session a record belongs to without
+//! trying to decrypt it, and a record for a replaced session is recognized as
+//! stale rather than guessed at. The id is outside the encryption: a relay
+//! that rewrites it can only make the record fail, which it could do by
+//! dropping it.
 
+use sha2::{Digest, Sha256};
 use snow::{Builder, HandshakeState, TransportState};
 
 use crate::CryptoError;
@@ -15,6 +24,9 @@ use crate::noise::{self, ECHO_LEN, Peer, echo_of, read, strip_echo, with_echo, w
 
 const PATTERN: &str = "Noise_KK_25519_ChaChaPoly_SHA256";
 const PROLOGUE: &[u8] = b"switchboard session v1";
+const SESSION_ID_DOMAIN: &[u8] = b"switchboard session id v1";
+/// Length of the session id every record frame carries.
+pub const SESSION_ID_LEN: usize = 8;
 
 /// The phone's state after sending message 1. A frame of another type, or a
 /// reply to another attempt, leaves it waiting; any other failure, or
@@ -39,6 +51,7 @@ pub struct SessionInitiator {
 /// accepts the replay. It becomes confirmed when its first record opens.
 /// Treat an unconfirmed session as a candidate, never as "this phone is here".
 pub struct Session {
+    id: [u8; SESSION_ID_LEN],
     transport: TransportState,
     fragmenter: Fragmenter,
     reassembler: Reassembler,
@@ -104,13 +117,10 @@ impl Session {
         })?;
         let mut records = Vec::with_capacity(fragments.len());
         for fragment in fragments {
-            let mut record = vec![0u8; 1 + fragment.len() + TAG_LEN];
-            record[0] = FrameKind::Record as u8;
-            let Ok(len) = self.transport.write_message(&fragment, &mut record[1..]) else {
+            let Some(record) = self.seal_fragment(&fragment) else {
                 self.close();
                 return Err(CryptoError::SendFailed);
             };
-            record.truncate(1 + len);
             records.push(record);
         }
         Ok(records)
@@ -120,21 +130,23 @@ impl Session {
     /// arrives, `None` while it is still incomplete. The first record that
     /// decrypts confirms the session.
     ///
-    /// Failures say which kind they are, because a device's records may be
-    /// offered to more than one session:
+    /// Failures say which kind they are, so the caller can route and react:
     /// - `UnexpectedFrame`: not a record, or oversize. Nothing is touched.
-    /// - `RecordRejected`: did not decrypt here. Nothing is touched either — a
-    ///   failed decryption does not advance the nonce — because the record may
-    ///   belong to another session of the same device.
+    /// - `StaleRecord`: names another session. Nothing is touched.
+    /// - `RecordRejected`: names this session but did not decrypt. Nothing is
+    ///   touched — a failed decryption does not advance the nonce — and the
+    ///   caller decides what a broken stream means for it.
     /// - `ProtocolViolation`: decrypted, but broke the fragment rules. The
-    ///   session is closed; the record belongs to no other session.
+    ///   session is closed.
     pub fn open(&mut self, record: &[u8]) -> Result<Option<Vec<u8>>, CryptoError> {
         if self.state == State::Closed {
             return Err(CryptoError::SessionClosed);
         }
         // Checked, including the length, before allocating anything: the
         // record comes straight off the relay.
-        let record = frame::body(FrameKind::Record, record)?;
+        let record = frame::body(FrameKind::Record, record)?
+            .strip_prefix(self.id.as_slice())
+            .ok_or(CryptoError::StaleRecord)?;
         let mut fragment = vec![0u8; record.len()];
         let Ok(len) = self.transport.read_message(record, &mut fragment) else {
             return Err(CryptoError::RecordRejected);
@@ -145,6 +157,11 @@ impl Session {
             self.close();
             CryptoError::ProtocolViolation
         })
+    }
+
+    /// The id its record frames carry.
+    pub fn id(&self) -> [u8; SESSION_ID_LEN] {
+        self.id
     }
 
     /// Live and proven: confirmed, and not closed since.
@@ -158,6 +175,7 @@ impl Session {
 
     fn from_handshake(handshake: HandshakeState, state: State) -> Result<Self, CryptoError> {
         Ok(Self {
+            id: session_id(handshake.get_handshake_hash()),
             transport: handshake
                 .into_transport_mode()
                 .map_err(|_| CryptoError::HandshakeFailed)?,
@@ -172,19 +190,39 @@ impl Session {
         self.reassembler.reset();
     }
 
+    /// One record frame: type, session id, then `fragment` encrypted.
+    fn seal_fragment(&mut self, fragment: &[u8]) -> Option<Vec<u8>> {
+        let header = 1 + SESSION_ID_LEN;
+        let mut record = vec![0u8; header + fragment.len() + TAG_LEN];
+        record[0] = FrameKind::Record as u8;
+        record[1..header].copy_from_slice(&self.id);
+        let len = self
+            .transport
+            .write_message(fragment, &mut record[header..])
+            .ok()?;
+        record.truncate(header + len);
+        Some(record)
+    }
+
     /// A record encrypting `fragment` as-is, header and all: the only way to
     /// produce an authentic record that breaks the fragment rules.
     #[cfg(test)]
     pub(crate) fn seal_raw_fragment(&mut self, fragment: &[u8]) -> Vec<u8> {
-        let mut record = vec![0u8; 1 + fragment.len() + TAG_LEN];
-        record[0] = FrameKind::Record as u8;
-        let len = self
-            .transport
-            .write_message(fragment, &mut record[1..])
-            .unwrap();
-        record.truncate(1 + len);
-        record
+        self.seal_fragment(fragment).unwrap()
     }
+}
+
+/// The id both sides derive from the finished handshake. Different for every
+/// handshake, including one answering a replayed message 1, because the Mac's
+/// ephemeral key is fresh each time.
+fn session_id(handshake_hash: &[u8]) -> [u8; SESSION_ID_LEN] {
+    let digest = Sha256::new()
+        .chain_update(SESSION_ID_DOMAIN)
+        .chain_update(handshake_hash)
+        .finalize();
+    let mut id = [0u8; SESSION_ID_LEN];
+    id.copy_from_slice(&digest[..SESSION_ID_LEN]);
+    id
 }
 
 fn initiate_from(builder: Builder<'_>) -> Result<(SessionInitiator, Vec<u8>), CryptoError> {
@@ -246,7 +284,7 @@ mod tests {
     fn deliver(from: &mut Session, to: &mut Session, envelope: &[u8]) -> Option<Vec<u8>> {
         let mut result = None;
         for record in from.seal(envelope).unwrap() {
-            assert!(record.len() <= 1 + MAX_RECORD_LEN);
+            assert!(record.len() <= 1 + SESSION_ID_LEN + MAX_RECORD_LEN);
             result = to.open(&record).unwrap();
         }
         result
@@ -333,11 +371,11 @@ mod tests {
             respond(&mac_keys, &phone_keys.noise_public_key(), &message_1).unwrap();
         assert!(!replayed.is_confirmed());
 
+        // The replay's session has its own id, because the Mac's ephemeral
+        // key differs, so the real phone's records are not even offered to it.
+        assert_ne!(replayed.id(), real.id());
         let record = phone.seal(b"hello").unwrap().remove(0);
-        assert_eq!(
-            replayed.open(&record).err(),
-            Some(CryptoError::RecordRejected)
-        );
+        assert_eq!(replayed.open(&record).err(), Some(CryptoError::StaleRecord));
         assert!(!replayed.is_confirmed());
         // The failed attempt leaves the real session untouched, so the same
         // record still opens there.
@@ -349,7 +387,7 @@ mod tests {
     fn an_oversize_record_is_refused_before_anything_is_allocated_for_it() {
         let (mut phone, mut mac) = connect(&keys(1), &keys(2));
         let mut oversize = vec![FrameKind::Record as u8];
-        oversize.resize(2 + MAX_RECORD_LEN, 0);
+        oversize.resize(frame::MAX_FRAME_LEN + 1, 0);
         assert_eq!(
             mac.open(&oversize).err(),
             Some(CryptoError::UnexpectedFrame)
@@ -432,12 +470,15 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_record_is_rejected_and_leaves_the_session_open() {
+    fn an_empty_record_is_refused_and_leaves_the_session_open() {
         let (mut phone, mut mac) = connect(&keys(1), &keys(2));
         assert_eq!(
             mac.open(&[FrameKind::Record as u8]).err(),
-            Some(CryptoError::RecordRejected)
+            Some(CryptoError::StaleRecord)
         );
+        let mut id_only = vec![FrameKind::Record as u8];
+        id_only.extend_from_slice(&mac.id());
+        assert_eq!(mac.open(&id_only).err(), Some(CryptoError::RecordRejected));
         assert!(!mac.is_closed());
         assert_eq!(
             deliver(&mut phone, &mut mac, b"hello"),
@@ -543,7 +584,7 @@ mod tests {
         let (mut phone, mut mac) = connect(&keys(1), &keys(2));
         let record = phone.seal(b"hello").unwrap().remove(0);
         let mut tampered = record.clone();
-        tampered[1] ^= 1;
+        tampered[1 + SESSION_ID_LEN] ^= 1;
         assert_eq!(mac.open(&tampered).err(), Some(CryptoError::RecordRejected));
         assert!(!mac.is_closed());
         assert_eq!(mac.open(&record), Ok(Some(b"hello".to_vec())));
@@ -557,15 +598,20 @@ mod tests {
         assert_eq!(mac.open(&record).err(), Some(CryptoError::RecordRejected));
     }
 
+    /// A record from an earlier connection names that connection's session,
+    /// so it is recognized as stale without being decrypted.
     #[test]
-    fn a_record_from_an_earlier_connection_is_refused() {
+    fn a_record_from_an_earlier_connection_is_stale() {
         let (phone_keys, mac_keys) = (keys(1), keys(2));
         let (mut old_phone, _) = connect(&phone_keys, &mac_keys);
         let old_record = old_phone.seal(b"stale").unwrap().remove(0);
-        let (_, mut mac) = connect(&phone_keys, &mac_keys);
+        let (mut phone, mut mac) = connect(&phone_keys, &mac_keys);
+        assert_eq!(phone.id(), mac.id());
+        assert_ne!(old_phone.id(), mac.id());
+        assert_eq!(mac.open(&old_record).err(), Some(CryptoError::StaleRecord));
         assert_eq!(
-            mac.open(&old_record).err(),
-            Some(CryptoError::RecordRejected)
+            deliver(&mut phone, &mut mac, b"fresh"),
+            Some(b"fresh".to_vec())
         );
     }
 
@@ -585,7 +631,8 @@ mod tests {
     /// it catches a change to the pattern, prologue, frame type, or record
     /// layout; `snow` itself is checked against the published Noise test
     /// vectors. Each frame is its one-byte type followed by the Noise message;
-    /// the reply has message 1's ephemeral key between the two.
+    /// the reply has message 1's ephemeral key between the two, and the record
+    /// its session id.
     #[test]
     fn the_handshake_and_first_record_are_pinned() {
         let (phone_keys, mac_keys) = (keys(1), keys(2));
@@ -615,7 +662,7 @@ mod tests {
         );
         assert_eq!(
             hex(&phone.seal(b"pinned").unwrap()[0]),
-            "04d0a3c36bf810c91dc84648de70358b28b3078407f1ec69ae53a290ab8352"
+            "0463135ff072ea9ce7d0a3c36bf810c91dc84648de70358b28b3078407f1ec69ae53a290ab8352"
         );
     }
 }

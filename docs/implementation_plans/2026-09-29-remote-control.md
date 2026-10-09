@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 20 · **Created:** 2026-09-29 · **Revised:** 2026-10-09
+**Status:** proposed · **Revision:** 21 · **Created:** 2026-09-29 · **Revised:** 2026-10-09
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,25 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 21 (2026-10-09)** — Shane's review of the Swift binding (§3, §4, §5.4, §5.11, §7.2,
+  §7.6).
+  - **Every record names its session.** A record frame is now the type byte, an 8-byte session
+    id, then the Noise message. Both sides derive the id from the handshake hash, so it differs
+    for every handshake, a replayed one included. The Mac routes a record to the session it
+    names instead of trying the new session and then the old; the phone ignores a record for
+    another session (`StaleRecord`) and treats one for its own session that does not decrypt
+    as a broken stream at once. This replaces revision 17's first-record window and revision
+    19's rule that the Mac stop the old session's writer on promotion: a record from the old
+    session can now arrive at any time without harm. A record naming no session changes
+    nothing, and one that fails on the session it names drops only that session, so
+    `SessionsEnded` is gone. `DeviceSessions::open` reports whether a record promoted the
+    unconfirmed session. **This changes every record on the wire.** The id is
+    unauthenticated; a relay that rewrites it can only make the record fail.
+  - **Pairing message 2 has its own frame type, `5` (`PairingReply`).** Message 1 is exactly the
+    ephemeral key message 2 echoes, so with one type for all three messages the phone's own
+    message 1, sent back to it, passed the echo check and used the pairing up.
+  - Swift asks Rust whether an error is terminal (`CryptoError::is_terminal`), refuses an
+    oversize frame before copying it into Rust, and the `ffi` module is private to the crate.
 - **Revision 20 (2026-10-09)** — third review of the Swift binding (§3, §4, §5.4, §5.11, §7.2,
   §7.3, §7.6).
   - **A handshake reply names the attempt it answers.** The connection reply and pairing
@@ -523,9 +542,10 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
   handshake; another handshake's code matches only by chance, about one in a million.
 - `session` — the `KK` handshake and the resulting transport: `seal(envelope) -> Vec<Record>`,
   `open(record) -> Option<Envelope>`. Handshake payloads are empty, and the prologue is
-  `switchboard session v1`. A record that does not decrypt — tampered, repeated, out of
-  order, or from an earlier connection — changes nothing, because a failed decryption does not
-  advance the nonce and the record may be another session's (§5.4). A record that decrypts but
+  `switchboard session v1`. A record that does not decrypt — tampered, repeated, or out of
+  order — changes the session in no way, because a failed decryption does not advance the
+  nonce; its caller treats it as a broken stream (§5.4). A record from an earlier connection
+  names that connection's session and is refused as stale without being decrypted. A record that decrypts but
   breaks the fragment rules closes the session for good: every later call returns
   `SessionClosed`, and the caller reconnects with a new handshake. A closed session is never
   confirmed. An envelope above the size limit is refused without closing the session, and a record over the
@@ -534,9 +554,12 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
   is not: whoever saw a message 1 can replay it, and `respond` accepts the replay. The Mac's
   session becomes confirmed when its first record decrypts (§5.4). Every frame carries its
   type (§4), and each step and `open` refuse another type without touching any state; a
-  handshake step so refused keeps waiting for its real message. `open` distinguishes a record
-  that did not decrypt (`RecordRejected`, nothing changed) from one that decrypted but broke
-  the fragment rules (`ProtocolViolation`, the session closed).
+  handshake step so refused keeps waiting for its real message. Every record frame also names
+  its session with an 8-byte id derived from the handshake hash (§4). `open` distinguishes a
+  record for another session (`StaleRecord`, nothing changed), one for this session that did
+  not decrypt (`RecordRejected`, nothing changed; its caller treats it as a broken stream),
+  and one that decrypted but broke the fragment rules (`ProtocolViolation`, the session
+  closed).
 - `fragment` — splits a serialized envelope into records that each fit the Noise limit
   (65,535 bytes on the wire, so 65,519 bytes of plaintext after the tag). Each record's header —
   message id, index, count — is inside the encrypted payload, so it is authenticated. Records
@@ -555,9 +578,10 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
   other.
 
 **`DeviceSessions`.** The Mac's container for one phone's sessions, owning §5.4's routing
-rule: `accept_handshake` creates the unconfirmed session; `open` offers a record to the
-unconfirmed session, then the confirmed one, promotes on success, drops a session on a
-`ProtocolViolation`, and ends both (`SessionsEnded`) when neither opens it; `seal` uses only
+rule: `accept_handshake` creates the unconfirmed session; `open` gives a record to the session
+its id names, reports whether it promoted the unconfirmed one, returns `StaleRecord` without
+change when it names neither, and drops only the named session on a record that does not
+decrypt (`StreamBroken`) or is malformed (`ProtocolViolation`); `seal` uses only
 the confirmed session (`NotConnected` without one); `expire_unconfirmed` drops a candidate.
 It is synchronous and does no I/O, so every branch is tested here.
 
@@ -603,13 +627,19 @@ and `ios/scripts/check-test-only-calls.sh` fails `make check-ios` if any Swift o
 tests names the generated `MacPairingHandshake` class or `accept_session` function. That
 check is a grep for the names, not a module boundary: the xcframework ships both to the app,
 and a Mac-only export added later must be added to it. Bytes returned to
-Swift are Swift-owned and cannot be wiped by this crate; only the storage blob is secret, and
-Swift hands it straight to the Keychain. `UniFFI` also lowers it into a `RustBuffer` that is
-freed unwiped: one more copy per Keychain write. The phone's session adds one rule to the
-core's, in `phone::PhoneSession`, which the binding's `Session` wraps in a lock: a record that
-does not decrypt is ignored until the session has opened a record, and afterwards closes it
-with `StreamBroken` (revision 17); `has_opened_record` lets the transport bound the first
-window. `frame_kind` takes only a frame's first byte. Keychain access stays in Swift.
+Swift are Swift-owned and cannot be wiped by this crate, and `UniFFI` moves bytes through
+`RustBuffer`s and intermediate `Vec`s it frees unwiped. So unwiped copies of the storage blob
+exist on every Keychain read (`restore`) and write (`storage_bytes`), and of the pre-shared key
+on input; `Zeroizing` wipes only the copies the crate owns. The threat model accepts this:
+exploiting it needs local memory access. The phone's session adds one rule to the core's, in
+`phone::PhoneSession`, which the binding's `Session` wraps in a lock: a record for another
+session is ignored (`StaleRecord`), and one for this session that does not decrypt closes it
+with `StreamBroken`; `has_opened_record` lets the transport bound the wait for the Mac's
+`hello`. `frame_kind` takes only a frame's first byte, and the Swift wrappers refuse a frame
+longer than `max_frame_len` before copying it into Rust. `crypto_error_is_terminal` lets Swift
+ask Rust which errors use up their handshake or session. The `ffi` module is private to the
+crate: `UniFFI` exports its functions regardless, and the Mac's crate cannot reach the
+phone-only `Session`. Keychain access stays in Swift.
 
 **Tests**
 
@@ -639,15 +669,21 @@ and `record`; the relay stamps `from` with the sender's registered device id and
 client-supplied value. Handshake messages and transport records travel the same way.
 
 **Frame body** — `record` is produced and parsed only by `remote-crypto` (§3). Its first byte
-is the frame type: `1` pairing message, `2` connection request (`KK` message 1), `3`
-connection reply (`KK` message 2), `4` record. The Noise message follows. The two replies — the
-connection reply, and pairing message 2 — put an echo between the two: the 32-byte ephemeral
-public key that starts message 1 in the clear, fresh per attempt. So the pairing frame's body
-depends on which message it is: messages 1 and 3 carry the Noise message alone. The phone
-compares the echo before reading a reply, so a reply to an attempt it abandoned, or to a
-replayed request, is refused as `UnexpectedFrame` and its waiting handshake is untouched. The
-type byte and the echo are outside the encryption; a relay that changes either only makes the
-frame fail or be ignored. Relay-level data — the
+is the frame type: `1` the phone's pairing messages 1 and 3, `2` connection request (`KK`
+message 1), `3` connection reply (`KK` message 2), `4` record, `5` the Mac's pairing message 2.
+Each reply has its own type, so a request sent back to its sender is refused by type: pairing
+message 1 is exactly the key its reply echoes, so it would otherwise pass the echo check. The
+Noise message follows the type, with one prefix in between for some types. The two replies
+carry an echo: the 32-byte ephemeral public key that starts message 1 in the clear, fresh per
+attempt. The phone compares it before reading a reply, so a reply to an attempt it abandoned,
+or to a replayed request, is refused as `UnexpectedFrame` and its waiting handshake is
+untouched. A record carries its session id: 8 bytes of a domain-separated SHA-256 of the
+handshake hash, the same on both sides and different for every handshake, a replayed one
+included. Each side gives a record to the session it names, so a record from a replaced
+connection is recognized as stale (`StaleRecord`) rather than guessed at. The type byte, the
+echo, and the session id are outside the encryption; a relay that changes any of them only
+makes the frame fail or be ignored. No frame is longer than `max_frame_len`: the type byte,
+the 32-byte echo, and one 65,535-byte Noise message. Relay-level data — the
 pairing token above all, which the relay must read to decide whether to forward a pairing
 frame (§6) — is a field of `Frame`, never part of these bytes.
 
@@ -766,19 +802,18 @@ unconfirmed one, never the confirmed one (§3: message 1 may be a replay). A dev
 most one confirmed and one unconfirmed session. Frames are routed by their type (§4): a
 connection request starts a handshake and is never offered to a session; a record is never
 offered to a handshake. Each record goes to the unconfirmed session first, then to the
-confirmed one, and `open`'s outcome decides what happens:
+confirmed one, and `open`'s outcome decides what happens. Each record names its session (§4),
+so only that session is ever offered it:
 - **It opens:** on the unconfirmed session, that session is confirmed and replaces the old
-  one; on the confirmed session, nothing else changes. A phone that reconnects with records
-  still in flight on its old keys therefore loses none of them: each is rejected by the new
-  session, harmlessly, and opens on the old one.
-- **`RecordRejected`** (did not decrypt): nothing changed — a failed decryption does not
-  advance `snow`'s nonce — so the record goes to the next session. A record that **no**
-  session of the device opens means its stream is broken (a lost or forged record), and the
-  device's sessions end.
-- **`ProtocolViolation`** (decrypted, but malformed): that session is closed and the record
-  is **not** offered to another, since it belongs to no other session. If it was the
-  unconfirmed one, the confirmed session is kept; if the phone has really moved on, it ends
-  as any session does.
+  one, and `open` says so (`promoted`); on the confirmed session, nothing else changes. A
+  phone that reconnects with records still in flight on its old keys therefore loses none of
+  them: each names the old session and opens there.
+- **`StaleRecord`** (names neither session): nothing changes.
+- **`StreamBroken`** (names a session but did not decrypt): that session's in-order stream has
+  a gap or a forgery, so that session alone is dropped.
+- **`ProtocolViolation`** (decrypted, but malformed): that session alone is dropped. If it
+  was the unconfirmed one, the confirmed session is kept; if the phone has really moved on,
+  it ends as any session does.
 - **`UnexpectedFrame`** (wrong type, or oversize): the frame is dropped and no session is
   touched.
 
@@ -787,16 +822,12 @@ envelope, `hello`, confirms it at once. A replayed handshake therefore costs the
 nothing; the relay can still end any session, by sending one bad record of the right type,
 which §2 accepts.
 
-When the unconfirmed session is promoted, the replaced session's writer is stopped before
-anything is sent on the new one, and nothing is ever sent on the replaced session again; an
-envelope half-sent on it is dropped, not finished. The phone's session treats a record it
-cannot decrypt after its first open as a broken stream (§3), so an old-session record that
-followed a new one would end the phone's fresh session. Nothing new recovers the dropped
-envelope: an event is recovered when the phone reloads the tail after reconnecting (§7.4),
-and a reply is lost as any reply is on a reconnect, with `send_message`'s outcome recovered
-by `send_receipt` (§7.2). The new session's first record is the Mac's answer to the phone's
-`hello` (§4), queued once the old writer has stopped; old-session records already queued
-ahead of it are harmless, since the phone ignores records until one opens on its new session.
+After a promotion, records the Mac sends on the replaced session, however late, name that
+session, and the phone ignores them (`StaleRecord`); there is no ordering rule between the
+two sessions' writers. An envelope cut short on the replaced session is lost: an event is
+recovered when the phone reloads the tail after reconnecting (§7.4), and a reply is lost as
+any reply is on a reconnect, with `send_message`'s outcome recovered by `send_receipt` (§7.2).
+The Mac answers the phone's `hello` on the new session at once (§4).
 
 Records are opened here and only plaintext envelopes leave the module. A transport record from a device
 with no session cannot be opened, so it is discarded without a reply; that includes records
@@ -1069,10 +1100,10 @@ It forwards everything unchanged, then:
   its own lease, and a connected session holding the lease on battery with the preference off;
   reset identity revokes every row and sends the empty set before the connection is
   dropped, then deletes both keys.
-- Unit: `SessionManager` — pause a multi-record send on the confirmed session, promote the
-  unconfirmed one, and assert the paused writer sends no further record on the replaced
-  session; promotion's first record on the new session is the answer to `hello`, and a
-  `hello` with another `protocol_version` is answered `protocol_mismatch`.
+- Unit: `SessionManager` — the phone's `hello` on a new session is answered at once on that
+  session, and a `hello` with another `protocol_version` is answered `protocol_mismatch`; a
+  send in progress on the replaced session when the new one is promoted does not disturb the
+  new one.
 - Fixture-driven: `RequestHandler` against the mock backend (a send calls
   `ensure_project_loaded` before validating recipients, an unknown recipient dispatches
   nothing, idempotent repeat, concurrent repeat, partial fan-out rejection, a request-level
@@ -1221,10 +1252,11 @@ though the phone cannot send attachments.
   the handshake needs are readable only while the phone is unlocked (§2). On
   `peer_disconnected` for the paired Mac it discards the session and retries the handshake
   with the same backoff. A session that has opened no record within 10 seconds of its
-  handshake is discarded and the handshake retried, since a damaged or lost first record
-  would otherwise leave it waiting. The deadline waits for any record to open, not for a
+  handshake is discarded and the handshake retried, since a lost `hello` or a lost answer to
+  it would otherwise leave it waiting. The deadline waits for any record to open, not for a
   particular envelope; the Mac answers `hello` at once (§4), so a live, idle session always
-  opens one. A handshake whose reply has not arrived within 10 seconds
+  opens one. A damaged record needs no deadline: it names this session, so it is
+  `streamBroken` at once, and a record for another session is `staleRecord` and ignored. A handshake whose reply has not arrived within 10 seconds
   of sending message 1 is abandoned and retried the same way, so a lost reply does not leave
   the phone connecting forever. Each deadline belongs to one attempt: one that fires after a
   newer attempt has started is ignored, and so is a reply to an abandoned attempt: the
@@ -1327,8 +1359,8 @@ though the phone cannot send attachments.
   unavailable, edit during authentication); a test that both configurations' Info.plists
   carry the camera and Face ID usage descriptions.
 - Coordinator: `RelayTransport`'s session deadline — a session whose first record never
-  opens is discarded after 10 seconds and the handshake retried; a stale record before the
-  first open does not end the session; every `isTerminal` error from the session or its
+  opens is discarded after 10 seconds and the handshake retried; a stale record, before or
+  after the first open, does not end the session; every `isTerminal` error from the session or its
   handshake starts a new handshake, and repeated stream breaks back off rather than looping;
   a connected, idle session survives past 10 seconds, because the Mac's answer to `hello`
   opens.

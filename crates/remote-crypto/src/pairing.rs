@@ -2,10 +2,13 @@
 //! Mac's QR code. The phone initiates; three messages:
 //!
 //! 1. phone → Mac: empty payload (nothing is encrypted yet).
-//! 2. Mac → phone: version, the Mac's name. Only this frame's body starts
-//!    with an echo of message 1's ephemeral key, ahead of the Noise message,
-//!    so the phone can tell its own reply from one to an attempt it gave up
-//!    on; messages 1 and 3 are the Noise message alone.
+//! 2. Mac → phone: version, the Mac's name. Only this frame has its own type,
+//!    `PairingReply`, and only its body starts with an echo of message 1's
+//!    ephemeral key, ahead of the Noise message, so the phone can tell its own
+//!    reply from one to an attempt it gave up on. Messages 1 and 3 are
+//!    `Pairing` frames holding the Noise message alone. The separate type
+//!    matters: message 1 is exactly that ephemeral key, so without it the
+//!    phone's own message 1, sent back to it, would pass the echo check.
 //! 3. phone → Mac: version, the phone's Ed25519 identity key, a signature
 //!    binding that identity key to the phone's Noise key and this handshake,
 //!    the phone's name.
@@ -75,7 +78,9 @@ pub struct PhoneAwaitingResponse {
 }
 
 /// The Mac's state after sending message 2. Like `PhoneAwaitingResponse`, a
-/// frame of another type leaves it waiting.
+/// frame of another type leaves it waiting. Any `Pairing` frame — message 3,
+/// a replayed message 1, or garbage — is read as message 3 and uses it up:
+/// no more than dropping the real message 3 would cost.
 pub struct MacAwaitingFinish {
     handshake: Option<HandshakeState>,
     /// The hash as it stood before message 3, which the phone's binding
@@ -121,7 +126,7 @@ impl PhoneAwaitingResponse {
     }
 
     fn read_message_2(&mut self, message_2: &[u8]) -> Result<Message2, CryptoError> {
-        let message_2 = strip_echo(&self.echo, frame::body(FrameKind::Pairing, message_2)?)?;
+        let message_2 = strip_echo(&self.echo, frame::body(FrameKind::PairingReply, message_2)?)?;
         let mut handshake = self.handshake.take().ok_or(CryptoError::HandshakeFailed)?;
         let payload = read(&mut handshake, message_2)?;
         let mac_key = remote_static(&handshake)?;
@@ -236,7 +241,7 @@ fn mac_respond_from(
             hash_before_message_3,
         },
         frame::tagged(
-            FrameKind::Pairing,
+            FrameKind::PairingReply,
             &with_echo(&echo_of(message_1)?, &message_2),
         ),
     ))
@@ -456,6 +461,9 @@ mod tests {
         .unwrap();
         let (paired_mac, message_3) = phone.respond("Phone", &message_2).unwrap();
         mac.finish(&message_3).unwrap();
+        assert_eq!(message_1[0], FrameKind::Pairing as u8);
+        assert_eq!(message_2[0], FrameKind::PairingReply as u8);
+        assert_eq!(message_3[0], FrameKind::Pairing as u8);
         assert_eq!(
             message_2[1..=ECHO_LEN],
             message_1[1..=ECHO_LEN],
@@ -522,6 +530,26 @@ mod tests {
             );
         }
         let (_, message_3) = phone.respond("Phone", &message_2).unwrap();
+        assert!(mac.finish(&message_3).is_ok());
+    }
+
+    /// The phone's message 1 is exactly the ephemeral key the Mac echoes, so
+    /// if it came back as a reply it would pass the echo check; its frame type
+    /// refuses it first, and the pairing then completes.
+    #[test]
+    fn the_phones_own_message_1_sent_back_leaves_it_waiting() {
+        let party = party();
+        let (mut phone, message_1) = phone_start(&party.phone, &offer(&party)).unwrap();
+        let (mut mac, message_2) = mac_respond(&party.mac, &party.psk, "Mac", &message_1).unwrap();
+        assert_eq!(
+            phone.respond("Phone", &message_1).err(),
+            Some(CryptoError::UnexpectedFrame)
+        );
+        let (_, message_3) = phone.respond("Phone", &message_2).unwrap();
+        assert_eq!(
+            mac.finish(&message_2).err(),
+            Some(CryptoError::UnexpectedFrame)
+        );
         assert!(mac.finish(&message_3).is_ok());
     }
 

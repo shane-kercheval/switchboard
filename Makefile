@@ -212,6 +212,7 @@ ios-crypto:
 # time) is unchanged; `check` is therefore no longer everything CI runs.
 check-ios:
 	ios/scripts/check-binding-imports.sh
+	ios/scripts/check-test-only-calls.sh
 	@test -n "$(IOS_SIMULATOR_ID)" || { echo "No available iPhone simulator. Install one in Xcode, or pass IOS_SIMULATOR_ID=<udid>."; exit 1; }
 	$(MAKE) ios-crypto
 	xcodebuild test -quiet -project $(IOS_PROJECT) -scheme SwitchboardMobile -configuration Debug \

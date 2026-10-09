@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 17 · **Created:** 2026-09-29 · **Revised:** 2026-10-08
+**Status:** proposed · **Revision:** 18 · **Created:** 2026-09-29 · **Revised:** 2026-10-08
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,17 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 18 (2026-10-09)** — review of the Swift binding (§3, §7.2, §7.6).
+  - Every error that ends the phone's session — `streamBroken`, `protocolViolation`,
+    `sendFailed`, `sessionClosed`, a binding failure — reports `endsSession`, and the transport
+    reconnects on any of them **with the same backoff** as `peer_disconnected`, not at once.
+    Revision 17's "at once" let a relay that injects one bad record after each reconnect drive
+    the phone into a tight handshake loop. Ending the session itself stays: a stream that has
+    missed a record cannot recover, and §2 already accepts that the relay can end sessions.
+  - The Mac's half of pairing, `MacPairingHandshake`, is exported for tests like
+    `accept_session`, so pairing round-trips in Swift: two of the phone's result fields are
+    `Data`, and a swapped mapping would otherwise surface only at the first real pairing.
+    `make check-ios` fails if anything outside the tests calls either Mac half.
 - **Revision 17 (2026-10-08)** — review of the Swift binding (§3, §7.2, §7.6).
   - **The phone's session ends when its in-order stream breaks.** The phone has one session,
     so a record it cannot decrypt has nowhere else to go. Before its first record opens, such
@@ -550,8 +561,10 @@ crosses: the `ffi` module exports opaque `DeviceKeys` (generate, restore, storag
 id, public keys, relay-challenge signature), `PairingHandshake` (message 1, then `respond`
 returning the Mac's key and name, the confirmation code, and message 3), `SessionHandshake`
 (message 1, then `finish` returning a `Session`), `Session` (`seal`, `open`, `is_closed`), and
-`frame_kind`, each over the unchanged core. `accept_session`, the Mac's half of a session
-handshake, is exported only so the Swift round trip can run on the device. Bytes returned to
+`frame_kind`, each over the unchanged core. `accept_session` and `MacPairingHandshake`, the Mac's
+halves of the session and pairing handshakes, are exported only so the Swift round trips can
+run on the device; `ios/scripts/check-test-only-calls.sh` fails `make check-ios` if anything
+outside the tests calls them. Bytes returned to
 Swift are Swift-owned and cannot be wiped by this crate; only the storage blob is secret, and
 Swift hands it straight to the Keychain. `UniFFI` also lowers it into a `RustBuffer` that is
 freed unwiped: one more copy per Keychain write. The phone's `Session` adds one rule to the
@@ -1144,7 +1157,10 @@ though the phone cannot send attachments.
   `peer_disconnected` for the paired Mac it discards the session and retries the handshake
   with the same backoff. A session that has opened no record within 10 seconds of its
   handshake is discarded and the handshake retried, since a damaged or lost first record
-  would otherwise leave it waiting; `streamBroken` from `open` does the same at once. It routes frames by type (§4) and ignores a connection reply when it
+  would otherwise leave it waiting. Any error whose `endsSession` is true — `streamBroken`,
+  `protocolViolation`, `sendFailed`, `sessionClosed` — does the same. All of these retry with
+  the same backoff, so a relay that keeps injecting bad records cannot spin the phone in a
+  handshake loop. It routes frames by type (§4) and ignores a connection reply when it
   is not waiting for one — the Mac sends one in answer to a replayed request — without
   touching its session.
 - **Local relay in development.** iOS App Transport Security blocks plain `ws://`, and iOS asks
@@ -1231,7 +1247,8 @@ though the phone cannot send attachments.
   carry the camera and Face ID usage descriptions.
 - Coordinator: `RelayTransport`'s session deadline — a session whose first record never
   opens is discarded after 10 seconds and the handshake retried; a stale record before the
-  first open does not end the session; `streamBroken` reconnects at once.
+  first open does not end the session; every `endsSession` error reconnects, and repeated
+  stream breaks back off rather than looping.
 - Coordinator: `SecureSession`'s outbound queue — suspend the first envelope's send, submit a
   second envelope, and assert every record of the first is transmitted before any of the
   second.

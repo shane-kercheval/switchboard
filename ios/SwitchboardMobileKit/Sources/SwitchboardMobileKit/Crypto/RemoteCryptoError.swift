@@ -31,6 +31,18 @@ public enum RemoteCryptoError: Error, Equatable, Sendable {
     /// panic or a binding built from a different version of the crate.
     case bindingFailure
 
+    /// Whether the session this error came from is finished: discard it and
+    /// reconnect, with backoff. The other errors leave the session usable.
+    public var endsSession: Bool {
+        switch self {
+        case .streamBroken, .protocolViolation, .sendFailed, .sessionClosed, .bindingFailure:
+            true
+        case .invalidKeyBlob, .invalidKey, .randomnessUnavailable, .handshakeFailed, .unexpectedPeerKey,
+            .invalidPayload, .messageTooLarge, .unexpectedFrame, .recordRejected:
+            false
+        }
+    }
+
     init(rustError error: any Error) {
         switch error {
         case CryptoError.InvalidKeyBlob: self = .invalidKeyBlob

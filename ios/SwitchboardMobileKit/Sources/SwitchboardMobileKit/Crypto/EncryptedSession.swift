@@ -38,8 +38,7 @@ public final class EncryptedSession: Sendable {
 
     /// The Mac's half of a connection, for tests only: it lets them run a real
     /// round trip through the same code the Mac runs. The app never plays the
-    /// Mac. `internal` only keeps it out of the public API, so keep it that
-    /// way and never call it from production code.
+    /// Mac. `make check-ios` fails if anything outside the tests calls it.
     static func accept(
         macKeys: PhoneKeys,
         phoneNoisePublicKey: Data,

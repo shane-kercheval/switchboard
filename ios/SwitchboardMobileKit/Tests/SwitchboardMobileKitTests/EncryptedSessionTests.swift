@@ -110,6 +110,41 @@ struct EncryptedSessionTests {
         #expect(throws: RemoteCryptoError.invalidKeyBlob) { try PhoneKeys(restoringFrom: Data([2, 0, 0])) }
     }
 
+    /// Both halves through the binding, so a field mapped to the wrong place
+    /// on either side — two of them are `Data` — fails here, not at the first
+    /// real pairing.
+    @Test func pairingRoundTripsAndBothSidesShowTheSameCode() throws {
+        let phoneKeys = try PhoneKeys.generate()
+        let macKeys = try PhoneKeys.generate()
+        let preSharedKey = Data(repeating: 7, count: 32)
+        let phone = try PhonePairing(keys: phoneKeys, macNoisePublicKey: macKeys.noisePublicKey, preSharedKey: preSharedKey)
+        let mac = try MacPairing(macKeys: macKeys, preSharedKey: preSharedKey, macName: "Studio Mac", message1: phone.message1)
+        let response = try phone.respond(phoneName: "Jo's iPhone", message2: mac.message2)
+        let candidate = try mac.finish(message3: response.message3)
+
+        #expect(response.macNoisePublicKey == macKeys.noisePublicKey)
+        #expect(response.macName == "Studio Mac")
+        #expect(candidate.phoneNoisePublicKey == phoneKeys.noisePublicKey)
+        #expect(candidate.phoneIdentityPublicKey == phoneKeys.identityPublicKey)
+        #expect(candidate.phoneName == "Jo's iPhone")
+        #expect(candidate.confirmationCode == response.confirmationCode)
+        #expect(response.confirmationCode.count == 6)
+    }
+
+    @Test func onlySessionEndingErrorsSayTheyEndTheSession() {
+        let ending: [RemoteCryptoError] = [.streamBroken, .protocolViolation, .sendFailed, .sessionClosed, .bindingFailure]
+        let recoverable: [RemoteCryptoError] = [
+            .invalidKeyBlob, .invalidKey, .randomnessUnavailable, .handshakeFailed, .unexpectedPeerKey,
+            .invalidPayload, .messageTooLarge(length: 1), .unexpectedFrame, .recordRejected,
+        ]
+        for error in ending {
+            #expect(error.endsSession, "\(error)")
+        }
+        for error in recoverable {
+            #expect(!error.endsSession, "\(error)")
+        }
+    }
+
     @Test func pairingRefusesKeysOfTheWrongLength() throws {
         let keys = try PhoneKeys.generate()
         #expect(throws: RemoteCryptoError.invalidKey) {

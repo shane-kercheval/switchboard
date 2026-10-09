@@ -24,7 +24,7 @@ use zeroize::Zeroizing;
 
 use crate::frame::{self, FrameKind as CoreFrameKind};
 use crate::keys::{DeviceKeys as CoreKeys, KEY_LEN};
-use crate::pairing::{self, PSK_LEN, PairingOffer, PhoneAwaitingResponse};
+use crate::pairing::{self, MacAwaitingFinish, PSK_LEN, PairingOffer, PhoneAwaitingResponse};
 use crate::session::{self, Session as CoreSession, SessionInitiator};
 use crate::{CryptoError, confirmation_code};
 
@@ -142,6 +142,63 @@ impl PairingHandshake {
             mac_name: mac.name,
             confirmation_code: confirmation_code(mac.handshake_hash.to_vec())?,
             message_3,
+        })
+    }
+}
+
+/// The Mac's half of pairing. The iPhone app never plays the Mac; this exists
+/// so the binding's pairing round trip can be tested on the device, through
+/// the same code the Mac runs.
+#[derive(uniffi::Object)]
+pub struct MacPairingHandshake {
+    state: Mutex<MacAwaitingFinish>,
+    message_2: Vec<u8>,
+}
+
+/// What the Mac learns from the phone's message 3. Not trusted yet: the Mac
+/// trusts the phone only once the user types the phone's code and it matches
+/// `confirmation_code`.
+#[derive(uniffi::Record)]
+pub struct PhoneCandidate {
+    pub phone_noise_public_key: Vec<u8>,
+    pub phone_identity_public_key: Vec<u8>,
+    pub phone_name: String,
+    pub confirmation_code: String,
+}
+
+#[uniffi::export]
+impl MacPairingHandshake {
+    /// Answers a phone's message 1 with this Mac's name.
+    #[uniffi::constructor]
+    pub fn new(
+        keys: Arc<DeviceKeys>,
+        psk: Vec<u8>,
+        mac_name: String,
+        message_1: Vec<u8>,
+    ) -> Result<Arc<Self>, CryptoError> {
+        let psk = Zeroizing::new(psk);
+        let psk = <[u8; PSK_LEN]>::try_from(psk.as_slice()).map_err(|_| CryptoError::InvalidKey)?;
+        let psk = Zeroizing::new(psk);
+        let (state, message_2) = pairing::mac_respond(&keys.keys, &psk, &mac_name, &message_1)?;
+        Ok(Arc::new(Self {
+            state: Mutex::new(state),
+            message_2,
+        }))
+    }
+
+    pub fn message_2(&self) -> Vec<u8> {
+        self.message_2.clone()
+    }
+
+    /// Reads the phone's message 3. A real message 3 uses the handshake up,
+    /// whatever the outcome.
+    pub fn finish(&self, message_3: Vec<u8>) -> Result<PhoneCandidate, CryptoError> {
+        let candidate = lock(&self.state, CryptoError::HandshakeFailed)?.finish(&message_3)?;
+        Ok(PhoneCandidate {
+            phone_noise_public_key: candidate.noise_public_key.to_vec(),
+            phone_identity_public_key: candidate.identity_public_key.to_bytes().to_vec(),
+            phone_name: candidate.name,
+            confirmation_code: confirmation_code(candidate.handshake_hash.to_vec())?,
         })
     }
 }
@@ -558,5 +615,42 @@ mod tests {
         assert_eq!(phone.open(third.clone()), Err(CryptoError::StreamBroken));
         assert!(phone.is_closed());
         assert_eq!(phone.open(third), Err(CryptoError::SessionClosed));
+    }
+
+    #[test]
+    fn pairing_round_trips_through_both_ffi_halves() {
+        let phone_keys = DeviceKeys::generate().unwrap();
+        let mac_keys = DeviceKeys::generate().unwrap();
+        let psk = vec![7u8; PSK_LEN];
+        let phone =
+            PairingHandshake::new(phone_keys.clone(), mac_keys.noise_public_key(), psk.clone())
+                .unwrap();
+        let mac = MacPairingHandshake::new(
+            mac_keys.clone(),
+            psk,
+            "Studio Mac".into(),
+            phone.message_1(),
+        )
+        .unwrap();
+        let response = phone
+            .respond("Jo's iPhone".into(), mac.message_2())
+            .unwrap();
+        let candidate = mac.finish(response.message_3.clone()).unwrap();
+        assert_eq!(response.mac_noise_public_key, mac_keys.noise_public_key());
+        assert_eq!(response.mac_name, "Studio Mac");
+        assert_eq!(
+            candidate.phone_noise_public_key,
+            phone_keys.noise_public_key()
+        );
+        assert_eq!(
+            candidate.phone_identity_public_key,
+            phone_keys.identity_public_key()
+        );
+        assert_eq!(candidate.phone_name, "Jo's iPhone");
+        assert_eq!(candidate.confirmation_code, response.confirmation_code);
+        assert_eq!(
+            mac.finish(response.message_3).err(),
+            Some(CryptoError::HandshakeFailed)
+        );
     }
 }

@@ -20,10 +20,13 @@ public final class ConnectionHandshake: Sendable {
     }
 }
 
-/// An established, encrypted connection. Safe to call from any thread: one
-/// `seal` produces all of an envelope's records at once. The caller must still
-/// transmit them in the order returned and finish one envelope's records
-/// before the next's.
+/// An established, encrypted connection. Safe to call from any thread, in that
+/// concurrent calls never corrupt its state, and one `seal` produces all of an
+/// envelope's records at once. That does not make concurrent sending safe:
+/// each record is numbered as it is sealed, and the Mac drops the connection
+/// at a gap, so records must be transmitted in the order they were sealed,
+/// across envelopes as well as within one. Seal and send from one place — a
+/// single queue with one consumer — never from several threads.
 ///
 /// Until a record opens, a record that does not decrypt (`recordRejected`) is
 /// a stale one from the Mac's previous session and is ignored; the transport

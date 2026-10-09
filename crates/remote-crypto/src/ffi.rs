@@ -110,9 +110,11 @@ impl PairingHandshake {
         mac_noise_public_key: Vec<u8>,
         psk: Vec<u8>,
     ) -> Result<Arc<Self>, CryptoError> {
+        // The key first, so it is wiped even if the Mac's key is refused.
+        let psk = pre_shared_key(psk)?;
         let offer = PairingOffer {
             mac_noise_public_key: key(&mac_noise_public_key)?,
-            psk: pre_shared_key(psk)?,
+            psk,
         };
         let (state, message_1) = pairing::phone_start(&keys.keys, &offer)?;
         Ok(Arc::new(Self {
@@ -235,7 +237,9 @@ impl SessionHandshake {
 
 /// The Mac's side of a connection, and its reply. The iPhone app never plays
 /// the Mac; this exists so the binding's round trip can be tested on the
-/// device, through the same code the Mac runs.
+/// device, through the same handshake and record encryption the Mac runs. The
+/// session is wrapped like the phone's, so it applies the phone's stream rule,
+/// not the Mac's routing (`DeviceSessions`), which is tested in Rust.
 #[derive(uniffi::Record)]
 pub struct SessionAcceptance {
     pub session: Arc<Session>,
@@ -259,8 +263,10 @@ pub fn accept_session(
 
 /// An established connection: the phone's session rule (`PhoneSession`)
 /// behind a lock. One `seal` call produces all of an envelope's records under
-/// the lock, so concurrent calls never interleave records; the caller must
-/// still transmit them in the order returned, one envelope at a time.
+/// the lock, so concurrent calls never interleave records. Records are
+/// numbered as they are sealed, though, so they must be transmitted in the
+/// order they were sealed, across envelopes too: the caller seals and sends
+/// from one queue, never from several threads.
 #[derive(uniffi::Object)]
 pub struct Session {
     state: Mutex<PhoneSession>,
@@ -307,6 +313,7 @@ impl Session {
 /// What a frame is, so the phone routes it to the right step without touching
 /// any state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[non_exhaustive]
 pub enum FrameKind {
     Pairing,
     SessionRequest,

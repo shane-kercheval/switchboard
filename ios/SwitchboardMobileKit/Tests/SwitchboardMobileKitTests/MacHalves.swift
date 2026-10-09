@@ -3,9 +3,11 @@ internal import SwitchboardRemoteCrypto
 @testable import SwitchboardMobileKit
 
 // The Mac's halves of the handshakes, so tests can run real round trips
-// through the same code the Mac runs. They live here, not in the package,
+// through the same handshake and record encryption the Mac runs (not its
+// routing, which is tested in Rust). They live here, not in the package,
 // because the app never plays the Mac; `make check-ios` fails if anything
-// outside the tests names the generated functions they call.
+// outside the tests names the generated class and function they call. This is
+// the only test file that may import the bindings.
 
 extension EncryptedSession {
     static func accept(

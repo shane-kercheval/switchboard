@@ -1,9 +1,9 @@
 #!/bin/sh
-# Fails if any Swift file outside SwitchboardMobileKit's Crypto/ and Tests/
-# imports the UniFFI-generated module or the C module under it. Among the
-# shipped sources, generated types stop at Crypto/, so regenerating the
-# bindings can only ever break that directory. Tests/ may import them on
-# purpose: it holds the Mac's test-only handshake halves, and tests don't ship.
+# Fails if any Swift file other than SwitchboardMobileKit's Crypto/ and the
+# tests' MacHalves.swift imports the UniFFI-generated module or the C module
+# under it. Generated types stop there, so regenerating the bindings can only
+# ever break those files. MacHalves.swift imports them on purpose: it holds
+# the Mac's test-only handshake halves, and tests don't ship.
 #
 # A grep, not a parser: it catches every conventional import form, but two
 # imports on one line separated by `;` get past it.
@@ -13,7 +13,7 @@ set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 allowed="$root/SwitchboardMobileKit/Sources/SwitchboardMobileKit/Crypto/"
-tests="$root/SwitchboardMobileKit/Tests/"
+mac_halves="$root/SwitchboardMobileKit/Tests/SwitchboardMobileKitTests/MacHalves.swift"
 pattern='^[[:space:]]*(@[A-Za-z_]+(\([^)]*\))?[[:space:]]+)*([a-z]+[[:space:]]+)?import[[:space:]]+([a-z]+[[:space:]]+)?(SwitchboardRemoteCrypto|switchboard_remote_cryptoFFI)([^A-Za-z0-9_]|$)'
 
 # The pattern is checked against known lines first, so this guard cannot pass
@@ -46,7 +46,7 @@ violations=
 while IFS= read -r file; do
 	[ -n "$file" ] || continue
 	case $file in
-	"$root/SwitchboardMobileKit/Generated/"* | "$tests"*) ;;
+	"$root/SwitchboardMobileKit/Generated/"* | "$mac_halves") ;;
 	"$allowed"*) found_allowed=yes ;;
 	*) violations="$violations$file
 " ;;
@@ -56,7 +56,7 @@ $matches
 SCAN
 
 if [ -n "$violations" ]; then
-	echo "Only SwitchboardMobileKit/Sources/SwitchboardMobileKit/Crypto/ and the tests may import the generated bindings:" >&2
+	echo "Only SwitchboardMobileKit/Sources/SwitchboardMobileKit/Crypto/ and Tests/SwitchboardMobileKitTests/MacHalves.swift may import the generated bindings:" >&2
 	printf '%s' "$violations" >&2
 	exit 1
 fi

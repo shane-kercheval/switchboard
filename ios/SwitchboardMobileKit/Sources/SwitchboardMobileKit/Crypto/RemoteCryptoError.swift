@@ -66,6 +66,9 @@ public enum RemoteCryptoError: Error, Equatable, Sendable {
         case CryptoError.SessionClosed: self = .sessionClosed
         case CryptoError.SendFailed: self = .sendFailed
         case CryptoError.StreamBroken: self = .streamBroken
+        // `InvalidSignature`, `SessionsEnded` and `NotConnected` come only from
+        // the Mac's side, which the app never runs; `InvalidHandshakeHash`
+        // only from `confirmationCode`, which maps its own errors.
         default:
             Logger.crypto.error("Unexpected error from the Rust library: \(String(describing: error), privacy: .private)")
             self = .bindingFailure

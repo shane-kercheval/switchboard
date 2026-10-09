@@ -131,17 +131,55 @@ struct EncryptedSessionTests {
         #expect(response.confirmationCode.count == 6)
     }
 
-    @Test func onlySessionEndingErrorsSayTheyEndTheSession() {
-        let ending: [RemoteCryptoError] = [.streamBroken, .protocolViolation, .sendFailed, .sessionClosed, .bindingFailure]
-        let recoverable: [RemoteCryptoError] = [
-            .invalidKeyBlob, .invalidKey, .randomnessUnavailable, .handshakeFailed, .unexpectedPeerKey,
-            .invalidPayload, .messageTooLarge(length: 1), .unexpectedFrame, .recordRejected,
+    @Test func onlyErrorsThatUseUpTheirObjectAreTerminal() {
+        let terminal: [RemoteCryptoError] = [
+            .handshakeFailed, .unexpectedPeerKey, .invalidPayload, .streamBroken, .protocolViolation, .sendFailed,
+            .sessionClosed, .bindingFailure,
         ]
-        for error in ending {
-            #expect(error.endsSession, "\(error)")
+        let nonTerminal: [RemoteCryptoError] = [
+            .invalidKeyBlob, .invalidKey, .randomnessUnavailable, .messageTooLarge(length: 1), .unexpectedFrame,
+            .recordRejected,
+        ]
+        for error in terminal {
+            #expect(error.isTerminal, "\(error)")
         }
-        for error in recoverable {
-            #expect(!error.endsSession, "\(error)")
+        for error in nonTerminal {
+            #expect(!error.isTerminal, "\(error)")
+        }
+    }
+
+    /// A damaged reply uses the handshake up, so the error says so and the
+    /// real reply arriving afterwards cannot revive it.
+    @Test func aDamagedConnectionReplyIsTerminal() throws {
+        let phoneKeys = try PhoneKeys.generate()
+        let macKeys = try PhoneKeys.generate()
+        let handshake = try ConnectionHandshake(keys: phoneKeys, macNoisePublicKey: macKeys.noisePublicKey)
+        let (_, message2) = try EncryptedSession.accept(
+            macKeys: macKeys,
+            phoneNoisePublicKey: phoneKeys.noisePublicKey,
+            message1: handshake.message1
+        )
+        var damaged = message2
+        damaged[damaged.count - 1] ^= 1
+        let error = #expect(throws: RemoteCryptoError.self) { try handshake.finish(message2: damaged) }
+        #expect(error == .handshakeFailed)
+        #expect(error?.isTerminal == true)
+        #expect(throws: RemoteCryptoError.handshakeFailed) { try handshake.finish(message2: message2) }
+    }
+
+    @Test func aDamagedPairingReplyIsTerminal() throws {
+        let phoneKeys = try PhoneKeys.generate()
+        let macKeys = try PhoneKeys.generate()
+        let preSharedKey = Data(repeating: 7, count: 32)
+        let phone = try PhonePairing(keys: phoneKeys, macNoisePublicKey: macKeys.noisePublicKey, preSharedKey: preSharedKey)
+        let mac = try MacPairing(macKeys: macKeys, preSharedKey: preSharedKey, macName: "Studio Mac", message1: phone.message1)
+        var damaged = mac.message2
+        damaged[damaged.count - 1] ^= 1
+        let error = #expect(throws: RemoteCryptoError.self) { try phone.respond(phoneName: "Jo's iPhone", message2: damaged) }
+        #expect(error == .handshakeFailed)
+        #expect(error?.isTerminal == true)
+        #expect(throws: RemoteCryptoError.handshakeFailed) {
+            try phone.respond(phoneName: "Jo's iPhone", message2: mac.message2)
         }
     }
 

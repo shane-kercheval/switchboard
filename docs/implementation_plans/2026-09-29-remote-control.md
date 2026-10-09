@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 18 · **Created:** 2026-09-29 · **Revised:** 2026-10-08
+**Status:** proposed · **Revision:** 19 · **Created:** 2026-09-29 · **Revised:** 2026-10-09
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,9 +17,26 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 19 (2026-10-09)** — second review of the Swift binding (§3, §5.4, §5.11, §7.2,
+  §7.3, §7.6).
+  - **A handshake that fails or goes unanswered no longer leaves the phone waiting.** A real
+    reply uses a handshake up whatever its outcome, so `handshakeFailed`, `invalidPayload`, and
+    `unexpectedPeerKey` mean the attempt is over. Revision 18's `endsSession` is renamed
+    `isTerminal`, "the handshake or session this came from can't be used again", and now
+    covers those three; the caller decides what follows. A connection handshake with no reply
+    within 10 seconds is abandoned and retried with the usual backoff, and a pairing with no
+    reply within 10 seconds is shown as failed, so a lost reply is not waited on until the
+    user leaves the app or the pairing token expires.
+  - **The Mac never sends on a session it has replaced.** The phone's broken-stream rule
+    (revision 17) assumes no record of the old session follows one of the new; promoting the
+    unconfirmed session now stops the old one's writer first, and an envelope half-sent on it
+    is dropped.
+  - The Mac's test-only halves move out of the Swift package into its test target, and
+    `check-test-only-calls.sh` now fails on the generated names (`MacPairingHandshake`,
+    `acceptSession`) anywhere outside the tests, not on call shapes.
 - **Revision 18 (2026-10-09)** — review of the Swift binding (§3, §7.2, §7.6).
   - Every error that ends the phone's session — `streamBroken`, `protocolViolation`,
-    `sendFailed`, `sessionClosed`, a binding failure — reports `endsSession`, and the transport
+    `sendFailed`, `sessionClosed`, a binding failure — reports `endsSession` (revision 19: `isTerminal`), and the transport
     reconnects on any of them **with the same backoff** as `peer_disconnected`, not at once.
     Revision 17's "at once" let a relay that injects one bad record after each reconnect drive
     the phone into a tight handshake loop. Ending the session itself stays: a stream that has
@@ -563,8 +580,11 @@ returning the Mac's key and name, the confirmation code, and message 3), `Sessio
 (message 1, then `finish` returning a `Session`), `Session` (`seal`, `open`, `is_closed`), and
 `frame_kind`, each over the unchanged core. `accept_session` and `MacPairingHandshake`, the Mac's
 halves of the session and pairing handshakes, are exported only so the Swift round trips can
-run on the device; `ios/scripts/check-test-only-calls.sh` fails `make check-ios` if anything
-outside the tests calls them. Bytes returned to
+run on the device. Their Swift wrappers live in the package's test target, not the package,
+and `ios/scripts/check-test-only-calls.sh` fails `make check-ios` if any Swift outside the
+tests names either generated function. That check is a grep for the names, not a module
+boundary: the xcframework ships both to the app, and a Mac-only function exported later must
+be added to it. Bytes returned to
 Swift are Swift-owned and cannot be wiped by this crate; only the storage blob is secret, and
 Swift hands it straight to the Keychain. `UniFFI` also lowers it into a `RustBuffer` that is
 freed unwiped: one more copy per Keychain write. The phone's `Session` adds one rule to the
@@ -737,7 +757,16 @@ confirmed one, and `open`'s outcome decides what happens:
 An unconfirmed session that opens no record within 10 seconds is discarded; the phone's first
 envelope, `hello`, confirms it at once. A replayed handshake therefore costs the real session
 nothing; the relay can still end any session, by sending one bad record of the right type,
-which §2 accepts. Records are opened here and only plaintext envelopes leave the module. A transport record from a device
+which §2 accepts.
+
+When the unconfirmed session is promoted, the replaced session's writer is stopped before
+anything is sent on the new one, and nothing is ever sent on the replaced session again; an
+envelope half-sent on it is dropped, not finished. The phone's session treats a record it
+cannot decrypt after its first open as a broken stream (§3), so an old-session record that
+followed a new one would end the phone's fresh session. Nothing new recovers the dropped
+envelope: an event is recovered when the phone reloads the tail after reconnecting (§7.4),
+and a reply is lost as any reply is on a reconnect, with `send_message`'s outcome recovered
+by `send_receipt` (§7.2). Records are opened here and only plaintext envelopes leave the module. A transport record from a device
 with no session cannot be opened, so it is discarded without a reply; that includes records
 sent while a handshake is still in progress. A handshake from a device that is not in the
 registry, or is revoked, is answered with `not_paired`. Also holds, in memory, each device's
@@ -1008,6 +1037,9 @@ It forwards everything unchanged, then:
   its own lease, and a connected session holding the lease on battery with the preference off;
   reset identity revokes every row and sends the empty set before the connection is
   dropped, then deletes both keys.
+- Unit: `SessionManager` — pause a multi-record send on the confirmed session, promote the
+  unconfirmed one, and assert the paused writer sends no further record on the replaced
+  session.
 - Fixture-driven: `RequestHandler` against the mock backend (a send calls
   `ensure_project_loaded` before validating recipients, an unknown recipient dispatches
   nothing, idempotent repeat, concurrent repeat, partial fan-out rejection, a request-level
@@ -1157,10 +1189,16 @@ though the phone cannot send attachments.
   `peer_disconnected` for the paired Mac it discards the session and retries the handshake
   with the same backoff. A session that has opened no record within 10 seconds of its
   handshake is discarded and the handshake retried, since a damaged or lost first record
-  would otherwise leave it waiting. Any error whose `endsSession` is true — `streamBroken`,
-  `protocolViolation`, `sendFailed`, `sessionClosed` — does the same. All of these retry with
-  the same backoff, so a relay that keeps injecting bad records cannot spin the phone in a
-  handshake loop. It routes frames by type (§4) and ignores a connection reply when it
+  would otherwise leave it waiting. A handshake whose reply has not arrived within 10 seconds
+  of sending message 1 is abandoned and retried the same way, so a lost reply does not leave
+  the phone connecting forever. Each deadline belongs to one attempt: one that fires after a
+  newer attempt has started is ignored, and so is a reply to an abandoned attempt. Any error
+  whose `isTerminal` is true, from the session or from its handshake — `streamBroken`,
+  `protocolViolation`, `sendFailed`, `sessionClosed`, `handshakeFailed`, `invalidPayload` —
+  does the same. All of these start a new handshake on the same relay connection, which stays
+  up, and retry with the same backoff, so a relay that keeps injecting bad records cannot spin
+  the phone in a handshake loop. A construction error (`invalidKey`, `invalidKeyBlob`) is not
+  terminal and is not retried: no retry fixes a corrupt stored key, so it is shown. It routes frames by type (§4) and ignores a connection reply when it
   is not waiting for one — the Mac sends one in answer to a replayed request — without
   touching its session.
 - **Local relay in development.** iOS App Transport Security blocks plain `ws://`, and iOS asks
@@ -1184,7 +1222,10 @@ though the phone cannot send attachments.
 - `PairingFlow` — runs the binding's `XXpsk2` handshake with the token, shows the confirmation
   code with "Type this code on your Mac", waits for `pairing_confirmed` / `pairing_declined`, then
   stores the phone's keys and the Mac's pinned keys in the Keychain. Handles expired offers,
-  decline, wrong relay, and Mac not connected.
+  decline, wrong relay, and Mac not connected. An `isTerminal` error from `respond` ends the
+  attempt, and so does no message 2 within 10 seconds of message 1: either is shown as a failed
+  pairing with a rescan offered, never retried in the background, since the token is
+  single-use and the user is watching.
 - One Mac per phone: pairing a new Mac replaces the old one after an explicit confirmation.
 
 **7.4 `Stores/`**
@@ -1247,8 +1288,13 @@ though the phone cannot send attachments.
   carry the camera and Face ID usage descriptions.
 - Coordinator: `RelayTransport`'s session deadline — a session whose first record never
   opens is discarded after 10 seconds and the handshake retried; a stale record before the
-  first open does not end the session; every `endsSession` error reconnects, and repeated
+  first open does not end the session; every `isTerminal` error from the session or its handshake starts a new handshake, and repeated
   stream breaks back off rather than looping.
+- Coordinator: `RelayTransport`'s handshake deadline — a connection handshake with no reply in
+  10 seconds is abandoned and retried with backoff; a reply arriving after that, while a newer
+  attempt is running, does not touch the newer attempt; a stale deadline from an earlier
+  attempt does not abandon the current one. `PairingFlow` shows a pairing with no reply
+  within its deadline as failed.
 - Coordinator: `SecureSession`'s outbound queue — suspend the first envelope's send, submit a
   second envelope, and assert every record of the first is transmitted before any of the
   second.

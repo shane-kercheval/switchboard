@@ -36,20 +36,6 @@ public final class EncryptedSession: Sendable {
         self.session = session
     }
 
-    /// The Mac's half of a connection, for tests only: it lets them run a real
-    /// round trip through the same code the Mac runs. The app never plays the
-    /// Mac. `make check-ios` fails if anything outside the tests calls it.
-    static func accept(
-        macKeys: PhoneKeys,
-        phoneNoisePublicKey: Data,
-        message1: Data
-    ) throws(RemoteCryptoError) -> (session: EncryptedSession, message2: Data) {
-        let acceptance = try bridging {
-            try acceptSession(keys: macKeys.keys, phoneNoisePublicKey: phoneNoisePublicKey, message1: message1)
-        }
-        return (EncryptedSession(session: acceptance.session), acceptance.message2)
-    }
-
     public func seal(_ envelope: Data) throws(RemoteCryptoError) -> [Data] {
         try bridging { try session.seal(envelope: envelope) }
     }

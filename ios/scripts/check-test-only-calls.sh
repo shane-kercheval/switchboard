@@ -1,16 +1,18 @@
 #!/bin/sh
-# Fails if anything outside the package's tests calls the Mac's halves of the
-# handshakes: EncryptedSession.accept and MacPairing. They exist so tests can
-# run real round trips through the code the Mac runs; the app never plays the
-# Mac, and `internal` alone would let any file in the package call them.
+# Fails if any Swift file outside the package's tests names the Mac's halves of
+# the handshakes, the generated `MacPairingHandshake` and `acceptSession`. The
+# tests use them to run real round trips through the code the Mac runs; the
+# app never plays the Mac. The bindings ship whole in one xcframework, so the
+# package could still call them; this is what stops it.
 #
-# A grep, not a parser, like check-binding-imports.sh: it catches calls
-# written the conventional ways.
+# A grep for the names, not a module boundary: it catches any spelling of a
+# call, an alias, or a reference, but a Mac-only function exported later must
+# be added to the pattern by hand.
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 tests="$root/SwitchboardMobileKit/Tests/"
-pattern='EncryptedSession[[:space:]]*\.[[:space:]]*accept[[:space:]]*\(|(^|[^A-Za-z0-9_])MacPairing[[:space:]]*(\.[[:space:]]*init[[:space:]]*)?\('
+pattern='(^|[^A-Za-z0-9_])(MacPairingHandshake|acceptSession)([^A-Za-z0-9_]|$)'
 
 # The pattern is checked against known lines first, so this guard cannot pass
 # by matching nothing.
@@ -22,14 +24,15 @@ while IFS='|' read -r expected line; do
 		self_check_failures=$((self_check_failures + 1))
 	fi
 done <<'CASES'
-match|let (mac, reply) = try EncryptedSession.accept(macKeys: keys, phoneNoisePublicKey: key, message1: m)
-match|try EncryptedSession .accept(
-match|let mac = try MacPairing(macKeys: keys, preSharedKey: psk, macName: "Mac", message1: m)
-match|let mac = try MacPairing.init(macKeys: keys, preSharedKey: psk, macName: "Mac", message1: m)
-none|static func accept(
-none|final class MacPairing: Sendable {
-none|try MacPairingHandshake(keys: macKeys.keys, psk: preSharedKey, macName: macName, message1: message1)
-none|let session = try handshake.finish(message2: reply)
+match|try MacPairingHandshake(keys: k, psk: p, macName: "Mac", message1: m)
+match|let make = MacPairingHandshake.init
+match|try acceptSession(keys: k, phoneNoisePublicKey: key, message1: m)
+match|let accept = acceptSession
+match|    handshake: MacPairingHandshake
+match|try SwitchboardRemoteCrypto.acceptSession(
+none|let handshake = try PairingHandshake(keys: k, macNoisePublicKey: key, psk: p)
+none|let acceptSessions = 2
+none|let isMacPairingHandshakeDone = true
 CASES
 [ "$self_check_failures" -eq 0 ] || exit 1
 
@@ -59,14 +62,14 @@ $matches
 SCAN
 
 if [ -n "$violations" ]; then
-	echo "Only the tests may call EncryptedSession.accept or construct MacPairing:" >&2
+	echo "Only the tests may name MacPairingHandshake or acceptSession:" >&2
 	printf '%s' "$violations" >&2
 	exit 1
 fi
 
-# The tests do call them, so finding no call there means the scan is not
+# The tests do use them, so finding neither there means the scan is not
 # looking where they are used.
 if [ "$found_in_tests" = no ]; then
-	echo "check-test-only-calls: found no call in $tests, so the scan is not covering the package." >&2
+	echo "check-test-only-calls: found no use in $tests, so the scan is not covering the package." >&2
 	exit 1
 fi

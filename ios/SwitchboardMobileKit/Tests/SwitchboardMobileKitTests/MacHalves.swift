@@ -1,9 +1,25 @@
 import Foundation
 internal import SwitchboardRemoteCrypto
+@testable import SwitchboardMobileKit
 
-/// The Mac's half of pairing, for tests only: it lets them run a real pairing
-/// round trip through the same code the Mac runs. The app never plays the Mac.
-/// `make check-ios` fails if anything outside the tests constructs one.
+// The Mac's halves of the handshakes, so tests can run real round trips
+// through the same code the Mac runs. They live here, not in the package,
+// because the app never plays the Mac; `make check-ios` fails if anything
+// outside the tests names the generated functions they call.
+
+extension EncryptedSession {
+    static func accept(
+        macKeys: PhoneKeys,
+        phoneNoisePublicKey: Data,
+        message1: Data
+    ) throws(RemoteCryptoError) -> (session: EncryptedSession, message2: Data) {
+        let acceptance = try bridging {
+            try acceptSession(keys: macKeys.keys, phoneNoisePublicKey: phoneNoisePublicKey, message1: message1)
+        }
+        return (EncryptedSession(session: acceptance.session), acceptance.message2)
+    }
+}
+
 final class MacPairing: Sendable {
     private let handshake: MacPairingHandshake
 

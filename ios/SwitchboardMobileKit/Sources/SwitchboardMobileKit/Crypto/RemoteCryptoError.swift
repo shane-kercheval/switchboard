@@ -31,14 +31,20 @@ public enum RemoteCryptoError: Error, Equatable, Sendable {
     /// panic or a binding built from a different version of the crate.
     case bindingFailure
 
-    /// Whether the session this error came from is finished: discard it and
-    /// reconnect, with backoff. The other errors leave the session usable.
-    public var endsSession: Bool {
+    /// Whether the handshake or session this error came from can't be used
+    /// again. The caller decides what follows: the transport starts a new
+    /// handshake, with backoff, on the same relay connection; pairing shows
+    /// the attempt as failed. False for errors that leave it usable, and for
+    /// the construction errors (`invalidKeyBlob`, `invalidKey`,
+    /// `randomnessUnavailable`), which come before anything exists to end and
+    /// which no retry fixes.
+    public var isTerminal: Bool {
         switch self {
-        case .streamBroken, .protocolViolation, .sendFailed, .sessionClosed, .bindingFailure:
+        case .handshakeFailed, .unexpectedPeerKey, .invalidPayload, .streamBroken, .protocolViolation, .sendFailed,
+            .sessionClosed, .bindingFailure:
             true
-        case .invalidKeyBlob, .invalidKey, .randomnessUnavailable, .handshakeFailed, .unexpectedPeerKey,
-            .invalidPayload, .messageTooLarge, .unexpectedFrame, .recordRejected:
+        case .invalidKeyBlob, .invalidKey, .randomnessUnavailable, .messageTooLarge, .unexpectedFrame,
+            .recordRejected:
             false
         }
     }

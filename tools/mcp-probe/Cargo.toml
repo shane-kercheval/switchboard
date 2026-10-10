@@ -1,0 +1,19 @@
+# Throwaway probe for M0 of docs/implementation_plans/2026-10-09-mcp.md: an MCP
+# server that measures how real clients (Claude Code, Codex, Claude Desktop)
+# handle long calls, progress, large results, and re-call loops. A workspace of
+# its own so the desktop gates never build it. Removed once
+# docs/research/mcp-client-behavior.md records the results.
+[package]
+name = "mcp-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+axum = "0.8"
+rmcp = { version = "1.7.0", features = ["server", "transport-streamable-http-server", "macros"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }

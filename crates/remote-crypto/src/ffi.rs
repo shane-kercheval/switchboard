@@ -405,9 +405,10 @@ mod tests {
     /// Several threads seal multi-record envelopes on one FFI session, whose
     /// lock is what is under test. If any envelope's records were interleaved
     /// with another's, the nonces would not run contiguously within it, and no
-    /// order of envelopes would open. The receiver is a core session, on which
-    /// a record that does not decrypt changes nothing, so it can try each
-    /// remaining envelope in turn and must always find the next one.
+    /// order of envelopes would open. The receiver is a core session opened
+    /// with `open_if_next`, on which a record that does not decrypt changes
+    /// nothing, so it can try each remaining envelope in turn and must always
+    /// find the next one.
     #[test]
     fn concurrent_seals_never_interleave_records() {
         let phone_keys = DeviceKeys::generate().unwrap();
@@ -433,21 +434,21 @@ mod tests {
         });
         assert!(batches.iter().all(|records| records.len() == 3));
 
-        let mut open = |record: &Vec<u8>| receiver.open(record);
+        let mut open = |record: &Vec<u8>| receiver.open_if_next(record);
         let mut remaining: Vec<usize> = (0..batches.len()).collect();
         let mut opened = HashSet::new();
         while !remaining.is_empty() {
             let next = remaining
                 .iter()
                 .position(|&batch| match open(&batches[batch][0]) {
-                    Err(CryptoError::RecordRejected) => false,
-                    Ok(None) => true,
+                    None => false,
+                    Some(Ok(None)) => true,
                     other => panic!("unexpected {other:?}"),
                 })
                 .expect("no envelope's first record is next: records were interleaved");
             let batch = remaining.remove(next);
-            assert_eq!(open(&batches[batch][1]), Ok(None));
-            let envelope = open(&batches[batch][2]).unwrap().unwrap();
+            assert_eq!(open(&batches[batch][1]), Some(Ok(None)));
+            let envelope = open(&batches[batch][2]).unwrap().unwrap().unwrap();
             assert!(envelope.iter().all(|&b| b == envelope[0]));
             assert!(opened.insert(envelope[0]));
         }

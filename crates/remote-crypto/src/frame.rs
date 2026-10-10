@@ -10,8 +10,9 @@
 use crate::CryptoError;
 use crate::fragment::MAX_RECORD_LEN;
 use crate::noise::ECHO_LEN;
+use crate::session::SESSION_ID_LEN;
 
-/// Longest frame any step accepts: the type byte, the longest prefix a frame
+/// Longest frame of any kind: the type byte, the longest prefix a frame
 /// carries before its Noise message (a reply's echo), and the longest Noise
 /// message. Anything longer is refused before anything is allocated for it.
 pub const MAX_FRAME_LEN: usize = 1 + ECHO_LEN + MAX_RECORD_LEN;
@@ -70,9 +71,21 @@ pub fn kind_of_tag(tag: u8) -> Result<FrameKind, CryptoError> {
         .ok_or(CryptoError::UnexpectedFrame)
 }
 
-/// The body of a frame of the expected kind.
+/// Longest frame of `kind`: the type byte, the prefix that kind carries before
+/// its Noise message, and the longest Noise message.
+const fn max_len(kind: FrameKind) -> usize {
+    let prefix = match kind {
+        FrameKind::Pairing | FrameKind::SessionRequest => 0,
+        FrameKind::SessionReply | FrameKind::PairingReply => ECHO_LEN,
+        FrameKind::Record => SESSION_ID_LEN,
+    };
+    1 + prefix + MAX_RECORD_LEN
+}
+
+/// The body of a frame of the expected kind. A frame longer than its kind
+/// allows is refused here, so a step never hands one to `snow`.
 pub(crate) fn body(expected: FrameKind, frame: &[u8]) -> Result<&[u8], CryptoError> {
-    if kind(frame)? == expected {
+    if kind(frame)? == expected && frame.len() <= max_len(expected) {
         Ok(&frame[1..])
     } else {
         Err(CryptoError::UnexpectedFrame)
@@ -122,5 +135,26 @@ mod tests {
         assert_eq!(kind(&oversize), Err(CryptoError::UnexpectedFrame));
         oversize.truncate(MAX_FRAME_LEN);
         assert_eq!(kind(&oversize), Ok(FrameKind::Record));
+    }
+
+    #[test]
+    fn each_kind_is_refused_one_byte_over_its_own_maximum() {
+        for &kind in FrameKind::ALL {
+            let mut frame = vec![kind as u8];
+            frame.resize(max_len(kind), 0);
+            assert!(body(kind, &frame).is_ok(), "{kind:?}");
+            frame.push(0);
+            assert_eq!(
+                body(kind, &frame),
+                Err(CryptoError::UnexpectedFrame),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_overall_maximum_is_the_longest_kind() {
+        let longest = FrameKind::ALL.iter().map(|&kind| max_len(kind)).max();
+        assert_eq!(longest, Some(MAX_FRAME_LEN));
     }
 }

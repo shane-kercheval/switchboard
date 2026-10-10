@@ -38,11 +38,11 @@ pub struct SessionInitiator {
 
 /// An established connection. `seal` and `open` take `&mut self`, so a whole
 /// envelope's records are produced without interleaving; records must be
-/// transmitted in the order `seal` returns them. A record that does not
-/// decrypt changes nothing, because a device may have two sessions and the
-/// record may be the other's; `DeviceSessions` ends a device's sessions when
-/// none of them opens a record. A record that decrypts but is malformed
-/// closes the session for good: every later call returns `SessionClosed`.
+/// transmitted in the order `seal` returns them. Every record names the
+/// session it belongs to, so one naming this session is never another's: if
+/// it does not decrypt, or decrypts but is malformed, the session closes for
+/// good and every later call returns `SessionClosed`. A record naming another
+/// session changes nothing.
 ///
 /// A session is *confirmed* once it has evidence the peer is live and holds
 /// the session's keys. The phone's session is confirmed when it is created,
@@ -131,14 +131,40 @@ impl Session {
     /// decrypts confirms the session.
     ///
     /// Failures say which kind they are, so the caller can route and react:
-    /// - `UnexpectedFrame`: not a record, or oversize. Nothing is touched.
+    /// - `UnexpectedFrame`: not a record, or longer than a record can be.
+    ///   Nothing is touched.
     /// - `StaleRecord`: names another session. Nothing is touched.
-    /// - `RecordRejected`: names this session but did not decrypt. Nothing is
-    ///   touched — a failed decryption does not advance the nonce — and the
-    ///   caller decides what a broken stream means for it.
+    /// - `StreamBroken`: names this session but did not decrypt, so the
+    ///   in-order stream has a gap or a forgery. The session is closed.
     /// - `ProtocolViolation`: decrypted, but broke the fragment rules. The
     ///   session is closed.
     pub fn open(&mut self, record: &[u8]) -> Result<Option<Vec<u8>>, CryptoError> {
+        let Some(fragment) = self.decrypt(record)? else {
+            self.close();
+            return Err(CryptoError::StreamBroken);
+        };
+        self.accept(&fragment)
+    }
+
+    /// `open`, except that a record naming this session that does not decrypt
+    /// returns `None` and leaves the session as it was, which relies on
+    /// `snow` not advancing the nonce on a failed decryption. For a test that
+    /// has to find which of several records comes next.
+    #[cfg(test)]
+    pub(crate) fn open_if_next(
+        &mut self,
+        record: &[u8],
+    ) -> Option<Result<Option<Vec<u8>>, CryptoError>> {
+        match self.decrypt(record) {
+            Ok(Some(fragment)) => Some(self.accept(&fragment)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    /// The fragment a record naming this session carries, `None` if it does
+    /// not decrypt. Changes nothing.
+    fn decrypt(&mut self, record: &[u8]) -> Result<Option<Vec<u8>>, CryptoError> {
         if self.state == State::Closed {
             return Err(CryptoError::SessionClosed);
         }
@@ -149,11 +175,17 @@ impl Session {
             .ok_or(CryptoError::StaleRecord)?;
         let mut fragment = vec![0u8; record.len()];
         let Ok(len) = self.transport.read_message(record, &mut fragment) else {
-            return Err(CryptoError::RecordRejected);
+            return Ok(None);
         };
-        self.state = State::Confirmed;
         fragment.truncate(len);
-        self.reassembler.accept(&fragment).map_err(|_| {
+        Ok(Some(fragment))
+    }
+
+    /// Takes a decrypted fragment: it confirms the session, and one that
+    /// breaks the fragment rules closes it.
+    fn accept(&mut self, fragment: &[u8]) -> Result<Option<Vec<u8>>, CryptoError> {
+        self.state = State::Confirmed;
+        self.reassembler.accept(fragment).map_err(|_| {
             self.close();
             CryptoError::ProtocolViolation
         })
@@ -185,7 +217,7 @@ impl Session {
         })
     }
 
-    pub(crate) fn close(&mut self) {
+    fn close(&mut self) {
         self.state = State::Closed;
         self.reassembler.reset();
     }
@@ -210,6 +242,17 @@ impl Session {
     pub(crate) fn seal_raw_fragment(&mut self, fragment: &[u8]) -> Vec<u8> {
         self.seal_fragment(fragment).unwrap()
     }
+}
+
+/// A record frame naming `id` that is one byte longer than any record can be,
+/// yet within `MAX_FRAME_LEN`, which leaves room for a reply's longer echo.
+#[cfg(test)]
+pub(crate) fn oversize_record(id: [u8; SESSION_ID_LEN]) -> Vec<u8> {
+    let mut record = vec![FrameKind::Record as u8];
+    record.extend_from_slice(&id);
+    record.resize(1 + SESSION_ID_LEN + crate::fragment::MAX_RECORD_LEN + 1, 0);
+    assert!(record.len() <= frame::MAX_FRAME_LEN);
+    record
 }
 
 /// The id both sides derive from the finished handshake. Different for every
@@ -392,6 +435,13 @@ mod tests {
             mac.open(&oversize).err(),
             Some(CryptoError::UnexpectedFrame)
         );
+        // Under the overall limit but over a record's, and naming this
+        // session: still refused untouched rather than breaking the stream.
+        let oversize = oversize_record(mac.id());
+        assert_eq!(
+            mac.open(&oversize).err(),
+            Some(CryptoError::UnexpectedFrame)
+        );
         assert!(!mac.is_closed());
         assert_eq!(
             deliver(&mut phone, &mut mac, b"still open"),
@@ -470,20 +520,26 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_record_is_refused_and_leaves_the_session_open() {
+    fn a_record_too_short_to_name_a_session_leaves_the_session_open() {
         let (mut phone, mut mac) = connect(&keys(1), &keys(2));
         assert_eq!(
             mac.open(&[FrameKind::Record as u8]).err(),
             Some(CryptoError::StaleRecord)
         );
-        let mut id_only = vec![FrameKind::Record as u8];
-        id_only.extend_from_slice(&mac.id());
-        assert_eq!(mac.open(&id_only).err(), Some(CryptoError::RecordRejected));
         assert!(!mac.is_closed());
         assert_eq!(
             deliver(&mut phone, &mut mac, b"hello"),
             Some(b"hello".to_vec())
         );
+    }
+
+    #[test]
+    fn a_record_naming_this_session_with_nothing_after_the_id_breaks_the_stream() {
+        let (_, mut mac) = connect(&keys(1), &keys(2));
+        let mut id_only = vec![FrameKind::Record as u8];
+        id_only.extend_from_slice(&mac.id());
+        assert_eq!(mac.open(&id_only).err(), Some(CryptoError::StreamBroken));
+        assert!(mac.is_closed());
     }
 
     #[test]
@@ -574,28 +630,41 @@ mod tests {
         assert!(record.capacity() < 128, "{}", record.capacity());
     }
 
-    /// A rejected record changes nothing: the session is still open, and the
-    /// genuine record it was forged from still opens. This relies on `snow` not
-    /// advancing the nonce on a failed decryption, which was the bug in
-    /// RUSTSEC-2024-0011 (fixed in 0.9.5): the canary for any `snow` upgrade,
-    /// and the fact `DeviceSessions`' routing rests on.
+    /// A tampered record names this session, so it breaks the stream, and
+    /// the genuine record it was forged from no longer opens.
     #[test]
-    fn a_tampered_record_is_rejected_without_disturbing_the_session() {
+    fn a_tampered_record_closes_the_session() {
         let (mut phone, mut mac) = connect(&keys(1), &keys(2));
         let record = phone.seal(b"hello").unwrap().remove(0);
         let mut tampered = record.clone();
         tampered[1 + SESSION_ID_LEN] ^= 1;
-        assert_eq!(mac.open(&tampered).err(), Some(CryptoError::RecordRejected));
-        assert!(!mac.is_closed());
+        assert_eq!(mac.open(&tampered).err(), Some(CryptoError::StreamBroken));
+        assert!(mac.is_closed());
+        assert!(!mac.is_confirmed());
+        assert_eq!(mac.open(&record).err(), Some(CryptoError::SessionClosed));
+    }
+
+    /// The test-only `open_if_next` leaves a session as it was when a record
+    /// does not decrypt, so the genuine record still opens. This relies on
+    /// `snow` not advancing the nonce on a failed decryption, which was the bug
+    /// in RUSTSEC-2024-0011 (fixed in 0.9.5): the canary for any `snow` upgrade.
+    #[test]
+    fn a_failed_decryption_does_not_advance_the_nonce() {
+        let (mut phone, mut mac) = connect(&keys(1), &keys(2));
+        let record = phone.seal(b"hello").unwrap().remove(0);
+        let mut tampered = record.clone();
+        tampered[1 + SESSION_ID_LEN] ^= 1;
+        assert_eq!(mac.open_if_next(&tampered), None);
         assert_eq!(mac.open(&record), Ok(Some(b"hello".to_vec())));
     }
 
     #[test]
-    fn a_repeated_record_is_refused() {
+    fn a_repeated_record_breaks_the_stream() {
         let (mut phone, mut mac) = connect(&keys(1), &keys(2));
         let record = phone.seal(b"once").unwrap().remove(0);
         assert_eq!(mac.open(&record), Ok(Some(b"once".to_vec())));
-        assert_eq!(mac.open(&record).err(), Some(CryptoError::RecordRejected));
+        assert_eq!(mac.open(&record).err(), Some(CryptoError::StreamBroken));
+        assert!(mac.is_closed());
     }
 
     /// A record from an earlier connection names that connection's session,
@@ -615,15 +684,14 @@ mod tests {
         );
     }
 
-    /// A record ahead of its turn does not open; the session still expects
-    /// the one before it.
+    /// A record ahead of its turn means the one before it was lost.
     #[test]
-    fn a_record_delivered_early_is_refused() {
+    fn a_record_delivered_early_breaks_the_stream() {
         let (mut phone, mut mac) = connect(&keys(1), &keys(2));
-        let first = phone.seal(b"first").unwrap().remove(0);
+        let _first = phone.seal(b"first").unwrap().remove(0);
         let second = phone.seal(b"second").unwrap().remove(0);
-        assert_eq!(mac.open(&second).err(), Some(CryptoError::RecordRejected));
-        assert_eq!(mac.open(&first), Ok(Some(b"first".to_vec())));
+        assert_eq!(mac.open(&second).err(), Some(CryptoError::StreamBroken));
+        assert!(mac.is_closed());
     }
 
     /// Regression vector: with every key and ephemeral fixed, the handshake and

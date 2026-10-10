@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 21 · **Created:** 2026-09-29 · **Revised:** 2026-10-09
+**Status:** proposed · **Revision:** 22 · **Created:** 2026-09-29 · **Revised:** 2026-10-10
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,18 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 22 (2026-10-10)** — review of the session ids (§3, §4, §5.4).
+  - **A record for this session that does not decrypt closes it.** `Session::open` now
+    returns `StreamBroken` and closes the session itself, rather than reporting
+    `RecordRejected` and leaving its callers to close it. Since every record names its
+    session, no caller wanted a failed decryption to leave the session open, and both callers
+    were undoing it. `RecordRejected` is gone from the error type, and from Swift's.
+  - Each frame type has its own maximum length: a record's prefix is the 8-byte session id,
+    not the 32-byte echo. A record up to 24 bytes over a record's maximum used to reach `snow`
+    and break the session; it is now refused untouched, like any oversize frame.
+    `max_frame_len` stays the overall ceiling Swift checks before copying a frame into Rust.
+  - A failed `DeviceSessions::open` may have dropped only the unconfirmed session, so the Mac
+    re-checks `is_connected` rather than treating `StreamBroken` as the phone gone.
 - **Revision 21 (2026-10-09)** — Shane's review of the Swift binding (§3, §4, §5.4, §5.11, §7.2,
   §7.6).
   - **Every record names its session.** A record frame is now the type byte, an 8-byte session
@@ -542,14 +554,14 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
   handshake; another handshake's code matches only by chance, about one in a million.
 - `session` — the `KK` handshake and the resulting transport: `seal(envelope) -> Vec<Record>`,
   `open(record) -> Option<Envelope>`. Handshake payloads are empty, and the prologue is
-  `switchboard session v1`. A record that does not decrypt — tampered, repeated, or out of
-  order — changes the session in no way, because a failed decryption does not advance the
-  nonce; its caller treats it as a broken stream (§5.4). A record from an earlier connection
+  `switchboard session v1`. A record for this session that does not decrypt — tampered,
+  repeated, or out of order — means the in-order stream has a gap or a forgery, so it closes
+  the session (`StreamBroken`). A record from an earlier connection
   names that connection's session and is refused as stale without being decrypted. A record that decrypts but
   breaks the fragment rules closes the session for good: every later call returns
   `SessionClosed`, and the caller reconnects with a new handshake. A closed session is never
-  confirmed. An envelope above the size limit is refused without closing the session, and a record over the
-  Noise maximum is refused before anything is allocated for it. The phone's session is
+  confirmed. An envelope above the size limit is refused without closing the session, and a frame longer than its
+  type allows is refused before anything is allocated for it. The phone's session is
   **confirmed** when created, because the Mac's message 2 carries a fresh ephemeral. The Mac's
   is not: whoever saw a message 1 can replay it, and `respond` accepts the replay. The Mac's
   session becomes confirmed when its first record decrypts (§5.4). Every frame carries its
@@ -557,9 +569,8 @@ No tokio, no Tauri. `crates/remote` depends on it; iOS consumes it through UniFF
   handshake step so refused keeps waiting for its real message. Every record frame also names
   its session with an 8-byte id derived from the handshake hash (§4). `open` distinguishes a
   record for another session (`StaleRecord`, nothing changed), one for this session that did
-  not decrypt (`RecordRejected`, nothing changed; its caller treats it as a broken stream),
-  and one that decrypted but broke the fragment rules (`ProtocolViolation`, the session
-  closed).
+  not decrypt (`StreamBroken`, the session closed), and one that decrypted but broke the
+  fragment rules (`ProtocolViolation`, the session closed).
 - `fragment` — splits a serialized envelope into records that each fit the Noise limit
   (65,535 bytes on the wire, so 65,519 bytes of plaintext after the tag). Each record's header —
   message id, index, count — is inside the encrypted payload, so it is authenticated. Records
@@ -682,8 +693,10 @@ handshake hash, the same on both sides and different for every handshake, a repl
 included. Each side gives a record to the session it names, so a record from a replaced
 connection is recognized as stale (`StaleRecord`) rather than guessed at. The type byte, the
 echo, and the session id are outside the encryption; a relay that changes any of them only
-makes the frame fail or be ignored. No frame is longer than `max_frame_len`: the type byte,
-the 32-byte echo, and one 65,535-byte Noise message. Relay-level data — the
+makes the frame fail or be ignored. Each frame type has a maximum length: the type byte, its
+prefix (none, the 32-byte echo, or the 8-byte session id), and one 65,535-byte Noise message.
+`max_frame_len`, the longest of these, is what Swift checks before copying a frame into
+Rust. Relay-level data — the
 pairing token above all, which the relay must read to decide whether to forward a pairing
 frame (§6) — is a field of `Frame`, never part of these bytes.
 
@@ -801,9 +814,8 @@ handshake from the same device becomes that device's **unconfirmed** session, re
 unconfirmed one, never the confirmed one (§3: message 1 may be a replay). A device thus has at
 most one confirmed and one unconfirmed session. Frames are routed by their type (§4): a
 connection request starts a handshake and is never offered to a session; a record is never
-offered to a handshake. Each record goes to the unconfirmed session first, then to the
-confirmed one, and `open`'s outcome decides what happens. Each record names its session (§4),
-so only that session is ever offered it:
+offered to a handshake. Each record names its session (§4), so only that session is ever
+offered it:
 - **It opens:** on the unconfirmed session, that session is confirmed and replaces the old
   one, and `open` says so (`promoted`); on the confirmed session, nothing else changes. A
   phone that reconnects with records still in flight on its old keys therefore loses none of
@@ -816,6 +828,10 @@ so only that session is ever offered it:
   it ends as any session does.
 - **`UnexpectedFrame`** (wrong type, or oversize): the frame is dropped and no session is
   touched.
+
+A failure may drop only the unconfirmed session and leave the confirmed one live, so after
+one `SessionManager` re-checks `is_connected` rather than treating the error as the phone
+gone.
 
 An unconfirmed session that opens no record within 10 seconds is discarded; the phone's first
 envelope, `hello`, confirms it at once. A replayed handshake therefore costs the real session

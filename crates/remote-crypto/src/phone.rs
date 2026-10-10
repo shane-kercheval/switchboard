@@ -1,15 +1,14 @@
-//! The phone's one session with its Mac, and the rule that ends it when the
-//! in-order stream from the Mac breaks. The Mac's half of the same routing is
-//! `DeviceSessions`.
+//! The phone's one session with its Mac, and whether anything has arrived on
+//! it. The Mac's half is `DeviceSessions`.
 //!
 //! Every record names its session, so the phone needs no guess about where a
 //! record came from. A record naming another session — a leftover from the
 //! Mac's previous connection, which it may keep sending on until the phone's
 //! `hello` confirms the new one — is `StaleRecord` and ignored. A record
-//! naming this session that does not decrypt means the stream has a gap or a
-//! forgery: the session closes and `open` returns `StreamBroken`. The Mac
-//! answers `hello` at once, so the phone's transport ends a session that has
-//! opened no record within its deadline (`has_opened_record`).
+//! naming this session that does not decrypt closes it (`StreamBroken`; see
+//! `Session::open`). The Mac answers `hello` at once, so the phone's
+//! transport ends a session that has opened no record within its deadline
+//! (`has_opened_record`).
 
 use crate::CryptoError;
 use crate::session::Session;
@@ -32,22 +31,11 @@ impl PhoneSession {
         self.session.seal(envelope)
     }
 
-    /// The envelope once its last record arrives, `None` before then. A
-    /// record for another session is `StaleRecord` and changes nothing; one
-    /// for this session that does not decrypt closes it and returns
-    /// `StreamBroken`. Every other outcome is `Session::open`'s.
+    /// See `Session::open`.
     pub fn open(&mut self, record: &[u8]) -> Result<Option<Vec<u8>>, CryptoError> {
-        match self.session.open(record) {
-            Ok(envelope) => {
-                self.opened_record = true;
-                Ok(envelope)
-            }
-            Err(CryptoError::RecordRejected) => {
-                self.session.close();
-                Err(CryptoError::StreamBroken)
-            }
-            Err(error) => Err(error),
-        }
+        let envelope = self.session.open(record)?;
+        self.opened_record = true;
+        Ok(envelope)
     }
 
     /// Whether any record has decrypted on this session.
@@ -148,6 +136,21 @@ mod tests {
         assert!(!phone.is_closed());
         let next = mac.seal(b"next").unwrap().remove(0);
         assert_eq!(phone.open(&next), Ok(Some(b"next".to_vec())));
+    }
+
+    /// Under `MAX_FRAME_LEN` but longer than any record, and naming this
+    /// session: refused as the wrong frame, so the session survives it.
+    #[test]
+    fn an_oversize_record_naming_this_session_leaves_it_open() {
+        let (phone_keys, mac_keys) = keys();
+        let (mut phone, mut mac) = connect(&phone_keys, &mac_keys);
+        assert_eq!(
+            phone.open(&session::oversize_record(mac.id())),
+            Err(CryptoError::UnexpectedFrame)
+        );
+        assert!(!phone.is_closed());
+        let record = mac.seal(b"hello").unwrap().remove(0);
+        assert_eq!(phone.open(&record), Ok(Some(b"hello".to_vec())));
     }
 
     /// A malformed first record closes the session before anything has

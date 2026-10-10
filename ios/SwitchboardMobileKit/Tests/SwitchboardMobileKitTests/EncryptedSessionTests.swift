@@ -237,6 +237,9 @@ struct EncryptedSessionTests {
         for error in nonTerminal {
             #expect(!error.isTerminal, "\(error)")
         }
+        for error in terminal + nonTerminal {
+            #expect(error.roundTripsThroughRust, "\(error)")
+        }
     }
 
     /// A damaged reply uses the handshake up, so the error says so and the

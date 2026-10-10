@@ -32,13 +32,6 @@ pub enum CryptoError {
     /// stays open and a waiting handshake keeps waiting.
     #[error("the frame is not of the expected type")]
     UnexpectedFrame,
-    /// The record named this session but did not decrypt under its keys.
-    /// Nothing changed in the session; `DeviceSessions` and `PhoneSession`
-    /// turn this into `StreamBroken`, since a session's records arrive in
-    /// order and one that does not decrypt means the stream has a gap or a
-    /// forgery.
-    #[error("the record did not authenticate under this session's keys")]
-    RecordRejected,
     /// The record names a session other than this one: a leftover from a
     /// connection that has since been replaced, or one that never existed.
     /// Nothing changed; the caller ignores it.
@@ -89,7 +82,6 @@ impl CryptoError {
             | Self::InvalidKey
             | Self::MessageTooLarge { .. }
             | Self::UnexpectedFrame
-            | Self::RecordRejected
             | Self::StaleRecord
             | Self::NotConnected => false,
         }

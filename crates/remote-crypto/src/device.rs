@@ -36,15 +36,6 @@ pub struct Opened {
     pub promoted: bool,
 }
 
-/// A session that failed on a record naming it is dropped; a record that did
-/// not decrypt there means its stream is broken.
-fn broken(error: CryptoError) -> CryptoError {
-    match error {
-        CryptoError::RecordRejected => CryptoError::StreamBroken,
-        other => other,
-    }
-}
-
 #[derive(Default)]
 pub struct DeviceSessions {
     confirmed: Option<Session>,
@@ -80,6 +71,10 @@ impl DeviceSessions {
     ///   is gone.
     /// - `ProtocolViolation`: it decrypted but was malformed; that session is
     ///   gone.
+    ///
+    /// A failure may have dropped only the candidate, leaving the confirmed
+    /// session live, so neither error means "device gone": re-check
+    /// `is_connected` afterwards.
     pub fn open(&mut self, record: &[u8]) -> Result<Opened, CryptoError> {
         frame::body(FrameKind::Record, record)?;
         if self.confirmed.is_none() && self.unconfirmed.is_none() {
@@ -97,7 +92,7 @@ impl DeviceSessions {
                 Err(CryptoError::StaleRecord) => {}
                 Err(error) => {
                     self.unconfirmed = None;
-                    return Err(broken(error));
+                    return Err(error);
                 }
             }
         }
@@ -112,7 +107,7 @@ impl DeviceSessions {
                 Err(CryptoError::StaleRecord) => {}
                 Err(error) => {
                     self.confirmed = None;
-                    return Err(broken(error));
+                    return Err(error);
                 }
             }
         }
@@ -270,9 +265,8 @@ mod tests {
     }
 
     /// The phone reconnects while records on its old keys are still in flight:
-    /// they are rejected by the new candidate without harm and open on the old
-    /// session, and the phone's first record on the new keys promotes the
-    /// candidate.
+    /// they name the old session and open there, and the phone's first record
+    /// on the new keys promotes the candidate.
     #[test]
     fn in_flight_records_on_the_old_keys_survive_a_reconnect() {
         let mut pair = Pair::new();
@@ -360,6 +354,26 @@ mod tests {
             Ok(Some(b"again".to_vec()))
         );
         assert!(pair.device.is_connected());
+    }
+
+    /// Under `MAX_FRAME_LEN` but longer than any record, and naming the live
+    /// session: refused as the wrong frame, so the session survives it.
+    #[test]
+    fn an_oversize_record_naming_a_session_leaves_it_live() {
+        let mut pair = Pair::new();
+        let mut phone = pair.connect();
+        pair.deliver(&mut phone, b"hello").unwrap();
+        assert_eq!(
+            pair.device
+                .open(&session::oversize_record(phone.id()))
+                .err(),
+            Some(CryptoError::UnexpectedFrame)
+        );
+        assert!(pair.device.is_connected());
+        assert_eq!(
+            pair.deliver(&mut phone, b"still here"),
+            Ok(Some(b"still here".to_vec()))
+        );
     }
 
     #[test]

@@ -42,6 +42,13 @@ public enum RemoteCryptoError: Error, Equatable, Sendable {
         rustError.map { cryptoErrorIsTerminal(error: $0) } ?? true
     }
 
+    /// Whether this case maps to its Rust error and back to itself, so the
+    /// two tables below agree. The tests call it, since only `Crypto/` may
+    /// name the Rust errors.
+    var roundTripsThroughRust: Bool {
+        rustError.map { RemoteCryptoError(rustError: $0) == self } ?? true
+    }
+
     /// The Rust error this case stands for, `nil` for `bindingFailure`.
     private var rustError: CryptoError? {
         switch self {
@@ -79,10 +86,8 @@ public enum RemoteCryptoError: Error, Equatable, Sendable {
         case CryptoError.StreamBroken: self = .streamBroken
         // Not library failures, so not logged as one: the Mac's side, which
         // the app never runs but the tests do (`InvalidSignature`,
-        // `NotConnected`); `RecordRejected`, which `PhoneSession` turns into
-        // `StreamBroken`; and `confirmationCode`'s own error.
-        case CryptoError.InvalidSignature, CryptoError.NotConnected, CryptoError.RecordRejected,
-            CryptoError.InvalidHandshakeHash:
+        // `NotConnected`), and `confirmationCode`'s own error.
+        case CryptoError.InvalidSignature, CryptoError.NotConnected, CryptoError.InvalidHandshakeHash:
             self = .bindingFailure
         default:
             logUnexpectedRustError(error)

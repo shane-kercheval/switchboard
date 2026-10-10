@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** proposed · **Revision:** 22 · **Created:** 2026-09-29 · **Revised:** 2026-10-10
+**Status:** in progress: M1 complete 2026-10-10 in #118 through #123; M2 next · **Revision:** 23 · **Created:** 2026-09-29 · **Revised:** 2026-10-10
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,16 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 23 (2026-10-10)** — M1 complete; the M2 PR plan (§9).
+  - The status moves from proposed to in progress, and M1 records the pull requests that
+    landed it.
+  - §9 gains an **M2 PR plan**: six PRs in two lines that fork after the Mac foundation, each
+    with its scope by section, the scenarios its tests cover, its done criteria, and its
+    review boundary. Two placements decided there: the envelope fixtures split between M2
+    (the control messages M2 uses) and M3 (the request and response payloads, whose types
+    do not exist before M3); and `PairingCoordinator` lands with `SessionManager`, in the
+    Rust PR that carries the integration test, so the pairing scenarios are pinned in Rust
+    and the review boundary is one PR.
 - **Revision 22 (2026-10-10)** — review of the session ids (§3, §4, §5.4).
   - **A record for this session that does not decrypt closes it.** `Session::open` now
     returns `StreamBroken` and closes the session itself, rather than reporting
@@ -1443,6 +1453,8 @@ the `SwitchboardMobile` project and `SwitchboardMobileKit` package laid out as i
 minimal app target calling the binding; the CI `check-ios` job.
 *Done when:* the xcframework builds on the CI runner and the Swift binding test passes there.
 *Review:* all of `remote-crypto`.
+*Status:* complete 2026-10-10, in #118 (`a3f99e0`), #119 (`678e6b8`), #120 (`8e9a885`),
+#121 (`c351c93`), and #123 (`00d86b2`).
 Proving the build first matters because everything after depends on it.
 
 **M2 — Relay, pairing, reconnect, revocation.**
@@ -1463,6 +1475,63 @@ Mac's window closed for 30 minutes the relay connection is still up and the phon
 connects. If that last check fails, the app holds an `NSProcessInfo` activity while remote
 access is enabled, and the check is repeated.
 *Review:* the pairing confirmation flow, `DeviceRegistry`, `SessionManager`, Swift key storage.
+
+**M2 PR plan.** Six PRs in two lines that fork after PR 2: the Mac line (3, then 4) and the iOS
+line (5, then 6) are independent until the device check in PR 6. Each PR ends with `make check`
+green, and PRs 5 and 6 with `make check-ios` too. PRs 2 and 3 may be merged if fewer PRs are
+preferred; the pairing logic stays in the Rust PR either way.
+
+1. **Relay** (§6). `crates/relay` as a library with a thin binary, so PR 3's integration test
+   starts it in-process rather than spawning it; its Dockerfile; the relay-level messages
+   (registration, `pairing_open`, `paired_devices`, `peer_disconnected`, the relay's errors)
+   with their fixtures. Adds the crate to AGENTS.md.
+   *Tests:* the §6 list. *Done when:* those pass, and the container builds and answers
+   `/healthz` locally. *Review:* none.
+2. **Mac foundation** (§4, §5.1, §5.3). `crates/remote`, Tauri-free: the envelope and the
+   control messages M2 uses (`hello`, `protocol_mismatch`, `error`, `pairing_hello`,
+   `pairing_confirmed`, `pairing_declined`) with their fixtures and `make protocol-fixtures`
+   (M3 adds its request and response payloads to the same set); the `Transport` trait with its
+   in-memory pair; `RelayTransport` with keepalive, backoff, and `paired_devices` after
+   registration; `DeviceRegistry`; the `KeyStore` trait. Adds the crate to AGENTS.md.
+   *Tests:* fixture encoding; registry read and write; against the in-process relay, a
+   reconnect after a dropped socket and a client that stops answering pings being reconnected.
+   *Done when:* those pass. *Review:* `DeviceRegistry`, reviewed together with PR 3.
+3. **Sessions and pairing** (§4, §5.2, §5.4). `SessionManager` over `DeviceSessions`,
+   `PairingCoordinator`, the `hello` answer, session end on every §5.4 trigger, the 10-second
+   unconfirmed discard; the in-process integration test, with a phone written in Rust on
+   `remote-crypto`'s phone half.
+   *Tests:* the §5.11 `SessionManager` unit tests, and from the integration list: pair → typed
+   confirm → connect → revoke mid-session → next frame refused; a replayed handshake during a
+   live session losing none of the phone's records; a wrong typed code writing no row and a
+   third killing the token; restart either side; restart the relay with the phone reconnecting
+   before the Mac; a phone disconnect ending its session on the Mac; a replaced socket's late
+   close leaving the new session intact; cross-connection replay; a second device with the same
+   token refused; a pending candidate's request discarded; `phone_offline` for one of two
+   phones ending only that session. *Done when:* every scenario in M2's own list above passes
+   in Rust. *Review:* the pairing confirmation flow, `DeviceRegistry`, `SessionManager`.
+4. **Desktop wiring and UI** (§5.9–5.10, minus keep-awake and launch at login). `KeyStore`
+   over the secret store; `config.yaml`'s `remote` section; the Tauri commands; Settings →
+   Remote access; the pairing modal with the QR code and the six-digit entry; Reset remote
+   identity.
+   *Tests:* the config test; the Settings and modal frontend tests (a mismatch clears the
+   field, a third mismatch and Decline end the pairing, the countdown); reset identity's
+   ordering. *Done when:* those pass; the Mac registers with a locally run relay from Settings;
+   and with the window closed for 30 minutes the relay connection is still up, seen as pings
+   still arriving in the relay's log. If that fails, a follow-up PR holds the `NSProcessInfo`
+   activity and repeats the check. *Review:* none new.
+5. **iOS transport** (§7.1, §7.2, §7.4). `Protocol/` mirrors decoding the shared fixtures;
+   `RelayTransport` with registration, pings, backoff, the background grace, the per-attempt
+   deadlines, and the message size constant; `SecureSession`; `ConnectionStore`; the
+   Debug-only ATS exception with the Release check.
+   *Tests:* the §7.6 coordinator tests for the session and handshake deadlines and for
+   `SecureSession`'s outbound queue; the Release Info.plist check. *Done when:*
+   `make check-ios` is green with those. *Review:* none new.
+6. **iOS pairing** (§7.3, §7.5). `PairingScanner`, `PairingFlow`, Keychain storage,
+   `NSCameraUsageDescription`, `PairView`, `SettingsView` with Unpair.
+   *Tests:* `PairingFlow`'s deadline and late-message-2 tests (§7.6); the Info.plist camera
+   check. *Done when:* a real iPhone pairs with a dev build through a locally run relay (Debug
+   configuration, §7.2), and still connects after the Mac's window has been closed for 30
+   minutes. *Review:* Swift key storage.
 
 **M3 — Read and sync.**
 First, an investigation step: for each harness (Claude, Codex, Antigravity), establish

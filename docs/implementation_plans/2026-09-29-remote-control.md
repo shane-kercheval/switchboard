@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** in progress: M1 complete 2026-10-10 in #118 through #123; M2 next · **Revision:** 23 · **Created:** 2026-09-29 · **Revised:** 2026-10-10
+**Status:** in progress: M1 complete 2026-10-10 in #118, #119, #120, #121, and #123; M2 next · **Revision:** 23 · **Created:** 2026-09-29 · **Revised:** 2026-10-10
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -1492,7 +1492,8 @@ preferred; the pairing logic stays in the Rust PR either way.
    `pairing_confirmed`, `pairing_declined`) with their fixtures and `make protocol-fixtures`
    (M3 adds its request and response payloads to the same set); the `Transport` trait with its
    in-memory pair; `RelayTransport` with keepalive, backoff, and `paired_devices` after
-   registration; `DeviceRegistry`; the `KeyStore` trait. Adds the crate to AGENTS.md.
+   registration; `DeviceRegistry`; the `KeyStore` trait. Adds the crate to AGENTS.md's
+   architecture overview and `remote_devices.jsonl` to its filesystem layout.
    *Tests:* fixture encoding; registry read and write; against the in-process relay, a
    reconnect after a dropped socket and a client that stops answering pings being reconnected.
    *Done when:* those pass. *Review:* `DeviceRegistry`, reviewed together with PR 3.
@@ -1507,8 +1508,11 @@ preferred; the pairing logic stays in the Rust PR either way.
    before the Mac; a phone disconnect ending its session on the Mac; a replaced socket's late
    close leaving the new session intact; cross-connection replay; a second device with the same
    token refused; a pending candidate's request discarded; `phone_offline` for one of two
-   phones ending only that session. *Done when:* every scenario in M2's own list above passes
-   in Rust. *Review:* the pairing confirmation flow, `DeviceRegistry`, `SessionManager`.
+   phones ending only that session; after a reset of the Mac's identity, a previously paired
+   phone answered `not_paired`; the Mac's relay connection dropping, the phone receiving
+   `peer_disconnected` and reconnecting with a new handshake. *Done when:* every scenario in
+   M2's own list above passes in Rust. *Review:* the pairing confirmation flow,
+   `DeviceRegistry`, `SessionManager`.
 4. **Desktop wiring and UI** (§5.9–5.10, minus keep-awake and launch at login). `KeyStore`
    over the secret store; `config.yaml`'s `remote` section; the Tauri commands; Settings →
    Remote access; the pairing modal with the QR code and the six-digit entry; Reset remote
@@ -1521,8 +1525,9 @@ preferred; the pairing logic stays in the Rust PR either way.
    activity and repeats the check. *Review:* none new.
 5. **iOS transport** (§7.1, §7.2, §7.4). `Protocol/` mirrors decoding the shared fixtures;
    `RelayTransport` with registration, pings, backoff, the background grace, the per-attempt
-   deadlines, and the message size constant; `SecureSession`; `ConnectionStore`; the
-   Debug-only ATS exception with the Release check.
+   deadlines, and the message size constant; `SecureSession`, which sends `hello` as the first
+   envelope after each handshake and handles the Mac's `hello` or `protocol_mismatch` (§4);
+   `ConnectionStore`; the Debug-only ATS exception with the Release check.
    *Tests:* the §7.6 coordinator tests for the session and handshake deadlines and for
    `SecureSession`'s outbound queue; the Release Info.plist check. *Done when:*
    `make check-ios` is green with those. *Review:* none new.

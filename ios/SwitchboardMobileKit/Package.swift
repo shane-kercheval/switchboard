@@ -14,7 +14,8 @@ let package = Package(
             dependencies: ["SwitchboardRemoteCrypto"]
         ),
         // `Generated/` is written by `make ios-crypto` from `crates/remote-crypto`
-        // and is not committed. Only `Crypto/` imports this module.
+        // and is not committed. Among the package's sources only `Crypto/`
+        // imports this module; among the tests, only `MacHalves.swift`.
         .target(
             name: "SwitchboardRemoteCrypto",
             dependencies: ["SwitchboardRemoteCryptoFFI"],
@@ -26,7 +27,8 @@ let package = Package(
         ),
         .testTarget(
             name: "SwitchboardMobileKitTests",
-            dependencies: ["SwitchboardMobileKit"]
+            // The Mac's test-only halves call the bindings directly.
+            dependencies: ["SwitchboardMobileKit", "SwitchboardRemoteCrypto"]
         ),
     ]
 )

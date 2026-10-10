@@ -63,6 +63,43 @@ pub(crate) fn write(
     Ok(message)
 }
 
+/// Length of the echo a handshake reply starts with.
+pub(crate) const ECHO_LEN: usize = KEY_LEN;
+
+/// What a reply repeats so the initiator can tell its own reply from one to
+/// an attempt it abandoned: the initiator's ephemeral public key, which
+/// starts message 1 in the clear in both handshake patterns and is fresh per
+/// attempt. Not authenticated: a relay that changes it only gets the reply
+/// ignored, which it could do by dropping the reply.
+pub(crate) fn echo_of(message_1: &[u8]) -> Result<[u8; ECHO_LEN], CryptoError> {
+    message_1
+        .first_chunk::<ECHO_LEN>()
+        .copied()
+        .ok_or(CryptoError::HandshakeFailed)
+}
+
+/// A reply's body: the echo, then the handshake message.
+pub(crate) fn with_echo(echo: &[u8; ECHO_LEN], message: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(ECHO_LEN + message.len());
+    body.extend_from_slice(echo);
+    body.extend_from_slice(message);
+    body
+}
+
+/// The handshake message in a reply to the attempt that sent `echo`. A reply
+/// to any other attempt is `UnexpectedFrame`, so the caller's handshake is
+/// untouched and still waiting. This sorts honest late replies; it is not an
+/// authenticity check. The echo is public, so whoever saw message 1 can send
+/// garbage behind the right one, and that uses the handshake up — no more than
+/// dropping the real reply would cost.
+pub(crate) fn strip_echo<'a>(
+    echo: &[u8; ECHO_LEN],
+    body: &'a [u8],
+) -> Result<&'a [u8], CryptoError> {
+    body.strip_prefix(echo.as_slice())
+        .ok_or(CryptoError::UnexpectedFrame)
+}
+
 pub(crate) fn remote_static(handshake: &HandshakeState) -> Result<[u8; KEY_LEN], CryptoError> {
     handshake
         .get_remote_static()

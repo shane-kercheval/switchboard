@@ -27,15 +27,16 @@ pub enum CryptoError {
     #[error("message of {length} bytes is too large to send")]
     MessageTooLarge { length: u64 },
     /// A frame of the wrong type, of no known type, or longer than any Noise
-    /// message. Refused before any handshake or session state is touched, so
-    /// an open session stays open.
+    /// message, or a handshake reply that answers another attempt. Refused
+    /// before any handshake or session state is touched, so an open session
+    /// stays open and a waiting handshake keeps waiting.
     #[error("the frame is not of the expected type")]
     UnexpectedFrame,
-    /// The record did not decrypt under this session's keys. Nothing changed:
-    /// the record may belong to another session of the same device. If no
-    /// session of the device opens it, the caller ends them.
-    #[error("the record did not authenticate under this session's keys")]
-    RecordRejected,
+    /// The record names a session other than this one: a leftover from a
+    /// connection that has since been replaced, or one that never existed.
+    /// Nothing changed; the caller ignores it.
+    #[error("the record belongs to another session")]
+    StaleRecord,
     /// The record decrypted, so the peer holds this session's keys, but its
     /// contents broke the fragment rules. The session is closed. The record
     /// belongs to no other session.
@@ -47,11 +48,42 @@ pub enum CryptoError {
     /// Encrypting a record failed, so the session is closed.
     #[error("a record could not be encrypted, so the session is closed")]
     SendFailed,
-    /// No session of the device opened the record: its stream is broken, and
-    /// the device's sessions have ended.
-    #[error("no session opened the record, so the device's sessions ended")]
-    SessionsEnded,
     /// The device has no session to open or seal with.
     #[error("the device is not connected")]
     NotConnected,
+    /// A record named a live session but did not decrypt: that session's
+    /// in-order stream has a gap or a forgery. The session is closed; the
+    /// phone reconnects.
+    #[error("a record for this session did not decrypt, so the session is closed")]
+    StreamBroken,
+}
+
+impl CryptoError {
+    /// Whether the handshake or session this error came from can't be used
+    /// again: a handshake step that read its real message, or a session that
+    /// closed. The caller decides what follows — a new handshake, a failed
+    /// pairing. False for errors that leave their object usable, and for
+    /// construction and input errors, which come before anything exists to
+    /// end. `InvalidSignature` is terminal because its only handshake source,
+    /// the Mac reading pairing message 3, has used up its handshake by then.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::InvalidSignature
+            | Self::HandshakeFailed
+            | Self::UnexpectedPeerKey
+            | Self::InvalidPayload
+            | Self::ProtocolViolation
+            | Self::SessionClosed
+            | Self::SendFailed
+            | Self::StreamBroken => true,
+            Self::InvalidHandshakeHash { .. }
+            | Self::InvalidKeyBlob
+            | Self::RandomnessUnavailable
+            | Self::InvalidKey
+            | Self::MessageTooLarge { .. }
+            | Self::UnexpectedFrame
+            | Self::StaleRecord
+            | Self::NotConnected => false,
+        }
+    }
 }

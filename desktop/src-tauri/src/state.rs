@@ -17,6 +17,8 @@ use uuid::Uuid;
 use crate::git_registry::{self, GitRegistry};
 use crate::harness_usage::{self, HarnessUsage};
 use crate::notification::{Notifier, NullNotifier};
+use crate::ops::desktop_sync::{DesktopSync, NoopDesktopSync};
+use crate::ops::ledger::{OpsLedgerEmitter, SendLedger};
 use crate::preferences::{self, Preferences};
 use crate::wake_lock::WakeLock;
 use crate::workspace::{self, Workspace};
@@ -101,6 +103,17 @@ pub enum TestSeam {
     /// indistinguishable from the broken form. The wait is a blocking one because
     /// the capture is synchronous and holds a `std` mutex.
     Capture,
+    /// Inside an `ops` send, immediately before each recipient's dispatch.
+    /// Holds the gap between the up-front busy check and the actor's own
+    /// admission open, so a test can make a recipient busy in between and
+    /// prove the partial-dispatch rule; and holds a send task mid-fan-out so a
+    /// test can drop the caller and prove the task finishes anyway.
+    OpsDispatch,
+    /// Inside `update_agent_selection_impl`, between its read of the record
+    /// and its write, **while it holds `registry_write`**. Holds the first of
+    /// two concurrent selection changes open so a test can prove the second
+    /// waits for it and merges onto its result rather than a stale read.
+    SelectionUpdate,
     /// Inside the attachment-reclaim worker, before it scans. Holds the worker
     /// open so a test can prove a second caller — a reloaded page — waits for
     /// the worker to stop rather than being released on "already claimed", and
@@ -216,7 +229,20 @@ pub struct AppState {
     pub codex_adapter: Arc<dyn HarnessAdapter>,
     /// Adapter for `HarnessKind::Antigravity` agents.
     pub antigravity_adapter: Arc<dyn HarnessAdapter>,
+    /// The app's event sink, with the send ledger's decorator outermost: every
+    /// event the dispatcher emits passes through [`OpsLedgerEmitter`] before
+    /// reaching whatever sink the constructor was given, so the ledger sees
+    /// the same stream the window does.
     pub emitter: Arc<dyn EventEmitter>,
+    /// Per-send and per-run outcomes fed by the event stream, for callers that
+    /// are not the window (MCP tools). A tail-leaf mutex: taken alone, briefly,
+    /// never across an `.await`.
+    pub ledger: Arc<SendLedger>,
+    /// The window half of the sync round trip a turn-starting operation runs
+    /// before dispatching. Defaults to an implementation that reports ready at
+    /// once; production injects the real one via
+    /// [`AppState::with_desktop_sync`].
+    pub desktop_sync: Arc<dyn DesktopSync>,
     /// Set of `agent_id`s whose next dispatch must run with
     /// `DispatchOptions::is_first_dispatch_after_attach = true`. Populated by
     /// `attach_agent_impl` (Codex-only — see below); read (not drained) by
@@ -548,7 +574,12 @@ impl AppState {
         store: Store,
         lock_root: PathBuf,
     ) -> Self {
+        let ledger = Arc::new(SendLedger::new());
+        let emitter: Arc<dyn EventEmitter> =
+            Arc::new(OpsLedgerEmitter::new(emitter, Arc::clone(&ledger)));
         Self {
+            ledger,
+            desktop_sync: Arc::new(NoopDesktopSync),
             store,
             maintenance: Mutex::new(HashSet::new()),
             project_generation: Arc::new(Mutex::new(HashMap::new())),
@@ -658,6 +689,13 @@ impl AppState {
     #[must_use]
     pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
         self.notifier = notifier;
+        self
+    }
+
+    /// Builder step that injects the window half of the sync round trip.
+    #[must_use]
+    pub fn with_desktop_sync(mut self, desktop_sync: Arc<dyn DesktopSync>) -> Self {
+        self.desktop_sync = desktop_sync;
         self
     }
 

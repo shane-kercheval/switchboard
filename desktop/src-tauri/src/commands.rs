@@ -17,7 +17,7 @@ use switchboard_core::{
 };
 use switchboard_dispatcher::{
     CancelOutcome, CurrentTurnWait, DispatchContextFactory, Dispatcher, EventEmitter, OnBusy,
-    RemoveQueuedMessageError, RemovedQueuedMessage, SendOutcome, TurnKind,
+    RemoveQueuedMessageError, RemovedQueuedMessage, SendOptions, SendOutcome, TurnKind,
 };
 use switchboard_harness::{
     CancelSource, ForwardedBlock, HarnessAdapter, MessageId, TurnOutcome,
@@ -183,6 +183,24 @@ fn wait_at_blocking_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>)
 #[cfg(not(test))]
 fn wait_at_blocking_seam(_barrier: Option<()>) {}
 
+#[cfg(test)]
+use crate::state::TestSeam::SelectionUpdate as SelectionSeam;
+#[cfg(not(test))]
+struct SelectionSeam;
+
+#[cfg(test)]
+fn test_seam_blocking(
+    state: &AppState,
+    seam: crate::state::TestSeam,
+) -> Option<Arc<crate::state::MaintenanceBarrier>> {
+    test_seam(state, seam)
+}
+
+#[cfg(not(test))]
+fn test_seam_blocking(_state: &AppState, _seam: SelectionSeam) -> Option<()> {
+    None
+}
+
 /// Hold the post-eviction, pre-drain window open when a test asks.
 #[cfg(test)]
 async fn wait_at_maintenance_barrier(state: &AppState) {
@@ -192,6 +210,17 @@ async fn wait_at_maintenance_barrier(state: &AppState) {
 #[cfg(not(test))]
 #[expect(clippy::unused_async, reason = "matches the cfg(test) signature")]
 async fn wait_at_maintenance_barrier(_state: &AppState) {}
+
+/// Hold an `ops` send open immediately before a recipient's dispatch when a
+/// test asks. See [`crate::state::TestSeam::OpsDispatch`].
+#[cfg(test)]
+pub(crate) async fn wait_at_ops_dispatch_seam(state: &AppState) {
+    wait_at_seam(test_seam(state, crate::state::TestSeam::OpsDispatch)).await;
+}
+
+#[cfg(not(test))]
+#[expect(clippy::unused_async, reason = "matches the cfg(test) signature")]
+pub(crate) async fn wait_at_ops_dispatch_seam(_state: &AppState) {}
 
 /// Hold [`capture_dispatch_snapshot`] open **between its two reads**, inside the
 /// `registry_write` guard, when a test asks. See [`crate::state::TestSeam::Capture`].
@@ -2425,8 +2454,25 @@ pub fn set_visible_project_impl(state: &AppState, project_id: Option<ProjectId>,
     lock(&state.visible_project).apply(project_id, seq);
 }
 
+/// Register a new agent in the **active** project — the window's create, which
+/// targets whatever project the user is in. A thin wrapper over
+/// [`create_agent_in_project_impl`] so the active-project resolution stays in a
+/// tested free function rather than the command shim.
 pub fn create_agent_impl(
     state: &AppState,
+    name: &str,
+    harness: HarnessKind,
+    selection: AgentSelection,
+) -> Result<AgentRecord, AppError> {
+    let active = lock(&state.active_project_id).ok_or(AppError::NoActiveProject)?;
+    create_agent_in_project_impl(state, active, name, harness, selection)
+}
+
+/// Register a new agent in `project_id`, which must be loaded. Callers that
+/// act on an explicit project (the `ops` layer) use this directly.
+pub fn create_agent_in_project_impl(
+    state: &AppState,
+    project_id: ProjectId,
     name: &str,
     harness: HarnessKind,
     selection: AgentSelection,
@@ -2441,11 +2487,10 @@ pub fn create_agent_impl(
     // an internal read-check-then-append window that two concurrent IPC
     // calls could race through.
     let _write = lock(&state.registry_write);
-    let active = lock(&state.active_project_id).ok_or(AppError::NoActiveProject)?;
     let project = lock(&state.projects)
-        .get(&active)
+        .get(&project_id)
         .cloned()
-        .ok_or(AppError::ProjectNotLoaded(active))?;
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
     let record = project.register_agent(name, harness, selection)?;
     cache_agent(state, record.clone())?;
     Ok(record)
@@ -2826,6 +2871,28 @@ pub fn set_agent_selection_impl(
     Ok(updated)
 }
 
+/// Change part of an agent's selection **under one `registry_write`
+/// acquisition**: read the current record, let `merge` produce the full
+/// replacement, write it, refresh the cache. A caller that read the record
+/// first and then called [`set_agent_selection_impl`] would race any write
+/// landing between its read and its write — a window edit of the model
+/// between an MCP caller's read and its effort-only write would be undone.
+pub fn update_agent_selection_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    merge: impl FnOnce(&AgentRecord) -> AgentSelection,
+) -> Result<AgentRecord, AppError> {
+    let _write = lock(&state.registry_write);
+    let (project, current) = lookup_agent(state, agent_id)?;
+    // Between the read and the write, while the lock is held: a test parks
+    // here and issues a second write, which must wait for this one.
+    wait_at_blocking_seam(test_seam_blocking(state, SelectionSeam));
+    let selection = merge(&current);
+    let updated = project.set_agent_selection(agent_id, selection)?;
+    cache_agent(state, updated.clone())?;
+    Ok(updated)
+}
+
 /// Rewrite a project's registry in `agent_ids` order — the roster's canonical
 /// display order (sidebar cards, compose chips, ⌘1..9). Synchronous under
 /// `registry_write` like the other registry mutations. Permutation validation
@@ -2913,21 +2980,35 @@ pub fn attach_agent_impl(
     existing_session_id: &str,
     home_dir: &Path,
 ) -> Result<AgentRecord, AppError> {
-    let _write = lock(&state.registry_write);
     let active = lock(&state.active_project_id).ok_or(AppError::NoActiveProject)?;
+    attach_agent_in_project_impl(state, active, name, harness, existing_session_id, home_dir)
+}
+
+/// [`attach_agent_impl`] against an explicit, loaded project — the same shape
+/// as [`create_agent_in_project_impl`], so the two registration paths stay
+/// parallel even though only create is reachable over MCP.
+pub fn attach_agent_in_project_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    name: &str,
+    harness: HarnessKind,
+    existing_session_id: &str,
+    home_dir: &Path,
+) -> Result<AgentRecord, AppError> {
+    let _write = lock(&state.registry_write);
     let project = lock(&state.projects)
-        .get(&active)
+        .get(&project_id)
         .cloned()
-        .ok_or(AppError::ProjectNotLoaded(active))?;
-    // The active project's index row, for its working directory: the session
-    // file to attach lives under the harness's per-cwd tree, and the Claude
-    // collision scan is scoped to the projects sharing that folder.
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
+    // The project's index row, for its working directory: the session file to
+    // attach lives under the harness's per-cwd tree, and the Claude collision
+    // scan is scoped to the projects sharing that folder.
     let entry = state
         .store
         .list_projects()?
         .into_iter()
-        .find(|e| e.id == active)
-        .ok_or(AppError::ProjectNotLoaded(active))?;
+        .find(|e| e.id == project_id)
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
     let directory_path = entry.directory.clone();
 
     // Claude/Antigravity identify a session by a UUID, parsed per-arm
@@ -3002,7 +3083,7 @@ pub fn attach_agent_impl(
         _ => return Err(AppError::UnsupportedHarness),
     };
 
-    // Register-cache: the new attached agent's project is `active`,
+    // Register-cache: the new attached agent's project is `project_id`,
     // which is loaded (resolved above), so a subsequent `lookup_agent` hits
     // the cache without a disk scan.
     cache_agent(state, record.clone())?;
@@ -3579,6 +3660,35 @@ pub async fn send_message_impl(
     send_id: SendId,
     home_dir: &Path,
 ) -> Result<MessageId, AppError> {
+    dispatch_message_impl(
+        state,
+        agent_id,
+        prompt,
+        attachments,
+        send_id,
+        home_dir,
+        OnBusy::Enqueue,
+        SendOptions::default(),
+    )
+    .await
+}
+
+/// [`send_message_impl`] with the caller choosing the busy policy and the
+/// dispatcher's [`SendOptions`]. The compose bar keeps `send_message_impl`'s
+/// queue-and-mint defaults; the `ops` layer passes `FailFast` under `refuse`,
+/// a ledger-registered `message_id`, and a live user message. Under
+/// `FailFast` a busy agent is [`AppError::AgentBusy`] with nothing enqueued.
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_message_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    prompt: &str,
+    attachments: Vec<Attachment>,
+    send_id: SendId,
+    home_dir: &Path,
+    on_busy: OnBusy,
+    options: SendOptions,
+) -> Result<MessageId, AppError> {
     // Project, agent, and generation from one instant — see
     // `capture_dispatch_snapshot`. Read separately they can straddle a lifecycle
     // operation, and the generation then validates itself.
@@ -3642,19 +3752,20 @@ pub async fn send_message_impl(
     // trivially-grouped 1-element fan-out with its own id.
     match state
         .dispatcher
-        .send_message(
+        .send_message_with(
             agent_id,
             prompt,
             attachments,
             send_id,
             factory,
-            OnBusy::Enqueue,
+            on_busy,
+            options,
         )
         .await
     {
         SendOutcome::Accepted(message_id) => Ok(message_id),
-        // Unreachable on the Enqueue path; FailFast (workflow §7) is not used
-        // here yet. Map defensively so a future caller can't silently misread.
+        // Unreachable on the Enqueue path; under FailFast the agent was busy
+        // and nothing was enqueued.
         SendOutcome::Busy => Err(AppError::AgentBusy),
     }
 }
@@ -4047,7 +4158,7 @@ async fn forward_resolve(
 /// the loaded record's own `project_id` against it. A mismatch means the draft
 /// names an agent that has since moved or been re-created, and is refused rather
 /// than silently resolved against the wrong project.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ForwardSourceRef {
     pub agent_id: AgentId,
     pub project_id: ProjectId,
@@ -4058,7 +4169,10 @@ pub struct ForwardSourceRef {
 /// backend with a foreign agent** — a chip picked this session, one restored
 /// after a restart, or a direct IPC call — so no frontend surface has to
 /// pre-open anything.
-fn resolve_source_ref(state: &AppState, source: ForwardSourceRef) -> Result<AgentId, AppError> {
+pub(crate) fn resolve_source_ref(
+    state: &AppState,
+    source: ForwardSourceRef,
+) -> Result<AgentId, AppError> {
     // Idempotent: a no-op when already loaded, a real open (with its lock) when
     // not. This is the *activation* path — deliberately distinct from the
     // read-only roster read the pickers browse with.
@@ -4312,11 +4426,26 @@ async fn resolve_all_sources(
 /// reports the failure. Closing that would require ordering journal outcomes
 /// against harness-file turns by timestamp — a systemic change (the transcript
 /// merge has the same blind spot), out of scope for the forward resolver.
-fn latest_turn_failure_note(
+pub(crate) fn latest_turn_failure_note(
     records: &[switchboard_core::JournalRecord],
     agent_id: AgentId,
     agent_name: &str,
 ) -> Option<String> {
+    latest_turn_outcome(records, agent_id, agent_name).map(|(_, note)| note)
+}
+
+/// The agent's most recent journaled turn's non-completed outcome, typed, with
+/// the note [`latest_turn_failure_note`] forwards for it. `None` when that
+/// turn completed or the agent has no journaled turns. The outcome is `None`
+/// when the record's payload could not be parsed (the note still says the turn
+/// did not complete). Readers that must tell failed from cancelled use this
+/// rather than searching the note's text, which embeds the harness's own error
+/// message and can contain any words.
+pub(crate) fn latest_turn_outcome(
+    records: &[switchboard_core::JournalRecord],
+    agent_id: AgentId,
+    agent_name: &str,
+) -> Option<(Option<TurnOutcome>, String)> {
     use switchboard_core::JournalRecord;
     let latest_turn = records
         .iter()
@@ -4343,21 +4472,22 @@ fn latest_turn_failure_note(
         } if *a == agent_id && *turn_id == latest_turn => Some(outcome),
         _ => None,
     })?;
-    let note = match serde_json::from_value::<TurnOutcome>(outcome.clone()) {
-        Ok(TurnOutcome::Failed { message, .. }) => format!(
+    let parsed = serde_json::from_value::<TurnOutcome>(outcome.clone()).ok();
+    let note = match &parsed {
+        Some(TurnOutcome::Failed { message, .. }) => format!(
             "⚠️ {agent_name}'s most recent turn failed and produced no output to forward.\n\nError: {message}"
         ),
-        Ok(TurnOutcome::Cancelled { .. }) => format!(
+        Some(TurnOutcome::Cancelled { .. }) => format!(
             "⚠️ {agent_name}'s most recent turn was cancelled before producing output to forward."
         ),
         // The journal never writes a `Completed` `Outcome` (contract); if one
         // somehow appears, treat it as no-failure and let the caller read disk.
-        Ok(TurnOutcome::Completed) => return None,
+        Some(TurnOutcome::Completed) => return None,
         // A future non-completed variant, or an unparseable payload: we still know
         // (from the `Outcome`'s presence) the turn didn't complete.
-        Ok(_) | Err(_) => format!("⚠️ {agent_name}'s most recent turn did not complete."),
+        Some(_) | None => format!("⚠️ {agent_name}'s most recent turn did not complete."),
     };
-    Some(note)
+    Some((parsed, note))
 }
 
 /// Resolve one forward source: await its current in-flight turn's terminal (the
@@ -4655,15 +4785,23 @@ async fn forward_prompt_resolve(
     let appended = compose_resolutions(&resolved[cursor..], appended_text);
 
     let rendered = state.prompts.render(provider, name, &args).await?;
-    // Combine like the frontend's `combinePromptMessage`: the rendered prompt,
-    // then (when non-empty) a blank line and the composed appended tail.
-    let trimmed_appended = appended.trim();
-    let body = if trimmed_appended.is_empty() {
-        rendered.text
+    Ok(ForwardOutcome::Resolved {
+        body: combine_prompt_message(&rendered.text, &appended),
+    })
+}
+
+/// A rendered prompt followed, when non-empty, by a blank line and the
+/// trimmed appended text — the one rule for combining the two, shared with the
+/// frontend's `combinePromptMessage` and with every backend send that takes a
+/// saved prompt plus typed text.
+#[must_use]
+pub(crate) fn combine_prompt_message(rendered: &str, appended: &str) -> String {
+    let trimmed = appended.trim();
+    if trimmed.is_empty() {
+        rendered.to_owned()
     } else {
-        format!("{}\n\n{trimmed_appended}", rendered.text)
-    };
-    Ok(ForwardOutcome::Resolved { body })
+        format!("{rendered}\n\n{trimmed}")
+    }
 }
 
 /// Cancel a held manual forward by `forward_id`: fire the registered hold token
@@ -4743,7 +4881,7 @@ pub fn load_transcript_impl(
 /// genuinely absent or never-started sessions remain successful empty loads.
 /// Session identity is read from the agent's registry record (`session_locator`),
 /// so there's no per-agent session-link sidecar to corrupt.
-fn load_agent_transcript(
+pub(crate) fn load_agent_transcript(
     project: &Project,
     agent: &AgentRecord,
     home_dir: &Path,
@@ -5435,7 +5573,7 @@ type UserMessageGroup = (
 /// (rendered but deliberately not correlated to any send), or nothing (a
 /// journaled prompt the journal already renders).
 #[derive(Clone, Copy)]
-enum TurnRender {
+pub(crate) enum TurnRender {
     Agent {
         send_id: Option<SendId>,
         correlation: Option<SendCorrelation>,
@@ -5804,7 +5942,7 @@ fn classify_turns_by_count(
 /// turns), and the window guard below declines any link naming a send this agent
 /// never received. Do not "flatten" the per-agent link maps into one, and do not
 /// relax the missing-send arm into a permissive default.
-fn classify_agent_turns(
+pub(crate) fn classify_agent_turns(
     turns: &[switchboard_harness::Turn],
     all_sends: &[(SendId, chrono::DateTime<chrono::Utc>)],
     links: &HashMap<String, SendId>,
@@ -6207,6 +6345,115 @@ fn commit_identity_join(
 // One linear pass over the journal + one over the transcripts; splitting it
 // would scatter the user-message grouping, outcome collection, and order-zip
 // correlation that are read together.
+/// Apply one `TurnLink` to an agent's link map under the poison rule above.
+/// Shared by the project merge and the single-agent view so the two cannot
+/// disagree about which links are trusted.
+fn record_turn_link(
+    links: &mut HashMap<String, SendId>,
+    poison: &mut HashSet<String>,
+    agent_id: AgentId,
+    hydration_key: String,
+    send_id: SendId,
+) {
+    if poison.contains(&hydration_key) {
+        return;
+    }
+    match links.get(&hydration_key) {
+        Some(&existing) if existing != send_id => {
+            // Breadcrumb: two `TurnLink`s claim one key for different sends. No
+            // legitimate trigger (per-turn keys are unique), so any firing is a
+            // stale/corrupt link — surface it. Ids only.
+            tracing::warn!(
+                hydration_key = %hydration_key,
+                existing_send = %existing,
+                conflicting_send = %send_id,
+                %agent_id,
+                "conflicting TurnLink records for one hydration_key — poisoning the key (both turns fall back to positional)",
+            );
+            links.remove(&hydration_key);
+            poison.insert(hydration_key);
+        }
+        Some(_) => {} // same key, same send — idempotent, keep it
+        None => {
+            links.insert(hydration_key, send_id);
+        }
+    }
+}
+
+/// One agent's side of the journal, as the merge derives it: its sends in
+/// dispatch order, the instant its journaled history begins, its trusted
+/// links, and its sends' prompts. The inputs [`classify_agent_turns`] needs
+/// to correlate that agent's transcript on its own — the same correlation the
+/// merged conversation applies, for a reader that needs one agent's turns
+/// without parsing every agent's file.
+pub(crate) struct AgentJournalView {
+    pub sends: Vec<(SendId, chrono::DateTime<chrono::Utc>)>,
+    pub journal_start: Option<chrono::DateTime<chrono::Utc>>,
+    pub links: HashMap<String, SendId>,
+    pub send_prompts: HashMap<SendId, (String, Vec<Attachment>)>,
+}
+
+impl AgentJournalView {
+    pub(crate) fn from_records(
+        records: &[switchboard_core::JournalRecord],
+        agent_id: AgentId,
+    ) -> Self {
+        let mut view = Self {
+            sends: Vec::new(),
+            journal_start: None,
+            links: HashMap::new(),
+            send_prompts: HashMap::new(),
+        };
+        let mut poison: HashSet<String> = HashSet::new();
+        for record in records {
+            match record {
+                switchboard_core::JournalRecord::Send {
+                    send_id,
+                    agent_id: a,
+                    prompt,
+                    attachments,
+                    at,
+                    ..
+                } if *a == agent_id => {
+                    view.sends.push((*send_id, *at));
+                    view.journal_start = Some(view.journal_start.map_or(*at, |s| s.min(*at)));
+                    view.send_prompts
+                        .entry(*send_id)
+                        .or_insert_with(|| (prompt.clone(), attachments.clone()));
+                }
+                switchboard_core::JournalRecord::TurnLink {
+                    send_id,
+                    agent_id: a,
+                    hydration_key,
+                    ..
+                } if *a == agent_id => {
+                    record_turn_link(
+                        &mut view.links,
+                        &mut poison,
+                        agent_id,
+                        hydration_key.clone(),
+                        *send_id,
+                    );
+                }
+                _ => {}
+            }
+        }
+        view
+    }
+
+    /// Correlate `turns` (this agent's transcript) to its sends exactly as the
+    /// merged conversation would.
+    pub(crate) fn classify(&self, turns: &[switchboard_harness::Turn]) -> Vec<TurnRender> {
+        classify_agent_turns(
+            turns,
+            &self.sends,
+            &self.links,
+            &self.send_prompts,
+            self.journal_start,
+        )
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn merge_project_conversation(
     journal: Vec<switchboard_core::JournalRecord>,
@@ -6341,31 +6588,13 @@ fn merge_project_conversation(
                 // for one turn would mis-group the other. Fresh Claude `message.id`s
                 // and Codex `turn_context.turn_id`s satisfy it today; a key-reusing
                 // harness must not be given a `TurnLink` without revisiting this.
-                let poison = agent_link_poison.entry(agent_id).or_default();
-                if poison.contains(&hydration_key) {
-                    continue;
-                }
-                let links = agent_links.entry(agent_id).or_default();
-                match links.get(&hydration_key) {
-                    Some(&existing) if existing != send_id => {
-                        // Breadcrumb: two `TurnLink`s claim one key for different
-                        // sends. No legitimate trigger (per-turn keys are unique), so
-                        // any firing is a stale/corrupt link — surface it. Ids only.
-                        tracing::warn!(
-                            hydration_key = %hydration_key,
-                            existing_send = %existing,
-                            conflicting_send = %send_id,
-                            %agent_id,
-                            "conflicting TurnLink records for one hydration_key — poisoning the key (both turns fall back to positional)",
-                        );
-                        links.remove(&hydration_key);
-                        poison.insert(hydration_key);
-                    }
-                    Some(_) => {} // same key, same send — idempotent, keep it
-                    None => {
-                        links.insert(hydration_key, send_id);
-                    }
-                }
+                record_turn_link(
+                    agent_links.entry(agent_id).or_default(),
+                    agent_link_poison.entry(agent_id).or_default(),
+                    agent_id,
+                    hydration_key,
+                    send_id,
+                );
             }
             // A future journal-record kind we don't yet render — degrade by
             // skipping it rather than failing the whole load.
@@ -7369,7 +7598,10 @@ pub fn install_status_for_adapter(adapter: Option<&dyn HarnessAdapter>) -> Harne
 /// typed error (`DirectoryNotFound` / `AmbiguousDirectory`) rather than
 /// `ProjectNotLoaded`: the project exists, and saying otherwise would point the
 /// user at the wrong repair.
-fn open_project_from_store(state: &AppState, project_id: ProjectId) -> Result<Project, AppError> {
+pub(crate) fn open_project_from_store(
+    state: &AppState,
+    project_id: ProjectId,
+) -> Result<Project, AppError> {
     // Gated: this is the fallback ordinary reads take when a project isn't
     // loaded, which is exactly what a lifecycle operation makes true. Two of its
     // callers resolve harness session files through `project.directory`, so
@@ -7385,7 +7617,10 @@ fn open_project_from_store(state: &AppState, project_id: ProjectId) -> Result<Pr
     state.store.open_project(project_id).map_err(AppError::from)
 }
 
-fn lookup_agent(state: &AppState, agent_id: AgentId) -> Result<(Project, AgentRecord), AppError> {
+pub(crate) fn lookup_agent(
+    state: &AppState,
+    agent_id: AgentId,
+) -> Result<(Project, AgentRecord), AppError> {
     // Register-cache hit: the cached `AgentRecord` carries its `project_id`, so
     // we resolve the owning project without scanning every loaded project's
     // `registry.jsonl` from disk. **The project is always loaded when its agents

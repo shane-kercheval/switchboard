@@ -14,6 +14,7 @@ mod lifecycle;
 mod locator_sink;
 mod metadata;
 mod notification;
+pub mod ops;
 mod preferences;
 mod secret_store;
 mod session_lock;
@@ -1639,36 +1640,26 @@ async fn refresh_workflow_form_from_cache(
         .map_err(|e| e.to_string())
 }
 
-/// Resolve any forward-fields (completed-only) and merge the composed text into
-/// the invocation inputs, so validation/launch see a forwarded field as a filled
-/// value. A still-streaming source rejects the whole invocation. The HOME read
-/// mirrors the manual-forward shims.
+/// The shim's half of the forward merge: the HOME read, mirroring the
+/// manual-forward shims, around `ops::workflow::merge_workflow_forwards`.
 async fn merge_workflow_forwards(
     state: &AppState,
     inputs: &std::collections::BTreeMap<String, InputValue>,
     forward_sources: &std::collections::BTreeMap<String, Vec<crate::commands::ForwardSourceRef>>,
     recipient_project: switchboard_core::ProjectId,
 ) -> Result<std::collections::BTreeMap<String, InputValue>, String> {
-    if forward_sources.values().all(Vec::is_empty) {
-        return Ok(inputs.clone());
-    }
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    let resolved = crate::commands::resolve_workflow_forwards(
+    crate::ops::workflow::merge_workflow_forwards(
         state,
-        forward_sources,
         inputs,
-        &home,
+        forward_sources,
         recipient_project,
+        &home,
     )
     .await
-    .map_err(|e| e.to_string())?;
-    let mut effective = inputs.clone();
-    for (field, text) in resolved {
-        effective.insert(field, InputValue::Text(text));
-    }
-    Ok(effective)
+    .map_err(|e| e.to_string())
 }
 
 /// Validate a workflow invocation (capability gate + input/roster/prompt rules)
@@ -1868,6 +1859,16 @@ async fn project_session_fingerprints(
 /// `NormalizedEvent` payloads, so this is defensive.
 struct AppHandleEmitter {
     app: tauri::AppHandle,
+}
+
+/// The production [`crate::ops::handle::AppStateHandle`]: a spawned send task
+/// holds an `AppHandle` clone and reaches the managed state through it.
+/// `State::inner` hands out a reference tied to the handle, so the borrow is
+/// valid for as long as the task holds the handle.
+impl crate::ops::handle::AppStateHandle for tauri::AppHandle {
+    fn app_state(&self) -> &AppState {
+        self.state::<AppState>().inner()
+    }
 }
 
 impl EventEmitter for AppHandleEmitter {

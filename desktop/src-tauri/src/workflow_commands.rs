@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use switchboard_core::name::canonicalize_for_uniqueness;
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId};
 use switchboard_dispatcher::{DispatchContextFactory, Dispatcher, EventEmitter};
@@ -166,16 +166,29 @@ impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
 /// The `workflow:<project-id>` event payload. Carries orchestration state only —
 /// **no agent output text** (§3); the turns stream on `agent:<id>` and render in
 /// the transcript. `step` is the zero-based index of the step in progress.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowProgressPayload {
     pub run_id: String,
     pub workflow: String,
     pub step: usize,
     pub total: usize,
-    /// `"running"` while live; `"complete"` / `"cancelled"` / `"failed"` at terminal.
-    pub status: &'static str,
+    /// `running` while live; a terminal status at the end. Typed so the
+    /// in-process reader of this channel (the send ledger) and the writer
+    /// share one vocabulary.
+    pub status: WorkflowProgressStatus,
     /// The failure reason on a failed terminal, else `None`.
     pub reason: Option<String>,
+}
+
+/// The run's state as the progress channel carries it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkflowProgressStatus {
+    Running,
+    Complete,
+    Cancelled,
+    Failed,
 }
 
 /// The production [`ProgressSink`]: mirrors the interpreter's live progress onto
@@ -217,12 +230,12 @@ impl ProgressSink for ChannelProgressSink {
         // events; the entry is still present at terminal (the owning task removes
         // it only after `execute()` returns). Tail-leaf lock, no await held.
         let (step, status, reason) = match event {
-            WorkflowProgress::Started { .. } => (0, "running", None),
+            WorkflowProgress::Started { .. } => (0, WorkflowProgressStatus::Running, None),
             WorkflowProgress::StepStarted { step_index } => {
                 if let Some(run) = lock(&self.workflow_runs).get_mut(&self.run_id) {
                     run.snapshot.current_step = step_index;
                 }
-                (step_index, "running", None)
+                (step_index, WorkflowProgressStatus::Running, None)
             }
             // Report the actual terminal step so the live indicator matches what
             // `list_workflow_runs` reports after a refresh: the failing step on a
@@ -257,13 +270,13 @@ impl ProgressSink for ChannelProgressSink {
     }
 }
 
-fn terminal_status_str(status: TerminalStatus) -> &'static str {
+fn terminal_status_str(status: TerminalStatus) -> WorkflowProgressStatus {
     match status {
-        TerminalStatus::Complete => "complete",
-        TerminalStatus::Cancelled => "cancelled",
-        // `Failed` and the `#[non_exhaustive]` catch-all both degrade to "failed"
+        TerminalStatus::Complete => WorkflowProgressStatus::Complete,
+        TerminalStatus::Cancelled => WorkflowProgressStatus::Cancelled,
+        // `Failed` and the `#[non_exhaustive]` catch-all both degrade to failed
         // rather than failing the build on a future variant.
-        _ => "failed",
+        _ => WorkflowProgressStatus::Failed,
     }
 }
 
@@ -513,7 +526,11 @@ fn workflows_dir(state: &AppState) -> Result<&Path, AppError> {
 
 /// Re-read and parse the named workflow snapshot: a built-in from the library, or
 /// a user-global directory file (re-read once at invoke, never per step).
-fn snapshot_workflow(state: &AppState, name: &str, is_builtin: bool) -> Result<Workflow, AppError> {
+pub(crate) fn snapshot_workflow(
+    state: &AppState,
+    name: &str,
+    is_builtin: bool,
+) -> Result<Workflow, AppError> {
     if is_builtin {
         return builtin_workflow(name).ok_or_else(|| AppError::WorkflowNotFound {
             name: name.to_owned(),
@@ -1227,6 +1244,42 @@ pub fn invoke_workflow_impl(
     inputs: &BTreeMap<String, InputValue>,
     home_dir: &Path,
 ) -> Result<Uuid, AppError> {
+    invoke_workflow_with(
+        state,
+        project_id,
+        name,
+        is_builtin,
+        inputs,
+        home_dir,
+        &InvokeOptions::default(),
+    )
+}
+
+/// What a caller that is not the window asks of an invocation beyond its
+/// inputs.
+#[derive(Default)]
+pub struct InvokeOptions {
+    /// Agent-typed inputs carry agent **ids** rather than names. They are
+    /// converted to names against the very roster the run binds with — never
+    /// an earlier read — so a rename and name reuse between two reads cannot
+    /// run the wrong agent.
+    pub agent_inputs_are_ids: bool,
+    /// Agents the window reported it cannot listen to. A run whose steps
+    /// resolve to any of them is refused rather than running invisibly, the
+    /// same rule a send applies per recipient.
+    pub unsubscribed_agents: Vec<AgentId>,
+}
+
+/// [`invoke_workflow_impl`] with [`InvokeOptions`].
+pub fn invoke_workflow_with(
+    state: &AppState,
+    project_id: ProjectId,
+    name: &str,
+    is_builtin: bool,
+    inputs: &BTreeMap<String, InputValue>,
+    home_dir: &Path,
+    options: &InvokeOptions,
+) -> Result<Uuid, AppError> {
     let workflow = snapshot_workflow(state, name, is_builtin)?;
     if workflow.gated_step_kind().is_some() {
         return Err(AppError::WorkflowStepUnsupported);
@@ -1234,6 +1287,13 @@ pub fn invoke_workflow_impl(
 
     let (project, generation, roster) = capture_run_snapshot(state, project_id)?;
     let names: Vec<String> = roster.iter().map(|r| r.name.clone()).collect();
+    let converted;
+    let inputs = if options.agent_inputs_are_ids {
+        converted = agent_ids_to_names(&workflow, inputs, &roster, project_id)?;
+        &converted
+    } else {
+        inputs
+    };
 
     // Partition the flat payload: declared inputs go through `validate_invocation`
     // + `bind_invocation`; derived prompt args through the classification +
@@ -1278,6 +1338,7 @@ pub fn invoke_workflow_impl(
 
     // Live-view step snapshot with recipients resolved to the bound agent names.
     let resolved_steps = resolve_step_display(&step_display(&workflow), &bound);
+    refuse_unheard_recipients(&resolved_steps, &roster, &options.unsubscribed_agents)?;
 
     let sink = Arc::new(ChannelProgressSink::new(
         run_id,
@@ -1356,6 +1417,67 @@ pub fn invoke_workflow_impl(
     });
 
     Ok(run_id)
+}
+
+/// Refuse a run whose steps resolve to an agent the window cannot listen to —
+/// slots and literal names alike, since a step may name an agent directly.
+fn refuse_unheard_recipients(
+    resolved_steps: &[WorkflowStepInfo],
+    roster: &[AgentRecord],
+    unsubscribed: &[AgentId],
+) -> Result<(), AppError> {
+    if unsubscribed.is_empty() {
+        return Ok(());
+    }
+    let unheard = resolved_steps
+        .iter()
+        .flat_map(|step| step.recipients.iter())
+        .filter_map(|r| match r {
+            RecipientRef::Literal { name } => roster
+                .iter()
+                .find(|a| canonicalize_for_uniqueness(&a.name) == canonicalize_for_uniqueness(name))
+                .map(|a| a.id),
+            RecipientRef::Slot { .. } => None,
+        })
+        .find(|id| unsubscribed.contains(id));
+    match unheard {
+        Some(agent_id) => Err(AppError::DesktopUnavailable { agent_id }),
+        None => Ok(()),
+    }
+}
+
+/// Convert the agent-typed inputs from ids to the names the workflow engine
+/// validates against, using the roster the invocation captured.
+fn agent_ids_to_names(
+    workflow: &Workflow,
+    inputs: &BTreeMap<String, InputValue>,
+    roster: &[AgentRecord],
+    project_id: ProjectId,
+) -> Result<BTreeMap<String, InputValue>, AppError> {
+    let to_name = |id: &str| -> Result<String, AppError> {
+        let agent_id: AgentId = id.parse().map_err(|e| AppError::invalid_uuid(id, e))?;
+        roster
+            .iter()
+            .find(|a| a.id == agent_id)
+            .map(|a| a.name.clone())
+            .ok_or(AppError::UnknownRecipient {
+                project_id,
+                agent_id,
+            })
+    };
+    let mut converted = inputs.clone();
+    for decl in workflow.inputs.iter().filter(|d| d.ty.is_agent()) {
+        let Some(value) = converted.get_mut(&decl.name) else {
+            continue;
+        };
+        *value = match value {
+            InputValue::Text(id) => InputValue::Text(to_name(id)?),
+            InputValue::List(ids) => {
+                InputValue::List(ids.iter().map(|id| to_name(id)).collect::<Result<_, _>>()?)
+            }
+        };
+    }
+    Ok(converted)
 }
 
 /// Retention keyed off the returned status: prune a `Complete`/`Cancelled` run
@@ -1467,7 +1589,7 @@ pub fn list_workflow_runs_impl(state: &AppState, project_id: ProjectId) -> Vec<W
 }
 
 /// `(run_id, records)` for every parseable `*.jsonl` in `runs_dir`.
-fn read_run_files(runs_dir: &Path) -> Vec<(Uuid, Vec<RunRecord>)> {
+pub(crate) fn read_run_files(runs_dir: &Path) -> Vec<(Uuid, Vec<RunRecord>)> {
     let Ok(entries) = std::fs::read_dir(runs_dir) else {
         return Vec::new();
     };
@@ -1486,7 +1608,7 @@ fn read_run_files(runs_dir: &Path) -> Vec<(Uuid, Vec<RunRecord>)> {
 /// Classify a run file (not in the live registry) into the run info the indicator
 /// shows, or `None` if it is a pruned/complete/cancelled terminal that shouldn't
 /// surface.
-fn classify_run_file(run_id: Uuid, records: &[RunRecord]) -> Option<WorkflowRunInfo> {
+pub(crate) fn classify_run_file(run_id: Uuid, records: &[RunRecord]) -> Option<WorkflowRunInfo> {
     let mut workflow = String::new();
     let mut total = 0usize;
     let mut completed = 0usize;

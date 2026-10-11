@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use switchboard_core::{AgentId, CoreError, HarnessKind, ProjectId};
+use switchboard_core::{AgentId, CoreError, HarnessKind, ProjectId, SendId};
 use switchboard_harness::{DispatchError, MessageId};
 
 #[derive(Debug, thiserror::Error)]
@@ -526,6 +526,91 @@ pub enum AppError {
     /// clobbers a user's prompt — they rename or remove the existing file first.
     #[error("a prompt file already exists at {path}")]
     PromptCopyExists { path: PathBuf },
+
+    /// A send or forward named a recipient that is not in the project's
+    /// roster. Spelled as the remote-control plan spells it (`unknown_recipient`
+    /// on the wire), because both clients validate recipients the same way.
+    #[error("agent {agent_id} is not in project {project_id}'s roster")]
+    UnknownRecipient {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
+
+    /// A turn cannot start because the project's working directory is gone:
+    /// the harness is spawned with it as cwd. Refused before anything is
+    /// journaled, so a caller sees the cause instead of a failed turn.
+    #[error("project {project_id}'s working directory does not exist: {}", path.display())]
+    DirectoryMissing {
+        project_id: ProjectId,
+        path: PathBuf,
+    },
+
+    /// The desktop window reported that it cannot listen to this agent's
+    /// events, so a send to it would run invisibly. Refused per recipient.
+    #[error("the desktop window is not listening to agent {agent_id}; nothing was sent to it")]
+    DesktopUnavailable { agent_id: AgentId },
+
+    /// The desktop window did not acknowledge loading the project within the
+    /// sync deadline. Nothing was dispatched; the load keeps running, so a
+    /// retry usually succeeds.
+    #[error("the desktop window did not finish loading project {0} in time")]
+    ProjectLoadTimeout(ProjectId),
+
+    /// A forward's source is still mid-turn past the caller's wait budget.
+    /// The compose was cancelled and nothing was dispatched.
+    #[error("{name} is still responding — wait for it with wait_agent, then forward again")]
+    SourceBusy { name: String },
+
+    /// A caller-supplied argument is malformed or inconsistent, including a
+    /// retry key reused for a different request.
+    #[error("{0}")]
+    InvalidArgument(String),
+
+    /// The composed message is larger than a harness CLI can take. Checked up
+    /// front on the final body so the whole send is refused before any
+    /// recipient is dispatched; the dispatcher's own check stays as the
+    /// backstop for other callers.
+    #[error("{0}")]
+    PromptTooLarge(DispatchError),
+
+    /// No in-memory record of this send: it was never made, it was pruned, or
+    /// the app restarted since. Waits fall back to the journal; cancels cannot.
+    #[error("send {0} is not known to this Switchboard process")]
+    SendUnknown(SendId),
+
+    /// A single result item cannot fit the reply budget even with every text
+    /// field emptied.
+    #[error("the result is too large to return whole; read it in pages with {read_with}")]
+    ResultTooLarge { read_with: &'static str },
+
+    /// A retry joined an in-flight request with the same key, and that request
+    /// failed before dispatching anything. Carries the original error so the
+    /// joiner sees the same outcome, mapped to the same code, and can retry.
+    #[error("{0}")]
+    Joined(std::sync::Arc<AppError>),
+
+    /// A retry joined an in-flight request with the same key, and its own wait
+    /// budget ran out before the original settled. The original keeps running
+    /// and its key stays claimed: call again with the same key.
+    #[error("request {send_id} is still in progress — call again with the same idempotency_key")]
+    RequestInProgress { send_id: SendId },
+
+    /// A blocking phase was ended by the server's own cancellation (shutdown)
+    /// before it produced a result. Nothing was dispatched.
+    #[error("the operation was interrupted by the server shutting down")]
+    Interrupted,
+
+    /// An invariant the code relies on did not hold. Never caused by the
+    /// caller's input.
+    #[error("internal error: {0}")]
+    Internal(String),
+
+    /// A fan-out under `refuse` found these recipients busy up front, so the
+    /// whole send was refused and nothing was dispatched. Names rather than
+    /// ids because the message is what the caller reads; the ids are in the
+    /// request it just made.
+    #[error("busy: {}", names.join(", "))]
+    RecipientsBusy { names: Vec<String> },
 
     /// Writing the copied built-in prompt into the user's folder failed.
     #[error("failed to copy prompt to {path}: {source}")]

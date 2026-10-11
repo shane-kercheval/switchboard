@@ -165,8 +165,9 @@ pub struct Enrichment {
     /// prefix joined into one command line.
     pub approved_commands: Option<Vec<String>>,
     /// Codex's run settings as display pairs — sandbox, approval policy,
-    /// personality, shell, timezone — from the last `turn_context` and the
-    /// accumulated `world_state`.
+    /// personality, shell, timezone — from the last `turn_context`, the
+    /// accumulated `world_state`, and the last personality any
+    /// `turn_context` or `thread_settings_applied` record stated.
     pub settings: Option<Vec<SettingPair>>,
     /// The **current turn's** content-bearing `Edit` facets, in record order —
     /// mode-selected single source: legacy `apply_patch` calls /
@@ -566,6 +567,19 @@ pub fn parse_session_content(content: &str) -> Enrichment {
     // *current* turn's selections, and the card describes the agent as it
     // stands now.
     let mut last_turn_context: Option<Value> = None;
+    // The agent's current personality, resolved across two record types in
+    // file order. `thread_settings_applied` carries a complete settings
+    // snapshot (Codex's `ThreadSettingsSnapshot`), which omits `personality`
+    // when it is unset, so each one sets the value or clears it.
+    // `turn_context` carried it until Codex 0.162 and never does since, so its
+    // absence alone says nothing. A `turn_context` that still carries
+    // `timezone` was written before 0.162, though, and there a missing
+    // `personality` means unset, so that record sets or clears the value too.
+    // Any other `turn_context` can only set it. That keeps the value on files
+    // that mix versions, where the last `turn_context` lacks it. A fresh first
+    // turn on 0.162 writes neither, so the row stays absent until a resumed
+    // turn.
+    let mut personality: Option<String> = None;
 
     for (idx, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
@@ -619,6 +633,10 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         .get("cwd")
                         .and_then(Value::as_str)
                         .map(std::path::PathBuf::from);
+                    let stated = p.get("personality").and_then(Value::as_str);
+                    if stated.is_some() || p.get("timezone").is_some() {
+                        personality = stated.map(str::to_owned);
+                    }
                     last_turn_context = Some(p.clone());
                 }
             }
@@ -706,6 +724,15 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                             enrichment.per_turn_usage = Some(usage);
                         }
                     }
+                    "thread_settings_applied" => {
+                        if let Some(snapshot) = p.get("thread_settings").and_then(Value::as_object)
+                        {
+                            personality = snapshot
+                                .get("personality")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                        }
+                    }
                     "patch_apply_end" if !history_mode.reads_item_completed() => {
                         capture_patch_apply_end_facet(p, &mut enrichment, &mut patch_call_ids);
                     }
@@ -722,7 +749,8 @@ pub fn parse_session_content(content: &str) -> Enrichment {
     if !world.is_empty() {
         enrichment.skills = world.skills();
         enrichment.approved_commands = world.approved_commands();
-        enrichment.settings = world_state::settings(&world, last_turn_context.as_ref());
+        enrichment.settings =
+            world_state::settings(&world, last_turn_context.as_ref(), personality.as_deref());
     }
 
     enrichment
@@ -3497,6 +3525,156 @@ mod tests {
                 ("Shell", "zsh"),
                 ("Timezone", "America/Los_Angeles"),
             ]
+        );
+    }
+
+    /// Codex 0.162 records, trimmed from a rollout written by 0.162.1: no
+    /// `personality` or `timezone` on `turn_context`, the timezone in the
+    /// environment state, and the personality only on the resumed turn's
+    /// `thread_settings_applied`.
+    const CODEX_0162_FIRST_TURN: &str = r#"{"type":"session_meta","payload":{"id":"t-0162","cli_version":"0.162.1","history_mode":"paginated"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+{"type":"world_state","payload":{"full":true,"state":{"environments":{"environments":{"local":{"cwd":"/x","status":"available","shell":"zsh"}},"current_date":"2026-10-11","timezone":"America/Chicago"}}}}
+{"type":"turn_context","payload":{"turn_id":"turn-1","cwd":"/x","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"model":"gpt-6-luna","effort":"low","summary":"none"}}
+"#;
+    const CODEX_0162_RESUMED_TURN: &str = r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_id":"t-0162","thread_settings":{"model":"gpt-6-luna","approval_policy":"never","reasoning_effort":"high","personality":"pragmatic"}}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}
+{"type":"turn_context","payload":{"turn_id":"turn-2","cwd":"/x","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"model":"gpt-6-luna","effort":"high","summary":"none"}}
+"#;
+
+    fn rendered_settings(content: &str) -> Vec<(String, String)> {
+        parse_session_content(content)
+            .settings
+            .expect("settings parsed")
+            .into_iter()
+            .map(|p| (p.label, p.value))
+            .collect()
+    }
+
+    #[test]
+    fn a_codex_0162_first_turn_reports_timezone_but_no_personality() {
+        // The first turn has no personality anywhere in the file, so the row
+        // is absent rather than invented.
+        let rendered = rendered_settings(CODEX_0162_FIRST_TURN);
+        let labels: Vec<&str> = rendered.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["Sandbox", "Approval policy", "Shell", "Timezone"],
+            "{rendered:?}"
+        );
+        assert!(rendered.contains(&("Timezone".to_owned(), "America/Chicago".to_owned())));
+    }
+
+    #[test]
+    fn a_codex_0162_resumed_turn_reports_the_personality_from_thread_settings() {
+        let content = format!("{CODEX_0162_FIRST_TURN}{CODEX_0162_RESUMED_TURN}");
+        let rendered = rendered_settings(&content);
+        assert!(
+            rendered.contains(&("Personality".to_owned(), "pragmatic".to_owned())),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn personality_survives_a_file_that_mixes_codex_versions() {
+        // Started on 0.161 (personality on `turn_context`), resumed on 0.162
+        // with no `thread_settings_applied` stating it: the last
+        // `turn_context` lacks it, and the earlier statement must still count.
+        let content = format!(
+            "{}\n{CODEX_0162_FIRST_TURN}",
+            r#"{"type":"turn_context","payload":{"turn_id":"turn-0","approval_policy":"never","personality":"friendly","timezone":"America/Chicago"}}"#
+        );
+        let rendered = rendered_settings(&content);
+        assert!(
+            rendered.contains(&("Personality".to_owned(), "friendly".to_owned())),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn the_latest_stated_personality_wins() {
+        let content = format!(
+            "{}\n{CODEX_0162_FIRST_TURN}{}",
+            r#"{"type":"turn_context","payload":{"turn_id":"turn-0","personality":"friendly"}}"#,
+            CODEX_0162_RESUMED_TURN
+        );
+        let rendered = rendered_settings(&content);
+        let personalities: Vec<&str> = rendered
+            .iter()
+            .filter(|(l, _)| l == "Personality")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(personalities, vec!["pragmatic"]);
+    }
+
+    #[test]
+    fn a_settings_snapshot_without_personality_clears_an_earlier_one() {
+        // The snapshot is complete and omits `personality` when it is unset,
+        // so a resumed turn after the user turned personality off must drop
+        // the row, not keep showing the old value.
+        let content = format!(
+            "{}\n{CODEX_0162_FIRST_TURN}{}\n",
+            r#"{"type":"turn_context","payload":{"turn_id":"turn-0","personality":"friendly"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6-luna","cwd":"/x","approval_policy":"never"}}}"#
+        );
+        let rendered = rendered_settings(&content);
+        assert!(
+            rendered.iter().all(|(label, _)| label != "Personality"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_pre_0162_turn_context_without_personality_clears_it() {
+        // Before 0.162 every `turn_context` carried `timezone` and omitted
+        // `personality` only when it was unset, so turning personality off
+        // mid-session must drop the row even with no settings snapshot after.
+        let content = [
+            r#"{"type":"world_state","payload":{"full":true,"state":{"environments":{"environments":{"local":{"shell":"zsh"}}}}}}"#,
+            r#"{"type":"turn_context","payload":{"turn_id":"turn-1","personality":"friendly","timezone":"America/Chicago"}}"#,
+            r#"{"type":"turn_context","payload":{"turn_id":"turn-2","timezone":"America/Chicago"}}"#,
+        ]
+        .join("\n");
+        let rendered = rendered_settings(&content);
+        assert!(
+            rendered.iter().all(|(label, _)| label != "Personality"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_settings_record_without_a_snapshot_changes_nothing() {
+        // Only a record that actually carries a snapshot object speaks for
+        // the settings; a malformed one is not evidence that personality was
+        // turned off.
+        let content = format!(
+            "{CODEX_0162_FIRST_TURN}{CODEX_0162_RESUMED_TURN}{}\n",
+            r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_id":"t-0162"}}"#
+        );
+        let rendered = rendered_settings(&content);
+        assert!(
+            rendered.contains(&("Personality".to_owned(), "pragmatic".to_owned())),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_date_change_patch_keeps_the_codex_0162_timezone_and_shell() {
+        // End to end through the session scan: the 0.162 first turn, then the
+        // partial `world_state` Codex writes when the session continues on a
+        // new day.
+        let content = format!(
+            "{CODEX_0162_FIRST_TURN}{}\n",
+            r#"{"type":"world_state","payload":{"full":false,"state":{"environments":{"current_date":"2026-10-12"}}}}"#
+        );
+        let rendered = rendered_settings(&content);
+        assert!(
+            rendered.contains(&("Timezone".to_owned(), "America/Chicago".to_owned())),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains(&("Shell".to_owned(), "zsh".to_owned())),
+            "{rendered:?}"
         );
     }
 

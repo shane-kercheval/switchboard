@@ -1012,7 +1012,7 @@ async fn read_send_output_pages_one_reply_stably_while_the_agent_starts_a_new_tu
 async fn a_three_recipient_fan_out_with_long_replies_stays_under_the_budget() {
     let (env, project_id, agents) = project_with_agents(&["a", "b", "c"]);
     for _ in 0..3 {
-        env.adapter.push(Script::reply(&"y".repeat(15_000)));
+        env.adapter.push(Script::reply(&"y".repeat(45_000)));
     }
     let receipt = send_now(
         env.handle(),
@@ -1030,7 +1030,7 @@ async fn a_three_recipient_fan_out_with_long_replies_stays_under_the_budget() {
     assert!(fitted.serialized_chars() <= RESULT_BUDGET_CHARS);
     assert_eq!(fitted.truncated.len(), 3);
     for cut in &fitted.truncated {
-        assert_eq!(cut.total_chars, 15_000);
+        assert_eq!(cut.total_chars, 45_000);
         let read_with = cut.read_with.as_ref().unwrap();
         assert!(read_with["agent_id"].is_string());
         assert_eq!(read_with["send_id"], receipt.send_id.to_string());
@@ -1980,7 +1980,7 @@ async fn a_workflow_runs_the_agent_an_id_names_even_after_a_rename_and_name_reus
 #[tokio::test]
 async fn a_page_is_sized_by_its_serialized_length() {
     let (env, project_id, agents) = project_with_agents(&["a"]);
-    let quoted = "\"".repeat(30_000);
+    let quoted = "\"".repeat(60_000);
     env.adapter.push(Script::reply(&quoted));
     let receipt = send_now(
         env.handle(),
@@ -2015,7 +2015,7 @@ async fn a_long_conversation_fits_the_budget_with_its_newest_items_intact() {
     let (env, project_id, agents) = project_with_agents(&["a"]);
     for i in 0..12 {
         env.adapter
-            .push(Script::reply(&format!("{i}-{}", "r".repeat(4_000))));
+            .push(Script::reply(&format!("{i}-{}", "r".repeat(10_000))));
         let receipt = send_now(
             env.handle(),
             env.home(),
@@ -2043,7 +2043,7 @@ async fn a_long_conversation_fits_the_budget_with_its_newest_items_intact() {
         text.starts_with("11-"),
         "the newest reply is kept whole: {text:.10}"
     );
-    assert!(text.len() > 4_000);
+    assert!(text.len() > 10_000);
 }
 
 // --- review round three: written before the fixes, each must fail first --------
@@ -2758,7 +2758,7 @@ async fn read_on(env: &TestEnv, project_id: ProjectId, read_with: &serde_json::V
 #[tokio::test]
 async fn a_cut_answer_rebuilds_exactly_from_its_pages_before_and_after_a_restart() {
     let (env, project_id, agents) = project_with_agents(&["a"]);
-    let reply = numbered(45_000);
+    let reply = numbered(150_000);
     env.adapter.push(Script::reply(&reply));
     let receipt = send_now(
         env.handle(),
@@ -2783,7 +2783,7 @@ async fn a_cut_answer_rebuilds_exactly_from_its_pages_before_and_after_a_restart
 #[tokio::test]
 async fn a_cancelled_partial_reply_reads_on_in_the_same_session() {
     let (env, project_id, agents) = project_with_agents(&["a"]);
-    let partial = numbered(45_000);
+    let partial = numbered(150_000);
     let gate = Arc::new(Notify::new());
     env.adapter.push(Script::parked(&partial, &gate));
     let receipt = send_now(

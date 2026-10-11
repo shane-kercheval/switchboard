@@ -48,13 +48,14 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
-/// The most characters a serialized tool result may carry. Codex keeps only
-/// about 10,000 tokens of a result and silently cuts the middle; at the
-/// densest ratio measured (2.5 characters per token for JSON with escapes)
-/// 25,000 characters stays under that. Claude Code's own cut, at ~50,000
-/// characters, is looser.
-pub const RESULT_BUDGET_CHARS: usize = 25_000;
+/// The most characters a serialized tool result may carry, for every client.
+/// MCP sets no limit; each client applies its own on top of this one. Claude
+/// Code shows the model up to about 50,000 characters directly and saves a
+/// larger result to a file the model can open; Codex keeps about 10,000
+/// tokens and cuts the middle of anything longer. A model that needs more
+/// pages with `read_send_output` or asks the agent.
+pub const RESULT_BUDGET_CHARS: usize = 100_000;
 
 /// Characters per page of [`read::read_send_output`]: the result budget less
 /// room for the envelope around the text.
-pub const OUTPUT_PAGE_CHARS: usize = 20_000;
+pub const OUTPUT_PAGE_CHARS: usize = 95_000;

@@ -22,7 +22,7 @@ harness="${1:?usage: $0 codex|claude|agy}"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-mkdir "$work/cwd"
+mkdir "$work/cwd" "$work/claude-config"
 
 fail() {
   echo "cli-surface: $*" >&2
@@ -69,19 +69,36 @@ print_table() {
   echo "$table"
 }
 
-# Print `<command> --help` and recurse into every subcommand it lists, up to
-# four levels deep. Only for CLIs whose `--help` is handled before any
-# subcommand runs (Codex's clap, Claude's commander).
+# Ask Codex or Claude Code for one command's help in a way that cannot run the
+# command. `codex help <command>` prints exactly what `<command> --help` prints
+# and never runs it. Claude Code has no `help` command (`claude help rm` sends
+# "help rm" to the model as a prompt), and some of its commands parse their own
+# arguments, so they print help only because their authors handle `--help`.
+# Claude therefore gets `--help` inside an empty throwaway config folder: its
+# help text is the same there, and a command that ever ran instead would act
+# on an empty setup rather than the developer's sessions.
+help_codex() {
+  run_help codex help "$@"
+}
+
+help_claude() {
+  CLAUDE_CONFIG_DIR="$work/claude-config" COLUMNS=100 claude "$@" --help </dev/null 2>&1
+}
+
+# Print one command's help and recurse into every subcommand it lists, up to
+# three levels below the top. $1 is the CLI (codex or claude), the rest the
+# command path.
 walk() {
-  local help sub
-  help=$(run_help "$@" --help) || fail "'$* --help' failed"
-  section "$* --help"
+  local cli="$1" help sub
+  shift
+  help=$("help_$cli" "$@") || fail "help for '$cli${*:+ $*}' failed"
+  section "$cli${*:+ $*} --help"
   echo "$help"
-  if (($# >= 4)); then
+  if (($# >= 3)); then
     return
   fi
   for sub in $(subcommands "$help" '^Commands:'); do
-    walk "$@" "$sub"
+    walk "$cli" "$@" "$sub"
   done
 }
 
@@ -91,8 +108,7 @@ codex_surface() {
   local methods
   codex app-server generate-json-schema --out "$work/schema" >/dev/null 2>&1 ||
     fail "'codex app-server generate-json-schema' failed"
-  methods=$(jq -r '.. | objects | select(has("enum")) | .enum[]? | strings | select(contains("/"))' \
-    "$work/schema/ClientRequest.json" | sort -u) ||
+  methods=$(jq -r '.oneOf[].properties.method.enum[]' "$work/schema/ClientRequest.json" | sort -u) ||
     fail "could not read app-server methods from ClientRequest.json"
   print_table "codex app-server methods (ClientRequest)" "$methods"
 }
@@ -103,10 +119,12 @@ claude_surface() {
   # `--bare --strict-mcp-config` drops the developer's own skills, plugins and
   # MCP prompts, leaving what Claude Code itself accepts in print mode. A
   # command can be missing here and still exist interactively, and account
-  # gating can add or remove a few.
+  # gating can add or remove a few. `--no-session-persistence` keeps the call
+  # from saving a session for the temporary folder under ~/.claude/projects.
   local stream commands
-  stream=$(cd "$work/cwd" && claude -p --bare --strict-mcp-config --output-format stream-json \
-    --verbose "/cost" </dev/null 2>/dev/null) || fail "'claude -p /cost' failed"
+  stream=$(cd "$work/cwd" && claude -p --bare --strict-mcp-config --no-session-persistence \
+    --output-format stream-json --verbose "/cost" </dev/null 2>/dev/null) ||
+    fail "'claude -p /cost' failed"
   commands=$(jq -r 'select(.type == "system" and .subtype == "init") | .slash_commands[]?' \
     <<<"$stream" | sort) || fail "could not read Claude's init event"
   print_table "claude slash commands accepted in print mode (bare)" "$commands"

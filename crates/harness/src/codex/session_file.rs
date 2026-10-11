@@ -570,11 +570,15 @@ pub fn parse_session_content(content: &str) -> Enrichment {
     // The agent's current personality, resolved across two record types in
     // file order. `thread_settings_applied` carries a complete settings
     // snapshot (Codex's `ThreadSettingsSnapshot`), which omits `personality`
-    // when it is unset, so each one sets the value or clears it. `turn_context`
-    // carried it until Codex 0.162 and never does since, so its absence says
-    // nothing: it can only set the value. That keeps the value on files that
-    // mix versions, where the last `turn_context` lacks it. A fresh first turn
-    // on 0.162 writes neither, so the row stays absent until a resumed turn.
+    // when it is unset, so each one sets the value or clears it.
+    // `turn_context` carried it until Codex 0.162 and never does since, so its
+    // absence alone says nothing. A `turn_context` that still carries
+    // `timezone` was written before 0.162, though, and there a missing
+    // `personality` means unset, so that record sets or clears the value too.
+    // Any other `turn_context` can only set it. That keeps the value on files
+    // that mix versions, where the last `turn_context` lacks it. A fresh first
+    // turn on 0.162 writes neither, so the row stays absent until a resumed
+    // turn.
     let mut personality: Option<String> = None;
 
     for (idx, line) in content.lines().enumerate() {
@@ -629,8 +633,9 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                         .get("cwd")
                         .and_then(Value::as_str)
                         .map(std::path::PathBuf::from);
-                    if let Some(stated) = p.get("personality").and_then(Value::as_str) {
-                        personality = Some(stated.to_owned());
+                    let stated = p.get("personality").and_then(Value::as_str);
+                    if stated.is_some() || p.get("timezone").is_some() {
+                        personality = stated.map(str::to_owned);
                     }
                     last_turn_context = Some(p.clone());
                 }
@@ -3612,6 +3617,24 @@ mod tests {
             r#"{"type":"turn_context","payload":{"turn_id":"turn-0","personality":"friendly"}}"#,
             r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6-luna","cwd":"/x","approval_policy":"never"}}}"#
         );
+        let rendered = rendered_settings(&content);
+        assert!(
+            rendered.iter().all(|(label, _)| label != "Personality"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_pre_0162_turn_context_without_personality_clears_it() {
+        // Before 0.162 every `turn_context` carried `timezone` and omitted
+        // `personality` only when it was unset, so turning personality off
+        // mid-session must drop the row even with no settings snapshot after.
+        let content = [
+            r#"{"type":"world_state","payload":{"full":true,"state":{"environments":{"environments":{"local":{"shell":"zsh"}}}}}}"#,
+            r#"{"type":"turn_context","payload":{"turn_id":"turn-1","personality":"friendly","timezone":"America/Chicago"}}"#,
+            r#"{"type":"turn_context","payload":{"turn_id":"turn-2","timezone":"America/Chicago"}}"#,
+        ]
+        .join("\n");
         let rendered = rendered_settings(&content);
         assert!(
             rendered.iter().all(|(label, _)| label != "Personality"),

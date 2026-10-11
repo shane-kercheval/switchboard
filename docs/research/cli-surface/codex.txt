@@ -3232,7 +3232,9 @@ fs/remove
 fs/unwatch
 fs/watch
 fs/writeFile
+fuzzyFileSearch
 hooks/list
+initialize
 marketplace/add
 marketplace/remove
 marketplace/upgrade

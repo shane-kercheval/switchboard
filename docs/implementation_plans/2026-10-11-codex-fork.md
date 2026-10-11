@@ -189,12 +189,12 @@ With one idle Codex agent selected, the Fork half of the send button creates `<n
 
    In this order:
    1. Read the project, the source and the project's lifecycle generation together with `capture_dispatch_snapshot`, not `lookup_agent`.
-   2. Run the existing checks: the source's session file exists (`resolve_session_file`), and the source is idle (`ensure_fork_source_free`).
-   3. Wait for PATH readiness, **before** taking the lock, so a slow login-shell PATH capture at app launch never lengthens the time the parent is locked.
-   4. Acquire the **parent's** session lock with `acquire_session_locks`, using the parent's Codex key.
+   2. Wait for PATH readiness (Codex arm only), **before** the checks and the lock. A slow login-shell PATH capture at app launch can take seconds. Waiting first means it never lengthens the time the parent is locked, and the idle check in step 3 reflects the parent's state just before locking rather than seconds earlier.
+   3. Run the existing checks: the source's session file exists (`resolve_session_file`), and the source is idle (`ensure_fork_source_free`).
+   4. Acquire the **parent's** session lock with `acquire_session_locks`, using the parent's Codex key. If it fails with `SessionInUse`, return `ForkSourceBusy { name }` instead. `SessionInUse`'s text ends "Wait for that turn to finish, then resend", which is written for a message and makes no sense for a fork; `ForkSourceBusy` names the busy agent and says it must stop changing before you can branch. This can happen when a workflow step or a second Switchboard instance starts a parent turn between step 3 and step 4.
    5. Call milestone 1's function.
    6. Release the lock.
-   7. Under the `registry_write` lock: refuse if the project is under maintenance (`reject_if_under_maintenance`) or its generation changed (`reject_if_generation_changed`), and refuse if the source is no longer in the registry. Then register and update the agent cache, both inside that guarded section.
+   7. Under the `registry_write` lock: refuse if the project is under maintenance (`reject_if_under_maintenance`) or its generation changed (`reject_if_generation_changed`), and refuse if the source is no longer in the registry. Then register and update the agent cache, both inside that guarded section. Add a `TestSeam` variant (for example `ForkRegistration`, in `state.rs`) that pauses just before this step, with the existing two-way handshake, so tests can start a project deletion at exactly this point for either harness.
 
    Step 7 matters because creation awaits a subprocess. Deleting the project, or changing its folder, during that wait evicts the project and bumps its generation (`begin_maintenance`). Without the re-check, the fork would be written into a project being deleted and reported as created, then vanish, or linger in the agent cache for a project no longer loaded. Ordinary sends already guard the same pattern this way. Apply steps 1 and 7 to the whole function, so Claude's fork, whose wait is shorter but has the same shape, gets the fix too.
 
@@ -205,10 +205,11 @@ With one idle Codex agent selected, the Fork half of the send button creates `<n
    - **Don't arm the pending notice.** `forkAgentIntoOwnPane` arms `forkHistoryPending` ("this is a branch, its earlier conversation is still coming") for every fork today, unconditionally. Only the one-time refresh, `loadForkInheritedHistory`, checks `forked_from_session`. Without the explicit branch, a Codex fork would show "still coming" forever.
    - **Load the inherited history through the project merge, and finish before the first send.** Await `chainProjectLoad(projectId, () => hydrateProject(projectId, new Set([fork.id])))`, the same serialized path `loadForkInheritedHistory` uses (clear `hydrationStarted` for the project first, as it does). Not `hydrateAgent`: the per-agent loader returns raw user turns, which the project merge owns, so it would show every inherited message twice (`loadForkInheritedHistory`'s doc comment explains this). Awaiting it costs the first send one project read; not awaiting it would let that read overlap the fork's live first turn, which no existing path does.
    - **A failed load is not a failed fork.** Any outcome other than `"applied"` still returns the fork, so the compose flow sends as usual and the user never retries into a second fork. To retry the load, widen `loadForkInheritedHistory`'s gate (which returns early when `forked_from_session` is null) to also accept forks created eagerly this session, tracked in a set; the existing terminal hook then retries after the fork's first completed turn. After a restart the ordinary project load already includes the inherited history.
+   - **A failed load is shown, with a Retry that uses the project merge.** The filtered `hydrateProject` call counts as a refresh, and a failed refresh only logs and keeps the old view (`workspace.svelte.ts`, the `catch` in `hydrateProject`). Left like that, the fork's pane is silently empty until the hook's retry, and a menu fork (milestone 4) sends no turn, so for it the retry never comes. That breaks the rule set when gap G19 closed: every history-loading failure is shown and can be retried. So when the fork's load returns anything other than `"applied"`, set the fork's runtime to `hydration_status: "failed"` with the error. The existing per-agent failure display ("Couldn't load `<agent>`'s history", Retry, Details) then renders. Retry for a fork in the eager-fork set must run the same serialized `chainProjectLoad` → `hydrateProject` load, not `retryAgentHydration` (`index.svelte.ts`), which goes through the per-agent loader and would show inherited messages twice. A later successful load, from Retry or from the first-turn hook, clears the failure.
 5. **Update the docs this milestone changes:**
    - `docs/harness-behavior.md` §3.5: the status line and Codex row move from unwired to built.
    - The capability watchlist row "Fork | Codex" in `docs/harness-behavior.md` §8: mark it built.
-   - `docs/system-design.md`: the §7 Fork paragraph (it says Fork is hidden for non-Claude recipients and not wired for other harnesses, and describes the parent-lock rule for Claude only), the §9 Fork bullet and matrix row, and resolved item 10.14.
+   - `docs/system-design.md`: the §7 Fork paragraph (it says Fork is hidden for non-Claude recipients and not wired for other harnesses, and describes the parent-lock rule for Claude only), the §9 Fork bullet and matrix row, and resolved item 10.14. In the §7 paragraph, the sentence saying the parent lock "costs the parent one turn's wait" becomes: a message to the parent is refused, for the fork's whole first turn with Claude and only during creation with Codex.
 
 ### Definition of done
 
@@ -221,15 +222,15 @@ With one idle Codex agent selected, the Fork half of the send button creates `<n
   - forking a working Codex agent is refused;
   - forking a source with no session file is refused;
   - a failed creation registers nothing;
-  - while the parent's session lock is held by a contender, the fork is refused rather than racing;
+  - while the parent's session lock is held by a contender, the fork is refused with `ForkSourceBusy` naming the parent, not `SessionInUse`;
   - the reverse: while creation is held open (the shim sleeps), a parent turn is refused with `SessionInUse`; after creation returns, a parent turn succeeds while the fork's first turn is still running;
-  - project deletion that begins while the shim sleeps: the fork is refused (`ProjectUnderMaintenance` or `ProjectViewStale`), and nothing is registered or cached;
+  - project deletion that begins at the `ForkRegistration` seam, once for a Codex fork and once for a Claude fork (step 7 changes both): the fork is refused (`ProjectUnderMaintenance` or `ProjectViewStale`), and nothing is registered or cached;
   - mock mode refuses a Codex fork with the plain message;
   - the source's own project is used, not the active one;
   - a later turn to the fork locks only the fork's own session key.
 - Frontend tests:
   - `ComposeBar.test.ts`: the Fork half is offered for one idle Codex recipient and refused for Antigravity, with the new copy naming Claude Code and Codex; ⇧⌘↵ works for Codex.
-  - `workspace.test.ts`: an eager fork loads its history through the project path before the send, and arms no pending notice; two overlapping fork creations followed by a project refresh show each inherited message once; a failed history load leaves the fork registered, and the compose flow still sends its message.
+  - `workspace.test.ts`: an eager fork loads its history through the project path before the send, and arms no pending notice; two overlapping fork creations followed by a project refresh show each inherited message once; a failed history load leaves the fork registered and marked failed, and the compose flow still sends its message; Retry on that failure goes through the project load, shows each inherited message once, and calls the fork command no second time.
 - Live test in `desktop/src-tauri` (named `live_codex_…`):
   1. Fork a Codex agent through `fork_agent_impl`.
   2. Send the fork a turn, and assert it knows the parent's code word.
@@ -249,6 +250,8 @@ A Codex agent's "…" menu has a Fork item that creates an idle fork without sen
 - The item appears on Codex agent cards only, not on Claude or Antigravity cards.
 - Choosing it creates `<name>-fork` in its own pane, idle, showing the inherited conversation. The original agent is not blocked afterwards.
 - It is unavailable while the agent is working or has no session, and says why, following how the menu's existing items handle the same states.
+- It is also unavailable, and says why, while another compose operation in the project holds the compose claim (below). A send with a saved prompt can hold that claim indefinitely while it waits for a browser sign-in.
+- If the fork is created but its earlier conversation fails to load, the fork shows the existing history-load error with Retry (milestone 3, step 4).
 - A failure shows the error and creates no agent.
 
 ### Implementation outline
@@ -256,6 +259,8 @@ A Codex agent's "…" menu has a Fork item that creates an idle fork without sen
 Small milestone. Add the item to the agent card menu in `lib/components/Sidebar.svelte`, gated by the "fork without a turn" capability from milestone 3. Place it beside "Compact context", and follow that item's handling of a busy agent and of errors. It calls the same `fork_agent` command and `forkAgentIntoOwnPane` as the compose path, minus the send.
 
 **Take the project's compose claim while the fork is being created**, as the compose fork does (`beginOperation` in `lib/state/composeOperations.svelte.ts`; add a kind for it). Without the claim, a compose send to the original typed during that second is refused with "resend" (milestone 3 explains the lock); with it, the compose bar is disabled for that second instead.
+
+**When the claim is already held, disable the item with a reason.** `beginOperation` returns null while any compose operation is in flight in the project, and a send waiting on a browser sign-in holds it with no time limit until the user clicks "Stop waiting". Without this rule, the obvious code returns on null and the click does nothing, with no message. While `operationFor(projectId)` is set, show the item disabled with a tooltip such as "Another send in this project is still in progress." Keep the null check after `beginOperation` as a backstop for a claim taken between render and click, showing the same message.
 
 Update `docs/system-design.md` §7, whose agent-row paragraph says Fork is "deliberately **not** a row action" because a Claude fork can only exist as a turn. State that Codex has the row action, and why Claude does not.
 
@@ -266,7 +271,9 @@ Update `docs/system-design.md` §7, whose agent-row paragraph says Fork is "deli
   - it is unavailable while the agent is working;
   - choosing it creates the fork and its pane, and dispatches no turn;
   - compose sends are disabled while the fork is being created, and enabled again afterwards, on success and on failure;
-  - a failure shows the error.
+  - with another compose operation in flight, the item is disabled with its reason, and clicking it calls no fork command;
+  - a failed fork creation shows the error;
+  - a fork whose history load fails shows the history-load error; Retry succeeds without sending a turn, inherited messages appear once, and the fork command was called exactly once.
 - **Prove it in the app:** fork a Codex agent from the menu, confirm the new agent is idle with the inherited conversation, then send the original agent a message and confirm it runs at once.
 - `README.md`: update the "Fork a conversation" feature bullet, the Fork how-to section, and the "Fork is currently Claude Code only" limitation, so they describe both harnesses and both entry points.
 

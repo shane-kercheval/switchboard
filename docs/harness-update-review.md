@@ -31,6 +31,21 @@ Prefer the changelog + commit diff over guessing. Per-harness sources:
 
 If a code-level look is needed, fetch the specific PRs (`gh pr view <n> --repo <repo>`).
 
+### Diff the command surface, to catch new capabilities
+
+§3 confirms that what Switchboard already uses still works. It cannot notice something new that we would want, and that gap is real: `codex exec fork` shipped in Codex 0.148.0 and went unnoticed through three reviews, until 0.162.1. This step is the check for that.
+
+`docs/research/cli-surface/<harness>.txt` is a snapshot of a harness's whole command surface at the version in the "Last reviewed" table: every command and subcommand's `--help`, plus Codex's app-server methods, the slash commands Claude Code accepts in print mode, and Antigravity's `/help` list. `scripts/cli-surface.sh` writes it, using only help output and commands that answer without a model call.
+
+1. Install the new version, run `make cli-surface HARNESS=<codex|claude|agy>`, and read `git diff docs/research/cli-surface/`. For `agy`, compare the snapshot's first line with `agy --version` and with the version this review is recording: the snapshot starts `agy -p`, which runs `agy`'s auto-updater, so `agy` can update itself mid-run. If the three differ, regenerate the snapshot and recheck any part of the review that depends on the version.
+2. For each added command, flag, app-server method or slash command, ask whether Switchboard would want it. Check it against the capability watchlist (`harness-behavior.md` §8), and probe anything that matches a row.
+3. If an addition is a capability we would want later but are not building now, add a watchlist row for it.
+4. Commit the regenerated file with the review, so the snapshot always matches the "Last reviewed" version.
+
+**`agy plugin`'s subcommand flags are not in the snapshot.** The script only descends into an `agy` command group whose help says `Run "agy <group> <subcommand> --help"`, because `plugin`'s subcommands treat `--help` as an ordinary argument: `agy plugin list --help` runs `list`, and `agy plugin import --help` tries to import a path named `--help` (verified on 1.3.3). New or removed plugin subcommands still show in the diff through the group's own list.
+
+**Claude Code's slash commands are the reason the snapshot goes beyond `--help`.** `/compact` appears in no `claude --help` output (§3.9 of `harness-behavior.md`). The script reads the list from the `system/init` event of `claude -p --bare --strict-mcp-config "/cost"`, which costs nothing and leaves out the developer's own skills and MCP prompts. A command can be absent from that list and still exist in interactive mode.
+
 ## 3. The dependency surface — what to check
 
 For each changelog item, ask "does it touch one of these contracts?" Most items won't. The contracts Switchboard depends on (all per-harness; confirm specifics in `harness-behavior.md` + the adapter):
@@ -88,6 +103,7 @@ Captured shapes and the original probe commands are frozen in `research/archive/
 - **Update the "Last reviewed" snapshot** at the top of this file: set the harness's row to the new version/date and a **one-line verdict**, and prepend a **one- or two-sentence entry to the Review history appendix** (bottom of this file). Keep both short — the snapshot is for scanning, not for the reasoning. Three homes for the detail, none of them a fat table cell: **durable adapter behavior → `harness-behavior.md`** (the single source of truth; don't restate it here), **the blow-by-blow reasoning → the review's PR description** (git owns chronology), and **open follow-ups → the verdict line** (so an action item isn't buried). Before condensing, make sure any durable fact you're dropping already lives in `harness-behavior.md`.
 - **Record in `docs/harness-behavior.md` *only if the update actually impacts Switchboard*.** §6 "Version notes" is for things that change what Switchboard does or documents — a contract that changed, a captured shape/string now stale, a behavior we depend on that shifted (e.g. a model-version bump that flips a behavior we track, like thinking redaction). A **no-impact review gets NO §6 entry** — the "Last reviewed" snapshot + Review history line above are its complete record. Do not add "reviewed X, nothing relevant" commentary or per-update changelog summaries; that bloats the single-source-of-truth doc. Also update any now-stale captured shape or cell. **Do not edit the archived `*-cli-observed.md` files** (frozen provenance).
 - **If a contract genuinely changed**, the fix goes in the **adapter** (never a `match harness {…}` in the dispatcher or `commands.rs`).
+- **Commit the regenerated command-surface snapshot** (`docs/research/cli-surface/<harness>.txt`, §2) with the review, and update any watchlist row (`harness-behavior.md` §8) whose signal appeared.
 - **Run the live tests** for any adapter-touching change: `make test-live-<harness>` (claude / codex / antigravity). These spawn the real CLI and are the project's drift-detection mechanism — they need the developer's logged-in session and cost a little quota (see AGENTS.md "Live testing"). The fixture/`make test` path won't catch CLI drift.
 
 ## 7. If you need a live capture

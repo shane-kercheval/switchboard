@@ -1,4 +1,4 @@
-.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check check-rust check-frontend clean clean-stale install ios-crypto check-ios test-live test-live-claude test-live-codex test-live-antigravity
+.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check check-rust check-frontend clean clean-stale install ios-crypto check-ios test-live test-live-claude test-live-codex test-live-antigravity cli-surface test-scripts
 
 # Crates that carry live (`#[ignore]`-gated) harness tests.
 LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
@@ -155,7 +155,7 @@ check-frontend:
 	$(DESKTOP) exec playwright install webkit
 	$(DESKTOP) test:browser
 
-check: check-rust check-frontend
+check: check-rust check-frontend test-scripts
 
 # The iOS app (`ios/`) links `crates/remote-crypto` as an
 # xcframework with UniFFI-generated Swift bindings. Both are build products,
@@ -241,6 +241,23 @@ test-live-codex:
 
 test-live-antigravity:
 	cargo test --locked $(LIVE_PKGS) antigravity -- --ignored
+
+# Snapshot a harness CLI's command surface (every command and subcommand's
+# help, plus its slash commands or app-server methods) for a harness update
+# review to `git diff`. HARNESS is codex, claude or agy. See
+# docs/harness-update-review.md for when to regenerate it.
+# CLI_SURFACE_DIR is overridable so scripts/cli-surface.test.sh can exercise
+# this target without touching the committed snapshots.
+CLI_SURFACE_DIR ?= docs/research/cli-surface
+cli-surface:
+	@test -n "$(HARNESS)" || { echo "usage: make cli-surface HARNESS=codex|claude|agy" >&2; exit 2; }
+	scripts/cli-surface.sh $(HARNESS) > $(CLI_SURFACE_DIR)/$(HARNESS).txt.tmp || { rm -f $(CLI_SURFACE_DIR)/$(HARNESS).txt.tmp; exit 1; }
+	mv $(CLI_SURFACE_DIR)/$(HARNESS).txt.tmp $(CLI_SURFACE_DIR)/$(HARNESS).txt
+
+# Tests for the repo's dev scripts, using fake CLIs (no harness or login
+# needed). Part of `check` and CI.
+test-scripts:
+	bash scripts/cli-surface.test.sh
 
 # Delete build artifacts nothing has touched in a week, WITHOUT throwing away
 # the warm cache (unlike `clean`, which forces a full rebuild).

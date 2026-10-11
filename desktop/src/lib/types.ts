@@ -284,6 +284,11 @@ export type NormalizedEvent =
   // it into a user turn; a fan-out's recipients share `send_id` so they group into
   // one user row + per-recipient columns. Manual sends don't use this.
   | { type: "user_message"; send_id: SendId; text: string; at: string }
+  // A send another client made (an orchestrator over MCP) was accepted into
+  // this agent's queue. Arrives before the send's `turn_start`, idle or busy;
+  // the window turns it into the same pending entry and queued row it creates
+  // for its own sends. The window's own sends never carry it.
+  | { type: "send_accepted"; message_id: MessageId; send_id: SendId; text: string; at: string }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
   // Content-free liveness signal: the harness is still alive mid-turn but
   // produced no renderable content (e.g. Claude Opus 4.8's redacted thinking
@@ -630,6 +635,17 @@ export type AgentSelection = {
   model_choices: string[];
   effort_choices: string[];
 };
+
+/// The parts of an agent's selection the user changed. An absent key leaves
+/// that part as it is, so another client's change to a different setting
+/// survives the save; `null` resets the model or effort to the harness default.
+export type AgentSelectionChanges = Partial<AgentSelection>;
+
+/// The window's answer to the backend's request to get a project ready for a
+/// turn another client is about to start.
+export type DesktopSyncAck =
+  | { status: "ready"; unsubscribed_agents: AgentId[] }
+  | { status: "failed"; message: string };
 
 // Mirror of `crates/core::AgentRecord`. `session_locator` is `null` for
 // harnesses that assign their own session id at runtime (Codex and Antigravity)

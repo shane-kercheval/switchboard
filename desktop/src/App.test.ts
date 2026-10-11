@@ -5015,4 +5015,28 @@ describe("App", () => {
       await screen.findByTestId("banner-project-directory-unavailable");
     });
   });
+
+  describe("changes another client makes", () => {
+    it("shows an agent another client created in the open project's sidebar without a reload", async () => {
+      seedProject({
+        projectId: "p-a",
+        agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+      });
+      await mountApp();
+      await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+      await fireEvent.click(screen.getByText("alpha"));
+      await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(1));
+
+      backend.rosters.set("p-a", [
+        ...(backend.rosters.get("p-a") ?? []),
+        agent({ id: "ag-2", project_id: "p-a", name: "helper" }),
+      ]);
+      fireTo("desktop_roster_changed", { project_id: "p-a" } as unknown as NormalizedEvent);
+
+      await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(2));
+      expect(
+        within(screen.getAllByTestId("sidebar-agent")[1]!).getByText("helper"),
+      ).toBeInTheDocument();
+    });
+  });
 });

@@ -6747,6 +6747,7 @@ mod accepts_now_and_caller_chosen_message_ids {
                     SendOptions {
                         message_id: Some(chosen),
                         emit_user_message: true,
+                        announce_accepted: false,
                     },
                 )
                 .await,
@@ -6807,6 +6808,7 @@ mod accepts_now_and_caller_chosen_message_ids {
                     SendOptions {
                         message_id: Some(chosen),
                         emit_user_message: false,
+                        announce_accepted: false,
                     },
                 )
                 .await,
@@ -6851,6 +6853,7 @@ mod accepts_now_and_caller_chosen_message_ids {
                     SendOptions {
                         message_id: Some(chosen),
                         emit_user_message: false,
+                        announce_accepted: false,
                     },
                 )
                 .await,
@@ -6887,6 +6890,117 @@ mod accepts_now_and_caller_chosen_message_ids {
                 .iter()
                 .any(|(_, v)| event_type(v) == "user_message"),
             "a compose send renders its user turn optimistically; no backend announcement"
+        );
+        assert!(
+            !emitter
+                .snapshot()
+                .iter()
+                .any(|(_, v)| event_type(v) == "send_accepted"),
+            "a compose send already has its row; it is not announced at admission"
+        );
+    }
+
+    async fn announced_send(
+        dispatcher: &Dispatcher,
+        agent: &AgentRecord,
+        factory: &Arc<TestFactory>,
+        send_id: Uuid,
+        text: &str,
+    ) -> MessageId {
+        let chosen = Uuid::now_v7();
+        accepted(
+            dispatcher
+                .send_message_with(
+                    agent.id,
+                    text,
+                    vec![],
+                    send_id,
+                    Arc::clone(factory) as Arc<dyn DispatchContextFactory>,
+                    OnBusy::Enqueue,
+                    SendOptions {
+                        message_id: Some(chosen),
+                        emit_user_message: true,
+                        announce_accepted: true,
+                    },
+                )
+                .await,
+        );
+        chosen
+    }
+
+    fn position(
+        events: &[(String, serde_json::Value)],
+        kind: &str,
+        message_id: MessageId,
+    ) -> usize {
+        events
+            .iter()
+            .position(|(_, v)| event_type(v) == kind && extract_message_id(v) == message_id)
+            .unwrap_or_else(|| panic!("no {kind} for {message_id}"))
+    }
+
+    #[tokio::test]
+    async fn an_announced_send_to_an_idle_agent_is_accepted_before_its_turn_starts() {
+        let (dispatcher, emitter, agent, factory) = setup(MockScenario::Streaming);
+        let send_id = Uuid::now_v7();
+        let message_id = announced_send(&dispatcher, &agent, &factory, send_id, "hello").await;
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        let events = emitter.snapshot();
+        let accepted_at = position(&events, "send_accepted", message_id);
+        assert!(accepted_at < position(&events, "turn_start", message_id));
+        let payload = &events[accepted_at].1;
+        assert_eq!(payload["send_id"], send_id.to_string());
+        assert_eq!(payload["text"], "hello");
+        assert_eq!(events[accepted_at].0, format!("agent:{}", agent.id));
+    }
+
+    #[tokio::test]
+    async fn an_announced_send_to_a_busy_agent_is_accepted_while_it_waits() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, emitter, agent, factory) =
+            setup(MockScenario::CompletesOnSignal(Arc::clone(&gate)));
+        enqueue(&dispatcher, &agent, &factory).await;
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        let message_id =
+            announced_send(&dispatcher, &agent, &factory, Uuid::now_v7(), "queued").await;
+        within(
+            &emitter,
+            "send_accepted",
+            emitter.wait_for_type("send_accepted", 1),
+        )
+        .await;
+        assert_eq!(
+            emitter
+                .snapshot()
+                .iter()
+                .filter(|(_, v)| event_type(v) == "turn_start")
+                .count(),
+            1,
+            "announced while the first turn still runs"
+        );
+        // A permit, not a wake-up: the first turn may not be parked yet.
+        gate.notify_one();
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 2),
+        )
+        .await;
+        gate.notify_one();
+        let events = emitter.snapshot();
+        assert!(
+            position(&events, "send_accepted", message_id)
+                < position(&events, "turn_start", message_id)
         );
     }
 }

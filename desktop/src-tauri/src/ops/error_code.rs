@@ -52,7 +52,9 @@ pub fn error_code(error: &AppError) -> &'static str {
         AppError::SessionInUse => AGENT_BUSY_ELSEWHERE,
         AppError::SourceBusy { .. } => SOURCE_BUSY,
         AppError::DirectoryMissing { .. } => DIRECTORY_MISSING,
-        AppError::DesktopUnavailable { .. } => DESKTOP_UNAVAILABLE,
+        AppError::DesktopUnavailable { .. } | AppError::DesktopSyncFailed { .. } => {
+            DESKTOP_UNAVAILABLE
+        }
         AppError::ProjectLoadTimeout(_) => PROJECT_LOAD_TIMEOUT,
         AppError::PromptTooLarge(_) => PROMPT_TOO_LARGE,
         AppError::SendUnknown(_) => SEND_UNKNOWN,

@@ -2858,7 +2858,10 @@ pub fn set_agent_session_locator_impl(
     Ok(updated)
 }
 
-/// Atomically replace the complete selection configuration for an agent.
+/// Atomically replace the complete selection configuration for an agent. Only
+/// tests write a whole selection; every caller in the app sends the parts it
+/// changed through [`change_agent_selection_impl`].
+#[cfg(test)]
 pub fn set_agent_selection_impl(
     state: &AppState,
     agent_id: AgentId,
@@ -2891,6 +2894,17 @@ pub fn update_agent_selection_impl(
     let updated = project.set_agent_selection(agent_id, selection)?;
     cache_agent(state, updated.clone())?;
     Ok(updated)
+}
+
+/// The window's selection editor: apply only the parts the user changed, so
+/// a model or effort change another client made a moment earlier survives the
+/// user's change to the other setting.
+pub fn change_agent_selection_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    changes: &crate::ops::change::SelectionChanges,
+) -> Result<AgentRecord, AppError> {
+    update_agent_selection_impl(state, agent_id, |current| changes.apply(current))
 }
 
 /// Rewrite a project's registry in `agent_ids` order — the roster's canonical

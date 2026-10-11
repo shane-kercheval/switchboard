@@ -149,7 +149,7 @@ pub async fn wait_workflow(
     let observed = wait_until(
         budget,
         signal,
-        async || {
+        || async move {
             match state.ledger.run(run_id) {
                 Some(run) if run.project_id == project_id => {
                     let reply = WaitWorkflowReply {

@@ -228,12 +228,20 @@ pub enum Observed<T> {
 /// running it was at the last signal. It runs with
 /// [`FINAL_OBSERVATION_GRACE`]; if even that passes, the last state seen is
 /// returned, or `unobserved()` when nothing was ever observed.
-pub(crate) async fn wait_until<T>(
+///
+/// `observe` is a closure returning a future rather than an async closure:
+/// the future an async closure returns borrows the closure, and the compiler
+/// cannot then prove the wait is `Send`, which a caller running it as a task
+/// or a request handler needs. Each observation's future owns what it reads.
+pub(crate) async fn wait_until<T, Fut>(
     budget: &WaitBudget,
     mut signal: watch::Receiver<u64>,
-    mut observe: impl AsyncFnMut() -> Observed<T>,
+    mut observe: impl FnMut() -> Fut,
     unobserved: impl FnOnce() -> T,
-) -> T {
+) -> T
+where
+    Fut: Future<Output = Observed<T>>,
+{
     let mut last: Option<T> = None;
     loop {
         match budget.run(observe()).await {
@@ -273,11 +281,12 @@ mod tests {
         assert_eq!(budget.effective_timeout(), MAX_WAIT_WITHOUT_KEEPALIVE);
         let started = tokio::time::Instant::now();
         let observations = AtomicUsize::new(0);
+        let counted = &observations;
         let value = wait_until(
             &budget,
             never(),
-            async || {
-                observations.fetch_add(1, Ordering::SeqCst);
+            || async move {
+                counted.fetch_add(1, Ordering::SeqCst);
                 Observed::NotYet("still running")
             },
             || "unobserved",
@@ -301,7 +310,7 @@ mod tests {
         }));
         assert_eq!(budget.effective_timeout(), MAX_WAIT_WITH_KEEPALIVE);
         let started = tokio::time::Instant::now();
-        wait_until(&budget, never(), async || Observed::NotYet(()), || ()).await;
+        wait_until(&budget, never(), || async { Observed::NotYet(()) }, || ()).await;
         assert_eq!(started.elapsed(), MAX_WAIT_WITH_KEEPALIVE);
         let fired = ticks.load(Ordering::SeqCst);
         assert!((59..=60).contains(&fired), "progress fired {fired} times");
@@ -327,7 +336,7 @@ mod tests {
         let value = wait_until(
             &budget,
             never(),
-            async || {
+            || async {
                 // An actor that never replies: the observation itself must be
                 // bounded, or the wait would hang past its deadline.
                 tokio::time::sleep(Duration::from_mins(10)).await;
@@ -428,7 +437,7 @@ mod tests {
         let value = wait_until(
             &budget,
             never(),
-            async || Observed::NotYet("cut short"),
+            || async { Observed::NotYet("cut short") },
             || "unobserved",
         )
         .await;
@@ -449,11 +458,12 @@ mod tests {
         });
         let started = tokio::time::Instant::now();
         let calls = AtomicUsize::new(0);
+        let counted = &calls;
         let value = wait_until(
             &budget,
             rx,
-            async || {
-                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            || async move {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
                     Observed::NotYet(false)
                 } else {
                     Observed::Done(true)

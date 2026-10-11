@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/svelte";
-import type { AgentRecord, AgentSelection, NormalizedEvent } from "$lib/types";
+import type { AgentRecord, AgentSelectionChanges, NormalizedEvent } from "$lib/types";
 // Static import so the component-tree transform happens at module collection,
 // not inside the first test's timeout (cold CI transforms have no vite cache).
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
@@ -17,13 +17,14 @@ vi.mock("@tauri-apps/api/event", () => ({
 // mocks are orthogonal.
 const renameAgentMock = vi.fn<(id: string, name: string) => Promise<void>>();
 const removeAgentMock = vi.fn<(id: string) => Promise<void>>();
-const setAgentSelectionMock = vi.fn<(id: string, selection: AgentSelection) => Promise<void>>();
+const setAgentSelectionMock =
+  vi.fn<(id: string, changes: AgentSelectionChanges) => Promise<void>>();
 const reorderAgentsMock = vi.fn<(projectId: string, orderedIds: string[]) => Promise<void>>();
 vi.mock("$lib/state/workspace.svelte", () => ({
   renameAgent: (id: string, name: string) => renameAgentMock(id, name),
   removeAgent: (id: string) => removeAgentMock(id),
-  setAgentSelection: (id: string, selection: AgentSelection) =>
-    setAgentSelectionMock(id, selection),
+  setAgentSelection: (id: string, changes: AgentSelectionChanges) =>
+    setAgentSelectionMock(id, changes),
   reorderAgents: (projectId: string, orderedIds: string[]) =>
     reorderAgentsMock(projectId, orderedIds),
 }));
@@ -1030,7 +1031,7 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("agent-selection-settings")).not.toBeNull();
   });
 
-  it("model settings saves the complete independent selection atomically", async () => {
+  it("model settings saves only the settings the user changed", async () => {
     const state = await loadState();
     const agent = {
       ...CLAUDE_AGENT,
@@ -1053,9 +1054,7 @@ describe("Sidebar", () => {
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
       model: "sonnet",
-      effort: "high",
       model_choices: ["sonnet"],
-      effort_choices: ["high"],
     });
   });
 
@@ -1074,12 +1073,8 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("change-selection-effort-current")).toBeNull();
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: null,
-      effort: null,
-      model_choices: [],
-      effort_choices: [],
-    });
+    // Nothing changed, so nothing is sent that could pin a value.
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {});
   });
 
   it("requires a compatible effort before saving a newly configured attached Antigravity agent", async () => {
@@ -1121,9 +1116,7 @@ describe("Sidebar", () => {
     await fireEvent.click(screen.getByTestId("change-save"));
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: null,
       effort: "medium",
-      model_choices: [],
       effort_choices: ["medium"],
     });
   });
@@ -1145,12 +1138,9 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("change-selection-model-implicit")).toBeNull();
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "future-opus",
-      effort: null,
-      model_choices: ["future-opus"],
-      effort_choices: [],
-    });
+    // Untouched, so the unknown value is not sent back at all: the backend
+    // keeps it.
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {});
   });
 
   it("Change model uses the segmented toggle for an in-catalog model", async () => {
@@ -1208,8 +1198,6 @@ describe("Sidebar", () => {
     await fireEvent.click(screen.getByTestId("change-save"));
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "opus",
-      effort: "high",
       model_choices: ["opus", "sonnet"],
       effort_choices: ["high", "medium"],
     });
@@ -1231,11 +1219,36 @@ describe("Sidebar", () => {
     expect(modelChip).toHaveAccessibleName(/Current model: Opus.*Switch to Sonnet/);
     await fireEvent.click(modelChip);
 
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, { model: "sonnet" });
+  });
+
+  it("a settings save sends only the model the user changed, so another client's effort change survives", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...CLAUDE_AGENT,
+      model: "opus",
+      effort: "high",
+      model_choices: ["opus"],
+      effort_choices: ["high"],
+    };
+    await state.registerAgent(agent);
+    const { rerender } = render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-selection-settings"));
+    await screen.findByTestId("change-selection-model");
+    // An orchestrator changes the effort while the editor is open.
+    await rerender({
+      projectId: PROJECT_ID,
+      agents: [{ ...agent, effort: "medium", effort_choices: ["high", "medium"] }],
+    });
+    await fireEvent.click(screen.getByTestId("change-selection-model-choice-sonnet"));
+    await fireEvent.click(screen.getByTestId("change-selection-model-choice-opus"));
+    await fireEvent.click(screen.getByTestId("change-save"));
+
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
       model: "sonnet",
-      effort: "high",
-      model_choices: ["opus", "sonnet"],
-      effort_choices: ["high", "medium"],
+      model_choices: ["sonnet"],
     });
   });
 
@@ -1263,12 +1276,7 @@ describe("Sidebar", () => {
     expect(screen.getByTestId("agent-model-option-sonnet")).toHaveTextContent("Sonnet");
     await fireEvent.click(await screen.findByTestId("agent-model-option-haiku"));
 
-    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "haiku",
-      effort: "high",
-      model_choices: ["opus", "sonnet", "haiku"],
-      effort_choices: ["high"],
-    });
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, { model: "haiku" });
   });
 
   it("opens a direct menu for three effort choices without changing the model", async () => {
@@ -1286,12 +1294,7 @@ describe("Sidebar", () => {
     await fireEvent.click(screen.getByTestId("agent-effort-chip"));
     await fireEvent.click(await screen.findByTestId("agent-effort-option-low"));
 
-    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "opus",
-      effort: "low",
-      model_choices: ["opus"],
-      effort_choices: ["high", "medium", "low"],
-    });
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, { effort: "low" });
   });
 
   it("announces and atomically applies an Antigravity model switch that adjusts effort", async () => {
@@ -1313,8 +1316,6 @@ describe("Sidebar", () => {
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
       model: "gemini-3.1-pro",
       effort: "high",
-      model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
-      effort_choices: ["medium", "high"],
     });
   });
 
@@ -1337,9 +1338,6 @@ describe("Sidebar", () => {
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
       model: "future-model",
-      effort: "medium",
-      model_choices: ["gemini-3.7-flash", "future-model"],
-      effort_choices: ["medium"],
     });
   });
 
@@ -1480,12 +1478,7 @@ describe("Sidebar", () => {
     expect(modelChip).toHaveAccessibleName(/Current model: Harness default.*Switch to Sonnet/);
     await fireEvent.click(modelChip);
 
-    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "sonnet",
-      effort: null,
-      model_choices: ["sonnet"],
-      effort_choices: ["medium"],
-    });
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, { model: "sonnet" });
   });
 
   it("keeps the quick switch usable and surfaces a persistence failure", async () => {

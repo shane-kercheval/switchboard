@@ -55,7 +55,13 @@ import type {
   TurnId,
 } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
-import { _internal, freshRuntime, runtimeReducer, transcriptReducer } from "./reducers";
+import {
+  _internal,
+  backendUserTurnId,
+  freshRuntime,
+  runtimeReducer,
+  transcriptReducer,
+} from "./reducers";
 import {
   markRecipientStarted,
   settleAgentIdle,
@@ -573,6 +579,22 @@ export function dispatchUserTurn(
     });
     return;
   }
+  addPendingUserTurn(runtime, userTurnId, text, attachments, sendId, startedAt);
+}
+
+/// The user row and pending entry of a send not yet started: the window's own
+/// (`dispatchUserTurn`, receipt recorded later) or one another client made
+/// (`send_accepted`, receipt already known).
+function addPendingUserTurn(
+  runtime: AgentRuntime,
+  userTurnId: TurnId,
+  text: string,
+  attachments: Attachment[],
+  sendId: SendId,
+  startedAt: string,
+  messageId?: MessageId,
+): void {
+  const agentId = runtime.agent_id;
   const existing = transcripts[agentId] ?? [];
   setTranscript(
     agentId,
@@ -583,7 +605,9 @@ export function dispatchUserTurn(
   // just lines up behind the running turn. The entry (keyed by user_turn_id,
   // receipt filled later) is what stamps each response's `send_id` and lets a
   // failure prune the right send.
-  const pending = [...(runtime.pending_sends ?? []), { send_id: sendId, user_turn_id: userTurnId }];
+  const entry: PendingSend = { send_id: sendId, user_turn_id: userTurnId };
+  if (messageId !== undefined) entry.message_id = messageId;
+  const pending = [...(runtime.pending_sends ?? []), entry];
   // Only an idle agent transitions to "starting" (the run_status machine
   // governs the single running turn); a send to a busy agent leaves its
   // run_status alone — its turn waits in the backend queue and surfaces when
@@ -592,6 +616,31 @@ export function dispatchUserTurn(
     runtime.run_status === "idle"
       ? { ...runtime, run_status: "starting", last_error: undefined, pending_sends: pending }
       : { ...runtime, pending_sends: pending };
+}
+
+/// A send another client made was accepted into this agent's queue: show it
+/// exactly as the window shows its own — a queued row (or a starting one, for
+/// an idle agent) with the usual cancel button. The row takes the id the
+/// send's later `user_message` derives, so that event finds it rather than
+/// adding a second; the entry carries the receipt, so `turn_start`,
+/// `message_cancelled`, and `message_failed` resolve this send and never the
+/// window's own pending one. Not registered with the completion tracker: the
+/// user did not send it, so it raises no notification.
+function admitAnnouncedSend(
+  runtime: AgentRuntime,
+  event: Extract<NormalizedEvent, { type: "send_accepted" }>,
+): void {
+  const userTurnId = backendUserTurnId(event.send_id, runtime.agent_id);
+  if ((transcripts[runtime.agent_id] ?? []).some((t) => t.turn_id === userTurnId)) return;
+  addPendingUserTurn(
+    runtime,
+    userTurnId,
+    event.text,
+    [],
+    event.send_id,
+    event.at,
+    event.message_id,
+  );
 }
 
 /// Ask `agentId` to compact its own conversation, and register the pending entry
@@ -1090,6 +1139,11 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
       agent_id: agentId,
       event_type: event.type,
     });
+    return;
+  }
+
+  if (event.type === "send_accepted") {
+    admitAnnouncedSend(priorRuntime, event);
     return;
   }
 

@@ -4,6 +4,7 @@
 //! is the Tauri wiring layer.
 
 mod commands;
+mod debug_ops;
 mod dispatch_context;
 mod emitter;
 mod error;
@@ -335,13 +336,13 @@ use crate::commands::{
     ForwardOutcome, HarnessInstallStatus, ProjectListing, RepoListing, StagedAttachment,
     WorkspaceStatus, add_mcp_provider_impl, add_tracked_repo_impl, agent_session_info_impl,
     attach_agent_impl, branch_comparison_file_diff_impl, branch_comparison_impl, cancel_agent_impl,
-    cancel_forward_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
-    check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
-    check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
-    commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, compact_agent_impl,
-    context_report_agent_impl, copy_builtin_prompt_impl, create_agent_impl, create_project_impl,
-    delete_project_impl, editor_open_argv, existing_attachment_paths_impl, fetch_repo_impl,
-    file_diff_impl, fork_agent_impl, forward_message_impl, forward_prompt_impl,
+    cancel_forward_impl, cancel_send_impl, cancel_turn_impl, change_agent_selection_impl,
+    changed_files_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
+    check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
+    check_codex_binary_impl, commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl,
+    compact_agent_impl, context_report_agent_impl, copy_builtin_prompt_impl, create_agent_impl,
+    create_project_impl, delete_project_impl, editor_open_argv, existing_attachment_paths_impl,
+    fetch_repo_impl, file_diff_impl, fork_agent_impl, forward_message_impl, forward_prompt_impl,
     get_harness_usage_impl, get_preferences_impl, get_prompt_source_impl, harness_adapter_for,
     install_status_for_adapter, list_agents_impl, list_mcp_providers_impl, list_message_pins_impl,
     list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
@@ -355,13 +356,13 @@ use crate::commands::{
     render_prompt_impl, reorder_agents_impl, resolve_saved_prompt_fresh_impl,
     resolve_saved_prompt_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
     search_project_files_in_root, search_project_files_root_impl, send_message_impl,
-    set_active_project_impl, set_agent_selection_impl, set_harness_usage_impl,
-    set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
-    set_project_directory_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
-    sign_out_mcp_provider_impl, spawn_prompt_resolution_change_notifications,
-    stage_attachment_impl, stage_pasted_text_impl, sync_prompts_and_notify, terminal_open_argv,
-    test_mcp_connection_impl, test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots,
-    validate_external_url, workspace_status_impl,
+    set_active_project_impl, set_harness_usage_impl, set_message_pin_impl, set_preferences_impl,
+    set_project_archived_impl, set_project_directory_impl, set_visible_project_impl,
+    sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
+    spawn_prompt_resolution_change_notifications, stage_attachment_impl, stage_pasted_text_impl,
+    sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
+    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
+    workspace_status_impl,
 };
 use crate::error::AppError;
 use crate::harness_usage::HarnessUsage;
@@ -1094,14 +1095,40 @@ async fn fork_agent(state: State<'_, AppState>, agent_id: String) -> Result<Agen
         .map_err(|e| e.to_string())
 }
 
+/// Change the parts of an agent's selection the user changed. Every absent
+/// part is left as it is, so another client's change to a different setting
+/// survives (see `SelectionChanges`).
 #[tauri::command]
 async fn set_agent_selection(
     state: State<'_, AppState>,
     agent_id: String,
-    selection: switchboard_core::AgentSelection,
+    changes: crate::ops::change::SelectionChanges,
 ) -> Result<AgentRecord, String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
-    set_agent_selection_impl(state.inner(), id, selection).map_err(|e| e.to_string())
+    change_agent_selection_impl(state.inner(), id, &changes).map_err(|e| e.to_string())
+}
+
+/// Drives `ops` from the devtools console of a debug build (see `debug_ops`).
+#[tauri::command]
+async fn debug_ops(
+    app: tauri::AppHandle,
+    request: crate::debug_ops::DebugOp,
+) -> Result<serde_json::Value, String> {
+    crate::debug_ops::run(app, request).await
+}
+
+/// The window's answer to a `desktop_sync_project` request: the project is
+/// loaded and every subscription has settled, or loading failed. An answer
+/// for a request nobody waits for any more is ignored.
+#[tauri::command]
+async fn desktop_project_synced(
+    sync: State<'_, Arc<crate::ops::desktop_sync::WindowSync>>,
+    request_id: String,
+    result: crate::ops::desktop_sync::SyncAck,
+) -> Result<(), String> {
+    let request_id = parse_uuid(&request_id).map_err(|e| e.to_string())?;
+    sync.acknowledge(request_id, result);
+    Ok(())
 }
 
 #[tauri::command]
@@ -2386,6 +2413,19 @@ pub fn run() {
             // Attach all user-global persistence locations (workspace.yaml,
             // git-view.yaml, config.yaml) — see `with_persistence_paths`.
             let state = with_persistence_paths(state);
+            // The window end of the sync a turn-starting operation runs, and of
+            // the change notifications. Its own emitter rather than the turn
+            // chain's: these are app-level events, and nothing in that chain
+            // (the wake lock, the send ledger) has a reason to see them.
+            let window_sync = Arc::new(crate::ops::desktop_sync::WindowSync::new(Arc::new(
+                AppHandleEmitter {
+                    app: app.handle().clone(),
+                },
+            )));
+            let state = state.with_desktop_sync(Arc::clone(&window_sync)
+                as Arc<dyn crate::ops::desktop_sync::DesktopSync>);
+            app.manage(window_sync);
+            crate::debug_ops::serve_socket(app.handle());
             // Resolve and inject the user-global prompt config + default prompts
             // store. Built-in example prompts are baked into the service as a
             // read-only library — nothing is written into the user's folder.
@@ -2536,6 +2576,8 @@ pub fn run() {
             remove_agent,
             rename_agent,
             set_agent_selection,
+            desktop_project_synced,
+            debug_ops,
             reorder_agents,
             attach_agent,
             list_agents,

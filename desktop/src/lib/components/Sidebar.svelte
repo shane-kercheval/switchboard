@@ -38,7 +38,7 @@
   import { DRAG_SLOP_PX, dropIndexForPointer, movedOrder } from "$lib/agentReorder";
   import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
-  import { effortSupportFor, selectionIsValid } from "$lib/agentSelection";
+  import { effortSupportFor, selectionChanges, selectionIsValid } from "$lib/agentSelection";
   import { preferences } from "$lib/preferences.svelte";
   import {
     AGENTS_SIDEBAR_DEFAULT_WIDTH,
@@ -160,8 +160,10 @@
   let removingAgentId = $state<AgentId | null>(null);
   let removeError = $state<{ agentId: AgentId; message: string } | null>(null);
 
-  /// Selection writes replace the complete configuration. One agent-level busy
-  /// flag prevents independently rendered controls from submitting stale peers.
+  /// Selection writes send only the parts the user changed, measured against
+  /// what they started from, so another client's change to a different setting
+  /// survives. One agent-level busy flag still keeps two controls of the same
+  /// card from saving at once.
   let selectionEditingAgentId = $state<AgentId | null>(null);
   let editSelection = $state<AgentSelection>({
     model: null,
@@ -169,6 +171,13 @@
     model_choices: [],
     effort_choices: [],
   });
+  /// The selection the editor opened with: what a save is measured against.
+  let editBaseline: AgentSelection = {
+    model: null,
+    effort: null,
+    model_choices: [],
+    effort_choices: [],
+  };
   let editBusy = $state<boolean>(false);
   let editError = $state<string | null>(null);
   let selectionSaving = $state<Record<AgentId, boolean>>({});
@@ -198,6 +207,7 @@
 
   function openSelectionSettings(agent: AgentRecord): void {
     selectionEditingAgentId = agent.id;
+    editBaseline = $state.snapshot(selectionForAgent(agent));
     editSelection = selectionForAgent(agent);
     editError = null;
     editBusy = false;
@@ -217,7 +227,10 @@
     selectionSaving[agentId] = true;
     editError = null;
     try {
-      await setAgentSelection(agentId, $state.snapshot(editSelection));
+      await setAgentSelection(
+        agentId,
+        selectionChanges(editBaseline, $state.snapshot(editSelection)),
+      );
       delete selectionSaveErrors[agentId];
       if (selectionEditingAgentId === agentId) closeChange();
     } catch (err) {
@@ -235,7 +248,7 @@
     selectionSaving[agent.id] = true;
     delete selectionSaveErrors[agent.id];
     try {
-      await setAgentSelection(agent.id, selection);
+      await setAgentSelection(agent.id, selectionChanges(selectionForAgent(agent), selection));
     } catch (err) {
       selectionSaveErrors[agent.id] = err instanceof Error ? err.message : String(err);
     } finally {

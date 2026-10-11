@@ -556,6 +556,15 @@ pub enum AppError {
     #[error("the desktop window did not finish loading project {0} in time")]
     ProjectLoadTimeout(ProjectId),
 
+    /// The desktop window could not load the project (its open or roster read
+    /// failed), so a turn started now would run where the window cannot show
+    /// it. Nothing was dispatched.
+    #[error("the desktop window could not load project {project_id}: {message}")]
+    DesktopSyncFailed {
+        project_id: ProjectId,
+        message: String,
+    },
+
     /// A forward's source is still mid-turn past the caller's wait budget.
     /// The compose was cancelled and nothing was dispatched.
     #[error("{name} is still responding — wait for it with wait_agent, then forward again")]

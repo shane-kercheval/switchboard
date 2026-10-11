@@ -2646,3 +2646,92 @@ describe("context breakdown requests", () => {
     });
   });
 });
+
+describe("send_accepted (a send another client made)", () => {
+  const ORCHESTRATOR_SEND = "00000000-0000-7000-8000-0000000000c1";
+  const ORCHESTRATOR_MESSAGE = "00000000-0000-7000-8000-0000000000c2";
+
+  function accepted(text = "from the orchestrator"): NormalizedEvent {
+    return {
+      type: "send_accepted",
+      message_id: ORCHESTRATOR_MESSAGE,
+      send_id: ORCHESTRATOR_SEND,
+      text,
+      at: "2026-05-16T00:00:02Z",
+    };
+  }
+
+  it("gives an idle agent the same starting row and pending entry as the window's own send", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+
+    fireTo(`agent:${AGENT_A}`, accepted());
+
+    const rows = (state.transcripts[AGENT_A] ?? []).filter((t) => t.role === "user");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      text: "from the orchestrator",
+      send_id: ORCHESTRATOR_SEND,
+      pending: true,
+    });
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
+    expect(state.runtimes[AGENT_A]?.pending_sends).toEqual([
+      expect.objectContaining({ send_id: ORCHESTRATOR_SEND, message_id: ORCHESTRATOR_MESSAGE }),
+    ]);
+  });
+
+  it("is not doubled by the send's user_message or turn_start", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+
+    fireTo(`agent:${AGENT_A}`, accepted());
+    fireTo(`agent:${AGENT_A}`, accepted());
+    fireTo(`agent:${AGENT_A}`, {
+      type: "user_message",
+      send_id: ORCHESTRATOR_SEND,
+      text: "from the orchestrator",
+      at: "2026-05-16T00:00:03Z",
+    });
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: ORCHESTRATOR_MESSAGE,
+      send_id: ORCHESTRATOR_SEND,
+      started_at: "2026-05-16T00:00:03Z",
+    });
+
+    const turns = state.transcripts[AGENT_A] ?? [];
+    expect(turns.filter((t) => t.role === "user")).toHaveLength(1);
+    expect(turns.find((t) => t.role === "user")?.pending).toBeUndefined();
+    const reply = turns.find((t) => t.role === "agent");
+    expect(reply?.send_id).toBe(ORCHESTRATOR_SEND);
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+  });
+
+  it("a message_failed for its message id fails that row, not the user's own pending send", async () => {
+    // The user's own send has no receipt yet (its IPC is in flight), which is
+    // when a failure that matched by position alone would take it.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, "user-own", "mine", [], "send-own", "2026-05-16T00:00:00Z");
+    fireTo(`agent:${AGENT_A}`, accepted());
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: ORCHESTRATOR_MESSAGE,
+      send_id: null,
+      agent_id: AGENT_A,
+      error: "harness refused",
+      at: "2026-05-16T00:00:04Z",
+    });
+
+    const failed = (state.transcripts[AGENT_A] ?? []).find(
+      (t) => t.role === "agent" && t.status === "failed",
+    );
+    expect(failed?.send_id).toBe(ORCHESTRATOR_SEND);
+    expect(state.runtimes[AGENT_A]?.pending_sends).toEqual([
+      expect.objectContaining({ send_id: "send-own", user_turn_id: "user-own" }),
+    ]);
+  });
+});

@@ -625,9 +625,13 @@ async fn dispatch_recipients(
             send_id,
             home_dir,
             on_busy,
+            // Announced at admission so the window shows the message queued,
+            // with the cancel button it has for its own, before the turn
+            // starts; the user message follows once the send is journaled.
             SendOptions {
                 message_id: Some(message_id),
                 emit_user_message: true,
+                announce_accepted: true,
             },
         )
         .await;
@@ -921,15 +925,17 @@ pub async fn wait_send(
     let observed = wait_until(
         budget,
         signal,
-        async || match state.ledger.send(send_id) {
-            Some(snapshot) if snapshot.project_id == project_id => {
-                if snapshot.is_done() {
-                    Observed::Done(Some(snapshot))
-                } else {
-                    Observed::NotYet(Some(snapshot))
+        || async move {
+            match state.ledger.send(send_id) {
+                Some(snapshot) if snapshot.project_id == project_id => {
+                    if snapshot.is_done() {
+                        Observed::Done(Some(snapshot))
+                    } else {
+                        Observed::NotYet(Some(snapshot))
+                    }
                 }
+                _ => Observed::Done(None),
             }
-            _ => Observed::Done(None),
         },
         || None,
     )
@@ -1137,7 +1143,7 @@ pub async fn wait_agent(
     let idle = wait_until(
         budget,
         signal,
-        async || {
+        || async move {
             if state.dispatcher.accepts_now(agent_id).await {
                 Observed::Done(true)
             } else {

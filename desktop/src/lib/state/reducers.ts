@@ -53,6 +53,14 @@ import type {
   TurnItem,
 } from "./types";
 
+/// The id of the user row for a send the backend announces rather than the
+/// window making it optimistically: a workflow step's `user_message`, or a
+/// send another client made (`send_accepted`). One derivation, so a send that
+/// carries both events gets one row.
+export function backendUserTurnId(sendId: SendId, agentId: AgentId): TurnId {
+  return `user:${sendId}:${agentId}`;
+}
+
 export function transcriptReducer(
   turns: Turn[],
   input: ReducerInput,
@@ -119,7 +127,9 @@ export function transcriptReducer(
       // A fan-out's recipients share `send_id`, so the unified view collapses
       // these per-recipient user turns into one user row (and groups the responses
       // into columns), matching a manual send and the reloaded journal view.
-      const turn_id = `user:${input.send_id}:${agentId}`;
+      const turn_id = backendUserTurnId(input.send_id, agentId);
+      // Also a no-op for a send announced at admission (`send_accepted`),
+      // whose row was created under this same id before its turn started.
       if (findTurn(turns, turn_id) !== undefined) return turns;
       return [
         ...turns,

@@ -23,7 +23,7 @@ use crate::commands::{create_project_impl, set_agent_session_locator_impl};
 use crate::error::AppError;
 use crate::state::{AppState, lock};
 
-use super::desktop_sync::{DesktopSync, ReadyReport};
+use super::desktop_sync::{DesktopSync, ReadyReport, WindowSync};
 
 /// One scripted turn.
 #[derive(Clone)]
@@ -250,6 +250,44 @@ impl DesktopSync for StubDesktopSync {
     }
 }
 
+/// One `desktop_sync_project` request as the window received it.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncRequest {
+    pub request_id: Uuid,
+    pub project_id: ProjectId,
+}
+
+/// The window, as the production [`WindowSync`] reaches it: records every
+/// event, and hands each sync request to the test to answer.
+pub struct TestWindow {
+    pub events: Mutex<Vec<(String, serde_json::Value)>>,
+    requests: tokio::sync::mpsc::UnboundedSender<SyncRequest>,
+}
+
+impl TestWindow {
+    pub fn names(&self) -> Vec<String> {
+        lock(&self.events).iter().map(|(n, _)| n.clone()).collect()
+    }
+}
+
+impl EventEmitter for TestWindow {
+    fn emit(&self, name: &str, payload: serde_json::Value) {
+        if name == "desktop_sync_project" {
+            let field = |key: &str| {
+                payload[key]
+                    .as_str()
+                    .and_then(|v| Uuid::parse_str(v).ok())
+                    .unwrap()
+            };
+            let _ = self.requests.send(SyncRequest {
+                request_id: field("request_id"),
+                project_id: field("project_id"),
+            });
+        }
+        lock(&self.events).push((name.to_owned(), payload));
+    }
+}
+
 /// A store root and an `AppState` over it. `restart` builds a fresh state
 /// over the same store, which is how a test starts from "a project the window
 /// has not opened": the project exists on disk and nothing in memory knows it.
@@ -278,7 +316,7 @@ impl TestEnv {
         let library = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         let adapter = Arc::new(ScriptedAdapter::new(scripts, home.path()));
-        let (state, emitter, sync) = build_state(store_root.path(), &adapter, None);
+        let (state, emitter, sync) = build_state(store_root.path(), &adapter, None, None);
         Self {
             state,
             store_root,
@@ -310,7 +348,36 @@ impl TestEnv {
     /// A fresh state over the same store and home: nothing loaded, the
     /// ledger empty, the scripts cleared. The old state is dropped first so
     /// its project locks are released.
-    pub fn restart(mut self) -> Self {
+    pub fn restart(self) -> Self {
+        self.restart_with(None)
+    }
+
+    /// [`TestEnv::restart`] with the production round trip, over a window the
+    /// test drives: each sync request arrives on the returned receiver, and
+    /// the test answers it through the returned [`WindowSync`] (or does not).
+    pub fn with_window(
+        self,
+        deadline: Duration,
+    ) -> (
+        Self,
+        Arc<WindowSync>,
+        Arc<TestWindow>,
+        tokio::sync::mpsc::UnboundedReceiver<SyncRequest>,
+    ) {
+        let (requests, received) = tokio::sync::mpsc::unbounded_channel();
+        let window = Arc::new(TestWindow {
+            events: Mutex::new(Vec::new()),
+            requests,
+        });
+        let sync = Arc::new(WindowSync::with_deadline(
+            Arc::clone(&window) as Arc<dyn EventEmitter>,
+            deadline,
+        ));
+        let env = self.restart_with(Some(Arc::clone(&sync) as Arc<dyn DesktopSync>));
+        (env, sync, window, received)
+    }
+
+    fn restart_with(mut self, desktop_sync: Option<Arc<dyn DesktopSync>>) -> Self {
         let adapter = Arc::new(ScriptedAdapter::new(Vec::new(), self.home.path()));
         let old = std::mem::replace(
             &mut self.state,
@@ -325,7 +392,8 @@ impl TestEnv {
         let library = self
             .library_enabled
             .then(|| self.library.path().to_path_buf());
-        let (state, emitter, sync) = build_state(self.store_root.path(), &adapter, library);
+        let (state, emitter, sync) =
+            build_state(self.store_root.path(), &adapter, library, desktop_sync);
         self.state = state;
         self.emitter = emitter;
         self.sync = sync;
@@ -541,10 +609,13 @@ impl TestEnv {
     }
 }
 
+/// The state under test, with `desktop_sync` as its window when given and the
+/// stub otherwise.
 fn build_state(
     store_root: &Path,
     adapter: &Arc<ScriptedAdapter>,
     library: Option<PathBuf>,
+    desktop_sync: Option<Arc<dyn DesktopSync>>,
 ) -> (Arc<AppState>, Arc<RecordingEmitter>, Arc<StubDesktopSync>) {
     let emitter = Arc::new(RecordingEmitter::new());
     let sync = Arc::new(StubDesktopSync::default());
@@ -555,7 +626,7 @@ fn build_state(
         Arc::clone(adapter) as Arc<dyn HarnessAdapter>,
         Arc::clone(&emitter) as Arc<dyn EventEmitter>,
     )
-    .with_desktop_sync(Arc::clone(&sync) as Arc<dyn DesktopSync>);
+    .with_desktop_sync(desktop_sync.unwrap_or_else(|| Arc::clone(&sync) as Arc<dyn DesktopSync>));
     if let Some(library) = library {
         let prompts_dir = library.join("prompts");
         let workflows_dir = library.join("workflows");

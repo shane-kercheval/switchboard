@@ -33,9 +33,12 @@ const generation = new Map<ProjectId, number>();
 /// generation guard discards the listener and the seed if the project is torn
 /// down while either await is in flight.
 export async function subscribeProjectWorkflows(projectId: ProjectId): Promise<void> {
-  if (subscriptions.has(projectId)) return;
+  // The in-flight subscribe first: the listener is installed before the seed
+  // lands, and a caller about to start a run must wait for the seed too, or
+  // the seed (read before the run existed) could replace the run's live state.
   const pending = pendingSubs.get(projectId);
   if (pending !== undefined) return pending;
+  if (subscriptions.has(projectId)) return;
 
   const gen = (generation.get(projectId) ?? 0) + 1;
   generation.set(projectId, gen);

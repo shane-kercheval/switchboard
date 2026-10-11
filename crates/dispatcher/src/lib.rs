@@ -260,6 +260,10 @@ enum WorkPayload {
         /// the live user message identical to the reloaded journal view by
         /// construction.
         emit_user_message: bool,
+        /// Emit [`NormalizedEvent::SendAccepted`] when the actor admits this
+        /// send, before its turn starts. Set for a send another client made,
+        /// so the window can show it queued and cancel it like its own.
+        announce_accepted: bool,
     },
     /// Ask the harness to compact the agent's **own existing conversation**.
     /// Carries no prompt and no attachments — it is not something the user said,
@@ -453,10 +457,16 @@ pub enum OnBusy {
 /// durable. `false` for the compose path, which renders its user turn
 /// optimistically; `true` for a backend-originated send that has no frontend
 /// optimistic turn.
+///
+/// `announce_accepted`: emit `send_accepted` as the actor admits the send, so
+/// the window can show a send it did not make as queued, with its cancel
+/// button, before the turn starts. `false` for the compose path, whose row
+/// already exists, and for workflow sends, which stay as they were.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SendOptions {
     pub message_id: Option<MessageId>,
     pub emit_user_message: bool,
+    pub announce_accepted: bool,
 }
 
 /// Result of `send_message`. `Busy` is only possible under [`OnBusy::FailFast`].
@@ -1188,6 +1198,7 @@ impl Dispatcher {
                 prompt: prompt.to_owned(),
                 attachments,
                 emit_user_message: options.emit_user_message,
+                announce_accepted: options.announce_accepted,
             },
             selection,
             completion: None,
@@ -1375,6 +1386,7 @@ impl Dispatcher {
                 prompt: prompt.to_owned(),
                 attachments,
                 emit_user_message,
+                announce_accepted: false,
             },
             selection,
             completion: Some(completion_tx),
@@ -1886,7 +1898,7 @@ fn apply_idle_command(
             // Idle ⇒ nothing is running and the backlog drains fully before we
             // park, so FailFast is satisfiable: accept.
             let message_id = item.message_id;
-            backlog.push_back(item);
+            admit(backlog, item, emitter, channel, agent_id);
             if let Some(reply) = reply {
                 let _ = reply.send(SendOutcome::Accepted(message_id));
             }
@@ -2081,6 +2093,7 @@ async fn run_turn(
             prompt,
             attachments,
             emit_user_message: announce_user_message,
+            announce_accepted: _,
         } => {
             // Clean prompt is journaled (below) and queued; the agent-facing
             // footer of `label: <absolute path>` lines is appended only here, at
@@ -2712,7 +2725,7 @@ async fn drain_turn(
                                 // workflow "contention = step failure" rule.
                                 if accepts_fail_fast_mid_turn(terminal_seen, backlog) {
                                     let message_id = item.message_id;
-                                    backlog.push_back(item);
+                                    admit(backlog, item, emitter.as_ref(), channel, agent_id);
                                     if let Some(reply) = reply {
                                         let _ = reply.send(SendOutcome::Accepted(message_id));
                                     }
@@ -2722,7 +2735,7 @@ async fn drain_turn(
                             }
                             OnBusy::Enqueue => {
                                 let message_id = item.message_id;
-                                backlog.push_back(item);
+                                admit(backlog, item, emitter.as_ref(), channel, agent_id);
                                 if let Some(reply) = reply {
                                     let _ = reply.send(SendOutcome::Accepted(message_id));
                                 }
@@ -3000,6 +3013,37 @@ fn remove_from_backlog(
         prompt,
         attachments,
     })
+}
+
+/// Admit `item` to the backlog. Every send joins the queue here, so a send
+/// that asked to be announced is announced exactly as it is admitted: before
+/// its own `TurnStart`, whether the agent was idle or busy.
+fn admit(
+    backlog: &mut VecDeque<WorkItem>,
+    item: WorkItem,
+    emitter: &dyn EventEmitter,
+    channel: &str,
+    agent_id: AgentId,
+) {
+    if let WorkPayload::Send {
+        prompt,
+        announce_accepted: true,
+        ..
+    } = &item.payload
+    {
+        emit_event(
+            emitter,
+            channel,
+            &NormalizedEvent::SendAccepted {
+                message_id: item.message_id,
+                send_id: item.send_id,
+                text: prompt.clone(),
+                at: Utc::now(),
+            },
+            agent_id,
+        );
+    }
+    backlog.push_back(item);
 }
 
 /// The one admission rule for a `FailFast` send arriving while the actor is

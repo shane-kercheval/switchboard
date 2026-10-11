@@ -132,6 +132,44 @@ impl SelectionChange {
     }
 }
 
+/// The parts of an agent's selection a caller changed; every absent part is
+/// left as it is. Callers send only what the user (or orchestrator) changed,
+/// so two clients changing different settings at once both keep their
+/// change: a whole-selection write would put back the stale copy of the
+/// setting the writer did not touch. Changes to the same setting resolve as
+/// last write wins.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct SelectionChanges {
+    #[serde(default)]
+    pub model: SelectionChange,
+    #[serde(default)]
+    pub effort: SelectionChange,
+    #[serde(default)]
+    pub model_choices: Option<Vec<String>>,
+    #[serde(default)]
+    pub effort_choices: Option<Vec<String>>,
+}
+
+impl SelectionChanges {
+    /// The whole selection to write, given the record as it is now. Called
+    /// under the registry lock, so `current` is the latest write.
+    #[must_use]
+    pub fn apply(&self, current: &AgentRecord) -> AgentSelection {
+        AgentSelection {
+            model: self.model.apply(current.model.clone()),
+            effort: self.effort.apply(current.effort.clone()),
+            model_choices: self
+                .model_choices
+                .clone()
+                .unwrap_or_else(|| current.model_choices.clone()),
+            effort_choices: self
+                .effort_choices
+                .clone()
+                .unwrap_or_else(|| current.effort_choices.clone()),
+        }
+    }
+}
+
 /// Change an agent's model and/or effort. The quick-choice lists are kept,
 /// and a new value joins them, because the core library appends the current
 /// value to its list on every write so every dispatch-ready value is also
@@ -147,12 +185,12 @@ pub fn set_agent_selection(
 ) -> Result<AgentRecord, AppError> {
     open_project_impl(state, project_id)?;
     agent_in_project(state, project_id, agent_id)?;
-    let record = update_agent_selection_impl(state, agent_id, |current| AgentSelection {
-        model: model.apply(current.model.clone()),
-        effort: effort.apply(current.effort.clone()),
-        model_choices: current.model_choices.clone(),
-        effort_choices: current.effort_choices.clone(),
-    })?;
+    let changes = SelectionChanges {
+        model: model.clone(),
+        effort: effort.clone(),
+        ..SelectionChanges::default()
+    };
+    let record = update_agent_selection_impl(state, agent_id, |current| changes.apply(current))?;
     state.desktop_sync.roster_changed(project_id);
     Ok(record)
 }

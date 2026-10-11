@@ -87,6 +87,7 @@
     projectDeletions,
     dismissProjectRelocationError,
     installRegistryStalenessRefresh,
+    installDesktopSync,
     projectRelocations,
     refreshProjectRegistry,
     setProjectDirectory,
@@ -462,6 +463,13 @@
     // so its inherited history has to be read back afterwards. No-op for every
     // non-fork agent.
     installForkHistoryRefresh();
+    // What other clients (an orchestrator over MCP) do: the backend asks the
+    // window to get a project ready before their turns start, and tells it
+    // about agents and projects they change.
+    const desktopSync = installDesktopSync().catch((err: unknown) => {
+      console.warn("[switchboard] could not listen for other clients' changes", err);
+      return () => {};
+    });
     // The startup probe races the backend's PATH capture, so its answer can be
     // provisional; the store awaits its own completion-listener registration
     // before issuing any probe, and arms its own backstop for a lost event.
@@ -509,6 +517,7 @@
       document.removeEventListener("visibilitychange", refreshWhenVisible);
       uninstallStalenessRefresh();
       removeDevSeed();
+      void desktopSync.then((uninstall) => uninstall());
     };
   });
 

@@ -24,9 +24,10 @@ use crate::state::{TestSeam, lock};
 
 use super::budget::fit;
 use super::change::{
-    SelectionChange, create_agent, create_project, dismiss_workflow_run, rename_agent,
-    set_agent_selection,
+    SelectionChange, SelectionChanges, create_agent, create_project, dismiss_workflow_run,
+    rename_agent, set_agent_selection,
 };
+use super::desktop_sync::SyncAck;
 use super::error_code::{self, error_code};
 use super::ledger::SendStatus;
 use super::read::conversation_budget;
@@ -3061,4 +3062,266 @@ async fn a_cancelled_or_failed_turn_carries_its_outcome_however_the_conversation
         }
         other => panic!("a send with no reply keeps its own marker: {other:?}"),
     }
+}
+
+// --- The window round trip, through the production `WindowSync` ---
+
+fn ready(unsubscribed_agents: Vec<AgentId>) -> SyncAck {
+    SyncAck::Ready {
+        unsubscribed_agents,
+    }
+}
+
+#[tokio::test]
+async fn a_window_that_answers_after_the_deadline_times_out_and_nothing_is_dispatched() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let (env, sync, _window, mut requests) = env.with_window(Duration::from_millis(100));
+    let pending = tokio::spawn(send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents, "hi"),
+    ));
+    let request = requests.recv().await.unwrap();
+    assert_eq!(request.project_id, project_id);
+    let err = pending.await.unwrap().unwrap_err();
+    assert_eq!(error_code(&err), error_code::PROJECT_LOAD_TIMEOUT);
+    assert_eq!(sync.pending_requests(), 0);
+    assert!(
+        !sync.acknowledge(request.request_id, ready(Vec::new())),
+        "the late answer is ignored"
+    );
+    assert!(lock(&env.adapter.prompts).is_empty());
+}
+
+#[tokio::test]
+async fn a_send_cancelled_during_the_round_trip_leaves_nothing_pending() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let (env, sync, _window, mut requests) = env.with_window(Duration::from_mins(1));
+    let mut request = text_send(project_id, agents, "hi");
+    request.idempotency_key = Some("k".to_owned());
+    let pending = tokio::spawn(send_now(env.handle(), env.home(), request));
+    let sync_request = requests.recv().await.unwrap();
+    assert_eq!(sync.pending_requests(), 1);
+    let send_id = env.state.ledger.send_id_for_key(project_id, "k").unwrap();
+    cancel_send(&env.state, project_id, send_id).unwrap();
+    let receipt = pending.await.unwrap().unwrap();
+    assert_eq!(receipt.recipients[0].status, SendStatus::Cancelled);
+    assert_eq!(sync.pending_requests(), 0, "the request went with the send");
+    assert!(
+        !sync.acknowledge(sync_request.request_id, ready(Vec::new())),
+        "the window's late answer is ignored"
+    );
+    assert!(lock(&env.adapter.prompts).is_empty());
+}
+
+#[tokio::test]
+async fn a_window_that_cannot_load_the_project_refuses_the_send() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let (env, sync, _window, mut requests) = env.with_window(Duration::from_mins(1));
+    let pending = tokio::spawn(send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents, "hi"),
+    ));
+    let request = requests.recv().await.unwrap();
+    assert!(sync.acknowledge(
+        request.request_id,
+        SyncAck::Failed {
+            message: "roster read failed".to_owned(),
+        },
+    ));
+    let err = pending.await.unwrap().unwrap_err();
+    assert_eq!(error_code(&err), error_code::DESKTOP_UNAVAILABLE);
+    assert!(err.to_string().contains("roster read failed"));
+    assert!(lock(&env.adapter.prompts).is_empty());
+}
+
+#[tokio::test]
+async fn a_recipient_the_window_reports_unsubscribed_is_rejected_and_the_others_are_sent() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b"]);
+    let (env, sync, _window, mut requests) = env.with_window(Duration::from_mins(1));
+    let pending = tokio::spawn(send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "hi"),
+    ));
+    let request = requests.recv().await.unwrap();
+    assert!(sync.acknowledge(request.request_id, ready(vec![agents[0]])));
+    let receipt = pending.await.unwrap().unwrap();
+    assert_eq!(receipt.recipients[0].status, SendStatus::Rejected);
+    assert_eq!(
+        receipt.recipients[0].code,
+        Some(error_code::DESKTOP_UNAVAILABLE)
+    );
+    assert_eq!(receipt.recipients[1].status, SendStatus::Accepted);
+    wait_done(&env, project_id, receipt.send_id).await;
+    assert_eq!(*lock(&env.adapter.prompts), vec!["hi".to_owned()]);
+}
+
+#[tokio::test]
+async fn changes_that_start_no_turn_notify_the_window_without_waiting() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let (env, sync, window, _requests) = env.with_window(Duration::from_mins(1));
+    create_agent(
+        &env.state,
+        project_id,
+        "b",
+        switchboard_core::HarnessKind::ClaudeCode,
+        None,
+        None,
+    )
+    .unwrap();
+    rename_agent(&env.state, project_id, agents[0], "renamed").unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
+    create_project(&env.state, "other", dir.path().to_str().unwrap()).unwrap();
+    let names = window.names();
+    assert_eq!(
+        names,
+        vec![
+            "desktop_roster_changed",
+            "desktop_roster_changed",
+            "projects_changed"
+        ]
+    );
+    assert_eq!(
+        lock(&window.events)[0].1["project_id"],
+        project_id.to_string()
+    );
+    assert_eq!(sync.pending_requests(), 0);
+}
+
+/// Every event on the agent's channel, by type, with its message id when it
+/// carries one.
+fn channel_events(env: &TestEnv, agent_id: AgentId) -> Vec<(String, Option<String>)> {
+    let channel = format!("agent:{agent_id}");
+    env.emitter
+        .snapshot()
+        .into_iter()
+        .filter(|(name, _)| *name == channel)
+        .map(|(_, v)| {
+            (
+                v["type"].as_str().unwrap_or_default().to_owned(),
+                v["message_id"].as_str().map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+fn position_of(events: &[(String, Option<String>)], kind: &str, message_id: &str) -> usize {
+    events
+        .iter()
+        .position(|(k, m)| k == kind && m.as_deref() == Some(message_id))
+        .unwrap_or_else(|| panic!("no {kind} for {message_id}: {events:?}"))
+}
+
+#[tokio::test]
+async fn a_send_is_announced_as_accepted_before_its_turn_starts_on_an_idle_agent() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "hi"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+    let message_id = receipt.recipients[0].message_id.unwrap().to_string();
+    let events = channel_events(&env, agents[0]);
+    assert!(
+        position_of(&events, "send_accepted", &message_id)
+            < position_of(&events, "turn_start", &message_id)
+    );
+}
+
+#[tokio::test]
+async fn a_send_queued_behind_a_running_turn_is_announced_while_it_waits() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("first", &gate));
+    let first = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "first"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    let mut queued = text_send(project_id, agents.clone(), "second");
+    queued.on_busy = OnBusyPolicy::Queue;
+    let second = send_now(env.handle(), env.home(), queued).await.unwrap();
+    let message_id = second.recipients[0].message_id.unwrap().to_string();
+    let events = channel_events(&env, agents[0]);
+    position_of(&events, "send_accepted", &message_id);
+    assert_eq!(
+        events.iter().filter(|(k, _)| k == "turn_start").count(),
+        1,
+        "announced while the first turn still runs"
+    );
+    gate.notify_one();
+    wait_done(&env, project_id, first.send_id).await;
+    wait_done(&env, project_id, second.send_id).await;
+    let events = channel_events(&env, agents[0]);
+    assert!(
+        position_of(&events, "send_accepted", &message_id)
+            < position_of(&events, "turn_start", &message_id)
+    );
+}
+
+#[tokio::test]
+async fn a_window_model_change_and_an_ops_effort_change_made_together_both_survive() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let agent_id = agents[0];
+    // Load the project, as the window would have before its editor saves.
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let barrier = env.seam(TestSeam::SelectionUpdate);
+    let state = Arc::clone(&env.state);
+    let window = tokio::task::spawn_blocking(move || {
+        crate::commands::change_agent_selection_impl(
+            &state,
+            agent_id,
+            &SelectionChanges {
+                model: SelectionChange::set("opus"),
+                ..SelectionChanges::default()
+            },
+        )
+    });
+    barrier.entered.notified().await;
+    let state = Arc::clone(&env.state);
+    let orchestrator = tokio::task::spawn_blocking(move || {
+        set_agent_selection(
+            &state,
+            project_id,
+            agent_id,
+            &SelectionChange::unchanged(),
+            &SelectionChange::set("high"),
+        )
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !orchestrator.is_finished(),
+        "the orchestrator's write waits for the window's"
+    );
+    env.clear_seam(TestSeam::SelectionUpdate);
+    barrier.release.notify_one();
+    window.await.unwrap().unwrap();
+    let record = orchestrator.await.unwrap().unwrap();
+    assert_eq!(record.model.as_deref(), Some("opus"));
+    assert_eq!(record.effort.as_deref(), Some("high"));
+}
+
+/// Compiles only while the waits' futures are `Send`, which a request handler
+/// or a spawned task needs; running them is incidental.
+#[tokio::test]
+async fn the_waits_can_run_as_tasks() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let state = Arc::clone(&env.state);
+    let home = env.home();
+    tokio::spawn(async move {
+        let budget = short();
+        let _ = wait_send(&state, project_id, Uuid::now_v7(), &budget, &home).await;
+        let _ = wait_agent(&state, project_id, agents[0], &budget, &home).await;
+        let _ = wait_workflow(&state, project_id, Uuid::now_v7(), &budget).await;
+    })
+    .await
+    .unwrap();
 }

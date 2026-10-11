@@ -32,7 +32,9 @@ import type {
   ActivationFailure,
   AgentRecord,
   AgentSelection,
+  AgentSelectionChanges,
   AgentSessionFingerprint,
+  DesktopSyncAck,
   ConversationItem,
   HarnessKind,
   LoadedTurn,
@@ -74,6 +76,7 @@ import {
 } from "./sendCompletion";
 import { clearReadingMode, forgetReadingMode, isReadingMode } from "./readingMode.svelte";
 import {
+  refreshRuns,
   subscribeProjectWorkflows,
   unsubscribeProjectWorkflows,
   workflowRuns,
@@ -668,11 +671,14 @@ export async function renameAgent(agentId: AgentId, newName: string): Promise<vo
   replaceAgentRecord(agentId, updated);
 }
 
+/// Save the parts of an agent's selection the user changed. Only those parts
+/// are sent, so a model or effort change another client made a moment
+/// earlier survives the user's change to the other setting.
 export async function setAgentSelection(
   agentId: AgentId,
-  agentSelection: AgentSelection,
+  changes: AgentSelectionChanges,
 ): Promise<void> {
-  const updated = await api.setAgentSelection(agentId, agentSelection);
+  const updated = await api.setAgentSelection(agentId, changes);
   replaceAgentRecord(agentId, updated);
 }
 
@@ -983,7 +989,11 @@ function ensureProjectLoaded(projectId: ProjectId): Promise<void> {
     // Subscribe to the project's workflow progress channel (not active-gated, so
     // a run in a background project keeps updating). Idempotent; seeds run state.
     void subscribeProjectWorkflows(projectId);
-    void hydrateProject(projectId);
+    // On the load chain like every later read, so the chain holds every read
+    // that is running or queued — which is what lets the sync for another
+    // client's turn wait for the first load (`syncProjectForTurn`). Awaiting a
+    // second `hydrateProject` would not: it returns "skipped" at once.
+    void chainProjectLoad(projectId, () => hydrateProject(projectId));
   })();
   loadStarted.set(projectId, load);
   // Allow a retry if the load (open/lock/roster) failed — a transient failure
@@ -1259,9 +1269,127 @@ export async function retryProjectHydration(projectId: ProjectId): Promise<void>
 
 /// Append a freshly created/attached agent to its owning project's roster so
 /// an async completion cannot place it in whichever project is active later.
+/// An agent already there is replaced in place: a roster refresh for another
+/// client's change can land between the window's own create and this call.
 export function addAgentToProjectRoster(agent: AgentRecord): void {
   const existing = agentsByProject[agent.project_id] ?? [];
-  agentsByProject[agent.project_id] = [...existing, agent];
+  agentsByProject[agent.project_id] = existing.some((a) => a.id === agent.id)
+    ? existing.map((a) => (a.id === agent.id ? agent : a))
+    : [...existing, agent];
+}
+
+/// Re-read a loaded project's roster and fold in what another client changed:
+/// a new agent is registered and added (its card and compose chip appear), a
+/// renamed or reconfigured one is replaced in place. Registration comes first,
+/// as on every create path, so the agent is never on screen without its
+/// event subscription.
+async function refreshProjectRoster(projectId: ProjectId): Promise<void> {
+  const fetched = await api.listAgents(projectId);
+  for (const agent of fetched) {
+    const known = (agentsByProject[projectId] ?? []).find((a) => a.id === agent.id);
+    if (known === undefined) {
+      await registerAgent(agent);
+      addAgentToProjectRoster(agent);
+    } else if (JSON.stringify(known) !== JSON.stringify(agent)) {
+      replaceAgentRecord(agent.id, agent);
+    }
+  }
+}
+
+/// Resolve once no read of the project is running or queued, including reads
+/// queued while waiting.
+async function settleProjectLoads(projectId: ProjectId): Promise<void> {
+  for (
+    let tail = projectLoadChain.get(projectId);
+    tail !== undefined;
+    tail = projectLoadChain.get(projectId)
+  ) {
+    await tail.catch(() => undefined);
+  }
+}
+
+/// Get a project ready for a turn another client (an orchestrator over MCP)
+/// is about to start in it, and report the agents the window cannot hear.
+/// Never changes the selection: the user keeps looking at what they were.
+///
+/// Ready means nothing is in flight that the turn would race: the project is
+/// open with its roster current, every agent's subscription has settled, the
+/// workflow channel is live, and no history read is running or queued. The
+/// first history load assumes no turn is running while it reads, and Tauri
+/// does not replay events, so the turn has to wait for all of it. A history
+/// load that failed still counts as settled — nothing is in flight, so the
+/// turn is safe — and the window shows that error as it would anyway. An
+/// open or roster read that fails is reported, and the backend sends nothing.
+export async function syncProjectForTurn(projectId: ProjectId): Promise<DesktopSyncAck> {
+  try {
+    await ensureProjectLoaded(projectId);
+    await refreshProjectRoster(projectId);
+  } catch (err) {
+    return { status: "failed", message: err instanceof Error ? err.message : String(err) };
+  }
+  // Idempotent: settles any registration in flight and retries one that
+  // failed, which gives an unreachable agent another chance on every sync.
+  await Promise.all((agentsByProject[projectId] ?? []).map((agent) => registerAgent(agent)));
+  try {
+    await subscribeProjectWorkflows(projectId);
+  } catch (err) {
+    // A send does not depend on the workflow channel; a run started without
+    // it still runs, and its state is read again when the project reloads.
+    console.warn("[switchboard] workflow subscription failed during sync", {
+      project_id: projectId,
+      error: err,
+    });
+  }
+  await settleProjectLoads(projectId);
+  return {
+    status: "ready",
+    unsubscribed_agents: (agentsByProject[projectId] ?? [])
+      .filter((agent) => runtimes[agent.id]?.listener_error != null)
+      .map((agent) => agent.id),
+  };
+}
+
+/// Another client changed a project's roster. A loaded project re-reads it so
+/// the change shows without a reload; a project not loaded reads it when it
+/// loads.
+function onRosterChanged(projectId: ProjectId): void {
+  const load = loadStarted.get(projectId);
+  if (load === undefined) return;
+  void load
+    .then(() => refreshProjectRoster(projectId))
+    .catch((err: unknown) => {
+      console.warn("[switchboard] roster refresh failed", { project_id: projectId, error: err });
+    });
+}
+
+/// Another client dismissed one of a loaded project's workflow runs, so the
+/// window stops showing it as blocking.
+function onRunsChanged(projectId: ProjectId): void {
+  if (loadStarted.has(projectId)) void refreshRuns(projectId);
+}
+
+/// Listen for what the backend tells the window about other clients: the
+/// request to get a project ready for a turn, and the changes that start no
+/// turn. Called once at app start; resolves to the uninstall.
+export async function installDesktopSync(): Promise<() => void> {
+  const unlisteners = await Promise.all([
+    api.listenDesktopSyncProject((request) => {
+      void syncProjectForTurn(request.project_id)
+        .then((result) => api.desktopProjectSynced(request.request_id, result))
+        .catch((err: unknown) => {
+          console.warn("[switchboard] project sync acknowledgement failed", {
+            project_id: request.project_id,
+            error: err,
+          });
+        });
+    }),
+    api.listenDesktopRosterChanged(onRosterChanged),
+    api.listenProjectsChanged(() => void refreshProjectRegistry()),
+    api.listenDesktopRunsChanged(onRunsChanged),
+  ]);
+  return () => {
+    for (const unlisten of unlisteners) unlisten();
+  };
 }
 
 /// Branch `sourceId`'s conversation into a new agent and make it the live one.

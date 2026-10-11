@@ -10,6 +10,8 @@ import type {
   AgentId,
   AgentRecord,
   AgentSelection,
+  AgentSelectionChanges,
+  DesktopSyncAck,
   ForwardSourceRef,
   Attachment,
   BranchComparison,
@@ -123,6 +125,48 @@ export async function awaitHarnessPath(): Promise<PathSource> {
 /// results taken before then are provisional, so listeners re-probe on receipt.
 export async function listenHarnessPathResolved(handler: () => void): Promise<UnlistenFn> {
   return await listen("harness_path_resolved", () => handler());
+}
+
+/// The backend asks the window to load or refresh a project before a turn
+/// another client starts there; the window answers with
+/// [`desktopProjectSynced`].
+export async function listenDesktopSyncProject(
+  handler: (request: { request_id: string; project_id: ProjectId }) => void,
+): Promise<UnlistenFn> {
+  return await listen<{ request_id: string; project_id: ProjectId }>(
+    "desktop_sync_project",
+    (event) => handler(event.payload),
+  );
+}
+
+export async function desktopProjectSynced(
+  requestId: string,
+  result: DesktopSyncAck,
+): Promise<void> {
+  await invoke("desktop_project_synced", { requestId, result });
+}
+
+/// Another client created, renamed, or reconfigured an agent in the project.
+export async function listenDesktopRosterChanged(
+  handler: (projectId: ProjectId) => void,
+): Promise<UnlistenFn> {
+  return await listen<{ project_id: ProjectId }>("desktop_roster_changed", (event) =>
+    handler(event.payload.project_id),
+  );
+}
+
+/// Another client created or renamed a project.
+export async function listenProjectsChanged(handler: () => void): Promise<UnlistenFn> {
+  return await listen("projects_changed", () => handler());
+}
+
+/// Another client dismissed one of the project's workflow runs.
+export async function listenDesktopRunsChanged(
+  handler: (projectId: ProjectId) => void,
+): Promise<UnlistenFn> {
+  return await listen<{ project_id: ProjectId }>("desktop_runs_changed", (event) =>
+    handler(event.payload.project_id),
+  );
 }
 
 export async function pickDirectory(path: string): Promise<DirectoryInfo> {
@@ -470,11 +514,13 @@ export async function renameAgent(agentId: AgentId, newName: string): Promise<Ag
   return await invoke<AgentRecord>("rename_agent", { agentId, newName });
 }
 
+/// Save the parts of an agent's selection the user changed; absent parts are
+/// left as the backend has them.
 export async function setAgentSelection(
   agentId: AgentId,
-  selection: AgentSelection,
+  changes: AgentSelectionChanges,
 ): Promise<AgentRecord> {
-  return await invoke<AgentRecord>("set_agent_selection", { agentId, selection });
+  return await invoke<AgentRecord>("set_agent_selection", { agentId, changes });
 }
 
 export async function attachAgent(

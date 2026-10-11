@@ -608,6 +608,20 @@ pub enum NormalizedEvent {
         text: String,
         at: DateTime<Utc>,
     },
+    /// A send another client made was **accepted** into this agent's queue:
+    /// emitted as the actor admits it, so it precedes the send's `TurnStart`
+    /// whether the agent was idle or busy. The window has no optimistic row
+    /// for a send it did not make, and without this a send queued behind a
+    /// running turn would be invisible until it started, with nothing to
+    /// cancel it from. The window turns it into the same pending entry and
+    /// queued row it creates for its own sends. Only sends that ask for it
+    /// carry it; the window's own sends and workflow sends do not.
+    SendAccepted {
+        message_id: MessageId,
+        send_id: SendId,
+        text: String,
+        at: DateTime<Utc>,
+    },
     ContentChunk {
         turn_id: TurnId,
         kind: ContentKind,

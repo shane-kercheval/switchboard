@@ -2,7 +2,7 @@
 
 **Captured:** 2026-10-10
 **Versions:** Claude Code 2.1.289 (CLI, interactive and `-p`); Codex CLI 0.161.0 (model GPT-6-Astra, medium effort); Claude Desktop 2.31226.1 (Chat, and Code in Local mode) through `mcp-remote` 0.14.3; probe server on `rmcp` 1.7.0.
-**Decision:** Every `wait_*` call defaults to 50 seconds, and a call that carries no progress token is capped there. A call with a progress token may ask for up to an hour, with progress every 60 seconds. Results stay under 25,000 serialized characters. No client needs MCP tasks. Claude Desktop uses `mcp-remote`. Codex is configured per folder, in a trusted orchestration folder. Details and the measurements behind each are in "Decisions this note settles".
+**Decision:** Every `wait_*` call defaults to 50 seconds, and a call that carries no progress token is capped there. A call with a progress token may ask for up to an hour, with progress every 60 seconds. Results stay under 25,000 serialized characters (superseded: the MCP plan's revision 10 sets 100,000 for every client). No client needs MCP tasks. Claude Desktop uses `mcp-remote`. Codex is configured per folder, in a trusted orchestration folder. Details and the measurements behind each are in "Decisions this note settles".
 **Consumed by:** [implementation_plans/2026-10-09-mcp.md](../implementation_plans/2026-10-09-mcp.md) (M0; the numbers M1, M3, and M4 use)
 
 ## Question
@@ -163,7 +163,9 @@ Each with the measurement that settles it.
   own, so losing a session loses nothing. What the default does constrain is a silent call
   over 300 seconds, which the two rules above rule out. M3 should test that a wait with a
   progress token survives past 300 seconds.
-- **Result budget: 25,000 serialized characters.** Codex keeps only about 10,000 tokens of a
+- **Result budget: 25,000 serialized characters** (superseded by the MCP plan's revision 10:
+  100,000 for every client, with each client's own limit applying on top). Codex keeps only
+  about 10,000 tokens of a
   result, cutting the middle (E6), and this numbered text ran 4.0 characters per token; JSON
   with escapes and code runs denser, so 25,000 characters stays under 10,000 tokens at 2.5
   characters per token. Claude Code's file cut at 50,000 characters is looser. The cost is

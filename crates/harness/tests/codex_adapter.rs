@@ -419,6 +419,64 @@ async fn truncated_stream_synthesizes_adapter_failure_with_buffered_error() {
 }
 
 #[tokio::test]
+async fn a_fork_whose_parent_file_is_gone_fails_its_turn_with_codexs_error() {
+    // What the missing-parent probe saw when it resumed a fork whose parent
+    // rollout had been deleted (harness-behavior §3.5): exit 1, no stdout
+    // events at all, and this one stderr line, verbatim. This proves the
+    // adapter turns that shape into the failed turn Switchboard shows; the
+    // probe itself ran Codex directly, not through Switchboard.
+    const CODEX_ERROR: &str = "Error: thread/resume: thread/resume failed: invalid paginated history lineage for 01a12d13-1b40-7232-8895-631605068ea7: missing source rollout (code -32600)";
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fixture_path = tmp.path().join("missing-parent.jsonl");
+    std::fs::write(
+        &fixture_path,
+        format!("// stderr:{CODEX_ERROR}\n// exit:1\n"),
+    )
+    .unwrap();
+    let agent = codex_agent_resuming(
+        "01a12d13-2870-7f61-93dc-f2b7256018a6",
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 11).unwrap(),
+    );
+    let home = tempfile::TempDir::new().unwrap();
+
+    let events: Vec<AdapterEvent> = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path())
+        .dispatch(
+            &agent,
+            tmp.path(),
+            fixture_path.to_str().unwrap(),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed")
+        .collect()
+        .await;
+
+    let terminals: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(terminals.len(), 1, "exactly one terminal event: {events:?}");
+    match terminals[0] {
+        AdapterEvent::TurnEnd {
+            outcome:
+                TurnOutcome::Failed {
+                    kind: FailureKind::AdapterFailure,
+                    message,
+                },
+            ..
+        } => {
+            assert!(
+                message.starts_with("harness exited without terminal stream event; stderr: "),
+                "got {message}"
+            );
+            assert!(message.contains(CODEX_ERROR), "got {message}");
+        }
+        other => panic!("expected TurnEnd(AdapterFailure), got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn corrupt_thread_started_emits_adapter_failure() {
     // thread.started without a thread_id field — the locator can't be
     // captured, so the adapter must fail-loud rather than silently produce

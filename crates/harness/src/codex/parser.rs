@@ -81,8 +81,15 @@ pub fn parse_line(line: &str, turn_id: TurnId, state: &mut CodexParserState) -> 
     }
 }
 
+/// The session id a `thread.started` event carries, or `None` when the field
+/// is missing or not a string. Shared with the promptless fork
+/// ([`super::fork`]), whose only output is this event.
+pub(crate) fn thread_started_id(event: &Value) -> Option<&str> {
+    event.get("thread_id").and_then(Value::as_str)
+}
+
 fn parse_thread_started(obj: &Value, state: &mut CodexParserState) -> ParseOutcome {
-    if let Some(id) = obj.get("thread_id").and_then(Value::as_str) {
+    if let Some(id) = thread_started_id(obj) {
         state.pending_thread_id = Some(id.to_owned());
     } else {
         tracing::warn!(

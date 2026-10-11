@@ -12,9 +12,10 @@ use futures::StreamExt;
 use serde_json::json;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
-    AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
-    ContextWindowSource, DispatchOptions, EditChange, FailureKind, HarnessAdapter, RateLimitSource,
-    ToolFacet, Turn, TurnItem, TurnOutcome, UserPromptSource, claude_session_file_path,
+    AdapterEvent, AntigravityAdapter, CODEX_FORK_TIMEOUT, ClaudeCodeAdapter, CodexAdapter,
+    ContentKind, ContextWindowSource, DispatchOptions, EditChange, FailureKind, HarnessAdapter,
+    RateLimitSource, ToolFacet, Turn, TurnItem, TurnOutcome, UserPromptSource,
+    claude_session_file_path, find_codex_session_file_for_attach, fork_codex_session,
     load_antigravity_transcript, load_claude_transcript, load_codex_transcript,
 };
 use uuid::Uuid;
@@ -2621,6 +2622,112 @@ async fn live_codex_resume_reuses_session() {
     assert!(
         codex_capture(&events2).is_none(),
         "a resume must not re-capture the locator"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_fork_without_a_prompt_creates_an_idle_session_that_inherits_context() {
+    // The promptless fork Switchboard uses to fork a Codex agent without
+    // locking its parent for a whole turn: create the fork with no turn, then
+    // send it an ordinary resume. The recall proves the fork carries the
+    // parent's conversation; the absence of `task_started` proves creation ran
+    // no turn. Pinned to the cheapest model at low effort, which also lets the
+    // test check that the selection reaches the fork.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+    let adapter = CodexAdapter::new();
+    let mut agent = live_codex_agent();
+    agent.model = Some("gpt-6-luna".to_owned());
+    agent.effort = Some("low".to_owned());
+
+    let parent_events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Remember the code word 'KESTREL-58'. Reply with only 'ok'.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("parent dispatch should succeed")
+        .collect()
+        .await;
+    let (parent_thread_id, _) =
+        codex_capture(&parent_events).expect("the parent's first dispatch captures a locator");
+
+    let fork = fork_codex_session(
+        Path::new("codex"),
+        &home,
+        tmp.path(),
+        &parent_thread_id,
+        &agent.selection(),
+        CODEX_FORK_TIMEOUT,
+    )
+    .await
+    .expect("a promptless fork should succeed");
+    assert_ne!(fork.thread_id, parent_thread_id);
+
+    let rollout = find_codex_session_file_for_attach(&home, &fork.thread_id)
+        .expect("the fork's rollout exists")
+        .0;
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&rollout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        !records
+            .iter()
+            .any(|r| r["payload"]["type"] == "task_started"),
+        "creating a fork must run no turn; records: {records:?}"
+    );
+    let meta = &records[0]["payload"];
+    assert_eq!(
+        meta["history_base"]["thread_id"], parent_thread_id,
+        "the fork must point into its parent's rollout"
+    );
+    let recorded_cwd = std::path::PathBuf::from(meta["cwd"].as_str().expect("session_meta.cwd"));
+    assert_eq!(
+        std::fs::canonicalize(recorded_cwd).unwrap(),
+        std::fs::canonicalize(tmp.path()).unwrap(),
+        "the fork must belong to the folder it was created in"
+    );
+    let settings = records
+        .iter()
+        .find(|r| r["payload"]["type"] == "thread_settings_applied")
+        .map(|r| &r["payload"]["thread_settings"])
+        .expect("the fork records its settings");
+    assert_eq!(settings["model"], "gpt-6-luna");
+    assert_eq!(settings["reasoning_effort"], "low");
+
+    let fork_agent = AgentRecord {
+        id: Uuid::now_v7(),
+        session_locator: Some(fork.into()),
+        ..agent.clone()
+    };
+    let fork_events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &fork_agent,
+            tmp.path(),
+            "What code word did I ask you to remember? Reply with only that word.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("the fork's first turn should dispatch")
+        .collect()
+        .await;
+    let reply: String = fork_events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        reply.to_uppercase().contains("KESTREL-58"),
+        "the fork's first turn must see the parent's conversation; reply was {reply:?}"
     );
 }
 

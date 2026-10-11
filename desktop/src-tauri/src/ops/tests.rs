@@ -14,7 +14,10 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::commands::{ConversationItem, ForwardSourceRef, send_message_impl};
+use crate::commands::{
+    ForwardSourceRef, list_project_agents_readonly_impl, load_project_conversation_impl,
+    send_message_impl,
+};
 use crate::error::AppError;
 use crate::state::{TestSeam, lock};
 
@@ -27,12 +30,12 @@ use super::error_code::{self, error_code};
 use super::ledger::SendStatus;
 use super::read::conversation_budget;
 use super::read::{
-    AgentOutputStatus, OutputSource, ProjectStatus, list_agents, list_projects, read_agent_output,
-    read_conversation, read_send_output,
+    AgentOutputStatus, DigestItem, OutputSource, ProjectStatus, list_agents, list_projects,
+    read_agent_output, read_conversation, read_send_output,
 };
 use super::send::{
     AgentWaitStatus, Body, ForwardPrompt, ForwardRequest, OnBusyPolicy, SendRequest, WaitSource,
-    cancel_send, forward, send, wait_agent, wait_send, wait_send_budget,
+    cancel_send, forward, refuse_if_busy, send, wait_agent, wait_send, wait_send_budget,
 };
 use super::test_support::*;
 use super::wait::WaitBudget;
@@ -265,7 +268,7 @@ async fn fan_out_of_three_shares_one_send_id_and_groups_once() {
         .items
         .iter()
         .filter_map(|i| match i {
-            ConversationItem::UserMessage { agent_ids, .. } => Some(agent_ids.len()),
+            DigestItem::UserMessage { agent_ids, .. } => Some(agent_ids.len()),
             _ => None,
         })
         .collect();
@@ -306,8 +309,10 @@ async fn refuse_with_a_busy_recipient_up_front_dispatches_nothing() {
     let err = send_now(env.handle(), env.home(), request.clone())
         .await
         .expect_err("a busy recipient refuses the whole send");
-    assert_eq!(error_code(&err), error_code::AGENT_BUSY);
-    assert!(err.to_string().contains("busy: a"), "{err}");
+    assert!(
+        matches!(err.root(), AppError::RecipientsBusy { names } if names == &["a".to_owned()]),
+        "{err:?}"
+    );
     assert_eq!(lock(&env.adapter.prompts).len(), 1, "b was not dispatched");
 
     gate.notify_waiters();
@@ -667,10 +672,9 @@ async fn forward_with_a_mid_turn_source_past_the_budget_is_source_busy() {
     )
     .await
     .unwrap_err();
-    assert_eq!(error_code(&err), error_code::SOURCE_BUSY);
     assert!(
-        err.to_string().starts_with("src is still responding"),
-        "{err}"
+        matches!(err.root(), AppError::SourceBusy { name } if name == "src"),
+        "{err:?}"
     );
     assert_eq!(lock(&env.adapter.prompts).len(), 1, "nothing dispatched");
 
@@ -1420,7 +1424,14 @@ fn the_error_code_mapping_covers_the_cases_a_caller_acts_on() {
     );
     assert_eq!(error_code(&AppError::NoActiveProject), error_code::INTERNAL);
     assert_eq!(
-        error_code(&AppError::Joined(Arc::new(AppError::SourceBusy {
+        error_code(&AppError::TimedOut {
+            what: "rendering the saved prompt"
+        }),
+        error_code::INTERNAL,
+        "a slow provider is not the caller's bad argument"
+    );
+    assert_eq!(
+        error_code(&AppError::Shared(Arc::new(AppError::SourceBusy {
             name: "x".to_owned()
         }))),
         error_code::SOURCE_BUSY
@@ -1528,7 +1539,7 @@ async fn create_send_forward_and_read_leave_the_expected_files() {
         .items
         .iter()
         .filter_map(|i| match i {
-            ConversationItem::UserMessage {
+            DigestItem::UserMessage {
                 send_id: Some(s),
                 agent_ids,
                 ..
@@ -1784,9 +1795,13 @@ async fn the_task_guard_settles_or_releases_without_the_caller() {
     let Claim::Fresh { send_id } = env.state.ledger.claim(project_id, Some("g1"), "h") else {
         panic!("fresh");
     };
-    env.state
-        .ledger
-        .register_send(send_id, project_id, &agents, Some("g1"));
+    env.state.ledger.register_send(
+        send_id,
+        project_id,
+        &agents,
+        Some("g1"),
+        tokio_util::sync::CancellationToken::new(),
+    );
     super::send::settle_abnormally(&env.state, send_id);
     assert!(env.state.ledger.send(send_id).is_none());
     assert!(matches!(
@@ -1797,15 +1812,19 @@ async fn the_task_guard_settles_or_releases_without_the_caller() {
     let Claim::Fresh { send_id } = env.state.ledger.claim(project_id, Some("g2"), "h") else {
         panic!("fresh");
     };
-    env.state
-        .ledger
-        .register_send(send_id, project_id, &agents, Some("g2"));
+    env.state.ledger.register_send(
+        send_id,
+        project_id,
+        &agents,
+        Some("g2"),
+        tokio_util::sync::CancellationToken::new(),
+    );
     env.state.ledger.mark_accepted(send_id, agents[0]).unwrap();
     super::send::settle_abnormally(&env.state, send_id);
     assert!(env.state.ledger.send(send_id).is_some_and(|s| s.settled));
     assert!(matches!(
         env.state.ledger.claim(project_id, Some("g2"), "h"),
-        Claim::Joined(_)
+        Claim::Joined { .. }
     ));
 }
 
@@ -2006,10 +2025,662 @@ async fn a_long_conversation_fits_the_budget_with_its_newest_items_intact() {
     let items = fitted.result["items"].as_array().unwrap();
     let newest = items.last().unwrap();
     assert_eq!(newest["kind"], "agent_turn");
-    let text = newest["items"][0]["text"].as_str().unwrap();
+    let text = newest["text"].as_str().unwrap();
     assert!(
         text.starts_with("11-"),
         "the newest reply is kept whole: {text:.10}"
     );
     assert!(text.len() > 4_000);
+}
+
+// --- review round three: written before the fixes, each must fail first --------
+
+#[tokio::test]
+async fn a_send_whose_only_recipient_is_unheard_reports_desktop_unavailable() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    *lock(&env.sync.unsubscribed) = vec![agents[0]];
+    let err = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents, "hi"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error_code(&err), error_code::DESKTOP_UNAVAILABLE, "{err}");
+}
+
+#[tokio::test]
+async fn a_busy_refusal_after_the_check_names_the_agent() {
+    let (env, project_id, agents) = project_with_agents(&["alpha"]);
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("busy", &gate));
+    let barrier = env.seam(TestSeam::OpsDispatch);
+    let caller = tokio::spawn(send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "hi"),
+    ));
+    barrier.entered.notified().await;
+    send_message_impl(
+        &env.state,
+        agents[0],
+        "compose",
+        Vec::new(),
+        Uuid::now_v7(),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    env.clear_seam(TestSeam::OpsDispatch);
+    barrier.release.notify_one();
+    let err = caller.await.unwrap().unwrap_err();
+    assert_eq!(error_code(&err), error_code::AGENT_BUSY);
+    assert!(err.to_string().contains("alpha"), "names, not ids: {err}");
+    gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn cancelling_a_send_between_its_check_and_its_admission_stops_it() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    // The admitted turn stays running until cancelled, so the cancel that
+    // reaches it is the one under test, not a race with its completion.
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("would run", &gate));
+    let barrier = env.seam(TestSeam::OpsDispatch);
+    let mut request = text_send(project_id, agents.clone(), "hi");
+    request.idempotency_key = Some("cancel-gap".to_owned());
+    let caller = tokio::spawn(send_now(env.handle(), env.home(), request.clone()));
+    // Parked after the cancel check and before the dispatcher admits it.
+    barrier.entered.notified().await;
+    let send_id = env
+        .state
+        .ledger
+        .send_id_for_key(project_id, "cancel-gap")
+        .expect("the send is registered");
+    cancel_send(&env.state, project_id, send_id).unwrap();
+    env.clear_seam(TestSeam::OpsDispatch);
+    barrier.release.notify_one();
+    let receipt = caller
+        .await
+        .unwrap()
+        .expect("a cancelled send settles with a receipt");
+    let reply = wait_done(&env, project_id, receipt.send_id).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Cancelled);
+    let again = send_now(env.handle(), env.home(), request).await.unwrap();
+    assert_eq!(
+        again.send_id, send_id,
+        "a retry returns the cancelled receipt"
+    );
+    assert!(
+        lock(&env.adapter.prompts).len() <= 1,
+        "at most the admitted turn started, and it was cancelled"
+    );
+    gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn cancelling_a_forward_while_it_waits_on_a_source_dispatches_nothing() {
+    let (env, project_id, agents) = project_with_agents(&["src", "r"]);
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("slow source", &gate));
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    send_message_impl(
+        &env.state,
+        agents[0],
+        "go",
+        Vec::new(),
+        Uuid::now_v7(),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    let request = ForwardRequest {
+        project_id,
+        sources: vec![ForwardSourceRef {
+            agent_id: agents[0],
+            project_id,
+        }],
+        recipients: vec![agents[1]],
+        text: None,
+        prompt: None,
+        on_busy: OnBusyPolicy::Refuse,
+        idempotency_key: Some("held".to_owned()),
+    };
+    let caller = tokio::spawn(forward(
+        env.handle(),
+        env.home(),
+        request,
+        WaitBudget::new(Some(600), true),
+    ));
+    let send_id = loop {
+        if let Some(id) = env.state.ledger.send_id_for_key(project_id, "held") {
+            break id;
+        }
+        tokio::task::yield_now().await;
+    };
+    cancel_send(&env.state, project_id, send_id).unwrap();
+    let receipt = tokio::time::timeout(Duration::from_secs(5), caller)
+        .await
+        .expect("the cancel stops the compose at once")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.recipients[0].status, SendStatus::Cancelled);
+    gate.notify_waiters();
+    wait_agent(
+        &env.state,
+        project_id,
+        agents[0],
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lock(&env.adapter.prompts).len(),
+        1,
+        "only the source's own turn ran"
+    );
+}
+
+#[tokio::test]
+async fn paging_after_a_restart_agrees_with_wait_send_on_a_failed_send() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("proj");
+    let a = env.agent(project_id, "a");
+    let send_id = Uuid::now_v7();
+    let turn_id = Uuid::now_v7();
+    let now = Utc::now();
+    let journal = env.journal_path(project_id);
+    for record in [
+        JournalRecord::Send {
+            send_id,
+            turn_id,
+            agent_id: a,
+            prompt: "hi".to_owned(),
+            attachments: Vec::new(),
+            at: now,
+        },
+        JournalRecord::Outcome {
+            send_id,
+            turn_id,
+            agent_id: a,
+            outcome: serde_json::to_value(TurnOutcome::Failed {
+                kind: switchboard_harness::FailureKind::HarnessError,
+                message: "boom".to_owned(),
+            })
+            .unwrap(),
+            started_at: now,
+            ended_at: now,
+        },
+    ] {
+        switchboard_core::journal::append_record(&journal, &record).unwrap();
+    }
+    let env = env.restart();
+    let waited = wait_done(&env, project_id, send_id).await;
+    assert_eq!(waited.recipients[0].status, SendStatus::Failed);
+    let page = read_send_output(&env.state, project_id, send_id, a, 0, &env.home())
+        .await
+        .expect("a failed send with no reply still pages");
+    assert_eq!(page.status, SendStatus::Failed);
+    assert!(page.text.is_empty());
+}
+
+const LOWER_WORKFLOW: &str = "name: lowered
+description: test
+inputs:
+  worker:
+    type: agent
+steps:
+  - label: Greet
+    send:
+      to: \"{{ worker | lower }}\"
+      prompt: \"local:greet\"
+  - label: Greeted
+    wait_for:
+      agent: \"{{ worker | lower }}\"
+";
+
+#[tokio::test]
+async fn a_step_naming_an_unheard_agent_through_a_filter_is_not_sent() {
+    let (env, project_id, agents) = workflow_env().await;
+    std::fs::write(env.workflows_dir().join("lowered.yaml"), LOWER_WORKFLOW).unwrap();
+    *lock(&env.sync.unsubscribed) = vec![agents[0]];
+    let request = RunWorkflowRequest {
+        project_id,
+        name: "lowered".to_owned(),
+        is_builtin: false,
+        inputs: BTreeMap::from([
+            ("worker".to_owned(), InputValue::Text(agents[0].to_string())),
+            ("who".to_owned(), InputValue::Text("bob".to_owned())),
+        ]),
+        forward_sources: BTreeMap::new(),
+    };
+    let outcome = run_workflow(&env.state, &env.home(), request).await;
+    if let Ok(run_id) = outcome {
+        let reply = wait_workflow(
+            &env.state,
+            project_id,
+            run_id,
+            &WaitBudget::new(Some(30), false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.status, WorkflowRunStatus::Failed);
+        assert!(
+            reply
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cannot listen"),
+            "{:?}",
+            reply.reason
+        );
+    }
+    assert!(
+        lock(&env.adapter.prompts).is_empty(),
+        "nothing was sent to the unheard agent"
+    );
+}
+
+/// One project whose agent `a` covers every case the classifier distinguishes
+/// — an imported turn, a durably linked fan-out (with agent `b`), a poisoned
+/// link, an unlinked send, and a failed send with no reply. Returns the
+/// project, `a`, the failed send, and the unlinked send.
+fn correlation_fixture() -> (TestEnv, ProjectId, AgentId, Uuid, Uuid) {
+    let mut env = TestEnv::new();
+    let project_id = env.project("proj");
+    let a = env.agent(project_id, "a");
+    let b = env.agent(project_id, "b");
+    let t = |minutes: i64| Utc::now() - chrono::Duration::minutes(60 - minutes);
+    let (s1, s2, s3, s4) = (
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+    );
+    let decoy = Uuid::now_v7();
+    let send = |send_id, agent_id, prompt: &str, at| JournalRecord::Send {
+        send_id,
+        turn_id: Uuid::now_v7(),
+        agent_id,
+        prompt: prompt.to_owned(),
+        attachments: Vec::new(),
+        at,
+    };
+    let link = |send_id, agent_id, key: &str, at| JournalRecord::TurnLink {
+        send_id,
+        turn_id: Uuid::now_v7(),
+        agent_id,
+        hydration_key: key.to_owned(),
+        at,
+    };
+    let records = vec![
+        // A fan-out to both agents, each turn durably linked.
+        send(s1, a, "one", t(10)),
+        send(s1, b, "one", t(10)),
+        link(s1, a, "a1", t(11)),
+        link(s1, b, "b1", t(11)),
+        // Two links naming one key for different sends: poisoned, so the turn
+        // falls back to positional matching.
+        send(s2, a, "two", t(20)),
+        link(s2, a, "a2", t(21)),
+        link(decoy, a, "a2", t(21)),
+        // A send that failed before any reply.
+        send(s3, a, "three", t(30)),
+        JournalRecord::Outcome {
+            send_id: s3,
+            turn_id: Uuid::now_v7(),
+            agent_id: a,
+            outcome: serde_json::to_value(TurnOutcome::Failed {
+                kind: switchboard_harness::FailureKind::HarnessError,
+                message: "boom".to_owned(),
+            })
+            .unwrap(),
+            started_at: t(30),
+            ended_at: t(30),
+        },
+        // A send with no link at all: positional.
+        send(s4, a, "four", t(40)),
+    ];
+    let journal = env.journal_path(project_id);
+    for record in &records {
+        switchboard_core::journal::append_record(&journal, record).unwrap();
+    }
+    env.seed_claude_turns(
+        project_id,
+        a,
+        &[
+            // Before the agent's first journaled send: imported history.
+            ("old", "imported answer", "a0", t(1)),
+            ("one", "answer one", "a1", t(10)),
+            ("two", "answer two", "a2", t(20)),
+            ("four", "answer four", "a4", t(40)),
+        ],
+    );
+    env.seed_claude_turns(project_id, b, &[("one", "b answer one", "b1", t(10))]);
+    (env, project_id, a, s3, s4)
+}
+
+/// The merged conversation and the single-agent readers derive an agent's
+/// sends from one place; this proves they assign the same send to every turn
+/// across the cases the classifier distinguishes, so a `send_id` reported by
+/// one pages the same reply through the other.
+#[tokio::test]
+async fn the_merged_conversation_and_reply_paging_agree_on_every_turn() {
+    let (env, project_id, a, s3, s4) = correlation_fixture();
+    let env = env.restart();
+
+    let conversation = read_conversation(&env.state, project_id, None, &env.home())
+        .await
+        .unwrap();
+    let mut checked = 0;
+    for item in &conversation.items {
+        let DigestItem::AgentTurn {
+            agent_id,
+            send_id,
+            send_correlation,
+            text: answer,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let Some(send_id) = send_id else {
+            assert_eq!(
+                answer, "imported answer",
+                "only the imported turn has no send"
+            );
+            continue;
+        };
+        let page = read_send_output(&env.state, project_id, *send_id, *agent_id, 0, &env.home())
+            .await
+            .unwrap();
+        assert_eq!(
+            &page.text, answer,
+            "send {send_id} pages the reply the conversation shows"
+        );
+        let expected = match send_correlation {
+            Some(crate::commands::SendCorrelation::DurableLink) => OutputSource::DurableLink,
+            _ => OutputSource::Positional,
+        };
+        assert_eq!(page.source, expected, "and with the same confidence");
+        let expected_source = match answer.as_str() {
+            "answer one" | "b answer one" => OutputSource::DurableLink,
+            // The poisoned link and the unlinked send.
+            "answer two" | "answer four" => OutputSource::Positional,
+            other => panic!("unexpected turn {other:?}"),
+        };
+        assert_eq!(page.source, expected_source, "{answer}");
+        checked += 1;
+    }
+    assert_eq!(checked, 4, "a1, a2, a4, and b1 each carry a send");
+
+    let failed = read_send_output(&env.state, project_id, s3, a, 0, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(failed.status, SendStatus::Failed);
+    assert!(failed.text.is_empty());
+    let latest = read_agent_output(&env.state, project_id, a, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(latest.text.as_deref(), Some("answer four"));
+    assert_eq!(latest.send_id, Some(s4));
+}
+
+// --- review round four ------------------------------------------------------------
+
+#[tokio::test]
+async fn an_unheard_recipient_first_or_in_the_middle_does_not_stop_the_others() {
+    for unheard in [0, 1] {
+        let (env, project_id, agents) = project_with_agents(&["a", "b", "c"]);
+        *lock(&env.sync.unsubscribed) = vec![agents[unheard]];
+        let receipt = send_now(
+            env.handle(),
+            env.home(),
+            text_send(project_id, agents.clone(), "hi"),
+        )
+        .await
+        .unwrap();
+        for (index, recipient) in receipt.recipients.iter().enumerate() {
+            if index == unheard {
+                assert_eq!(recipient.status, SendStatus::Rejected);
+                assert_eq!(recipient.code, Some(error_code::DESKTOP_UNAVAILABLE));
+            } else {
+                assert_eq!(
+                    recipient.status,
+                    SendStatus::Accepted,
+                    "recipient {index}, with the unheard agent at {unheard}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_send_whose_recipients_are_all_unheard_reports_desktop_unavailable() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b"]);
+    *lock(&env.sync.unsubscribed) = agents.clone();
+    let err = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents, "hi"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error_code(&err), error_code::DESKTOP_UNAVAILABLE, "{err}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_busy_check_whose_deadline_passed_before_asking_names_no_one_busy() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b"]);
+    let roster = list_project_agents_readonly_impl(&env.state, project_id).unwrap();
+    let budget = short();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let err = refuse_if_busy(&env.state, &budget, &agents, &[], &roster)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AppError::TimedOut { .. }),
+        "both agents are idle, so neither may be reported busy: {err}"
+    );
+    assert_eq!(error_code(&err), error_code::INTERNAL);
+}
+
+#[tokio::test]
+async fn after_a_restart_an_unreadable_transcript_hides_only_its_own_recipient() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("proj");
+    let a = env.agent(project_id, "a");
+    let b = env.agent(project_id, "b");
+    let send_id = Uuid::now_v7();
+    let now = Utc::now() - chrono::Duration::minutes(1);
+    let journal = env.journal_path(project_id);
+    let turn_a = Uuid::now_v7();
+    for record in [
+        JournalRecord::Send {
+            send_id,
+            turn_id: turn_a,
+            agent_id: a,
+            prompt: "hi".to_owned(),
+            attachments: Vec::new(),
+            at: now,
+        },
+        JournalRecord::Send {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: b,
+            prompt: "hi".to_owned(),
+            attachments: Vec::new(),
+            at: now,
+        },
+        JournalRecord::TurnLink {
+            send_id,
+            turn_id: turn_a,
+            agent_id: a,
+            hydration_key: "m1".to_owned(),
+            at: now,
+        },
+    ] {
+        switchboard_core::journal::append_record(&journal, &record).unwrap();
+    }
+    env.seed_claude_turn(project_id, a, "DONE", "m1");
+    env.seed_unreadable_session(project_id, b);
+    let env = env.restart();
+
+    let reply = wait_done(&env, project_id, send_id).await;
+    assert_eq!(reply.source, WaitSource::Journal);
+    assert_eq!(reply.recipients[0].agent_id, a);
+    assert_eq!(reply.recipients[0].status, SendStatus::Completed);
+    assert_eq!(reply.recipients[0].text.as_deref(), Some("DONE"));
+    assert_eq!(reply.recipients[1].agent_id, b);
+    assert_eq!(
+        reply.recipients[1].status,
+        SendStatus::Started,
+        "outcome unknown, not failed"
+    );
+    let error = reply.recipients[1].error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("could not read this agent's transcript"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_with_three_hundred_edits_comes_back_whole_in_the_conversation() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("proj");
+    let a = env.agent(project_id, "coder");
+    let send_id = Uuid::now_v7();
+    let turn_id = Uuid::now_v7();
+    let at = Utc::now() - chrono::Duration::minutes(5);
+    let journal = env.journal_path(project_id);
+    for record in [
+        JournalRecord::Send {
+            send_id,
+            turn_id,
+            agent_id: a,
+            prompt: "edit".to_owned(),
+            attachments: Vec::new(),
+            at,
+        },
+        JournalRecord::TurnLink {
+            send_id,
+            turn_id,
+            agent_id: a,
+            hydration_key: "m1".to_owned(),
+            at,
+        },
+    ] {
+        switchboard_core::journal::append_record(&journal, &record).unwrap();
+    }
+    let answer = "Refactored the parser; all tests pass.";
+    env.seed_claude_editing_turn(
+        project_id,
+        a,
+        300,
+        answer,
+        "m1",
+        at + chrono::Duration::seconds(1),
+    );
+    let env = env.restart();
+
+    let window_shape = load_project_conversation_impl(&env.state, project_id, &env.home())
+        .await
+        .unwrap();
+    assert!(
+        serde_json::to_string(&window_shape).unwrap().len() > 3 * RESULT_BUDGET_CHARS,
+        "the window's shape, with every tool card, is far over the budget"
+    );
+
+    let conversation = read_conversation(&env.state, project_id, None, &env.home())
+        .await
+        .unwrap();
+    let fitted = fit(
+        serde_json::to_value(&conversation).unwrap(),
+        &conversation_budget(project_id),
+    )
+    .unwrap();
+    assert!(fitted.truncated.is_empty(), "nothing needed cutting");
+    assert_eq!(fitted.items_omitted, 0);
+    assert_eq!(
+        conversation.items,
+        vec![
+            DigestItem::UserMessage {
+                send_id: Some(send_id),
+                agent_ids: vec![a],
+                text: "edit".to_owned(),
+                attachments: Vec::new(),
+                at,
+            },
+            DigestItem::AgentTurn {
+                agent_id: a,
+                send_id: Some(send_id),
+                send_correlation: Some(crate::commands::SendCorrelation::DurableLink),
+                status: switchboard_harness::TurnStatus::Complete,
+                text: answer.to_owned(),
+                // A turn starts at its first assistant message, a moment
+                // after its prompt.
+                at: at + chrono::Duration::seconds(1) + chrono::Duration::milliseconds(1),
+            },
+        ]
+    );
+    assert_eq!(conversation.agents.len(), 1);
+    assert_eq!(conversation.agents[0].name, "coder");
+    assert_eq!(conversation.agents[0].load_error, None);
+}
+
+#[tokio::test]
+async fn a_cut_answer_in_the_conversation_reads_on_from_where_it_was_cut() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let reply = "r".repeat(40_000);
+    env.adapter.push(Script::reply(&reply));
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "go"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+    let conversation = read_conversation(&env.state, project_id, None, &env.home())
+        .await
+        .unwrap();
+    let fitted = fit(
+        serde_json::to_value(&conversation).unwrap(),
+        &conversation_budget(project_id),
+    )
+    .unwrap();
+    assert!(fitted.serialized_chars() <= RESULT_BUDGET_CHARS);
+    let cut = fitted
+        .truncated
+        .iter()
+        .find(|t| t.path.ends_with("/text") && t.total_chars == reply.len())
+        .expect("the answer was cut");
+    let read_with = cut
+        .read_with
+        .as_ref()
+        .expect("an answer with a send reads on");
+    assert_eq!(read_with["tool"], "read_send_output");
+    assert_eq!(read_with["offset"], cut.kept_chars);
+    let page = read_send_output(
+        &env.state,
+        project_id,
+        receipt.send_id,
+        agents[0],
+        cut.kept_chars,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        page.offset + page.text.len(),
+        page.total_chars.min(cut.kept_chars + OUTPUT_PAGE_CHARS)
+    );
+    assert_eq!(
+        page.total_chars,
+        reply.len(),
+        "the same reply the conversation cut"
+    );
 }

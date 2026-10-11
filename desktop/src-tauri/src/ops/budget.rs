@@ -11,17 +11,39 @@
 //! truncated id is useless for the next call.
 //!
 //! **How the budget is shared.** Text fields share it evenly: the helper finds
-//! the largest per-field cap at which the whole envelope fits (binary search,
-//! one serialization per step) and cuts every field to that cap. Cutting the
-//! longest field by the whole overflow would empty one recipient's reply and
-//! leave the others whole.
+//! the largest per-field cap at which the whole envelope fits and cuts every
+//! longer field to that cap. Cutting the longest field by the whole overflow
+//! would empty one recipient's reply and leave the others whole.
+//!
+//! **Why the search walks intervals.** Every newly cut field adds its own
+//! record to the envelope, so lowering the cap past a field's length can make
+//! the result *bigger*: "fits at this cap" is not monotone across the whole
+//! range, and a plain binary search over it can skip every cap that fits.
+//! Between two consecutive field lengths the set of cut fields is fixed and
+//! size only shrinks with the cap, so the search takes those intervals from
+//! the largest caps down and binary-searches inside the first that can fit.
+//! Sizes are computed from a model of the serializer — each field's escaped
+//! length at any cut point, each record's length — not by serializing at every
+//! step, which on one large item with hundreds of tool outputs would mean
+//! hundreds of serializations of megabytes. One real serialization at the end
+//! confirms the result; a disagreement with the model only steps the cap
+//! down, never returns an oversized result.
+//!
+//! **Why the search is cheap for any input.** A record's length depends on
+//! the cap only through its digit count, so each field's record is serialized
+//! at most once per digit count. A size check visits only the fields that cap
+//! cuts, longest first. And the walk stops as soon as the fields already cut —
+//! each at its shortest possible record, with its text emptied — cannot fit:
+//! lowering the cap only cuts more, so no smaller cap can fit either. Every
+//! cut field costs at least 60 characters of record, so at most `budget / 60`
+//! fields are ever examined, however many the result holds.
 //!
 //! **When cutting is not enough.** A result with a droppable list — a
-//! conversation's items — keeps whole items newest-first while they fit, cuts
-//! the text of the first that does not, and omits the rest, reporting how
-//! many. A fan-out's recipients are never droppable. A single element that
-//! cannot fit even with every text field emptied is an error naming the call
-//! that reads it in pages.
+//! conversation's items — keeps whole items newest-first while they fit and
+//! omits the older ones, reporting how many. The newest item is always kept;
+//! if it alone is over, its text is cut. A fan-out's recipients are never
+//! droppable. A single element that cannot fit even with every text field
+//! emptied is an error naming the call that reads it in pages.
 //!
 //! **What a cut carries.** Every cut field is listed in the envelope with its
 //! path (a JSON pointer), its full length, the length kept, and, when the
@@ -34,10 +56,8 @@
 //! escapes any key; a field that still cannot be addressed is treated as not
 //! cuttable rather than retried forever.
 //!
-//! The envelope wraps the result rather than annotating it in place, so the
-//! shapes the desktop renders (`ConversationItem`) cross unchanged.
-
-use std::sync::atomic::{AtomicUsize, Ordering};
+//! The envelope wraps the result rather than annotating it in place, so each
+//! result type's own shape crosses unchanged.
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -71,7 +91,10 @@ pub struct BudgetSpec {
     /// The call to read it in pages, for the error when one element cannot fit.
     pub read_with: &'static str,
     /// For a cut field, the call that reads the rest, or `None` when nothing
-    /// can.
+    /// can. Its serialized length may depend on the cap only through the
+    /// digit count of `kept_chars` (embedding the offset as a number does):
+    /// the search caches record lengths per digit count, and the final real
+    /// serialization catches a pointer that breaks this.
     pub pointer: Pointer,
 }
 
@@ -119,13 +142,42 @@ impl Budgeted {
     }
 }
 
-/// Serializations performed, for tests that bound the helper's cost without
-/// a clock.
-static SERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+thread_local! {
+    /// Serializations this thread performed — whole results and truncation
+    /// records alike — and fields the size model visited, for tests that bound
+    /// the helper's cost without a clock. Thread-local so tests running in
+    /// parallel do not count each other's work.
+    static SERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FIELD_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 fn measure<T: Serialize>(value: &T) -> usize {
-    SERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    SERIALIZATIONS.with(|count| count.set(count.get() + 1));
     serde_json::to_string(value).map_or(0, |s| s.chars().count())
+}
+
+fn count_field_visit() {
+    #[cfg(test)]
+    FIELD_VISITS.with(|count| count.set(count.get() + 1));
+}
+
+/// Decimal digits in `n`, which is all a record's length depends on.
+fn decimal_digits(n: usize) -> u32 {
+    n.checked_ilog10().map_or(1, |log| log + 1)
+}
+
+/// Characters `c` occupies in `serde_json`'s output: quotes, backslashes, and
+/// the short-escaped control characters take two, other control characters
+/// take six (`\u00XX`), everything else one. Shared with paging, which sizes a
+/// page by what it serializes to.
+pub(crate) fn json_escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        _ => 1,
+    }
 }
 
 /// Fit `value` to `spec`.
@@ -151,8 +203,8 @@ pub fn fit(value: Value, spec: &BudgetSpec) -> Result<Budgeted, AppError> {
 }
 
 /// Keep whole elements of the droppable list newest-first while the envelope
-/// fits; drop the rest and record how many. The oldest kept element is the
-/// one `cut_evenly` will trim if the whole set is still over.
+/// fits; drop the older ones and record how many. The newest element is
+/// always kept, and `cut_evenly` trims it if it alone is over.
 fn keep_newest(budgeted: &mut Budgeted, spec: &BudgetSpec, key: &str) {
     let Some(items) = budgeted.result.get_mut(key).and_then(Value::as_array_mut) else {
         return;
@@ -182,53 +234,248 @@ fn keep_newest(budgeted: &mut Budgeted, spec: &BudgetSpec, key: &str) {
 }
 
 /// Find the largest per-field cap at which the envelope fits and cut every
-/// cuttable field to it.
+/// longer field to it. See the module doc for why the search walks intervals.
 fn cut_evenly(budgeted: &mut Budgeted, spec: &BudgetSpec) -> Result<(), AppError> {
     let mut candidates = Vec::new();
     collect_candidates(&budgeted.result, "", &mut candidates);
-    // Fields that cannot be addressed are not cuttable: skipping them is what
-    // keeps every pass from retrying the same field forever.
+    // A field that cannot be addressed is not cuttable: dropping it here is
+    // what keeps the search from retrying the same field forever.
     candidates.retain(|c| budgeted.result.pointer(&c.path).is_some());
-    if candidates.is_empty() {
-        return if budgeted.serialized_chars() <= spec.budget_chars {
-            Ok(())
-        } else {
-            Err(AppError::ResultTooLarge {
-                read_with: spec.read_with,
-            })
-        };
+    let base = measure(budgeted);
+    // Dropping old items may already have made it fit.
+    if base <= spec.budget_chars {
+        return Ok(());
     }
-    let longest = candidates.iter().map(|c| c.chars).max().unwrap_or(0);
+    let cap = SizeModel::new(&budgeted.result, &candidates, spec, base)
+        .largest_fitting_cap(spec.budget_chars);
+    let Some(mut cap) = cap else {
+        return Err(AppError::ResultTooLarge {
+            read_with: spec.read_with,
+        });
+    };
     let original = budgeted.result.clone();
-    // Binary search the cap: `fits(cap)` is monotone in `cap`.
-    let (mut low, mut high) = (0usize, longest);
-    if !apply_cap(budgeted, &original, &candidates, high, spec) {
-        while low < high {
-            let mid = low + (high - low).div_ceil(2);
-            if apply_cap(budgeted, &original, &candidates, mid, spec) {
-                low = mid;
-            } else {
-                high = mid - 1;
-            }
+    loop {
+        apply_cap(budgeted, &original, &candidates, cap, spec);
+        let size = budgeted.serialized_chars();
+        if size <= spec.budget_chars {
+            return Ok(());
         }
-        if !apply_cap(budgeted, &original, &candidates, low, spec) {
+        // The model disagreed with the serializer. Step down by the overflow
+        // rather than return an oversized result.
+        if cap == 0 {
             return Err(AppError::ResultTooLarge {
                 read_with: spec.read_with,
             });
         }
+        cap = cap.saturating_sub((size - spec.budget_chars).max(1));
     }
-    Ok(())
 }
 
-/// Cut every candidate to `cap` characters on a fresh copy of the original,
-/// rebuild the truncation records, and report whether the envelope fits.
+/// The envelope's size at any cap, computed without serializing it. Sizes
+/// are summed from the parts, never adjusted by subtraction: a cut structured
+/// field (a tool input object) can serialize *longer* than the object it
+/// replaced, because its quotes escape.
+struct SizeModel<'a> {
+    /// The envelope with every candidate field's value and every record
+    /// removed.
+    fixed: usize,
+    /// Longest first, so the fields a cap cuts are a prefix.
+    fields: Vec<FieldModel<'a>>,
+    /// `uncut_after[i]`: what `fields[i..]` cost uncut.
+    uncut_after: Vec<usize>,
+    spec: &'a BudgetSpec,
+    /// Distinct field lengths, longest first.
+    lengths: Vec<usize>,
+}
+
+struct FieldModel<'a> {
+    candidate: &'a Candidate,
+    ancestors: Vec<&'a Map<String, Value>>,
+    /// What the field costs in the uncut envelope.
+    full_cost: usize,
+    /// Positions (in characters) of the field's characters that escape to
+    /// more than one, each with the running total of extra cost up to and
+    /// including it, so the escaped length of any prefix is a binary search.
+    escapes: Vec<(usize, usize)>,
+    /// The field's record length, by the cap's digit count, as measured.
+    records: Vec<(u32, usize)>,
+    /// The shortest the field's record can be at any cap, once measured.
+    min_record: Option<usize>,
+}
+
+impl FieldModel<'_> {
+    /// The field's serialized cost when cut to `cap` characters: a string of
+    /// that prefix, quotes included.
+    fn cut_cost(&self, cap: usize) -> usize {
+        let extra = match self.escapes.partition_point(|(pos, _)| *pos < cap) {
+            0 => 0,
+            n => self.escapes[n - 1].1,
+        };
+        2 + cap + extra
+    }
+
+    /// The field's truncation record at `cap`, serialized once per digit count.
+    fn record_len(&mut self, cap: usize, spec: &BudgetSpec) -> usize {
+        let digits = decimal_digits(cap);
+        if let Some(&(_, len)) = self.records.iter().find(|(d, _)| *d == digits) {
+            return len;
+        }
+        let len = measure(&Truncation {
+            path: self.candidate.path.clone(),
+            total_chars: self.candidate.chars,
+            kept_chars: cap,
+            read_with: (spec.pointer)(&CutSite {
+                path: &self.candidate.path,
+                key: &self.candidate.key,
+                kept_chars: cap,
+                ancestors: &self.ancestors,
+            }),
+        });
+        self.records.push((digits, len));
+        len
+    }
+
+    /// A lower bound on the field's record at any cap, whatever the pointer
+    /// returns: one digit kept, and a one-character `read_with` (shorter than
+    /// any pointer, and than `null`).
+    fn min_record(&mut self) -> usize {
+        *self.min_record.get_or_insert_with(|| {
+            measure(&Truncation {
+                path: self.candidate.path.clone(),
+                total_chars: self.candidate.chars,
+                kept_chars: 0,
+                read_with: Some(Value::from(0)),
+            })
+        })
+    }
+}
+
+impl<'a> SizeModel<'a> {
+    fn new(
+        root: &'a Value,
+        candidates: &'a [Candidate],
+        spec: &'a BudgetSpec,
+        base: usize,
+    ) -> Self {
+        let mut fields: Vec<FieldModel<'a>> = candidates
+            .iter()
+            .map(|candidate| {
+                let mut ancestors = Vec::new();
+                collect_ancestors(root, &candidate.path, &mut ancestors);
+                let mut escapes = Vec::new();
+                let mut extra = 0;
+                for (pos, c) in candidate.text.chars().enumerate() {
+                    let cost = json_escaped_len(c);
+                    if cost > 1 {
+                        extra += cost - 1;
+                        escapes.push((pos, extra));
+                    }
+                }
+                // A string field costs its escaped text plus quotes; a
+                // structured field (a tool input object) costs its JSON text.
+                let full_cost = if candidate.structured {
+                    candidate.chars
+                } else {
+                    candidate.chars + extra + 2
+                };
+                FieldModel {
+                    candidate,
+                    ancestors,
+                    full_cost,
+                    escapes,
+                    records: Vec::new(),
+                    min_record: None,
+                }
+            })
+            .collect();
+        fields.sort_by_key(|f| std::cmp::Reverse(f.candidate.chars));
+        let mut uncut_after = vec![0; fields.len() + 1];
+        for index in (0..fields.len()).rev() {
+            uncut_after[index] = uncut_after[index + 1] + fields[index].full_cost;
+        }
+        // An empty field is never cut, so it bounds no interval.
+        let mut lengths: Vec<usize> = fields
+            .iter()
+            .map(|f| f.candidate.chars)
+            .filter(|chars| *chars > 0)
+            .collect();
+        lengths.dedup();
+        Self {
+            fixed: base.saturating_sub(uncut_after[0]),
+            fields,
+            uncut_after,
+            spec,
+            lengths,
+        }
+    }
+
+    /// How many fields `cap` cuts: those longer than it, a prefix.
+    fn cut_count(&self, cap: usize) -> usize {
+        self.fields.partition_point(|f| f.candidate.chars > cap)
+    }
+
+    /// The envelope's size with every field longer than `cap` cut to it.
+    fn size(&mut self, cap: usize) -> usize {
+        let spec = self.spec;
+        let cut = self.cut_count(cap);
+        let mut size = self.fixed + self.uncut_after[cut];
+        for field in &mut self.fields[..cut] {
+            count_field_visit();
+            size += field.cut_cost(cap) + field.record_len(cap, spec);
+        }
+        // Commas between records; the brackets are already in `fixed`.
+        size + cut.saturating_sub(1)
+    }
+
+    /// The largest cap at which the envelope fits, walking the intervals in
+    /// which the set of cut fields is fixed, from the largest caps down, and
+    /// stopping once no smaller cap can fit.
+    fn largest_fitting_cap(&mut self, budget: usize) -> Option<usize> {
+        // A lower bound on the size at every cap below the current interval's
+        // top: the fields cut there, emptied, each with its shortest record.
+        let mut floor = self.fixed;
+        let mut counted = 0;
+        for index in 0..self.lengths.len() {
+            let length = self.lengths[index];
+            let high = length - 1;
+            let low = self.lengths.get(index + 1).copied().unwrap_or(0);
+            let cut = self.cut_count(high);
+            for field in &mut self.fields[counted..cut] {
+                count_field_visit();
+                floor += 2 + field.min_record();
+            }
+            counted = cut;
+            if floor + cut.saturating_sub(1) > budget {
+                return None;
+            }
+            if self.size(low) > budget {
+                continue;
+            }
+            // Within the interval, size never shrinks as the cap grows.
+            let (mut lo, mut hi) = (low, high);
+            while lo < hi {
+                let mid = lo + (hi - lo).div_ceil(2);
+                if self.size(mid) <= budget {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            return Some(lo);
+        }
+        None
+    }
+}
+
+/// Cut every candidate longer than `cap` on a fresh copy of the original and
+/// rebuild the truncation records.
 fn apply_cap(
     budgeted: &mut Budgeted,
     original: &Value,
     candidates: &[Candidate],
     cap: usize,
     spec: &BudgetSpec,
-) -> bool {
+) {
     budgeted.result = original.clone();
     budgeted.truncated.clear();
     for candidate in candidates {
@@ -246,12 +493,7 @@ fn apply_cap(
         let Some(slot) = budgeted.result.pointer_mut(&candidate.path) else {
             continue;
         };
-        let full = if candidate.structured {
-            serde_json::to_string(slot).unwrap_or_default()
-        } else {
-            slot.as_str().unwrap_or_default().to_owned()
-        };
-        *slot = Value::String(full.chars().take(cap).collect());
+        *slot = Value::String(candidate.text.chars().take(cap).collect());
         budgeted.truncated.push(Truncation {
             path: candidate.path.clone(),
             total_chars: candidate.chars,
@@ -259,13 +501,14 @@ fn apply_cap(
             read_with,
         });
     }
-    budgeted.serialized_chars() <= spec.budget_chars
 }
 
 struct Candidate {
     /// JSON pointer.
     path: String,
     key: String,
+    /// The field's text: the string itself, or a structured field's JSON.
+    text: String,
     chars: usize,
     /// The field holds a non-string value (a tool input object), which is cut
     /// as its JSON text.
@@ -287,15 +530,20 @@ fn collect_candidates(value: &Value, path: &str, out: &mut Vec<Candidate>) {
                             path: child_path,
                             key: key.clone(),
                             chars: text.chars().count(),
+                            text: text.clone(),
                             structured: false,
                         }),
                         Value::Null => {}
-                        other => out.push(Candidate {
-                            path: child_path,
-                            key: key.clone(),
-                            chars: serde_json::to_string(other).map_or(0, |s| s.chars().count()),
-                            structured: true,
-                        }),
+                        other => {
+                            let text = serde_json::to_string(other).unwrap_or_default();
+                            out.push(Candidate {
+                                path: child_path,
+                                key: key.clone(),
+                                chars: text.chars().count(),
+                                text,
+                                structured: true,
+                            });
+                        }
                     }
                 } else {
                     collect_candidates(child, &child_path, out);
@@ -340,7 +588,12 @@ fn collect_ancestors<'a>(root: &'a Value, path: &str, out: &mut Vec<&'a Map<Stri
 
 #[cfg(test)]
 pub(crate) fn serializations() -> usize {
-    SERIALIZATIONS.load(Ordering::Relaxed)
+    SERIALIZATIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn field_visits() -> usize {
+    FIELD_VISITS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -511,8 +764,132 @@ mod tests {
         let fitted = fit(value, &spec(20_000, Some("items"))).unwrap();
         assert!(fitted.serialized_chars() <= 20_000);
         let used = serializations() - before;
-        // One envelope measure, one per element for the newest-first fill,
-        // and a logarithmic number of cap probes — never one per cut field.
-        assert!(used < 5_000 + 40, "{used} serializations");
+        // One envelope measure, one per element the newest-first fill visits,
+        // and a few more — never one per element of the input.
+        let kept = fitted.result["items"].as_array().unwrap().len();
+        assert!(
+            used <= kept + 6,
+            "{used} serializations for {kept} kept items"
+        );
+    }
+}
+
+#[cfg(test)]
+mod round_three {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_short_and_a_long_field_fit_when_a_cap_exists() {
+        // Cutting the short field too adds a second record, which costs more
+        // than the characters it removes: the fitting caps form a window, and
+        // the search must find it.
+        let value = json!({ "body": "b".repeat(20), "text": "t".repeat(1_000) });
+        let fitted = fit(
+            value,
+            &BudgetSpec::unpageable(180, None, "read_send_output"),
+        )
+        .expect("caps 20 through 27 fit");
+        assert!(fitted.serialized_chars() <= 180);
+        assert_eq!(fitted.truncated.len(), 1, "only the long field is cut");
+        assert_eq!(
+            fitted.truncated[0].kept_chars, 27,
+            "the largest cap that fits"
+        );
+    }
+}
+
+#[cfg(test)]
+mod size_model {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn one_large_item_with_many_fields_serializes_each_record_a_few_times() {
+        // One agent turn with 100 tool outputs of different lengths: dropping
+        // items cannot shrink it, so every cut is decided inside the item.
+        // (Hundreds more would not fit at all — each cut field's own record
+        // costs about 80 characters — which is the single-item error.)
+        let items: Vec<Value> = (0..100)
+            .map(|i| json!({ "item_kind": "tool", "output": "o".repeat(1_000 + i * 7) }))
+            .collect();
+        let value = json!({ "items": [{ "kind": "agent_turn", "items": items }] });
+        let before = serializations();
+        let fitted = fit(value, &BudgetSpec::unpageable(25_000, Some("items"), "x")).unwrap();
+        assert!(fitted.serialized_chars() <= 25_000);
+        let used = serializations() - before;
+        // A handful of whole-result serializations; per field, its shortest
+        // record and one record per digit count of the caps probed (at most
+        // four here). Never a whole-result serialization per probe.
+        assert!(
+            used <= 6 + 100 * 5,
+            "{used} serializations: the model, not the serializer, searches"
+        );
+    }
+
+    #[test]
+    fn records_that_alone_overflow_stop_the_search_early() {
+        // 2,000 fields of distinct lengths whose structure fits on its own, so
+        // the walk runs: every cap either leaves megabytes uncut or cuts so
+        // many fields that their records alone overflow.
+        let budget = 25_000;
+        let recipients = |text: &dyn Fn(usize) -> String| -> Value {
+            let list: Vec<Value> = (0..2_000).map(|i| json!({ "text": text(i) })).collect();
+            json!({ "recipients": list })
+        };
+        let structure = serde_json::to_string(&Budgeted {
+            result: recipients(&|_| String::new()),
+            truncated: Vec::new(),
+            items_omitted: 0,
+        })
+        .unwrap();
+        assert!(structure.len() < budget, "the structure alone fits");
+        let value = recipients(&|i| "o".repeat(1_000 + i));
+        let (serialized_before, visits_before) = (serializations(), field_visits());
+        let err = fit(value, &BudgetSpec::unpageable(budget, None, "x")).unwrap_err();
+        assert!(matches!(err, AppError::ResultTooLarge { read_with: "x" }));
+        let serialized = serializations() - serialized_before;
+        let visits = field_visits() - visits_before;
+        // Every cut field costs at least 60 characters of record, so the walk
+        // examines at most `budget / 60` fields before it stops, and each
+        // probe visits only the fields it cuts: bounded by the budget, not by
+        // the 2,000 fields (whose square is 4,000,000).
+        let examined = budget / 60;
+        assert!(
+            visits <= examined * examined,
+            "{visits} field visits for at most {examined} examined fields"
+        );
+        assert!(
+            serialized <= 4 + examined * 3,
+            "{serialized} serializations for at most {examined} examined fields"
+        );
+    }
+
+    #[test]
+    fn an_empty_text_field_does_not_break_the_search() {
+        let value = json!({ "items": [
+            { "agent_id": "a", "text": "" },
+            { "agent_id": "b", "text": "x".repeat(2_000) },
+        ] });
+        let fitted = fit(value, &BudgetSpec::unpageable(300, None, "x")).unwrap();
+        assert!(fitted.serialized_chars() <= 300);
+        assert_eq!(fitted.truncated.len(), 1);
+        assert_eq!(fitted.result["items"][0]["text"], "");
+    }
+
+    #[test]
+    fn the_model_agrees_with_the_serializer_on_escaped_text() {
+        // Quotes, backslashes, newlines, and other control characters all
+        // escape to more than one character; the chosen cap must still fit on
+        // the first real serialization.
+        let tricky: String = "a\"b\\c\nd\u{1}e\u{8}f\u{c}g".repeat(400);
+        let value = json!({ "recipients": [
+            { "agent_id": "x", "text": tricky.clone() },
+            { "agent_id": "y", "text": "plain".repeat(800) },
+        ] });
+        let fitted = fit(value, &BudgetSpec::unpageable(3_000, None, "x")).unwrap();
+        assert!(fitted.serialized_chars() <= 3_000);
+        let kept = fitted.truncated[0].kept_chars;
+        assert!(kept > 300, "a real share survives the escapes: {kept}");
     }
 }

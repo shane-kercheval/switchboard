@@ -583,11 +583,13 @@ pub enum AppError {
     #[error("the result is too large to return whole; read it in pages with {read_with}")]
     ResultTooLarge { read_with: &'static str },
 
-    /// A retry joined an in-flight request with the same key, and that request
-    /// failed before dispatching anything. Carries the original error so the
-    /// joiner sees the same outcome, mapped to the same code, and can retry.
+    /// An error shared between the request that raised it and any retry that
+    /// joined it with the same key. Every `send` and `forward` error arrives in
+    /// this wrapper, always — whether a retry is holding a copy is a matter of
+    /// timing, and an error whose shape depended on timing would be a trap. Use
+    /// [`AppError::root`] to match on the underlying error.
     #[error("{0}")]
-    Joined(std::sync::Arc<AppError>),
+    Shared(std::sync::Arc<AppError>),
 
     /// A retry joined an in-flight request with the same key, and its own wait
     /// budget ran out before the original settled. The original keeps running
@@ -604,6 +606,13 @@ pub enum AppError {
     /// caller's input.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A step before dispatch did not finish within the call's wait budget —
+    /// a slow prompt provider, or opening a forward's source projects. Nothing
+    /// was dispatched; trying again is the right response, not changing the
+    /// request.
+    #[error("{what} did not finish within the wait budget; nothing was sent — try again")]
+    TimedOut { what: &'static str },
 
     /// A fan-out under `refuse` found these recipients busy up front, so the
     /// whole send was refused and nothing was dispatched. Names rather than
@@ -622,6 +631,16 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// The underlying error, with any [`AppError::Shared`] wrappers removed.
+    /// The way to match on an `ops` error's kind.
+    #[must_use]
+    pub fn root(&self) -> &AppError {
+        match self {
+            AppError::Shared(inner) => inner.root(),
+            other => other,
+        }
+    }
+
     pub fn invalid_uuid(value: impl Into<String>, source: uuid::Error) -> Self {
         Self::InvalidUuid {
             value: value.into(),

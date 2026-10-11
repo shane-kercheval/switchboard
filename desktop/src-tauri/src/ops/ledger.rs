@@ -64,6 +64,7 @@ use switchboard_harness::{
     FailureKind, MessageFailureKind, MessageId, NormalizedEvent, TextCapture, TurnId, TurnOutcome,
 };
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -187,7 +188,12 @@ pub enum Claim {
     /// This caller owns the request; `send_id` is freshly minted.
     Fresh { send_id: SendId },
     /// An identical request is in flight or already finished; await its result.
-    Joined(watch::Receiver<Option<ClaimResult>>),
+    /// Carries the original's `send_id`, so a joiner that gives up first can
+    /// still tell the caller which send to watch.
+    Joined {
+        send_id: SendId,
+        result: watch::Receiver<Option<ClaimResult>>,
+    },
     /// The key is claimed by a different request.
     Mismatch,
 }
@@ -245,6 +251,16 @@ struct SendEntry {
     created_at: DateTime<Utc>,
     key: Option<String>,
     settled: bool,
+    /// Set by `cancel_send`. The send task reads it before each dispatch and
+    /// after each admission, so a cancel that lands while the send is still
+    /// preparing, or between the check and the dispatcher's answer, still
+    /// stops it.
+    cancel_requested: bool,
+    /// Fired with `cancel_requested`, so preparation (a forward waiting on a
+    /// busy source, a slow prompt provider) stops at once instead of running
+    /// to its deadline. A child of the call's own cancel token, so server
+    /// shutdown fires it too; the flag tells the two apart.
+    cancel: CancellationToken,
     recipients: Vec<RecipientEntry>,
 }
 
@@ -256,6 +272,7 @@ impl SendEntry {
 }
 
 struct KeyClaim {
+    send_id: SendId,
     request_hash: String,
     result: watch::Sender<Option<ClaimResult>>,
 }
@@ -319,7 +336,10 @@ impl SendLedger {
         let mut inner = lock(&self.inner);
         if let Some(existing) = inner.claims.get(&(project_id, key.to_owned())) {
             if existing.request_hash == request_hash {
-                return Claim::Joined(existing.result.subscribe());
+                return Claim::Joined {
+                    send_id: existing.send_id,
+                    result: existing.result.subscribe(),
+                };
             }
             return Claim::Mismatch;
         }
@@ -327,6 +347,7 @@ impl SendLedger {
         inner.claims.insert(
             (project_id, key.to_owned()),
             KeyClaim {
+                send_id,
                 request_hash: request_hash.to_owned(),
                 result: watch::Sender::new(None),
             },
@@ -342,6 +363,7 @@ impl SendLedger {
         project_id: ProjectId,
         recipients: &[AgentId],
         key: Option<&str>,
+        cancel: CancellationToken,
     ) {
         let now = Utc::now();
         let mut inner = lock(&self.inner);
@@ -352,6 +374,8 @@ impl SendLedger {
                 created_at: now,
                 key: key.map(str::to_owned),
                 settled: false,
+                cancel_requested: false,
+                cancel,
                 recipients: recipients
                     .iter()
                     .map(|&agent_id| RecipientEntry {
@@ -465,8 +489,8 @@ impl SendLedger {
         Some(receipt)
     }
 
-    /// The send a key currently names, for a joiner reporting that the
-    /// original is still in progress.
+    /// The send a key currently names.
+    #[cfg(test)]
     #[must_use]
     pub fn send_id_for_key(&self, project_id: ProjectId, key: &str) -> Option<SendId> {
         let inner = lock(&self.inner);
@@ -476,6 +500,49 @@ impl SendLedger {
             .iter()
             .find(|(_, e)| e.project_id == project_id && e.key.as_deref() == Some(key))
             .map(|(id, _)| *id)
+    }
+
+    /// Ask a send to stop: flag it and fire its cancel signal. Returns the
+    /// recipients the dispatcher may own — accepted or running — which the
+    /// caller cancels there; the send task cancels the rest itself.
+    pub fn request_cancel(&self, send_id: SendId) -> Option<Vec<AgentId>> {
+        let mut inner = lock(&self.inner);
+        let entry = inner.sends.get_mut(&send_id)?;
+        entry.cancel_requested = true;
+        entry.cancel.cancel();
+        Some(
+            entry
+                .recipients
+                .iter()
+                .filter(|r| !r.status.is_terminal())
+                .map(|r| r.agent_id)
+                .collect(),
+        )
+    }
+
+    /// Whether `cancel_send` has asked this send to stop.
+    #[must_use]
+    pub fn cancel_requested(&self, send_id: SendId) -> bool {
+        lock(&self.inner)
+            .sends
+            .get(&send_id)
+            .is_some_and(|e| e.cancel_requested)
+    }
+
+    /// Mark every recipient not yet offered to the dispatcher as cancelled —
+    /// at dispatch time and now — for a send stopped by `cancel_send`.
+    pub fn cancel_undispatched(&self, send_id: SendId) {
+        let mut inner = lock(&self.inner);
+        if let Some(entry) = inner.sends.get_mut(&send_id) {
+            for recipient in &mut entry.recipients {
+                if recipient.dispatch == SendStatus::NotDispatched {
+                    recipient.dispatch = SendStatus::Cancelled;
+                    recipient.status = SendStatus::Cancelled;
+                }
+            }
+        }
+        drop(inner);
+        self.bump();
     }
 
     /// Whether any recipient of the send was accepted by the dispatcher.
@@ -950,7 +1017,13 @@ mod tests {
         let Claim::Fresh { send_id } = ledger.claim(project_id, Some("k"), "h") else {
             panic!("fresh");
         };
-        ledger.register_send(send_id, project_id, &[agent_id], Some("k"));
+        ledger.register_send(
+            send_id,
+            project_id,
+            &[agent_id],
+            Some("k"),
+            CancellationToken::new(),
+        );
         let message_id = ledger.mark_accepted(send_id, agent_id).unwrap();
         ledger.settle(send_id);
         (project_id, send_id, agent_id, message_id)
@@ -1097,11 +1170,23 @@ mod tests {
         let Claim::Fresh { send_id: live } = ledger.claim(project_id, Some("live"), "h") else {
             panic!("fresh");
         };
-        ledger.register_send(live, project_id, &[agent_id], Some("live"));
+        ledger.register_send(
+            live,
+            project_id,
+            &[agent_id],
+            Some("live"),
+            CancellationToken::new(),
+        );
         ledger.mark_accepted(live, agent_id).unwrap();
         for _ in 0..(MAX_ENTRIES + 10) {
             let send_id = Uuid::now_v7();
-            ledger.register_send(send_id, project_id, &[Uuid::now_v7()], None);
+            ledger.register_send(
+                send_id,
+                project_id,
+                &[Uuid::now_v7()],
+                None,
+                CancellationToken::new(),
+            );
             ledger.settle(send_id);
         }
         assert!(
@@ -1110,7 +1195,7 @@ mod tests {
         );
         assert!(matches!(
             ledger.claim(project_id, Some("live"), "h"),
-            Claim::Joined(_)
+            Claim::Joined { .. }
         ));
         ledger.prune(Utc::now() + MAX_AGE + Duration::seconds(1));
         assert!(
@@ -1126,7 +1211,13 @@ mod tests {
         let mut ids = Vec::new();
         for _ in 0..(MAX_ENTRIES + 10) {
             let send_id = Uuid::now_v7();
-            ledger.register_send(send_id, project_id, &[Uuid::now_v7()], None);
+            ledger.register_send(
+                send_id,
+                project_id,
+                &[Uuid::now_v7()],
+                None,
+                CancellationToken::new(),
+            );
             ledger.settle(send_id);
             ids.push(send_id);
         }
@@ -1208,10 +1299,21 @@ mod tests {
         let Claim::Fresh { send_id } = ledger.claim(project_id, Some("k"), "h") else {
             panic!("fresh");
         };
-        ledger.register_send(send_id, project_id, &[Uuid::now_v7()], Some("k"));
-        let Claim::Joined(mut joined) = ledger.claim(project_id, Some("k"), "h") else {
+        ledger.register_send(
+            send_id,
+            project_id,
+            &[Uuid::now_v7()],
+            Some("k"),
+            CancellationToken::new(),
+        );
+        let Claim::Joined {
+            send_id: joined_id,
+            result: mut joined,
+        } = ledger.claim(project_id, Some("k"), "h")
+        else {
             panic!("joined");
         };
+        assert_eq!(joined_id, send_id, "a join names the original send");
         assert!(matches!(
             ledger.claim(project_id, Some("k"), "other"),
             Claim::Mismatch

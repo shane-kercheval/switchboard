@@ -61,7 +61,7 @@ pub fn error_code(error: &AppError) -> &'static str {
         AppError::WorkflowAlreadyRunning { .. } => WORKFLOW_ALREADY_RUNNING,
         AppError::ResultTooLarge { .. } => RESULT_TOO_LARGE,
         AppError::RequestInProgress { .. } => REQUEST_IN_PROGRESS,
-        AppError::Joined(original) => error_code(original),
+        AppError::Shared(original) => error_code(original),
         AppError::InvalidArgument(_)
         | AppError::InvalidUuid { .. }
         | AppError::NoForwardSources
@@ -71,6 +71,8 @@ pub fn error_code(error: &AppError) -> &'static str {
         | AppError::WorkflowRunActive { .. }
         | AppError::ForkSourceBusy { .. }
         | AppError::ForkSourceHasNoSession { .. } => INVALID_ARGUMENT,
+        // Includes `TimedOut`, `Interrupted`, and `Internal`: operational
+        // failures, not the caller's input; their messages say to try again.
         _ => INTERNAL,
     }
 }

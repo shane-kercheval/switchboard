@@ -24,11 +24,13 @@
 //! restart the clock or the progress schedule, so a call never goes silent
 //! past the limit and never outlives its budget by the sum of its parts.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+
+use crate::state::lock;
 
 /// What a wait defaults to when the caller gives no `timeout_seconds`.
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(50);
@@ -38,11 +40,13 @@ pub const MAX_WAIT_WITHOUT_KEEPALIVE: Duration = Duration::from_secs(50);
 pub const MAX_WAIT_WITH_KEEPALIVE: Duration = Duration::from_hours(1);
 /// How often a kept-alive wait fires its progress hook.
 pub const PROGRESS_INTERVAL: Duration = Duration::from_mins(1);
-/// How long the final observation at the deadline may take. A deadline fixed
-/// at the call's start has already passed when the final look runs, so the
-/// look needs its own small allowance or it would time out at once and the
-/// wait would return the state it saw last rather than the state as of now.
-/// Five seconds sits inside the gap between the 50-second cap and Claude
+/// How far past the deadline the call's finishing steps may run, all together.
+/// A deadline fixed at the call's start has already passed when the final
+/// observation runs, so that look — and anything read after it, such as an
+/// idle agent's output — needs an allowance, or the wait would return the
+/// state it saw last rather than the state as of now. It is one fixed point
+/// (the deadline plus five seconds) shared by every finishing step, never five
+/// seconds per step, so a 50-second call ends by 55 seconds: inside Claude
 /// Desktop's 60-second cancel.
 pub const FINAL_OBSERVATION_GRACE: Duration = Duration::from_secs(5);
 
@@ -60,9 +64,12 @@ pub struct WaitBudget {
     effective: Duration,
     cancel: CancellationToken,
     on_progress: Option<ProgressHook>,
-    /// The one progress interval of the call, created lazily on first use and
-    /// shared by every phase so a new phase cannot restart the schedule.
-    progress: Arc<Mutex<Option<tokio::time::Interval>>>,
+    /// When the call's next progress notification is due, shared by every
+    /// phase (and every clone) so a new phase cannot restart the schedule.
+    /// Held only for the instant it takes to check and advance it, so phases
+    /// that overlap never wait on each other, and a tick is claimed by exactly
+    /// one of them.
+    next_progress: Arc<Mutex<Option<tokio::time::Instant>>>,
 }
 
 impl WaitBudget {
@@ -84,7 +91,7 @@ impl WaitBudget {
             effective,
             cancel: CancellationToken::new(),
             on_progress: None,
-            progress: Arc::new(Mutex::new(None)),
+            next_progress: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -125,11 +132,12 @@ impl WaitBudget {
         self.run_until(self.deadline, fut).await
     }
 
-    /// [`Self::run`] with a small allowance past the deadline, for the final
-    /// observation of a wait — see [`FINAL_OBSERVATION_GRACE`].
+    /// [`Self::run`] against the call's finishing deadline — the deadline
+    /// plus [`FINAL_OBSERVATION_GRACE`], one fixed point for every finishing
+    /// step of the call.
     pub async fn run_with_grace<T>(&self, fut: impl Future<Output = T>) -> Outcome<T> {
-        let deadline = self.deadline.max(tokio::time::Instant::now()) + FINAL_OBSERVATION_GRACE;
-        self.run_until(deadline, fut).await
+        self.run_until(self.deadline + FINAL_OBSERVATION_GRACE, fut)
+            .await
     }
 
     async fn run_until<T>(
@@ -138,20 +146,17 @@ impl WaitBudget {
         fut: impl Future<Output = T>,
     ) -> Outcome<T> {
         tokio::pin!(fut);
-        let mut progress = self.progress.lock().await;
-        if progress.is_none() && self.on_progress.is_some() {
-            *progress = Some(tokio::time::interval_at(
-                tokio::time::Instant::now() + PROGRESS_INTERVAL,
-                PROGRESS_INTERVAL,
-            ));
-        }
         loop {
+            let due = self.next_progress_due();
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => return Outcome::Cancelled,
                 () = tokio::time::sleep_until(deadline) => return Outcome::Timeout,
-                () = tick(progress.as_mut()), if progress.is_some() => {
-                    if let Some(hook) = &self.on_progress {
+                () = sleep_until_due(due) => {
+                    if let Some(due) = due
+                        && self.claim_progress_tick(due)
+                        && let Some(hook) = &self.on_progress
+                    {
                         hook();
                     }
                 }
@@ -159,13 +164,37 @@ impl WaitBudget {
             }
         }
     }
+
+    /// When the next progress notification is due, starting the schedule on
+    /// first use; `None` when the call has no progress hook.
+    fn next_progress_due(&self) -> Option<tokio::time::Instant> {
+        self.on_progress.as_ref()?;
+        let mut next = lock(&self.next_progress);
+        Some(*next.get_or_insert_with(|| tokio::time::Instant::now() + PROGRESS_INTERVAL))
+    }
+
+    /// Claim the tick due at `due`, if no overlapping phase has: advance the
+    /// schedule by one interval, skipping any ticks already missed (a gap
+    /// between phases produces one notification, not a burst). Returns whether
+    /// this caller claimed it and so should fire the hook.
+    fn claim_progress_tick(&self, due: tokio::time::Instant) -> bool {
+        let mut next = lock(&self.next_progress);
+        if *next != Some(due) {
+            return false;
+        }
+        let now = tokio::time::Instant::now();
+        let mut following = due + PROGRESS_INTERVAL;
+        if following <= now {
+            following = now + PROGRESS_INTERVAL;
+        }
+        *next = Some(following);
+        true
+    }
 }
 
-async fn tick(interval: Option<&mut tokio::time::Interval>) {
-    match interval {
-        Some(interval) => {
-            interval.tick().await;
-        }
+async fn sleep_until_due(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(due) => tokio::time::sleep_until(due).await,
         None => std::future::pending().await,
     }
 }
@@ -312,6 +341,71 @@ mod tests {
             started.elapsed(),
             Duration::from_secs(1) + FINAL_OBSERVATION_GRACE,
             "the first observation ends at the deadline, the final one at its grace"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_phases_share_one_progress_schedule() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        let budget = WaitBudget::new(Some(300), true).with_progress(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let other = budget.clone();
+        let started = tokio::time::Instant::now();
+        let (one, two) = tokio::join!(
+            budget.run(tokio::time::sleep(Duration::from_secs(250))),
+            other.run(tokio::time::sleep(Duration::from_secs(250))),
+        );
+        assert!(matches!(one, Outcome::Done(())));
+        assert!(matches!(two, Outcome::Done(())));
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(250),
+            "neither waited on the other"
+        );
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            4,
+            "one notification per minute for the call, not one per phase"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_gap_between_phases_produces_one_notification_not_a_burst() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        let budget = WaitBudget::new(Some(3_600), true).with_progress(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let _ = budget
+            .run(tokio::time::sleep(Duration::from_secs(10)))
+            .await;
+        // Five minutes pass outside any phase.
+        tokio::time::sleep(Duration::from_mins(5)).await;
+        let _ = budget.run(tokio::time::sleep(Duration::from_secs(1))).await;
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            1,
+            "the missed ticks are skipped; the overdue one fires once"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finishing_steps_share_one_allowance() {
+        let budget = WaitBudget::new(Some(10), false);
+        let started = tokio::time::Instant::now();
+        let _ = budget.run(std::future::pending::<()>()).await;
+        let first = budget
+            .run_with_grace(tokio::time::sleep(Duration::from_secs(3)))
+            .await;
+        assert!(matches!(first, Outcome::Done(())));
+        let second = budget.run_with_grace(std::future::pending::<()>()).await;
+        assert!(matches!(second, Outcome::Timeout));
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(10) + FINAL_OBSERVATION_GRACE,
+            "two finishing steps end at one fixed point, not five seconds each"
         );
     }
 

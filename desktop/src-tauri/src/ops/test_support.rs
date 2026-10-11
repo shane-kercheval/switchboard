@@ -365,16 +365,9 @@ impl TestEnv {
         .id
     }
 
-    /// Give the agent a Claude session file holding one completed turn whose
-    /// assistant text is `text` and whose message id (the hydration key) is
-    /// `key`.
-    pub fn seed_claude_turn(
-        &self,
-        project_id: ProjectId,
-        agent_id: AgentId,
-        text: &str,
-        key: &str,
-    ) {
+    /// Point the agent at a new Claude session and return its file's path,
+    /// with the directory created.
+    fn new_claude_session(&self, project_id: ProjectId, agent_id: AgentId) -> PathBuf {
         let session = Uuid::now_v7();
         set_agent_session_locator_impl(&self.state, agent_id, SessionLocator::Uuid(session))
             .unwrap();
@@ -386,7 +379,147 @@ impl TestEnv {
         let path =
             switchboard_harness::claude_session_file_path(self.home.path(), &directory, &session);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
+    }
+
+    /// Give the agent a Claude session file holding one completed turn whose
+    /// assistant text is `text` and whose message id (the hydration key) is
+    /// `key`.
+    pub fn seed_claude_turn(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        text: &str,
+        key: &str,
+    ) {
+        let path = self.new_claude_session(project_id, agent_id);
         std::fs::write(&path, claude_session_jsonl("hi", text, key)).unwrap();
+    }
+
+    /// Give the agent a Claude session file that cannot be read: invalid
+    /// UTF-8, which the loader reports as an I/O error rather than salvaging
+    /// line by line.
+    pub fn seed_unreadable_session(&self, project_id: ProjectId, agent_id: AgentId) {
+        let path = self.new_claude_session(project_id, agent_id);
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+    }
+
+    /// Give the agent a Claude session file holding these completed turns, in
+    /// order: `(prompt, answer, message id, when)`.
+    pub fn seed_claude_turns(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        turns: &[(&str, &str, &str, chrono::DateTime<Utc>)],
+    ) {
+        let mut lines = Vec::new();
+        for (prompt, answer, key, at) in turns {
+            lines.push(serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": prompt },
+                "timestamp": at.to_rfc3339(),
+            }));
+            lines.push(serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "id": key,
+                    "model": "claude-sonnet-4-6",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": answer }],
+                    "stop_reason": "end_turn",
+                    "usage": { "input_tokens": 10, "output_tokens": 5 },
+                },
+                "timestamp": (*at + chrono::Duration::milliseconds(500)).to_rfc3339(),
+            }));
+        }
+        self.write_claude_session(project_id, agent_id, &lines);
+    }
+
+    /// Give the agent a Claude session file holding one completed turn that
+    /// edits a file `edits` times, each edit replacing 200 characters, before
+    /// answering `answer`. The first message id, the hydration key, is `key`.
+    pub fn seed_claude_editing_turn(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        edits: usize,
+        answer: &str,
+        key: &str,
+        at: chrono::DateTime<Utc>,
+    ) {
+        let stamp = |step: usize| {
+            (at + chrono::Duration::milliseconds(i64::try_from(step).unwrap())).to_rfc3339()
+        };
+        let mut lines = vec![serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": "edit" },
+            "timestamp": stamp(0),
+        })];
+        let assistant = |id: String, content: serde_json::Value, stop: &str, step: usize| {
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "id": id,
+                    "model": "claude-sonnet-4-6",
+                    "role": "assistant",
+                    "content": content,
+                    "stop_reason": stop,
+                    "usage": { "input_tokens": 10, "output_tokens": 5 },
+                },
+                "timestamp": stamp(step),
+            })
+        };
+        for edit in 0..edits {
+            let id = if edit == 0 {
+                key.to_owned()
+            } else {
+                format!("{key}-{edit}")
+            };
+            let tool = format!("toolu_{edit}");
+            let (old, new) = ("o".repeat(200), "n".repeat(200));
+            lines.push(assistant(
+                id,
+                serde_json::json!([{
+                    "type": "tool_use",
+                    "id": tool,
+                    "name": "Edit",
+                    "input": { "file_path": "/w/src/lib.rs", "old_string": old, "new_string": new },
+                }]),
+                "tool_use",
+                1 + edit * 2,
+            ));
+            lines.push(serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool,
+                    "content": "The file /w/src/lib.rs has been updated successfully.",
+                }] },
+                "timestamp": stamp(2 + edit * 2),
+                "toolUseResult": { "filePath": "/w/src/lib.rs", "oldString": old, "newString": new },
+            }));
+        }
+        lines.push(assistant(
+            format!("{key}-answer"),
+            serde_json::json!([{ "type": "text", "text": answer }]),
+            "end_turn",
+            1 + edits * 2,
+        ));
+        self.write_claude_session(project_id, agent_id, &lines);
+    }
+
+    fn write_claude_session(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        lines: &[serde_json::Value],
+    ) {
+        let path = self.new_claude_session(project_id, agent_id);
+        let body: String = lines
+            .iter()
+            .map(|l| serde_json::to_string(l).unwrap() + "\n")
+            .collect();
+        std::fs::write(&path, body).unwrap();
     }
 
     pub fn journal_path(&self, project_id: ProjectId) -> PathBuf {

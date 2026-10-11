@@ -62,6 +62,11 @@ pub struct ProjectDispatchFactoryProvider {
     roster: Vec<AgentRecord>,
     agents_by_id: Arc<Mutex<HashMap<AgentId, AgentRecord>>>,
     home_dir: PathBuf,
+    /// Agents the window reported it cannot listen to. A step resolving to
+    /// one is refused at dispatch — the authoritative point, because a step
+    /// may name its agent through any template expression (`{{ worker |
+    /// lower }}`), which only the interpreter resolves.
+    unheard: Vec<AgentId>,
 }
 
 impl ProjectDispatchFactoryProvider {
@@ -121,7 +126,15 @@ impl ProjectDispatchFactoryProvider {
             roster: roster.to_vec(),
             agents_by_id: Arc::clone(&state.agents_by_id),
             home_dir: home_dir.to_path_buf(),
+            unheard: Vec::new(),
         }
+    }
+
+    /// Refuse dispatch to these agents (see [`Self::unheard`]).
+    #[must_use]
+    pub fn with_unheard(mut self, unheard: Vec<AgentId>) -> Self {
+        self.unheard = unheard;
+        self
     }
 }
 
@@ -141,6 +154,13 @@ impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
                 // Not a bound agent of this run; `factory_for` reports it.
                 return Ok(());
             };
+            if self.unheard.contains(&agent_id) {
+                return Err(format!(
+                    "the desktop window cannot listen to {}'s events, so this step was not \
+                     sent — it would have run where nobody could see it",
+                    agent.name
+                ));
+            }
             // One shared policy, not a second copy — the two used to be written
             // independently and their refusal text had already drifted apart.
             match crate::commands::busy_fork_source(
@@ -1324,9 +1344,10 @@ pub fn invoke_workflow_with(
         .map(|r| (canonicalize_for_uniqueness(&r.name), r.id))
         .collect();
 
-    let provider = Arc::new(ProjectDispatchFactoryProvider::new(
-        state, &project, &roster, home_dir, generation,
-    ));
+    let provider = Arc::new(
+        ProjectDispatchFactoryProvider::new(state, &project, &roster, home_dir, generation)
+            .with_unheard(options.unsubscribed_agents.clone()),
+    );
 
     let run_id = Uuid::now_v7();
     let run_path = project.run_path(run_id);

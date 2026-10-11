@@ -5,22 +5,21 @@
 
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId};
-use switchboard_harness::{TurnStatus, turn_answer_text};
-
-use switchboard_harness::{Turn, TurnOutcome};
+use switchboard_harness::{Turn, TurnOutcome, TurnStatus, turn_answer_text};
 
 use crate::commands::{
-    AgentJournalView, ProjectConversation, ProjectListing, SendCorrelation, TurnRender,
-    list_project_agents_readonly_impl, list_projects_impl, load_agent_transcript,
-    load_project_conversation_impl, open_project_from_store,
+    AgentJournalView, ConversationItem, OutcomeStatus, ProjectConversation, ProjectListing,
+    SendCorrelation, TurnRender, list_project_agents_readonly_impl, list_projects_impl,
+    load_agent_transcript, load_project_conversation_impl, open_project_from_store,
 };
 use crate::error::AppError;
 use crate::state::{AppState, lock};
 use crate::workflow_commands::{WorkflowListing, list_workflows_impl};
 
-use super::budget::{BudgetSpec, CutSite};
+use super::budget::{BudgetSpec, CutSite, json_escaped_len};
 use super::ledger::SendStatus;
 use super::{OUTPUT_PAGE_CHARS, RESULT_BUDGET_CHARS};
 
@@ -100,8 +99,82 @@ pub async fn list_agents(
     Ok(out)
 }
 
-/// The project's merged conversation, cut to its last `last_n_items` items,
-/// in the shape the desktop renders.
+/// A project's conversation as an orchestrating agent reads it: what was sent,
+/// what each agent answered, and which turns failed or were cancelled.
+///
+/// **Not the shape the window renders.** The window's items carry every tool
+/// call with its input, output, and file diffs; one ordinary agentic turn
+/// serializes past the result budget on those alone. Here an agent turn is
+/// its answer text — every text block, the same text a forward sends — and
+/// tool calls, their output, and thinking are always left out, so an empty
+/// `text` means the turn wrote no text, not that it did nothing. Harness
+/// bookkeeping (compaction, slash commands, `/context` reports) is left out
+/// too.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ConversationDigest {
+    pub items: Vec<DigestItem>,
+    pub agents: Vec<DigestAgent>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DigestItem {
+    /// One send, once however many recipients it had. No `send_id` for a
+    /// prompt imported from a session that predates Switchboard.
+    UserMessage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        send_id: Option<SendId>,
+        agent_ids: Vec<AgentId>,
+        text: String,
+        /// Labels of the files attached, as the text refers to them.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<String>,
+        at: DateTime<Utc>,
+    },
+    /// One agent's turn. With a `send_id`, `read_send_output` pages the same
+    /// text; `send_correlation` says whether that match is a durable link or
+    /// positional (a guess).
+    AgentTurn {
+        agent_id: AgentId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        send_id: Option<SendId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        send_correlation: Option<SendCorrelation>,
+        status: TurnStatus,
+        text: String,
+        at: DateTime<Utc>,
+    },
+    /// A turn that failed or was cancelled, from the journal.
+    Outcome {
+        send_id: SendId,
+        agent_id: AgentId,
+        status: OutcomeStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        at: DateTime<Utc>,
+    },
+}
+
+/// An agent of the project, and whether its history loaded.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DigestAgent {
+    pub agent_id: AgentId,
+    pub name: String,
+    /// Its transcript could not be read, so its turns are missing above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<String>,
+    /// Lines of its transcript that could not be parsed and were skipped.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub parse_warnings: usize,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// The project's conversation, cut to its last `last_n_items` items, as a
+/// [`ConversationDigest`].
 ///
 /// Known limitation: no cursor paging. A caller that needs older items than
 /// one result holds has no way to ask for them; the remote-control plan's
@@ -111,15 +184,86 @@ pub async fn read_conversation(
     project_id: ProjectId,
     last_n_items: Option<usize>,
     home_dir: &Path,
-) -> Result<ProjectConversation, AppError> {
-    let mut conversation = load_project_conversation_impl(state, project_id, home_dir).await?;
+) -> Result<ConversationDigest, AppError> {
+    let conversation = load_project_conversation_impl(state, project_id, home_dir).await?;
+    let roster = list_project_agents_readonly_impl(state, project_id)?;
+    let mut digest = digest(conversation, &roster);
     if let Some(n) = last_n_items
-        && conversation.items.len() > n
+        && digest.items.len() > n
     {
-        let cut = conversation.items.len() - n;
-        conversation.items.drain(..cut);
+        let cut = digest.items.len() - n;
+        digest.items.drain(..cut);
     }
-    Ok(conversation)
+    Ok(digest)
+}
+
+fn digest(conversation: ProjectConversation, roster: &[AgentRecord]) -> ConversationDigest {
+    let items = conversation
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            ConversationItem::UserMessage {
+                send_id,
+                agent_ids,
+                text,
+                attachments,
+                at,
+                ..
+            } => Some(DigestItem::UserMessage {
+                send_id,
+                agent_ids,
+                text,
+                attachments: attachments.into_iter().map(|a| a.label).collect(),
+                at,
+            }),
+            ConversationItem::AgentTurn {
+                agent_id,
+                send_id,
+                send_correlation,
+                status,
+                items,
+                started_at,
+                ..
+            } => Some(DigestItem::AgentTurn {
+                agent_id,
+                send_id,
+                send_correlation,
+                status,
+                text: turn_answer_text(&items),
+                at: started_at,
+            }),
+            ConversationItem::Outcome {
+                send_id,
+                agent_id,
+                status,
+                reason,
+                at,
+                ..
+            } => Some(DigestItem::Outcome {
+                send_id,
+                agent_id,
+                status,
+                reason,
+                at,
+            }),
+            ConversationItem::SystemMarker { .. } => None,
+        })
+        .collect();
+    let agents = conversation
+        .agents
+        .into_iter()
+        .map(|meta| DigestAgent {
+            agent_id: meta.agent_id,
+            name: roster
+                .iter()
+                .find(|a| a.id == meta.agent_id)
+                .map(|a| a.name.clone())
+                .unwrap_or_default(),
+            load_error: meta.load_error,
+            parse_warnings: meta.warnings.len(),
+        })
+        .collect();
+    ConversationDigest { items, agents }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -187,53 +331,66 @@ pub async fn read_send_output(
         ));
     }
     let agent = agent_in_project(state, project_id, agent_id)?;
-    let correlated = correlate_agent(state, project_id, &agent, home_dir).await?;
-    let turn = correlated.iter().rev().find_map(|turn| match turn {
-        CorrelatedTurn {
-            send_id: Some(s),
-            correlation,
-            status,
-            text,
-        } if *s == send_id => Some((*correlation, *status, text.as_str())),
-        _ => None,
-    });
-    let Some((correlation, status, text)) = turn else {
-        return Err(AppError::SendUnknown(send_id));
+    let (view, correlated) = correlate_agent(state, project_id, &agent, home_dir).await?;
+    let turn = correlated
+        .iter()
+        .rev()
+        .find(|turn| turn.send_id == Some(send_id));
+    // The journal's recorded outcome wins over the transcript, as it does for
+    // `wait_send` after a restart: a failed or cancelled send with partial
+    // content on disk is not a completed answer, and one with no reply at all
+    // still pages (empty) rather than reading as unknown.
+    let status = match (view.outcomes.get(&send_id), turn) {
+        (Some((OutcomeStatus::Cancelled, _)), _) => SendStatus::Cancelled,
+        (Some((OutcomeStatus::Failed, _)), _) => SendStatus::Failed,
+        (None, Some(turn)) => match turn.status {
+            TurnStatus::Complete => SendStatus::Completed,
+            TurnStatus::Streaming => SendStatus::Running,
+            TurnStatus::Failed => SendStatus::Failed,
+        },
+        (None, None) if view.sends.iter().any(|(s, _)| *s == send_id) => SendStatus::Started,
+        (None, None) => return Err(AppError::SendUnknown(send_id)),
     };
-    let source = match correlation {
+    let source = match turn.and_then(|t| t.correlation) {
         Some(SendCorrelation::DurableLink) => OutputSource::DurableLink,
-        _ => OutputSource::Positional,
+        Some(SendCorrelation::Positional) => OutputSource::Positional,
+        _ => OutputSource::Journal,
     };
-    let status = match status {
-        TurnStatus::Complete => SendStatus::Completed,
-        TurnStatus::Streaming => SendStatus::Running,
-        TurnStatus::Failed => SendStatus::Failed,
-    };
+    let text = turn.map_or("", |t| t.text.as_str());
     Ok(page(send_id, agent_id, status, text, offset, source))
 }
 
 /// One of an agent's transcript turns, correlated to its send exactly as the
 /// merged conversation correlates it, with its answer text.
-struct CorrelatedTurn {
-    send_id: Option<SendId>,
-    correlation: Option<SendCorrelation>,
-    status: TurnStatus,
-    text: String,
+pub(crate) struct CorrelatedTurn {
+    pub send_id: Option<SendId>,
+    pub correlation: Option<SendCorrelation>,
+    pub status: TurnStatus,
+    pub text: String,
+}
+
+/// The project's journal, read off the async workers: a blocking read cannot
+/// be interrupted by a wait's deadline, so it must not hold a worker thread.
+pub(crate) async fn read_journal(
+    project: &Project,
+) -> Result<Vec<switchboard_core::JournalRecord>, AppError> {
+    let path = project.journal_path();
+    tokio::task::spawn_blocking(move || switchboard_core::journal::read_records(&path))
+        .await
+        .map_err(|e| AppError::Internal(format!("journal read task failed: {e}")))?
+        .map_err(AppError::from)
 }
 
 /// Read one agent's transcript and correlate its turns to its journaled
-/// sends with the merge's own per-agent classifier — one file parsed, the
+/// sends with the merge's own per-agent derivation — one file parsed, the
 /// same matching the merged conversation applies, so a `send_id` reported
 /// here pages the same reply through `read_send_output`.
-async fn correlate_agent(
-    state: &AppState,
-    project_id: ProjectId,
+pub(crate) async fn correlate_turns(
+    project: &Project,
     agent: &AgentRecord,
+    view: &AgentJournalView,
     home_dir: &Path,
 ) -> Result<Vec<CorrelatedTurn>, AppError> {
-    let project = project_readonly(state, project_id)?;
-    let records = switchboard_core::journal::read_records(&project.journal_path())?;
-    let view = AgentJournalView::from_records(&records, agent.id);
     let transcript = {
         let project = project.clone();
         let agent = agent.clone();
@@ -265,15 +422,19 @@ async fn correlate_agent(
         .collect())
 }
 
-/// Characters a character costs once JSON-escaped: quotes, backslashes, and
-/// control characters grow, so a page is sized on what it will serialize to,
-/// never on raw characters, or a reply full of code could exceed the budget.
-fn escaped_len(c: char) -> usize {
-    match c {
-        '"' | '\\' | '\n' | '\r' | '\t' => 2,
-        c if (c as u32) < 0x20 => 6,
-        _ => 1,
-    }
+/// [`correlate_turns`] for an agent of `project_id`, with the agent's journal
+/// view it used.
+async fn correlate_agent(
+    state: &AppState,
+    project_id: ProjectId,
+    agent: &AgentRecord,
+    home_dir: &Path,
+) -> Result<(AgentJournalView, Vec<CorrelatedTurn>), AppError> {
+    let project = project_readonly(state, project_id)?;
+    let records = read_journal(&project).await?;
+    let view = AgentJournalView::from_records(&records, agent.id);
+    let turns = correlate_turns(&project, agent, &view, home_dir).await?;
+    Ok((view, turns))
 }
 
 fn page(
@@ -290,7 +451,7 @@ fn page(
         .chars()
         .skip(offset)
         .take_while(|c| {
-            let cost = escaped_len(*c);
+            let cost = json_escaped_len(*c);
             if cost > budget {
                 return false;
             }
@@ -365,7 +526,7 @@ pub async fn read_agent_output(
         });
     }
     let project = project_readonly(state, project_id)?;
-    let records = switchboard_core::journal::read_records(&project.journal_path())?;
+    let records = read_journal(&project).await?;
     if let Some((outcome, note)) =
         crate::commands::latest_turn_outcome(&records, agent_id, &agent.name)
     {
@@ -392,7 +553,8 @@ pub async fn read_agent_output(
             source: OutputSource::Journal,
         });
     }
-    let correlated = correlate_agent(state, project_id, &agent, home_dir).await?;
+    let view = AgentJournalView::from_records(&records, agent_id);
+    let correlated = correlate_turns(&project, &agent, &view, home_dir).await?;
     let latest = correlated
         .into_iter()
         .rev()
@@ -419,10 +581,11 @@ pub async fn read_agent_output(
     })
 }
 
-/// The budget rules for a [`ProjectConversation`]: text, tool input and
-/// output may be cut; the oldest items are dropped when the structure alone is
-/// over; an agent turn's text reads on through `read_send_output` when the
-/// turn has a send, and nothing else can be read on.
+/// The budget rules for a [`ConversationDigest`]: message and answer text may
+/// be cut; the oldest items are dropped when the structure alone is over; an
+/// agent turn's text reads on through `read_send_output` from where it was cut
+/// when the turn has a send (its text is the whole reply that call pages), and
+/// a user message's cannot be read on.
 #[must_use]
 pub fn conversation_budget(project_id: ProjectId) -> BudgetSpec {
     BudgetSpec {
@@ -430,22 +593,20 @@ pub fn conversation_budget(project_id: ProjectId) -> BudgetSpec {
         droppable_list: Some("items"),
         read_with: "read_conversation with a smaller last_n_items",
         pointer: Box::new(move |site: &CutSite<'_>| {
-            // The item (`ConversationItem::AgentTurn`) is the ancestor that
-            // carries the send; the cut field's own object is a `TurnItem`.
-            let turn = site.ancestors.iter().rev().find(|o| {
-                o.get("kind").and_then(serde_json::Value::as_str) == Some("agent_turn")
-            })?;
-            let send_id = turn.get("send_id")?.as_str()?;
-            let agent_id = turn.get("agent_id")?.clone();
-            (site.key == "text").then(|| {
-                serde_json::json!({
-                    "tool": "read_send_output",
-                    "project_id": project_id,
-                    "send_id": send_id,
-                    "agent_id": agent_id,
-                    "offset": 0,
-                })
-            })
+            let item = site.ancestors.last()?;
+            if site.key != "text"
+                || item.get("kind").and_then(serde_json::Value::as_str) != Some("agent_turn")
+            {
+                return None;
+            }
+            let send_id = item.get("send_id")?.as_str()?;
+            Some(serde_json::json!({
+                "tool": "read_send_output",
+                "project_id": project_id,
+                "send_id": send_id,
+                "agent_id": item.get("agent_id")?.clone(),
+                "offset": site.kept_chars,
+            }))
         }),
     }
 }

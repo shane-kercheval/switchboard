@@ -6345,9 +6345,36 @@ fn commit_identity_join(
 // One linear pass over the journal + one over the transcripts; splitting it
 // would scatter the user-message grouping, outcome collection, and order-zip
 // correlation that are read together.
-/// Apply one `TurnLink` to an agent's link map under the poison rule above.
-/// Shared by the project merge and the single-agent view so the two cannot
-/// disagree about which links are trusted.
+/// Apply one `TurnLink` to an agent's link map under the poison rule.
+///
+/// A `hydration_key` is per-turn-unique, so in normal data each key
+/// maps to exactly one send. Enforce that invariant defensively
+/// rather than trusting it: if a key ever appears with a
+/// **conflicting** `send_id` — a stale/duplicate link (e.g. an
+/// enrichment read that raced the session-file flush, a future field
+/// reshape, a corrupt journal) — **poison** it: drop it so BOTH turns
+/// fall to positional, bounding any anomaly to "no worse than
+/// positional" rather than a silent mis-group (a last-write-wins
+/// `insert` would confidently reassign a turn to the wrong send). An
+/// idempotent same-key-same-send re-write is fine and never poisons;
+/// a poisoned key stays out even if it reappears later.
+///
+/// NOTE: this catches a stale link whose key collides with a
+/// legitimately-linked turn. The complementary cases — a stale key
+/// matching a turn with **no** link of its own (no collision fires), a
+/// link naming a foreign/missing send, or two keys naming one send — are
+/// caught by the window guard + claim-once in `classify_agent_turns` (a
+/// link is trusted only when the turn ran within that send's dispatch
+/// window and the send isn't already claimed). Together they bound any
+/// stale/corrupt link to "no worse than positional."
+///
+/// **Load-bearing axiom:** all of this presupposes a `hydration_key`
+/// identifies exactly ONE turn per agent. Key *reuse* across two turns
+/// (a harness that repeats an id, or a resumed/forked session that
+/// replays one) would defeat both layers — a link internally consistent
+/// for one turn would mis-group the other. Fresh Claude `message.id`s
+/// and Codex `turn_context.turn_id`s satisfy it today; a key-reusing
+/// harness must not be given a `TurnLink` without revisiting this.
 fn record_turn_link(
     links: &mut HashMap<String, SendId>,
     poison: &mut HashSet<String>,
@@ -6380,41 +6407,71 @@ fn record_turn_link(
     }
 }
 
-/// One agent's side of the journal, as the merge derives it: its sends in
-/// dispatch order, the instant its journaled history begins, its trusted
-/// links, and its sends' prompts. The inputs [`classify_agent_turns`] needs
-/// to correlate that agent's transcript on its own — the same correlation the
-/// merged conversation applies, for a reader that needs one agent's turns
-/// without parsing every agent's file.
+/// One agent's side of the journal: its sends in dispatch order — **all** of
+/// them, completed and not (a send cancelled or failed after the agent wrote
+/// content leaves a partial harness turn that must be paired) — the instant its
+/// journaled history begins (the boundary between imported pre-journaling turns
+/// and Switchboard-dispatched ones), its trusted durable links (under the
+/// poison rule in [`record_turn_link`]), its sends' prompts, and each send's
+/// recorded non-completed outcome.
+///
+/// **The one derivation.** The project merge and the single-agent readers
+/// (`ops::read`) both correlate an agent's transcript through this view, built
+/// by [`Self::by_agent`] in one pass, so a reply's `send_id` reported to one
+/// caller pages the same reply for every other. The prompt is the agent's own
+/// record's: every recipient of a fan-out receives identical text today, and
+/// if per-recipient prompts ever differ, the agent's own is the text its
+/// transcript echoes.
+#[derive(Default)]
 pub(crate) struct AgentJournalView {
     pub sends: Vec<(SendId, chrono::DateTime<chrono::Utc>)>,
     pub journal_start: Option<chrono::DateTime<chrono::Utc>>,
     pub links: HashMap<String, SendId>,
     pub send_prompts: HashMap<SendId, (String, Vec<Attachment>)>,
+    /// The non-completed outcome the journal recorded for a send, with its
+    /// reason. Absent for a completed send (the journal writes no outcome for
+    /// one) and for one still running.
+    pub outcomes: HashMap<SendId, (OutcomeStatus, Option<String>)>,
+    poison: HashSet<String>,
 }
 
 impl AgentJournalView {
+    /// Every agent's view, in one pass over the journal.
+    pub(crate) fn by_agent(
+        records: &[switchboard_core::JournalRecord],
+    ) -> HashMap<AgentId, AgentJournalView> {
+        Self::build(records, None)
+    }
+
+    /// One agent's view. Other agents' records are skipped, not indexed.
     pub(crate) fn from_records(
         records: &[switchboard_core::JournalRecord],
         agent_id: AgentId,
     ) -> Self {
-        let mut view = Self {
-            sends: Vec::new(),
-            journal_start: None,
-            links: HashMap::new(),
-            send_prompts: HashMap::new(),
-        };
-        let mut poison: HashSet<String> = HashSet::new();
+        Self::build(records, Some(agent_id))
+            .remove(&agent_id)
+            .unwrap_or_default()
+    }
+
+    /// The one per-record step behind both constructors: every agent's view,
+    /// or only `only`'s.
+    fn build(
+        records: &[switchboard_core::JournalRecord],
+        only: Option<AgentId>,
+    ) -> HashMap<AgentId, AgentJournalView> {
+        let wanted = |agent_id: &AgentId| only.is_none_or(|only| only == *agent_id);
+        let mut views: HashMap<AgentId, AgentJournalView> = HashMap::new();
         for record in records {
             match record {
                 switchboard_core::JournalRecord::Send {
                     send_id,
-                    agent_id: a,
+                    agent_id,
                     prompt,
                     attachments,
                     at,
                     ..
-                } if *a == agent_id => {
+                } if wanted(agent_id) => {
+                    let view = views.entry(*agent_id).or_default();
                     view.sends.push((*send_id, *at));
                     view.journal_start = Some(view.journal_start.map_or(*at, |s| s.min(*at)));
                     view.send_prompts
@@ -6423,26 +6480,40 @@ impl AgentJournalView {
                 }
                 switchboard_core::JournalRecord::TurnLink {
                     send_id,
-                    agent_id: a,
+                    agent_id,
                     hydration_key,
                     ..
-                } if *a == agent_id => {
+                } if wanted(agent_id) => {
+                    let view = views.entry(*agent_id).or_default();
                     record_turn_link(
                         &mut view.links,
-                        &mut poison,
-                        agent_id,
+                        &mut view.poison,
+                        *agent_id,
                         hydration_key.clone(),
                         *send_id,
                     );
                 }
+                switchboard_core::JournalRecord::Outcome {
+                    send_id,
+                    agent_id,
+                    outcome,
+                    ..
+                } if wanted(agent_id) => {
+                    let (status, reason, _) = parse_outcome(outcome);
+                    views
+                        .entry(*agent_id)
+                        .or_default()
+                        .outcomes
+                        .insert(*send_id, (status, reason));
+                }
                 _ => {}
             }
         }
-        view
+        views
     }
 
     /// Correlate `turns` (this agent's transcript) to its sends exactly as the
-    /// merged conversation would.
+    /// merged conversation does.
     pub(crate) fn classify(&self, turns: &[switchboard_harness::Turn]) -> Vec<TurnRender> {
         classify_agent_turns(
             turns,
@@ -6473,31 +6544,13 @@ fn merge_project_conversation(
     let mut index_of: HashMap<SendId, usize> = HashMap::new();
     let mut user_messages: Vec<UserMessageGroup> = Vec::new();
     // The journal's `turn_id` is the dispatcher's, distinct from the harness
-    // session file's own turn ids, so they can't be joined directly. Instead we
-    // correlate each agent's harness turns to its sends by ORDER: the Nth harness
-    // agent turn answers the Nth send dispatched to it (the dispatcher runs an
-    // agent's turns FIFO and journals in that order). `agent_sends` is each
-    // agent's sends in dispatch order — **all** of them, completed and not: a
-    // send cancelled/failed *after* the agent wrote content leaves a partial
-    // harness turn that must be paired (excluding non-completed sends here is the
-    // bug that double-rendered the prompt). A non-completed send's cancelled/failed
-    // badge comes from its Outcome marker, which renders alongside the turn
-    // (`ProjectConversation` render-both contract).
-    let mut agent_sends: HashMap<AgentId, Vec<(SendId, chrono::DateTime<chrono::Utc>)>> =
-        HashMap::new();
-    // Each agent's earliest journaled-send instant — the boundary between its
-    // pre-journaling history (attached/imported turns, older than this) and its
-    // Switchboard-dispatched turns. Used to count an agent's leading imported
-    // turns by timestamp rather than by `min(turns, sends)`, which can't tell a
-    // leading imported turn from a trailing in-flight send when both are present.
-    let mut journal_start: HashMap<AgentId, chrono::DateTime<chrono::Utc>> = HashMap::new();
-    // Durable send↔turn links (`hydration_key → send_id`), per agent, from
-    // `TurnLink` records. The key-join uses these to match content-bearing turns
-    // to their sends exactly, before the positional fallback runs. `agent_link_poison`
-    // holds keys seen with conflicting sends (see the `TurnLink` arm) — a poisoned
-    // key is excluded from the join so the anomaly degrades to positional.
-    let mut agent_links: HashMap<AgentId, HashMap<String, SendId>> = HashMap::new();
-    let mut agent_link_poison: HashMap<AgentId, HashSet<String>> = HashMap::new();
+    // session file's own turn ids, so they can't be joined directly. Each agent's
+    // harness turns are correlated to its sends through its `AgentJournalView`
+    // (durable links first, then order: the Nth harness agent turn answers the Nth
+    // send dispatched to it, since the dispatcher runs an agent's turns FIFO and
+    // journals in that order). Built once, before the records are consumed below,
+    // by the same builder the single-agent readers use.
+    let mut views = AgentJournalView::by_agent(&journal);
     for record in journal {
         match record {
             switchboard_core::JournalRecord::Send {
@@ -6508,15 +6561,6 @@ fn merge_project_conversation(
                 attachments,
                 at,
             } => {
-                agent_sends.entry(agent_id).or_default().push((send_id, at));
-                journal_start
-                    .entry(agent_id)
-                    .and_modify(|earliest| {
-                        if at < *earliest {
-                            *earliest = at;
-                        }
-                    })
-                    .or_insert(at);
                 if let Some(&i) = index_of.get(&send_id) {
                     let entry = &mut user_messages[i];
                     if !entry.1.contains(&agent_id) {
@@ -6554,62 +6598,13 @@ fn merge_project_conversation(
                     at: started_at,
                 });
             }
-            switchboard_core::JournalRecord::TurnLink {
-                send_id,
-                agent_id,
-                hydration_key,
-                ..
-            } => {
-                // A `hydration_key` is per-turn-unique, so in normal data each key
-                // maps to exactly one send. Enforce that invariant defensively
-                // rather than trusting it: if a key ever appears with a
-                // **conflicting** send_id — a stale/duplicate link (e.g. an
-                // enrichment read that raced the session-file flush, a future field
-                // reshape, a corrupt journal) — **poison** it: drop it so BOTH turns
-                // fall to positional, bounding any anomaly to "no worse than
-                // positional" rather than a silent mis-group (a last-write-wins
-                // `insert` would confidently reassign a turn to the wrong send). An
-                // idempotent same-key-same-send re-write is fine and never poisons;
-                // a poisoned key stays out even if it reappears later.
-                //
-                // NOTE: this catches a stale link whose key collides with a
-                // legitimately-linked turn. The complementary cases — a stale key
-                // matching a turn with **no** link of its own (no collision fires), a
-                // link naming a foreign/missing send, or two keys naming one send — are
-                // caught by the window guard + claim-once in `classify_agent_turns` (a
-                // link is trusted only when the turn ran within that send's dispatch
-                // window and the send isn't already claimed). Together they bound any
-                // stale/corrupt link to "no worse than positional."
-                //
-                // **Load-bearing axiom:** all of this presupposes a `hydration_key`
-                // identifies exactly ONE turn per agent. Key *reuse* across two turns
-                // (a harness that repeats an id, or a resumed/forked session that
-                // replays one) would defeat both layers — a link internally consistent
-                // for one turn would mis-group the other. Fresh Claude `message.id`s
-                // and Codex `turn_context.turn_id`s satisfy it today; a key-reusing
-                // harness must not be given a `TurnLink` without revisiting this.
-                record_turn_link(
-                    agent_links.entry(agent_id).or_default(),
-                    agent_link_poison.entry(agent_id).or_default(),
-                    agent_id,
-                    hydration_key,
-                    send_id,
-                );
-            }
-            // A future journal-record kind we don't yet render — degrade by
-            // skipping it rather than failing the whole load.
+            // `TurnLink`s are applied by `AgentJournalView::by_agent` above,
+            // under the poison rule documented on `record_turn_link`. A future
+            // journal-record kind we don't yet render degrades by being skipped
+            // rather than failing the whole load.
             _ => {}
         }
     }
-    // Each send's journaled prompt + attachments — the two halves the surplus
-    // arm of `classify_turns_by_provenance` reconstructs the dispatched text
-    // from. Taken before the grouped messages are consumed below.
-    let send_prompts: HashMap<SendId, (String, Vec<Attachment>)> = user_messages
-        .iter()
-        .map(|(send_id, _, prompt, attachments, _)| {
-            (*send_id, (prompt.clone(), attachments.clone()))
-        })
-        .collect();
     for (send_id, agent_ids, text, attachments, at) in user_messages {
         items.push(ConversationItem::UserMessage {
             id: send_id,
@@ -6640,8 +6635,6 @@ fn merge_project_conversation(
         // cannot help), confined to the discouraged bare-CLI-on-a-driven-session
         // pattern and pinned by a characterization test — live in those helpers'
         // docs. The key-join dissolves it for any turn that carries a link.
-        let all_sends = agent_sends.get(&agent_id).map_or(&[][..], Vec::as_slice);
-        let journal_start_at = journal_start.get(&agent_id).copied();
         // Durable key-join first (authoritative), positional fallback for the
         // residual. `classify_agent_turns` matches each content-bearing turn to its
         // send by `hydration_key` (suppressing the harness-echoed prompt via the
@@ -6649,10 +6642,7 @@ fn merge_project_conversation(
         // positionally — recomputing `turn_offset`/`dangling`/provenance-vs-count
         // from that residual view. All the front-offset / dangling / straddling
         // rationale lives in those helpers' docs now.
-        let empty_links = HashMap::new();
-        let links = agent_links.get(&agent_id).unwrap_or(&empty_links);
-        let renders =
-            classify_agent_turns(&turns, all_sends, links, &send_prompts, journal_start_at);
+        let renders = views.remove(&agent_id).unwrap_or_default().classify(&turns);
         for (turn, render) in turns.into_iter().zip(renders) {
             match (turn, render) {
                 (

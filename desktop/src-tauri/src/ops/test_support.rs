@@ -71,9 +71,10 @@ impl Script {
 
 /// A harness adapter that plays one [`Script`] per dispatch, in order, and
 /// replies `ack: <prompt>` once the scripts run out. Records every prompt it
-/// was given, and, like the real Claude adapter, leaves a completed turn in
-/// the agent's session file under `home`, so disk reads (forwards from an
-/// idle source, the restart fallback) see what the turn produced.
+/// was given, and, like the real Claude adapter, leaves a completed or
+/// cancelled turn's text in the agent's session file under `home`, so disk
+/// reads (forwards from an idle source, the restart fallback, the
+/// conversation) see what the turn produced.
 pub struct ScriptedAdapter {
     scripts: Mutex<VecDeque<Script>>,
     home: PathBuf,
@@ -125,6 +126,10 @@ impl HarnessAdapter for ScriptedAdapter {
         let prompt = prompt.to_owned();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
+            let key = script
+                .key
+                .clone()
+                .unwrap_or_else(|| format!("msg-{turn_id}"));
             let _ = tx.send(AdapterEvent::ContentChunk {
                 turn_id,
                 kind: ContentKind::Text,
@@ -136,14 +141,17 @@ impl HarnessAdapter for ScriptedAdapter {
                 } else {
                     tokio::select! {
                         () = gate.notified() => {}
-                        () = options.cancel_token.cancelled() => return,
+                        () = options.cancel_token.cancelled() => {
+                            // Claude has already written what it streamed, so a
+                            // cancelled turn leaves its partial reply on disk.
+                            if let Some(path) = &session_file {
+                                append_claude_turn(path, &prompt, &script.text, &key);
+                            }
+                            return;
+                        }
                     }
                 }
             }
-            let key = script
-                .key
-                .clone()
-                .unwrap_or_else(|| format!("msg-{turn_id}"));
             let outcome = if script.fail {
                 TurnOutcome::Failed {
                     kind: switchboard_harness::FailureKind::HarnessError,
@@ -508,7 +516,8 @@ impl TestEnv {
         self.write_claude_session(project_id, agent_id, &lines);
     }
 
-    fn write_claude_session(
+    /// Point the agent at a new Claude session file holding these records.
+    pub fn write_claude_session(
         &self,
         project_id: ProjectId,
         agent_id: AgentId,

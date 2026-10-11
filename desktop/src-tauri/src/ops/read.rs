@@ -3,12 +3,13 @@
 //! window has not loaded, when the window is slow, and when the working
 //! directory is gone.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId};
-use switchboard_harness::{Turn, TurnOutcome, TurnStatus, turn_answer_text};
+use switchboard_harness::{SystemMarker, Turn, TurnOutcome, TurnStatus, turn_answer_text};
 
 use crate::commands::{
     AgentJournalView, ConversationItem, OutcomeStatus, ProjectConversation, ProjectListing,
@@ -108,8 +109,16 @@ pub async fn list_agents(
 /// its answer text — every text block, the same text a forward sends — and
 /// tool calls, their output, and thinking are always left out, so an empty
 /// `text` means the turn wrote no text, not that it did nothing. Harness
-/// bookkeeping (compaction, slash commands, `/context` reports) is left out
-/// too.
+/// bookkeeping is left out too, except a one-line marker where an agent's
+/// context was compacted: no reply says so, and an agent may have lost
+/// earlier instructions there.
+///
+/// **One status per turn.** A journaled failure or cancellation is folded
+/// into the turn it ended, because the session file can record a cancelled
+/// partial reply as complete, and the journal's marker sorts before the reply
+/// (it carries the dispatch time), so trimming the oldest items could keep
+/// the reply and lose the marker. A standalone outcome remains only for a
+/// send that left no reply.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ConversationDigest {
     pub items: Vec<DigestItem>,
@@ -131,28 +140,55 @@ pub enum DigestItem {
         attachments: Vec<String>,
         at: DateTime<Utc>,
     },
-    /// One agent's turn. With a `send_id`, `read_send_output` pages the same
-    /// text; `send_correlation` says whether that match is a durable link or
-    /// positional (a guess).
+    /// One agent's turn. With a `send_id`, `read_send_output` with
+    /// [`ReadFrom::Transcript`] pages exactly this text; `send_correlation`
+    /// says whether that match is a durable link or positional (a guess), and
+    /// so how far to trust a journaled outcome applied through it.
     AgentTurn {
         agent_id: AgentId,
         #[serde(skip_serializing_if = "Option::is_none")]
         send_id: Option<SendId>,
         #[serde(skip_serializing_if = "Option::is_none")]
         send_correlation: Option<SendCorrelation>,
-        status: TurnStatus,
+        status: DigestTurnStatus,
+        /// Why the turn failed or was cancelled, when the journal says.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// The failure's kind (`usage_limit`, `auth_failure`, …), so a caller
+        /// does not retry into a limit.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure_kind: Option<String>,
         text: String,
         at: DateTime<Utc>,
     },
-    /// A turn that failed or was cancelled, from the journal.
+    /// A send that failed or was cancelled before the agent replied.
     Outcome {
         send_id: SendId,
         agent_id: AgentId,
         status: OutcomeStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure_kind: Option<String>,
         at: DateTime<Utc>,
     },
+    /// The agent's harness compacted its context here: the agent may no
+    /// longer hold instructions or decisions from before this point. A reply
+    /// compacted mid-way continues after the marker as a turn with no send.
+    Compacted {
+        agent_id: AgentId,
+        at: DateTime<Utc>,
+    },
+}
+
+/// An agent turn's final status, with the journal's outcome applied.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DigestTurnStatus {
+    Complete,
+    Running,
+    Failed,
+    Cancelled,
 }
 
 /// An agent of the project, and whether its history loaded.
@@ -167,6 +203,12 @@ pub struct DigestAgent {
     #[serde(skip_serializing_if = "is_zero")]
     pub parse_warnings: usize,
 }
+
+/// A journaled non-completed outcome: status, reason, failure kind.
+type JournalOutcome = (OutcomeStatus, Option<String>, Option<String>);
+
+/// One recipient of one send.
+type SendTo = (SendId, AgentId);
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(n: &usize) -> bool {
@@ -198,6 +240,7 @@ pub async fn read_conversation(
 }
 
 fn digest(conversation: ProjectConversation, roster: &[AgentRecord]) -> ConversationDigest {
+    let (outcomes, answered) = journal_outcomes(&conversation.items);
     let items = conversation
         .items
         .into_iter()
@@ -224,28 +267,42 @@ fn digest(conversation: ProjectConversation, roster: &[AgentRecord]) -> Conversa
                 items,
                 started_at,
                 ..
-            } => Some(DigestItem::AgentTurn {
-                agent_id,
-                send_id,
-                send_correlation,
-                status,
-                text: turn_answer_text(&items),
-                at: started_at,
-            }),
+            } => {
+                let outcome = send_id.and_then(|s| outcomes.get(&(s, agent_id)));
+                let (status, reason, failure_kind) = turn_status(status, outcome);
+                Some(DigestItem::AgentTurn {
+                    agent_id,
+                    send_id,
+                    send_correlation,
+                    status,
+                    reason,
+                    failure_kind,
+                    text: turn_answer_text(&items),
+                    at: started_at,
+                })
+            }
             ConversationItem::Outcome {
                 send_id,
                 agent_id,
                 status,
                 reason,
+                failure_kind,
                 at,
                 ..
-            } => Some(DigestItem::Outcome {
+            } => (!answered.contains(&(send_id, agent_id))).then_some(DigestItem::Outcome {
                 send_id,
                 agent_id,
                 status,
                 reason,
+                failure_kind,
                 at,
             }),
+            ConversationItem::SystemMarker {
+                agent_id,
+                marker: SystemMarker::Compaction { .. },
+                at,
+                ..
+            } => Some(DigestItem::Compacted { agent_id, at }),
             ConversationItem::SystemMarker { .. } => None,
         })
         .collect();
@@ -264,6 +321,66 @@ fn digest(conversation: ProjectConversation, roster: &[AgentRecord]) -> Conversa
         })
         .collect();
     ConversationDigest { items, agents }
+}
+
+/// The journal's outcome for each `(send, agent)`, and which of those sends
+/// have a reply in the conversation to fold it into.
+fn journal_outcomes(
+    items: &[ConversationItem],
+) -> (HashMap<SendTo, JournalOutcome>, HashSet<SendTo>) {
+    let mut outcomes: HashMap<SendTo, JournalOutcome> = HashMap::new();
+    let mut answered: HashSet<SendTo> = HashSet::new();
+    for item in items {
+        match item {
+            ConversationItem::Outcome {
+                send_id,
+                agent_id,
+                status,
+                reason,
+                failure_kind,
+                ..
+            } => {
+                outcomes.insert(
+                    (*send_id, *agent_id),
+                    (*status, reason.clone(), failure_kind.clone()),
+                );
+            }
+            ConversationItem::AgentTurn {
+                send_id: Some(send_id),
+                agent_id,
+                ..
+            } => {
+                answered.insert((*send_id, *agent_id));
+            }
+            _ => {}
+        }
+    }
+    (outcomes, answered)
+}
+
+/// A turn's final status: the journal's failure or cancellation when it
+/// recorded one, otherwise what the session file says.
+fn turn_status(
+    status: TurnStatus,
+    outcome: Option<&JournalOutcome>,
+) -> (DigestTurnStatus, Option<String>, Option<String>) {
+    match outcome {
+        Some((OutcomeStatus::Cancelled, reason, _)) => {
+            (DigestTurnStatus::Cancelled, reason.clone(), None)
+        }
+        Some((OutcomeStatus::Failed, reason, kind)) => {
+            (DigestTurnStatus::Failed, reason.clone(), kind.clone())
+        }
+        None => (
+            match status {
+                TurnStatus::Complete => DigestTurnStatus::Complete,
+                TurnStatus::Streaming => DigestTurnStatus::Running,
+                TurnStatus::Failed => DigestTurnStatus::Failed,
+            },
+            None,
+            None,
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -297,63 +414,94 @@ pub struct OutputPage {
     pub source: OutputSource,
 }
 
-/// One recipient's reply to one send, paged from `offset` (in characters).
-/// The ledger's captured text when it holds the send, otherwise the agent
-/// turn in the merged conversation whose `send_id` matches. The stable way to
-/// read a long reply: a new turn on the same agent does not move this one.
+/// Which copy of a reply [`read_send_output`] pages.
+///
+/// A completed reply exists twice: the text the app captured as the turn
+/// streamed, and the session file's. They agree for a whole turn, but the
+/// session file splits a reply that spans a context compaction into two
+/// turns, and only the first carries the send. An offset is only meaningful
+/// in the copy it was taken from, so a caller reading on from a cut keeps to
+/// that copy.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadFrom {
+    /// The captured text when the app holds it (a completed reply sent since
+    /// the app started), otherwise the session file's. What `wait_send` and
+    /// `read_agent_output` return, and so where their cuts read on.
+    #[default]
+    Auto,
+    /// The session file's, as `read_conversation` shows the reply.
+    Transcript,
+}
+
+/// One recipient's reply to one send, paged from `offset` (in characters),
+/// from the copy `read_from` names. Without captured text — the send is still
+/// running, failed, or was cancelled, or the app restarted since — the session
+/// file's is read, so the answer does not change across a restart. The stable
+/// way to read a long reply: a new turn on the same agent does not move this
+/// one.
 pub async fn read_send_output(
     state: &AppState,
     project_id: ProjectId,
     send_id: SendId,
     agent_id: AgentId,
     offset: usize,
+    read_from: ReadFrom,
     home_dir: &Path,
 ) -> Result<OutputPage, AppError> {
-    if let Some(snapshot) = state.ledger.send(send_id)
-        && snapshot.project_id == project_id
-    {
-        let recipient = snapshot
-            .recipients
-            .into_iter()
-            .find(|r| r.agent_id == agent_id)
-            .ok_or(AppError::UnknownRecipient {
-                project_id,
-                agent_id,
-            })?;
-        let text = recipient.text.unwrap_or_default();
-        return Ok(page(
-            send_id,
-            agent_id,
-            recipient.status,
-            &text,
-            offset,
-            OutputSource::Live,
-        ));
-    }
+    let live_status = match state.ledger.send(send_id) {
+        Some(snapshot) if snapshot.project_id == project_id => {
+            let recipient = snapshot
+                .recipients
+                .into_iter()
+                .find(|r| r.agent_id == agent_id)
+                .ok_or(AppError::UnknownRecipient {
+                    project_id,
+                    agent_id,
+                })?;
+            if read_from == ReadFrom::Auto
+                && let Some(text) = &recipient.text
+            {
+                return Ok(page(
+                    send_id,
+                    agent_id,
+                    recipient.status,
+                    text,
+                    offset,
+                    OutputSource::Live,
+                ));
+            }
+            Some(recipient.status)
+        }
+        _ => None,
+    };
     let agent = agent_in_project(state, project_id, agent_id)?;
     let (view, correlated) = correlate_agent(state, project_id, &agent, home_dir).await?;
     let turn = correlated
         .iter()
         .rev()
         .find(|turn| turn.send_id == Some(send_id));
-    // The journal's recorded outcome wins over the transcript, as it does for
-    // `wait_send` after a restart: a failed or cancelled send with partial
+    // The ledger's status is the most current when it holds the send. Without
+    // it, the journal's recorded outcome wins over the transcript, as it does
+    // for `wait_send` after a restart: a failed or cancelled send with partial
     // content on disk is not a completed answer, and one with no reply at all
     // still pages (empty) rather than reading as unknown.
-    let status = match (view.outcomes.get(&send_id), turn) {
-        (Some((OutcomeStatus::Cancelled, _)), _) => SendStatus::Cancelled,
-        (Some((OutcomeStatus::Failed, _)), _) => SendStatus::Failed,
-        (None, Some(turn)) => match turn.status {
+    let status = match (live_status, view.outcomes.get(&send_id), turn) {
+        (Some(status), _, _) => status,
+        (None, Some((OutcomeStatus::Cancelled, _)), _) => SendStatus::Cancelled,
+        (None, Some((OutcomeStatus::Failed, _)), _) => SendStatus::Failed,
+        (None, None, Some(turn)) => match turn.status {
             TurnStatus::Complete => SendStatus::Completed,
             TurnStatus::Streaming => SendStatus::Running,
             TurnStatus::Failed => SendStatus::Failed,
         },
-        (None, None) if view.sends.iter().any(|(s, _)| *s == send_id) => SendStatus::Started,
-        (None, None) => return Err(AppError::SendUnknown(send_id)),
+        (None, None, None) if view.sends.iter().any(|(s, _)| *s == send_id) => SendStatus::Started,
+        (None, None, None) => return Err(AppError::SendUnknown(send_id)),
     };
-    let source = match turn.and_then(|t| t.correlation) {
-        Some(SendCorrelation::DurableLink) => OutputSource::DurableLink,
-        Some(SendCorrelation::Positional) => OutputSource::Positional,
+    let source = match (turn.and_then(|t| t.correlation), live_status) {
+        (Some(SendCorrelation::DurableLink), _) => OutputSource::DurableLink,
+        (Some(SendCorrelation::Positional), _) => OutputSource::Positional,
+        (_, Some(_)) => OutputSource::Live,
         _ => OutputSource::Journal,
     };
     let text = turn.map_or("", |t| t.text.as_str());
@@ -583,9 +731,9 @@ pub async fn read_agent_output(
 
 /// The budget rules for a [`ConversationDigest`]: message and answer text may
 /// be cut; the oldest items are dropped when the structure alone is over; an
-/// agent turn's text reads on through `read_send_output` from where it was cut
-/// when the turn has a send (its text is the whole reply that call pages), and
-/// a user message's cannot be read on.
+/// agent turn's text reads on through `read_send_output` from the session
+/// file's copy, from where it was cut, when the turn has a send; a user
+/// message's cannot be read on.
 #[must_use]
 pub fn conversation_budget(project_id: ProjectId) -> BudgetSpec {
     BudgetSpec {
@@ -600,19 +748,23 @@ pub fn conversation_budget(project_id: ProjectId) -> BudgetSpec {
                 return None;
             }
             let send_id = item.get("send_id")?.as_str()?;
+            // The conversation's text is the session file's, so reading on
+            // keeps to that copy (see `ReadFrom`).
             Some(serde_json::json!({
                 "tool": "read_send_output",
                 "project_id": project_id,
                 "send_id": send_id,
                 "agent_id": item.get("agent_id")?.clone(),
                 "offset": site.kept_chars,
+                "read_from": ReadFrom::Transcript,
             }))
         }),
     }
 }
 
-/// The budget rules for an [`AgentOutput`]: its text may be cut and reads on
-/// through `read_send_output` when the output has a send.
+/// The budget rules for an [`AgentOutput`]: a reply may be cut and reads on
+/// through `read_send_output`, from the copy its text came from, when the
+/// output has a send. A journal note is not a reply and has no read-on.
 #[must_use]
 pub fn agent_output_budget(project_id: ProjectId) -> BudgetSpec {
     BudgetSpec {
@@ -622,12 +774,19 @@ pub fn agent_output_budget(project_id: ProjectId) -> BudgetSpec {
         pointer: Box::new(move |site: &CutSite<'_>| {
             let output = site.ancestors.last()?;
             let send_id = output.get("send_id")?.as_str()?;
+            // Read on from the copy the text came from (see `ReadFrom`).
+            let read_from = match output.get("source").and_then(serde_json::Value::as_str) {
+                Some("live") => ReadFrom::Auto,
+                Some("journal") => return None,
+                _ => ReadFrom::Transcript,
+            };
             Some(serde_json::json!({
                 "tool": "read_send_output",
                 "project_id": project_id,
                 "send_id": send_id,
                 "agent_id": output.get("agent_id")?.clone(),
                 "offset": site.kept_chars,
+                "read_from": read_from,
             }))
         }),
     }

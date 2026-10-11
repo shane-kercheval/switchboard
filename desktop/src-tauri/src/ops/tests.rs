@@ -3,6 +3,7 @@
 //! the store, and the state under test was built after it.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,8 +31,8 @@ use super::error_code::{self, error_code};
 use super::ledger::SendStatus;
 use super::read::conversation_budget;
 use super::read::{
-    AgentOutputStatus, DigestItem, OutputSource, ProjectStatus, list_agents, list_projects,
-    read_agent_output, read_conversation, read_send_output,
+    AgentOutputStatus, DigestItem, DigestTurnStatus, OutputSource, ProjectStatus, ReadFrom,
+    list_agents, list_projects, read_agent_output, read_conversation, read_send_output,
 };
 use super::send::{
     AgentWaitStatus, Body, ForwardPrompt, ForwardRequest, OnBusyPolicy, SendRequest, WaitSource,
@@ -970,6 +971,7 @@ async fn read_send_output_pages_one_reply_stably_while_the_agent_starts_a_new_tu
         receipt.send_id,
         agents[0],
         0,
+        ReadFrom::Auto,
         &env.home(),
     )
     .await
@@ -996,6 +998,7 @@ async fn read_send_output_pages_one_reply_stably_while_the_agent_starts_a_new_tu
         receipt.send_id,
         agents[0],
         OUTPUT_PAGE_CHARS * 2,
+        ReadFrom::Auto,
         &env.home(),
     )
     .await
@@ -1134,9 +1137,17 @@ async fn the_restart_fallback_answers_from_the_journal() {
     assert_eq!(reply.source, WaitSource::Unknown);
     assert!(reply.recipients.is_empty());
 
-    let page = read_send_output(&env.state, project_id, s_a, a, 0, &env.home())
-        .await
-        .unwrap();
+    let page = read_send_output(
+        &env.state,
+        project_id,
+        s_a,
+        a,
+        0,
+        ReadFrom::Auto,
+        &env.home(),
+    )
+    .await
+    .unwrap();
     assert_eq!(page.text, "DONE");
     assert_eq!(page.source, OutputSource::DurableLink);
 }
@@ -1509,6 +1520,7 @@ async fn create_send_forward_and_read_leave_the_expected_files() {
         second.send_id,
         reviewer.id,
         0,
+        ReadFrom::Auto,
         &env.home(),
     )
     .await
@@ -1984,6 +1996,7 @@ async fn a_page_is_sized_by_its_serialized_length() {
         receipt.send_id,
         agents[0],
         0,
+        ReadFrom::Auto,
         &env.home(),
     )
     .await
@@ -2220,9 +2233,17 @@ async fn paging_after_a_restart_agrees_with_wait_send_on_a_failed_send() {
     let env = env.restart();
     let waited = wait_done(&env, project_id, send_id).await;
     assert_eq!(waited.recipients[0].status, SendStatus::Failed);
-    let page = read_send_output(&env.state, project_id, send_id, a, 0, &env.home())
-        .await
-        .expect("a failed send with no reply still pages");
+    let page = read_send_output(
+        &env.state,
+        project_id,
+        send_id,
+        a,
+        0,
+        ReadFrom::Auto,
+        &env.home(),
+    )
+    .await
+    .expect("a failed send with no reply still pages");
     assert_eq!(page.status, SendStatus::Failed);
     assert!(page.text.is_empty());
 }
@@ -2394,9 +2415,17 @@ async fn the_merged_conversation_and_reply_paging_agree_on_every_turn() {
             );
             continue;
         };
-        let page = read_send_output(&env.state, project_id, *send_id, *agent_id, 0, &env.home())
-            .await
-            .unwrap();
+        let page = read_send_output(
+            &env.state,
+            project_id,
+            *send_id,
+            *agent_id,
+            0,
+            ReadFrom::Auto,
+            &env.home(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             &page.text, answer,
             "send {send_id} pages the reply the conversation shows"
@@ -2417,9 +2446,17 @@ async fn the_merged_conversation_and_reply_paging_agree_on_every_turn() {
     }
     assert_eq!(checked, 4, "a1, a2, a4, and b1 each carry a send");
 
-    let failed = read_send_output(&env.state, project_id, s3, a, 0, &env.home())
-        .await
-        .unwrap();
+    let failed = read_send_output(
+        &env.state,
+        project_id,
+        s3,
+        a,
+        0,
+        ReadFrom::Auto,
+        &env.home(),
+    )
+    .await
+    .unwrap();
     assert_eq!(failed.status, SendStatus::Failed);
     assert!(failed.text.is_empty());
     let latest = read_agent_output(&env.state, project_id, a, &env.home())
@@ -2618,7 +2655,9 @@ async fn a_turn_with_three_hundred_edits_comes_back_whole_in_the_conversation() 
                 agent_id: a,
                 send_id: Some(send_id),
                 send_correlation: Some(crate::commands::SendCorrelation::DurableLink),
-                status: switchboard_harness::TurnStatus::Complete,
+                status: DigestTurnStatus::Complete,
+                reason: None,
+                failure_kind: None,
                 text: answer.to_owned(),
                 // A turn starts at its first assistant message, a moment
                 // after its prompt.
@@ -2631,19 +2670,29 @@ async fn a_turn_with_three_hundred_edits_comes_back_whole_in_the_conversation() 
     assert_eq!(conversation.agents[0].load_error, None);
 }
 
-#[tokio::test]
-async fn a_cut_answer_in_the_conversation_reads_on_from_where_it_was_cut() {
-    let (env, project_id, agents) = project_with_agents(&["a"]);
-    let reply = "r".repeat(40_000);
-    env.adapter.push(Script::reply(&reply));
-    let receipt = send_now(
-        env.handle(),
-        env.home(),
-        text_send(project_id, agents.clone(), "go"),
-    )
-    .await
-    .unwrap();
-    wait_done(&env, project_id, receipt.send_id).await;
+// --- review round five ------------------------------------------------------------
+
+/// Text that differs at every position, so a wrong offset cannot read as
+/// right: `chars` characters of numbered lines.
+fn numbered(chars: usize) -> String {
+    let mut text = String::new();
+    let mut line = 0;
+    while text.len() < chars {
+        line += 1;
+        let _ = writeln!(text, "line {line:06}");
+    }
+    text.truncate(chars);
+    text
+}
+
+/// The conversation fitted to its budget, and the cut answer of `agent_id`'s
+/// turn for `send_id`: its kept text and the call that reads on.
+async fn cut_answer(
+    env: &TestEnv,
+    project_id: ProjectId,
+    send_id: Uuid,
+    agent_id: AgentId,
+) -> (String, serde_json::Value) {
     let conversation = read_conversation(&env.state, project_id, None, &env.home())
         .await
         .unwrap();
@@ -2653,34 +2702,363 @@ async fn a_cut_answer_in_the_conversation_reads_on_from_where_it_was_cut() {
     )
     .unwrap();
     assert!(fitted.serialized_chars() <= RESULT_BUDGET_CHARS);
+    let items = fitted.result["items"].as_array().unwrap();
+    let index = items
+        .iter()
+        .position(|item| {
+            item["kind"] == "agent_turn"
+                && item["send_id"] == send_id.to_string()
+                && item["agent_id"] == agent_id.to_string()
+        })
+        .expect("the turn is in the conversation");
+    let path = format!("/items/{index}/text");
     let cut = fitted
         .truncated
         .iter()
-        .find(|t| t.path.ends_with("/text") && t.total_chars == reply.len())
+        .find(|t| t.path == path)
         .expect("the answer was cut");
+    let kept = items[index]["text"].as_str().unwrap().to_owned();
+    assert_eq!(kept.chars().count(), cut.kept_chars);
     let read_with = cut
         .read_with
-        .as_ref()
+        .clone()
         .expect("an answer with a send reads on");
     assert_eq!(read_with["tool"], "read_send_output");
-    assert_eq!(read_with["offset"], cut.kept_chars);
+    (kept, read_with)
+}
+
+/// Follow a read-on call to the end of the reply and return everything it
+/// paged.
+async fn read_on(env: &TestEnv, project_id: ProjectId, read_with: &serde_json::Value) -> String {
+    let send_id: Uuid = serde_json::from_value(read_with["send_id"].clone()).unwrap();
+    let agent_id: AgentId = serde_json::from_value(read_with["agent_id"].clone()).unwrap();
+    let read_from: ReadFrom = serde_json::from_value(read_with["read_from"].clone()).unwrap();
+    let mut offset = usize::try_from(read_with["offset"].as_u64().unwrap()).unwrap();
+    let mut text = String::new();
+    loop {
+        let page = read_send_output(
+            &env.state,
+            project_id,
+            send_id,
+            agent_id,
+            offset,
+            read_from,
+            &env.home(),
+        )
+        .await
+        .unwrap();
+        text.push_str(&page.text);
+        match page.next_offset {
+            Some(next) => offset = next,
+            None => return text,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cut_answer_rebuilds_exactly_from_its_pages_before_and_after_a_restart() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let reply = numbered(45_000);
+    env.adapter.push(Script::reply(&reply));
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "go"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+
+    let (kept, read_with) = cut_answer(&env, project_id, receipt.send_id, agents[0]).await;
+    assert_eq!(read_with["read_from"], "transcript");
+    let rest = read_on(&env, project_id, &read_with).await;
+    assert_eq!(kept + &rest, reply, "in the same session");
+
+    let env = env.restart();
+    let (kept, read_with) = cut_answer(&env, project_id, receipt.send_id, agents[0]).await;
+    let rest = read_on(&env, project_id, &read_with).await;
+    assert_eq!(kept + &rest, reply, "after a restart");
+}
+
+#[tokio::test]
+async fn a_cancelled_partial_reply_reads_on_in_the_same_session() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let partial = numbered(45_000);
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked(&partial, &gate));
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "go"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    cancel_send(&env.state, project_id, receipt.send_id).unwrap();
+    let reply = wait_done(&env, project_id, receipt.send_id).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Cancelled);
+
     let page = read_send_output(
         &env.state,
         project_id,
         receipt.send_id,
         agents[0],
-        cut.kept_chars,
+        0,
+        ReadFrom::Auto,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.status, SendStatus::Cancelled);
+    assert_eq!(
+        page.total_chars,
+        partial.len(),
+        "the partial reply on disk, not an empty page"
+    );
+
+    let conversation = read_conversation(&env.state, project_id, None, &env.home())
+        .await
+        .unwrap();
+    let status = conversation.items.iter().find_map(|item| match item {
+        DigestItem::AgentTurn { status, .. } => Some(*status),
+        _ => None,
+    });
+    assert_eq!(status, Some(DigestTurnStatus::Cancelled));
+    let (kept, read_with) = cut_answer(&env, project_id, receipt.send_id, agents[0]).await;
+    let rest = read_on(&env, project_id, &read_with).await;
+    assert_eq!(kept + &rest, partial);
+}
+
+/// A session file holding one reply that a context compaction split: the
+/// prompt `go`, the piece before (message `m1`), the compaction summary, and
+/// the piece after (message `m2`).
+fn split_by_compaction(first: &str, second: &str) -> Vec<serde_json::Value> {
+    let at = Utc::now();
+    let stamp = |ms: i64| (at + chrono::Duration::milliseconds(ms)).to_rfc3339();
+    let assistant = |id: &str, text: &str, ms: i64| {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "id": id,
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": text }],
+                "stop_reason": "end_turn",
+                "usage": { "input_tokens": 10, "output_tokens": 5 },
+            },
+            "timestamp": stamp(ms),
+        })
+    };
+    vec![
+        serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": "go" },
+            "timestamp": stamp(0),
+        }),
+        assistant("m1", first, 1),
+        serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": "This session is being continued…" },
+            "isCompactSummary": true,
+            "timestamp": stamp(2),
+        }),
+        assistant("m2", second, 3),
+    ]
+}
+
+#[tokio::test]
+async fn a_reply_split_by_compaction_pages_the_piece_the_conversation_shows() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let first = numbered(30_000);
+    let second = "after the compaction".to_owned();
+    // Live, the turn streams one reply; on disk the session file splits it at
+    // the compaction, and only the first piece carries the send.
+    let mut script = Script::reply(&format!("{first}\n\n{second}"));
+    script.key = Some("m1".to_owned());
+    env.adapter.push(script);
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "go"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+    env.write_claude_session(project_id, agents[0], &split_by_compaction(&first, &second));
+
+    let conversation = read_conversation(&env.state, project_id, None, &env.home())
+        .await
+        .unwrap();
+    let shape: Vec<(&str, Option<&str>)> = conversation
+        .items
+        .iter()
+        .map(|item| match item {
+            DigestItem::UserMessage { .. } => ("user", None),
+            DigestItem::AgentTurn {
+                send_id: Some(_),
+                text,
+                ..
+            } => ("reply", Some(text.as_str())),
+            DigestItem::AgentTurn {
+                send_id: None,
+                text,
+                ..
+            } => ("continuation", Some(text.as_str())),
+            DigestItem::Compacted { .. } => ("compacted", None),
+            DigestItem::Outcome { .. } => ("outcome", None),
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("user", None),
+            ("reply", Some(first.as_str())),
+            ("compacted", None),
+            ("continuation", Some(second.as_str())),
+        ],
+        "the marker sits between the two pieces"
+    );
+
+    // Reading on from inside the first piece, as a cut in the conversation
+    // would, stays within that piece.
+    let offset = 1_000;
+    let rest = read_on(
+        &env,
+        project_id,
+        &serde_json::json!({
+            "send_id": receipt.send_id,
+            "agent_id": agents[0],
+            "offset": offset,
+            "read_from": ReadFrom::Transcript,
+        }),
+    )
+    .await;
+    assert_eq!(rest, first[offset..]);
+    let captured = read_send_output(
+        &env.state,
+        project_id,
+        receipt.send_id,
+        agents[0],
+        0,
+        ReadFrom::Auto,
         &env.home(),
     )
     .await
     .unwrap();
     assert_eq!(
-        page.offset + page.text.len(),
-        page.total_chars.min(cut.kept_chars + OUTPUT_PAGE_CHARS)
+        captured.total_chars,
+        first.len() + 2 + second.len(),
+        "the captured copy is the whole reply"
     );
-    assert_eq!(
-        page.total_chars,
-        reply.len(),
-        "the same reply the conversation cut"
+}
+
+#[tokio::test]
+async fn a_cancelled_or_failed_turn_carries_its_outcome_however_the_conversation_is_cut() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("proj");
+    let a = env.agent(project_id, "a");
+    let (s1, s2, s3) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    let t = |minutes: i64| Utc::now() - chrono::Duration::minutes(60 - minutes);
+    let send = |send_id, at| JournalRecord::Send {
+        send_id,
+        turn_id: Uuid::now_v7(),
+        agent_id: a,
+        prompt: "go".to_owned(),
+        attachments: Vec::new(),
+        at,
+    };
+    let outcome = |send_id, outcome: TurnOutcome, at| JournalRecord::Outcome {
+        send_id,
+        turn_id: Uuid::now_v7(),
+        agent_id: a,
+        outcome: serde_json::to_value(outcome).unwrap(),
+        started_at: at,
+        ended_at: at,
+    };
+    let journal = env.journal_path(project_id);
+    for record in [
+        // Cancelled after writing part of a reply, then a later send.
+        send(s1, t(10)),
+        outcome(
+            s1,
+            TurnOutcome::Cancelled {
+                source: CancelSource::User,
+            },
+            t(10),
+        ),
+        send(s2, t(20)),
+        JournalRecord::TurnLink {
+            send_id: s2,
+            turn_id: Uuid::now_v7(),
+            agent_id: a,
+            hydration_key: "m2".to_owned(),
+            at: t(20),
+        },
+        // Failed before any reply.
+        send(s3, t(30)),
+        outcome(
+            s3,
+            TurnOutcome::Failed {
+                kind: switchboard_harness::FailureKind::UsageLimit,
+                message: "limit reached".to_owned(),
+            },
+            t(30),
+        ),
+    ] {
+        switchboard_core::journal::append_record(&journal, &record).unwrap();
+    }
+    // The session file closes the cancelled reply as complete once the next
+    // prompt starts.
+    env.seed_claude_turns(
+        project_id,
+        a,
+        &[
+            ("go", "half a reply", "m1", t(10)),
+            ("go", "done", "m2", t(20)),
+        ],
     );
+    let env = env.restart();
+
+    // Six items: each send's message, the two replies, and the failure. The
+    // last five start at the cancelled reply, and would have left out the
+    // separate cancellation marker, which sorts before it.
+    let conversation = read_conversation(&env.state, project_id, Some(5), &env.home())
+        .await
+        .unwrap();
+    let cancelled = conversation
+        .items
+        .iter()
+        .find_map(|item| match item {
+            DigestItem::AgentTurn {
+                send_id: Some(s),
+                status,
+                ..
+            } if *s == s1 => Some(*status),
+            _ => None,
+        })
+        .expect("the cancelled reply is within the last five items");
+    assert_eq!(cancelled, DigestTurnStatus::Cancelled);
+    assert!(
+        conversation.items.iter().all(|item| !matches!(
+            item,
+            DigestItem::Outcome { send_id, .. } if *send_id == s1
+        )),
+        "its outcome is folded into the turn, not a separate item"
+    );
+    let failed = conversation.items.last().unwrap();
+    match failed {
+        DigestItem::Outcome {
+            send_id,
+            status,
+            failure_kind,
+            reason,
+            ..
+        } => {
+            assert_eq!(*send_id, s3);
+            assert_eq!(*status, crate::commands::OutcomeStatus::Failed);
+            assert_eq!(failure_kind.as_deref(), Some("usage_limit"));
+            assert_eq!(reason.as_deref(), Some("limit reached"));
+        }
+        other => panic!("a send with no reply keeps its own marker: {other:?}"),
+    }
 }

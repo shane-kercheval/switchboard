@@ -8481,7 +8481,10 @@ mod tests {
     ) -> Result<switchboard_dispatcher::TurnPermit, String> {
         let factory = factory_for(state, project_id, agent_id, home);
         let context = factory.build(SendId::now_v7());
-        factory.preflight(&context.agent).await
+        factory
+            .preflight(&context.agent)
+            .await
+            .map_err(|refusal| refusal.message)
     }
 
     /// The session-lock key for an agent's own session, as the other
@@ -8787,8 +8790,10 @@ mod tests {
             .await
             .expect_err("a project that moved between the read and the build must not dispatch");
         assert!(
-            refusal.contains("changed before the turn could start"),
-            "got: {refusal}"
+            refusal
+                .message
+                .contains("changed before the turn could start"),
+            "got: {refusal:?}"
         );
     }
 
@@ -9196,8 +9201,10 @@ mod tests {
             .await
             .expect_err("a factory built before the operation must not dispatch after it");
         assert!(
-            refusal.contains("changed before the turn could start"),
-            "got: {refusal}"
+            refusal
+                .message
+                .contains("changed before the turn could start"),
+            "got: {refusal:?}"
         );
     }
 

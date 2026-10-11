@@ -125,8 +125,9 @@ use switchboard_core::{
 };
 use switchboard_harness::{
     AdapterEvent, CancelSource, ContextWindowSource, DispatchOptions, EventStream, FailureKind,
-    HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, SessionInventory,
-    SessionMetaSource, TextCapture, TurnId, TurnOutcome, TurnSpend, check_prompt_size,
+    HarnessAdapter, MessageFailureKind, MessageId, NormalizedEvent, RateLimitSource,
+    SessionInventory, SessionMetaSource, TextCapture, TurnId, TurnOutcome, TurnSpend,
+    check_prompt_size,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -438,6 +439,26 @@ pub enum OnBusy {
     FailFast,
 }
 
+/// What a caller of [`Dispatcher::send_message_with`] chooses that the compose
+/// path leaves to defaults.
+///
+/// `message_id`: the receipt id for this send. `None` mints one (the compose
+/// path). A caller that must correlate the send's events before the dispatch
+/// returns chooses it: the actor can emit the send's first event before the
+/// caller has the receipt back, so an observer of the event stream (the MCP
+/// send ledger) registers the id first and then dispatches, with no orphan
+/// map and no fallback matching.
+///
+/// `emit_user_message`: emit a live `user_message` for the send once it is
+/// durable. `false` for the compose path, which renders its user turn
+/// optimistically; `true` for a backend-originated send that has no frontend
+/// optimistic turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SendOptions {
+    pub message_id: Option<MessageId>,
+    pub emit_user_message: bool,
+}
+
 /// Result of `send_message`. `Busy` is only possible under [`OnBusy::FailFast`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendOutcome {
@@ -535,6 +556,10 @@ enum Command {
     /// session handoff uses this to avoid starting a second process against a
     /// harness session Switchboard is still driving.
     PeekWorkPending { reply: oneshot::Sender<bool> },
+    /// Reply `true` iff an `Enqueue` under `FailFast` arriving now would be
+    /// accepted — see [`Dispatcher::accepts_now`]. Answered with the same
+    /// predicate the `FailFast` admission arm uses, so the two cannot drift.
+    PeekAcceptsNow { reply: oneshot::Sender<bool> },
     /// Cancel the running turn (out-of-band; no-op if none is live).
     Cancel(CancelSource),
     /// Cancel a whole *send* on this agent: fire the running turn's cancel
@@ -939,6 +964,34 @@ pub struct DispatchContext {
     pub locator_sink: Arc<dyn SessionLocatorSink>,
 }
 
+/// Why [`DispatchContextFactory::preflight`] refused to start a turn.
+///
+/// `message` is what the user reads on the failed send. `kind` is set only for
+/// a cause a program should act on differently from a generic failure, and
+/// rides out on the `MessageFailed` event; `None` for every other refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightRefusal {
+    pub message: String,
+    pub kind: Option<MessageFailureKind>,
+}
+
+impl PreflightRefusal {
+    /// A refusal with no typed cause.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_kind(mut self, kind: MessageFailureKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+}
+
 /// What a turn must keep alive for its whole lifetime, handed back by
 /// [`DispatchContextFactory::preflight`] and bound by the turn loop until the
 /// turn ends.
@@ -1039,8 +1092,9 @@ pub trait DispatchContextFactory: Send + Sync {
     fn preflight<'a>(
         &'a self,
         agent: &'a AgentRecord,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnPermit, String>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<TurnPermit, PreflightRefusal>> + Send + 'a>,
+    > {
         let _ = agent;
         Box::pin(async { Ok(TurnPermit::none()) })
     }
@@ -1096,21 +1150,82 @@ impl Dispatcher {
         factory: Arc<dyn DispatchContextFactory>,
         on_busy: OnBusy,
     ) -> SendOutcome {
+        self.send_message_with(
+            agent_id,
+            prompt,
+            attachments,
+            send_id,
+            factory,
+            on_busy,
+            SendOptions::default(),
+        )
+        .await
+    }
+
+    /// [`send_message`](Self::send_message) with the caller choosing what the
+    /// compose path leaves to defaults — see [`SendOptions`]. The compose path
+    /// keeps calling `send_message`, so its behaviour is unchanged by
+    /// construction.
+    // The compose path's six arguments plus the options struct; folding the
+    // dispatch identity into the struct would make the struct carry what every
+    // caller must supply anyway.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_message_with(
+        &self,
+        agent_id: AgentId,
+        prompt: &str,
+        attachments: Vec<Attachment>,
+        send_id: SendId,
+        factory: Arc<dyn DispatchContextFactory>,
+        on_busy: OnBusy,
+        options: SendOptions,
+    ) -> SendOutcome {
         let selection = factory.selection_snapshot();
         let item = WorkItem {
-            message_id: Uuid::now_v7(),
+            message_id: options.message_id.unwrap_or_else(Uuid::now_v7),
             send_id,
             payload: WorkPayload::Send {
                 prompt: prompt.to_owned(),
                 attachments,
-                // Compose-bar sends render their user turn optimistically on the
-                // frontend; no backend-emitted user message.
-                emit_user_message: false,
+                emit_user_message: options.emit_user_message,
             },
             selection,
             completion: None,
         };
         self.accept(agent_id, item, factory, on_busy).await
+    }
+
+    /// Whether a send to `agent_id` would be accepted **right now** under
+    /// [`OnBusy::FailFast`] — the same rule the actor applies when it admits
+    /// one: true with no actor, true when idle with an empty backlog, true when
+    /// the running turn has reached its terminal and nothing is queued (the
+    /// post-terminal drain accept), false otherwise and for a closing agent.
+    ///
+    /// Exists beside [`Self::has_pending_work`] because that one answers true
+    /// for the whole turn including its post-terminal drain, so an up-front
+    /// check built on it would refuse sends the dispatcher would accept, such
+    /// as an immediate follow-up after the turn's terminal was observed. This
+    /// is an observation, not a reservation: another caller can occupy the
+    /// agent between the answer and the send, which then returns `Busy`.
+    pub async fn accepts_now(&self, agent_id: AgentId) -> bool {
+        let commands = {
+            let agents = lock(&self.agents);
+            match agents.get(&agent_id) {
+                Some(AgentSlot::Active(tx)) => tx.clone(),
+                Some(AgentSlot::Closing) => return false,
+                None => return true,
+            }
+        };
+        let (tx, rx) = oneshot::channel();
+        if commands
+            .send(Command::PeekAcceptsNow { reply: tx })
+            .is_err()
+        {
+            // The actor is gone between the lock and the send; a fresh actor
+            // would be spawned for the send, so it would be accepted.
+            return true;
+        }
+        rx.await.unwrap_or(false)
     }
 
     /// Accept a **manual context compaction** for `agent_id`: ask the harness to
@@ -1356,6 +1471,7 @@ impl Dispatcher {
                 None,
                 agent_id,
                 reason,
+                None,
             );
         }
         message_id
@@ -1742,6 +1858,7 @@ fn abandon_backlog(
             None,
             agent_id,
             "agent is shutting down",
+            None,
         );
     }
 }
@@ -1792,6 +1909,12 @@ fn apply_idle_command(
         }
         Command::PeekWorkPending { reply } => {
             let _ = reply.send(!backlog.is_empty());
+            IdleAfter::Continue
+        }
+        // Idle ⇒ a FailFast send is accepted (the backlog is empty whenever the
+        // actor parks; a non-empty one here is the instant before it drains).
+        Command::PeekAcceptsNow { reply } => {
+            let _ = reply.send(backlog.is_empty());
             IdleAfter::Continue
         }
         // No turn live ⇒ cancel is a no-op.
@@ -1908,7 +2031,8 @@ async fn run_turn(
     // [`DispatchContextFactory::preflight`].
     let _permit = match factory.preflight(&agent).await {
         Ok(permit) => permit,
-        Err(reason) => {
+        Err(refusal) => {
+            let reason = refusal.message;
             emit_message_failed(
                 emitter.as_ref(),
                 channel,
@@ -1917,6 +2041,7 @@ async fn run_turn(
                 None,
                 agent_id,
                 &reason,
+                refusal.kind,
             );
             fire_completion(
                 &mut completion,
@@ -1977,6 +2102,7 @@ async fn run_turn(
                     None,
                     agent_id,
                     &message,
+                    None,
                 );
                 fire_completion(
                     &mut completion,
@@ -2004,6 +2130,7 @@ async fn run_turn(
                     None,
                     agent_id,
                     &e.to_string(),
+                    None,
                 );
                 // An awaited send must not hang because its turn never started.
                 fire_completion(
@@ -2079,6 +2206,7 @@ async fn run_turn(
                 durable_send_id,
                 agent_id,
                 &message,
+                None,
             );
             fire_completion(&mut completion, outcome, String::new());
             return TurnAfter::Continue;
@@ -2582,7 +2710,7 @@ async fn drain_turn(
                                 // mid-flight (terminal not seen) or other work already
                                 // queued — still returns Busy, preserving the
                                 // workflow "contention = step failure" rule.
-                                if terminal_seen && backlog.is_empty() {
+                                if accepts_fail_fast_mid_turn(terminal_seen, backlog) {
                                     let message_id = item.message_id;
                                     backlog.push_back(item);
                                     if let Some(reply) = reply {
@@ -2644,6 +2772,12 @@ async fn drain_turn(
                     // post-terminal enrichment, and may also hold a backlog.
                     Some(Command::PeekWorkPending { reply }) => {
                         let _ = reply.send(true);
+                    }
+                    // The same predicate as the `FailFast` enqueue arm above:
+                    // free once this turn's terminal has passed and nothing is
+                    // queued, busy otherwise.
+                    Some(Command::PeekAcceptsNow { reply }) => {
+                        let _ = reply.send(accepts_fail_fast_mid_turn(terminal_seen, backlog));
                     }
                     Some(Command::CancelSend { send_id, source }) => {
                         // Fire the running turn's cancel token only if this turn
@@ -2868,6 +3002,15 @@ fn remove_from_backlog(
     })
 }
 
+/// The one admission rule for a `FailFast` send arriving while the actor is
+/// inside a turn: free once this turn's terminal has passed and nothing is
+/// queued, busy otherwise. Both the admission arm and the `PeekAcceptsNow`
+/// answer call this, so the two cannot drift. (Idle is its own rule: an empty
+/// backlog.)
+fn accepts_fail_fast_mid_turn(terminal_seen: bool, backlog: &VecDeque<WorkItem>) -> bool {
+    terminal_seen && backlog.is_empty()
+}
+
 fn channel_name(agent_id: AgentId) -> String {
     format!("agent:{agent_id}")
 }
@@ -2925,6 +3068,9 @@ fn emit_message_failed(
     send_id: Option<SendId>,
     agent_id: AgentId,
     error: &str,
+    // The typed cause, when the failure is one a caller should act on rather
+    // than retry (today only a preflight refusal carries one).
+    kind: Option<MessageFailureKind>,
 ) {
     emit_event(
         emitter,
@@ -2934,6 +3080,7 @@ fn emit_message_failed(
             send_id,
             agent_id,
             error: error.to_owned(),
+            kind,
             at: Utc::now(),
         },
         agent_id,

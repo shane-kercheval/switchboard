@@ -25,9 +25,9 @@ use switchboard_core::{
 use switchboard_dispatcher::{
     AwaitableSendOutcome, CancelOutcome, CompletionResult, ConversationJournal, CurrentTurnWait,
     DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter, JournalError, MetadataCache,
-    NoopJournal, NoopMetadataCache, NoopSessionLocatorSink, OnBusy, RecordingEmitter,
-    RemoveQueuedMessageError, SelectionSnapshot, SendOutcome, SessionLocatorError,
-    SessionLocatorSink, TurnKind, TurnPermit,
+    NoopJournal, NoopMetadataCache, NoopSessionLocatorSink, OnBusy, PreflightRefusal,
+    RecordingEmitter, RemoveQueuedMessageError, SelectionSnapshot, SendOutcome,
+    SessionLocatorError, SessionLocatorSink, TurnKind, TurnPermit,
 };
 use switchboard_harness::{
     AdapterEvent, CancelSource, ContentKind, ContextWindowSource, DispatchOptions, FailureKind,
@@ -200,11 +200,12 @@ impl DispatchContextFactory for TestFactory {
     fn preflight<'a>(
         &'a self,
         _agent: &'a AgentRecord,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnPermit, String>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<TurnPermit, PreflightRefusal>> + Send + 'a>,
+    > {
         Box::pin(async move {
             match &self.refuse_at_start {
-                Some(reason) => Err(reason.clone()),
+                Some(reason) => Err(PreflightRefusal::new(reason.clone())),
                 None => Ok(TurnPermit::none()),
             }
         })
@@ -6608,4 +6609,284 @@ async fn an_unsupported_context_report_fails_the_message_without_starting_a_turn
     );
     assert_eq!(count_type(&emitter.snapshot(), "turn_start"), 0);
     assert_journal_untouched(&journal, "a refused context report");
+}
+
+mod accepts_now_and_caller_chosen_message_ids {
+    use super::*;
+    use switchboard_dispatcher::SendOptions;
+
+    fn setup(
+        scenario: MockScenario,
+    ) -> (
+        Arc<Dispatcher>,
+        Arc<RecordingEmitter>,
+        AgentRecord,
+        Arc<TestFactory>,
+    ) {
+        let dispatcher = Arc::new(Dispatcher::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let agent = agent_record();
+        let factory = TestFactory::new(
+            scenario,
+            agent.clone(),
+            Arc::clone(&emitter),
+            noop_journal(),
+        );
+        (dispatcher, emitter, agent, factory)
+    }
+
+    async fn enqueue(dispatcher: &Dispatcher, agent: &AgentRecord, factory: &Arc<TestFactory>) {
+        accepted(
+            dispatcher
+                .send_message(
+                    agent.id,
+                    "go",
+                    vec![],
+                    Uuid::now_v7(),
+                    Arc::clone(factory) as Arc<dyn DispatchContextFactory>,
+                    OnBusy::Enqueue,
+                )
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn true_with_no_actor_and_after_the_turn_false_mid_turn() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, emitter, agent, factory) =
+            setup(MockScenario::CompletesOnSignal(Arc::clone(&gate)));
+        assert!(
+            dispatcher.accepts_now(agent.id).await,
+            "no actor: a send would spawn one"
+        );
+        enqueue(&dispatcher, &agent, &factory).await;
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        assert!(
+            !dispatcher.accepts_now(agent.id).await,
+            "a turn is in flight"
+        );
+        gate.notify_waiters();
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert!(
+            dispatcher.accepts_now(agent.id).await,
+            "idle with an empty backlog"
+        );
+    }
+
+    #[tokio::test]
+    async fn true_after_the_terminal_during_the_drain_and_false_with_a_queued_item() {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, emitter, agent, factory) =
+            setup(MockScenario::CompletesThenHolds(Arc::clone(&hold)));
+        enqueue(&dispatcher, &agent, &factory).await;
+        within(&emitter, "turn_end", emitter.wait_for_type("turn_end", 1)).await;
+        // The terminal passed; the stream is still open (post-terminal drain).
+        assert!(
+            dispatcher.accepts_now(agent.id).await,
+            "the fail-fast admission arm would accept here, so this must agree"
+        );
+        enqueue(&dispatcher, &agent, &factory).await;
+        assert!(
+            !dispatcher.accepts_now(agent.id).await,
+            "something is queued behind the drain"
+        );
+        hold.notify_waiters();
+        hold.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn false_while_closing() {
+        // Shut the agent down during its post-terminal drain: the turn has
+        // ended and nothing is queued, so only the closing check can refuse.
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, emitter, agent, factory) =
+            setup(MockScenario::CompletesThenHolds(Arc::clone(&hold)));
+        enqueue(&dispatcher, &agent, &factory).await;
+        within(&emitter, "turn_end", emitter.wait_for_type("turn_end", 1)).await;
+        assert!(
+            dispatcher.accepts_now(agent.id).await,
+            "free during the drain"
+        );
+        let closing = Arc::clone(&dispatcher);
+        let agent_id = agent.id;
+        let shutdown = tokio::spawn(async move {
+            closing
+                .shutdown_agent(agent_id, CancelSource::Shutdown)
+                .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!dispatcher.accepts_now(agent.id).await, "closing refuses");
+        hold.notify_waiters();
+        shutdown.await.unwrap();
+        assert!(dispatcher.accepts_now(agent.id).await, "the slot is gone");
+    }
+
+    #[tokio::test]
+    async fn a_caller_chosen_message_id_is_on_turn_start_and_the_user_message_is_announced() {
+        let (dispatcher, emitter, agent, factory) = setup(MockScenario::Streaming);
+        let chosen = Uuid::now_v7();
+        let returned = accepted(
+            dispatcher
+                .send_message_with(
+                    agent.id,
+                    "go",
+                    vec![],
+                    Uuid::now_v7(),
+                    Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                    OnBusy::Enqueue,
+                    SendOptions {
+                        message_id: Some(chosen),
+                        emit_user_message: true,
+                    },
+                )
+                .await,
+        );
+        assert_eq!(returned, chosen);
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        let events = emitter.snapshot();
+        let start = events
+            .iter()
+            .find(|(_, v)| event_type(v) == "turn_start")
+            .expect("a turn_start");
+        assert_eq!(extract_message_id(&start.1), chosen);
+        assert!(
+            events.iter().any(|(_, v)| event_type(v) == "user_message"),
+            "the option announces the user message"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_chosen_message_id_survives_an_early_failure() {
+        // The id must reach the event that fails a send before any turn
+        // starts, or an observer registered under it could never see the
+        // failure.
+        let dispatcher = Arc::new(Dispatcher::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let agent = agent_record();
+        let factory = TestFactory::new(
+            MockScenario::Streaming,
+            agent.clone(),
+            Arc::clone(&emitter),
+            noop_journal(),
+        );
+        let factory = Arc::new(TestFactory {
+            refuse_at_start: Some("held elsewhere".to_owned()),
+            adapters: Mutex::new(std::collections::VecDeque::new()),
+            last: Arc::clone(&factory.last),
+            agent: agent.clone(),
+            emitter: Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+            journal: noop_journal(),
+            metadata: Arc::new(NoopMetadataCache),
+            locator_sink: Arc::new(NoopSessionLocatorSink),
+        });
+        let chosen = Uuid::now_v7();
+        accepted(
+            dispatcher
+                .send_message_with(
+                    agent.id,
+                    "go",
+                    vec![],
+                    Uuid::now_v7(),
+                    factory as Arc<dyn DispatchContextFactory>,
+                    OnBusy::Enqueue,
+                    SendOptions {
+                        message_id: Some(chosen),
+                        emit_user_message: false,
+                    },
+                )
+                .await,
+        );
+        within(
+            &emitter,
+            "message_failed",
+            emitter.wait_for_type("message_failed", 1),
+        )
+        .await;
+        let failed = emitter
+            .snapshot()
+            .into_iter()
+            .find(|(_, v)| event_type(v) == "message_failed")
+            .expect("a message_failed");
+        assert_eq!(extract_message_id(&failed.1), chosen);
+    }
+
+    #[tokio::test]
+    async fn a_caller_chosen_message_id_survives_a_queued_cancellation() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, emitter, agent, factory) =
+            setup(MockScenario::CompletesOnSignal(Arc::clone(&gate)));
+        enqueue(&dispatcher, &agent, &factory).await;
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        let chosen = Uuid::now_v7();
+        let send_id = Uuid::now_v7();
+        accepted(
+            dispatcher
+                .send_message_with(
+                    agent.id,
+                    "queued",
+                    vec![],
+                    send_id,
+                    Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                    OnBusy::Enqueue,
+                    SendOptions {
+                        message_id: Some(chosen),
+                        emit_user_message: false,
+                    },
+                )
+                .await,
+        );
+        dispatcher.cancel_send(send_id, &[agent.id], CancelSource::User);
+        within(
+            &emitter,
+            "message_cancelled",
+            emitter.wait_for_type("message_cancelled", 1),
+        )
+        .await;
+        let cancelled = emitter
+            .snapshot()
+            .into_iter()
+            .find(|(_, v)| event_type(v) == "message_cancelled")
+            .expect("a message_cancelled");
+        assert_eq!(extract_message_id(&cancelled.1), chosen);
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn the_default_options_keep_the_compose_path_unchanged() {
+        let (dispatcher, emitter, agent, factory) = setup(MockScenario::Streaming);
+        enqueue(&dispatcher, &agent, &factory).await;
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert!(
+            !emitter
+                .snapshot()
+                .iter()
+                .any(|(_, v)| event_type(v) == "user_message"),
+            "a compose send renders its user turn optimistically; no backend announcement"
+        );
+    }
 }

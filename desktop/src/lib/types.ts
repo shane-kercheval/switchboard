@@ -382,6 +382,10 @@ export type NormalizedEvent =
       send_id: SendId | null;
       agent_id: AgentId;
       error: string;
+      // The typed cause when the failure is one a caller should act on
+      // rather than retry (the harness session held by another process).
+      // Absent for every other failure.
+      kind?: "session_in_use";
       at: string;
     }
   // A queued send was cancelled before it started (its backlog item was dropped

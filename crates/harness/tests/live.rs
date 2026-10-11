@@ -5,6 +5,7 @@
 /// Requires `claude`, `codex`, and/or `agy` installed and authenticated.
 /// Developer-local only — not run in CI. See `AGENTS.md` "Live testing
 /// against real harnesses" for the policy.
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use futures::StreamExt;
@@ -2105,8 +2106,16 @@ async fn live_codex_world_state_yields_inventory() {
     // physically cannot test: `SessionMeta` used to be emitted on the first
     // turn only, and the inventory changes between turns (a skill installed,
     // a command approved). The gate is gone, and only a real resume proves it.
+    //
+    // **Personality is requested explicitly**, through a wrapper that adds
+    // `-c personality=…`, because Codex has no default for it: on a machine
+    // whose config leaves it unset the row is legitimately absent. A value
+    // other than the common `pragmatic` proves the row shows what this test
+    // asked for rather than whatever the developer configured. The wrapper
+    // runs the real `codex` with the developer's own login; nothing is copied.
     let tmp = tempfile::TempDir::new().unwrap();
-    let adapter = CodexAdapter::new();
+    let wrapper = codex_wrapper_requesting_personality(tmp.path(), LIVE_CODEX_PERSONALITY);
+    let adapter = CodexAdapter::with_binary_path(&wrapper);
     let agent = live_codex_agent();
 
     let turn1 = Uuid::now_v7();
@@ -2182,7 +2191,7 @@ async fn live_codex_world_state_yields_inventory() {
         codex_capture(&events1).expect("first dispatch emits a captured Codex locator");
     let resumed_agent = AgentRecord {
         session_locator: Some(SessionLocator::Codex {
-            thread_id,
+            thread_id: thread_id.clone(),
             partition_date,
         }),
         ..agent.clone()
@@ -2217,6 +2226,69 @@ async fn live_codex_world_state_yields_inventory() {
             .is_some_and(|s| !s.is_empty()),
         "the resume turn's inventory must be read fresh from the rollout, not left empty"
     );
+    // Since Codex 0.162 the personality reaches the rollout only through the
+    // resumed turn's `thread_settings_applied`, so this is the one turn that
+    // can show it. Read the record straight from the file rather than through
+    // our parser, so a parser bug cannot agree with itself: its absence means
+    // Codex stopped writing it on resume, and a different value means the
+    // requested personality no longer reaches it.
+    let rollout = switchboard_harness::codex::session_file::locate_session_file(
+        &home_dir(),
+        partition_date,
+        &thread_id,
+    )
+    .expect("the resumed session's rollout must be on disk");
+    let recorded = last_thread_settings(&rollout)
+        .expect("the resumed turn must write a `thread_settings_applied` record");
+    assert_eq!(
+        recorded["personality"], LIVE_CODEX_PERSONALITY,
+        "the resumed turn's `thread_settings_applied` must carry the requested personality; \
+         got {recorded}"
+    );
+    let shown: Vec<(&str, &str)> = resumed_inventory
+        .settings
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| (p.label.as_str(), p.value.as_str()))
+        .collect();
+    assert!(
+        shown.contains(&("Personality", LIVE_CODEX_PERSONALITY)),
+        "a resumed turn's settings must show the personality its `thread_settings_applied` \
+         recorded; got {shown:?}"
+    );
+}
+
+/// The personality `live_codex_world_state_yields_inventory` requests. Not
+/// `pragmatic`, the value a developer is most likely to have configured, so a
+/// pass proves the requested value arrived.
+const LIVE_CODEX_PERSONALITY: &str = "friendly";
+
+/// Write an executable wrapper that runs the real `codex` from `PATH` with
+/// `-c personality="<personality>"` ahead of the adapter's own arguments.
+fn codex_wrapper_requesting_personality(dir: &Path, personality: &str) -> std::path::PathBuf {
+    let path = dir.join("codex-with-personality");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nexec codex -c 'personality=\"{personality}\"' \"$@\"\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The `thread_settings` object of the last `thread_settings_applied` record
+/// in a rollout, read as raw JSON. `None` when the rollout has no such record.
+fn last_thread_settings(rollout: &Path) -> Option<serde_json::Value> {
+    let content = std::fs::read_to_string(rollout).unwrap();
+    content
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|record| {
+            record["type"] == "event_msg" && record["payload"]["type"] == "thread_settings_applied"
+        })
+        .map(|record| record["payload"]["thread_settings"].clone())
 }
 
 #[tokio::test]

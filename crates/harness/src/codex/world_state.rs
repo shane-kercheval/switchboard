@@ -12,13 +12,17 @@
 //! list rather than a wrong one.
 //!
 //! **`world_state` is a snapshot-plus-delta log, not a series of snapshots.**
-//! A record with `full: true` carries the whole state; one with `full: false`
-//! carries **only the keys that changed** (observed: `{"environments"}` alone,
-//! mid-session). Last-*record*-wins would therefore erase `host_skills` and
-//! `permissions` the moment any delta landed, so the reader accumulates
-//! per-key: a delta updates the keys it names, and a full snapshot replaces
-//! the accumulator outright (a key absent from a full snapshot is genuinely
-//! gone).
+//! A record with `full: true` carries the whole state, and replaces the
+//! accumulator outright (a key absent from a full snapshot is genuinely gone).
+//! A record with `full: false` is an **RFC 7386 JSON merge patch** against the
+//! state before it: Codex builds it with `create_merge_patch` and advances its
+//! own state with `apply_merge_patch_value` (`core/src/context/world_state/mod.rs`
+//! in openai/codex). Patches nest. A date change arrives as
+//! `{"environments": {"current_date": …}}` alone, and a spawned subagent as
+//! `{"environments": {"subagents": …}}`, so replacing whole top-level keys
+//! would erase the timezone and the shell sitting beside them. A `null` value
+//! deletes its key. The reader applies patches the same way, so its
+//! accumulated state is the state Codex itself holds.
 
 use serde_json::{Map, Value};
 
@@ -34,8 +38,8 @@ pub(crate) struct WorldState {
 }
 
 impl WorldState {
-    /// Fold one `world_state` record's payload in. `full` records replace,
-    /// deltas merge per key.
+    /// Fold one `world_state` record's payload in. `full` records replace;
+    /// partial records are merge patches (see the module doc).
     pub(crate) fn absorb(&mut self, payload: &Value) {
         let Some(state) = payload.get("state").and_then(Value::as_object) else {
             return;
@@ -45,9 +49,7 @@ impl WorldState {
             self.state.clone_from(state);
             return;
         }
-        for (key, value) in state {
-            self.state.insert(key.clone(), value.clone());
-        }
+        apply_merge_patch(&mut self.state, state);
     }
 
     /// Whether any `world_state` record was seen at all. A rollout written by
@@ -115,17 +117,31 @@ impl WorldState {
             .get("shell")?
             .as_str()
     }
+
+    /// The timezone Codex tells the model it is in. Codex 0.162 stopped
+    /// writing it to `turn_context`; this copy, in the environment state, was
+    /// already present at 0.161.
+    fn timezone(&self) -> Option<&str> {
+        self.state.get("environments")?.get("timezone")?.as_str()
+    }
 }
 
 /// Codex's run settings as display pairs, drawn from the last `turn_context`
-/// (the current turn's selections) and the accumulated `world_state` (the
-/// shell, which `turn_context` does not carry).
+/// (the current turn's selections), the accumulated `world_state` (shell and
+/// timezone), and `personality`, which the caller tracks across records.
+///
+/// Timezone prefers `world_state` and falls back to `turn_context` for
+/// rollouts written before Codex 0.162, which carried it only there.
+/// Personality left `turn_context` in 0.162 too, and its other carrier is a
+/// different record type, so the session scan resolves it (see
+/// `parse_session_content`).
 ///
 /// `None` when neither source yielded a single readable setting, so the card
 /// draws no settings line at all instead of an empty one.
 pub(crate) fn settings(
     world: &WorldState,
     turn_context: Option<&Value>,
+    personality: Option<&str>,
 ) -> Option<Vec<SettingPair>> {
     let mut pairs: Vec<SettingPair> = Vec::new();
     let mut push = |label: &str, value: Option<&str>| {
@@ -151,20 +167,47 @@ pub(crate) fn settings(
             .and_then(|c| c.get("approval_policy"))
             .and_then(Value::as_str),
     );
-    push(
-        "Personality",
-        turn_context
-            .and_then(|c| c.get("personality"))
-            .and_then(Value::as_str),
-    );
+    push("Personality", personality);
     push("Shell", world.shell());
     push(
         "Timezone",
-        turn_context
-            .and_then(|c| c.get("timezone"))
-            .and_then(Value::as_str),
+        world.timezone().or_else(|| {
+            turn_context
+                .and_then(|c| c.get("timezone"))
+                .and_then(Value::as_str)
+        }),
     );
     (!pairs.is_empty()).then_some(pairs)
+}
+
+/// Apply an RFC 7386 merge patch to `target`, matching Codex's
+/// `apply_merge_patch_value`: an object patch merges key by key at every depth,
+/// `null` deletes the key, and any other value (string, number, array)
+/// replaces what was there. An object patch landing on a missing or non-object
+/// value starts from an empty object, so the patch's own `null`s never survive
+/// as keys.
+fn apply_merge_patch(target: &mut Map<String, Value>, patch: &Map<String, Value>) {
+    for (key, patch_value) in patch {
+        match patch_value {
+            Value::Null => {
+                target.remove(key);
+            }
+            Value::Object(patch_object) => {
+                let entry = target
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if !entry.is_object() {
+                    *entry = Value::Object(Map::new());
+                }
+                if let Value::Object(object) = entry {
+                    apply_merge_patch(object, patch_object);
+                }
+            }
+            _ => {
+                target.insert(key.clone(), patch_value.clone());
+            }
+        }
+    }
 }
 
 /// Outcome of reading the `host_skills` markdown block.
@@ -488,10 +531,10 @@ mod tests {
         let turn_context = json!({
             "sandbox_policy": {"type": "read-only"},
             "approval_policy": "never",
-            "personality": "pragmatic",
             "timezone": "America/Los_Angeles",
         });
-        let pairs = settings(&world, Some(&turn_context)).expect("settings reported");
+        let pairs =
+            settings(&world, Some(&turn_context), Some("pragmatic")).expect("settings reported");
         let rendered: Vec<(&str, &str)> = pairs
             .iter()
             .map(|p| (p.label.as_str(), p.value.as_str()))
@@ -511,12 +554,16 @@ mod tests {
     #[test]
     fn settings_skip_what_neither_source_reports() {
         let world = world_with(&json!({"environments": {}}));
-        let pairs = settings(&world, Some(&json!({"approval_policy": "on-request"})))
-            .expect("one readable setting");
+        let pairs = settings(
+            &world,
+            Some(&json!({"approval_policy": "on-request"})),
+            None,
+        )
+        .expect("one readable setting");
         assert_eq!(pairs.len(), 1, "absent settings render no row: {pairs:?}");
         assert_eq!(pairs[0].label, "Approval policy");
         assert_eq!(
-            settings(&world, None),
+            settings(&world, None, None),
             None,
             "nothing readable → no settings line at all"
         );
@@ -529,7 +576,41 @@ mod tests {
         let world = world_with(&json!({
             "environments": {"environments": {"remote": {"shell": "bash"}}}
         }));
-        assert_eq!(settings(&world, None), None);
+        assert_eq!(settings(&world, None, None), None);
+    }
+
+    #[test]
+    fn timezone_comes_from_the_environment_state_when_turn_context_lacks_it() {
+        // Codex 0.162 dropped `timezone` from `turn_context`; the environment
+        // state is the only place a 0.162 rollout records it.
+        let world = world_with(&json!({
+            "environments": {"timezone": "America/Chicago"}
+        }));
+        let turn_context = json!({"approval_policy": "never"});
+        let pairs = settings(&world, Some(&turn_context), None).expect("settings reported");
+        assert!(
+            pairs
+                .iter()
+                .any(|p| p.label == "Timezone" && p.value == "America/Chicago"),
+            "{pairs:?}"
+        );
+    }
+
+    #[test]
+    fn the_environment_state_timezone_wins_over_turn_context() {
+        // Both carry it on 0.161 rollouts. The environment state is the copy
+        // Codex still writes, so it is the one to trust when they differ.
+        let world = world_with(&json!({
+            "environments": {"timezone": "America/Chicago"}
+        }));
+        let turn_context = json!({"timezone": "America/Los_Angeles"});
+        let pairs = settings(&world, Some(&turn_context), None).expect("settings reported");
+        let timezones: Vec<&str> = pairs
+            .iter()
+            .filter(|p| p.label == "Timezone")
+            .map(|p| p.value.as_str())
+            .collect();
+        assert_eq!(timezones, vec!["America/Chicago"]);
     }
 
     #[test]
@@ -556,6 +637,134 @@ mod tests {
             world.shell(),
             Some("fish"),
             "the delta's own key is applied"
+        );
+    }
+
+    /// A full snapshot shaped like a Codex 0.162.1 rollout's first
+    /// `world_state`: the local shell, the date and the timezone side by side
+    /// under `environments`, plus skills and an allowlist at the top level.
+    fn codex_0162_snapshot() -> WorldState {
+        world_with(&json!({
+            "environments": {
+                "environments": {"local": {"cwd": "/x", "status": "available", "shell": "zsh"}},
+                "current_date": "2026-10-11",
+                "timezone": "America/Chicago",
+            },
+            "host_skills": {"body": BODY},
+            "permissions": {"approved_command_prefixes": [["ls"]]},
+        }))
+    }
+
+    fn setting(world: &WorldState, label: &str) -> Option<String> {
+        settings(world, None, None)?
+            .into_iter()
+            .find(|p| p.label == label)
+            .map(|p| p.value)
+    }
+
+    #[test]
+    fn a_date_change_keeps_the_timezone_and_the_shell() {
+        // The patch Codex writes when a session continues on a new day: only
+        // the date under `environments`. Replacing the whole `environments`
+        // object erased the shell (before Codex 0.162) and the timezone (since
+        // 0.162 moved it here).
+        let mut world = codex_0162_snapshot();
+        world.absorb(&json!({
+            "full": false,
+            "state": {"environments": {"current_date": "2026-10-12"}}
+        }));
+        assert_eq!(
+            setting(&world, "Timezone").as_deref(),
+            Some("America/Chicago")
+        );
+        assert_eq!(setting(&world, "Shell").as_deref(), Some("zsh"));
+    }
+
+    #[test]
+    fn a_subagent_update_keeps_the_shell() {
+        let mut world = codex_0162_snapshot();
+        world.absorb(&json!({
+            "full": false,
+            "state": {"environments": {"subagents": "- reviewer: idle"}}
+        }));
+        assert_eq!(setting(&world, "Shell").as_deref(), Some("zsh"));
+        assert_eq!(
+            setting(&world, "Timezone").as_deref(),
+            Some("America/Chicago")
+        );
+    }
+
+    #[test]
+    fn a_patch_that_changes_the_timezone_replaces_it() {
+        let mut world = codex_0162_snapshot();
+        world.absorb(&json!({
+            "full": false,
+            "state": {"environments": {"current_date": "2026-10-12", "timezone": "Europe/Paris"}}
+        }));
+        assert_eq!(setting(&world, "Timezone").as_deref(), Some("Europe/Paris"));
+        assert_eq!(setting(&world, "Shell").as_deref(), Some("zsh"));
+    }
+
+    #[test]
+    fn null_in_a_patch_deletes_the_key_at_any_depth() {
+        let mut world = codex_0162_snapshot();
+        world.absorb(&json!({
+            "full": false,
+            "state": {
+                "host_skills": null,
+                "environments": {"timezone": null}
+            }
+        }));
+        assert_eq!(world.skills(), None, "a top-level null removes the section");
+        assert_eq!(
+            setting(&world, "Timezone"),
+            None,
+            "a nested null removes the key"
+        );
+        assert_eq!(
+            setting(&world, "Shell").as_deref(),
+            Some("zsh"),
+            "keys the patch does not name are untouched"
+        );
+        assert!(
+            !world.state.contains_key("host_skills"),
+            "a deleted key is gone, not stored as null"
+        );
+    }
+
+    #[test]
+    fn an_object_patch_on_a_missing_or_scalar_value_drops_its_own_nulls() {
+        // RFC 7386: patching a non-object starts from an empty object, so a
+        // `null` inside the patch deletes nothing and must not appear as a key.
+        let mut world = world_with(&json!({"environments": "unexpected scalar"}));
+        world.absorb(&json!({
+            "full": false,
+            "state": {
+                "environments": {"timezone": "America/Chicago", "removed": null},
+                "brand_new": {"kept": 1, "gone": null}
+            }
+        }));
+        assert_eq!(
+            world.state["environments"],
+            json!({"timezone": "America/Chicago"})
+        );
+        assert_eq!(world.state["brand_new"], json!({"kept": 1}));
+    }
+
+    #[test]
+    fn an_array_in_a_patch_replaces_the_old_array() {
+        // Arrays are values, not objects: a patch replaces the whole list
+        // rather than merging entries.
+        let mut world = world_with(&json!({
+            "permissions": {"approved_command_prefixes": [["ls"], ["git", "status"]]}
+        }));
+        world.absorb(&json!({
+            "full": false,
+            "state": {"permissions": {"approved_command_prefixes": [["brew", "install"]]}}
+        }));
+        assert_eq!(
+            world.approved_commands(),
+            Some(vec!["brew install".to_owned()])
         );
     }
 

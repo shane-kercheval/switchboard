@@ -15,11 +15,9 @@ use switchboard_core::AgentSelection;
 use switchboard_harness::{CodexForkError, CodexLocator, fork_codex_session};
 
 #[cfg(unix)]
-use nix::errno::Errno;
+mod common;
 #[cfg(unix)]
-use nix::sys::signal::killpg;
-#[cfg(unix)]
-use nix::unistd::Pid;
+use common::{assert_group_reaped, wait_for_pgid};
 
 const FAKE_CODEX: &str = env!("CARGO_BIN_EXE_fake_codex");
 
@@ -254,41 +252,6 @@ async fn a_missing_working_folder_is_not_reported_as_a_missing_binary() {
         matches!(&error, CodexForkError::WorkingDirectoryMissing(path) if *path == gone),
         "got {error:?}"
     );
-}
-
-/// Poll until `path` holds a parseable pgid; bounded so a spawn failure panics
-/// with a message rather than hanging the suite.
-#[cfg(unix)]
-async fn wait_for_pgid(path: &Path) -> Pid {
-    for _ in 0..200 {
-        if let Ok(s) = std::fs::read_to_string(path)
-            && let Ok(n) = s.trim().parse::<i32>()
-        {
-            return Pid::from_raw(n);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("fake_codex never wrote its pgid at {}", path.display());
-}
-
-/// Poll until **every** process in the group is gone.
-///
-/// Signal 0 to the group fails with `ESRCH` only when no member is left.
-/// Checking the leader alone (`getpgid(leader)`) is not enough: a teardown that
-/// kills only the spawned process passes that check while a child it started
-/// keeps running, which is the leak `terminate_then_kill` exists to prevent.
-/// Any other error (a permission error, say) is not evidence the group is
-/// gone, so it fails the test instead of passing it.
-#[cfg(unix)]
-async fn assert_group_reaped(leader: Pid) {
-    for _ in 0..200 {
-        match killpg(leader, None) {
-            Err(Errno::ESRCH) => return,
-            Ok(()) => tokio::time::sleep(Duration::from_millis(50)).await,
-            Err(other) => panic!("couldn't check process group {leader}: {other}"),
-        }
-    }
-    panic!("process group {leader} still alive after the fork returned");
 }
 
 #[cfg(unix)]

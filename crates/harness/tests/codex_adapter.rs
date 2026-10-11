@@ -15,11 +15,14 @@ use switchboard_harness::{
 use uuid::Uuid;
 
 #[cfg(unix)]
-use nix::unistd::{Pid, getpgid};
-#[cfg(unix)]
 use std::time::Duration;
 #[cfg(unix)]
 use tokio_util::sync::CancellationToken;
+
+#[cfg(unix)]
+mod common;
+#[cfg(unix)]
+use common::{assert_group_reaped, wait_for_pgid};
 
 const FAKE_CODEX: &str = env!("CARGO_BIN_EXE_fake_codex");
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex");
@@ -1321,32 +1324,6 @@ command = "p"
         session_meta.iter().all(|s| s.status == "configured"),
         "all entries report status='configured'"
     );
-}
-
-/// Poll until `path` holds a parseable pgid; bounded so a spawn failure panics.
-#[cfg(unix)]
-async fn wait_for_pgid(path: &Path) -> Pid {
-    for _ in 0..200 {
-        if let Ok(s) = std::fs::read_to_string(path)
-            && let Ok(n) = s.trim().parse::<i32>()
-        {
-            return Pid::from_raw(n);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("fake_codex never wrote its pgid at {}", path.display());
-}
-
-/// Poll until the process group's leader is gone (`getpgid` → `ESRCH`).
-#[cfg(unix)]
-async fn assert_group_reaped(leader: Pid) {
-    for _ in 0..200 {
-        if getpgid(Some(leader)).is_err() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("process group {leader} still alive after cancel");
 }
 
 #[cfg(unix)]

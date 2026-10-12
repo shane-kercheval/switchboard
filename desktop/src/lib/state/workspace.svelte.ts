@@ -1594,14 +1594,17 @@ type RereadOutcome = HydrateOutcome | "not_loaded";
 ///
 /// A read that throws keeps the view that was loaded and reports why through
 /// `onFailure`. A failure to load this one agent is recorded on the agent by
-/// `hydrateProject`.
+/// `hydrateProject`. `onReadStart` runs once this read's turn has come and it is
+/// about to read, after any read queued ahead of it has finished.
 async function rereadAgentHistory(
   agent: AgentRecord,
   onFailure: (message: string) => void,
+  onReadStart?: () => void,
 ): Promise<RereadOutcome> {
   const projectId = agent.project_id;
   return await chainProjectLoad(projectId, async () => {
     if (conversations[projectId]?.status !== "complete") return "not_loaded";
+    onReadStart?.();
     hydrationStarted.delete(projectId);
     return await hydrateProject(projectId, new Set([agent.id]), onFailure);
   });
@@ -1611,6 +1614,14 @@ async function rereadAgentHistory(
 /// read settles: for Retry, an attached agent, and a Codex fork. While it shows
 /// loading, sends to it and workflow runs wait, so the read doesn't overlap a
 /// reply being written to the agent's session file.
+///
+/// **Loading from the request until this read ends, including its own read.** A
+/// read queued ahead of this one can include the agent and mark it loaded, e.g.
+/// the project's first load when an attach finishes before that load reads the
+/// agent list. So the mark is set again when this read starts, from the current
+/// runtime so what the earlier read filled in stays. Otherwise sends to the
+/// agent would resume while this read runs, and a Codex reply caught
+/// half-written would show twice.
 ///
 /// **Never leaves it loading.** An applied read marks the agent complete, and a
 /// failed one marks it failed with the reason. A read that didn't run puts back
@@ -1622,10 +1633,19 @@ async function rereadAgentHistoryShowingProgress(agentId: AgentId): Promise<Rere
   if (agent === undefined || before === undefined || before.hydration_status === "loading") {
     return "skipped";
   }
-  runtimes[agentId] = { ...before, hydration_status: "loading", hydration_error: undefined };
+  const markLoading = (): void => {
+    const current = runtimes[agentId];
+    if (current === undefined || current.hydration_status === "loading") return;
+    runtimes[agentId] = { ...current, hydration_status: "loading", hydration_error: undefined };
+  };
+  markLoading();
   let outcome: RereadOutcome;
   try {
-    outcome = await rereadAgentHistory(agent, (message) => markHistoryFailed(agentId, message));
+    outcome = await rereadAgentHistory(
+      agent,
+      (message) => markHistoryFailed(agentId, message),
+      markLoading,
+    );
   } catch (err) {
     markHistoryFailed(agentId, err instanceof Error ? err.message : String(err));
     return "failed";

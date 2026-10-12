@@ -2496,8 +2496,9 @@
       <p class="text-muted text-sm">Loading history…</p>
     </div>
   {:else if loadStatus === "loading"}
-    <!-- Rows are already on screen (per-agent hydration landed first) — a
-         small note above them, not a centered takeover over visible content. -->
+    <!-- Rows are already on screen (this session's live turns, or the view a
+         project Retry keeps while it rereads) — a small note above them, not a
+         centered takeover over visible content. -->
     <p class="text-muted mb-3 text-xs italic" data-testid="transcript-loading">Loading history…</p>
   {:else if loadStatus === "failed"}
     {@render failureBanner(

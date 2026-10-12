@@ -2323,6 +2323,37 @@ describe("one agent's history reread (Retry and attach)", () => {
     expect(await promptRows("hello")).toBe(1);
   });
 
+  it("keeps an attached agent loading through its own read when the first load already included it", async () => {
+    // The attach finished before the first load read the agent list, so that
+    // load applies the agent and marks it loaded. Its own read still follows,
+    // and sends to it must keep waiting until that read ends.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const attached = agent(AGENT_1, PROJECT_1);
+    const firstLoad = deferred<ProjectConversation>();
+    const ownRead = deferred<ProjectConversation>();
+    let roster: AgentRecord[] = [];
+    const { reads } = backend(
+      () => roster,
+      async (n) => (n === 1 ? await firstLoad.promise : await ownRead.promise),
+    );
+    await ws.activateProject(PROJECT_1);
+    roster = [attached];
+    await state.registerAgent(attached);
+    ws.addAgentToProjectRoster(attached);
+    const attaching = ws.loadAttachedAgentHistory(AGENT_1);
+
+    firstLoad.resolve(exchange({ imported: true }));
+    await vi.waitFor(() => expect(reads()).toBe(2));
+
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("loading");
+    ownRead.resolve(exchange({ imported: true }));
+    await attaching;
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(state.transcripts[AGENT_1]?.filter((turn) => turn.role === "agent")).toHaveLength(1);
+    expect(await promptRows("hello")).toBe(1);
+  });
+
   it("refuses Retry until the project's history has loaded, and says why", async () => {
     // Retry rereads through the project read. Run while the project's history
     // is loading or failed, it would mark the project loaded holding only this

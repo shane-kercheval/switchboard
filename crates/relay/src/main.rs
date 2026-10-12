@@ -3,6 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use switchboard_relay::{Config, serve};
 use tokio::net::TcpListener;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -18,10 +19,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "relay listening");
     let shutdown = CancellationToken::new();
+    // In a container the relay is PID 1, which Linux sends no default
+    // signal handling, so `docker stop`'s SIGTERM must be caught here or the
+    // container is killed without closing its connections.
+    let mut terminate = signal(SignalKind::terminate())?;
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            tracing::info!("shutting down");
             shutdown.cancel();
         }
     });

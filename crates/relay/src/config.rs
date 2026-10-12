@@ -10,7 +10,7 @@ use crate::protocol::{DeviceId, InvalidDeviceId};
 pub struct Config {
     pub port: u16,
     /// Messages per second a connection may send, sustained; a connection
-    /// may also burst up to this many at once. Pings do not count.
+    /// may also burst up to this many at once. Pings and pongs count.
     pub rate_limit: u32,
     /// The longest WebSocket message accepted. The default is above a frame
     /// carrying the longest record: 65,568 bytes, about 87,500 as base64.

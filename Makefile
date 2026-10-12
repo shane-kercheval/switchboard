@@ -1,4 +1,4 @@
-.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check check-rust check-frontend clean clean-stale install ios-crypto check-ios test-live test-live-claude test-live-codex test-live-antigravity cli-surface test-scripts protocol-fixtures relay
+.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check check-rust check-frontend clean clean-stale install ios-crypto check-ios test-live test-live-claude test-live-codex test-live-antigravity cli-surface test-scripts protocol-fixtures relay relay-image
 
 # Crates that carry live (`#[ignore]`-gated) harness tests.
 LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
@@ -265,6 +265,14 @@ protocol-fixtures:
 # settings are environment variables too (crates/relay/src/config.rs).
 relay:
 	cargo run -p switchboard-relay --locked
+
+# Build the relay's container image, with the Rust version read from
+# rust-toolchain.toml so the image never builds with a different toolchain
+# than the gates. Needs Docker.
+RUST_CHANNEL = $(shell sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+relay-image:
+	@test -n "$(RUST_CHANNEL)" || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+	docker build -f crates/relay/Dockerfile --build-arg RUST_VERSION=$(RUST_CHANNEL) -t switchboard-relay .
 
 # Tests for the repo's dev scripts, using fake CLIs (no harness or login
 # needed). Part of `check` and CI.

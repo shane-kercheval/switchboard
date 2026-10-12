@@ -14,12 +14,12 @@ workspace = true
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
 chrono.workspace = true
-data-encoding = "2.11.1"
+data-encoding.workspace = true
 futures.workspace = true
-getrandom = "0.3"
+getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2.workspace = true
 switchboard-remote-crypto = { path = "../remote-crypto" }
 thiserror.workspace = true
 tokio.workspace = true

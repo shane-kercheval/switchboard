@@ -32,6 +32,9 @@ use crate::state::{Outbox, Relay};
 const OUTBOUND_QUEUE: usize = 256;
 /// How long a closing connection's queued messages may take to go out.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Messages read and discarded while a closing connection waits for the
+/// client to answer its close; past this the socket is simply dropped.
+const DRAIN_LIMIT: usize = 64;
 
 struct Shared {
     config: Config,
@@ -179,19 +182,29 @@ async fn run_connection(socket: WebSocket, shared: Arc<Shared>) {
         shared.relay().unregister(&id, generation, Utc::now());
         tracing::info!(device_id = %id, "disconnected");
     }
+    // The slot covers the connection's working life, not its close, so a
+    // refused client cannot keep it by never answering.
+    drop(slot);
     // Dropping the outbox, the queue's last sender, lets the writer flush
     // and send its close. Reading on until the client answers that close
     // matters: closing a socket with the client's messages still unread
     // resets the connection, and the reset can discard the error just sent.
+    // The reading is bounded by count and time, and nothing read is acted on.
     let mut stream = connection.into_stream();
-    let drain = async { while let Some(Ok(_)) = stream.next().await {} };
+    let drain = async {
+        let mut read = 0;
+        while read < DRAIN_LIMIT
+            && let Some(Ok(_)) = stream.next().await
+        {
+            read += 1;
+        }
+    };
     let flushed = tokio::time::timeout(FLUSH_TIMEOUT, async {
         let ((), _) = tokio::join!(drain, &mut writer);
     });
     if flushed.await.is_err() {
         writer.abort();
     }
-    drop(slot);
 }
 
 async fn write_queue(
@@ -225,6 +238,15 @@ struct Connection {
     registration: Option<(DeviceId, u64)>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Deadline {
+    /// A fixed moment, unmoved by anything the client sends: the window to
+    /// register, which pings must not stretch.
+    At(tokio::time::Instant),
+    /// This long after the client's last message of any kind.
+    Idle(Duration),
+}
+
 enum Incoming {
     Message(ClientMessage),
     /// The connection is over; anything owed to the client is queued.
@@ -245,7 +267,8 @@ impl Connection {
         }
         self.send(ServerMessage::Challenge { nonce });
         let register_timeout = self.shared.config.register_timeout;
-        match self.next(register_timeout).await {
+        let register_by = tokio::time::Instant::now() + register_timeout;
+        match self.next(Deadline::At(register_by)).await {
             Incoming::Message(ClientMessage::Register {
                 relay_protocol,
                 device_id,
@@ -269,7 +292,7 @@ impl Connection {
             Incoming::End => return,
         }
         let idle_timeout = self.shared.config.idle_timeout;
-        while let Incoming::Message(message) = self.next(idle_timeout).await {
+        while let Incoming::Message(message) = self.next(Deadline::Idle(idle_timeout)).await {
             if !self.handle(message) {
                 return;
             }
@@ -373,35 +396,42 @@ impl Connection {
         true
     }
 
-    /// The next client message, or `End` once the connection is over. Pings
-    /// and pongs keep the connection alive and are otherwise skipped.
-    async fn next(&mut self, wait: Duration) -> Incoming {
+    /// The next client message, or `End` once the connection is over or
+    /// `deadline` passes. Pings and pongs count toward the rate limit and
+    /// an idle deadline, and are otherwise skipped.
+    async fn next(&mut self, deadline: Deadline) -> Incoming {
         loop {
+            let until = match deadline {
+                Deadline::At(at) => at,
+                Deadline::Idle(idle) => tokio::time::Instant::now() + idle,
+            };
             let received = tokio::select! {
                 () = self.closed.cancelled() => return Incoming::End,
-                received = tokio::time::timeout(wait, self.stream.next()) => received,
+                received = tokio::time::timeout_at(until, self.stream.next()) => received,
             };
             let message = match received {
                 Err(_) => {
-                    tracing::debug!("closing an idle connection");
+                    tracing::debug!("closing a connection past its deadline");
                     return Incoming::End;
                 }
                 Ok(Some(Ok(message))) => message,
                 Ok(None | Some(Err(_))) => return Incoming::End,
             };
+            if matches!(message, Message::Close(_)) {
+                return Incoming::End;
+            }
+            if !self.limiter.allow(Instant::now()) {
+                self.refuse(ErrorCode::RateLimited, "too many messages");
+                return Incoming::End;
+            }
             let text = match message {
-                Message::Ping(_) | Message::Pong(_) => continue,
-                Message::Close(_) => return Incoming::End,
+                Message::Ping(_) | Message::Pong(_) | Message::Close(_) => continue,
                 Message::Text(text) => text,
                 Message::Binary(_) => {
                     self.refuse(ErrorCode::BadMessage, "messages are JSON text");
                     return Incoming::End;
                 }
             };
-            if !self.limiter.allow(Instant::now()) {
-                self.refuse(ErrorCode::RateLimited, "too many messages");
-                return Incoming::End;
-            }
             if let Ok(message) = serde_json::from_str(text.as_str()) {
                 return Incoming::Message(message);
             }

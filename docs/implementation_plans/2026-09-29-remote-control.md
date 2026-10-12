@@ -38,13 +38,24 @@ shared Rust cryptography are in one tree.
     `not_paired`, `pairing_expired`, and `protocol_mismatch`. A relay error is the relay's
     own message, not an envelope, so it has no `id`.
   - **`RATE_LIMIT`** is messages a second per connection, sustained, with bursts of the same
-    size; pings do not count. Default 256. A client over it is sent `rate_limited` and closed.
+    size; pings and pongs count, so a client cannot make the relay answer pings without limit.
+    Default 256. A client over it is sent `rate_limited` and closed.
   - Two limits the plan did not name: a connection whose outbound queue (256 messages) is full
     is closed, so a client that stops reading cannot hold up its senders; and the relay keeps
     at most 1,024 held sets of disconnected Macs, forgetting the longest disconnected first,
     since registration is open to any key.
+  - **A Mac is reached only through its own set.** Any device may send `paired_devices`, so
+    a sender's own set never admits it to a device the relay holds a set for, and a Mac's
+    disconnect is announced only to the phones in its own set. Otherwise a stranger could
+    list a Mac's id, learn its `last_seen` and its comings and goings, and fill its queue
+    until the relay closed it. A phone, which holds no set, is still reachable by any device
+    that lists its id; this is accepted, below.
+  - The registration window is a fixed 10 seconds that pings do not extend, and a refused
+    connection gives up its `MAX_CONNECTIONS` slot before waiting for the client to answer
+    the close.
   - `make protocol-fixtures` lands with the relay's fixtures in PR 1; PR 2 adds the envelope
-    fixtures to it.
+    fixtures to it. `make relay-image` builds the container with the Rust version from
+    `rust-toolchain.toml`.
 - **Revision 23 (2026-10-10)** — M1 complete; the M2 PR plan (§9).
   - The status moves from proposed to in progress, and M1 records the pull requests that
     landed it.
@@ -1208,12 +1219,14 @@ It forwards everything unchanged, then:
 Deliberately dumb; never sees plaintext; holds no conversation state.
 
 - **Stack**: axum + `tokio-tungstenite`. Env config: `PORT`, `RATE_LIMIT` (messages a second
-  per connection, sustained, with bursts of the same size; pings do not count; default 256),
+  per connection, sustained, with bursts of the same size; pings and pongs count; default 256),
   `MAX_FRAME_BYTES` (the longest WebSocket message; default 131,072, above the 87,500-odd
   bytes of a frame carrying the longest record as base64),
   `MAX_DEVICES_PER_MAC`, `MAX_CONNECTIONS` (global, default 64, since registration is open to
   any key), `DENY_DEVICE_IDS` (comma-separated). `crates/relay/Dockerfile`; TLS terminated by
-  the host so clients use `wss://`. Locally: `make relay`. The WebSocket is at `/connect`.
+  the host so clients use `wss://`. Locally: `make relay`; the image: `make relay-image`, which
+  passes the Rust version from `rust-toolchain.toml` as the required `RUST_VERSION` build
+  argument. The WebSocket is at `/connect`.
 - **Wire**: every message either way is one WebSocket text message holding a JSON object
   tagged by `type`, with byte fields in standard padded base64. A binary message, or one that
   does not parse, is answered `bad_message` and closes the connection; an unknown `type`
@@ -1223,7 +1236,7 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   pairing_token? }`, `peer_disconnected { device_id }`, `error { code, message, device_id?,
   last_seen? }`. Fixtures for each are in `crates/relay/tests/fixtures/protocol/`.
 - **Registration**: on connect the relay sends `challenge { nonce }`, 32 fresh random bytes.
-  Within 10 seconds the client answers `register { relay_protocol, device_id,
+  Within 10 seconds of connecting, which pings do not extend, the client answers `register { relay_protocol, device_id,
   identity_public_key, signature }`, the signature from `DeviceKeys::sign_relay_challenge`
   over the nonce; anything else first is `bad_message`. The relay refuses an unsupported
   `relay_protocol` with `protocol_mismatch`, and with `registration_refused` a key that does
@@ -1256,8 +1269,14 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   the same as for any Mac it does not know: after a relay restart, a paired phone that
   reconnects before its Mac is told the Mac is offline, not that it is unpaired. Neither
   answer says whether the Mac is connected. A device becomes a Mac to the relay by sending
-  `paired_devices` or `pairing_open`. A Mac may address the phones in its set, answered
-  `phone_offline` for one not connected and `not_paired` for one outside it.
+  `paired_devices` or `pairing_open`. A Mac is reached only through its own set and its
+  pairing token: a sender's own set never admits it to a Mac, since any device may send
+  `paired_devices`. A Mac may address the phones in its set, answered `phone_offline` for
+  one not connected and `not_paired` for one outside it. A phone holds no set, so any device
+  that lists its id may address it and is told of its disconnects, and could flood it until
+  the relay closes it as not reading. That needs the phone's id, which only its Mac and the
+  relay's logs hold, and the phone ignores frames that do not come from its Mac; accepted
+  for the pilot.
 - **Pairing token**: 32 random bytes the Mac mints, carried as `pairing_token` on the phone's
   pairing frames; `pairing_open`'s `token_hash` is its SHA-256 (`protocol::token_hash`). One
   window per Mac: a new `pairing_open` replaces it, and `expires_in` is capped at 300 seconds.
@@ -1268,7 +1287,8 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   the Mac's disconnect.
 - **Peer notices**: the relay sends `peer_disconnected { device_id }` **exactly once for each
   registration that ends**, to every connected device paired with it: to the Mac for a phone,
-  and to each connected phone in the Mac's set for a Mac. A registration ends when a newer
+  and to each connected phone in the Mac's set for a Mac — never to a device that merely
+  lists the Mac. A registration ends when a newer
   registration for the same id replaces it, or when its socket closes or times out while it
   is still the one registered. On a replacement the notice goes out before any frame from
   the new connection is forwarded, so the receiver ends the old session before the new

@@ -11,7 +11,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
-use switchboard_remote_crypto::identity::{self, DEVICE_ID_LEN, VerifyingKey};
+use switchboard_remote_crypto::identity::{self, VerifyingKey};
 
 /// The relay protocol this build speaks. A client names its own in
 /// `register`; any other value is refused with `protocol_mismatch`.
@@ -34,11 +34,7 @@ pub struct InvalidDeviceId(pub String);
 
 impl DeviceId {
     pub fn parse(value: &str) -> Result<Self, InvalidDeviceId> {
-        let well_formed = value.len() == DEVICE_ID_LEN
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b));
-        if well_formed {
+        if identity::is_device_id(value) {
             Ok(Self(value.to_owned()))
         } else {
             Err(InvalidDeviceId(value.to_owned()))
@@ -252,20 +248,9 @@ mod tests {
     const ID: &str = "abcdefghijklmnopqrstuvwxyz";
 
     #[test]
-    fn device_id_accepts_only_26_lower_case_base32_characters() {
+    fn device_id_parses_by_the_crypto_crates_rule() {
         assert!(DeviceId::parse(ID).is_ok());
-        assert!(DeviceId::parse("234567abcdefghijklmnopqrst").is_ok());
-        for bad in [
-            "",
-            &ID[..25],
-            &format!("{ID}a"),
-            "Abcdefghijklmnopqrstuvwxyz",
-            "abcdefghijklmnopqrstuvwxy1",
-            "abcdefghijklmnopqrstuvwxy8",
-            "abcdefghijklmnopqrstuvwxy=",
-        ] {
-            assert!(DeviceId::parse(bad).is_err(), "{bad:?}");
-        }
+        assert!(DeviceId::parse("Abcdefghijklmnopqrstuvwxyz").is_err());
     }
 
     #[test]

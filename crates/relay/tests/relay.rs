@@ -580,15 +580,17 @@ async fn connections_past_the_limit_are_refused() {
 
 #[tokio::test]
 async fn a_silent_client_is_closed_and_a_pinging_one_is_not() {
+    // Pings every 100 ms against a 2 s timeout, for longer than the timeout:
+    // a twenty-fold margin, so a loaded machine cannot close the pinging one.
     let relay = start(Config {
-        idle_timeout: Duration::from_millis(400),
+        idle_timeout: Duration::from_secs(2),
         ..Config::default()
     })
     .await;
     let mut silent = Client::connect(&relay).await;
     let mut pinging = Client::connect(&relay).await;
 
-    for _ in 0..10 {
+    for _ in 0..30 {
         pinging
             .socket
             .send(Message::Ping(b"keepalive".to_vec().into()))
@@ -600,6 +602,92 @@ async fn a_silent_client_is_closed_and_a_pinging_one_is_not() {
     }
     assert_eq!(until_closed(&mut silent.socket).await, vec![]);
     assert_eq!(pinging.sync().await, vec![]);
+}
+
+#[tokio::test]
+async fn pings_do_not_extend_the_registration_deadline() {
+    let relay = start(Config {
+        register_timeout: Duration::from_millis(300),
+        ..Config::default()
+    })
+    .await;
+    let (mut socket, _) = open(&relay.url()).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a client that only pings was never closed"
+        );
+        if socket
+            .send(Message::Ping(b"stalling".to_vec().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        match tokio::time::timeout(WAIT, socket.next()).await {
+            Ok(Some(Ok(Message::Pong(_)))) => {}
+            Ok(Some(Ok(Message::Close(_)) | Err(_)) | None) => return,
+            other => panic!("unexpected {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn pings_count_toward_the_rate_limit() {
+    let relay = start(Config {
+        rate_limit: 5,
+        ..Config::default()
+    })
+    .await;
+    let mut client = Client::connect(&relay).await;
+    for _ in 0..20 {
+        if client
+            .socket
+            .send(Message::Ping(b"flood".to_vec().into()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    let said = until_closed(&mut client.socket).await;
+    assert_eq!(codes(&said), vec![ErrorCode::RateLimited]);
+}
+
+#[tokio::test]
+async fn a_refused_client_that_never_answers_the_close_does_not_keep_its_slot() {
+    let relay = start(Config {
+        max_connections: 1,
+        ..Config::default()
+    })
+    .await;
+    let mut refused = Client::connect(&relay).await;
+    refused
+        .socket
+        .send(Message::Binary(vec![1].into()))
+        .await
+        .unwrap();
+    // `refused` never reads again, so it never answers the relay's close.
+    // Its slot must come free well before the relay stops waiting for that
+    // answer.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let (mut socket, _) = connect_async(relay.url()).await.unwrap();
+        if matches!(
+            next(&mut socket).await,
+            Some(ServerMessage::Challenge { .. })
+        ) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refused connection kept its slot while closing"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(refused);
 }
 
 #[tokio::test]

@@ -23,7 +23,6 @@ import type {
   GitCommitRange,
   HarnessInstallStatus,
   HarnessKind,
-  LoadedTranscript,
   McpAuth,
   McpProviderInfo,
   MessageId,
@@ -385,8 +384,8 @@ export async function migrateMessagePin(
 }
 
 // The merged post-restart conversation for a project (journal user-messages +
-// harness agent content + journal outcome markers). Replaces per-agent
-// `loadTranscript` for the unified view.
+// harness agent content + journal outcome markers). Every history read goes
+// through it, including one agent's Retry and an attached agent's first load.
 //
 // Read-only: reclaiming orphaned attachments is `reclaimProjectAttachments`'s
 // job, and is safe only at project open.
@@ -714,10 +713,6 @@ export async function openSessionFile(agentId: AgentId): Promise<void> {
 /// content is rejected rather than handed to the OS opener.
 export async function openExternalUrl(url: string): Promise<void> {
   await invoke("open_external_url", { url });
-}
-
-export async function loadTranscript(agentId: AgentId): Promise<LoadedTranscript> {
-  return await invoke<LoadedTranscript>("load_transcript", { agentId });
 }
 
 /// Configured MCP prompt-server providers with their status (Settings list).

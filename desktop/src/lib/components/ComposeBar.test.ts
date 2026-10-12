@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, NormalizedEvent, ProjectListing, Prompt } from "$lib/types";
 // Static import so the component-tree transform happens at module collection,
@@ -124,6 +124,9 @@ beforeEach(async () => {
   // A compose operation is project-scoped and outlives its component, so a test
   // that leaves one in flight would keep every later test's composer busy.
   (await import("$lib/state/composeOperations.svelte"))._testing.reset();
+  // A project whose history has loaded, the normal state of an open project.
+  // Fork waits for it; a test about the loading window sets it back.
+  (await loadWorkspace()).conversations[PROJECT_ID] = { items: [], status: "complete" };
   listeners.clear();
   // `listenMock` is module-level so a test can make one channel fail; reset it
   // here or that override leaks into every test after it.
@@ -1332,7 +1335,7 @@ describe("ComposeBar", () => {
       });
     }
 
-    it("is offered only for a single Claude recipient that has something to branch", async () => {
+    it("is offered only for a single recipient that has something to branch", async () => {
       const state = await loadState();
       await state.registerAgent(AGENT_A);
       await state.registerAgent(AGENT_B);
@@ -1346,9 +1349,154 @@ describe("ComposeBar", () => {
       await fireEvent.click(chip(AGENT_B.id));
       await waitFor(() => expect(forkHalf()).toBeNull());
 
-      // A single non-Claude recipient — no harness support.
+      // A single recipient with nothing to branch yet (bob has no session).
       await fireEvent.click(chip(AGENT_A.id));
       await waitFor(() => expect(forkHalf()).toBeNull());
+    });
+
+    const CODEX_AGENT: AgentRecord = {
+      ...AGENT_B,
+      session_locator: {
+        codex: {
+          thread_id: "01a12c22-a3f8-71e2-b51e-ca72562cfabb",
+          partition_date: "2026-10-11",
+        },
+      },
+    };
+    const CODEX_FORK_RECORD: AgentRecord = {
+      ...CODEX_AGENT,
+      id: "00000000-0000-7000-8000-000000000c0f",
+      name: "bob-fork",
+      session_locator: {
+        codex: {
+          thread_id: "01a12c22-df64-7103-9fc3-92f2e3595c02",
+          partition_date: "2026-10-11",
+        },
+      },
+      created_at: "2026-05-16T00:00:03Z",
+    };
+    const AGY_AGENT: AgentRecord = {
+      ...AGENT_A,
+      id: "00000000-0000-7000-8000-000000000ccc",
+      name: "gina",
+      harness: "antigravity",
+      session_locator: { uuid: "00000000-0000-7000-8000-000000000003" },
+    };
+
+    it("is offered for a single idle Codex recipient with a session", async () => {
+      const state = await loadState();
+      await state.registerAgent(CODEX_AGENT);
+      seedTurn(state, CODEX_AGENT.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+      expect(forkHalf()).toHaveAttribute("aria-label", expect.stringMatching(/fork bob/i));
+    });
+
+    it("forks a Codex agent from the keyboard and sends to the fork", async () => {
+      const state = await loadState();
+      await state.registerAgent(CODEX_AGENT);
+      seedTurn(state, CODEX_AGENT.id);
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return CODEX_FORK_RECORD;
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch the codex agent" } });
+      await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
+
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("fork_agent", { agentId: CODEX_AGENT.id });
+      });
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith(
+          "send_message",
+          expect.objectContaining({ agentId: CODEX_FORK_RECORD.id }),
+        );
+      });
+      expect(invokeMock).not.toHaveBeenCalledWith(
+        "send_message",
+        expect.objectContaining({ agentId: CODEX_AGENT.id }),
+      );
+    });
+
+    it("waits for the project's history before offering Fork, for Claude and Codex alike", async () => {
+      // A fork's earlier conversation is read through the project's history
+      // load, which skips while the project is still loading. One rule for
+      // both harnesses, in the one shared fork check.
+      const ws = await loadWorkspace();
+      const state = await loadState();
+      for (const agent of [AGENT_A, CODEX_AGENT]) {
+        cleanup();
+        ws.conversations[PROJECT_ID] = { items: [], status: "loading" };
+        await state.registerAgent(agent);
+        seedTurn(state, agent.id);
+        render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+        const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+        await fireEvent.input(textarea, { target: { value: "branch" } });
+        expect(forkHalf()).toBeNull();
+
+        await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
+        expect(await screen.findByTestId("compose-send-error")).toHaveTextContent(
+          "Fork is available once the project's history has loaded.",
+        );
+        expect(invokeMock).not.toHaveBeenCalledWith("fork_agent", expect.anything());
+
+        // Positive control: the same composer offers it once the load lands.
+        ws.conversations[PROJECT_ID] = { items: [], status: "complete" };
+        await waitFor(() => expect(forkHalf()).not.toBeNull());
+      }
+    });
+
+    it("still sends to a Codex fork whose earlier conversation failed to load", async () => {
+      // The fork exists in Codex and in the registry. Its history load failing
+      // must not stop the message, or the user's retry would make a second fork.
+      const state = await loadState();
+      await state.registerAgent(CODEX_AGENT);
+      seedTurn(state, CODEX_AGENT.id);
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return CODEX_FORK_RECORD;
+        if (cmd === "load_project_conversation") throw new Error("disk went away");
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch anyway" } });
+      await fireEvent.click(forkHalf()!);
+
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith(
+          "send_message",
+          expect.objectContaining({ agentId: CODEX_FORK_RECORD.id }),
+        );
+      });
+      expect(invokeMock).toHaveBeenCalledWith("load_project_conversation", expect.anything());
+      expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "fork_agent")).toHaveLength(1);
+      expect(state.runtimes[CODEX_FORK_RECORD.id]?.hydration_status).toBe("failed");
+    });
+
+    it("is not offered for Antigravity, and the shortcut says which harnesses can branch", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGY_AGENT);
+      seedTurn(state, AGY_AGENT.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGY_AGENT] } });
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch" } });
+      expect(forkHalf()).toBeNull();
+
+      await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
+
+      expect(await screen.findByTestId("compose-send-error")).toHaveTextContent(
+        "Switchboard can branch only Claude Code and Codex sessions, and gina is Antigravity.",
+      );
+      expect(invokeMock).not.toHaveBeenCalledWith("fork_agent", expect.anything());
     });
 
     it("is not offered while the agent has no session to branch from", async () => {
@@ -1358,6 +1506,23 @@ describe("ComposeBar", () => {
 
       await waitFor(() => expect(screen.getByTestId("compose-send")).toBeInTheDocument());
       expect(forkHalf()).toBeNull();
+    });
+
+    it("is offered for a Codex agent with a session id even when none of it shows", async () => {
+      // A Codex fork whose earlier conversation can't be shown, sent nothing
+      // yet, has an empty transcript but a real session. A Claude agent's id
+      // proves nothing (the test above), because Claude's is assigned before
+      // any session exists.
+      const codexFork: AgentRecord = {
+        ...AGENT_B,
+        session_locator: { codex: { thread_id: "thread-b", partition_date: "2026-10-11" } },
+      };
+      const state = await loadState();
+      await state.registerAgent(codexFork);
+      expect(state.runtimes[codexFork.id]?.hydration_status).toBe("complete");
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [codexFork] } });
+
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
     });
 
     it("withdraws the offer while the agent is working", async () => {
@@ -8822,6 +8987,144 @@ describe("ComposeBar — auto reading mode", () => {
   });
 });
 
+describe("ComposeBar — project history loading", () => {
+  // While the project's history is being read (its first load, or the
+  // project-wide Retry), a reply that starts could be caught half-written and
+  // shown twice, so sends wait. The wait ends when the read ends either way.
+  it("holds sends while the history loads, and releases them whether it loads or fails", async () => {
+    const state = await loadState();
+    const ws = await loadWorkspace();
+    await state.registerAgent(AGENT_A);
+    ws.conversations[PROJECT_ID] = { items: [], status: "loading" };
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "hi" } });
+    const send = screen.getByTestId("compose-send") as HTMLButtonElement;
+    expect(send.disabled).toBe(true);
+
+    await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
+    expect(await screen.findByTestId("compose-send-error")).toHaveTextContent(
+      "Sending is available once the project's history has loaded.",
+    );
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message")).toHaveLength(0);
+
+    ws.conversations[PROJECT_ID] = { items: [], status: "complete" };
+    await waitFor(() => expect(send.disabled).toBe(false));
+
+    ws.conversations[PROJECT_ID] = { items: [], status: "loading" };
+    await waitFor(() => expect(send.disabled).toBe(true));
+    ws.conversations[PROJECT_ID] = { items: [], status: "failed", error: "unreadable" };
+    await waitFor(() => expect(send.disabled).toBe(false));
+  });
+
+  it("holds a workflow run while the history loads", async () => {
+    const state = await loadState();
+    const ws = await loadWorkspace();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "quick-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    const DESCRIPTOR = {
+      ...WORKFLOW,
+      steps: [],
+      derived_args: [],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:quick-workflow"));
+    const run = await screen.findByTestId("workflow-invoke-button");
+    await waitFor(() => expect(run).toBeEnabled());
+
+    ws.conversations[PROJECT_ID] = { items: [], status: "loading" };
+
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-invoke-button")).toHaveAttribute("aria-disabled", "true"),
+    );
+    ws.conversations[PROJECT_ID] = { items: [], status: "complete" };
+    await waitFor(() => expect(screen.getByTestId("workflow-invoke-button")).toBeEnabled());
+    expect(screen.getByTestId("workflow-invoke-button")).not.toHaveAttribute("aria-disabled");
+  });
+
+  // One agent's history being read (a fork's earlier conversation, or a
+  // Retry) holds a run as the project's does, and so does the agent card's
+  // Fork while it locks the original's session. Neither shows in the form, so
+  // hovering Run says why.
+  it("holds a workflow run while one agent's history loads or a fork is being created", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "quick-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        return { ...WORKFLOW, steps: [], derived_args: [], compatibility: { state: "ok" } };
+      }
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:quick-workflow"));
+    await waitFor(() => expect(screen.getByTestId("workflow-invoke-button")).toBeEnabled());
+
+    const hoverReason = async (): Promise<string | null> => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        await fireEvent.pointerEnter(screen.getByTestId("workflow-invoke-button"));
+        await vi.advanceTimersByTimeAsync(1100);
+        return screen.getByTestId("tooltip-content").textContent;
+      } finally {
+        await fireEvent.pointerLeave(screen.getByTestId("workflow-invoke-button"));
+        vi.useRealTimers();
+      }
+    };
+
+    state.runtimes[AGENT_A.id] = { ...state.runtimes[AGENT_A.id]!, hydration_status: "loading" };
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-invoke-button")).toHaveAttribute("aria-disabled", "true"),
+    );
+    expect(await hoverReason()).toContain(
+      "Workflows can run once every agent's history has loaded.",
+    );
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "invoke_workflow")).toHaveLength(0);
+
+    state.runtimes[AGENT_A.id] = { ...state.runtimes[AGENT_A.id]!, hydration_status: "complete" };
+    await waitFor(() => expect(screen.getByTestId("workflow-invoke-button")).toBeEnabled());
+
+    const ops = await import("$lib/state/composeOperations.svelte");
+    const fork = ops.beginOperation(PROJECT_ID, { kind: "menu_fork", sourceId: AGENT_A.id })!;
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-invoke-button")).toHaveAttribute("aria-disabled", "true"),
+    );
+    expect(await hoverReason()).toContain(
+      "Workflows can run once the send or fork in progress in this project has finished.",
+    );
+
+    ops.finishOperation(PROJECT_ID, fork);
+    await waitFor(() => expect(screen.getByTestId("workflow-invoke-button")).toBeEnabled());
+  });
+});
+
 describe("ComposeBar — unavailable project folder", () => {
   const LISTING: ProjectListing = {
     id: PROJECT_ID,
@@ -8906,7 +9209,7 @@ describe("ComposeBar — unavailable project folder, fork shortcut", () => {
     await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
 
     expect(await screen.findByTestId("compose-send-error")).toHaveTextContent(
-      "folder is unavailable, so nothing can be sent",
+      "folder is unavailable, so its agents can't run",
     );
     expect(invokeMock).not.toHaveBeenCalledWith("fork_agent", expect.anything());
     expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());

@@ -34,13 +34,14 @@ pub use antigravity::session_file::load_antigravity_transcript;
 pub use claude_code::{
     ClaudeCodeAdapter, claude_session_file_path, claude_transport_prompt, load_claude_transcript,
 };
-pub use codex::CodexAdapter;
 pub use codex::account_usage::{
     ACCOUNT_USAGE_TIMEOUT, AccountUsageError, CodexAccountUsage, read_account_usage,
 };
+pub use codex::fork::{CODEX_FORK_TIMEOUT, CodexForkError, fork_codex_session};
 pub use codex::session_file::{
     AttachLookupError, find_codex_session_file_for_attach, load_codex_transcript,
 };
+pub use codex::{CodexAdapter, CodexLocator};
 pub use context_report::{ContextCategory, ContextItem, ContextReport};
 pub use events::{
     AdapterEvent, CancelSource, ContentKind, ContextWindowSource, FailureKind, McpServerStatus,
@@ -58,6 +59,6 @@ pub use forward::{
 pub use mock::{MockHarnessAdapter, MockScenario};
 pub use resume::interactive_resume_command;
 pub use transcript::{
-    LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, SystemMarker, Turn,
-    TurnItem, TurnStatus, UserPromptSource,
+    InheritedHistoryGap, LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo,
+    SystemMarker, Turn, TurnItem, TurnStatus, UserPromptSource,
 };

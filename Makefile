@@ -1,4 +1,4 @@
-.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check check-rust check-frontend clean clean-stale install ios-crypto check-ios test-live test-live-claude test-live-codex test-live-antigravity cli-surface test-scripts
+.PHONY: dev build open run install-app uninstall-app debug-app uninstall-debug-app deploy test test-browser lint fmt check check-rust check-frontend clean clean-stale install ios-crypto check-ios test-live test-live-claude test-live-codex test-live-antigravity cli-surface test-scripts protocol-fixtures relay
 
 # Crates that carry live (`#[ignore]`-gated) harness tests.
 LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
@@ -253,6 +253,18 @@ cli-surface:
 	@test -n "$(HARNESS)" || { echo "usage: make cli-surface HARNESS=codex|claude|agy" >&2; exit 2; }
 	scripts/cli-surface.sh $(HARNESS) > $(CLI_SURFACE_DIR)/$(HARNESS).txt.tmp || { rm -f $(CLI_SURFACE_DIR)/$(HARNESS).txt.tmp; exit 1; }
 	mv $(CLI_SURFACE_DIR)/$(HARNESS).txt.tmp $(CLI_SURFACE_DIR)/$(HARNESS).txt
+
+# Regenerate the remote-access protocol fixtures from the Rust types, after a
+# deliberate change to the wire format. The fixtures are the contract the Mac
+# and the iPhone app decode against, so review the diff. `make test` fails
+# while a fixture differs from the encoding.
+protocol-fixtures:
+	UPDATE_PROTOCOL_FIXTURES=1 $(NO_INCR) cargo test -p switchboard-relay --all-features --locked --test protocol_fixtures
+
+# Run the remote-access relay locally on PORT (default 8080); its other
+# settings are environment variables too (crates/relay/src/config.rs).
+relay:
+	cargo run -p switchboard-relay --locked
 
 # Tests for the repo's dev scripts, using fake CLIs (no harness or login
 # needed). Part of `check` and CI.

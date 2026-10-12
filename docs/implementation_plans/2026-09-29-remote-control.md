@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** in progress: M1 complete 2026-10-10 in #118, #119, #120, #121, and #123; M2 next · **Revision:** 23 · **Created:** 2026-09-29 · **Revised:** 2026-10-10
+**Status:** in progress: M1 complete 2026-10-10 in #118, #119, #120, #121, and #123; M2 in progress · **Revision:** 24 · **Created:** 2026-09-29 · **Revised:** 2026-10-12
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -17,6 +17,34 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
+- **Revision 24 (2026-10-12)** — the relay's wire protocol, settled while building it (§4,
+  §5.2, §6, §9).
+  - **Every relay message is a WebSocket text message holding JSON**, tagged by `type`, with
+    byte fields in standard padded base64; a binary message is refused. A frame carrying the
+    longest record is about 87,500 bytes as base64, so `MAX_FRAME_BYTES`' default of 131,072
+    still covers it. JSON keeps the relay messages in the same fixture form as the envelopes.
+  - **Registration is a challenge and an answer.** The relay sends `challenge { nonce }` on
+    connect; the client answers `register { relay_protocol, device_id, identity_public_key,
+    signature }` within 10 seconds; the relay answers `registered`, which precedes every frame
+    and notice for that connection.
+  - **The pairing token** is 32 random bytes, carried as `pairing_token` on the phone's frames;
+    `pairing_open`'s `token_hash` is its SHA-256 (`protocol::token_hash`, shared with the Mac).
+    The relay keeps one window per Mac. A Mac may answer the device bound to its token, which
+    is how pairing message 2 and `pairing_declined` reach a phone not yet in its set. The new
+    `pairing_close` ends the window, so the Mac's "kills the token" (§5.2) is a message; the
+    first `paired_devices` set naming the bound device ends it too.
+  - **Relay error codes** gain `registration_refused`, `relay_full`, `rate_limited`,
+    `bad_message`, and `limit_exceeded`, beside the existing `mac_offline`, `phone_offline`,
+    `not_paired`, `pairing_expired`, and `protocol_mismatch`. A relay error is the relay's
+    own message, not an envelope, so it has no `id`.
+  - **`RATE_LIMIT`** is messages a second per connection, sustained, with bursts of the same
+    size; pings do not count. Default 256. A client over it is sent `rate_limited` and closed.
+  - Two limits the plan did not name: a connection whose outbound queue (256 messages) is full
+    is closed, so a client that stops reading cannot hold up its senders; and the relay keeps
+    at most 1,024 held sets of disconnected Macs, forgetting the longest disconnected first,
+    since registration is open to any key.
+  - `make protocol-fixtures` lands with the relay's fixtures in PR 1; PR 2 adds the envelope
+    fixtures to it.
 - **Revision 23 (2026-10-10)** — M1 complete; the M2 PR plan (§9).
   - The status moves from proposed to in progress, and M1 records the pull requests that
     landed it.
@@ -760,7 +788,9 @@ the relay for a phone outside a set it holds, §6; unencrypted, with no `id`),
 session lock: `AppError::SessionInUse`), `project_locked` (another Switchboard process holds the
 project: `AppError::ProjectLocked`), `project_load_timeout`, `protocol_mismatch` (says which
 side to update; also returned by the relay for an unsupported `relay_protocol`, §6),
-`unknown_recipient`, and `internal`, with the error's text as `message`. `internal` covers
+`unknown_recipient`, and `internal`, with the error's text as `message`. The relay's own
+errors on its connection also include `registration_refused`, `relay_full`, `rate_limited`,
+`bad_message`, and `limit_exceeded` (§6). `internal` covers
 every `AppError` without its own code, such as `ProjectUnderMaintenance`, and a reply that
 would exceed the reassembly limit. A harness that is not signed in is not a request error:
 a send is accepted before its turn starts, so the failure arrives later as `message_failed`
@@ -809,7 +839,9 @@ about message types.
    knows the phone before the phone can start its first handshake. A
    mismatch says so and clears the field. A third mismatch, **Decline**, expiry, or a dropped
    relay connection mid-pairing discards the candidate, kills the token, and sends
-   `pairing_declined`. Three failed handshakes on one token also kill it.
+   `pairing_declined`. Three failed handshakes on one token also kill it. Killing the token
+   sends the relay `pairing_close`, after `pairing_declined` so the relay still forwards that
+   to the candidate.
 
 **5.3 `DeviceRegistry`.** Trait plus JSONL impl over `remote_devices.jsonl` in the config dir:
 `device_id`, `name`, `noise_public_key`, `identity_public_key`, `paired_at`, `revoked_at?`.
@@ -1175,16 +1207,30 @@ It forwards everything unchanged, then:
 
 Deliberately dumb; never sees plaintext; holds no conversation state.
 
-- **Stack**: axum + `tokio-tungstenite`. Env config: `PORT`, `RATE_LIMIT`, `MAX_FRAME_BYTES`
-  (default 131,072, above one 65,535-byte Noise record plus the frame header),
+- **Stack**: axum + `tokio-tungstenite`. Env config: `PORT`, `RATE_LIMIT` (messages a second
+  per connection, sustained, with bursts of the same size; pings do not count; default 256),
+  `MAX_FRAME_BYTES` (the longest WebSocket message; default 131,072, above the 87,500-odd
+  bytes of a frame carrying the longest record as base64),
   `MAX_DEVICES_PER_MAC`, `MAX_CONNECTIONS` (global, default 64, since registration is open to
   any key), `DENY_DEVICE_IDS` (comma-separated). `crates/relay/Dockerfile`; TLS terminated by
-  the host so clients use `wss://`. Locally: `cargo run -p switchboard-relay`.
-- **Registration**: the client sends `relay_protocol` and its Ed25519 public key. The relay
-  refuses an unsupported `relay_protocol` with `protocol_mismatch`, refuses an id in
-  `DENY_DEVICE_IDS`, and checks that the key hashes to the claimed `device_id` and that the
-  client signs a fresh challenge. No trust-on-first-use map, so a relay restart gives an
-  impostor nothing.
+  the host so clients use `wss://`. Locally: `make relay`. The WebSocket is at `/connect`.
+- **Wire**: every message either way is one WebSocket text message holding a JSON object
+  tagged by `type`, with byte fields in standard padded base64. A binary message, or one that
+  does not parse, is answered `bad_message` and closes the connection; an unknown `type`
+  is ignored. Client to relay: `register`, `frame { to, record, pairing_token? }`,
+  `paired_devices { device_ids }`, `pairing_open { token_hash, expires_in }`, `pairing_close`.
+  Relay to client: `challenge { nonce }`, `registered`, `frame { to, from, record,
+  pairing_token? }`, `peer_disconnected { device_id }`, `error { code, message, device_id?,
+  last_seen? }`. Fixtures for each are in `crates/relay/tests/fixtures/protocol/`.
+- **Registration**: on connect the relay sends `challenge { nonce }`, 32 fresh random bytes.
+  Within 10 seconds the client answers `register { relay_protocol, device_id,
+  identity_public_key, signature }`, the signature from `DeviceKeys::sign_relay_challenge`
+  over the nonce; anything else first is `bad_message`. The relay refuses an unsupported
+  `relay_protocol` with `protocol_mismatch`, and with `registration_refused` a key that does
+  not hash to the claimed `device_id`, a signature that does not verify, and an id in
+  `DENY_DEVICE_IDS`; each closes the connection. On success it answers `registered`, queued
+  before any frame or notice for the connection. No trust-on-first-use map, so a relay
+  restart gives an impostor nothing.
 - **Denylist**: a listed id cannot register, and frames addressed to it are refused. Denying a
   phone cuts it off. Denying a Mac cuts off all remote access to it until the list changes.
   To find the ids, the relay logs each registration's `device_id` and each Mac's
@@ -1209,8 +1255,17 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   `not_paired`. If the relay holds no set, the answer is `mac_offline` without `last_seen`,
   the same as for any Mac it does not know: after a relay restart, a paired phone that
   reconnects before its Mac is told the Mac is offline, not that it is unpaired. Neither
-  answer says whether the Mac is connected. A token is bound to the first device presenting
-  it and cleared on expiry, first confirmation, or the Mac's disconnect.
+  answer says whether the Mac is connected. A device becomes a Mac to the relay by sending
+  `paired_devices` or `pairing_open`. A Mac may address the phones in its set, answered
+  `phone_offline` for one not connected and `not_paired` for one outside it.
+- **Pairing token**: 32 random bytes the Mac mints, carried as `pairing_token` on the phone's
+  pairing frames; `pairing_open`'s `token_hash` is its SHA-256 (`protocol::token_hash`). One
+  window per Mac: a new `pairing_open` replaces it, and `expires_in` is capped at 300 seconds.
+  A token is bound to the first device presenting it, and the Mac may address that device
+  while the window is open. Another device presenting it, an unknown or expired token, and a
+  token after the window ends are all answered `pairing_expired`. The window ends on expiry,
+  on `pairing_close`, on the first `paired_devices` set that names the bound device, and on
+  the Mac's disconnect.
 - **Peer notices**: the relay sends `peer_disconnected { device_id }` **exactly once for each
   registration that ends**, to every connected device paired with it: to the Mac for a phone,
   and to each connected phone in the Mac's set for a Mac. A registration ends when a newer
@@ -1222,10 +1277,15 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   acts only if the session table still holds that generation for the id.
 - **Last seen**: per Mac id, the time of its last disconnect, in memory; documented as
   observational and absent after a relay restart.
-- **Limits from day one**: per-device message rate, `MAX_FRAME_BYTES`, idle timeout,
-  `MAX_DEVICES_PER_MAC`, `MAX_CONNECTIONS`.
-- **Observability**: `tracing` logs, `/healthz`, counters for connected devices and forwarded
-  frames. Frame contents are never logged.
+- **Limits from day one**: per-connection message rate (`rate_limited`, then closed),
+  `MAX_FRAME_BYTES` (closed), idle timeout, `MAX_DEVICES_PER_MAC` (`limit_exceeded`; the held
+  set is kept), `MAX_CONNECTIONS` (`relay_full`, then closed; unregistered connections
+  count). A connection whose outbound queue of 256 messages is full is closed, so a client
+  that stops reading cannot hold up the devices sending to it. At most 1,024 held sets of
+  disconnected Macs are kept, the longest disconnected forgotten first; its phones are then
+  answered `mac_offline` as after a restart.
+- **Observability**: `tracing` logs, and `/healthz`, which answers JSON with open
+  connections, registered devices, and forwarded frames. Frame contents are never logged.
 - **Deployment** of the shared pilot instance is a separately approved action, not part of a
   PR. M5 records the host, the domain, log retention, who is alerted when `/healthz` fails,
   and where `DENY_DEVICE_IDS` is edited.
@@ -1242,7 +1302,7 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   `mac_offline`; relay errors carry the addressed `device_id`; token
   forwarding, expiry, and
   second-device refusal; rate and frame limits; reconnect replaces the stale session; the
-  container builds and answers `/healthz` locally.
+  fixtures match the encoding; the container builds and answers `/healthz` locally.
 
 ## 7. iOS app — SwiftUI, `ios/`
 
@@ -1484,13 +1544,13 @@ preferred; the pairing logic stays in the Rust PR either way.
 1. **Relay** (§6). `crates/relay` as a library with a thin binary, so PR 3's integration test
    starts it in-process rather than spawning it; its Dockerfile; the relay-level messages
    (registration, `pairing_open`, `paired_devices`, `peer_disconnected`, the relay's errors)
-   with their fixtures. Adds the crate to AGENTS.md.
+   with their fixtures and `make protocol-fixtures`. Adds the crate to AGENTS.md.
    *Tests:* the §6 list. *Done when:* those pass, and the container builds and answers
    `/healthz` locally. *Review:* none.
 2. **Mac foundation** (§4, §5.1, §5.3). `crates/remote`, Tauri-free: the envelope and the
    control messages M2 uses (`hello`, `protocol_mismatch`, `error`, `pairing_hello`,
-   `pairing_confirmed`, `pairing_declined`) with their fixtures and `make protocol-fixtures`
-   (M3 adds its request and response payloads to the same set); the `Transport` trait with its
+   `pairing_confirmed`, `pairing_declined`) with their fixtures, added to
+   `make protocol-fixtures` (M3 adds its request and response payloads to the same set); the `Transport` trait with its
    in-memory pair; `RelayTransport` with keepalive, backoff, and `paired_devices` after
    registration; `DeviceRegistry`; the `KeyStore` trait. Adds the crate to AGENTS.md's
    architecture overview and `remote_devices.jsonl` to its filesystem layout.

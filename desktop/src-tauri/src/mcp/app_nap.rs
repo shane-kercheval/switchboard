@@ -5,14 +5,16 @@
 //! The window is usually hidden when an orchestrator runs unattended, and App
 //! Nap slows an app nobody is looking at: lower priority, timers batched. The
 //! risky moment is the first message after a quiet stretch, before any turn
-//! runs, so the wake lock (held only while turns run) does not cover it.
-//! Exempting the app while the server listens removes the risk rather than
-//! testing for a slowdown that might appear only after a long idle. The Mac may
-//! still sleep; only the app's own throttling is off. The cost is a little more
-//! energy while access is on.
+//! runs, so the wake lock (held only while turns run) does not cover it. The
+//! Mac may still sleep; only the app's own throttling is off. The cost is a
+//! little more energy while access is on.
 //!
-//! This does not stop the web engine from slowing timers in a hidden page,
-//! which is a separate mechanism inside the window.
+//! **What it does not cover.** The exemption applies to this process only.
+//! The window's page runs in the web engine's own content process, which the web
+//! engine may throttle while the window is hidden, separately from App Nap. A
+//! development build's hidden window answered the readiness round trip in
+//! 268 ms after 30 minutes; the installed app is checked by hand with its
+//! window closed and left alone for 15 minutes.
 //!
 //! **Why a thread.** The activity is held through `NSProcessInfo`'s
 //! block-scoped call, which ends it when the block returns: ending one any other
@@ -36,16 +38,26 @@ impl NapExemption {
     /// runs as before and the failure is logged.
     #[must_use]
     pub fn begin() -> Self {
+        Self::begin_with(|| {})
+    }
+
+    /// [`Self::begin`], calling `on_hold` once the activity is in effect,
+    /// just before the hold waits to be dropped. Tests use it to see the
+    /// hold begin.
+    fn begin_with(on_hold: impl Fn() + Send + 'static) -> Self {
         let (end, ended) = mpsc::channel::<()>();
         Self {
             _end: end,
-            holder: hold_until_dropped(ended),
+            holder: hold_until_dropped(ended, on_hold),
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn hold_until_dropped(ended: mpsc::Receiver<()>) -> Option<JoinHandle<()>> {
+fn hold_until_dropped(
+    ended: mpsc::Receiver<()>,
+    on_hold: impl Fn() + Send + 'static,
+) -> Option<JoinHandle<()>> {
     use block2::RcBlock;
     use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
 
@@ -55,6 +67,7 @@ fn hold_until_dropped(ended: mpsc::Receiver<()>) -> Option<JoinHandle<()>> {
             let reason = NSString::from_str("Agent access is listening for MCP clients");
             // Returns once the exemption is dropped, which ends the activity.
             let block = RcBlock::new(move || {
+                on_hold();
                 let _ = ended.recv();
             });
             NSProcessInfo::processInfo().performActivityWithOptions_reason_usingBlock(
@@ -73,25 +86,54 @@ fn hold_until_dropped(ended: mpsc::Receiver<()>) -> Option<JoinHandle<()>> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn hold_until_dropped(_ended: mpsc::Receiver<()>) -> Option<JoinHandle<()>> {
+fn hold_until_dropped(
+    _ended: mpsc::Receiver<()>,
+    _on_hold: impl Fn() + Send + 'static,
+) -> Option<JoinHandle<()>> {
     None
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
     use super::NapExemption;
 
+    /// Proves the holding call stays inside the activity until the exemption
+    /// is dropped, and leaves it then. Whether macOS honors the activity can
+    /// only be seen from outside (Activity Monitor's App Nap column).
     #[test]
-    fn dropping_the_exemption_ends_the_activity() {
+    fn the_holding_call_runs_until_the_exemption_is_dropped() {
         // Twice: a second exemption after the first ended is the listener's
         // restart on a new port or token.
         for _ in 0..2 {
-            let mut exemption = NapExemption::begin();
-            let holder = exemption.holder.take();
+            let (entered_tx, entered) = mpsc::channel();
+            let mut exemption = NapExemption::begin_with(move || {
+                let _ = entered_tx.send(());
+            });
+            let Some(holder) = exemption.holder.take() else {
+                // No holding thread on this platform.
+                return;
+            };
+            entered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the hold began");
+            assert!(
+                !holder.is_finished(),
+                "the hold lasts while the exemption lives"
+            );
+
             drop(exemption);
-            if let Some(holder) = holder {
-                holder.join().expect("the activity's block returned");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !holder.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
             }
+            assert!(
+                holder.is_finished(),
+                "dropping the exemption ended the hold"
+            );
+            holder.join().expect("the holding thread did not panic");
         }
     }
 }

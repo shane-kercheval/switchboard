@@ -102,6 +102,18 @@ describe("AgentAccessSettings", () => {
     );
   });
 
+  it("tells Codex users to keep the token in a private file and Claude Code users to remove before re-adding", async () => {
+    backend = listening();
+    render(AgentAccessSettings);
+    await waitFor(() => screen.getByTestId("agent-access-codex-token-file"));
+    expect(screen.getByTestId("agent-access-codex-token-file")).toHaveTextContent(
+      "chmod 600 ~/.switchboard-token",
+    );
+    expect(screen.getByTestId("agent-access-claude-code-readd")).toHaveTextContent(
+      "claude mcp remove switchboard --scope local",
+    );
+  });
+
   it("copies the token itself, not the masked text", async () => {
     backend = listening();
     render(AgentAccessSettings);

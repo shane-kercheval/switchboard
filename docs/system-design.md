@@ -73,7 +73,7 @@ The shape (illustrative):
 ```
 ~/.config/switchboard/          # user-global (illustrative Linux/XDG path; resolved via the `directories`
 │                               #   crate — on macOS ~/Library/Application Support/switchboard/)
-├── config.yaml                 # personal preferences + prompt providers (local_prompt_dirs, mcp_providers — §6)
+├── config.yaml                 # personal preferences + prompt providers (local_prompt_dirs, mcp_providers — §6) + agent access (agent_access — §7)
 ├── prompts/                    # default local prompt store (built-ins are baked-in read-only — §6)
 ├── workflows/                  # user-global workflow definitions (YAML), shared across every project
 ├── workspace.yaml              # app-managed **view-state only**: which projects are archived.
@@ -637,18 +637,19 @@ While the session is live, Switchboard's in-memory stream buffer holds whatever 
 
 Agent access (Settings → Agent access, off by default) runs an MCP server on `127.0.0.1` that an orchestrating agent calls instead of the user typing. Its tools are the operations the window performs, keyed by ids: list projects and agents, send to one or more agents, forward agents' latest answers, wait for a send, an agent, or a workflow run, read the conversation or one reply in pages, run and dismiss workflows, cancel. A send returns at once with an id; the orchestrator then waits in bounded calls (a minute, or up to an hour from a client that can keep a call alive) and calls again until the send is done, so no agent's work depends on a call staying open.
 
-Everything an orchestrator does goes through the same paths as the user's own actions, so the rules above hold unchanged: a busy recipient refuses or queues (the orchestrator chooses, refusing by default), outcomes are journaled, and the unified history groups each send once. Before an orchestrator's turn starts, the backend asks the window to load or refresh the project and waits for it, so the message and reply appear live, queued messages show with their cancel button, and the window's Stop controls cancel them like the user's own. The window can be closed: the app keeps running, and while agent access is on it asks macOS not to throttle it in the background.
+Everything an orchestrator does goes through the same paths as the user's own actions, so the rules above hold unchanged: a busy recipient refuses or queues (the orchestrator chooses, refusing by default), outcomes are journaled, and the unified history groups each send once. Before an orchestrator's turn starts, the backend asks the window to load or refresh the project and waits for it, so the message and reply appear live, queued messages show with their cancel button, and the window's Stop controls cancel them like the user's own. The window can be closed: the app keeps running, and while agent access is on it exempts itself from App Nap. The exemption covers the app's own process; the window's page runs in the web engine's content process, which the engine may throttle while the window is hidden, so the installed app is checked with its window closed and left alone (a development build's hidden window answered after 30 minutes hidden).
 
 What it defends against, since a send runs an agent with permission prompts disabled:
 
 | Threat | Defended? | By |
 |---|---|---|
 | A web page in the user's browser reaches the server (DNS rebinding, cross-site request) | Yes | `Host` and `Origin` checks pinned to the port; a bearer token the page does not have; bound to `127.0.0.1` |
-| Another user account on the same Mac | Only while the app holds the port | The bearer token, kept in the Keychain and in each client's private configuration. While the app is quit or access is off, another account could listen on the port and collect the token from the next client that starts |
+| Another user account on the same Mac | Only while the app holds the port | The bearer token, kept in the Keychain and in each client's configuration: Claude Code's and Claude Desktop's are private to the user, and Codex reads it from an environment variable the setup tells the user to keep in an owner-only file. While the app is quit or access is off, another account could listen on the port and collect the token from the next client that starts |
 | Another process running as the user | No | Out of scope: such a process can already run the agent CLIs itself |
 | The token committed to a repository | Yes, by setup | Settings gives only private-scope client configuration |
-| A client's model loops and burns quota | Partly | Turning access off stops the server at once; busy recipients refuse by default, so a loop cannot pile up queued turns |
+| A client's model loops and burns quota | Partly | Turning access off stops the server at once, though messages already queued and workflows already started keep going until the user stops them; busy recipients refuse by default, so a loop cannot pile up queued turns |
 | Agents Switchboard launches get the tools | Partly | Setup tells the user to register the server outside every project's folder; a send to a busy agent, including the caller itself, is refused by default |
+| `mcp-remote` (third-party, run through `npx` for Claude Desktop) sees the token | Accepted | It runs as the user, like any client |
 
 ### Unified history after restart — worked examples
 

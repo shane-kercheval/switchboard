@@ -1229,65 +1229,194 @@ with exactly the text worker answered and nothing else.";
 /// What the scripted worker answers `hello` with.
 const LIVE_REPLY: &str = "ack: hello";
 
-/// Run `command` to completion within five minutes and return its stdout. A
-/// client that fails or runs out of time is killed, never left running, and
-/// the failure shows the end of what it printed, so a client change that
-/// breaks the loop says how.
+/// How a client run ended.
+#[derive(Debug)]
+enum ClientRun {
+    Succeeded(String),
+    Failed {
+        status: std::process::ExitStatus,
+        stdout: String,
+        stderr: String,
+    },
+    TimedOut {
+        stdout: String,
+        stderr: String,
+    },
+}
+
+/// Run `command` to completion within five minutes and return its stdout, or
+/// fail the test showing the end of what the client printed, so a client
+/// change that breaks the loop says how.
 async fn run_client(command: &mut tokio::process::Command) -> String {
-    use tokio::io::AsyncReadExt as _;
+    let tail = |text: &str| {
+        let start = text.len().saturating_sub(4_000);
+        text.get(start..).unwrap_or(text).to_owned()
+    };
+    match run_client_within(command, Duration::from_mins(5), Duration::from_secs(2)).await {
+        ClientRun::Succeeded(stdout) => stdout,
+        ClientRun::Failed {
+            status,
+            stdout,
+            stderr,
+        } => panic!(
+            "the client failed ({status}):\n{}\n{}",
+            tail(&stdout),
+            tail(&stderr)
+        ),
+        ClientRun::TimedOut { stdout, stderr } => panic!(
+            "the client did not finish within five minutes:\n{}\n{}",
+            tail(&stdout),
+            tail(&stderr)
+        ),
+    }
+}
+
+/// How long the client's output may take to close once it has been stopped.
+const OUTPUT_DRAIN_LIMIT: Duration = Duration::from_secs(10);
+
+/// Run `command` within `limit`, and leave nothing of it running however it
+/// ends. The client runs in its own process group, recorded when it starts
+/// (its id cannot be looked up once it has exited), because a client's
+/// launcher can start workers that outlive it and hold its output open:
+/// Codex's does. A timed-out group is asked to stop, given `grace`, then
+/// killed; the group is killed after any exit, which is a no-op when nothing
+/// of it remains. Reading its output is time-limited too, and whatever was
+/// read is kept for the report.
+async fn run_client_within(
+    command: &mut tokio::process::Command,
+    limit: Duration,
+    grace: Duration,
+) -> ClientRun {
     let mut child = command
         // Empty input: `codex exec` otherwise waits for more of the prompt on
         // an open stdin.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        // Its own process group, so a timeout stops the client and every
-        // process it started: Codex's launcher runs a separate worker that
-        // would otherwise outlive it and hold the output open.
         .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .expect("the client could be started");
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
-    let stdout = tokio::spawn(async move {
-        let mut out = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut out).await;
-        String::from_utf8_lossy(&out).into_owned()
-    });
-    let stderr = tokio::spawn(async move {
-        let mut out = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut out).await;
-        String::from_utf8_lossy(&out).into_owned()
-    });
-    let status = tokio::time::timeout(Duration::from_mins(5), child.wait()).await;
-    if status.is_err() {
-        if let Some(group) = child.id() {
-            let _ = std::process::Command::new("kill")
-                .args(["-TERM", &format!("-{group}")])
-                .status();
+    let group = child.id();
+    let (stdout, mut stdout_task) = collect_output(child.stdout.take().unwrap());
+    let (stderr, mut stderr_task) = collect_output(child.stderr.take().unwrap());
+
+    let status = match tokio::time::timeout(limit, child.wait()).await {
+        Ok(status) => Some(status.expect("the client could be waited on")),
+        Err(_elapsed) => {
+            signal_group(group, "TERM");
+            let _ = tokio::time::timeout(grace, child.wait()).await;
+            None
         }
-        let _ = child.kill().await;
-    }
-    let (stdout, stderr) = (stdout.await.unwrap(), stderr.await.unwrap());
-    let tail = |text: &str| {
-        let start = text.len().saturating_sub(4_000);
-        text.get(start..).unwrap_or(text).to_owned()
     };
-    match status {
-        Ok(Ok(status)) if status.success() => stdout,
-        Ok(Ok(status)) => panic!(
-            "the client failed ({status}):\n{}\n{}",
-            tail(&stdout),
-            tail(&stderr)
-        ),
-        Ok(Err(error)) => panic!("the client could not be waited on: {error}"),
-        Err(elapsed) => panic!(
-            "the client did not finish within five minutes ({elapsed}):\n{}\n{}",
-            tail(&stdout),
-            tail(&stderr)
-        ),
+    signal_group(group, "KILL");
+    let _ = child.kill().await;
+
+    let drained = tokio::time::timeout(OUTPUT_DRAIN_LIMIT, async {
+        let _ = (&mut stdout_task).await;
+        let _ = (&mut stderr_task).await;
+    })
+    .await;
+    if drained.is_err() {
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
     }
+    let text = |buffer: &Arc<Mutex<Vec<u8>>>| {
+        String::from_utf8_lossy(&buffer.lock().unwrap()).into_owned()
+    };
+    let (stdout, stderr) = (text(&stdout), text(&stderr));
+    match status {
+        Some(status) if status.success() => ClientRun::Succeeded(stdout),
+        Some(status) => ClientRun::Failed {
+            status,
+            stdout,
+            stderr,
+        },
+        None => ClientRun::TimedOut { stdout, stderr },
+    }
+}
+
+/// Read `pipe` to its end in a task, into a buffer that keeps what was read
+/// even if the task is stopped first.
+fn collect_output(
+    mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+) -> (Arc<Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncReadExt as _;
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&buffer);
+    let task = tokio::spawn(async move {
+        let mut chunk = [0u8; 8_192];
+        while let Ok(read) = pipe.read(&mut chunk).await {
+            if read == 0 {
+                break;
+            }
+            sink.lock().unwrap().extend_from_slice(&chunk[..read]);
+        }
+    });
+    (buffer, task)
+}
+
+/// Send `signal` to the process group `group` leads. A group with nothing
+/// left in it is not an error.
+fn signal_group(group: Option<u32>, signal: &str) {
+    if let Some(group) = group {
+        let _ = std::process::Command::new("kill")
+            .args([format!("-{signal}"), format!("-{group}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// Whether process `pid` still exists, waiting a few seconds for one that
+/// was just killed to be reaped.
+fn process_ends(pid: &str) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !alive {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[tokio::test]
+async fn a_client_that_exits_leaving_a_worker_holding_its_output_is_cleaned_up() {
+    // The launcher prints its worker's pid and exits at once; the worker
+    // keeps the output open.
+    let outcome = run_client_within(
+        tokio::process::Command::new("sh").args(["-c", "sleep 600 & echo $!; exit 0"]),
+        Duration::from_mins(1),
+        Duration::from_millis(100),
+    )
+    .await;
+    let ClientRun::Succeeded(stdout) = outcome else {
+        panic!("the launcher's own exit was reported: {outcome:?}");
+    };
+    assert!(process_ends(stdout.trim()), "the worker was stopped");
+}
+
+#[tokio::test]
+async fn a_client_that_ignores_the_polite_stop_is_killed_at_the_limit() {
+    // Ignored signals are inherited, so the `sleep` ignores SIGTERM too.
+    let outcome = run_client_within(
+        tokio::process::Command::new("sh").args(["-c", "trap '' TERM; echo $$; sleep 600"]),
+        Duration::from_secs(1),
+        Duration::from_millis(100),
+    )
+    .await;
+    let ClientRun::TimedOut { stdout, .. } = outcome else {
+        panic!("the run was not reported as timed out: {outcome:?}");
+    };
+    assert!(process_ends(stdout.trim()), "the client was killed");
 }
 
 /// The worker received the message the client sent.

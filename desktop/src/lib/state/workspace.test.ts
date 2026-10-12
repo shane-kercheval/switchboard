@@ -1039,7 +1039,10 @@ describe("forkAgentIntoOwnPane", () => {
     expect(parentPane?.members).toContain(parent.id);
   });
 
-  it("keeps only the fork source in an untouched all-agent pane", async () => {
+  it("splits the unified view without hiding any agent it showed", async () => {
+    // A fork isn't a layout gesture: the header's "+" keeps only the compose
+    // selection in the first pane, but a fork leaves every other agent where it
+    // was and only gives the branch a pane of its own.
     const ws = await loadWorkspaceState();
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const parent = agent(AGENT_1, PROJECT_1);
@@ -1059,9 +1062,9 @@ describe("forkAgentIntoOwnPane", () => {
     const rosterIds = [...originalRoster, FORK_ID];
     const parentPane = panes.paneOfAgent(PROJECT_1, rosterIds, parent.id);
     const forkPane = panes.paneOfAgent(PROJECT_1, rosterIds, FORK_ID);
-    expect(parentPane?.members).toEqual([parent.id]);
+    expect(parentPane?.members).toEqual(originalRoster);
     expect(forkPane?.members).toEqual([FORK_ID]);
-    expect(panes.unassignedAgentIds(PROJECT_1, rosterIds)).toEqual([codex.id, antigravity.id]);
+    expect(panes.unassignedAgentIds(PROJECT_1, rosterIds)).toEqual([]);
   });
 
   it("makes the branch visible when the user is in focus mode", async () => {

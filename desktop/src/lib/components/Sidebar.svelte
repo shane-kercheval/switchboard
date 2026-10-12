@@ -8,6 +8,7 @@
     Eye,
     EyeOff,
     FileText,
+    GitBranch,
     GripVertical,
     MoreHorizontal,
     Pencil,
@@ -27,8 +28,13 @@
     stopAgent,
     transcripts,
   } from "$lib/state/index.svelte";
-  import { supportsContextReport, supportsManualCompaction } from "$lib/harnessCapabilities";
   import {
+    supportsContextReport,
+    supportsForkWithoutTurn,
+    supportsManualCompaction,
+  } from "$lib/harnessCapabilities";
+  import {
+    forkAgentWithoutSending,
     removeAgent,
     renameAgent,
     reorderAgents,
@@ -74,6 +80,12 @@
     toggleAgentHidden,
   } from "$lib/state/transcriptPanes.svelte";
   import { selectAgent, selectionFor } from "$lib/state/recipientSelection.svelte";
+  import {
+    beginOperation,
+    finishOperation,
+    operationFor,
+  } from "$lib/state/composeOperations.svelte";
+  import { forkBlockFor } from "$lib/state/forkAvailability";
   import { workflowRuns } from "$lib/state/workflows.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
@@ -159,6 +171,10 @@
   let compactConfirmTooltipOpen = $state(false);
   let removingAgentId = $state<AgentId | null>(null);
   let removeError = $state<{ agentId: AgentId; message: string } | null>(null);
+  /// A failed Fork from an agent's menu, shown on that agent's card. A fork
+  /// still being created is read from the project's compose claim instead, so
+  /// it survives this sidebar being closed and reopened.
+  let forkError = $state<{ agentId: AgentId; message: string } | null>(null);
 
   /// Selection writes replace the complete configuration. One agent-level busy
   /// flag prevents independently rendered controls from submitting stale peers.
@@ -325,6 +341,7 @@
       removeConfirmAgentId = null;
     if (compactConfirmAgentId !== null && !ids.has(compactConfirmAgentId))
       compactConfirmAgentId = null;
+    if (forkError !== null && !ids.has(forkError.agentId)) forkError = null;
     if (resumeAgentId !== null && !ids.has(resumeAgentId)) {
       resumeAgentId = null;
       resumeOpen = false;
@@ -692,6 +709,59 @@
   async function startCompaction(agentId: AgentId): Promise<void> {
     disarmCompaction();
     await dispatchCompaction(agentId, crypto.randomUUID());
+  }
+
+  const COMPOSE_CLAIM_HELD = "Another send in this project is still in progress.";
+
+  /// Why the menu's Fork item is unavailable for `agent`, or `null`. The
+  /// project and agent conditions are the compose box's (`forkBlockFor`). The
+  /// compose claim is this item's own: a send waiting on a browser sign-in holds
+  /// it with no time limit, and without a reason the click would do nothing.
+  function menuForkBlock(agent: AgentRecord): string | null {
+    const shared = forkBlockFor(projectId, agent);
+    if (shared !== null) return shared;
+    const operation = operationFor(projectId);
+    if (operation === undefined) return null;
+    return operation.kind === "menu_fork"
+      ? "A fork is already being created in this project."
+      : COMPOSE_CLAIM_HELD;
+  }
+
+  function forkInFlightFrom(agentId: AgentId): boolean {
+    const operation = operationFor(projectId);
+    return operation?.kind === "menu_fork" && operation.sourceId === agentId;
+  }
+
+  /// Fork `agent` into its own pane and send nothing. Codex only: a Codex fork
+  /// exists as soon as it is created, while a Claude fork can only come into
+  /// existence as a turn, so Claude's Fork is the compose box's.
+  ///
+  /// Holds the project's compose claim while the fork is created, as the
+  /// compose box's fork does. The original's session is locked for that second,
+  /// so a compose send to it would be refused with "resend"; with the claim
+  /// held, the compose bar is disabled for the second instead. The claim ends
+  /// once the fork exists: its earlier conversation then loads with only the
+  /// fork waiting, and a failed load shows the history-load error with Retry on
+  /// the fork's own card.
+  async function forkFromMenu(agent: AgentRecord): Promise<void> {
+    // This sidebar is reused across projects, so release the claim in the
+    // project it was taken in, whichever one is showing by then.
+    const forkProjectId = projectId;
+    forkError = null;
+    const opId = beginOperation(forkProjectId, { kind: "menu_fork", sourceId: agent.id });
+    if (opId === null) {
+      // The item is disabled while a claim is held; this covers one taken
+      // between the menu rendering and the click.
+      forkError = { agentId: agent.id, message: COMPOSE_CLAIM_HELD };
+      return;
+    }
+    try {
+      await forkAgentWithoutSending(agent.id);
+    } catch (err) {
+      forkError = { agentId: agent.id, message: err instanceof Error ? err.message : String(err) };
+    } finally {
+      finishOperation(forkProjectId, opId);
+    }
   }
 
   /// The agent whose breakdown panel is open, or `null`. One at a time — the
@@ -1252,6 +1322,25 @@
                         Compact context
                       </DropdownMenuItem>
                     {/if}
+                    {#if supportsForkWithoutTurn(agent.harness)}
+                      {@const forkBlock = menuForkBlock(agent)}
+                      <DropdownMenuItem
+                        onSelect={() => void forkFromMenu(agent)}
+                        disabled={forkBlock !== null}
+                        tooltip={forkBlock ??
+                          `Create a new agent with ${agent.name}'s conversation so far, idle in its own pane. Nothing is sent.`}
+                        class="gap-2"
+                        data-testid="agent-action-fork"
+                      >
+                        <GitBranch
+                          size={14}
+                          strokeWidth={1.8}
+                          class="text-muted shrink-0"
+                          aria-hidden="true"
+                        />
+                        Fork
+                      </DropdownMenuItem>
+                    {/if}
                     {#if sessionInfo?.resume_command}
                       <DropdownMenuItem
                         onSelect={() => {
@@ -1606,6 +1695,16 @@
                  one. Do not re-add it. The current overage *status* below stays
                  (Bucket-A "as of now" state). -->
             <AgentEnvironment inventory={runtime?.meta?.inventory} asOf={runtime?.meta_as_of} />
+          {/if}
+          {#if forkInFlightFrom(agent.id)}
+            <div class="text-muted mt-1 text-xs" data-testid="agent-fork-pending">
+              Creating a fork of {agent.name}…
+            </div>
+          {/if}
+          {#if forkError?.agentId === agent.id}
+            <div class="text-status-failed mt-1 text-xs" data-testid="agent-fork-error">
+              Couldn't fork {agent.name}: {forkError.message}
+            </div>
           {/if}
           {#if removeError?.agentId === agent.id}
             <div class="text-status-failed mt-1 text-xs" data-testid="agent-remove-error">

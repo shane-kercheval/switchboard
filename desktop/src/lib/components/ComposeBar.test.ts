@@ -1508,6 +1508,23 @@ describe("ComposeBar", () => {
       expect(forkHalf()).toBeNull();
     });
 
+    it("is offered for a Codex agent with a session id even when none of it shows", async () => {
+      // A Codex fork whose earlier conversation can't be shown, sent nothing
+      // yet, has an empty transcript but a real session. A Claude agent's id
+      // proves nothing (the test above), because Claude's is assigned before
+      // any session exists.
+      const codexFork: AgentRecord = {
+        ...AGENT_B,
+        session_locator: { codex: { thread_id: "thread-b", partition_date: "2026-10-11" } },
+      };
+      const state = await loadState();
+      await state.registerAgent(codexFork);
+      expect(state.runtimes[codexFork.id]?.hydration_status).toBe("complete");
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [codexFork] } });
+
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+    });
+
     it("withdraws the offer while the agent is working", async () => {
       // Probe-measured hazard: a branch taken mid-turn inherits a synthesized
       // placeholder instead of the parent's in-flight answer.
@@ -9054,7 +9071,7 @@ describe("ComposeBar — unavailable project folder, fork shortcut", () => {
     await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
 
     expect(await screen.findByTestId("compose-send-error")).toHaveTextContent(
-      "folder is unavailable, so nothing can be sent",
+      "folder is unavailable, so its agents can't run",
     );
     expect(invokeMock).not.toHaveBeenCalledWith("fork_agent", expect.anything());
     expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());

@@ -1,6 +1,5 @@
 <script lang="ts">
   import {
-    agentIsWorking,
     cancelSend,
     dispatchUserTurn,
     noteLocalSend,
@@ -10,8 +9,11 @@
     transcripts,
   } from "$lib/state/index.svelte";
   import { createReachableFork, type ReachableFork } from "$lib/state/workspace.svelte";
-  import { HARNESS_LABEL } from "$lib/harnessDisplay";
-  import { supportsComposeFork } from "$lib/harnessCapabilities";
+  import {
+    agentForkBlock,
+    projectFolderAvailable,
+    projectForkBlock,
+  } from "$lib/state/forkAvailability";
   import {
     addHeldForward,
     removeHeldForward,
@@ -60,11 +62,7 @@
     setOperationPhase,
     takeOutcome,
   } from "$lib/state/composeOperations.svelte";
-  import {
-    conversations,
-    projects,
-    recordProjectsActivityLocally,
-  } from "$lib/state/workspace.svelte";
+  import { projects, recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
   import {
     selectionFor,
     setRecipients,
@@ -457,16 +455,6 @@
     // clicks; this covers keyboard removal, where the X held focus.)
     textareaEl?.focus();
     forwardSources = forwardSources.filter((s) => forwardSourceKey(s) !== key);
-  }
-
-  /// Whether an agent's on-disk history has been read into `transcripts`.
-  ///
-  /// Load-bearing wherever an *absent* transcript is read as evidence: every
-  /// agent is seeded with an empty one at registration, and a failed read leaves
-  /// it empty until the user retries hydration — so before this holds, "empty"
-  /// and "has months of history" are indistinguishable.
-  function isHydrated(agentId: AgentId): boolean {
-    return runtimes[agentId]?.hydration_status === "complete";
   }
 
   /// What an agent would contribute if forwarded from right now. The single source
@@ -1256,15 +1244,16 @@
       .filter((a): a is AgentRecord => a !== undefined),
   );
 
-  // ---- Fork: a send-time option, not a standalone action ----
+  // ---- Fork: a send-time option here ----
   //
   // Claude has no copy-a-session operation and refuses a promptless fork, so a
   // branch can only come into existence *as a turn* (harness-behavior §3.5).
   // Modelling Fork as a send-modifier makes the UI match that: the send that
   // carries it registers the branch and dispatches its first turn as one
   // action, which is also why a parent and its not-yet-existing branch can
-  // never be co-recipients.
-  /// Shared so the shape check and the narrowing guard in `evaluateForkAttempt`
+  // never be co-recipients. Codex can fork without a turn, so a Codex agent's
+  // card also offers Fork on its own.
+  /// Shared so `forkBlock` and the narrowing guard in `evaluateForkAttempt`
   /// cannot drift into saying different things about the same state.
   const NO_FORK_SOURCE = "Select an agent to branch from.";
 
@@ -1283,44 +1272,11 @@
         promptAppendedSources.length > 0),
   );
 
-  /// Whether `agentId` looks like it has a harness session to branch from.
-  ///
-  /// Derived from the transcript rather than fetched: an agent with any turn
-  /// has dispatched at least once, and the compose bar already holds that
-  /// state. Deliberately **not** an `agent_session_info` call — the chip is
-  /// advisory and re-validated by the backend, and putting an IPC behind every
-  /// selection change would make the compose bar's request sequence depend on
-  /// which agent is selected.
-  ///
-  /// **Advisory, not exact.** It errs toward offering the chip; the backend
-  /// re-validates through `resolve_session_file` and returns a precise error.
-  /// Known imprecision, all in the safe direction: an agent whose only turn
-  /// failed before a session file was written reads as branchable, and so does
-  /// a real session that parses to zero turns (an empty or housekeeping-only
-  /// file). Hydration state is consulted so the *unsafe* direction — a real
-  /// session reading as absent while hydration is loading or has failed —
-  /// cannot happen.
-  function looksLikeItHasASession(agentId: AgentId): boolean {
-    // An empty transcript is evidence only once hydration has *completed*.
-    // While loading, and after a failure until the user retries, it is empty for
-    // an agent that may have a long history — and "send it a message first" is
-    // then not merely unhelpful but false.
-    if (!isHydrated(agentId)) return true;
-    return (transcripts[agentId] ?? []).length > 0;
-  }
+  /// The project's working directory is usable; the send and the fork are
+  /// refused without it (see `projectFolderAvailable`).
+  const projectAvailable = $derived(projectFolderAvailable(projectId));
 
-  /// The project's working directory is usable. A harness subprocess starts in
-  /// that directory, so with it deleted or unresolvable every send would fail at
-  /// spawn; the send and the fork are refused here instead, and the app-level
-  /// banner says why. A project the list doesn't know is not gated — no
-  /// information, and the backend reports the truth if the folder really is gone.
-  const projectAvailable = $derived.by(() => {
-    const listing = projects.list.find((candidate) => candidate.id === projectId);
-    return listing === undefined || projectIsAvailable(listing);
-  });
-
-  /// Why this send's *shape* rules out a fork, or `null` when it admits one.
-  /// Everything except whether the recipient happens to be busy right now.
+  /// Why a fork can't be taken right now, or `null` when it can.
   ///
   /// **Drives visibility as a boolean, and explanation as a string.** The fork
   /// half is an unlabelled icon, so it is simply absent unless it applies —
@@ -1329,22 +1285,11 @@
   /// *only* fork surface the user can reach, so the reason has to exist as real
   /// copy rather than as a comment. Silence there would swallow the keystroke.
   ///
-  const forkShapeBlock = $derived.by((): string | null => {
-    // Nothing can run in a project whose folder is gone. The send button is
-    // already disabled on the same predicate; the shortcut must refuse too, or
-    // it creates the fork agent for real and only then fails at spawn.
-    if (!projectAvailable) {
-      return "This project's folder is unavailable, so nothing can be sent.";
-    }
-    // A fork's earlier conversation is read through the project's history load:
-    // a Codex fork's right after it is created, a Claude fork's after its first
-    // reply. Either read is skipped while the project is still loading, and the
-    // in-flight load may have started before the fork existed, so a fork made
-    // now could show no earlier conversation and no error. Both harnesses, one
-    // rule; it also holds after a failed project load until a retry succeeds.
-    if (conversations[projectId]?.status !== "complete") {
-      return "Fork is available once the project's history has loaded.";
-    }
+  /// The project and agent conditions are shared with the agent card's Fork
+  /// item (`forkAvailability.ts`); the checks between them are this box's own.
+  const forkBlock = $derived.by((): string | null => {
+    const projectBlock = projectForkBlock(projectId);
+    if (projectBlock !== null) return projectBlock;
     // A workflow is N sends; "which one branches?" has no answer.
     if (mode === "workflow") return "Fork isn't available while composing a workflow.";
     // A prompt with a forwarded field composes server-side and dispatches
@@ -1364,29 +1309,7 @@
       // the branch's selection swap exists to prevent.
       return "Fork branches from one agent's own history — clear the forward sources first.";
     }
-    if (!supportsComposeFork(candidate.harness)) {
-      return `Switchboard can branch only Claude Code and Codex sessions, and ${candidate.name} is ${HARNESS_LABEL[candidate.harness]}.`;
-    }
-    if (!looksLikeItHasASession(candidate.id)) {
-      return `${candidate.name} has no session to branch from yet — send it a message first.`;
-    }
-    return null;
-  });
-
-  /// Why a fork can't be taken right now, or `null` when it can. Probe-measured:
-  /// a branch taken mid-turn copies a session file still being written — for a
-  /// send that means inheriting a synthesized "No response requested." placeholder
-  /// instead of the parent's real answer, permanently; for a compaction it means
-  /// copying a half-rewritten history. The backend re-checks this at dispatch —
-  /// here it keeps the offer off the screen and gives the shortcut something to
-  /// say. Keep this wording in step with `AppError::ForkSourceBusy`.
-  const forkBlock = $derived.by((): string | null => {
-    if (forkShapeBlock !== null) return forkShapeBlock;
-    const candidate = forkCandidate;
-    if (candidate !== null && agentIsWorking(runtimes[candidate.id])) {
-      return `${candidate.name} is busy — its conversation must stop changing before you can branch. Wait for it to finish, or cancel it first.`;
-    }
-    return null;
+    return agentForkBlock(candidate);
   });
 
   const forkAvailable = $derived(forkBlock === null);
@@ -1402,7 +1325,7 @@
 
   function evaluateForkAttempt(): ForkAttempt {
     if (forkBlock !== null) return { kind: "blocked", reason: forkBlock };
-    // Unreachable at runtime — `forkShapeBlock` already returns `NO_FORK_SOURCE`
+    // Unreachable at runtime — `forkBlock` already returns `NO_FORK_SOURCE`
     // for a null candidate, so the check above returns first. Kept because it is
     // what narrows `forkCandidate` to non-null for the `ready` variant below;
     // deleting it does not compile.

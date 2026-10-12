@@ -256,7 +256,7 @@ A Codex agent's "…" menu has a Fork item that creates an idle fork without sen
 
 ### Implementation outline
 
-Small milestone. Add the item to the agent card menu in `lib/components/Sidebar.svelte`, gated by the "fork without a turn" capability from milestone 3. **Share the agent-level conditions with the compose box rather than copying them:** the project's folder is available, its history has loaded, the agent can fork, has a session, and is idle. Move those checks out of `ComposeBar.svelte`'s `forkShapeBlock`/`forkBlock` into one helper both surfaces call, leaving the compose-only conditions (workflow mode, forwarded fields, multiple recipients) in the compose box. Place it beside "Compact context", and follow that item's handling of a busy agent and of errors. It calls the same `fork_agent` command and `forkAgentIntoOwnPane` as the compose path, minus the send.
+Small milestone. Add the item to the agent card menu in `lib/components/Sidebar.svelte`, gated by the "fork without a turn" capability from milestone 3. **Share the agent-level conditions with the compose box rather than copying them:** the project's folder is available, its history has loaded, the agent can fork, has a session, and is idle. Move those checks out of `ComposeBar.svelte`'s `forkShapeBlock`/`forkBlock` into one helper both surfaces call, leaving the compose-only conditions (workflow mode, forwarded fields, multiple recipients) in the compose box. Place it beside "Compact context", and follow that item's handling of a busy agent and of errors. It calls the same `fork_agent` command as the compose path, minus the send, through its own entry point (`forkAgentWithoutSending`). That entry point returns once the fork exists and loads the earlier conversation in the background with the fork marked as loading, so the compose claim covers only the original's lock. Neither Fork moves other agents between panes: splitting the unified view keeps every agent it showed in the first pane.
 
 **Take the project's compose claim while the fork is being created**, as the compose fork does (`beginOperation` in `lib/state/composeOperations.svelte.ts`; add a kind for it). Without the claim, a compose send to the original typed during that second is refused with "resend" (milestone 3 explains the lock); with it, the compose bar is disabled for that second instead.
 
@@ -266,7 +266,7 @@ Update `docs/system-design.md` §7, whose agent-row paragraph says Fork is "deli
 
 ### Definition of done
 
-- Frontend tests in `Sidebar.test.ts`:
+- Frontend tests in `Sidebar.test.ts`, and in `AgentCardFork.test.ts` for the cases that need the real stores rather than `Sidebar.test.ts`'s mocked workspace (the pane, the compose bar, and Retry):
   - the item shows for a Codex agent and not for Claude or Antigravity;
   - it is unavailable while the agent is working, and while the project's history is loading, each with its reason;
   - choosing it creates the fork and its pane, and dispatches no turn;

@@ -1271,6 +1271,7 @@ export function addAgentToProjectRoster(agent: AgentRecord): void {
 }
 
 /// Branch `sourceId`'s conversation into a new agent and make it the live one.
+/// The compose box's Fork; the agent card's is [`forkAgentWithoutSending`].
 ///
 /// What happens next depends on the harness:
 ///
@@ -1281,42 +1282,11 @@ export function addAgentToProjectRoster(agent: AgentRecord): void {
 ///   come into being until someone messages it.
 /// - **Codex (eager, `supportsForkWithoutTurn`):** the backend has already
 ///   created the session, so the branch is complete on return, with its earlier
-///   conversation loaded. A send after it is the user's choice, not a
-///   requirement (the agent card's Fork sends nothing).
-///
-/// Ordering is load-bearing and mirrors the create/attach path:
-/// `registerAgent` first (it initializes the runtime *before* subscribing, so an
-/// event arriving immediately after the command resolves finds somewhere to
-/// land), then roster, then placement.
-///
-/// **Placement:** the branch gets its own visible track. Never the parent's
-/// pane — they share history with identical timestamps, so co-paning renders
-/// every inherited message twice. Prefer a visible empty pane the user already
-/// has; otherwise create one while narrowing an untouched all-agent pane to the
-/// source the user actually forked. The other idle roster agents become
-/// unassigned instead of unexpectedly remaining recipients in the original
-/// pane. A new pane may start *minimized* when the row is full — hence
-/// `revealPane`, which also handles focus mode by making the branch the
-/// maximized pane rather than dropping the user out of focus. A fork-send is an
-/// explicit action with an immediate result: leaving the reply in a pane the
-/// user cannot see (with compose now addressed at that unseen agent) reads as
-/// "my message vanished." The parent is left exactly where it is; only the
-/// compose selection moves.
+///   conversation loaded. The load is awaited because the caller sends to the
+///   fork next, and that read must not overlap the fork's live first turn.
 export async function forkAgentIntoOwnPane(sourceId: AgentId): Promise<AgentRecord> {
-  const fork = await api.forkAgent(sourceId);
-  await registerAgent(fork);
-  addAgentToProjectRoster(fork);
-  const rosterIds = (agentsByProject[fork.project_id] ?? []).map((item) => item.id);
-  let paneId = assignAgentToFirstVisibleEmptyPane(fork.project_id, rosterIds, fork.id);
-  if (paneId === null) {
-    paneId = createEmptyPane(fork.project_id, rosterIds, [sourceId]);
-    moveAgentToPane(fork.project_id, rosterIds, fork.id, paneId);
-  }
-  revealPane(fork.project_id, rosterIds, paneId);
+  const fork = await registerForkInOwnPane(sourceId);
   if (supportsForkWithoutTurn(fork.harness)) {
-    // An eager fork (Codex) already exists, with its earlier conversation
-    // readable now. Load it before returning, so it's on screen before the
-    // first send, and so that read can't overlap the fork's live first turn.
     // A failed load doesn't fail the fork: the fork is real, and the caller
     // still sends to it rather than retrying into a second fork.
     eagerForks.add(fork.id);
@@ -1326,6 +1296,64 @@ export async function forkAgentIntoOwnPane(sourceId: AgentId): Promise<AgentReco
     // materializes it — so the transcript cue arms here, before the first turn.
     forkHistoryPending.add(fork.id);
   }
+  return fork;
+}
+
+/// Fork a Codex agent and send nothing: the agent card's Fork item.
+///
+/// Returns as soon as the fork exists, without waiting for its earlier
+/// conversation. That read rereads the whole project and can queue behind
+/// another, and the caller holds the project's compose claim until this
+/// returns, only to cover the original's lock during creation. The fork is
+/// marked as loading its history until the read settles instead, so only
+/// sends to the fork wait for it.
+///
+/// Refused for a harness that can't fork without a turn: a Claude branch
+/// registered with no message would never come into existence.
+export async function forkAgentWithoutSending(sourceId: AgentId): Promise<AgentRecord> {
+  const source = Object.values(agentsByProject)
+    .flat()
+    .find((candidate) => candidate.id === sourceId);
+  if (source === undefined || !supportsForkWithoutTurn(source.harness)) {
+    throw new Error("Only a Codex agent can be forked without sending a message.");
+  }
+  const fork = await registerForkInOwnPane(sourceId);
+  eagerForks.add(fork.id);
+  void loadEagerForkHistoryShowingProgress(fork.id);
+  return fork;
+}
+
+/// Register a branch and give it its own visible pane, for both Fork entry
+/// points.
+///
+/// Ordering is load-bearing and mirrors the create/attach path:
+/// `registerAgent` first (it initializes the runtime *before* subscribing, so an
+/// event arriving immediately after the command resolves finds somewhere to
+/// land), then roster, then placement.
+///
+/// **Placement:** the branch gets its own visible pane. Never the parent's
+/// pane — they share history with identical timestamps, so co-paning renders
+/// every inherited message twice. Prefer a visible empty pane the user already
+/// has; otherwise create one. **No other agent moves.** Creating the pane from
+/// the unified view keeps every agent the view showed in the first pane: unlike
+/// the header's "+", a fork isn't a layout gesture, so it never hides
+/// conversations the user was looking at. A new pane may start *minimized* when
+/// the row is full — hence `revealPane`, which also handles focus mode by
+/// making the branch the maximized pane rather than dropping the user out of
+/// focus. A fork is an explicit action with an immediate result, and a branch
+/// in a pane the user cannot see reads as "my fork vanished." The parent is
+/// left exactly where it is.
+async function registerForkInOwnPane(sourceId: AgentId): Promise<AgentRecord> {
+  const fork = await api.forkAgent(sourceId);
+  await registerAgent(fork);
+  addAgentToProjectRoster(fork);
+  const rosterIds = (agentsByProject[fork.project_id] ?? []).map((item) => item.id);
+  let paneId = assignAgentToFirstVisibleEmptyPane(fork.project_id, rosterIds, fork.id);
+  if (paneId === null) {
+    paneId = createEmptyPane(fork.project_id, rosterIds);
+    moveAgentToPane(fork.project_id, rosterIds, fork.id, paneId);
+  }
+  revealPane(fork.project_id, rosterIds, paneId);
   return fork;
 }
 
@@ -1582,24 +1610,41 @@ export async function retryAgentHistory(agentId: AgentId): Promise<void> {
     await retryAgentHydration(agentId);
     return;
   }
-  const runtime = runtimes[agentId];
-  if (runtime === undefined || runtime.hydration_status === "loading") return;
-  runtimes[agentId] = { ...runtime, hydration_status: "loading", hydration_error: undefined };
+  if (runtimes[agentId]?.hydration_status === "loading") return;
   // An explicit Retry always reads again. The once-per-fork mark only stops
   // the automatic reload after each turn from repeating a read that worked; a
   // fork that loaded once can still fail a later project reload.
   forkHistoryLoaded.delete(agentId);
-  await loadForkInheritedHistory(agentId);
-  // The load either applied (which marks the agent complete) or failed (which
-  // marks it failed). It can also return without reading, e.g. while the
-  // project itself is still loading; then put back what was there rather than
-  // leave a spinner nothing will clear.
+  await loadEagerForkHistoryShowingProgress(agentId);
+}
+
+/// Load an eager fork's inherited history with the fork shown as loading it,
+/// for Retry and for a fork made from the agent card. While it shows loading,
+/// the compose bar won't send to it, so the read never overlaps the fork's own
+/// turn.
+///
+/// **Never leaves it loading.** The load either applies (which marks the agent
+/// complete) or fails (which marks it failed). It can also return without
+/// reading, e.g. when the fork was deleted meanwhile; then this puts back what
+/// was there rather than leave a spinner nothing will clear, and a fork made
+/// from the card, which started out complete, can be sent to. An unexpected
+/// error marks it failed, with Retry.
+async function loadEagerForkHistoryShowingProgress(agentId: AgentId): Promise<void> {
+  const before = runtimes[agentId];
+  if (before === undefined || before.hydration_status === "loading") return;
+  runtimes[agentId] = { ...before, hydration_status: "loading", hydration_error: undefined };
+  try {
+    await loadForkInheritedHistory(agentId);
+  } catch (err) {
+    markEagerForkHistoryFailed(agentId, err instanceof Error ? err.message : String(err));
+    return;
+  }
   const after = runtimes[agentId];
   if (after?.hydration_status === "loading") {
     runtimes[agentId] = {
       ...after,
-      hydration_status: runtime.hydration_status,
-      hydration_error: runtime.hydration_error,
+      hydration_status: before.hydration_status,
+      hydration_error: before.hydration_error,
     };
   }
 }

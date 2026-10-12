@@ -21,6 +21,9 @@ vi.mock("$lib/state/workspace.svelte", () => ({
     reorderAgentsMock(projectId, orderedIds),
   retryAgentHistory: vi.fn(async () => undefined),
   setAgentSelection: vi.fn(async () => undefined),
+  forkAgentWithoutSending: vi.fn(async () => undefined),
+  projects: { list: [] },
+  conversations: {},
 }));
 
 import { render } from "vitest-browser-svelte";

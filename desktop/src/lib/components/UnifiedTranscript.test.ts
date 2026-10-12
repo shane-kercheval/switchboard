@@ -2749,6 +2749,53 @@ describe("UnifiedTranscript hydration failures", () => {
     expect(copyTextMock).toHaveBeenCalledWith("journal read failed at /work/journal.jsonl");
   });
 
+  it("keeps the project-load Retry unavailable while any agent is replying", async () => {
+    // It rereads every agent, and a reply still being written would show twice.
+    const state = await loadState();
+    const ws = await import("$lib/state/workspace.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    ws.agentsByProject[PROJECT_ID] = [CLAUDE_AGENT];
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...state.runtimes[CLAUDE_AGENT.id]!,
+      run_status: "processing",
+    };
+    const onRetryLoad = vi.fn();
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT],
+        loadStatus: "failed",
+        loadError: "journal read failed",
+        onRetryLoad,
+      },
+    });
+    const retry = screen.getByTestId("transcript-load-failed-retry");
+    expect(retry).toHaveAttribute("aria-disabled", "true");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.pointerEnter(retry);
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(screen.getByTestId("tooltip-content")).toHaveTextContent(
+        "Retry is available once every agent in this project has finished replying",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    await fireEvent.click(retry);
+    expect(onRetryLoad).not.toHaveBeenCalled();
+
+    state.runtimes[CLAUDE_AGENT.id] = { ...state.runtimes[CLAUDE_AGENT.id]!, run_status: "idle" };
+    await waitFor(() =>
+      expect(screen.getByTestId("transcript-load-failed-retry")).not.toHaveAttribute(
+        "aria-disabled",
+      ),
+    );
+    await fireEvent.click(screen.getByTestId("transcript-load-failed-retry"));
+    expect(onRetryLoad).toHaveBeenCalledTimes(1);
+  });
+
   it("suppresses the empty-state message when the project load failed", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);

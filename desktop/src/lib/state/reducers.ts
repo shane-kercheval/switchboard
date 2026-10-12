@@ -343,9 +343,11 @@ export function transcriptReducer(
       // already hold a `hydration_key` from the `turn_identity` event, and a
       // *synthesized* terminal (a cancelled turn's `TurnEnd`, built by the
       // dispatcher) carries `hydration_key: None` — clearing it would leave the
-      // cancelled turn keyless and duplicate it against its keyed disk copy. For
-      // parser-emitted terminals `input.hydration_key` is present and equals the
-      // early key, so this is a no-op there.
+      // cancelled turn keyless and duplicate it against its keyed disk copy.
+      // For a Claude terminal the key equals the early one, so this is a no-op.
+      // A Codex turn has no early key except on cancel, so its terminal key is
+      // the only one, and it is absent when the terminal's session-file read
+      // failed or the turn ended abnormally (harness-behavior G44).
       const hydration_key = input.hydration_key ?? existing.hydration_key;
       const baseUpdate = {
         ...existing,

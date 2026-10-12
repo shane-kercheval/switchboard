@@ -8987,6 +8987,75 @@ describe("ComposeBar — auto reading mode", () => {
   });
 });
 
+describe("ComposeBar — project history loading", () => {
+  // While the project's history is being read (its first load, or the
+  // project-wide Retry), a reply that starts could be caught half-written and
+  // shown twice, so sends wait. The wait ends when the read ends either way.
+  it("holds sends while the history loads, and releases them whether it loads or fails", async () => {
+    const state = await loadState();
+    const ws = await loadWorkspace();
+    await state.registerAgent(AGENT_A);
+    ws.conversations[PROJECT_ID] = { items: [], status: "loading" };
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "hi" } });
+    const send = screen.getByTestId("compose-send") as HTMLButtonElement;
+    expect(send.disabled).toBe(true);
+
+    await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
+    expect(await screen.findByTestId("compose-send-error")).toHaveTextContent(
+      "Sending is available once the project's history has loaded.",
+    );
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message")).toHaveLength(0);
+
+    ws.conversations[PROJECT_ID] = { items: [], status: "complete" };
+    await waitFor(() => expect(send.disabled).toBe(false));
+
+    ws.conversations[PROJECT_ID] = { items: [], status: "loading" };
+    await waitFor(() => expect(send.disabled).toBe(true));
+    ws.conversations[PROJECT_ID] = { items: [], status: "failed", error: "unreadable" };
+    await waitFor(() => expect(send.disabled).toBe(false));
+  });
+
+  it("holds a workflow run while the history loads", async () => {
+    const state = await loadState();
+    const ws = await loadWorkspace();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "quick-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    const DESCRIPTOR = {
+      ...WORKFLOW,
+      steps: [],
+      derived_args: [],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:quick-workflow"));
+    const run = await screen.findByTestId("workflow-invoke-button");
+    await waitFor(() => expect(run).toBeEnabled());
+
+    ws.conversations[PROJECT_ID] = { items: [], status: "loading" };
+
+    await waitFor(() => expect(run).toBeDisabled());
+    ws.conversations[PROJECT_ID] = { items: [], status: "complete" };
+    await waitFor(() => expect(run).toBeEnabled());
+  });
+});
+
 describe("ComposeBar — unavailable project folder", () => {
   const LISTING: ProjectListing = {
     id: PROJECT_ID,

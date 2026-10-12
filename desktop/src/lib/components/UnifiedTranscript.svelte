@@ -39,6 +39,7 @@
     agentsByProject,
     historyRetryBlock,
     isAwaitingForkHistory,
+    projectHistoryRetryBlock,
     retryAgentHistory,
   } from "$lib/state/workspace.svelte";
   import {
@@ -2509,6 +2510,7 @@
           "The project's conversation history failed to load. The exact error is below — copy it into a bug report.",
           loadError ?? "No error detail was reported.",
         ),
+      projectHistoryRetryBlock(projectId),
     )}
   {/if}
 

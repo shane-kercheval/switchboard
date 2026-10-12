@@ -1246,23 +1246,53 @@ async function maybeRefreshProject(projectId: ProjectId): Promise<void> {
 /// re-runs (the `loadStarted` open/roster guard is untouched — open succeeded;
 /// only the conversation merge failed). A failed load applied nothing, so the
 /// re-attempt cannot duplicate content.
+///
+/// **Never while a reply could be written during the read.** It rereads every
+/// agent, and a Codex reply still being written can't be matched to its saved
+/// copy, so it would show twice. So it refuses while any agent is working
+/// ([`projectHistoryRetryBlock`]), and the project counts as loading from the
+/// click rather than from when the read starts: the read may wait behind
+/// another one, and the compose bar holds sends while a project's history is
+/// loading, so no reply can start in that wait either.
 export async function retryProjectHydration(projectId: ProjectId): Promise<void> {
   // Re-entrancy guard, mirroring `retryAgentHydration`. `hydrateProject` also
   // feeds each agent's turns through the per-agent append-merge
   // (`applyAgentHydrate`), so two concurrent project retries duplicate agent
   // turns just like the per-agent path — not only the `conversations` overlay
-  // (which is last-write-wins and would be fine). `hydrateProject` sets status
-  // `"loading"` synchronously before its await, so a racing retry sees it here.
-  if (conversations[projectId]?.status === "loading") return;
-  // Chained like the two background readers, so "every read after the project's
-  // first is queued behind the others" holds by construction rather than by each
-  // caller remembering. The guard above catches a read that is already *running*;
-  // it cannot see one merely queued, and two overlapping reads race to replace
-  // the whole overlay.
-  await chainProjectLoad(projectId, async () => {
-    hydrationStarted.delete(projectId);
-    return await hydrateProject(projectId);
-  });
+  // (which is last-write-wins and would be fine).
+  const before = conversations[projectId];
+  if (before?.status === "loading") return;
+  if (projectHistoryRetryBlock(projectId) !== null) return;
+  conversations[projectId] = { items: before?.items ?? [], status: "loading" };
+  try {
+    // Chained like the two background readers, so "every read after the
+    // project's first is queued behind the others" holds by construction
+    // rather than by each caller remembering. The guard above catches a read
+    // that is already *running*; it cannot see one merely queued, and two
+    // overlapping reads race to replace the whole overlay.
+    await chainProjectLoad(projectId, async () => {
+      hydrationStarted.delete(projectId);
+      return await hydrateProject(projectId);
+    });
+  } finally {
+    // `hydrateProject` always settles the status. A read that ended any other
+    // way must not leave the project loading, which would hold every send.
+    if (conversations[projectId]?.status === "loading") {
+      conversations[projectId] = before ?? { items: [], status: "failed" };
+    }
+  }
+}
+
+/// Why a project's history can't be retried right now, or `null` when it can:
+/// the project-wide Retry, shown when the whole project's history failed to
+/// load. It rereads every agent, so it waits until none has a reply running or
+/// queued, for the reason [`historyRetryBlock`] gives for one agent.
+export function projectHistoryRetryBlock(projectId: ProjectId): string | null {
+  const working = (agentsByProject[projectId] ?? []).some((agent) =>
+    agentIsWorking(runtimes[agent.id]),
+  );
+  if (!working) return null;
+  return "Retry is available once every agent in this project has finished replying, including any queued messages.";
 }
 
 /// Append a freshly created/attached agent to its owning project's roster so
@@ -1716,6 +1746,12 @@ export function installForkHistoryRefresh(): void {
 /// mid-reply, or its output breaks off or can't be parsed), or when the
 /// session file couldn't be read as it ended (`docs/harness-behavior.md`,
 /// gap G44).
+///
+/// Deliberately stricter than needed: a queued message cancelled before it ran,
+/// or a send that failed before starting, also leaves an agent row with no id
+/// though nothing of it was saved. Telling those apart from a reply that ended
+/// before writing anything would mean guessing from the row; the cost is only
+/// the automatic retry for that session, and Retry still works.
 function showsUnmatchableReply(agentId: AgentId): boolean {
   return (transcripts[agentId] ?? []).some(
     (turn) => turn.role === "agent" && turn.hydration_key == null,

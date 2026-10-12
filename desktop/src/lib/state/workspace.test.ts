@@ -29,6 +29,21 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: (name: string, cb: (e: { payload: unknown }) => void) => listenMock(name, cb),
 }));
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/// Let pending IPC replies and the work queued behind them run. The fake IPC
+/// resolves at once, but a read is several awaits deep, so one microtask is not
+/// enough to observe that it happened, or that it didn't.
+async function flushAsync(): Promise<void> {
+  for (let i = 0; i < 5; i += 1) await new Promise((r) => setTimeout(r, 0));
+}
+
 function fireTo(channel: string, payload: unknown): void {
   const cb = listeners.get(channel);
   if (cb === undefined) throw new Error(`no listener for ${channel}`);
@@ -1755,7 +1770,7 @@ describe("eager (Codex) fork inherited history", () => {
     calls.length = 0;
 
     reply(FORK_A, "turn-1", "send-1", { outcome: { status: "completed" }, hydrationKey: "key-1" });
-    await settled(() => true);
+    await flushAsync();
 
     expect(calls).not.toContain("load_project_conversation");
     expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
@@ -1787,7 +1802,7 @@ describe("eager (Codex) fork inherited history", () => {
     calls.length = 0;
 
     goIdle(FORK_A);
-    await settled(() => true);
+    await flushAsync();
 
     expect(calls).not.toContain("load_project_conversation");
     expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
@@ -1822,6 +1837,47 @@ describe("eager (Codex) fork inherited history", () => {
     expect(ws.historyRetryBlock(codexAgent(FORK_A, "cx-fork"))).toBeNull();
     await ws.retryAgentHistory(FORK_A);
     expect(state.runtimes[FORK_A]?.hydration_status).toBe("complete");
+  });
+
+  it("refuses the project-wide Retry while any agent is replying", async () => {
+    const { ws, state, calls } = await codexProject(async () => undefined);
+    ws.conversations[PROJECT_1] = { items: [], status: "failed", error: "unreadable" };
+    state.runtimes[AGENT_1] = { ...state.runtimes[AGENT_1]!, run_status: "processing" };
+
+    expect(ws.projectHistoryRetryBlock(PROJECT_1)).toContain(
+      "once every agent in this project has finished replying",
+    );
+    await ws.retryProjectHydration(PROJECT_1);
+
+    expect(calls).not.toContain("load_project_conversation");
+    expect(ws.conversations[PROJECT_1]?.status).toBe("failed");
+  });
+
+  it("holds the project as loading from the click while its Retry waits behind another read", async () => {
+    // The compose bar holds sends while a project's history loads, so no reply
+    // can start between the click and the read itself.
+    const history = deferred<ProjectConversation>();
+    let reads = 0;
+    const { ws, state } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") {
+        reads += 1;
+        return reads === 1 ? await history.promise : conversationWith([FORK_A]);
+      }
+      return undefined;
+    });
+    // A card fork's history read is in flight, queued on the project.
+    await ws.forkAgentWithoutSending(AGENT_1);
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("loading");
+    ws.conversations[PROJECT_1] = { items: [], status: "failed", error: "unreadable" };
+
+    const retry = ws.retryProjectHydration(PROJECT_1);
+
+    expect(ws.conversations[PROJECT_1]?.status).toBe("loading");
+    history.resolve(conversationWith([FORK_A]));
+    await retry;
+    expect(ws.conversations[PROJECT_1]?.status).toBe("complete");
+    expect(reads).toBe(2);
   });
 
   it("refuses a manual Retry for an ordinary agent while it is replying", async () => {

@@ -62,7 +62,11 @@
     setOperationPhase,
     takeOutcome,
   } from "$lib/state/composeOperations.svelte";
-  import { projects, recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
+  import {
+    conversations,
+    projects,
+    recordProjectsActivityLocally,
+  } from "$lib/state/workspace.svelte";
   import {
     selectionFor,
     setRecipients,
@@ -1276,6 +1280,15 @@
   /// refused without it (see `projectFolderAvailable`).
   const projectAvailable = $derived(projectFolderAvailable(projectId));
 
+  /// The project's history is being read: its first load after opening, or the
+  /// project-wide Retry, which counts as loading from the click. Sends wait for
+  /// it. The read covers every agent, and a Codex reply that starts during it
+  /// can't be matched to its saved copy until it ends, so it would show twice.
+  /// The wait ends when the read finishes, whether it succeeded or failed, so a
+  /// failed load never holds sends.
+  const historyLoading = $derived(conversations[projectId]?.status === "loading");
+  const HISTORY_LOADING = "Sending is available once the project's history has loaded.";
+
   /// Why a fork can't be taken right now, or `null` when it can.
   ///
   /// **Drives visibility as a boolean, and explanation as a string.** The fork
@@ -1597,6 +1610,7 @@
   /// flight. **Not** gated on run_status — send-while-busy queues.
   const sendDisabledExceptStaging = $derived(
     !projectAvailable ||
+      historyLoading ||
       (mode === "prompt"
         ? selectedPrompt === null ||
           missingRequired.length > 0 ||
@@ -1607,6 +1621,12 @@
           !allRecipientsHydrated),
   );
   const sendDisabled = $derived(sendDisabledExceptStaging || stagingPending);
+  /// Something is typed or chosen to send, so a refused ⌘↵ should explain.
+  const composerHasContent = $derived(
+    mode === "prompt"
+      ? selectedPrompt !== null
+      : draft.trim() !== "" || attachmentChips.length > 0 || forwardSources.length > 0,
+  );
   const STILL_ATTACHING = "Still attaching a file — try again in a moment.";
 
   // Every live send across this project's agents, mapped to the agents it's
@@ -2272,7 +2292,7 @@
   /// state. A pending (`unresolved`) or `incompatible` form blocks Run.
   const workflowRunnable = $derived.by(() => {
     const form = workflowForm;
-    if (form === null || workflowFormLoading || !projectAvailable) return false;
+    if (form === null || workflowFormLoading || !projectAvailable || historyLoading) return false;
     if (!form.invocable || form.compatibility.state !== "ok") return false;
     // A single `text` input / derived arg also counts as filled when it carries
     // ≥1 forward source (only text/derived fields can — agent/list fields keep
@@ -3250,8 +3270,9 @@
   async function handleSubmit(): Promise<void> {
     if (sendDisabled) {
       // Plain ⌘↵ on an empty composer is deliberately silent; a composer that
-      // only a running copy is holding back should say so.
+      // only a running copy, or the history load, is holding back should say so.
       if (!sendDisabledExceptStaging) showError(STILL_ATTACHING);
+      else if (historyLoading && composerHasContent) showError(HISTORY_LOADING);
       return;
     }
     clearStatus();
@@ -4522,9 +4543,11 @@
           : "Cancel send"
         : !projectAvailable
           ? "Project folder unavailable"
-          : stagingPending
-            ? `Attaching ${stagingNames[0]}…`
-            : "Send"}
+          : historyLoading
+            ? HISTORY_LOADING
+            : stagingPending
+              ? `Attaching ${stagingNames[0]}…`
+              : "Send"}
       shortcut={shortcut("mod", "enter")}
       disableHoverableContent
     >

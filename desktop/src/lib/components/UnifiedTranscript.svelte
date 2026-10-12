@@ -77,6 +77,7 @@
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import UserMessageBody from "$lib/components/UserMessageBody.svelte";
+  import { inheritedHistoryNotice } from "$lib/inheritedHistory";
   import { consumeJump, jumpRequest } from "$lib/state/transcriptJump.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import Button from "$lib/components/ui/Button.svelte";
@@ -105,6 +106,27 @@
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
   type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
+  type MarkerRow = Extract<UnifiedRow, { kind: "system_marker" }>;
+
+  /// What a marker row's hover copy button copies, and its label. A marker kind
+  /// with nothing worth copying gets an empty string, which hides the button.
+  function markerCopy(marker: MarkerRow["marker"]): { copyable: string; label: string } {
+    switch (marker.marker_kind) {
+      case "compaction":
+        return { copyable: marker.summary, label: "Copy summary" };
+      case "slash_command":
+        return { copyable: marker.command, label: "Copy command" };
+      case "inherited_history_unavailable": {
+        const notice = inheritedHistoryNotice(marker.reason);
+        return {
+          copyable: `${notice.title}. ${notice.detail} Codex session ${marker.rollout_id}`,
+          label: "Copy notice",
+        };
+      }
+      default:
+        return { copyable: "", label: "Copy" };
+    }
+  }
 
   /// `agents` is the active project's roster (for attribution + flattening
   /// their per-agent transcripts). `overlay` is the project's hydrated
@@ -2408,6 +2430,18 @@
         >
           Ran <span class="font-mono normal-case">{row.marker.command}</span>
         </div>
+      {:else if row.marker.marker_kind === "inherited_history_unavailable"}
+        <!-- A Codex fork whose earlier conversation couldn't be loaded. Sits at
+             the fork's creation time, just above its own turns, so the gap is
+             explained where it is. -->
+        {@const notice = inheritedHistoryNotice(row.marker.reason)}
+        <div class="space-y-1 text-xs" data-testid="inherited-history-marker">
+          <div class="text-warning font-semibold">{notice.title}</div>
+          <p class="text-muted">{notice.detail}</p>
+          <p class="text-muted">
+            Codex session <span class="font-mono">{row.marker.rollout_id}</span>
+          </p>
+        </div>
       {/if}
       <!-- Unknown marker_kind: render nothing (degrade gracefully on a future
            variant this build doesn't model). -->
@@ -2415,17 +2449,7 @@
     <!-- Same hover-revealed timestamp + copy as every other row (copies the
          verbatim recap). Also restores the inter-row spacing the bare disclosure
          lost. -->
-    {@render messageMeta({
-      at: row.at,
-      copyable:
-        row.marker.marker_kind === "compaction"
-          ? row.marker.summary
-          : row.marker.marker_kind === "slash_command"
-            ? row.marker.command
-            : "",
-      label: row.marker.marker_kind === "slash_command" ? "Copy command" : "Copy summary",
-      mt: "mt-2.5",
-    })}
+    {@render messageMeta({ at: row.at, ...markerCopy(row.marker), mt: "mt-2.5" })}
   </div>
 {/snippet}
 

@@ -1018,7 +1018,25 @@ export type SystemMarker =
   // A `/context` run recorded in the session file. Renders nothing — a report is
   // not conversation — and exists so a reopened project can fill the breakdown
   // panel from the latest one, stamped "as of" the marker's time.
-  | { marker_kind: "context_report"; report: ContextReport };
+  | { marker_kind: "context_report"; report: ContextReport }
+  // A Codex fork whose inherited history couldn't be shown. `rollout_id` is the
+  // Codex session file the chain broke at, which may be a grandparent's.
+  | {
+      marker_kind: "inherited_history_unavailable";
+      reason: InheritedHistoryGap;
+      rollout_id: string;
+    };
+
+// Mirror of Rust `InheritedHistoryGap` (`crates/harness/src/transcript.rs`). A
+// reason this build doesn't know still renders, with general wording
+// (`inheritedHistoryNotice`).
+export type InheritedHistoryGap =
+  | "not_found"
+  | "compressed"
+  | "changed"
+  | "ambiguous"
+  | "cycle"
+  | "too_deep";
 
 // Mirror of Rust `ContextReport` (`crates/harness/src/context_report.rs`).
 //

@@ -87,6 +87,42 @@ pub enum SystemMarker {
     ContextReport {
         report: crate::context_report::ContextReport,
     },
+    /// A Codex fork whose inherited history could not be shown. A Codex fork's
+    /// rollout points into its parent's rollout instead of copying it, so the
+    /// loader follows that pointer (`codex::inherited_history`). When it can't,
+    /// it shows the fork's own turns and this marker, stamped with the fork's
+    /// creation time so it sits just above them, rather than a history that is
+    /// silently missing or only partly there. `rollout_id` names the file the
+    /// chain broke at, which may be a grandparent's.
+    InheritedHistoryUnavailable {
+        reason: InheritedHistoryGap,
+        rollout_id: String,
+    },
+}
+
+/// Why a Codex fork's inherited history could not be loaded. The frontend words
+/// each case for the user, because they mean different things: a missing file
+/// also stops Codex from running the fork, a compressed one does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum InheritedHistoryGap {
+    /// No rollout with that id under `~/.codex/sessions`. Probed: Codex then
+    /// refuses to run the fork until the file is restored.
+    NotFound,
+    /// Only a compressed copy (`rollout-*.jsonl.zst`) exists. Codex can read
+    /// it; Switchboard can't yet (gap G40).
+    Compressed,
+    /// The file is shorter than the fork's recorded cut-off, or the cut-off
+    /// no longer falls on a line break, so it is not the file Codex forked.
+    Changed,
+    /// More than one rollout carries that id. Impossible by Codex's design,
+    /// so nothing is guessed.
+    Ambiguous,
+    /// The chain of forks loops back on itself.
+    Cycle,
+    /// The chain of forks is longer than the loader follows.
+    TooDeep,
 }
 
 /// One reconstructed turn. Discriminated by `role` matching the event-vocabulary

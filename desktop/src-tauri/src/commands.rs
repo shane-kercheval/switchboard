@@ -18998,6 +18998,179 @@ mod tests {
         );
     }
 
+    // A real Codex fork chain (harness-behavior §3.5), trimmed: the parent's
+    // first turn is inherited by the fork through `history_base`, the parent's
+    // second turn came after the fork, and the fork has two turns of its own.
+    const CODEX_FORK_PARENT: &str = "01a12c22-a3f8-71e2-b51e-ca72562cfabb";
+    const CODEX_FORK_CHILD: &str = "01a12c22-df64-7103-9fc3-92f2e3595c02";
+    const CODEX_PELICAN: &str = "Remember this code word: PELICAN-42. Reply with only: ok";
+    const CODEX_OTTER: &str = "Also remember a second code word: OTTER-7. Reply with only: ok";
+    const CODEX_CHILD_FIRST: &str =
+        "What code word did I ask you to remember? Reply with only the code word.";
+    const CODEX_CHILD_SECOND: &str = "List every code word I asked you to remember, separated by a comma. If there is only one, reply with just that one.";
+    const CODEX_PARENT_KEYS: [&str; 2] = [
+        "01a12c22-a467-7b02-afc3-fc1e2774e3f4",
+        "01a12c23-5549-7533-98df-4bc75c0e02b2",
+    ];
+    const CODEX_CHILD_KEYS: [&str; 2] = [
+        "01a12c23-085c-72f0-8d9f-971d943a67f4",
+        "01a12c23-63e0-74a1-914c-ed4186693a70",
+    ];
+
+    /// Stage the trimmed Codex fork chain in `home` and load `thread_id`'s
+    /// transcript through the real loader, which follows the fork's pointer.
+    fn load_codex_fork_fixture(
+        home: &TempDir,
+        agent: AgentId,
+        thread_id: &str,
+    ) -> LoadedTranscript {
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/harness/tests/fixtures/codex"
+        );
+        let folder = home.path().join(".codex/sessions/2026/10/11");
+        std::fs::create_dir_all(&folder).unwrap();
+        for (id, name) in [
+            (CODEX_FORK_PARENT, "fork-parent"),
+            (CODEX_FORK_CHILD, "fork-child"),
+        ] {
+            std::fs::copy(
+                format!("{fixtures}/{name}.session.jsonl"),
+                folder.join(format!("rollout-2026-10-11T00-00-00-{id}.jsonl")),
+            )
+            .unwrap();
+        }
+        switchboard_harness::load_codex_transcript(
+            home.path(),
+            home.path(),
+            thread_id,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 11).unwrap()),
+            agent,
+        )
+        .unwrap()
+    }
+
+    fn codex_send(send_id: SendId, agent: AgentId, prompt: &str, at: &str) -> JournalRecord {
+        JournalRecord::Send {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: agent,
+            prompt: prompt.to_owned(),
+            attachments: Vec::new(),
+            at: ts(at),
+        }
+    }
+
+    fn codex_link(send_id: SendId, agent: AgentId, key: &str, at: &str) -> JournalRecord {
+        JournalRecord::TurnLink {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: agent,
+            hydration_key: key.to_owned(),
+            at: ts(at),
+        }
+    }
+
+    #[test]
+    fn merge_codex_fork_renders_inherited_history_as_imported_beside_its_parent() {
+        // The fork's inherited turn carries the parent's prompt, timestamps and
+        // hydration key. With both agents in one project, the parent's turns
+        // claim only the parent's sends, the fork's inherited copy claims
+        // nothing, and the fork's own turns claim the fork's sends. The
+        // parent's second turn, written after the fork, appears only once.
+        let home = TempDir::new().unwrap();
+        let (parent, fork) = (Uuid::now_v7(), Uuid::now_v7());
+        let parent_transcript = load_codex_fork_fixture(&home, parent, CODEX_FORK_PARENT);
+        let fork_transcript = load_codex_fork_fixture(&home, fork, CODEX_FORK_CHILD);
+        let [p1, p2, f1, f2] = [
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        ];
+        let journal = vec![
+            codex_send(p1, parent, CODEX_PELICAN, "2026-10-11T18:03:50.000Z"),
+            codex_link(p1, parent, CODEX_PARENT_KEYS[0], "2026-10-11T18:03:52.600Z"),
+            codex_send(f1, fork, CODEX_CHILD_FIRST, "2026-10-11T18:04:15.000Z"),
+            codex_link(f1, fork, CODEX_CHILD_KEYS[0], "2026-10-11T18:04:17.900Z"),
+            codex_send(p2, parent, CODEX_OTTER, "2026-10-11T18:04:35.000Z"),
+            codex_link(p2, parent, CODEX_PARENT_KEYS[1], "2026-10-11T18:04:38.100Z"),
+            codex_send(f2, fork, CODEX_CHILD_SECOND, "2026-10-11T18:04:39.000Z"),
+            codex_link(f2, fork, CODEX_CHILD_KEYS[1], "2026-10-11T18:04:41.300Z"),
+        ];
+
+        let merged = merge_project_conversation(
+            journal,
+            vec![
+                (parent, parent_transcript, None),
+                (fork, fork_transcript, None),
+            ],
+        );
+
+        assert_eq!(
+            turns_of(&merged, parent),
+            vec![
+                (Some(CODEX_PARENT_KEYS[0]), Some(p1)),
+                (Some(CODEX_PARENT_KEYS[1]), Some(p2)),
+            ],
+            "the parent renders exactly as it would with no fork in the project"
+        );
+        assert_eq!(
+            turns_of(&merged, fork),
+            vec![
+                (Some(CODEX_PARENT_KEYS[0]), None),
+                (Some(CODEX_CHILD_KEYS[0]), Some(f1)),
+                (Some(CODEX_CHILD_KEYS[1]), Some(f2)),
+            ],
+            "the inherited turn claims nothing; the fork's own turns claim its sends"
+        );
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![
+                (CODEX_PELICAN, Some(p1)),
+                (CODEX_PELICAN, None),
+                (CODEX_CHILD_FIRST, Some(f1)),
+                (CODEX_OTTER, Some(p2)),
+                (CODEX_CHILD_SECOND, Some(f2)),
+            ],
+        );
+    }
+
+    #[test]
+    fn merge_codex_fork_without_turn_links_still_imports_its_inherited_prompt() {
+        // Codex prompts carry no provenance, so with no `TurnLink` to join on
+        // the merge falls back to counting turns against sends. The inherited
+        // turn predates the fork's first send, so it counts as history from
+        // before Switchboard dispatched anything, not as a reply to that send.
+        let home = TempDir::new().unwrap();
+        let fork = Uuid::now_v7();
+        let transcript = load_codex_fork_fixture(&home, fork, CODEX_FORK_CHILD);
+        let [f1, f2] = [Uuid::now_v7(), Uuid::now_v7()];
+        let journal = vec![
+            codex_send(f1, fork, CODEX_CHILD_FIRST, "2026-10-11T18:04:15.000Z"),
+            codex_send(f2, fork, CODEX_CHILD_SECOND, "2026-10-11T18:04:39.000Z"),
+        ];
+
+        let merged = merge_project_conversation(journal, vec![(fork, transcript, None)]);
+
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![
+                (CODEX_PELICAN, None),
+                (CODEX_CHILD_FIRST, Some(f1)),
+                (CODEX_CHILD_SECOND, Some(f2)),
+            ],
+        );
+        assert_eq!(
+            turns_of(&merged, fork),
+            vec![
+                (Some(CODEX_PARENT_KEYS[0]), None),
+                (Some(CODEX_CHILD_KEYS[0]), Some(f1)),
+                (Some(CODEX_CHILD_KEYS[1]), Some(f2)),
+            ],
+        );
+    }
+
     #[test]
     fn merge_forked_agent_whose_first_turn_failed_renders_the_outcome_only() {
         // A fork whose first dispatch failed never materialized a session file,

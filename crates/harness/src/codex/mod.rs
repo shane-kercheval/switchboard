@@ -30,6 +30,7 @@ pub mod account_usage;
 pub mod config;
 pub(crate) mod facets;
 pub mod fork;
+pub(crate) mod inherited_history;
 pub mod parser;
 pub mod session_file;
 pub mod skills;

@@ -4058,6 +4058,80 @@ describe("UnifiedTranscript compact mode", () => {
     );
   });
 
+  it("explains a Codex fork's missing earlier conversation above the fork's own turns", async () => {
+    // The loader couldn't follow the fork's pointer into its parent's session
+    // file, so it sent the fork's own turns plus this marker, stamped at the
+    // fork's creation. Both must render: the turns are real, and the marker
+    // says why nothing comes before them.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CODEX_AGENT.id] = [
+      user(CODEX_AGENT, "send-a", "u-a", "2026-05-16T00:00:10Z"),
+      done(CODEX_AGENT, "send-a", "a-1", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        ANSWER("the fork's own answer"),
+      ]),
+    ];
+    const overlay: ConversationItem[] = [
+      {
+        kind: "system_marker",
+        id: "marker-1",
+        agent_id: CODEX_AGENT.id,
+        marker: {
+          marker_kind: "inherited_history_unavailable",
+          reason: "not_found",
+          rollout_id: "01a12c22-a3f8-71e2-b51e-ca72562cfabb",
+        },
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CODEX_AGENT], overlay },
+    });
+
+    const marker = screen.getByTestId("inherited-history-marker");
+    expect(marker).toHaveTextContent("Earlier conversation unavailable");
+    expect(marker).toHaveTextContent("can't continue this agent until that file is restored");
+    expect(marker).toHaveTextContent("01a12c22-a3f8-71e2-b51e-ca72562cfabb");
+    expect(marker.closest('[data-testid="system-marker"]')).toHaveAttribute(
+      "data-agent-id",
+      CODEX_AGENT.id,
+    );
+    expect(screen.getByText("the fork's own answer")).toBeInTheDocument();
+    // Above the fork's own turns, not after them.
+    const answer = screen.getByText("the fork's own answer");
+    expect(marker.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("words a compressed parent differently from a missing one", async () => {
+    // A compressed parent doesn't stop the agent: Codex still reads it. The
+    // marker must not tell the user their working fork is broken.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    const overlay: ConversationItem[] = [
+      {
+        kind: "system_marker",
+        id: "marker-1",
+        agent_id: CODEX_AGENT.id,
+        marker: {
+          marker_kind: "inherited_history_unavailable",
+          reason: "compressed",
+          rollout_id: "01a12c22-a3f8-71e2-b51e-ca72562cfabb",
+        },
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CODEX_AGENT], overlay },
+    });
+
+    const marker = screen.getByTestId("inherited-history-marker");
+    expect(marker).toHaveTextContent("Earlier conversation not shown");
+    expect(marker).toHaveTextContent("still has the earlier conversation");
+    expect(marker).not.toHaveTextContent("can't continue");
+  });
+
   it("hides tool calls and thinking widgets in a compact completed response", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);

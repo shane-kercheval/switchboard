@@ -62,13 +62,14 @@ use serde_json::Value;
 use switchboard_core::AgentId;
 use uuid::Uuid;
 
+use super::inherited_history::{InheritedHistory, load_inherited_history};
 use crate::events::{
     ContentKind, McpServerStatus, SessionInventory, SettingPair, SkillEntry, ToolKind, TurnId,
     TurnUsage,
 };
 use crate::transcript::{
-    LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
-    TurnStatus, merge_meta_with_loaders,
+    LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, SystemMarker, Turn,
+    TurnItem, TurnStatus, merge_meta_with_loaders,
 };
 
 use super::config::load_mcp_servers;
@@ -288,24 +289,57 @@ pub enum AttachLookupError {
 /// **before** registration commits, and the user is choosing which file to
 /// bind to — silent dup resolution would bind to the wrong file. Fail loud.
 ///
-/// Scan strategy: `read_dir × 3` over `<home>/.codex/sessions/YYYY/MM/DD/`.
-/// Non-numeric directory names are silently skipped (defensive against
-/// `.DS_Store` and similar). The whole scan errors only if the root
-/// `~/.codex/sessions/` directory is unreadable; per-leaf read failures are
-/// skipped so a single permission-denied date dir doesn't blanket-fail the
-/// lookup.
+/// Scan strategy: every date folder [`session_day_folders`] yields. An
+/// unreadable `~/.codex/sessions/` finds nothing and reports `NotFound`;
+/// per-folder read failures are skipped so a single permission-denied date dir
+/// doesn't blanket-fail the lookup.
 pub fn find_codex_session_file_for_attach(
     home_dir: &Path,
     session_id: &str,
 ) -> Result<(PathBuf, NaiveDate), AttachLookupError> {
-    let root = home_dir.join(".codex").join("sessions");
     let suffix = format!("-{session_id}.jsonl");
     let mut matches: Vec<(PathBuf, NaiveDate)> = Vec::new();
+    for (folder, date) in session_day_folders(home_dir) {
+        let Ok(file_entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for file_entry in file_entries.flatten() {
+            let path = file_entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.starts_with("rollout-")
+                && name.ends_with(&suffix)
+            {
+                matches.push((path, date));
+            }
+        }
+    }
 
-    let Ok(year_entries) = std::fs::read_dir(&root) else {
-        return Err(AttachLookupError::NotFound {
+    match matches.len() {
+        0 => Err(AttachLookupError::NotFound {
             session_id: session_id.to_owned(),
-        });
+        }),
+        1 => Ok(matches.into_iter().next().expect("len==1 guaranteed")),
+        _ => {
+            // Sort for stable error output.
+            matches.sort_by(|a, b| a.0.cmp(&b.0));
+            Err(AttachLookupError::Ambiguous {
+                session_id: session_id.to_owned(),
+                paths: matches.into_iter().map(|(p, _)| p).collect(),
+            })
+        }
+    }
+}
+
+/// Every `<home>/.codex/sessions/YYYY/MM/DD/` folder, with its date.
+///
+/// Non-numeric names are skipped (defensive against `.DS_Store` and similar),
+/// and so is any level that can't be read, so one permission-denied folder
+/// doesn't hide the rest. An unreadable or missing root yields nothing.
+pub(super) fn session_day_folders(home_dir: &Path) -> Vec<(PathBuf, NaiveDate)> {
+    let root = home_dir.join(".codex").join("sessions");
+    let mut folders = Vec::new();
+    let Ok(year_entries) = std::fs::read_dir(&root) else {
+        return folders;
     };
     for year_entry in year_entries.flatten() {
         let Some(year) = parse_numeric_dir(&year_entry, 4) else {
@@ -325,41 +359,15 @@ pub fn find_codex_session_file_for_attach(
                 let Some(day) = parse_numeric_dir(&day_entry, 2) else {
                     continue;
                 };
-                let Some(date) =
+                if let Some(date) =
                     NaiveDate::from_ymd_opt(i32::from(year), u32::from(month), u32::from(day))
-                else {
-                    continue;
-                };
-                let Ok(file_entries) = std::fs::read_dir(day_entry.path()) else {
-                    continue;
-                };
-                for file_entry in file_entries.flatten() {
-                    let path = file_entry.path();
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                        && name.starts_with("rollout-")
-                        && name.ends_with(&suffix)
-                    {
-                        matches.push((path, date));
-                    }
+                {
+                    folders.push((day_entry.path(), date));
                 }
             }
         }
     }
-
-    match matches.len() {
-        0 => Err(AttachLookupError::NotFound {
-            session_id: session_id.to_owned(),
-        }),
-        1 => Ok(matches.into_iter().next().expect("len==1 guaranteed")),
-        _ => {
-            // Sort for stable error output.
-            matches.sort_by(|a, b| a.0.cmp(&b.0));
-            Err(AttachLookupError::Ambiguous {
-                session_id: session_id.to_owned(),
-                paths: matches.into_iter().map(|(p, _)| p).collect(),
-            })
-        }
-    }
+    folders
 }
 
 /// Parse a directory-entry name as a fixed-width zero-padded numeric (year=4,
@@ -1065,10 +1073,50 @@ pub fn load_codex_transcript(
         return Err(LoadTranscriptError::RecordedSessionUnavailable);
     };
 
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| LoadTranscriptError::Io { path, source: e })?;
+    let content = std::fs::read_to_string(&path).map_err(|e| LoadTranscriptError::Io {
+        path: path.clone(),
+        source: e,
+    })?;
 
     let mut transcript = parse_codex_transcript_content(&content, agent_id);
+    match load_inherited_history(home_dir, &path, date, &content, agent_id) {
+        InheritedHistory::NotAFork => {}
+        InheritedHistory::Loaded {
+            mut turns,
+            warnings,
+        } => {
+            turns.append(&mut transcript.turns);
+            transcript.turns = turns;
+            transcript.warnings.extend(warnings);
+        }
+        InheritedHistory::Unavailable {
+            reason,
+            rollout_id,
+            created_at,
+        } => {
+            // At the fork's creation, so the marker sits just above its own
+            // turns. A rollout with no readable timestamp falls back to its
+            // first turn, then to now: misplaced, but never missing.
+            let started_at = created_at
+                .or_else(|| {
+                    transcript.turns.first().map(|turn| match turn {
+                        Turn::User { started_at, .. }
+                        | Turn::Agent { started_at, .. }
+                        | Turn::System { started_at, .. } => *started_at,
+                    })
+                })
+                .unwrap_or_else(Utc::now);
+            transcript.turns.insert(
+                0,
+                Turn::System {
+                    turn_id: Uuid::now_v7(),
+                    agent_id,
+                    started_at,
+                    marker: SystemMarker::InheritedHistoryUnavailable { reason, rollout_id },
+                },
+            );
+        }
+    }
     transcript.meta = Some(merge_meta_with_loaders(
         transcript.meta.take(),
         Some(load_mcp_servers(home_dir, cwd)),

@@ -2731,6 +2731,108 @@ async fn live_codex_fork_without_a_prompt_creates_an_idle_session_that_inherits_
     );
 }
 
+/// Dispatch one turn to `agent` in `cwd` and return its events.
+async fn live_codex_turn(
+    adapter: &CodexAdapter,
+    agent: &AgentRecord,
+    cwd: &Path,
+    prompt: &str,
+) -> Vec<AdapterEvent> {
+    adapter
+        .dispatch(
+            agent,
+            cwd,
+            prompt,
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed")
+        .collect()
+        .await
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_fork_loads_the_parents_history_up_to_the_fork_point() {
+    // The parent's history reaches a Codex fork only through the pointer the
+    // fork's rollout stores, so this is the end-to-end proof that the loader
+    // follows it, stops at the recorded cut-off, and never shows the parent's
+    // later turns. Pinned to the cheapest model at low effort.
+    const FIRST: &str = "Remember the word 'heron'. Reply with only 'ok'.";
+    const SECOND: &str = "Remember the word 'willow'. Reply with only 'ok'.";
+    const FORK_OWN: &str = "Reply with only 'ok'.";
+    const AFTER_FORK: &str = "Remember the word 'quartz'. Reply with only 'ok'.";
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+    let adapter = CodexAdapter::new();
+    let mut parent = live_codex_agent();
+    parent.model = Some("gpt-6-luna".to_owned());
+    parent.effort = Some("low".to_owned());
+
+    let first = live_codex_turn(&adapter, &parent, tmp.path(), FIRST).await;
+    let (parent_thread_id, partition_date) =
+        codex_capture(&first).expect("the parent's first dispatch captures a locator");
+    parent.session_locator = Some(SessionLocator::Codex {
+        thread_id: parent_thread_id.clone(),
+        partition_date,
+    });
+    live_codex_turn(&adapter, &parent, tmp.path(), SECOND).await;
+
+    let fork_locator = fork_codex_session(
+        Path::new("codex"),
+        &home,
+        tmp.path(),
+        &parent_thread_id,
+        &parent.selection(),
+        CODEX_FORK_TIMEOUT,
+    )
+    .await
+    .expect("a promptless fork should succeed");
+    let fork = AgentRecord {
+        id: Uuid::now_v7(),
+        session_locator: Some(fork_locator.clone().into()),
+        ..parent.clone()
+    };
+    live_codex_turn(&adapter, &fork, tmp.path(), FORK_OWN).await;
+    live_codex_turn(&adapter, &parent, tmp.path(), AFTER_FORK).await;
+
+    let transcript = load_codex_transcript(
+        &home,
+        tmp.path(),
+        &fork_locator.thread_id,
+        Some(fork_locator.partition_date),
+        fork.id,
+    )
+    .expect("the fork's transcript loads");
+    let prompts: Vec<&str> = transcript
+        .turns
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    // Printed for the milestone's "prove it" step: compare with the rollouts.
+    println!(
+        "fork {} prompts in order: {prompts:#?}",
+        fork_locator.thread_id
+    );
+    assert_eq!(
+        prompts,
+        [FIRST, SECOND, FORK_OWN],
+        "the parent's two turns before the fork, then the fork's own, and never the \
+         parent's turn after the fork"
+    );
+    assert!(
+        transcript
+            .turns
+            .iter()
+            .all(|turn| !matches!(turn, Turn::System { .. })),
+        "a fork whose parent is intact carries no unavailable-history marker"
+    );
+}
+
 // --- Antigravity live tests ---
 
 fn live_antigravity_agent() -> AgentRecord {

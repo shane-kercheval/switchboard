@@ -27,6 +27,7 @@
     updatePreferences,
   } from "$lib/preferences.svelte";
   import McpServersSettings from "$lib/components/McpServersSettings.svelte";
+  import AgentAccessSettings from "$lib/components/AgentAccessSettings.svelte";
   import {
     localPromptsDir,
     openLocalPromptsDir,
@@ -768,6 +769,24 @@
             class="border-border bg-surface text-fg max-h-80 overflow-auto border-t px-3 py-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">{workflowPrompt}</pre>
         {/if}
       </div>
+    </section>
+
+    <section class={cn(sectionClass, "mt-7")} data-testid="agent-access-settings">
+      <div>
+        <h2 class={sectionHeadingClass}>Agent access</h2>
+        <p class="text-muted mt-1 text-sm leading-relaxed">
+          Let an AI agent you run elsewhere (Claude Code, Codex, or Claude Desktop) work Switchboard
+          over MCP the way you do from the keyboard: create projects and agents, send messages and
+          wait for the replies, forward one agent's output to others, and run workflows. Its
+          messages appear here like yours, and you can stop them the same way.
+        </p>
+        <p class="text-muted mt-1 text-sm leading-relaxed">
+          An agent connected over MCP has the same reach as the keyboard. Agents run without
+          approval prompts, so any program holding the token can run commands on your Mac. It's off
+          by default; regenerate the token to cut every client off.
+        </p>
+      </div>
+      <AgentAccessSettings />
     </section>
 
     <section

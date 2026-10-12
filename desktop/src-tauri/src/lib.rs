@@ -4,7 +4,6 @@
 //! is the Tauri wiring layer.
 
 mod commands;
-mod debug_ops;
 mod dispatch_context;
 mod emitter;
 mod error;
@@ -13,6 +12,7 @@ mod harness_usage;
 mod journal;
 mod lifecycle;
 mod locator_sink;
+pub mod mcp;
 mod metadata;
 mod notification;
 pub mod ops;
@@ -176,6 +176,12 @@ async fn finish_orderly_quit(app: tauri::AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
+    // Agent access first: no client can start work the drain below would
+    // cancel, and a client waiting on a reply gets an answer rather than a
+    // dropped connection.
+    if let Some(access) = app.try_state::<crate::mcp::AgentAccess>() {
+        access.shut_down().await;
+    }
     save_main_window_geometry(&app);
     let project_ids: Vec<_> = crate::state::lock(&state.projects)
         .keys()
@@ -1108,13 +1114,38 @@ async fn set_agent_selection(
     change_agent_selection_impl(state.inner(), id, &changes).map_err(|e| e.to_string())
 }
 
-/// Drives `ops` from the devtools console of a debug build (see `debug_ops`).
+/// Agent access as Settings shows it.
 #[tauri::command]
-async fn debug_ops(
-    app: tauri::AppHandle,
-    request: crate::debug_ops::DebugOp,
-) -> Result<serde_json::Value, String> {
-    crate::debug_ops::run(app, request).await
+async fn mcp_status(
+    access: State<'_, crate::mcp::AgentAccess>,
+) -> Result<crate::mcp::AgentAccessStatus, String> {
+    Ok(access.status().await)
+}
+
+/// Turn agent access on or off. Off stops the listener at once.
+#[tauri::command]
+async fn mcp_set_enabled(
+    access: State<'_, crate::mcp::AgentAccess>,
+    enabled: bool,
+) -> Result<crate::mcp::AgentAccessStatus, String> {
+    access.set_enabled(enabled).await.map_err(|e| e.to_string())
+}
+
+/// Move agent access to another port.
+#[tauri::command]
+async fn mcp_set_port(
+    access: State<'_, crate::mcp::AgentAccess>,
+    port: u16,
+) -> Result<crate::mcp::AgentAccessStatus, String> {
+    access.set_port(port).await.map_err(|e| e.to_string())
+}
+
+/// Replace the token, cutting every client off.
+#[tauri::command]
+async fn mcp_regenerate_token(
+    access: State<'_, crate::mcp::AgentAccess>,
+) -> Result<crate::mcp::AgentAccessStatus, String> {
+    access.regenerate_token().await.map_err(|e| e.to_string())
 }
 
 /// The sync requests still waiting for the window's answer. The window calls
@@ -2086,11 +2117,16 @@ fn workflows_dir_path() -> Option<std::path::PathBuf> {
 ///
 /// Release builds use one cached aggregate Keychain record; debug builds use a
 /// dev-only plaintext file so rebuilds never trigger Keychain authorization.
-fn build_prompt_service() -> switchboard_prompts::PromptService {
+///
+/// `secrets` is the one store the app uses, shared with agent access: the
+/// release store caches its Keychain record, so two instances would each
+/// write over the other's changes.
+fn build_prompt_service(
+    secrets: Arc<dyn switchboard_prompts::SecretStore>,
+) -> switchboard_prompts::PromptService {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if let Some(dir) = config_dir() {
         let prompts_dir = dir.join("prompts");
-        let secrets = build_secret_store(&dir);
         switchboard_prompts::PromptService::new(dir.join("config.yaml"), prompts_dir, home, secrets)
             .with_browser_opener(Arc::new(SystemBrowserOpener))
     } else {
@@ -2435,11 +2471,17 @@ pub fn run() {
             let state = state.with_desktop_sync(Arc::clone(&window_sync)
                 as Arc<dyn crate::ops::desktop_sync::DesktopSync>);
             app.manage(window_sync);
-            crate::debug_ops::serve_socket(app.handle());
+            // One secret store for the whole app (see `build_prompt_service`).
+            // With no config directory nothing persists, so a session-only
+            // store keeps agent access usable until quit.
+            let secrets: Arc<dyn switchboard_prompts::SecretStore> = match config_dir() {
+                Some(dir) => build_secret_store(&dir),
+                None => Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+            };
             // Resolve and inject the user-global prompt config + default prompts
             // store. Built-in example prompts are baked into the service as a
             // read-only library — nothing is written into the user's folder.
-            let prompts = build_prompt_service();
+            let prompts = build_prompt_service(Arc::clone(&secrets));
             spawn_prompt_resolution_change_notifications(&prompts, Arc::clone(&state.emitter));
             // Warm the prompt cache in the background so a slow/cold MCP server
             // never blocks startup. `PromptService` is cheaply cloneable and
@@ -2505,6 +2547,26 @@ pub fn run() {
             // directories (unmounted/moved) are skipped and stay unavailable.
             app.manage(crate::lifecycle::QuitCoordinator::new());
             app.manage(state);
+            // Agent access reaches the state through the handle per request,
+            // so it is built after the state is managed. It listens now only
+            // if the user left it on; a port in use shows in Settings rather
+            // than failing the start.
+            let access = crate::mcp::AgentAccess::new(
+                config_dir().map(|dir| dir.join("config.yaml")),
+                secrets,
+                Arc::new(app.handle().clone()),
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default(),
+            );
+            app.manage(access);
+            let resume_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                resume_handle
+                    .state::<crate::mcp::AgentAccess>()
+                    .resume()
+                    .await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2588,7 +2650,10 @@ pub fn run() {
             set_agent_selection,
             desktop_project_synced,
             desktop_pending_syncs,
-            debug_ops,
+            mcp_status,
+            mcp_set_enabled,
+            mcp_set_port,
+            mcp_regenerate_token,
             reorder_agents,
             attach_agent,
             list_agents,

@@ -1170,6 +1170,22 @@ export type ProviderStatus =
   | { state: "needs_auth" }
   | { state: "unknown" };
 
+// Mirror of Rust `AgentAccessStatus` (`desktop/src-tauri/src/mcp/mod.rs`):
+// the MCP server other agents connect to, as Settings shows it.
+export type AgentAccessStatus = {
+  /// The user's setting: on means the app listens whenever it runs.
+  enabled: boolean;
+  port: number;
+  /// Listening right now.
+  listening: boolean;
+  /// Why it is on but not listening (the port is taken).
+  error: string | null;
+  /// The token clients present; null until agent access is first turned on.
+  token: string | null;
+  /// The URL clients connect to.
+  url: string;
+};
+
 // Mirrors the Rust `McpAuth` (`#[serde(tag = "type", rename_all =
 // "snake_case")]`, `#[non_exhaustive]`). `scopes` is the optional per-provider
 // override of the scopes requested at sign-in; absent means "resolve from the

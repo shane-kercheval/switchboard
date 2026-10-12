@@ -28,6 +28,7 @@ import type {
   LoadedTranscript,
   McpAuth,
   McpProviderInfo,
+  AgentAccessStatus,
   MessageId,
   MessagePin,
   ProjectConversation,
@@ -772,6 +773,28 @@ export async function openExternalUrl(url: string): Promise<void> {
 
 export async function loadTranscript(agentId: AgentId): Promise<LoadedTranscript> {
   return await invoke<LoadedTranscript>("load_transcript", { agentId });
+}
+
+/// Agent access, the MCP server other agents (Claude Code, Codex, Claude
+/// Desktop) connect to, as Settings shows it.
+export async function agentAccessStatus(): Promise<AgentAccessStatus> {
+  return await invoke<AgentAccessStatus>("mcp_status");
+}
+
+/// Turn agent access on or off. Off stops the listener at once, even with
+/// clients connected; on creates the token the first time.
+export async function setAgentAccessEnabled(enabled: boolean): Promise<AgentAccessStatus> {
+  return await invoke<AgentAccessStatus>("mcp_set_enabled", { enabled });
+}
+
+/// Move agent access to another port, restarting it if it is on.
+export async function setAgentAccessPort(port: number): Promise<AgentAccessStatus> {
+  return await invoke<AgentAccessStatus>("mcp_set_port", { port });
+}
+
+/// Replace the token. Every client is cut off until given the new one.
+export async function regenerateAgentAccessToken(): Promise<AgentAccessStatus> {
+  return await invoke<AgentAccessStatus>("mcp_regenerate_token");
 }
 
 /// Configured MCP prompt-server providers with their status (Settings list).

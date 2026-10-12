@@ -106,3 +106,33 @@ fn prompt_code(error: &PromptError) -> &'static str {
         _ => INTERNAL,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn a_variant_with_no_code_of_its_own_is_internal() {
+        for error in [
+            AppError::Internal("x".to_owned()),
+            AppError::Interrupted,
+            AppError::TimedOut { what: "x" },
+            AppError::WorkflowsDirUnavailable,
+            AppError::BranchComparisonStale,
+        ] {
+            assert_eq!(error_code(&error), INTERNAL, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn a_shared_error_carries_the_code_of_the_one_it_wraps() {
+        let inner = AppError::UnknownRecipient {
+            project_id: uuid::Uuid::now_v7(),
+            agent_id: uuid::Uuid::now_v7(),
+        };
+        let shared = AppError::Shared(Arc::new(AppError::Shared(Arc::new(inner))));
+        assert_eq!(error_code(&shared), UNKNOWN_RECIPIENT);
+    }
+}

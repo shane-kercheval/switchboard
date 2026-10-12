@@ -3,11 +3,20 @@
 //! **Why a token on a server only the Mac can reach.** Any web page the user
 //! visits can make the browser send requests to `127.0.0.1`. The `Host` and
 //! `Origin` checks refuse those; the token is a second layer in case those
-//! checks ever have a bug, and it keeps out other accounts on the same Mac,
-//! which can reach a loopback port but cannot read this user's secret store
-//! or the clients' configuration files. Both MCP Inspector (CVE-2025-49596)
-//! and Claude Code's IDE extensions (CVE-2025-52882) trusted localhost and
-//! were reachable from web pages.
+//! checks ever have a bug. Both MCP Inspector (CVE-2025-49596) and Claude
+//! Code's IDE extensions (CVE-2025-52882) trusted localhost and were
+//! reachable from web pages.
+//!
+//! **Other accounts on the same Mac are kept out only while the app holds
+//! the port.** Another account can reach a loopback port but cannot read this
+//! user's secret store or the clients' configuration files, so it cannot
+//! present the token. But a client sends the token to whatever answers at the
+//! address and cannot check who that is, and while the app is quit or agent
+//! access is off, any account can listen on the port and collect the token
+//! from the next client that starts. On a Mac with one user account this
+//! changes nothing. Refusing connections from other accounts would close it,
+//! at the cost of looking up each connection's owner in macOS's socket table;
+//! that waits until shared Macs are in scope.
 //!
 //! The token is 32 random bytes from the OS generator, base64url without
 //! padding, kept in the app's secret store (the Keychain in a release build,

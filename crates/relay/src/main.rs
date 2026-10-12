@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use switchboard_relay::{Config, serve};
@@ -9,6 +10,8 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        // Color only for a person at a terminal, not a container's log store.
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
     let config = Config::from_env()?;
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.port));

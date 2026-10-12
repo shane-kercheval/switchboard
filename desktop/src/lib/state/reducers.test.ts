@@ -1632,6 +1632,21 @@ describe("runtimeReducer", () => {
     return freshRuntime(AGENT_A);
   }
 
+  it("a successful hydrate clears an earlier history failure", () => {
+    // The sidebar and transcript show a failure whenever `hydration_error` is
+    // set, so a load that recovers must clear it, not only flip the status.
+    const failed: AgentRuntime = {
+      ...fresh(),
+      hydration_status: "failed",
+      hydration_error: "permission denied",
+    };
+
+    const r = runtimeReducer(failed, { type: "hydrate", agent_id: AGENT_A, turns: [] });
+
+    expect(r.hydration_status).toBe("complete");
+    expect(r.hydration_error).toBeUndefined();
+  });
+
   it("freshRuntime initializes with run_status=idle, hydration_status=complete", () => {
     const r = fresh();
     expect(r.run_status).toBe("idle");

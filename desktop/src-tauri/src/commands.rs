@@ -2477,7 +2477,8 @@ pub fn create_agent_impl(
 /// session lock backs it up.
 ///
 /// `codex_binary` is the Codex program to run, a parameter so app tests can
-/// point it at the harness crate's fake.
+/// point it at a stand-in (a shell script; the harness crate's `fake_codex`
+/// isn't built for this crate's tests).
 pub async fn fork_agent_impl(
     state: &AppState,
     source_agent_id: AgentId,
@@ -8493,7 +8494,7 @@ mod tests {
         let source_id = seed_codex_source(&state, home.path(), "cx");
         let shim = codex_fork_shim(home.path(), home.path(), "");
 
-        let fork = fork_agent_impl(&state, source_id, home.path(), &shim)
+        let fork = fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
             .await
             .expect("forking an idle Codex agent with a session should succeed");
 
@@ -8527,7 +8528,7 @@ mod tests {
         );
         let before = lock(&state.agents_by_id).len();
 
-        let err = fork_agent_impl(&state, source_id, home.path(), &shim)
+        let err = fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
             .await
             .expect_err("a fork Codex didn't create must not be registered");
 
@@ -8557,7 +8558,7 @@ mod tests {
         std::fs::remove_dir_all(home.path().join(".codex")).unwrap();
         let shim = codex_fork_shim(home.path(), home.path(), "");
 
-        let err = fork_agent_impl(&state, source_id, home.path(), &shim)
+        let err = fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
             .await
             .expect_err("a source with no rollout has nothing to fork");
 
@@ -8600,7 +8601,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = fork_agent_impl(&state, source_id, home.path(), &shim)
+        let err = fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
             .await
             .expect_err("a locked parent must not be forked");
 
@@ -8635,7 +8636,7 @@ mod tests {
         let forking = tokio::spawn({
             let state = Arc::clone(&state);
             let home = home.path().to_owned();
-            async move { fork_agent_impl(&state, source_id, &home, &shim).await }
+            async move { fork_agent_with(&state, source_id, &home, &shim, path_settled()).await }
         });
         for _ in 0..250 {
             if entered.exists() {
@@ -8676,6 +8677,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_fork_waits_for_the_path_before_locking_the_parent() {
+        // At launch the login-shell PATH can take seconds to arrive. The fork
+        // waits for it before it checks or locks the parent, so that wait never
+        // stretches the time the parent is locked.
+        let (_tmp, home, state, project_id) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let started = home.path().join("codex-started");
+        let shim = codex_fork_shim(
+            home.path(),
+            home.path(),
+            &format!(": > '{}'", started.display()),
+        );
+        let parent_key = codex_parent_key(&state, project_id);
+        let state = Arc::new(state);
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let path_ready = {
+            let waiting = Arc::clone(&waiting);
+            let release = Arc::clone(&release);
+            async move {
+                // Announce that the fork has reached the wait, so the checks
+                // below run while it is waiting and not before it got here.
+                waiting.notify_one();
+                release.notified().await;
+                PathSource::LoginShell
+            }
+        };
+
+        let forking = tokio::spawn({
+            let state = Arc::clone(&state);
+            let home = home.path().to_owned();
+            async move { fork_agent_with(&state, source_id, &home, &shim, path_ready).await }
+        });
+        let reached = tokio::time::timeout(WAIT, waiting.notified()).await;
+        let parent_free = crate::session_lock::acquire_session_locks(
+            &state.lock_root,
+            &BTreeSet::from([parent_key]),
+        )
+        .map(drop);
+        let codex_started = started.exists();
+        release.notify_one();
+        let fork = tokio::time::timeout(WAIT, forking)
+            .await
+            .expect("the fork finishes once the PATH arrives")
+            .unwrap();
+
+        assert!(reached.is_ok(), "the fork never waited for the PATH");
+        assert!(
+            parent_free.is_ok(),
+            "the parent must not be locked while the fork waits for the PATH"
+        );
+        assert!(
+            !codex_started,
+            "Codex must not start before the PATH arrives"
+        );
+        assert!(fork.is_ok(), "got: {fork:?}");
+    }
+
+    #[tokio::test]
     async fn codex_fork_of_a_working_agent_is_refused() {
         let gate = Arc::new(tokio::sync::Notify::new());
         let (codex, _prompts) = gated_adapter(&["parent"], &gate, 0);
@@ -8700,7 +8760,7 @@ mod tests {
         await_turn_running(&state, source_id).await;
         let before = lock(&state.agents_by_id).len();
 
-        let err = fork_agent_impl(&state, source_id, home.path(), &shim).await;
+        let err = fork_agent_with(&state, source_id, home.path(), &shim, path_settled()).await;
         gate.notify_waiters();
 
         assert!(
@@ -8728,7 +8788,7 @@ mod tests {
         tokio::pin!(entered);
         let forking = tokio::spawn({
             let state = Arc::clone(&state);
-            async move { fork_agent_impl(&state, source_id, &home, &codex_binary).await }
+            async move { fork_agent_with(&state, source_id, &home, &codex_binary, path_settled()).await }
         });
         let reached = tokio::time::timeout(WAIT, entered).await;
         let deleted = delete_project_impl(&state, project_id).await;
@@ -8817,7 +8877,7 @@ mod tests {
         set_active_project_impl(&state, other.id).unwrap();
         let shim = codex_fork_shim(home.path(), home.path(), "");
 
-        let fork = fork_agent_impl(&state, source_id, home.path(), &shim)
+        let fork = fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
             .await
             .expect("forking an agent outside the active project must work");
 

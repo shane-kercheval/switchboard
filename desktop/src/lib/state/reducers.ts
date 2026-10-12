@@ -888,9 +888,14 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // The hydrated quota reading is **not** filled in here: it is account state,
       // offered to `harnessUsage.svelte.ts` from `applyAgentHydrate` where it is
       // ranked against every other agent's reading rather than stored per agent.
+      // A successful load also ends any earlier failure: the sidebar line and
+      // the transcript banner show whenever `hydration_error` is set, so
+      // leaving it would keep saying the history failed after it arrived (a
+      // load that fails and then recovers through a project reload).
       const next: AgentRuntime = {
         ...runtime,
         hydration_status: "complete",
+        hydration_error: undefined,
       };
       if (next.meta === undefined && input.meta != null) {
         next.meta = {

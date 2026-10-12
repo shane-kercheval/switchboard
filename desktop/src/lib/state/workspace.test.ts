@@ -1605,6 +1605,12 @@ describe("eager (Codex) fork inherited history", () => {
     expect(importedTexts(ws).sort()).toEqual(
       [`inherited prompt for ${FORK_A}`, `inherited prompt for ${FORK_B}`].sort(),
     );
+    // Replies merge by their stable id across the three reads, so each fork
+    // holds its inherited reply exactly once.
+    const state = await loadAgentState();
+    for (const fork of [FORK_A, FORK_B]) {
+      expect(state.transcripts[fork]?.filter((turn) => turn.role === "agent")).toHaveLength(1);
+    }
   });
 
   it("keeps the fork when its history fails to load, and marks it failed", async () => {
@@ -1627,6 +1633,100 @@ describe("eager (Codex) fork inherited history", () => {
     // conversation is still coming" notice would promise history that no turn
     // of this fork is going to bring, so it must never be armed.
     expect(ws.isAwaitingForkHistory(FORK_A)).toBe(false);
+  });
+
+  /// Fire a completed turn end for `agentId`, which drives the automatic
+  /// inherited-history reload after a fork's turn.
+  function completeTurn(agentId: string): void {
+    fireTo(`agent:${agentId}`, {
+      type: "turn_end",
+      turn_id: `turn-${agentId}-done`,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:05Z",
+    });
+  }
+
+  async function settled(predicate: () => boolean): Promise<void> {
+    for (let i = 0; i < 50; i += 1) {
+      if (predicate()) return;
+      await tick();
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    expect(predicate()).toBe(true);
+  }
+
+  it("clears the failure once a later automatic load succeeds", async () => {
+    // The banner and the sidebar line show while an error is stored, so a load
+    // that recovers after the fork's first reply must take the error away.
+    let failing = true;
+    const { ws, state } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") {
+        if (failing) throw new Error("disk went away");
+        return conversationWith([FORK_A]);
+      }
+      return undefined;
+    });
+    ws.installForkHistoryRefresh();
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+    expect(state.runtimes[FORK_A]?.hydration_error).toContain("disk went away");
+    failing = false;
+
+    completeTurn(FORK_A);
+
+    await settled(() => state.runtimes[FORK_A]?.hydration_status === "complete");
+    expect(state.runtimes[FORK_A]?.hydration_error).toBeUndefined();
+    expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
+  });
+
+  it("retries a fork whose history loaded once and failed a later project reload", async () => {
+    let reload: "ok" | "fork-broken" = "ok";
+    const { ws, state, calls } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") {
+        if (reload === "fork-broken") {
+          return {
+            items: [],
+            agents: [
+              { agent_id: AGENT_1, warnings: [] },
+              { agent_id: FORK_A, warnings: [], load_error: "fork session unreadable" },
+            ],
+          } satisfies ProjectConversation;
+        }
+        return conversationWith([FORK_A]);
+      }
+      return undefined;
+    });
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+    reload = "fork-broken";
+    await ws.retryProjectHydration(PROJECT_1);
+    expect(state.runtimes[FORK_A]?.hydration_error).toBe("fork session unreadable");
+    reload = "ok";
+    calls.length = 0;
+
+    await ws.retryAgentHistory(FORK_A);
+
+    expect(calls).toContain("load_project_conversation");
+    expect(calls).not.toContain("fork_agent");
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("complete");
+    expect(state.runtimes[FORK_A]?.hydration_error).toBeUndefined();
+    expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
+    expect(state.transcripts[FORK_A]?.filter((turn) => turn.role === "agent")).toHaveLength(1);
+  });
+
+  it("marks a fork failed, not silently skipped, when the project reloads during its creation", async () => {
+    const { ws, state } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") {
+        ws.conversations[PROJECT_1] = { items: [], status: "loading" };
+        return codexAgent(FORK_A, "cx-fork");
+      }
+      return undefined;
+    });
+
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+    expect(state.runtimes[FORK_A]?.hydration_error).toContain("reloading");
   });
 
   it("retries a failed load through the project merge without forking again", async () => {

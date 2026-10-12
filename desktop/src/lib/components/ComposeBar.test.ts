@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, NormalizedEvent, ProjectListing, Prompt } from "$lib/types";
 // Static import so the component-tree transform happens at module collection,
@@ -124,6 +124,9 @@ beforeEach(async () => {
   // A compose operation is project-scoped and outlives its component, so a test
   // that leaves one in flight would keep every later test's composer busy.
   (await import("$lib/state/composeOperations.svelte"))._testing.reset();
+  // A project whose history has loaded, the normal state of an open project.
+  // Fork waits for it; a test about the loading window sets it back.
+  (await loadWorkspace()).conversations[PROJECT_ID] = { items: [], status: "complete" };
   listeners.clear();
   // `listenMock` is module-level so a test can make one channel fail; reset it
   // here or that override leaks into every test after it.
@@ -1419,6 +1422,64 @@ describe("ComposeBar", () => {
         "send_message",
         expect.objectContaining({ agentId: CODEX_AGENT.id }),
       );
+    });
+
+    it("waits for the project's history before offering Fork, for Claude and Codex alike", async () => {
+      // A fork's earlier conversation is read through the project's history
+      // load, which skips while the project is still loading. One rule for
+      // both harnesses, in the one shared fork check.
+      const ws = await loadWorkspace();
+      const state = await loadState();
+      for (const agent of [AGENT_A, CODEX_AGENT]) {
+        cleanup();
+        ws.conversations[PROJECT_ID] = { items: [], status: "loading" };
+        await state.registerAgent(agent);
+        seedTurn(state, agent.id);
+        render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+        const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+        await fireEvent.input(textarea, { target: { value: "branch" } });
+        expect(forkHalf()).toBeNull();
+
+        await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
+        expect(await screen.findByTestId("compose-send-error")).toHaveTextContent(
+          "Fork is available once the project's history has loaded.",
+        );
+        expect(invokeMock).not.toHaveBeenCalledWith("fork_agent", expect.anything());
+
+        // Positive control: the same composer offers it once the load lands.
+        ws.conversations[PROJECT_ID] = { items: [], status: "complete" };
+        await waitFor(() => expect(forkHalf()).not.toBeNull());
+      }
+    });
+
+    it("still sends to a Codex fork whose earlier conversation failed to load", async () => {
+      // The fork exists in Codex and in the registry. Its history load failing
+      // must not stop the message, or the user's retry would make a second fork.
+      const state = await loadState();
+      await state.registerAgent(CODEX_AGENT);
+      seedTurn(state, CODEX_AGENT.id);
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return CODEX_FORK_RECORD;
+        if (cmd === "load_project_conversation") throw new Error("disk went away");
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch anyway" } });
+      await fireEvent.click(forkHalf()!);
+
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith(
+          "send_message",
+          expect.objectContaining({ agentId: CODEX_FORK_RECORD.id }),
+        );
+      });
+      expect(invokeMock).toHaveBeenCalledWith("load_project_conversation", expect.anything());
+      expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "fork_agent")).toHaveLength(1);
+      expect(state.runtimes[CODEX_FORK_RECORD.id]?.hydration_status).toBe("failed");
     });
 
     it("is not offered for Antigravity, and the shortcut says which harnesses can branch", async () => {

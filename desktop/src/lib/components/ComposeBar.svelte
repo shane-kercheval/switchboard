@@ -60,7 +60,11 @@
     setOperationPhase,
     takeOutcome,
   } from "$lib/state/composeOperations.svelte";
-  import { projects, recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
+  import {
+    conversations,
+    projects,
+    recordProjectsActivityLocally,
+  } from "$lib/state/workspace.svelte";
   import {
     selectionFor,
     setRecipients,
@@ -1331,6 +1335,15 @@
     // it creates the fork agent for real and only then fails at spawn.
     if (!projectAvailable) {
       return "This project's folder is unavailable, so nothing can be sent.";
+    }
+    // A fork's earlier conversation is read through the project's history load:
+    // a Codex fork's right after it is created, a Claude fork's after its first
+    // reply. Either read is skipped while the project is still loading, and the
+    // in-flight load may have started before the fork existed, so a fork made
+    // now could show no earlier conversation and no error. Both harnesses, one
+    // rule; it also holds after a failed project load until a retry succeeds.
+    if (conversations[projectId]?.status !== "complete") {
+      return "Fork is available once the project's history has loaded.";
     }
     // A workflow is N sends; "which one branches?" has no answer.
     if (mode === "workflow") return "Fork isn't available while composing a workflow.";

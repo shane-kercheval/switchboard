@@ -249,14 +249,14 @@ A Codex agent's "…" menu has a Fork item that creates an idle fork without sen
 
 - The item appears on Codex agent cards only, not on Claude or Antigravity cards.
 - Choosing it creates `<name>-fork` in its own pane, idle, showing the inherited conversation. The original agent is not blocked afterwards.
-- It is unavailable while the agent is working or has no session, and says why, following how the menu's existing items handle the same states.
+- It is unavailable while the agent is working or has no session, and until the project's history has loaded, and says why, following how the menu's existing items handle the same states. The loading rule is the compose box's (milestone 3): a fork made while the project's history is still loading could show no earlier conversation and no error, and a menu fork sends nothing that would trigger a later reload. "Fork is available once the project's history has loaded" also fits a project whose load failed.
 - It is also unavailable, and says why, while another compose operation in the project holds the compose claim (below). A send with a saved prompt can hold that claim indefinitely while it waits for a browser sign-in.
 - If the fork is created but its earlier conversation fails to load, the fork shows the existing history-load error with Retry (milestone 3, step 4).
 - A failure shows the error and creates no agent.
 
 ### Implementation outline
 
-Small milestone. Add the item to the agent card menu in `lib/components/Sidebar.svelte`, gated by the "fork without a turn" capability from milestone 3. Place it beside "Compact context", and follow that item's handling of a busy agent and of errors. It calls the same `fork_agent` command and `forkAgentIntoOwnPane` as the compose path, minus the send.
+Small milestone. Add the item to the agent card menu in `lib/components/Sidebar.svelte`, gated by the "fork without a turn" capability from milestone 3. **Share the agent-level conditions with the compose box rather than copying them:** the project's folder is available, its history has loaded, the agent can fork, has a session, and is idle. Move those checks out of `ComposeBar.svelte`'s `forkShapeBlock`/`forkBlock` into one helper both surfaces call, leaving the compose-only conditions (workflow mode, forwarded fields, multiple recipients) in the compose box. Place it beside "Compact context", and follow that item's handling of a busy agent and of errors. It calls the same `fork_agent` command and `forkAgentIntoOwnPane` as the compose path, minus the send.
 
 **Take the project's compose claim while the fork is being created**, as the compose fork does (`beginOperation` in `lib/state/composeOperations.svelte.ts`; add a kind for it). Without the claim, a compose send to the original typed during that second is refused with "resend" (milestone 3 explains the lock); with it, the compose bar is disabled for that second instead.
 
@@ -268,14 +268,14 @@ Update `docs/system-design.md` §7, whose agent-row paragraph says Fork is "deli
 
 - Frontend tests in `Sidebar.test.ts`:
   - the item shows for a Codex agent and not for Claude or Antigravity;
-  - it is unavailable while the agent is working;
+  - it is unavailable while the agent is working, and while the project's history is loading, each with its reason;
   - choosing it creates the fork and its pane, and dispatches no turn;
   - compose sends are disabled while the fork is being created, and enabled again afterwards, on success and on failure;
   - with another compose operation in flight, the item is disabled with its reason, and clicking it calls no fork command;
   - a failed fork creation shows the error;
   - a fork whose history load fails shows the history-load error; Retry succeeds without sending a turn, inherited messages appear once, and the fork command was called exactly once.
 - **Prove it in the app:** fork a Codex agent from the menu, confirm the new agent is idle with the inherited conversation, then send the original agent a message and confirm it runs at once.
-- `README.md`: update the "Fork a conversation" feature bullet, the Fork how-to section, and the "Fork is currently Claude Code only" limitation, so they describe both harnesses and both entry points.
+- `README.md`: the compose-fork wording for both harnesses, and the Codex fork's dependence on its original's session file, landed with milestone 3. Add the agent card's Fork item for Codex agents to the Fork how-to section and the Fork limitation.
 
 ## Known limitations to record
 

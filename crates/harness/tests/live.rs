@@ -2813,7 +2813,7 @@ async fn live_codex_fork_loads_the_parents_history_up_to_the_fork_point() {
             _ => None,
         })
         .collect();
-    // Printed for the milestone's "prove it" step: compare with the rollouts.
+    // Printed so a person can compare the order with the rollouts by hand.
     println!(
         "fork {} prompts in order: {prompts:#?}",
         fork_locator.thread_id

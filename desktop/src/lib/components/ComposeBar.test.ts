@@ -9050,9 +9050,78 @@ describe("ComposeBar — project history loading", () => {
 
     ws.conversations[PROJECT_ID] = { items: [], status: "loading" };
 
-    await waitFor(() => expect(run).toBeDisabled());
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-invoke-button")).toHaveAttribute("aria-disabled", "true"),
+    );
     ws.conversations[PROJECT_ID] = { items: [], status: "complete" };
-    await waitFor(() => expect(run).toBeEnabled());
+    await waitFor(() => expect(screen.getByTestId("workflow-invoke-button")).toBeEnabled());
+    expect(screen.getByTestId("workflow-invoke-button")).not.toHaveAttribute("aria-disabled");
+  });
+
+  // One agent's history being read (a fork's earlier conversation, or a
+  // Retry) holds a run as the project's does, and so does the agent card's
+  // Fork while it locks the original's session. Neither shows in the form, so
+  // hovering Run says why.
+  it("holds a workflow run while one agent's history loads or a fork is being created", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "quick-workflow",
+      is_builtin: true,
+      description: "d",
+      inputs: [],
+      invocable: true,
+      parse_error: null,
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        return { ...WORKFLOW, steps: [], derived_args: [], compatibility: { state: "ok" } };
+      }
+      return null;
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await fireEvent.click(await screen.findByTestId("workflow-option-builtin:quick-workflow"));
+    await waitFor(() => expect(screen.getByTestId("workflow-invoke-button")).toBeEnabled());
+
+    const hoverReason = async (): Promise<string | null> => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        await fireEvent.pointerEnter(screen.getByTestId("workflow-invoke-button"));
+        await vi.advanceTimersByTimeAsync(1100);
+        return screen.getByTestId("tooltip-content").textContent;
+      } finally {
+        await fireEvent.pointerLeave(screen.getByTestId("workflow-invoke-button"));
+        vi.useRealTimers();
+      }
+    };
+
+    state.runtimes[AGENT_A.id] = { ...state.runtimes[AGENT_A.id]!, hydration_status: "loading" };
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-invoke-button")).toHaveAttribute("aria-disabled", "true"),
+    );
+    expect(await hoverReason()).toContain(
+      "Workflows can run once every agent's history has loaded.",
+    );
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "invoke_workflow")).toHaveLength(0);
+
+    state.runtimes[AGENT_A.id] = { ...state.runtimes[AGENT_A.id]!, hydration_status: "complete" };
+    await waitFor(() => expect(screen.getByTestId("workflow-invoke-button")).toBeEnabled());
+
+    const ops = await import("$lib/state/composeOperations.svelte");
+    const fork = ops.beginOperation(PROJECT_ID, { kind: "menu_fork", sourceId: AGENT_A.id })!;
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-invoke-button")).toHaveAttribute("aria-disabled", "true"),
+    );
+    expect(await hoverReason()).toContain(
+      "Workflows can run once the send or fork in progress in this project has finished.",
+    );
+
+    ops.finishOperation(PROJECT_ID, fork);
+    await waitFor(() => expect(screen.getByTestId("workflow-invoke-button")).toBeEnabled());
   });
 });
 

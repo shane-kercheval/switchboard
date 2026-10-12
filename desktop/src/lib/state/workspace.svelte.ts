@@ -153,6 +153,13 @@ export const selection = $state<{
 /// Per-project agent rosters, populated lazily on first activation.
 export const agentsByProject = $state<Record<ProjectId, AgentRecord[]>>({});
 
+/// The record for `agentId`, from whichever project roster holds it.
+function agentRecordById(agentId: AgentId): AgentRecord | undefined {
+  return Object.values(agentsByProject)
+    .flat()
+    .find((candidate) => candidate.id === agentId);
+}
+
 /// Harnesses whose agent failed to auto-create on the just-created project,
 /// with the reason. Surfaced as a dismissible banner so a partial failure (the
 /// project opens, but one expected agent is missing) is visible rather than
@@ -1152,7 +1159,9 @@ export async function hydrateProject(
     }
 
     conversations[projectId] = { items: overlay, status: "complete" };
-    if (baseline !== undefined) sessionFingerprintBaseline.set(projectId, baseline);
+    // `!= null`: the probe is best-effort, and its failure can read as an
+    // explicit null as well as absence (see `seedPendingForkHistory`).
+    if (baseline != null) recordFingerprintBaseline(projectId, baseline, agentTurnFilter);
     if (!isRefresh) seedPendingForkHistory(projectId, baseline);
     // A per-agent parse failure means that agent contributed no turns even
     // though the project load succeeded — for a caller waiting on one specific
@@ -1179,6 +1188,35 @@ export async function hydrateProject(
     }
     return "failed";
   }
+}
+
+/// Save the fingerprints a read captured as the baseline the next staleness
+/// check compares against.
+///
+/// **A filtered read records only the agents it merged.** It captured every
+/// agent's fingerprint, but applied turns only for the agents in the filter. Saving
+/// the rest would mark another agent's newer file as seen without its new turns
+/// shown: a Claude session continued in a terminal, followed by any fork, would
+/// then never be reread on switch-back. Their old entries stay, so the next check
+/// still finds them changed.
+function recordFingerprintBaseline(
+  projectId: ProjectId,
+  captured: AgentSessionFingerprint[],
+  agentTurnFilter: ReadonlySet<AgentId> | undefined,
+): void {
+  if (agentTurnFilter === undefined) {
+    sessionFingerprintBaseline.set(projectId, captured);
+    return;
+  }
+  // Function-local scratch, never observed reactively.
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const merged = new Map(
+    (sessionFingerprintBaseline.get(projectId) ?? []).map((entry) => [entry.agent_id, entry]),
+  );
+  for (const entry of captured) {
+    if (agentTurnFilter.has(entry.agent_id)) merged.set(entry.agent_id, entry);
+  }
+  sessionFingerprintBaseline.set(projectId, [...merged.values()]);
 }
 
 /// On re-activation of an already-loaded project, re-read its conversation if a
@@ -1343,9 +1381,7 @@ export async function forkAgentIntoOwnPane(sourceId: AgentId): Promise<AgentReco
 /// Refused for a harness that can't fork without a turn: a Claude branch
 /// registered with no message would never come into existence.
 export async function forkAgentWithoutSending(sourceId: AgentId): Promise<AgentRecord> {
-  const source = Object.values(agentsByProject)
-    .flat()
-    .find((candidate) => candidate.id === sourceId);
+  const source = agentRecordById(sourceId);
   if (source === undefined || !supportsForkWithoutTurn(source.harness)) {
     throw new Error("Only a Codex agent can be forked without sending a message.");
   }
@@ -1553,9 +1589,7 @@ function seedPendingForkHistory(
 /// agent, where the live first reply collapses against its disk copy by
 /// `hydration_key`.
 async function loadForkInheritedHistory(agentId: AgentId): Promise<void> {
-  const agent = Object.values(agentsByProject)
-    .flat()
-    .find((candidate) => candidate.id === agentId);
+  const agent = agentRecordById(agentId);
   if (agent === undefined) return;
   const eager = eagerForks.has(agentId);
   if (agent.forked_from_session == null && !eager) return;
@@ -1720,9 +1754,7 @@ export function installForkHistoryRefresh(): void {
       // marker explaining what was summarized only appears after a project
       // switch. `maybeRefreshProject` stays private: this is its second caller,
       // not a reason to export it.
-      const agent = Object.values(agentsByProject)
-        .flat()
-        .find((candidate) => candidate.id === agentId);
+      const agent = agentRecordById(agentId);
       if (agent !== undefined) void maybeRefreshProject(agent.project_id);
     }
   });

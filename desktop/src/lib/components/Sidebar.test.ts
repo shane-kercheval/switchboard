@@ -7,6 +7,7 @@ import type {
   ConversationItem,
   NormalizedEvent,
   ProjectListing,
+  WorkflowRunInfo,
 } from "$lib/types";
 // Static import so the component-tree transform happens at module collection,
 // not inside the first test's timeout (cold CI transforms have no vite cache).
@@ -194,6 +195,7 @@ beforeEach(async () => {
   (await import("$lib/layout.svelte"))._testing.reset();
   // A compose claim is project-scoped and outlives its component.
   (await import("$lib/state/composeOperations.svelte"))._testing.reset();
+  (await import("$lib/state/workflows.svelte"))._testing.reset();
 });
 
 afterEach(async () => {
@@ -2503,6 +2505,36 @@ describe("fork action", () => {
     );
     await fireEvent.click(item);
     expect(forkAgentWithoutSendingMock).not.toHaveBeenCalled();
+  });
+
+  it("is unavailable while a workflow is running in the project, and says why", async () => {
+    // Creating the fork locks the original's session for about a second, and a
+    // workflow step sent to it then would be refused and fail the run. A failed
+    // run left on screen runs nothing, so it doesn't block.
+    await registerWithHistory(CODEX_AGENT);
+    const { workflowRuns } = await import("$lib/state/workflows.svelte");
+    const run: WorkflowRunInfo = {
+      run_id: "run-1",
+      workflow: "review",
+      step: 0,
+      total: 2,
+      status: "running",
+      reason: null,
+      steps: [],
+    };
+    workflowRuns[PROJECT_ID] = [run];
+
+    const item = await forkItem(CODEX_AGENT);
+
+    expect(item).toHaveAttribute("data-disabled");
+    expect(await hoverTooltip(item)).toContain(
+      "Fork is available once the workflow running in this project has finished.",
+    );
+    await fireEvent.click(item);
+    expect(forkAgentWithoutSendingMock).not.toHaveBeenCalled();
+
+    workflowRuns[PROJECT_ID] = [{ ...run, status: "failed", reason: "step failed" }];
+    await waitFor(() => expect(item).not.toHaveAttribute("data-disabled"));
   });
 
   it("forks through the shared path, holding the compose claim until the fork exists", async () => {

@@ -297,6 +297,12 @@ async fn fork_on_task(
     };
     let Some(finished) = finished else {
         crate::subprocess::terminate_then_kill(&mut child).await;
+        // Nobody reads the stderr tail of an abandoned fork, so stop the reader
+        // rather than leave it detached for as long as a process outside the
+        // group holds the pipe.
+        if let Some(draining) = draining {
+            draining.abort();
+        }
         return Err(CodexForkError::Abandoned);
     };
 

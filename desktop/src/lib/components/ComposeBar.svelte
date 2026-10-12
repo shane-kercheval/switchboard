@@ -2286,13 +2286,36 @@
     onConfigurePrompts?.();
   }
 
+  /// Why Run waits for something the workflow form doesn't show, or `null`.
+  ///
+  /// - **History being read**, the project's or any one agent's (e.g. a fork's
+  ///   earlier conversation, or a Retry). A step's reply that starts during the
+  ///   read could be caught half-written and shown twice, the reason sends wait.
+  ///   Any agent rather than only the ones the workflow targets, because the
+  ///   reads are short and one rule is simpler.
+  /// - **A send or fork in progress** in this project. Workflows never take that
+  ///   claim, so this can't hold a run on itself. The agent card's Fork holds it
+  ///   while it locks the original's session, and a step sent to the original in
+  ///   that second would be refused and fail the run.
+  const workflowHold = $derived.by((): string | null => {
+    if (historyLoading || agents.some((a) => runtimes[a.id]?.hydration_status === "loading")) {
+      return "Workflows can run once every agent's history has loaded.";
+    }
+    if (composerBusy) {
+      return "Workflows can run once the send or fork in progress in this project has finished.";
+    }
+    return null;
+  });
+
   /// Whether the picked workflow is runnable: the form is resolved, invocable,
   /// compatible (prompts resolved, no drift), and every required field (declared
   /// input or derived prompt arg) is filled. Drives the invoke button's disabled
   /// state. A pending (`unresolved`) or `incompatible` form blocks Run.
   const workflowRunnable = $derived.by(() => {
     const form = workflowForm;
-    if (form === null || workflowFormLoading || !projectAvailable || historyLoading) return false;
+    if (form === null || workflowFormLoading || !projectAvailable || workflowHold !== null) {
+      return false;
+    }
     if (!form.invocable || form.compatibility.state !== "ok") return false;
     // A single `text` input / derived arg also counts as filled when it carries
     // ≥1 forward source (only text/derived fields can — agent/list fields keep
@@ -4245,15 +4268,34 @@
             onconfigure={onConfigurePrompts ? configurePrompts : undefined}
           >
             {#snippet invoke()}
-              <Button
-                variant="primary"
-                size="sm"
-                data-testid="workflow-invoke-button"
-                disabled={!workflowRunnable || invokingWorkflow}
-                onclick={() => void invokeWorkflowAction()}
-              >
-                {invokingWorkflow ? "Starting…" : "Run workflow"}
-              </Button>
+              <!-- Held for a reason the form doesn't show: `aria-disabled`
+                   rather than `disabled`, so hovering still says why. -->
+              {#if workflowHold !== null && !invokingWorkflow}
+                <Tooltip label={workflowHold}>
+                  {#snippet trigger(props)}
+                    <Button
+                      {...props}
+                      variant="primary"
+                      size="sm"
+                      aria-disabled="true"
+                      class="cursor-not-allowed opacity-50"
+                      data-testid="workflow-invoke-button"
+                    >
+                      Run workflow
+                    </Button>
+                  {/snippet}
+                </Tooltip>
+              {:else}
+                <Button
+                  variant="primary"
+                  size="sm"
+                  data-testid="workflow-invoke-button"
+                  disabled={!workflowRunnable || invokingWorkflow}
+                  onclick={() => void invokeWorkflowAction()}
+                >
+                  {invokingWorkflow ? "Starting…" : "Run workflow"}
+                </Button>
+              {/if}
             {/snippet}
           </WorkflowComposer>
         {:else if mode === "prompt" && selectedPrompt !== null}

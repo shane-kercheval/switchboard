@@ -716,11 +716,21 @@
 
   /// Why the menu's Fork item is unavailable for `agent`, or `null`. The
   /// project and agent conditions are the compose box's (`forkBlockFor`). The
-  /// compose claim is this item's own: a send waiting on a browser sign-in holds
-  /// it with no time limit, and without a reason the click would do nothing.
+  /// rest are this item's own:
+  ///
+  /// - **A running workflow.** Creating the fork locks the original's session
+  ///   for about a second, and a step sent to it then is refused and fails the
+  ///   run. The compose box's Fork can't hit this: a run's progress view
+  ///   replaces the compose box. A finished or failed run left on screen
+  ///   doesn't block.
+  /// - **The compose claim.** A send waiting on a browser sign-in holds it with
+  ///   no time limit, and without a reason the click would do nothing.
   function menuForkBlock(agent: AgentRecord): string | null {
     const shared = forkBlockFor(projectId, agent);
     if (shared !== null) return shared;
+    if ((workflowRuns[projectId] ?? []).some((run) => run.status === "running")) {
+      return "Fork is available once the workflow running in this project has finished.";
+    }
     const operation = operationFor(projectId);
     if (operation === undefined) return null;
     return operation.kind === "menu_fork"

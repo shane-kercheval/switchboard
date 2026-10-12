@@ -7610,7 +7610,9 @@ mod tests {
     use async_trait::async_trait;
     use switchboard_core::CoreError;
     use switchboard_dispatcher::{EventEmitter, RecordingEmitter};
-    use switchboard_harness::{ClaudeCodeAdapter, HarnessAdapter, MockHarnessAdapter};
+    use switchboard_harness::{
+        ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, MockHarnessAdapter,
+    };
     use tempfile::TempDir;
 
     /// The working directories a test has registered per store, so
@@ -12709,7 +12711,6 @@ mod tests {
     #[ignore = "requires codex installed — run with: make test-live"]
     #[allow(clippy::too_many_lines)]
     async fn live_codex_fork_through_the_app_leaves_the_parent_free_during_its_first_turn() {
-        use switchboard_harness::CodexAdapter;
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let codex: Arc<dyn HarnessAdapter> = Arc::new(CodexAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
@@ -12823,7 +12824,6 @@ mod tests {
 
     #[test]
     fn check_codex_binary_with_missing_binary_returns_error() {
-        use switchboard_harness::CodexAdapter;
         let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let codex: Arc<dyn HarnessAdapter> =
             Arc::new(CodexAdapter::with_binary_path("/nonexistent/codex-xyz"));

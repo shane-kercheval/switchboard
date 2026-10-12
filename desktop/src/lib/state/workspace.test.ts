@@ -723,6 +723,51 @@ describe("project staleness refresh", () => {
     expect(loadCount).toBe(1);
   });
 
+  it("still picks up an agent's outside turns on switch-back after a fork's reread", async () => {
+    // The fork's reread captures every agent's file but merges only the fork.
+    // Had it saved the Claude agent's newer file as seen, the switch-back below
+    // would skip the turn the user ran in a terminal.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    panes._testing.reset();
+    const FORK = "00000000-0000-7000-8000-0000000000c1";
+    const codexParent: AgentRecord = {
+      ...agent(AGENT_2, PROJECT_1),
+      harness: "codex",
+      session_locator: { codex: { thread_id: "thread-b", partition_date: "2026-10-11" } },
+    };
+    installBackend([agent(AGENT_1, PROJECT_1), codexParent]);
+    const backend = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "fork_agent"
+        ? { ...codexParent, id: FORK, name: "cx-fork" }
+        : await backend(cmd, args),
+    );
+    fingerprints = [fp(AGENT_1, true, "2026-05-20T00:00:00Z", 100), fp(AGENT_2, false, null)];
+    conversation = convo([agentTurnItem("t1", "K1", "2026-05-20T00:00:01Z")]);
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(state.transcripts[AGENT_1]?.length).toBe(1));
+
+    // The user continues the Claude agent in a terminal, then forks the Codex one.
+    fingerprints = [
+      fp(AGENT_1, true, "2026-05-20T00:05:00Z", 250),
+      fp(AGENT_2, false, null),
+      fp(FORK, false, null),
+    ];
+    conversation = convo([
+      agentTurnItem("t1-reparse", "K1", "2026-05-20T00:00:01Z"),
+      agentTurnItem("t2", "K2", "2026-05-20T00:06:00Z"),
+    ]);
+    await ws.forkAgentWithoutSending(AGENT_2);
+    await vi.waitFor(() => expect(state.runtimes[FORK]?.hydration_status).toBe("complete"));
+    expect(agentKeys(state)).toEqual(["K1"]);
+
+    expect(await ws.activateProject(PROJECT_1)).toBe("activated");
+
+    expect(agentKeys(state).sort()).toEqual(["K1", "K2"]);
+  });
+
   it("preserves a live in-flight turn across a refresh", async () => {
     const ws = await loadWorkspaceState();
     const state = await loadAgentState();

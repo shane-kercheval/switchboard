@@ -215,6 +215,21 @@ export function setDispatchFailedHook(hook: DispatchFailedHook | undefined): () 
   };
 }
 
+/// Called when an agent's queue has drained (`agent_idle`): no reply running
+/// and none queued. It runs after the agent's runtime has been updated, so the
+/// hook sees the agent idle and may write to its runtime; one called before
+/// that update would have its write replaced by it. The one consumer retries a
+/// Codex fork's failed inherited-history load, which must not reread the
+/// fork's session file while a reply is still being written to it. Same
+/// registration shape as `TurnTerminalHook`, for the same dependency reason.
+type AgentIdleHook = (agentId: AgentId) => void;
+
+let agentIdleHook: AgentIdleHook | undefined;
+
+export function setAgentIdleHook(hook: AgentIdleHook | undefined): void {
+  agentIdleHook = hook;
+}
+
 /// Per-agent unlisten functions for the Tauri event channel. Keyed by
 /// `agent_id`. We hold these so the test harness can drain them via
 /// `_testing.reset()`; production callers never unregister.
@@ -1186,6 +1201,7 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   runtimes[agentId] = runtimeReducer(priorRuntime, event);
   recordAccountUsage(agentId, event, receivedAt);
   manageHeartbeat(agentId, event);
+  if (event.type === "agent_idle") agentIdleHook?.(agentId);
 
   // Deferred cancel: if this turn started for a send the user cancelled before
   // the backend accepted it, the turn ran anyway — fire the send-scoped cancel

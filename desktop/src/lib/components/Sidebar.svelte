@@ -35,6 +35,7 @@
   } from "$lib/harnessCapabilities";
   import {
     forkAgentWithoutSending,
+    historyRetryBlock,
     removeAgent,
     renameAgent,
     reorderAgents,
@@ -1490,6 +1491,7 @@
             </div>
           {/if}
           {#if runtime?.hydration_error}
+            {@const retryBlock = historyRetryBlock(agent)}
             <div class="mt-1 space-y-1" data-testid="agent-hydration-error">
               <!-- Clamp the inline reason to two lines: it keeps an
                      at-a-glance "why" without a long path-bearing error (the
@@ -1500,14 +1502,32 @@
                 history failed to load: {runtime.hydration_error}
               </div>
               <div class="flex items-center gap-3 text-xs">
-                <button
-                  type="button"
-                  class="text-accent hover:underline"
-                  data-testid="agent-hydration-retry"
-                  onclick={() => void retryAgentHistory(agent.id)}
-                >
-                  Retry
-                </button>
+                {#if retryBlock === null}
+                  <button
+                    type="button"
+                    class="text-accent hover:underline"
+                    data-testid="agent-hydration-retry"
+                    onclick={() => void retryAgentHistory(agent.id)}
+                  >
+                    Retry
+                  </button>
+                {:else}
+                  <!-- `aria-disabled` rather than `disabled`, so hovering still
+                       opens the tooltip that says why. -->
+                  <Tooltip label={retryBlock}>
+                    {#snippet trigger(props)}
+                      <button
+                        {...props}
+                        type="button"
+                        aria-disabled="true"
+                        class="text-muted cursor-not-allowed"
+                        data-testid="agent-hydration-retry"
+                      >
+                        Retry
+                      </button>
+                    {/snippet}
+                  </Tooltip>
+                {/if}
                 <button
                   type="button"
                   class="text-muted hover:text-fg hover:underline"

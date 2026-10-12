@@ -13,6 +13,7 @@ vi.mock("$lib/state/workspace.svelte", () => ({
   retryAgentHistory: vi.fn(async () => undefined),
   setAgentSelection: vi.fn(async () => undefined),
   forkAgentWithoutSending: vi.fn(async () => undefined),
+  historyRetryBlock: () => null,
   projects: { list: [] },
   conversations: {},
 }));

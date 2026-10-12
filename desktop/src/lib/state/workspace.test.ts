@@ -6,6 +6,7 @@ import type {
   ConversationItem,
   ProjectConversation,
   ProjectListing,
+  TurnOutcome,
 } from "$lib/types";
 
 const invokeMock = vi.fn(
@@ -1658,9 +1659,15 @@ describe("eager (Codex) fork inherited history", () => {
     expect(predicate()).toBe(true);
   }
 
+  /// Fire the queue-drained signal for `agentId`, which drives the automatic
+  /// retry of a Codex fork's failed inherited-history load.
+  function goIdle(agentId: string): void {
+    fireTo(`agent:${agentId}`, { type: "agent_idle", agent_id: agentId });
+  }
+
   it("clears the failure once a later automatic load succeeds", async () => {
     // The banner and the sidebar line show while an error is stored, so a load
-    // that recovers after the fork's first reply must take the error away.
+    // that recovers once the fork is idle must take the error away.
     let failing = true;
     const { ws, state } = await codexProject(async (cmd) => {
       if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
@@ -1676,10 +1683,164 @@ describe("eager (Codex) fork inherited history", () => {
     failing = false;
 
     completeTurn(FORK_A);
+    goIdle(FORK_A);
 
     await settled(() => state.runtimes[FORK_A]?.hydration_status === "complete");
     expect(state.runtimes[FORK_A]?.hydration_error).toBeUndefined();
     expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
+  });
+
+  /// A reply on `agentId`: it starts, and ends as `outcome`. A completed or
+  /// reported Codex reply ends carrying the id that matches it to its saved
+  /// copy (`hydrationKey`); one that ends abnormally carries none.
+  function reply(
+    agentId: string,
+    turnId: string,
+    sendId: string,
+    end: { outcome: TurnOutcome; hydrationKey?: string },
+  ): void {
+    fireTo(`agent:${agentId}`, {
+      type: "turn_start",
+      turn_id: turnId,
+      send_id: sendId,
+      started_at: "2026-05-16T00:00:03Z",
+    });
+    fireTo(`agent:${agentId}`, {
+      type: "content_chunk",
+      turn_id: turnId,
+      kind: "text",
+      text: "half an answer",
+    });
+    fireTo(`agent:${agentId}`, {
+      type: "turn_end",
+      turn_id: turnId,
+      outcome: end.outcome,
+      ended_at: "2026-05-16T00:00:04Z",
+      hydration_key: end.hydrationKey ?? null,
+    });
+  }
+
+  /// A Codex project whose fork's inherited history failed to load, then
+  /// becomes loadable, with the automatic retry installed.
+  async function forkWithFailedHistory(): Promise<{
+    ws: Awaited<ReturnType<typeof loadWorkspaceState>>;
+    state: Awaited<ReturnType<typeof loadAgentState>>;
+    calls: string[];
+  }> {
+    let failing = true;
+    const project = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") {
+        if (failing) throw new Error("disk went away");
+        return conversationWith([FORK_A]);
+      }
+      if (cmd === "send_message") return "msg";
+      return undefined;
+    });
+    project.ws.installForkHistoryRefresh();
+    await project.ws.forkAgentIntoOwnPane(AGENT_1);
+    expect(project.state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+    failing = false;
+    return project;
+  }
+
+  it("retries automatically only once the fork has nothing running or queued", async () => {
+    // Retrying when one reply ends would reread the fork's session file while
+    // the next queued reply is being written to it, and the half-written copy
+    // would show as a second reply.
+    const { ws, state, calls } = await forkWithFailedHistory();
+    // Two messages: the first runs, the second waits behind it.
+    state.dispatchUserTurn(FORK_A, "user-1", "one", [], "send-1", "2026-05-16T00:00:01Z");
+    state.dispatchUserTurn(FORK_A, "user-2", "two", [], "send-2", "2026-05-16T00:00:02Z");
+    calls.length = 0;
+
+    reply(FORK_A, "turn-1", "send-1", { outcome: { status: "completed" }, hydrationKey: "key-1" });
+    await settled(() => true);
+
+    expect(calls).not.toContain("load_project_conversation");
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+
+    reply(FORK_A, "turn-2", "send-2", { outcome: { status: "completed" }, hydrationKey: "key-2" });
+    expect(calls).not.toContain("load_project_conversation");
+    goIdle(FORK_A);
+    // Shown as loading for the whole read, so a new send to the fork waits.
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("loading");
+
+    await settled(() => state.runtimes[FORK_A]?.hydration_status === "complete");
+    expect(calls.filter((cmd) => cmd === "load_project_conversation")).toHaveLength(1);
+    expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
+  });
+
+  it("skips the automatic retry while a reply on screen can't be matched to its saved copy", async () => {
+    // A Codex reply that ends abnormally (Codex exited mid-reply) carries no
+    // id, so a reread would add its saved partial copy as a second reply. The
+    // failure stays on screen with Retry instead, which still works.
+    const { ws, state, calls } = await forkWithFailedHistory();
+    state.dispatchUserTurn(FORK_A, "user-1", "one", [], "send-1", "2026-05-16T00:00:01Z");
+    reply(FORK_A, "turn-1", "send-1", {
+      outcome: {
+        status: "failed",
+        kind: "adapter_failure",
+        message: "harness exited without terminal stream event",
+      },
+    });
+    calls.length = 0;
+
+    goIdle(FORK_A);
+    await settled(() => true);
+
+    expect(calls).not.toContain("load_project_conversation");
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+    expect(state.runtimes[FORK_A]?.hydration_error).toContain("disk went away");
+    expect(ws.historyRetryBlock(codexAgent(FORK_A, "cx-fork"))).toBeNull();
+  });
+
+  it("refuses a manual Retry while the fork is replying", async () => {
+    let failing = true;
+    const { ws, state, calls } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") {
+        if (failing) throw new Error("disk went away");
+        return conversationWith([FORK_A]);
+      }
+      return undefined;
+    });
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+    failing = false;
+    state.runtimes[FORK_A] = { ...state.runtimes[FORK_A]!, run_status: "processing" };
+    calls.length = 0;
+
+    expect(ws.historyRetryBlock(codexAgent(FORK_A, "cx-fork"))).toBe(
+      "Retry is available once cx-fork has finished replying, including any queued messages.",
+    );
+    await ws.retryAgentHistory(FORK_A);
+
+    expect(calls).not.toContain("load_project_conversation");
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+
+    state.runtimes[FORK_A] = { ...state.runtimes[FORK_A]!, run_status: "idle" };
+    expect(ws.historyRetryBlock(codexAgent(FORK_A, "cx-fork"))).toBeNull();
+    await ws.retryAgentHistory(FORK_A);
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("complete");
+  });
+
+  it("refuses a manual Retry for an ordinary agent while it is replying", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const plain = codexAgent(AGENT_2, "cx-2");
+    await state.registerAgent(plain);
+    state.runtimes[AGENT_2] = {
+      ...state.runtimes[AGENT_2]!,
+      run_status: "processing",
+      hydration_status: "failed",
+      hydration_error: "unreadable",
+    };
+    invokeMock.mockClear();
+
+    await ws.retryAgentHistory(AGENT_2);
+
+    expect(invokeMock).not.toHaveBeenCalledWith("load_transcript", expect.anything());
+    expect(state.runtimes[AGENT_2]?.hydration_error).toBe("unreadable");
   });
 
   it("retries a fork whose history loaded once and failed a later project reload", async () => {

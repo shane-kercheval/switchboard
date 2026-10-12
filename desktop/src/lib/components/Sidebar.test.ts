@@ -26,6 +26,8 @@ const removeAgentMock = vi.fn<(id: string) => Promise<void>>();
 const setAgentSelectionMock = vi.fn<(id: string, selection: AgentSelection) => Promise<void>>();
 const reorderAgentsMock = vi.fn<(projectId: string, orderedIds: string[]) => Promise<void>>();
 const forkAgentWithoutSendingMock = vi.fn<(sourceId: string) => Promise<AgentRecord>>();
+const retryAgentHistoryMock = vi.fn<(agentId: string) => Promise<void>>();
+const historyRetryBlockMock = vi.fn<(agent: AgentRecord) => string | null>();
 // The fork conditions the card shares with the compose box read the project's
 // folder and history-load state from here. A test about either sets it.
 const workspaceProjects = vi.hoisted(() => ({ list: [] as ProjectListing[] }));
@@ -40,6 +42,8 @@ vi.mock("$lib/state/workspace.svelte", () => ({
   reorderAgents: (projectId: string, orderedIds: string[]) =>
     reorderAgentsMock(projectId, orderedIds),
   forkAgentWithoutSending: (sourceId: string) => forkAgentWithoutSendingMock(sourceId),
+  retryAgentHistory: (agentId: string) => retryAgentHistoryMock(agentId),
+  historyRetryBlock: (agent: AgentRecord) => historyRetryBlockMock(agent),
   projects: workspaceProjects,
   conversations: workspaceConversations,
 }));
@@ -171,6 +175,10 @@ beforeEach(() => {
   contextReportAgentMock.mockReset();
   contextReportAgentMock.mockResolvedValue("00000000-0000-7000-8000-00000000d0aa");
   forkAgentWithoutSendingMock.mockReset();
+  retryAgentHistoryMock.mockReset();
+  retryAgentHistoryMock.mockResolvedValue(undefined);
+  historyRetryBlockMock.mockReset();
+  historyRetryBlockMock.mockReturnValue(null);
   workspaceProjects.list = [];
   for (const key of Object.keys(workspaceConversations)) delete workspaceConversations[key];
   // A project whose history has loaded, the normal state of an open project.
@@ -2304,6 +2312,49 @@ describe("compact context action", () => {
     const bar = screen.getByTestId("agent-context-bar");
     expect(bar).toHaveTextContent("120k / 200k");
     expect(bar).toHaveTextContent("60%");
+  });
+});
+
+describe("history Retry", () => {
+  async function failedHistory(): Promise<void> {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.runtimes[CODEX_AGENT.id] = {
+      ...state.runtimes[CODEX_AGENT.id]!,
+      hydration_status: "failed",
+      hydration_error: "unreadable",
+    };
+  }
+
+  it("retries the agent's history when it is allowed", async () => {
+    await failedHistory();
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+
+    await fireEvent.click(screen.getByTestId("agent-hydration-retry"));
+
+    expect(retryAgentHistoryMock).toHaveBeenCalledExactlyOnceWith(CODEX_AGENT.id);
+  });
+
+  it("is unavailable while the agent is replying, says why, and does nothing", async () => {
+    // A reread while a reply is still being written would show it twice.
+    await failedHistory();
+    historyRetryBlockMock.mockReturnValue("Retry is available once bob has finished replying.");
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+    const retry = screen.getByTestId("agent-hydration-retry");
+
+    expect(retry).toHaveAttribute("aria-disabled", "true");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.pointerEnter(retry);
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(screen.getByTestId("tooltip-content")).toHaveTextContent(
+        "Retry is available once bob has finished replying.",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    await fireEvent.click(retry);
+    expect(retryAgentHistoryMock).not.toHaveBeenCalled();
   });
 });
 

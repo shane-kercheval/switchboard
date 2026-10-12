@@ -2842,6 +2842,53 @@ describe("UnifiedTranscript hydration failures", () => {
     expect(state.runtimes[CLAUDE_AGENT.id]?.hydration_error).toBeUndefined();
   });
 
+  it("keeps the per-agent Retry unavailable while the agent is replying", async () => {
+    // A reread while a reply is still being written finds a half-written copy
+    // that can't be matched to the one on screen, so it would show twice.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...state.runtimes[CLAUDE_AGENT.id]!,
+      run_status: "processing",
+      hydration_status: "failed",
+      hydration_error: "permission denied",
+    };
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const retry = screen.getByTestId("agent-hydration-failed-retry");
+    expect(retry).toHaveAttribute("aria-disabled", "true");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.pointerEnter(retry);
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(screen.getByTestId("tooltip-content")).toHaveTextContent(
+        `Retry is available once ${CLAUDE_AGENT.name} has finished replying`,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    await fireEvent.click(retry);
+    expect(invokeMock).not.toHaveBeenCalledWith("load_transcript", expect.anything());
+
+    state.runtimes[CLAUDE_AGENT.id] = { ...state.runtimes[CLAUDE_AGENT.id]!, run_status: "idle" };
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-hydration-failed-retry")).not.toHaveAttribute(
+        "aria-disabled",
+      ),
+    );
+    invokeMock.mockResolvedValueOnce({
+      turns: [],
+      meta: null,
+      last_rate_limit: null,
+      warnings: [],
+    });
+    await fireEvent.click(screen.getByTestId("agent-hydration-failed-retry"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("load_transcript", { agentId: CLAUDE_AGENT.id }),
+    );
+  });
+
   it("keeps the per-agent banner when Retry fails again", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);

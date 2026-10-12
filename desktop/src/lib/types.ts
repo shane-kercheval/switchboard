@@ -334,12 +334,15 @@ export type NormalizedEvent =
       // harnesses; `effort` Codex-only. Absent → render nothing.
       model?: string | null;
       effort?: string | null;
-      // Live-matched stable hydration key — the same per-turn id this turn will
-      // carry on disk, so the hydrate merge can recognize a turn that streamed
-      // live and is later re-read as one turn. Populated only for live-matched
-      // harnesses (Claude's *first* non-subagent assistant message.id — distinct
-      // from the cost-join's final id, parse-invariant so a mid-flight re-read
-      // dedups correctly); absent otherwise.
+      // Stable hydration key — the same per-turn id this turn carries on disk,
+      // so the hydrate merge can recognize a turn that streamed live and is
+      // later re-read as one turn. Claude: the *first* non-subagent assistant
+      // message.id (distinct from the cost-join's final id, parse-invariant so a
+      // mid-flight re-read dedups correctly). Codex: the turn's
+      // `turn_context.turn_id`, read from the session file when the turn ends.
+      // Absent for Antigravity, and for a Codex turn that ended without that
+      // read (Codex exited mid-turn, its output broke off or couldn't be
+      // parsed): a re-read then duplicates it (harness-behavior G44).
       hydration_key?: string | null;
     }
   | { type: "rate_limit_event"; agent_id: AgentId; info: unknown }

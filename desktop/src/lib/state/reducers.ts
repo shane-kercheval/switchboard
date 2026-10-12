@@ -336,9 +336,9 @@ export function transcriptReducer(
       const existing = findTurn(turns, input.turn_id);
       if (existing === undefined || existing.role !== "agent") return turns;
       if (existing.status !== "streaming") return turns;
-      // Stamp the live-matched hydration key (Claude only) onto the completing
-      // turn so a later disk re-read of the same turn dedups against it instead
-      // of appending a second copy (see the `hydrate` merge). **Preserve an
+      // Stamp the hydration key (Claude and Codex) onto the completing turn so
+      // a later disk re-read of the same turn dedups against it instead of
+      // appending a second copy (see the `hydrate` merge). **Preserve an
       // early key when the terminal carries none**: an in-flight turn may
       // already hold a `hydration_key` from the `turn_identity` event, and a
       // *synthesized* terminal (a cancelled turn's `TurnEnd`, built by the

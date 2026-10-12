@@ -37,6 +37,7 @@
   } from "$lib/state/index.svelte";
   import {
     agentsByProject,
+    historyRetryBlock,
     isAwaitingForkHistory,
     retryAgentHistory,
   } from "$lib/state/workspace.svelte";
@@ -1700,11 +1701,15 @@
   }
 </script>
 
+<!-- `retryBlock` is why Retry can't run right now; the button then stays on
+     screen, `aria-disabled` rather than `disabled` so hovering still opens the
+     tooltip that says why. -->
 {#snippet failureBanner(
   testid: string,
   message: string,
   onRetry: (() => void) | undefined,
   onDetails: () => void,
+  retryBlock: string | null = null,
 )}
   <div
     class="border-status-failed/40 bg-status-failed-soft/40 mb-3 flex items-center justify-between gap-3 rounded-md border px-3 py-2"
@@ -1712,7 +1717,22 @@
   >
     <span class="text-status-failed text-xs">{message}</span>
     <div class="flex shrink-0 items-center gap-2">
-      {#if onRetry}
+      {#if onRetry && retryBlock !== null}
+        <Tooltip label={retryBlock}>
+          {#snippet trigger(props)}
+            <Button
+              {...props}
+              variant="secondary"
+              size="sm"
+              aria-disabled="true"
+              class="cursor-not-allowed opacity-50"
+              data-testid={`${testid}-retry`}
+            >
+              Retry
+            </Button>
+          {/snippet}
+        </Tooltip>
+      {:else if onRetry}
         <Button variant="secondary" size="sm" data-testid={`${testid}-retry`} onclick={onRetry}>
           Retry
         </Button>
@@ -2507,6 +2527,7 @@
           "This agent's history failed to load. The exact error is below — copy it into a bug report.",
           runtimes[agent.id]?.hydration_error ?? "No error detail was reported.",
         ),
+      historyRetryBlock(agent),
     )}
   {/each}
 

@@ -58,11 +58,13 @@ import { draftAttachmentPaths } from "$lib/state/composeStore";
 import { layout } from "$lib/layout.svelte";
 import { supportsForkWithoutTurn } from "$lib/harnessCapabilities";
 import {
+  agentIsWorking,
   applyAgentHydrate,
   markHydrationAttempted,
   registerAgent,
   retryAgentHydration,
   runtimes,
+  setAgentIdleHook,
   setDispatchFailedHook,
   setTurnTerminalHook,
   transcripts,
@@ -1598,6 +1600,25 @@ function markEagerForkHistoryFailed(agentId: AgentId, message: string): void {
   runtimes[agentId] = { ...runtime, hydration_status: "failed", hydration_error: message };
 }
 
+/// Why `agent`'s history can't be retried right now, or `null` when it can.
+///
+/// **Not while a reply is running or queued.** A reread then finds the reply
+/// half-written in the session file, and a Codex reply gets the id that matches
+/// it to its saved copy only once it ends, so the partial copy would show as a
+/// second reply until Switchboard restarts. Claude's rereads are safe
+/// mid-reply, but one rule is simpler and the wait is at most the agent's
+/// current work.
+///
+/// A finished reply can still lack that id, and a Retry then shows it twice:
+/// every Antigravity reply (gap G43), and a Codex reply that ended abnormally
+/// (gap G44, both in `docs/harness-behavior.md`). Retry stays available then:
+/// refusing it would leave the history missing until a restart, which is worse
+/// than one reply shown twice. Only the automatic retry skips such an agent.
+export function historyRetryBlock(agent: AgentRecord): string | null {
+  if (!agentIsWorking(runtimes[agent.id])) return null;
+  return `Retry is available once ${agent.name} has finished replying, including any queued messages.`;
+}
+
 /// Retry loading an agent's history after a failure, through the path that
 /// loaded it.
 ///
@@ -1606,6 +1627,9 @@ function markEagerForkHistoryFailed(agentId: AgentId, message: string): void {
 /// merge owns, so it would show the fork's inherited messages twice. Every other
 /// agent goes through [`retryAgentHydration`].
 export async function retryAgentHistory(agentId: AgentId): Promise<void> {
+  // The buttons are disabled meanwhile (`historyRetryBlock`); this covers a
+  // click that lands as a reply starts.
+  if (agentIsWorking(runtimes[agentId])) return;
   if (!eagerForks.has(agentId)) {
     await retryAgentHydration(agentId);
     return;
@@ -1619,9 +1643,11 @@ export async function retryAgentHistory(agentId: AgentId): Promise<void> {
 }
 
 /// Load an eager fork's inherited history with the fork shown as loading it,
-/// for Retry and for a fork made from the agent card. While it shows loading,
-/// the compose bar won't send to it, so the read never overlaps the fork's own
-/// turn.
+/// for Retry, for the automatic retry once the fork is idle, and for a fork
+/// made from the agent card. Every caller starts it only while the fork has no
+/// reply running or queued, and while it shows loading the compose bar won't
+/// send to the fork, so the read doesn't overlap a reply being written to the
+/// fork's session file.
 ///
 /// **Never leaves it loading.** The load either applies (which marks the agent
 /// complete) or fails (which marks it failed). It can also return without
@@ -1649,12 +1675,15 @@ async function loadEagerForkHistoryShowingProgress(agentId: AgentId): Promise<vo
   }
 }
 
-/// Wire the terminal hook that drives [`loadForkInheritedHistory`]. Called once
-/// at app start; the hook is a no-op for every non-fork agent.
+/// Wire the hooks that drive [`loadForkInheritedHistory`]: after a reply for a
+/// Claude fork, and once idle for a Codex fork. Called once at app start; both
+/// are no-ops for every non-fork agent.
 export function installForkHistoryRefresh(): void {
   setTurnTerminalHook((agentId, outcome, kind) => {
     if (outcome !== "completed") return;
-    void loadForkInheritedHistory(agentId);
+    // A Claude fork materializes during its first reply and its file is safe
+    // to reread at once. A Codex fork's retry waits for the idle hook below.
+    if (!eagerForks.has(agentId)) void loadForkInheritedHistory(agentId);
     if (kind === "compaction") {
       // The recap the harness wrote lives in its own session file, and the
       // compaction turn itself carries no content — so without this re-read the
@@ -1667,6 +1696,30 @@ export function installForkHistoryRefresh(): void {
       if (agent !== undefined) void maybeRefreshProject(agent.project_id);
     }
   });
+  // A Codex fork whose earlier conversation failed to load retries once it has
+  // nothing running or queued: retrying when one reply ends would reread the
+  // fork's session file while the next queued reply is being written to it.
+  // It stops once a load succeeds; a later failure needs Retry. It also skips a
+  // fork showing a reply the reread couldn't match to its saved copy, which
+  // would then appear twice; the failure stays on screen with Retry instead.
+  setAgentIdleHook((agentId) => {
+    if (!eagerForks.has(agentId) || forkHistoryLoaded.has(agentId)) return;
+    if (agentIsWorking(runtimes[agentId]) || showsUnmatchableReply(agentId)) return;
+    void loadEagerForkHistoryShowingProgress(agentId);
+  });
+}
+
+/// Whether `agentId` shows a reply that a reread of its session file can't
+/// match to the reply's saved copy, because it carries no saved-copy id
+/// (`hydration_key`). A reread would add that saved copy as a second reply.
+/// A Codex reply is left without one when it ends abnormally (Codex exits
+/// mid-reply, or its output breaks off or can't be parsed), or when the
+/// session file couldn't be read as it ended (`docs/harness-behavior.md`,
+/// gap G44).
+function showsUnmatchableReply(agentId: AgentId): boolean {
+  return (transcripts[agentId] ?? []).some(
+    (turn) => turn.role === "agent" && turn.hydration_key == null,
+  );
 }
 
 /// Test-only reset. Production never calls this; the module is a singleton, so
@@ -1679,6 +1732,7 @@ export const _testing = {
     refreshRequestedAgain.clear();
     projectLoadChain.clear();
     setTurnTerminalHook(undefined);
+    setAgentIdleHook(undefined);
     setDispatchFailedHook(undefined);
     loaderGeneration += 1;
     readInFlight = null;

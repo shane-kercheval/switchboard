@@ -335,7 +335,7 @@ pub fn find_codex_session_file_for_attach(
 /// Non-numeric names are skipped (defensive against `.DS_Store` and similar),
 /// and so is any level that can't be read, so one permission-denied folder
 /// doesn't hide the rest. An unreadable or missing root yields nothing.
-pub(super) fn session_day_folders(home_dir: &Path) -> Vec<(PathBuf, NaiveDate)> {
+fn session_day_folders(home_dir: &Path) -> Vec<(PathBuf, NaiveDate)> {
     let root = home_dir.join(".codex").join("sessions");
     let mut folders = Vec::new();
     let Ok(year_entries) = std::fs::read_dir(&root) else {
@@ -1079,7 +1079,7 @@ pub fn load_codex_transcript(
     })?;
 
     let mut transcript = parse_codex_transcript_content(&content, agent_id);
-    match load_inherited_history(home_dir, &path, date, &content, agent_id) {
+    match load_inherited_history(home_dir, &path, &content, agent_id) {
         InheritedHistory::NotAFork => {}
         InheritedHistory::Loaded {
             mut turns,

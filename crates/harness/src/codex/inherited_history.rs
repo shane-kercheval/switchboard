@@ -24,15 +24,15 @@
 //! context window, settings, environment) comes from the fork's own file, which
 //! `parse_codex_transcript_content` already reads; nothing here touches it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use switchboard_core::AgentId;
 
-use super::session_file::{parse_codex_transcript_content, session_day_folders};
+use super::session_file::parse_codex_transcript_content;
 use crate::transcript::{InheritedHistoryGap, ParseWarning, Turn};
 
 /// How many ancestors the walk follows before giving up. Real chains are a
@@ -67,16 +67,18 @@ struct Pointer {
 /// inherits.
 ///
 /// `own_path` is the fork's own rollout, used only to recognise a chain that
-/// loops back to it. `own_partition` is its date folder, searched first for the
-/// parent because most forks share their parent's day.
+/// loops back to it.
 pub(crate) fn load_inherited_history(
     home_dir: &Path,
     own_path: &Path,
-    own_partition: NaiveDate,
     own_content: &str,
     agent_id: AgentId,
 ) -> InheritedHistory {
-    let Some(own_meta) = first_session_meta(own_content) else {
+    // The fork's own header only has to be a session header: a pointer in it
+    // is reason enough to follow. The stricter `readable_header` rule is for
+    // files reached through a pointer, where "no pointer" must be something
+    // the header says.
+    let Some(own_meta) = session_meta_record(own_content) else {
         return InheritedHistory::NotAFork;
     };
     let created_at = meta_timestamp(&own_meta);
@@ -99,7 +101,9 @@ pub(crate) fn load_inherited_history(
         .map(|(id, _)| HashSet::from([id.to_owned()]))
         .unwrap_or_default();
     let mut segments: Vec<(String, crate::transcript::LoadedTranscript)> = Vec::new();
-    let mut search_date = own_partition;
+    // Built on the first lookup, so only a fork pays for the walk, and only
+    // once however long its chain is.
+    let index = RolloutIndex::build(home_dir);
     loop {
         let fail = |reason, rollout_id: &str| InheritedHistory::Unavailable {
             reason,
@@ -112,30 +116,34 @@ pub(crate) fn load_inherited_history(
         if !visited.insert(pointer.rollout_id.clone()) {
             return fail(InheritedHistoryGap::Cycle, &pointer.rollout_id);
         }
-        let (path, date) = match find_rollout(home_dir, &pointer.rollout_id, search_date) {
-            Ok(found) => found,
+        let path = match index.find(&pointer.rollout_id) {
+            Ok(path) => path,
             Err(reason) => return fail(reason, &pointer.rollout_id),
         };
         let prefix = match read_prefix(&path, pointer.end_byte_offset) {
             Ok(prefix) => prefix,
             Err(reason) => return fail(reason, &pointer.rollout_id),
         };
-        let next = match first_session_meta(&prefix).map(|meta| pointer_of(&meta)) {
-            None | Some(PointerField::Absent) => None,
-            Some(PointerField::Unreadable(rollout_id)) => {
+        // A file reached through a pointer must open with a readable header.
+        // Without one, nothing says whether it continues the chain, and
+        // treating it as the chain's start would show part of the history as
+        // all of it.
+        let Some(meta) = readable_header(&prefix) else {
+            return fail(InheritedHistoryGap::Changed, &pointer.rollout_id);
+        };
+        let next = match pointer_of(&meta) {
+            PointerField::Absent => None,
+            PointerField::Unreadable(rollout_id) => {
                 return fail(InheritedHistoryGap::Changed, &rollout_id);
             }
-            Some(PointerField::Present(next)) => Some(next),
+            PointerField::Present(next) => Some(next),
         };
         segments.push((
             pointer.rollout_id,
             parse_codex_transcript_content(&prefix, agent_id),
         ));
         match next {
-            Some(next) => {
-                pointer = next;
-                search_date = date;
-            }
+            Some(next) => pointer = next,
             None => break,
         }
     }
@@ -152,12 +160,23 @@ pub(crate) fn load_inherited_history(
     InheritedHistory::Loaded { turns, warnings }
 }
 
-/// The content's first record, if it is a `session_meta`. Codex writes it
-/// first; anything else means there is no pointer to follow.
-fn first_session_meta(content: &str) -> Option<Value> {
+/// The content's first record, if it is a `session_meta`. Codex writes one
+/// first in every rollout.
+fn session_meta_record(content: &str) -> Option<Value> {
     let first = content.lines().find(|line| !line.trim().is_empty())?;
     let record: Value = serde_json::from_str(first).ok()?;
     (record.get("type").and_then(Value::as_str) == Some("session_meta")).then_some(record)
+}
+
+/// The content's first record, if it is a `session_meta` whose payload names
+/// its session id. Every Codex rollout's header does, legacy ones included
+/// (`SessionMeta.id` is required). Used for a file reached through a pointer:
+/// there, a header with no pointer ends the chain, so it has to be a header
+/// that says so, not one that parses and says nothing
+/// (`{"type":"session_meta","payload":null}`).
+fn readable_header(content: &str) -> Option<Value> {
+    session_meta_record(content)
+        .filter(|record| record.pointer("/payload/id").is_some_and(Value::is_string))
 }
 
 /// When the session was created: the payload's own timestamp, else the
@@ -224,65 +243,96 @@ fn rollout_file_id(name: &str) -> Option<(&str, bool)> {
     Some((rollout_id, compressed))
 }
 
-/// The plain rollout files in `folder` carrying `rollout_id`, and whether a
-/// compressed one does.
-fn rollouts_in(folder: &Path, rollout_id: &str) -> (Vec<PathBuf>, bool) {
-    let mut plain = Vec::new();
-    let mut compressed = false;
-    let Ok(entries) = std::fs::read_dir(folder) else {
-        return (plain, compressed);
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some((id, is_compressed)) = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(rollout_file_id)
-        else {
-            continue;
-        };
-        if id != rollout_id {
-            continue;
-        }
-        if is_compressed {
-            compressed = true;
-        } else {
-            plain.push(path);
-        }
-    }
-    (plain, compressed)
+/// Where Codex keeps rollouts, in the order it searches them when following a
+/// `history_base`: its `find_rollout_path_by_rollout_id`
+/// (`codex-rs/rollout/src/list.rs` at `rust-v0.162.1`) walks `sessions`, then
+/// `archived_sessions`, and takes the first match. Archiving a session in Codex
+/// moves its file into the second, where it is stored flat rather than in date
+/// folders, and a fork of it keeps working.
+const ROLLOUT_TIERS: [&str; 2] = ["sessions", "archived_sessions"];
+
+/// The copies of one rollout within one tier.
+#[derive(Default)]
+struct Copies {
+    plain: Vec<PathBuf>,
+    compressed: bool,
 }
 
-/// Find the rollout carrying `rollout_id`, trying `first_try`'s folder before
-/// scanning every date folder.
-///
-/// More than one plain match is refused, as the attach lookup refuses it. A
-/// compressed copy matters only when no plain one exists.
-fn find_rollout(
-    home_dir: &Path,
-    rollout_id: &str,
-    first_try: NaiveDate,
-) -> Result<(PathBuf, NaiveDate), InheritedHistoryGap> {
-    let day = home_dir
-        .join(".codex")
-        .join("sessions")
-        .join(first_try.format("%Y/%m/%d").to_string());
-    let (plain, _) = rollouts_in(&day, rollout_id);
-    if let [only] = plain.as_slice() {
-        return Ok((only.clone(), first_try));
+/// Every rollout file under Codex's session folders, by tier and rollout id.
+struct RolloutIndex {
+    tiers: Vec<HashMap<String, Copies>>,
+}
+
+impl RolloutIndex {
+    /// Walk each tier recursively, as Codex does, so the archive's flat layout
+    /// and the dated `sessions` layout are read the same way. A folder that
+    /// can't be read is skipped rather than failing the whole lookup.
+    fn build(home_dir: &Path) -> Self {
+        let codex = home_dir.join(".codex");
+        let tiers = ROLLOUT_TIERS
+            .iter()
+            .map(|tier| {
+                let mut by_id: HashMap<String, Copies> = HashMap::new();
+                let mut folders = vec![codex.join(tier)];
+                while let Some(folder) = folders.pop() {
+                    let Ok(entries) = std::fs::read_dir(&folder) else {
+                        continue;
+                    };
+                    for entry in entries.flatten() {
+                        let Ok(file_type) = entry.file_type() else {
+                            continue;
+                        };
+                        let path = entry.path();
+                        if file_type.is_dir() {
+                            folders.push(path);
+                            continue;
+                        }
+                        // Regular files only, as Codex: a symlink, valid or
+                        // broken, is not a rollout it would read, so one named
+                        // like the original must not hide an archived copy.
+                        if !file_type.is_file() {
+                            continue;
+                        }
+                        let Some((id, compressed)) = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .and_then(rollout_file_id)
+                        else {
+                            continue;
+                        };
+                        let copies = by_id.entry(id.to_owned()).or_default();
+                        if compressed {
+                            copies.compressed = true;
+                        } else {
+                            copies.plain.push(path);
+                        }
+                    }
+                }
+                by_id
+            })
+            .collect();
+        Self { tiers }
     }
-    let mut plain = Vec::new();
-    let mut compressed = false;
-    for (folder, date) in session_day_folders(home_dir) {
-        let (found, found_compressed) = rollouts_in(&folder, rollout_id);
-        plain.extend(found.into_iter().map(|path| (path, date)));
-        compressed |= found_compressed;
-    }
-    match plain.len() {
-        1 => Ok(plain.remove(0)),
-        0 if compressed => Err(InheritedHistoryGap::Compressed),
-        0 => Err(InheritedHistoryGap::NotFound),
-        _ => Err(InheritedHistoryGap::Ambiguous),
+
+    /// The rollout carrying `rollout_id`, from the first tier that has one.
+    ///
+    /// Within that tier, more than one plain copy is refused, as the attach
+    /// lookup refuses it, because two copies could hold different
+    /// conversations. A copy in an earlier tier simply wins over a later one:
+    /// that is Codex's own order, so it is not a duplicate. A tier holding
+    /// only a compressed copy decides the answer too, as it would for Codex.
+    fn find(&self, rollout_id: &str) -> Result<PathBuf, InheritedHistoryGap> {
+        for tier in &self.tiers {
+            let Some(copies) = tier.get(rollout_id) else {
+                continue;
+            };
+            return match copies.plain.as_slice() {
+                [only] => Ok(only.clone()),
+                [] => Err(InheritedHistoryGap::Compressed),
+                _ => Err(InheritedHistoryGap::Ambiguous),
+            };
+        }
+        Err(InheritedHistoryGap::NotFound)
     }
 }
 
@@ -305,6 +355,11 @@ fn read_prefix(path: &Path, end_byte_offset: u64) -> Result<String, InheritedHis
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    use chrono::NaiveDate;
+
     use super::*;
     use crate::codex::session_file::load_codex_transcript;
     use crate::transcript::{LoadedTranscript, SystemMarker};
@@ -364,6 +419,18 @@ mod tests {
 
         fn rollout(&self, day: u32, id: &str, content: &str) {
             self.stage(day, id, ".jsonl", content);
+        }
+
+        /// Write `content` into `~/.codex/archived_sessions`, which Codex keeps
+        /// flat rather than in date folders.
+        fn archive(&self, ids: &str, extension: &str, content: &str) {
+            let folder = self.dir.path().join(".codex/archived_sessions");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(
+                folder.join(format!("rollout-2026-10-11T00-00-00-{ids}{extension}")),
+                content,
+            )
+            .unwrap();
         }
 
         fn load(&self, own_id: &str, day: u32) -> LoadedTranscript {
@@ -445,8 +512,8 @@ mod tests {
 
     #[test]
     fn a_fork_of_a_fork_shows_the_whole_chain_oldest_first() {
-        // The parent is in another day's folder, so the lookup has to fall back
-        // from the fork's own day to the full scan.
+        // The parent is in another day's folder: the lookup finds a rollout
+        // wherever Codex filed it, not only beside the fork.
         let home = Home::new();
         home.rollout(10, PARENT, &fixture("fork-parent"));
         home.rollout(11, CHILD, &fixture("fork-child"));
@@ -658,9 +725,12 @@ mod tests {
 
     #[test]
     fn two_files_carrying_the_parents_id_are_refused_rather_than_picked_from() {
+        // One copy sits beside the fork, where a shortcut would find it first;
+        // the other is in another day. Either could hold a different
+        // conversation, so neither is shown.
         let home = Home::new();
-        home.rollout(9, PARENT, &fixture("fork-parent"));
         home.rollout(10, PARENT, &fixture("fork-parent"));
+        home.rollout(11, PARENT, &fixture("fork-parent"));
         home.rollout(11, CHILD, &fixture("fork-child"));
 
         let transcript = home.load(CHILD, 11);
@@ -669,6 +739,192 @@ mod tests {
             markers(&transcript),
             [(InheritedHistoryGap::Ambiguous, PARENT)]
         );
+    }
+
+    #[test]
+    fn an_original_archived_in_codex_still_shows_its_history() {
+        // Codex follows a fork's pointer into `archived_sessions` too, so the
+        // fork keeps working; it must not be reported as missing.
+        let home = Home::new();
+        home.archive(PARENT, ".jsonl", &fixture("fork-parent"));
+        home.rollout(11, CHILD, &fixture("fork-child"));
+
+        let transcript = home.load(CHILD, 11);
+
+        assert!(
+            markers(&transcript).is_empty(),
+            "{:?}",
+            markers(&transcript)
+        );
+        assert_eq!(user_texts(&transcript)[..2], [PELICAN, CHILD_FIRST]);
+    }
+
+    #[test]
+    fn an_archived_grandparent_completes_the_chain() {
+        let home = Home::new();
+        home.archive(PARENT, ".jsonl", &fixture("fork-parent"));
+        home.rollout(11, CHILD, &fixture("fork-child"));
+        home.rollout(11, GRANDCHILD, &fixture("fork-grandchild"));
+
+        let transcript = home.load(GRANDCHILD, 11);
+
+        assert!(
+            markers(&transcript).is_empty(),
+            "{:?}",
+            markers(&transcript)
+        );
+        assert_eq!(user_texts(&transcript).len(), 4);
+        assert_eq!(user_texts(&transcript)[0], PELICAN);
+    }
+
+    #[test]
+    fn a_copy_in_sessions_wins_over_an_archived_copy_without_counting_as_a_duplicate() {
+        // Codex searches `sessions` first and stops there. The archived copy
+        // here is damaged, so reading it would produce a "changed" marker.
+        let home = Home::new();
+        home.rollout(10, PARENT, &fixture("fork-parent"));
+        home.archive(PARENT, ".jsonl", "not the parent\n");
+        home.rollout(11, CHILD, &fixture("fork-child"));
+
+        let transcript = home.load(CHILD, 11);
+
+        assert!(
+            markers(&transcript).is_empty(),
+            "{:?}",
+            markers(&transcript)
+        );
+        assert_eq!(user_texts(&transcript)[0], PELICAN);
+    }
+
+    #[test]
+    fn a_compressed_copy_in_sessions_decides_even_when_the_archive_has_a_plain_one() {
+        // Codex would read the compressed copy it finds first, so the fork
+        // works; Switchboard can't read it, and must say so rather than show
+        // the archived copy as if it were the one Codex uses.
+        let home = Home::new();
+        home.stage(10, PARENT, ".jsonl.zst", "not really zstd");
+        home.archive(PARENT, ".jsonl", &fixture("fork-parent"));
+        home.rollout(11, CHILD, &fixture("fork-child"));
+
+        let transcript = home.load(CHILD, 11);
+
+        assert_eq!(
+            markers(&transcript),
+            [(InheritedHistoryGap::Compressed, PARENT)]
+        );
+    }
+
+    #[test]
+    fn a_compressed_archived_original_is_told_apart_from_a_missing_one() {
+        let home = Home::new();
+        home.archive(PARENT, ".jsonl.zst", "not really zstd");
+        home.rollout(11, CHILD, &fixture("fork-child"));
+
+        let transcript = home.load(CHILD, 11);
+
+        assert_eq!(
+            markers(&transcript),
+            [(InheritedHistoryGap::Compressed, PARENT)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_named_like_the_original_does_not_hide_an_archived_copy() {
+        // Codex reads regular files only, so it runs this fork from the
+        // archived copy; the broken link in `sessions` must not stand in front
+        // of it and turn into a false "missing" line.
+        let home = Home::new();
+        let folder = home.dir.path().join(".codex/sessions/2026/10/11");
+        std::fs::create_dir_all(&folder).unwrap();
+        symlink(
+            home.dir.path().join("nowhere.jsonl"),
+            folder.join(format!("rollout-2026-10-11T00-00-00-{PARENT}.jsonl")),
+        )
+        .unwrap();
+        home.archive(PARENT, ".jsonl", &fixture("fork-parent"));
+        home.rollout(11, CHILD, &fixture("fork-child"));
+
+        let transcript = home.load(CHILD, 11);
+
+        assert!(
+            markers(&transcript).is_empty(),
+            "{:?}",
+            markers(&transcript)
+        );
+        assert_eq!(user_texts(&transcript)[0], PELICAN);
+    }
+
+    #[test]
+    fn a_forks_own_header_needs_only_its_pointer_to_be_followed() {
+        // The stricter "header names its session" rule is for files reached
+        // through a pointer. The fork's own header carries the pointer, which
+        // is enough.
+        let home = Home::new();
+        home.rollout(11, PARENT, &fixture("fork-parent"));
+        let child = fixture("fork-child");
+        let without_id = child.replacen(&format!(r#""id":"{CHILD}","#), "", 1);
+        assert_ne!(without_id, child, "the fixture's header lost its id field");
+        home.rollout(11, CHILD, &without_id);
+
+        let transcript = home.load(CHILD, 11);
+
+        assert!(
+            markers(&transcript).is_empty(),
+            "{:?}",
+            markers(&transcript)
+        );
+        assert_eq!(user_texts(&transcript)[..2], [PELICAN, CHILD_FIRST]);
+    }
+
+    /// The fork-child fixture with its header line replaced by `header`,
+    /// padded with spaces to the same byte length, so the grandchild's
+    /// cut-off (the whole file) still matches and ends on a line break.
+    fn child_with_header(header: &str) -> String {
+        let child = fixture("fork-child");
+        let (first, rest) = child.split_once('\n').unwrap();
+        assert!(header.len() <= first.len());
+        format!("{header}{}\n{rest}", " ".repeat(first.len() - header.len()))
+    }
+
+    #[test]
+    fn a_middle_fork_whose_header_is_unreadable_breaks_the_chain() {
+        // Without its header, nothing says the middle fork continues the
+        // chain; showing its turns as the start would hide the parent's.
+        let home = Home::new();
+        home.rollout(11, PARENT, &fixture("fork-parent"));
+        home.rollout(11, CHILD, &child_with_header("not json at all"));
+        home.rollout(11, GRANDCHILD, &fixture("fork-grandchild"));
+
+        let transcript = home.load(GRANDCHILD, 11);
+
+        assert_eq!(
+            markers(&transcript),
+            [(InheritedHistoryGap::Changed, CHILD)]
+        );
+        assert_eq!(user_texts(&transcript), [GRANDCHILD_ONLY]);
+    }
+
+    #[test]
+    fn a_middle_fork_whose_header_parses_but_says_nothing_breaks_the_chain() {
+        // Valid JSON of the right type, but no session in it: "no pointer"
+        // must come from a header that says so, not from an empty one.
+        let home = Home::new();
+        home.rollout(11, PARENT, &fixture("fork-parent"));
+        home.rollout(
+            11,
+            CHILD,
+            &child_with_header(r#"{"type":"session_meta","payload":null}"#),
+        );
+        home.rollout(11, GRANDCHILD, &fixture("fork-grandchild"));
+
+        let transcript = home.load(GRANDCHILD, 11);
+
+        assert_eq!(
+            markers(&transcript),
+            [(InheritedHistoryGap::Changed, CHILD)]
+        );
+        assert_eq!(user_texts(&transcript), [GRANDCHILD_ONLY]);
     }
 
     #[test]

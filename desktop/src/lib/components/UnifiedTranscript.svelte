@@ -118,10 +118,8 @@
         return { copyable: marker.command, label: "Copy command" };
       case "inherited_history_unavailable": {
         const notice = inheritedHistoryNotice(marker.reason);
-        return {
-          copyable: `${notice.title}. ${notice.detail} Codex session ${marker.rollout_id}`,
-          label: "Copy notice",
-        };
+        const session = marker.rollout_id ? ` Codex session ${marker.rollout_id}` : "";
+        return { copyable: `${notice.title}. ${notice.detail}${session}`, label: "Copy notice" };
       }
       default:
         return { copyable: "", label: "Copy" };
@@ -2438,9 +2436,11 @@
         <div class="space-y-1 text-xs" data-testid="inherited-history-marker">
           <div class="text-warning font-semibold">{notice.title}</div>
           <p class="text-muted">{notice.detail}</p>
-          <p class="text-muted">
-            Codex session <span class="font-mono">{row.marker.rollout_id}</span>
-          </p>
+          {#if row.marker.rollout_id}
+            <p class="text-muted" data-testid="inherited-history-session">
+              Codex session <span class="font-mono">{row.marker.rollout_id}</span>
+            </p>
+          {/if}
         </div>
       {/if}
       <!-- Unknown marker_kind: render nothing (degrade gracefully on a future

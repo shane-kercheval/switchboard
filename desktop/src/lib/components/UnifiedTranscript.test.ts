@@ -4103,6 +4103,31 @@ describe("UnifiedTranscript compact mode", () => {
     expect(marker.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
+  it("leaves out the session line when the marker names no session", async () => {
+    // A fork whose pointer named no session still explains the gap, without a
+    // dangling "Codex session" label.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    const overlay: ConversationItem[] = [
+      {
+        kind: "system_marker",
+        id: "marker-1",
+        agent_id: CODEX_AGENT.id,
+        marker: { marker_kind: "inherited_history_unavailable", reason: "changed", rollout_id: "" },
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CODEX_AGENT], overlay },
+    });
+
+    expect(screen.getByTestId("inherited-history-marker")).toHaveTextContent(
+      "Earlier conversation unavailable",
+    );
+    expect(screen.queryByTestId("inherited-history-session")).toBeNull();
+  });
+
   it("words a compressed parent differently from a missing one", async () => {
     // A compressed parent doesn't stop the agent: Codex still reads it. The
     // marker must not tell the user their working fork is broken.

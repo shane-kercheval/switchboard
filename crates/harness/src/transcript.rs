@@ -107,7 +107,8 @@ pub enum SystemMarker {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum InheritedHistoryGap {
-    /// No rollout with that id under `~/.codex/sessions`. Probed: Codex then
+    /// No rollout with that id under `~/.codex/sessions` or
+    /// `~/.codex/archived_sessions`, the two places Codex looks. Probed: Codex then
     /// refuses to run the fork until the file is restored.
     NotFound,
     /// Only a compressed copy (`rollout-*.jsonl.zst`) exists. Codex can read

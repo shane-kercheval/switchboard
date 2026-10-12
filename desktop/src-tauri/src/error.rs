@@ -355,6 +355,18 @@ pub enum AppError {
         expected_path: String,
     },
 
+    /// Fork: Codex couldn't create the fork. Nothing was registered; the
+    /// message says why, in Codex's words where it gave any.
+    #[error(transparent)]
+    CodexFork(#[from] switchboard_harness::CodexForkError),
+
+    /// Fork: this process runs with mock harnesses and spawns no CLIs, and a
+    /// Codex fork has to be created by the real Codex CLI. Said plainly rather
+    /// than reported as a missing session, which would send a developer
+    /// looking for the wrong problem.
+    #[error("Codex forks need the real Codex CLI, and Switchboard is running with mock harnesses")]
+    CodexForkNeedsRealHarness,
+
     /// Transcript hydration failed at the lookup-mechanism level (I/O on a
     /// file that exists, registry lookup failure). Per-line parse damage
     /// degrades silently to warnings inside `LoadedTranscript` — it does

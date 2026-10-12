@@ -148,9 +148,9 @@ pub enum CoreError {
     },
 
     /// Deliberately a statement about **Switchboard's support**, not about what
-    /// the harness's CLI can do — Codex, for one, can branch a session (through
-    /// an integration Switchboard doesn't wire). Claiming otherwise would be
-    /// false, and this message is the source for the user-facing explanation on
+    /// the harness's CLI can do: Antigravity, for one, forks conversations
+    /// server-side on its own initiative. Claiming otherwise would be false, and
+    /// this message is the source for the user-facing explanation on
     /// non-forkable agents.
     #[error(
         "Switchboard does not support forking {harness} sessions \

@@ -15,7 +15,9 @@ use std::time::Duration;
 use switchboard_harness::{AccountUsageError, read_account_usage};
 
 #[cfg(unix)]
-use nix::unistd::{Pid, getpgid};
+mod common;
+#[cfg(unix)]
+use common::{assert_group_reaped, wait_for_pgid};
 
 const FAKE_CODEX: &str = env!("CARGO_BIN_EXE_fake_codex");
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex");
@@ -232,33 +234,6 @@ async fn stderr_from_a_failed_read_reaches_the_error_message() {
     );
 }
 
-/// Poll until `path` holds a parseable pgid; bounded so a spawn failure panics
-/// with a message rather than hanging the suite.
-#[cfg(unix)]
-async fn wait_for_pgid(path: &Path) -> Pid {
-    for _ in 0..200 {
-        if let Ok(s) = std::fs::read_to_string(path)
-            && let Ok(n) = s.trim().parse::<i32>()
-        {
-            return Pid::from_raw(n);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("fake_codex never wrote its pgid at {}", path.display());
-}
-
-/// Poll until the process group's leader is gone (`getpgid` → `ESRCH`).
-#[cfg(unix)]
-async fn assert_group_reaped(leader: Pid) {
-    for _ in 0..200 {
-        if getpgid(Some(leader)).is_err() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("process group {leader} still alive after the read returned");
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn a_hung_server_times_out_and_leaves_no_process_behind() {
@@ -272,7 +247,7 @@ async fn a_hung_server_times_out_and_leaves_no_process_behind() {
     std::fs::write(
         &fixture,
         format!(
-            "// pgid_to:{}\n// stderr:wedged before answering\n// hang\n",
+            "// pgid_to:{}\n// spawn_child_holding_stderr\n// stderr:wedged before answering\n// hang\n",
             pgid_path.display()
         ),
     )
@@ -325,7 +300,10 @@ async fn abandoning_the_call_still_tears_the_server_down() {
     let fixture = dir.path().join("hang.jsonl");
     std::fs::write(
         &fixture,
-        format!("// pgid_to:{}\n// hang\n", pgid_path.display()),
+        format!(
+            "// pgid_to:{}\n// spawn_child_holding_stderr\n// hang\n",
+            pgid_path.display()
+        ),
     )
     .unwrap();
     let shim = codex_shim(dir.path(), &fixture);
@@ -355,7 +333,10 @@ async fn the_server_is_killed_after_a_successful_read_too() {
     let fixture = dir.path().join("answer-then-hang.jsonl");
     std::fs::write(
         &fixture,
-        format!("// pgid_to:{}\n{answer}\n// hang\n", pgid_path.display()),
+        format!(
+            "// pgid_to:{}\n// spawn_child_holding_stderr\n{answer}\n// hang\n",
+            pgid_path.display()
+        ),
     )
     .unwrap();
     let shim = codex_shim(dir.path(), &fixture);

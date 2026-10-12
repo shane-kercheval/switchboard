@@ -135,6 +135,7 @@ afterEach(async () => {
   cleanup();
   const { _testing } = await loadState();
   _testing.reset();
+  (await import("$lib/state/workspace.svelte"))._testing.reset();
   previewState.reset();
   (await import("$lib/state/transcriptJump.svelte"))._testing.reset();
   (await import("$lib/state/messagePins.svelte"))._testing.reset();
@@ -2749,6 +2750,53 @@ describe("UnifiedTranscript hydration failures", () => {
     expect(copyTextMock).toHaveBeenCalledWith("journal read failed at /work/journal.jsonl");
   });
 
+  it("keeps the project-load Retry unavailable while any agent is replying", async () => {
+    // It rereads every agent, and a reply still being written would show twice.
+    const state = await loadState();
+    const ws = await import("$lib/state/workspace.svelte");
+    await state.registerAgent(CLAUDE_AGENT);
+    ws.agentsByProject[PROJECT_ID] = [CLAUDE_AGENT];
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...state.runtimes[CLAUDE_AGENT.id]!,
+      run_status: "processing",
+    };
+    const onRetryLoad = vi.fn();
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT],
+        loadStatus: "failed",
+        loadError: "journal read failed",
+        onRetryLoad,
+      },
+    });
+    const retry = screen.getByTestId("transcript-load-failed-retry");
+    expect(retry).toHaveAttribute("aria-disabled", "true");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.pointerEnter(retry);
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(screen.getByTestId("tooltip-content")).toHaveTextContent(
+        "Retry is available once every agent in this project has finished replying",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    await fireEvent.click(retry);
+    expect(onRetryLoad).not.toHaveBeenCalled();
+
+    state.runtimes[CLAUDE_AGENT.id] = { ...state.runtimes[CLAUDE_AGENT.id]!, run_status: "idle" };
+    await waitFor(() =>
+      expect(screen.getByTestId("transcript-load-failed-retry")).not.toHaveAttribute(
+        "aria-disabled",
+      ),
+    );
+    await fireEvent.click(screen.getByTestId("transcript-load-failed-retry"));
+    expect(onRetryLoad).toHaveBeenCalledTimes(1);
+  });
+
   it("suppresses the empty-state message when the project load failed", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
@@ -2810,7 +2858,26 @@ describe("UnifiedTranscript hydration failures", () => {
     );
   });
 
-  it("Retry on a per-agent banner re-invokes load_transcript and clears the banner on success", async () => {
+  /// A project whose history has loaded with `agent` in it, answering the
+  /// project read an agent's Retry makes with `read`.
+  async function loadedProjectWith(
+    agent: AgentRecord,
+    read: () => Promise<unknown>,
+  ): Promise<void> {
+    const ws = await import("$lib/state/workspace.svelte");
+    ws.agentsByProject[PROJECT_ID] = [agent];
+    ws.conversations[PROJECT_ID] = { items: [], status: "complete" };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") return await read();
+      return cmd === "project_session_fingerprints" ? [] : null;
+    });
+  }
+
+  function loadedAgent(agent: AgentRecord): unknown {
+    return { items: [], agents: [{ agent_id: agent.id, warnings: [], load_error: null }] };
+  }
+
+  it("Retry on a per-agent banner rereads through the project read and clears the banner on success", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     const rt = state.runtimes[CLAUDE_AGENT.id];
@@ -2820,26 +2887,106 @@ describe("UnifiedTranscript hydration failures", () => {
       hydration_status: "failed",
       hydration_error: "permission denied",
     };
+    await loadedProjectWith(CLAUDE_AGENT, async () => loadedAgent(CLAUDE_AGENT));
 
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     expect(screen.getByTestId("agent-hydration-failed")).toBeInTheDocument();
 
-    // Retry re-runs hydration; stage a successful load.
-    invokeMock.mockResolvedValueOnce({
-      turns: [],
-      meta: null,
-      last_rate_limit: null,
-      warnings: [],
-    });
     await fireEvent.click(screen.getByTestId("agent-hydration-failed-retry"));
 
     await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("load_transcript", { agentId: CLAUDE_AGENT.id }),
+      expect(invokeMock).toHaveBeenCalledWith("load_project_conversation", {
+        projectId: PROJECT_ID,
+      }),
     );
     await waitFor(() => expect(screen.queryByTestId("agent-hydration-failed")).toBeNull());
     expect(state.runtimes[CLAUDE_AGENT.id]?.hydration_status).toBe("complete");
     expect(state.runtimes[CLAUDE_AGENT.id]?.hydration_error).toBeUndefined();
+  });
+
+  it("keeps the per-agent Retry unavailable until the project's history has loaded", async () => {
+    // Retry rereads through the project read, which needs the project loaded;
+    // until then the project's own load reads this agent too.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...state.runtimes[CLAUDE_AGENT.id]!,
+      hydration_status: "failed",
+      hydration_error: "permission denied",
+    };
+    await loadedProjectWith(CLAUDE_AGENT, async () => loadedAgent(CLAUDE_AGENT));
+    const ws = await import("$lib/state/workspace.svelte");
+    ws.conversations[PROJECT_ID] = { items: [], status: "loading" };
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const retry = screen.getByTestId("agent-hydration-failed-retry");
+    expect(retry).toHaveAttribute("aria-disabled", "true");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.pointerEnter(retry);
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(screen.getByTestId("tooltip-content")).toHaveTextContent(
+        "Retry is available once the project's history has loaded.",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    await fireEvent.click(retry);
+    expect(invokeMock).not.toHaveBeenCalledWith("load_project_conversation", expect.anything());
+
+    ws.conversations[PROJECT_ID] = { items: [], status: "complete" };
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-hydration-failed-retry")).not.toHaveAttribute(
+        "aria-disabled",
+      ),
+    );
+  });
+
+  it("keeps the per-agent Retry unavailable while the agent is replying", async () => {
+    // A reread while a reply is still being written finds a half-written copy
+    // that can't be matched to the one on screen, so it would show twice.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...state.runtimes[CLAUDE_AGENT.id]!,
+      run_status: "processing",
+      hydration_status: "failed",
+      hydration_error: "permission denied",
+    };
+
+    await loadedProjectWith(CLAUDE_AGENT, async () => loadedAgent(CLAUDE_AGENT));
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const retry = screen.getByTestId("agent-hydration-failed-retry");
+    expect(retry).toHaveAttribute("aria-disabled", "true");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.pointerEnter(retry);
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(screen.getByTestId("tooltip-content")).toHaveTextContent(
+        `Retry is available once ${CLAUDE_AGENT.name} has finished replying`,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    await fireEvent.click(retry);
+    expect(invokeMock).not.toHaveBeenCalledWith("load_project_conversation", expect.anything());
+
+    state.runtimes[CLAUDE_AGENT.id] = { ...state.runtimes[CLAUDE_AGENT.id]!, run_status: "idle" };
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-hydration-failed-retry")).not.toHaveAttribute(
+        "aria-disabled",
+      ),
+    );
+    await fireEvent.click(screen.getByTestId("agent-hydration-failed-retry"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("load_project_conversation", {
+        projectId: PROJECT_ID,
+      }),
+    );
   });
 
   it("keeps the per-agent banner when Retry fails again", async () => {
@@ -2853,10 +3000,13 @@ describe("UnifiedTranscript hydration failures", () => {
       hydration_error: "first error",
     };
 
+    await loadedProjectWith(CLAUDE_AGENT, async () => {
+      throw new Error("still broken");
+    });
+
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    invokeMock.mockRejectedValueOnce(new Error("still broken"));
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     await fireEvent.click(screen.getByTestId("agent-hydration-failed-retry"));
 
@@ -4056,6 +4206,105 @@ describe("UnifiedTranscript compact mode", () => {
       "data-agent-id",
       CLAUDE_AGENT.id,
     );
+  });
+
+  it("explains a Codex fork's missing earlier conversation above the fork's own turns", async () => {
+    // The loader couldn't follow the fork's pointer into its parent's session
+    // file, so it sent the fork's own turns plus this marker, stamped at the
+    // fork's creation. Both must render: the turns are real, and the marker
+    // says why nothing comes before them.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CODEX_AGENT.id] = [
+      user(CODEX_AGENT, "send-a", "u-a", "2026-05-16T00:00:10Z"),
+      done(CODEX_AGENT, "send-a", "a-1", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        ANSWER("the fork's own answer"),
+      ]),
+    ];
+    const overlay: ConversationItem[] = [
+      {
+        kind: "system_marker",
+        id: "marker-1",
+        agent_id: CODEX_AGENT.id,
+        marker: {
+          marker_kind: "inherited_history_unavailable",
+          reason: "not_found",
+          rollout_id: "01a12c22-a3f8-71e2-b51e-ca72562cfabb",
+        },
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CODEX_AGENT], overlay },
+    });
+
+    const marker = screen.getByTestId("inherited-history-marker");
+    expect(marker).toHaveTextContent("Earlier conversation unavailable");
+    expect(marker).toHaveTextContent("can't continue this agent until that file is restored");
+    expect(marker).toHaveTextContent("01a12c22-a3f8-71e2-b51e-ca72562cfabb");
+    expect(marker.closest('[data-testid="system-marker"]')).toHaveAttribute(
+      "data-agent-id",
+      CODEX_AGENT.id,
+    );
+    expect(screen.getByText("the fork's own answer")).toBeInTheDocument();
+    // Above the fork's own turns, not after them.
+    const answer = screen.getByText("the fork's own answer");
+    expect(marker.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("leaves out the session line when the marker names no session", async () => {
+    // A fork whose pointer named no session still explains the gap, without a
+    // dangling "Codex session" label.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    const overlay: ConversationItem[] = [
+      {
+        kind: "system_marker",
+        id: "marker-1",
+        agent_id: CODEX_AGENT.id,
+        marker: { marker_kind: "inherited_history_unavailable", reason: "changed", rollout_id: "" },
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CODEX_AGENT], overlay },
+    });
+
+    expect(screen.getByTestId("inherited-history-marker")).toHaveTextContent(
+      "Earlier conversation unavailable",
+    );
+    expect(screen.queryByTestId("inherited-history-session")).toBeNull();
+  });
+
+  it("words a compressed parent differently from a missing one", async () => {
+    // A compressed parent doesn't stop the agent: Codex still reads it. The
+    // marker must not tell the user their working fork is broken.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    const overlay: ConversationItem[] = [
+      {
+        kind: "system_marker",
+        id: "marker-1",
+        agent_id: CODEX_AGENT.id,
+        marker: {
+          marker_kind: "inherited_history_unavailable",
+          reason: "compressed",
+          rollout_id: "01a12c22-a3f8-71e2-b51e-ca72562cfabb",
+        },
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CODEX_AGENT], overlay },
+    });
+
+    const marker = screen.getByTestId("inherited-history-marker");
+    expect(marker).toHaveTextContent("Earlier conversation not shown");
+    expect(marker).toHaveTextContent("still has the earlier conversation");
+    expect(marker).not.toHaveTextContent("can't continue");
   });
 
   it("hides tool calls and thinking widgets in a compact completed response", async () => {

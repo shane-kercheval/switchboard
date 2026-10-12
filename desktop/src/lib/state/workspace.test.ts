@@ -6,6 +6,7 @@ import type {
   ConversationItem,
   ProjectConversation,
   ProjectListing,
+  TurnOutcome,
 } from "$lib/types";
 
 const invokeMock = vi.fn(
@@ -27,6 +28,21 @@ const listenMock = vi.fn(async (name: string, cb: (e: { payload: unknown }) => v
 vi.mock("@tauri-apps/api/event", () => ({
   listen: (name: string, cb: (e: { payload: unknown }) => void) => listenMock(name, cb),
 }));
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/// Let pending IPC replies and the work queued behind them run. The fake IPC
+/// resolves at once, but a read is several awaits deep, so one microtask is not
+/// enough to observe that it happened, or that it didn't.
+async function flushAsync(): Promise<void> {
+  for (let i = 0; i < 5; i += 1) await new Promise((r) => setTimeout(r, 0));
+}
 
 function fireTo(channel: string, payload: unknown): void {
   const cb = listeners.get(channel);
@@ -619,6 +635,153 @@ describe("project staleness refresh", () => {
     ]);
   });
 
+  it("carries the rate-limit model onto the window a restored reading delivers", async () => {
+    const ws = await loadWorkspaceState();
+    const usage = await import("./harnessUsage.svelte");
+    installBackend([agent(AGENT_1, PROJECT_1)]);
+    conversation = {
+      items: [],
+      agents: [
+        {
+          agent_id: AGENT_1,
+          meta: null,
+          last_rate_limit: {
+            unifiedWindows: {
+              seven_day_overage_included: { utilization: 0.79, resetsAt: 1_800_000_000 },
+            },
+          },
+          last_rate_limit_model: "claude-fable-5-1",
+          last_rate_limit_as_of: "2026-09-17T12:00:00Z",
+          warnings: [],
+          load_error: null,
+        },
+      ],
+    };
+
+    await ws.activateProject(PROJECT_1);
+
+    await vi.waitFor(() =>
+      expect(usage.harnessUsage.claude_code?.windows?.seven_day_overage_included?.model).toBe(
+        "claude-fable-5-1",
+      ),
+    );
+    // **No contributing turn**, unlike a live reading. A restored window
+    // describes a turn that has already ended, so no live turn can claim to have
+    // measured it and none may name it.
+    expect(
+      usage.harnessUsage.claude_code?.windows?.seven_day_overage_included?.turn_id,
+    ).toBeUndefined();
+  });
+
+  it("does not restore a Codex reading from the rollout snapshot", async () => {
+    // The restored shape is the one-unnamed-bucket payload the account read
+    // replaces, so it would put the old shape back on screen at project open.
+    // The backend no longer sends one; this pins the frontend's own capability
+    // gate, so a harness that starts reporting a rollout reading again can't
+    // reach the store without that decision being made deliberately.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const usage = await import("./harnessUsage.svelte");
+    installBackend([{ ...agent(AGENT_1, PROJECT_1), harness: "codex" }]);
+    conversation = {
+      items: [],
+      agents: [
+        {
+          agent_id: AGENT_1,
+          meta: null,
+          last_rate_limit: { primary: { used_percent: 93, resets_at: 1_800_000_000 } },
+          last_rate_limit_as_of: "2026-09-17T12:00:00Z",
+          warnings: [],
+          load_error: null,
+        },
+      ],
+    };
+
+    await ws.activateProject(PROJECT_1);
+
+    await vi.waitFor(() => expect(ws.conversations[PROJECT_1]?.status).toBe("complete"));
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(usage.harnessUsage.codex).toBeUndefined();
+  });
+
+  it("keeps a live inventory that lands before the project read resolves, with no age", async () => {
+    // Ordering race: the hydrate fills meta only where absent, so a live
+    // `session_meta` that arrives first wins, and the saved snapshot's capture
+    // time must not be stamped onto it. An "as of" on a live inventory would
+    // age it past the staleness threshold.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend([agent(AGENT_1, PROJECT_1)]);
+    const backend = invokeMock.getMockImplementation()!;
+    const read = deferred<ProjectConversation>();
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "load_project_conversation" ? await read.promise : await backend(cmd, args),
+    );
+
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("load_project_conversation", expect.anything()),
+    );
+    fireTo(`agent:${AGENT_1}`, {
+      type: "session_meta",
+      agent_id: AGENT_1,
+      model: "claude-fable-5-1",
+      harness_version: "2.1.274",
+      inventory: { mcp_servers: [{ name: "gmail", status: "connected" }] },
+      raw: {},
+    });
+    read.resolve({
+      items: [],
+      agents: [
+        {
+          agent_id: AGENT_1,
+          meta: {
+            model: "claude-fable-5-1",
+            harness_version: "",
+            inventory: { mcp_servers: [{ name: "gmail", status: "needs-auth" }] },
+          },
+          last_rate_limit: null,
+          meta_as_of: "2026-09-17T12:00:00Z",
+          warnings: [],
+          load_error: null,
+        },
+      ],
+    });
+
+    await vi.waitFor(() => expect(ws.conversations[PROJECT_1]?.status).toBe("complete"));
+    expect(state.runtimes[AGENT_1]?.meta?.inventory.mcp_servers).toEqual([
+      { name: "gmail", status: "connected" },
+    ]);
+    expect(state.runtimes[AGENT_1]?.meta_as_of).toBeNull();
+  });
+
+  it("does not promote an agent's parse warnings onto its runtime", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend([agent(AGENT_1, PROJECT_1)]);
+    conversation = {
+      items: [],
+      agents: [
+        {
+          agent_id: AGENT_1,
+          meta: null,
+          last_rate_limit: null,
+          warnings: Array.from({ length: 500 }, (_, index) => ({
+            line_number: index + 1,
+            reason: `aggregate warning ${index + 1}`,
+          })),
+          load_error: null,
+        },
+      ],
+    };
+
+    await ws.activateProject(PROJECT_1);
+
+    await vi.waitFor(() => expect(ws.conversations[PROJECT_1]?.status).toBe("complete"));
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(state.runtimes[AGENT_1]).not.toHaveProperty("parse_warnings");
+  });
+
   it("re-reads on reactivation when a refresh-capable file advanced; the new turn appears exactly once", async () => {
     const ws = await loadWorkspaceState();
     const state = await loadAgentState();
@@ -705,6 +868,51 @@ describe("project staleness refresh", () => {
     fingerprints = [fp(AGENT_1, false, "2026-05-20T00:05:00Z", 999)];
     expect(await ws.activateProject(PROJECT_1)).toBe("activated");
     expect(loadCount).toBe(1);
+  });
+
+  it("still picks up an agent's outside turns on switch-back after a fork's reread", async () => {
+    // The fork's reread captures every agent's file but merges only the fork.
+    // Had it saved the Claude agent's newer file as seen, the switch-back below
+    // would skip the turn the user ran in a terminal.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    panes._testing.reset();
+    const FORK = "00000000-0000-7000-8000-0000000000c1";
+    const codexParent: AgentRecord = {
+      ...agent(AGENT_2, PROJECT_1),
+      harness: "codex",
+      session_locator: { codex: { thread_id: "thread-b", partition_date: "2026-10-11" } },
+    };
+    installBackend([agent(AGENT_1, PROJECT_1), codexParent]);
+    const backend = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "fork_agent"
+        ? { ...codexParent, id: FORK, name: "cx-fork" }
+        : await backend(cmd, args),
+    );
+    fingerprints = [fp(AGENT_1, true, "2026-05-20T00:00:00Z", 100), fp(AGENT_2, false, null)];
+    conversation = convo([agentTurnItem("t1", "K1", "2026-05-20T00:00:01Z")]);
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(state.transcripts[AGENT_1]?.length).toBe(1));
+
+    // The user continues the Claude agent in a terminal, then forks the Codex one.
+    fingerprints = [
+      fp(AGENT_1, true, "2026-05-20T00:05:00Z", 250),
+      fp(AGENT_2, false, null),
+      fp(FORK, false, null),
+    ];
+    conversation = convo([
+      agentTurnItem("t1-reparse", "K1", "2026-05-20T00:00:01Z"),
+      agentTurnItem("t2", "K2", "2026-05-20T00:06:00Z"),
+    ]);
+    await ws.forkAgentWithoutSending(AGENT_2);
+    await vi.waitFor(() => expect(state.runtimes[FORK]?.hydration_status).toBe("complete"));
+    expect(agentKeys(state)).toEqual(["K1"]);
+
+    expect(await ws.activateProject(PROJECT_1)).toBe("activated");
+
+    expect(agentKeys(state).sort()).toEqual(["K1", "K2"]);
   });
 
   it("preserves a live in-flight turn across a refresh", async () => {
@@ -1029,7 +1237,10 @@ describe("forkAgentIntoOwnPane", () => {
     expect(parentPane?.members).toContain(parent.id);
   });
 
-  it("keeps only the fork source in an untouched all-agent pane", async () => {
+  it("splits the unified view without hiding any agent it showed", async () => {
+    // A fork isn't a layout gesture: the header's "+" keeps only the compose
+    // selection in the first pane, but a fork leaves every other agent where it
+    // was and only gives the branch a pane of its own.
     const ws = await loadWorkspaceState();
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const parent = agent(AGENT_1, PROJECT_1);
@@ -1049,9 +1260,9 @@ describe("forkAgentIntoOwnPane", () => {
     const rosterIds = [...originalRoster, FORK_ID];
     const parentPane = panes.paneOfAgent(PROJECT_1, rosterIds, parent.id);
     const forkPane = panes.paneOfAgent(PROJECT_1, rosterIds, FORK_ID);
-    expect(parentPane?.members).toEqual([parent.id]);
+    expect(parentPane?.members).toEqual(originalRoster);
     expect(forkPane?.members).toEqual([FORK_ID]);
-    expect(panes.unassignedAgentIds(PROJECT_1, rosterIds)).toEqual([codex.id, antigravity.id]);
+    expect(panes.unassignedAgentIds(PROJECT_1, rosterIds)).toEqual([]);
   });
 
   it("makes the branch visible when the user is in focus mode", async () => {
@@ -1471,6 +1682,765 @@ describe("forked-agent inherited-history refresh", () => {
     fireTurnEnd(AGENT_1, "completed");
     await settle();
     expect(loads()).toBe(before);
+  });
+});
+
+describe("eager (Codex) fork inherited history", () => {
+  const FORK_A = "00000000-0000-7000-8000-0000000000c1";
+  const FORK_B = "00000000-0000-7000-8000-0000000000c2";
+
+  beforeEach(async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    panes._testing.reset();
+  });
+
+  function codexAgent(id: string, name: string): AgentRecord {
+    return {
+      ...agent(id, PROJECT_1),
+      name,
+      harness: "codex",
+      session_locator: {
+        codex: { thread_id: `thread-${id.slice(-2)}`, partition_date: "2026-10-11" },
+      },
+    };
+  }
+
+  /// The project as the backend merges it once `forks` exist: each fork's
+  /// inherited prompt is an imported user message (no send), and its inherited
+  /// reply an agent turn carrying the parent's hydration key.
+  function conversationWith(forks: string[]): ProjectConversation {
+    return {
+      items: forks.flatMap((fork) => [
+        {
+          kind: "user_message" as const,
+          id: `imported-${fork}`,
+          send_id: null,
+          agent_ids: [fork],
+          text: `inherited prompt for ${fork}`,
+          at: "2026-05-15T00:00:00Z",
+        },
+        {
+          kind: "agent_turn" as const,
+          turn_id: `inherited-reply-${fork}`,
+          agent_id: fork,
+          send_id: null,
+          started_at: "2026-05-15T00:00:01Z",
+          ended_at: "2026-05-15T00:00:02Z",
+          status: "complete" as const,
+          items: [{ item_kind: "text" as const, kind: "text" as const, text: "inherited reply" }],
+          hydration_key: "parent-key",
+        },
+      ]),
+      agents: [AGENT_1, ...forks].map((agentId) => ({ agent_id: agentId, warnings: [] })),
+    };
+  }
+
+  function importedTexts(ws: Awaited<ReturnType<typeof loadWorkspaceState>>): string[] {
+    return (ws.conversations[PROJECT_1]?.items ?? [])
+      .filter((item) => item.kind === "user_message" && item.send_id == null)
+      .map((item) => (item.kind === "user_message" ? item.text : ""));
+  }
+
+  /// A hydrated project holding the Codex parent, with the IPC routed by
+  /// `respond` and every IPC command recorded in order.
+  async function codexProject(respond: (cmd: string, args: unknown) => Promise<unknown>): Promise<{
+    ws: Awaited<ReturnType<typeof loadWorkspaceState>>;
+    state: Awaited<ReturnType<typeof loadAgentState>>;
+    calls: string[];
+  }> {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const parent = codexAgent(AGENT_1, "cx");
+    const calls: string[] = [];
+    let opened = false;
+    invokeMock.mockImplementation(async (cmd: string, args: unknown) => {
+      if (!opened) {
+        return cmd === "load_project_conversation"
+          ? ({ items: [], agents: [] } satisfies ProjectConversation)
+          : undefined;
+      }
+      calls.push(cmd);
+      return await respond(cmd, args);
+    });
+    ws.agentsByProject[PROJECT_1] = [parent];
+    await state.registerAgent(parent);
+    await ws.hydrateProject(PROJECT_1);
+    expect(ws.conversations[PROJECT_1]?.status).toBe("complete");
+    opened = true;
+    return { ws, state, calls };
+  }
+
+  it("loads the fork's inherited history before returning, with no pending notice", async () => {
+    // Returning only after the read means the compose flow's send comes after
+    // it, so the earlier conversation is on screen before the first reply and
+    // the read never overlaps the fork's live turn.
+    const { ws, state, calls } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") return conversationWith([FORK_A]);
+      return undefined;
+    });
+
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+
+    expect(calls).toContain("load_project_conversation");
+    expect(ws.isAwaitingForkHistory(FORK_A)).toBe(false);
+    expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
+    expect(state.transcripts[FORK_A]?.length).toBeGreaterThan(0);
+  });
+
+  it("shows each inherited message once after overlapping forks and a project refresh", async () => {
+    let forks = 0;
+    const { ws } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") {
+        forks += 1;
+        return forks === 1 ? codexAgent(FORK_A, "cx-fork") : codexAgent(FORK_B, "cx-fork-2");
+      }
+      if (cmd === "load_project_conversation") return conversationWith([FORK_A, FORK_B]);
+      return undefined;
+    });
+
+    await Promise.all([ws.forkAgentIntoOwnPane(AGENT_1), ws.forkAgentIntoOwnPane(AGENT_1)]);
+    await ws.retryProjectHydration(PROJECT_1);
+
+    expect(importedTexts(ws).sort()).toEqual(
+      [`inherited prompt for ${FORK_A}`, `inherited prompt for ${FORK_B}`].sort(),
+    );
+    // Replies merge by their stable id across the three reads, so each fork
+    // holds its inherited reply exactly once.
+    const state = await loadAgentState();
+    for (const fork of [FORK_A, FORK_B]) {
+      expect(state.transcripts[fork]?.filter((turn) => turn.role === "agent")).toHaveLength(1);
+    }
+  });
+
+  it("keeps the fork when its history fails to load, and marks it failed", async () => {
+    // The fork exists in Codex and in the registry. Failing the whole fork here
+    // would leave the compose bar holding the message, and the user's retry
+    // would create a second fork.
+    const { ws, state } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") throw new Error("disk went away");
+      return undefined;
+    });
+
+    const fork = await ws.forkAgentIntoOwnPane(AGENT_1);
+
+    expect(fork.id).toBe(FORK_A);
+    expect(ws.agentsByProject[PROJECT_1]?.map((a) => a.id)).toContain(FORK_A);
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+    expect(state.runtimes[FORK_A]?.hydration_error).toContain("disk went away");
+    // The failure display explains the gap. A lazy fork's "earlier
+    // conversation is still coming" notice would promise history that no turn
+    // of this fork is going to bring, so it must never be armed.
+    expect(ws.isAwaitingForkHistory(FORK_A)).toBe(false);
+  });
+
+  /// Fire a completed turn end for `agentId`, which drives the automatic
+  /// inherited-history reload after a fork's turn.
+  function completeTurn(agentId: string): void {
+    fireTo(`agent:${agentId}`, {
+      type: "turn_end",
+      turn_id: `turn-${agentId}-done`,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:05Z",
+    });
+  }
+
+  async function settled(predicate: () => boolean): Promise<void> {
+    for (let i = 0; i < 50; i += 1) {
+      if (predicate()) return;
+      await tick();
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    expect(predicate()).toBe(true);
+  }
+
+  /// Fire the queue-drained signal for `agentId`, which drives the automatic
+  /// retry of a Codex fork's failed inherited-history load.
+  function goIdle(agentId: string): void {
+    fireTo(`agent:${agentId}`, { type: "agent_idle", agent_id: agentId });
+  }
+
+  it("clears the failure once a later automatic load succeeds", async () => {
+    // The banner and the sidebar line show while an error is stored, so a load
+    // that recovers once the fork is idle must take the error away.
+    let failing = true;
+    const { ws, state } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") {
+        if (failing) throw new Error("disk went away");
+        return conversationWith([FORK_A]);
+      }
+      return undefined;
+    });
+    ws.installForkHistoryRefresh();
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+    expect(state.runtimes[FORK_A]?.hydration_error).toContain("disk went away");
+    failing = false;
+
+    completeTurn(FORK_A);
+    goIdle(FORK_A);
+
+    await settled(() => state.runtimes[FORK_A]?.hydration_status === "complete");
+    expect(state.runtimes[FORK_A]?.hydration_error).toBeUndefined();
+    expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
+  });
+
+  /// A reply on `agentId`: it starts, and ends as `outcome`. A completed or
+  /// reported Codex reply ends carrying the id that matches it to its saved
+  /// copy (`hydrationKey`); one that ends abnormally carries none.
+  function reply(
+    agentId: string,
+    turnId: string,
+    sendId: string,
+    end: { outcome: TurnOutcome; hydrationKey?: string },
+  ): void {
+    fireTo(`agent:${agentId}`, {
+      type: "turn_start",
+      turn_id: turnId,
+      send_id: sendId,
+      started_at: "2026-05-16T00:00:03Z",
+    });
+    fireTo(`agent:${agentId}`, {
+      type: "content_chunk",
+      turn_id: turnId,
+      kind: "text",
+      text: "half an answer",
+    });
+    fireTo(`agent:${agentId}`, {
+      type: "turn_end",
+      turn_id: turnId,
+      outcome: end.outcome,
+      ended_at: "2026-05-16T00:00:04Z",
+      hydration_key: end.hydrationKey ?? null,
+    });
+  }
+
+  /// A Codex project whose fork's inherited history failed to load, then
+  /// becomes loadable, with the automatic retry installed.
+  async function forkWithFailedHistory(): Promise<{
+    ws: Awaited<ReturnType<typeof loadWorkspaceState>>;
+    state: Awaited<ReturnType<typeof loadAgentState>>;
+    calls: string[];
+  }> {
+    let failing = true;
+    const project = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") {
+        if (failing) throw new Error("disk went away");
+        return conversationWith([FORK_A]);
+      }
+      if (cmd === "send_message") return "msg";
+      return undefined;
+    });
+    project.ws.installForkHistoryRefresh();
+    await project.ws.forkAgentIntoOwnPane(AGENT_1);
+    expect(project.state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+    failing = false;
+    return project;
+  }
+
+  it("retries automatically only once the fork has nothing running or queued", async () => {
+    // Retrying when one reply ends would reread the fork's session file while
+    // the next queued reply is being written to it, and the half-written copy
+    // would show as a second reply.
+    const { ws, state, calls } = await forkWithFailedHistory();
+    // Two messages: the first runs, the second waits behind it.
+    state.dispatchUserTurn(FORK_A, "user-1", "one", [], "send-1", "2026-05-16T00:00:01Z");
+    state.dispatchUserTurn(FORK_A, "user-2", "two", [], "send-2", "2026-05-16T00:00:02Z");
+    calls.length = 0;
+
+    reply(FORK_A, "turn-1", "send-1", { outcome: { status: "completed" }, hydrationKey: "key-1" });
+    await flushAsync();
+
+    expect(calls).not.toContain("load_project_conversation");
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+
+    reply(FORK_A, "turn-2", "send-2", { outcome: { status: "completed" }, hydrationKey: "key-2" });
+    expect(calls).not.toContain("load_project_conversation");
+    goIdle(FORK_A);
+    // Shown as loading for the whole read, so a new send to the fork waits.
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("loading");
+
+    await settled(() => state.runtimes[FORK_A]?.hydration_status === "complete");
+    expect(calls.filter((cmd) => cmd === "load_project_conversation")).toHaveLength(1);
+    expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
+  });
+
+  it("skips the automatic retry while a reply on screen can't be matched to its saved copy", async () => {
+    // A Codex reply that ends abnormally (Codex exited mid-reply) carries no
+    // id, so a reread would add its saved partial copy as a second reply. The
+    // failure stays on screen with Retry instead, which still works.
+    const { ws, state, calls } = await forkWithFailedHistory();
+    state.dispatchUserTurn(FORK_A, "user-1", "one", [], "send-1", "2026-05-16T00:00:01Z");
+    reply(FORK_A, "turn-1", "send-1", {
+      outcome: {
+        status: "failed",
+        kind: "adapter_failure",
+        message: "harness exited without terminal stream event",
+      },
+    });
+    calls.length = 0;
+
+    goIdle(FORK_A);
+    await flushAsync();
+
+    expect(calls).not.toContain("load_project_conversation");
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+    expect(state.runtimes[FORK_A]?.hydration_error).toContain("disk went away");
+    expect(ws.historyRetryBlock(codexAgent(FORK_A, "cx-fork"))).toBeNull();
+  });
+
+  it("refuses a manual Retry while the fork is replying", async () => {
+    let failing = true;
+    const { ws, state, calls } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") {
+        if (failing) throw new Error("disk went away");
+        return conversationWith([FORK_A]);
+      }
+      return undefined;
+    });
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+    failing = false;
+    state.runtimes[FORK_A] = { ...state.runtimes[FORK_A]!, run_status: "processing" };
+    calls.length = 0;
+
+    expect(ws.historyRetryBlock(codexAgent(FORK_A, "cx-fork"))).toBe(
+      "Retry is available once cx-fork has finished replying, including any queued messages.",
+    );
+    await ws.retryAgentHistory(FORK_A);
+
+    expect(calls).not.toContain("load_project_conversation");
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+
+    state.runtimes[FORK_A] = { ...state.runtimes[FORK_A]!, run_status: "idle" };
+    expect(ws.historyRetryBlock(codexAgent(FORK_A, "cx-fork"))).toBeNull();
+    await ws.retryAgentHistory(FORK_A);
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("complete");
+  });
+
+  it("refuses the project-wide Retry while any agent is replying", async () => {
+    const { ws, state, calls } = await codexProject(async () => undefined);
+    ws.conversations[PROJECT_1] = { items: [], status: "failed", error: "unreadable" };
+    state.runtimes[AGENT_1] = { ...state.runtimes[AGENT_1]!, run_status: "processing" };
+
+    expect(ws.projectHistoryRetryBlock(PROJECT_1)).toContain(
+      "once every agent in this project has finished replying",
+    );
+    await ws.retryProjectHydration(PROJECT_1);
+
+    expect(calls).not.toContain("load_project_conversation");
+    expect(ws.conversations[PROJECT_1]?.status).toBe("failed");
+  });
+
+  it("holds the project as loading from the click while its Retry waits behind another read", async () => {
+    // The compose bar holds sends while a project's history loads, so no reply
+    // can start between the click and the read itself.
+    const history = deferred<ProjectConversation>();
+    let reads = 0;
+    const { ws, state } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") {
+        reads += 1;
+        return reads === 1 ? await history.promise : conversationWith([FORK_A]);
+      }
+      return undefined;
+    });
+    // A card fork's history read is in flight, queued on the project.
+    await ws.forkAgentWithoutSending(AGENT_1);
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("loading");
+    ws.conversations[PROJECT_1] = { items: [], status: "failed", error: "unreadable" };
+
+    const retry = ws.retryProjectHydration(PROJECT_1);
+
+    expect(ws.conversations[PROJECT_1]?.status).toBe("loading");
+    history.resolve(conversationWith([FORK_A]));
+    await retry;
+    expect(ws.conversations[PROJECT_1]?.status).toBe("complete");
+    expect(reads).toBe(2);
+  });
+
+  it("refuses a manual Retry for an ordinary agent while it is replying", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const plain = codexAgent(AGENT_2, "cx-2");
+    await state.registerAgent(plain);
+    ws.agentsByProject[PROJECT_1] = [plain];
+    ws.conversations[PROJECT_1] = { items: [], status: "complete" };
+    state.runtimes[AGENT_2] = {
+      ...state.runtimes[AGENT_2]!,
+      run_status: "processing",
+      hydration_status: "failed",
+      hydration_error: "unreadable",
+    };
+    invokeMock.mockClear();
+
+    expect(ws.historyRetryBlock(plain)).toContain("has finished replying");
+    await ws.retryAgentHistory(AGENT_2);
+
+    expect(invokeMock).not.toHaveBeenCalledWith("load_project_conversation", expect.anything());
+    expect(state.runtimes[AGENT_2]?.hydration_error).toBe("unreadable");
+  });
+
+  it("retries a fork whose history loaded once and failed a later project reload", async () => {
+    let reload: "ok" | "fork-broken" = "ok";
+    const { ws, state, calls } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") {
+        if (reload === "fork-broken") {
+          return {
+            items: [],
+            agents: [
+              { agent_id: AGENT_1, warnings: [] },
+              { agent_id: FORK_A, warnings: [], load_error: "fork session unreadable" },
+            ],
+          } satisfies ProjectConversation;
+        }
+        return conversationWith([FORK_A]);
+      }
+      return undefined;
+    });
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+    reload = "fork-broken";
+    await ws.retryProjectHydration(PROJECT_1);
+    expect(state.runtimes[FORK_A]?.hydration_error).toBe("fork session unreadable");
+    reload = "ok";
+    calls.length = 0;
+
+    await ws.retryAgentHistory(FORK_A);
+
+    expect(calls).toContain("load_project_conversation");
+    expect(calls).not.toContain("fork_agent");
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("complete");
+    expect(state.runtimes[FORK_A]?.hydration_error).toBeUndefined();
+    expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
+    expect(state.transcripts[FORK_A]?.filter((turn) => turn.role === "agent")).toHaveLength(1);
+  });
+
+  it("leaves a fork's read to a project reload that is under way when its turn comes", async () => {
+    // The reload rereads every agent, including the fork, so the fork's own
+    // read is skipped: a targeted read would mark the project loaded holding
+    // only the fork's turns. The fork shows no failure and isn't left loading.
+    const { ws, state, calls } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") {
+        ws.conversations[PROJECT_1] = { items: [], status: "loading" };
+        return codexAgent(FORK_A, "cx-fork");
+      }
+      return undefined;
+    });
+
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+
+    expect(calls).not.toContain("load_project_conversation");
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("complete");
+    expect(state.runtimes[FORK_A]?.hydration_error).toBeUndefined();
+  });
+
+  it("retries a failed load through the project merge without forking again", async () => {
+    let failing = true;
+    const { ws, state, calls } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") {
+        if (failing) throw new Error("disk went away");
+        return conversationWith([FORK_A]);
+      }
+      return undefined;
+    });
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+    failing = false;
+    calls.length = 0;
+
+    await ws.retryAgentHistory(FORK_A);
+
+    expect(calls).toEqual(expect.arrayContaining(["load_project_conversation"]));
+    expect(calls).not.toContain("fork_agent");
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("complete");
+    expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
+  });
+});
+
+describe("one agent's history reread (Retry and attach)", () => {
+  const SEND_1 = "00000000-0000-7000-8000-0000000000e1";
+  const CODEX_FORK = "00000000-0000-7000-8000-0000000000c9";
+
+  /// `AGENT_1`'s one exchange as the project read merges it: the prompt from
+  /// the journal (send `SEND_1`), or from the session file when `imported`
+  /// (an attached session's history predates Switchboard), and the reply. With
+  /// `loadError` the agent's file couldn't be read, so only the journal's
+  /// prompt is there.
+  function exchange(opts: { loadError?: string; imported?: boolean } = {}): ProjectConversation {
+    const prompt: ConversationItem = {
+      kind: "user_message",
+      id: opts.imported ? "imported-1" : SEND_1,
+      send_id: opts.imported ? null : SEND_1,
+      agent_ids: [AGENT_1],
+      text: "hello",
+      at: "2026-05-16T00:00:01Z",
+    };
+    const replyItem: ConversationItem = {
+      kind: "agent_turn",
+      turn_id: "reply-1",
+      agent_id: AGENT_1,
+      send_id: opts.imported ? null : SEND_1,
+      started_at: "2026-05-16T00:00:02Z",
+      ended_at: "2026-05-16T00:00:03Z",
+      status: "complete",
+      items: [{ item_kind: "text", kind: "text", text: "hi" }],
+      hydration_key: "k1",
+    };
+    return {
+      items: opts.loadError === undefined ? [prompt, replyItem] : [prompt],
+      agents: [{ agent_id: AGENT_1, warnings: [], load_error: opts.loadError ?? null }],
+    };
+  }
+
+  /// Route the project IPC: `read` answers each project read (counted in
+  /// `reads()`), and the roster is whatever `roster` holds when asked.
+  function backend(
+    roster: () => AgentRecord[],
+    read: (n: number) => Promise<ProjectConversation>,
+  ): { reads: () => number } {
+    let reads = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      switch (cmd) {
+        case "open_project":
+          return { id: PROJECT_1, name: "p", created_at: "2026-05-16T00:00:00Z" };
+        case "list_agents":
+          return roster();
+        case "project_session_fingerprints":
+          return [];
+        case "load_project_conversation":
+          reads += 1;
+          return await read(reads);
+        default:
+          return undefined;
+      }
+    });
+    return { reads: () => reads };
+  }
+
+  /// How many times the prompt `text` shows in the project's transcript.
+  async function promptRows(text: string): Promise<number> {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const { buildUnifiedRows } = await import("./unified");
+    const turns = (ws.agentsByProject[PROJECT_1] ?? []).flatMap(
+      (member) => state.transcripts[member.id] ?? [],
+    );
+    return buildUnifiedRows(turns, ws.conversations[PROJECT_1]?.items ?? []).filter(
+      (row) => row.kind === "user" && row.text === text,
+    ).length;
+  }
+
+  it("shows an agent's messages once after Retry recovers its history", async () => {
+    // The project's journal already holds the agent's prompt. A Retry that
+    // loaded the agent on its own put its prompts in its own column as well,
+    // so each showed twice.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    let broken = true;
+    backend(
+      () => [agent(AGENT_1, PROJECT_1)],
+      async () => exchange(broken ? { loadError: "corrupt sidecar" } : {}),
+    );
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(state.runtimes[AGENT_1]?.hydration_status).toBe("failed"));
+    broken = false;
+
+    await ws.retryAgentHistory(AGENT_1);
+
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(state.runtimes[AGENT_1]?.hydration_error).toBeUndefined();
+    expect(state.transcripts[AGENT_1]?.filter((turn) => turn.role === "agent")).toHaveLength(1);
+    expect(await promptRows("hello")).toBe(1);
+  });
+
+  it("shows an attached session's messages once, also after a later project read", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const attached = agent(AGENT_1, PROJECT_1);
+    let roster: AgentRecord[] = [];
+    backend(
+      () => roster,
+      async () => (roster.length === 0 ? { items: [], agents: [] } : exchange({ imported: true })),
+    );
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(ws.conversations[PROJECT_1]?.status).toBe("complete"));
+
+    roster = [attached];
+    await state.registerAgent(attached);
+    ws.addAgentToProjectRoster(attached);
+    await ws.loadAttachedAgentHistory(AGENT_1);
+
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(await promptRows("hello")).toBe(1);
+
+    await ws.retryProjectHydration(PROJECT_1);
+    expect(await promptRows("hello")).toBe(1);
+  });
+
+  it("waits for the project's first load when attaching during it, then reads the agent", async () => {
+    // The first load may have started before the agent existed, so its result
+    // can't be relied on to include it. The attach's read waits behind it.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const attached = agent(AGENT_1, PROJECT_1);
+    const firstLoad = deferred<ProjectConversation>();
+    let roster: AgentRecord[] = [];
+    const { reads } = backend(
+      () => roster,
+      async (n) => (n === 1 ? await firstLoad.promise : exchange({ imported: true })),
+    );
+    await ws.activateProject(PROJECT_1);
+    expect(ws.conversations[PROJECT_1]?.status).toBe("loading");
+
+    roster = [attached];
+    await state.registerAgent(attached);
+    ws.addAgentToProjectRoster(attached);
+    const attaching = ws.loadAttachedAgentHistory(AGENT_1);
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("loading");
+    await flushAsync();
+    expect(reads()).toBe(1);
+
+    firstLoad.resolve({ items: [], agents: [] });
+    await attaching;
+
+    expect(reads()).toBe(2);
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(state.transcripts[AGENT_1]?.filter((turn) => turn.role === "agent")).toHaveLength(1);
+    expect(await promptRows("hello")).toBe(1);
+  });
+
+  it("keeps an attached agent loading through its own read when the first load already included it", async () => {
+    // The attach finished before the first load read the agent list, so that
+    // load applies the agent and marks it loaded. Its own read still follows,
+    // and sends to it must keep waiting until that read ends.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const attached = agent(AGENT_1, PROJECT_1);
+    const firstLoad = deferred<ProjectConversation>();
+    const ownRead = deferred<ProjectConversation>();
+    let roster: AgentRecord[] = [];
+    const { reads } = backend(
+      () => roster,
+      async (n) => (n === 1 ? await firstLoad.promise : await ownRead.promise),
+    );
+    await ws.activateProject(PROJECT_1);
+    roster = [attached];
+    await state.registerAgent(attached);
+    ws.addAgentToProjectRoster(attached);
+    const attaching = ws.loadAttachedAgentHistory(AGENT_1);
+
+    firstLoad.resolve(exchange({ imported: true }));
+    await vi.waitFor(() => expect(reads()).toBe(2));
+
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("loading");
+    ownRead.resolve(exchange({ imported: true }));
+    await attaching;
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(state.transcripts[AGENT_1]?.filter((turn) => turn.role === "agent")).toHaveLength(1);
+    expect(await promptRows("hello")).toBe(1);
+  });
+
+  it("refuses Retry until the project's history has loaded, and says why", async () => {
+    // Retry rereads through the project read. Run while the project's history
+    // is loading or failed, it would mark the project loaded holding only this
+    // agent's turns; the project's own load or Retry reads the agent anyway.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const failing = agent(AGENT_1, PROJECT_1);
+    const { reads } = backend(
+      () => [failing],
+      async () => exchange({ loadError: "corrupt sidecar" }),
+    );
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(state.runtimes[AGENT_1]?.hydration_status).toBe("failed"));
+
+    for (const status of ["loading", "failed"] as const) {
+      ws.conversations[PROJECT_1] = { items: [], status };
+      expect(ws.historyRetryBlock(failing)).toBe(
+        "Retry is available once the project's history has loaded.",
+      );
+      await ws.retryAgentHistory(AGENT_1);
+      expect(reads()).toBe(1);
+      expect(state.runtimes[AGENT_1]?.hydration_error).toBe("corrupt sidecar");
+    }
+
+    ws.conversations[PROJECT_1] = { items: [], status: "complete" };
+    expect(ws.historyRetryBlock(failing)).toBeNull();
+  });
+
+  it("reads once for overlapping Retry clicks, and shows a failed Retry's reason", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const gate = deferred<void>();
+    const { reads } = backend(
+      () => [agent(AGENT_1, PROJECT_1)],
+      async (n) => {
+        if (n === 1) return exchange({ loadError: "corrupt sidecar" });
+        await gate.promise;
+        throw new Error("still broken");
+      },
+    );
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(state.runtimes[AGENT_1]?.hydration_status).toBe("failed"));
+
+    const first = ws.retryAgentHistory(AGENT_1);
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("loading");
+    expect(state.runtimes[AGENT_1]?.hydration_error).toBeUndefined();
+    const second = ws.retryAgentHistory(AGENT_1);
+    gate.resolve();
+    await Promise.all([first, second]);
+
+    expect(reads()).toBe(2);
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("failed");
+    expect(state.runtimes[AGENT_1]?.hydration_error).toBe("still broken");
+  });
+
+  it("keeps a Codex fork's 'earlier conversation unavailable' notice when Retry runs after a restart", async () => {
+    // After a restart Switchboard no longer knows the agent is a fork, so its
+    // Retry is any agent's. The per-agent load it used to take dropped the
+    // notice, leaving the fork's history silently short.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const fork: AgentRecord = {
+      ...agent(CODEX_FORK, PROJECT_1),
+      name: "cx-fork",
+      harness: "codex",
+      session_locator: { codex: { thread_id: "thread-c9", partition_date: "2026-10-11" } },
+    };
+    const notice: ConversationItem = {
+      kind: "system_marker",
+      id: "gap-1",
+      agent_id: CODEX_FORK,
+      marker: {
+        marker_kind: "inherited_history_unavailable",
+        reason: "not_found",
+        rollout_id: "parent-rollout",
+      },
+      at: "2026-10-11T00:00:00Z",
+    };
+    let broken = true;
+    backend(
+      () => [fork],
+      async () =>
+        broken
+          ? {
+              items: [],
+              agents: [{ agent_id: CODEX_FORK, warnings: [], load_error: "unreadable" }],
+            }
+          : { items: [notice], agents: [{ agent_id: CODEX_FORK, warnings: [], load_error: null }] },
+    );
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(state.runtimes[CODEX_FORK]?.hydration_status).toBe("failed"));
+    broken = false;
+
+    await ws.retryAgentHistory(CODEX_FORK);
+
+    expect(state.runtimes[CODEX_FORK]?.hydration_status).toBe("complete");
+    expect(ws.conversations[PROJECT_1]?.items).toContainEqual(notice);
   });
 });
 
@@ -2772,6 +3742,35 @@ describe("desktop sync for another client's turn", () => {
     conversation.open();
     await settle();
     expect(acks()).toHaveLength(1);
+  });
+
+  it("waits for one agent's history reread, so the turn cannot start while its file is read", async () => {
+    // A Retry, an attach, or a new Codex fork rereads the agent's history. A
+    // reply that starts during that read can show twice, so the compose box
+    // waits for it; another client's turn has to wait too.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const backend = installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await vi.waitFor(() => expect(ws.conversations[PROJECT_2]?.status).toBe("complete"));
+
+    const reread = gate();
+    backend.conversation = reread;
+    const attaching = ws.loadAttachedAgentHistory(AGENT_1);
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("loading");
+
+    requestSync(PROJECT_2);
+    await settle();
+    expect(acks()).toEqual([]);
+
+    reread.open();
+    await attaching;
+    await settle();
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(acks()).toEqual([
+      { requestId: REQUEST, result: { status: "ready", listening_agents: [AGENT_1] } },
+    ]);
   });
 
   it("waits for the project's workflow channel", async () => {

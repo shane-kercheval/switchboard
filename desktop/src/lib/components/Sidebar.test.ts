@@ -1,7 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/svelte";
-import type { AgentRecord, AgentSelectionChanges, NormalizedEvent } from "$lib/types";
+import type {
+  AgentRecord,
+  AgentSelectionChanges,
+  ConversationItem,
+  NormalizedEvent,
+  ProjectListing,
+  WorkflowRunInfo,
+} from "$lib/types";
 // Static import so the component-tree transform happens at module collection,
 // not inside the first test's timeout (cold CI transforms have no vite cache).
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
@@ -20,6 +27,15 @@ const removeAgentMock = vi.fn<(id: string) => Promise<void>>();
 const setAgentSelectionMock =
   vi.fn<(id: string, changes: AgentSelectionChanges) => Promise<void>>();
 const reorderAgentsMock = vi.fn<(projectId: string, orderedIds: string[]) => Promise<void>>();
+const forkAgentWithoutSendingMock = vi.fn<(sourceId: string) => Promise<AgentRecord>>();
+const retryAgentHistoryMock = vi.fn<(agentId: string) => Promise<void>>();
+const historyRetryBlockMock = vi.fn<(agent: AgentRecord) => string | null>();
+// The fork conditions the card shares with the compose box read the project's
+// folder and history-load state from here. A test about either sets it.
+const workspaceProjects = vi.hoisted(() => ({ list: [] as ProjectListing[] }));
+const workspaceConversations = vi.hoisted(
+  () => ({}) as Record<string, { items: ConversationItem[]; status: string }>,
+);
 vi.mock("$lib/state/workspace.svelte", () => ({
   renameAgent: (id: string, name: string) => renameAgentMock(id, name),
   removeAgent: (id: string) => removeAgentMock(id),
@@ -27,6 +43,11 @@ vi.mock("$lib/state/workspace.svelte", () => ({
     setAgentSelectionMock(id, changes),
   reorderAgents: (projectId: string, orderedIds: string[]) =>
     reorderAgentsMock(projectId, orderedIds),
+  forkAgentWithoutSending: (sourceId: string) => forkAgentWithoutSendingMock(sourceId),
+  retryAgentHistory: (agentId: string) => retryAgentHistoryMock(agentId),
+  historyRetryBlock: (agent: AgentRecord) => historyRetryBlockMock(agent),
+  projects: workspaceProjects,
+  conversations: workspaceConversations,
 }));
 
 const agentSessionInfoMock = vi.fn();
@@ -45,7 +66,6 @@ vi.mock("$lib/api", () => ({
   cancelTurn: vi.fn(),
   compactAgent: (agentId: string, sendId: string) => compactAgentMock(agentId, sendId),
   contextReportAgent: (agentId: string, sendId: string) => contextReportAgentMock(agentId, sendId),
-  loadTranscript: vi.fn(),
 }));
 
 const copyTextMock = vi.fn<(t: string) => Promise<void>>();
@@ -155,6 +175,15 @@ beforeEach(() => {
   compactAgentMock.mockResolvedValue("00000000-0000-7000-8000-00000000c003");
   contextReportAgentMock.mockReset();
   contextReportAgentMock.mockResolvedValue("00000000-0000-7000-8000-00000000d0aa");
+  forkAgentWithoutSendingMock.mockReset();
+  retryAgentHistoryMock.mockReset();
+  retryAgentHistoryMock.mockResolvedValue(undefined);
+  historyRetryBlockMock.mockReset();
+  historyRetryBlockMock.mockReturnValue(null);
+  workspaceProjects.list = [];
+  for (const key of Object.keys(workspaceConversations)) delete workspaceConversations[key];
+  // A project whose history has loaded, the normal state of an open project.
+  workspaceConversations[PROJECT_ID] = { items: [], status: "complete" };
 });
 
 beforeEach(async () => {
@@ -164,6 +193,9 @@ beforeEach(async () => {
   (await import("$lib/state/transcriptPanes.svelte"))._testing.reset();
   (await import("$lib/state/recipientSelection.svelte"))._testing.reset();
   (await import("$lib/layout.svelte"))._testing.reset();
+  // A compose claim is project-scoped and outlives its component.
+  (await import("$lib/state/composeOperations.svelte"))._testing.reset();
+  (await import("$lib/state/workflows.svelte"))._testing.reset();
 });
 
 afterEach(async () => {
@@ -2274,6 +2306,274 @@ describe("compact context action", () => {
     const bar = screen.getByTestId("agent-context-bar");
     expect(bar).toHaveTextContent("120k / 200k");
     expect(bar).toHaveTextContent("60%");
+  });
+});
+
+describe("history Retry", () => {
+  async function failedHistory(): Promise<void> {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.runtimes[CODEX_AGENT.id] = {
+      ...state.runtimes[CODEX_AGENT.id]!,
+      hydration_status: "failed",
+      hydration_error: "unreadable",
+    };
+  }
+
+  it("retries the agent's history when it is allowed", async () => {
+    await failedHistory();
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+
+    await fireEvent.click(screen.getByTestId("agent-hydration-retry"));
+
+    expect(retryAgentHistoryMock).toHaveBeenCalledExactlyOnceWith(CODEX_AGENT.id);
+  });
+
+  it("is unavailable while the agent is replying, says why, and does nothing", async () => {
+    // A reread while a reply is still being written would show it twice.
+    await failedHistory();
+    historyRetryBlockMock.mockReturnValue("Retry is available once bob has finished replying.");
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+    const retry = screen.getByTestId("agent-hydration-retry");
+
+    expect(retry).toHaveAttribute("aria-disabled", "true");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.pointerEnter(retry);
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(screen.getByTestId("tooltip-content")).toHaveTextContent(
+        "Retry is available once bob has finished replying.",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    await fireEvent.click(retry);
+    expect(retryAgentHistoryMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("fork action", () => {
+  const FORK: AgentRecord = {
+    ...CODEX_AGENT,
+    id: "00000000-0000-7000-8000-000000000bbc",
+    name: "bob-fork",
+    created_at: "2026-05-16T00:00:05Z",
+  };
+
+  /// The tooltip a menu item shows on hover: the reason a disabled item gives.
+  async function hoverTooltip(item: HTMLElement): Promise<string> {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.pointerEnter(item);
+      await vi.advanceTimersByTimeAsync(1100);
+      return screen.getByTestId("tooltip-content").textContent ?? "";
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  /// Register `agent` with one completed turn, so it has a session to fork.
+  async function registerWithHistory(agent: AgentRecord): Promise<void> {
+    const state = await loadState();
+    await state.registerAgent(agent);
+    state.transcripts[agent.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: agent.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+      },
+    ];
+  }
+
+  async function forkItem(agent: AgentRecord): Promise<HTMLElement> {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+    const menu = await openAgentActions();
+    return within(menu).getByTestId("agent-action-fork");
+  }
+
+  it("is offered for a Codex agent", async () => {
+    await registerWithHistory(CODEX_AGENT);
+
+    const item = await forkItem(CODEX_AGENT);
+
+    expect(item).toHaveTextContent("Fork");
+    expect(item).not.toHaveAttribute("data-disabled");
+    expect(await hoverTooltip(item)).toContain("Nothing is sent.");
+  });
+
+  it.each([
+    ["Claude Code", CLAUDE_AGENT],
+    ["Antigravity", ANTIGRAVITY_AGENT],
+  ])("is withheld from a %s agent", async (_harness, agent) => {
+    // Claude refuses to fork without a prompt, so its branch exists only as a
+    // turn and its Fork is the compose box's. Antigravity can't fork on request.
+    const state = await loadState();
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    const menu = await openAgentActions();
+    expect(within(menu).queryByTestId("agent-action-fork")).toBeNull();
+    expect(within(menu).getByTestId("agent-action-rename")).toBeInTheDocument();
+  });
+
+  it("is unavailable while the agent is working, and says why", async () => {
+    const state = await loadState();
+    await registerWithHistory(CODEX_AGENT);
+    const runtime = state.runtimes[CODEX_AGENT.id];
+    if (runtime === undefined) throw new Error("expected a runtime");
+    state.runtimes[CODEX_AGENT.id] = { ...runtime, run_status: "processing" };
+
+    const item = await forkItem(CODEX_AGENT);
+
+    expect(item).toHaveAttribute("data-disabled");
+    expect(await hoverTooltip(item)).toContain(
+      "bob is busy — its conversation must stop changing before you can branch.",
+    );
+    await fireEvent.click(item);
+    expect(forkAgentWithoutSendingMock).not.toHaveBeenCalled();
+  });
+
+  it("is unavailable until the project's history has loaded, and says why", async () => {
+    // A fork made while the project loads could show no earlier conversation
+    // and no error, and a menu fork sends no turn that would reload it later.
+    await registerWithHistory(CODEX_AGENT);
+    workspaceConversations[PROJECT_ID] = { items: [], status: "loading" };
+
+    const item = await forkItem(CODEX_AGENT);
+
+    expect(item).toHaveAttribute("data-disabled");
+    expect(await hoverTooltip(item)).toContain(
+      "Fork is available once the project's history has loaded.",
+    );
+  });
+
+  it("is unavailable for an agent with no session yet, and says why", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    const runtime = state.runtimes[CODEX_AGENT.id];
+    if (runtime === undefined) throw new Error("expected a runtime");
+    // Loaded, empty and with no Codex session id: the agent has never been
+    // sent anything.
+    state.runtimes[CODEX_AGENT.id] = { ...runtime, hydration_status: "complete" };
+
+    const item = await forkItem(CODEX_AGENT);
+
+    expect(item).toHaveAttribute("data-disabled");
+    expect(await hoverTooltip(item)).toContain("bob has no session to branch from yet");
+  });
+
+  it("is offered for an agent with a Codex session id even when none of it shows", async () => {
+    // A Codex fork whose earlier conversation can't be shown, sent nothing
+    // yet: its transcript is empty, but Codex recorded its session.
+    const withSession: AgentRecord = {
+      ...CODEX_AGENT,
+      session_locator: { codex: { thread_id: "thread-b", partition_date: "2026-10-11" } },
+    };
+    const state = await loadState();
+    await state.registerAgent(withSession);
+    expect(state.runtimes[withSession.id]?.hydration_status).toBe("complete");
+
+    const item = await forkItem(withSession);
+
+    expect(item).not.toHaveAttribute("data-disabled");
+  });
+
+  it("is unavailable while another compose operation holds the project, and says why", async () => {
+    // A send waiting on a browser sign-in holds the claim with no time limit,
+    // so a click that silently did nothing would look broken.
+    await registerWithHistory(CODEX_AGENT);
+    const ops = await import("$lib/state/composeOperations.svelte");
+    ops.beginOperation(PROJECT_ID, { kind: "prompt_send" });
+
+    const item = await forkItem(CODEX_AGENT);
+
+    expect(item).toHaveAttribute("data-disabled");
+    expect(await hoverTooltip(item)).toContain(
+      "Another send in this project is still in progress.",
+    );
+    await fireEvent.click(item);
+    expect(forkAgentWithoutSendingMock).not.toHaveBeenCalled();
+  });
+
+  it("is unavailable while a workflow is running in the project, and says why", async () => {
+    // Creating the fork locks the original's session for about a second, and a
+    // workflow step sent to it then would be refused and fail the run. A failed
+    // run left on screen runs nothing, so it doesn't block.
+    await registerWithHistory(CODEX_AGENT);
+    const { workflowRuns } = await import("$lib/state/workflows.svelte");
+    const run: WorkflowRunInfo = {
+      run_id: "run-1",
+      workflow: "review",
+      step: 0,
+      total: 2,
+      status: "running",
+      reason: null,
+      steps: [],
+    };
+    workflowRuns[PROJECT_ID] = [run];
+
+    const item = await forkItem(CODEX_AGENT);
+
+    expect(item).toHaveAttribute("data-disabled");
+    expect(await hoverTooltip(item)).toContain(
+      "Fork is available once the workflow running in this project has finished.",
+    );
+    await fireEvent.click(item);
+    expect(forkAgentWithoutSendingMock).not.toHaveBeenCalled();
+
+    workflowRuns[PROJECT_ID] = [{ ...run, status: "failed", reason: "step failed" }];
+    await waitFor(() => expect(item).not.toHaveAttribute("data-disabled"));
+  });
+
+  it("forks through the shared path, holding the compose claim until the fork exists", async () => {
+    const state = await loadState();
+    const ops = await import("$lib/state/composeOperations.svelte");
+    await registerWithHistory(CODEX_AGENT);
+    const creation = deferred<AgentRecord>();
+    forkAgentWithoutSendingMock.mockReturnValue(creation.promise);
+
+    await fireEvent.click(await forkItem(CODEX_AGENT));
+
+    expect(forkAgentWithoutSendingMock).toHaveBeenCalledExactlyOnceWith(CODEX_AGENT.id);
+    expect(ops.operationFor(PROJECT_ID)).toMatchObject({
+      kind: "menu_fork",
+      sourceId: CODEX_AGENT.id,
+    });
+    expect(await screen.findByTestId("agent-fork-pending")).toHaveTextContent(
+      "Creating a fork of bob…",
+    );
+    // A second fork can't start while the first is being created.
+    const menu = await openAgentActions();
+    const again = within(menu).getByTestId("agent-action-fork");
+    expect(again).toHaveAttribute("data-disabled");
+    expect(await hoverTooltip(again)).toContain("A fork is already being created in this project.");
+
+    creation.resolve(FORK);
+
+    await waitFor(() => expect(ops.operationFor(PROJECT_ID)).toBeUndefined());
+    expect(screen.queryByTestId("agent-fork-pending")).toBeNull();
+    expect(screen.queryByTestId("agent-fork-error")).toBeNull();
+    expect(state.runtimes[CODEX_AGENT.id]?.pending_sends ?? []).toEqual([]);
+  });
+
+  it("shows a failed creation on the agent's card and releases the compose claim", async () => {
+    const ops = await import("$lib/state/composeOperations.svelte");
+    await registerWithHistory(CODEX_AGENT);
+    forkAgentWithoutSendingMock.mockRejectedValue(
+      new Error("Codex exited with status 1: no rollout found"),
+    );
+
+    await fireEvent.click(await forkItem(CODEX_AGENT));
+
+    expect(await screen.findByTestId("agent-fork-error")).toHaveTextContent(
+      "Couldn't fork bob: Codex exited with status 1: no rollout found",
+    );
+    expect(ops.operationFor(PROJECT_ID)).toBeUndefined();
+    expect(ops.outcomeFor(PROJECT_ID)).toBeUndefined();
   });
 });
 

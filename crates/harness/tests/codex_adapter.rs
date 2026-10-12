@@ -15,11 +15,14 @@ use switchboard_harness::{
 use uuid::Uuid;
 
 #[cfg(unix)]
-use nix::unistd::{Pid, getpgid};
-#[cfg(unix)]
 use std::time::Duration;
 #[cfg(unix)]
 use tokio_util::sync::CancellationToken;
+
+#[cfg(unix)]
+mod common;
+#[cfg(unix)]
+use common::{assert_group_reaped, wait_for_pgid};
 
 const FAKE_CODEX: &str = env!("CARGO_BIN_EXE_fake_codex");
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex");
@@ -413,6 +416,64 @@ async fn truncated_stream_synthesizes_adapter_failure_with_buffered_error() {
                 message.contains("stream ended without turn.failed"),
                 "EOF marker must appear: {message}"
             );
+        }
+        other => panic!("expected TurnEnd(AdapterFailure), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_fork_whose_parent_file_is_gone_fails_its_turn_with_codexs_error() {
+    // What the missing-parent probe saw when it resumed a fork whose parent
+    // rollout had been deleted (harness-behavior §3.5): exit 1, no stdout
+    // events at all, and this one stderr line, verbatim. This proves the
+    // adapter turns that shape into the failed turn Switchboard shows; the
+    // probe itself ran Codex directly, not through Switchboard.
+    const CODEX_ERROR: &str = "Error: thread/resume: thread/resume failed: invalid paginated history lineage for 01a12d13-1b40-7232-8895-631605068ea7: missing source rollout (code -32600)";
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fixture_path = tmp.path().join("missing-parent.jsonl");
+    std::fs::write(
+        &fixture_path,
+        format!("// stderr:{CODEX_ERROR}\n// exit:1\n"),
+    )
+    .unwrap();
+    let agent = codex_agent_resuming(
+        "01a12d13-2870-7f61-93dc-f2b7256018a6",
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 11).unwrap(),
+    );
+    let home = tempfile::TempDir::new().unwrap();
+
+    let events: Vec<AdapterEvent> = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path())
+        .dispatch(
+            &agent,
+            tmp.path(),
+            fixture_path.to_str().unwrap(),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed")
+        .collect()
+        .await;
+
+    let terminals: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(terminals.len(), 1, "exactly one terminal event: {events:?}");
+    match terminals[0] {
+        AdapterEvent::TurnEnd {
+            outcome:
+                TurnOutcome::Failed {
+                    kind: FailureKind::AdapterFailure,
+                    message,
+                },
+            ..
+        } => {
+            assert!(
+                message.starts_with("harness exited without terminal stream event; stderr: "),
+                "got {message}"
+            );
+            assert!(message.contains(CODEX_ERROR), "got {message}");
         }
         other => panic!("expected TurnEnd(AdapterFailure), got {other:?}"),
     }
@@ -1263,32 +1324,6 @@ command = "p"
         session_meta.iter().all(|s| s.status == "configured"),
         "all entries report status='configured'"
     );
-}
-
-/// Poll until `path` holds a parseable pgid; bounded so a spawn failure panics.
-#[cfg(unix)]
-async fn wait_for_pgid(path: &Path) -> Pid {
-    for _ in 0..200 {
-        if let Ok(s) = std::fs::read_to_string(path)
-            && let Ok(n) = s.trim().parse::<i32>()
-        {
-            return Pid::from_raw(n);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("fake_codex never wrote its pgid at {}", path.display());
-}
-
-/// Poll until the process group's leader is gone (`getpgid` → `ESRCH`).
-#[cfg(unix)]
-async fn assert_group_reaped(leader: Pid) {
-    for _ in 0..200 {
-        if getpgid(Some(leader)).is_err() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("process group {leader} still alive after cancel");
 }
 
 #[cfg(unix)]

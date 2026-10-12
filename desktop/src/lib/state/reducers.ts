@@ -346,16 +346,18 @@ export function transcriptReducer(
       const existing = findTurn(turns, input.turn_id);
       if (existing === undefined || existing.role !== "agent") return turns;
       if (existing.status !== "streaming") return turns;
-      // Stamp the live-matched hydration key (Claude only) onto the completing
-      // turn so a later disk re-read of the same turn dedups against it instead
-      // of appending a second copy (see the `hydrate` merge). **Preserve an
+      // Stamp the hydration key (Claude and Codex) onto the completing turn so
+      // a later disk re-read of the same turn dedups against it instead of
+      // appending a second copy (see the `hydrate` merge). **Preserve an
       // early key when the terminal carries none**: an in-flight turn may
       // already hold a `hydration_key` from the `turn_identity` event, and a
       // *synthesized* terminal (a cancelled turn's `TurnEnd`, built by the
       // dispatcher) carries `hydration_key: None` — clearing it would leave the
-      // cancelled turn keyless and duplicate it against its keyed disk copy. For
-      // parser-emitted terminals `input.hydration_key` is present and equals the
-      // early key, so this is a no-op there.
+      // cancelled turn keyless and duplicate it against its keyed disk copy.
+      // For a Claude terminal the key equals the early one, so this is a no-op.
+      // A Codex turn has no early key except on cancel, so its terminal key is
+      // the only one, and it is absent when the terminal's session-file read
+      // failed or the turn ended abnormally (harness-behavior G44).
       const hydration_key = input.hydration_key ?? existing.hydration_key;
       const baseUpdate = {
         ...existing,
@@ -898,9 +900,14 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // The hydrated quota reading is **not** filled in here: it is account state,
       // offered to `harnessUsage.svelte.ts` from `applyAgentHydrate` where it is
       // ranked against every other agent's reading rather than stored per agent.
+      // A successful load also ends any earlier failure: the sidebar line and
+      // the transcript banner show whenever `hydration_error` is set, so
+      // leaving it would keep saying the history failed after it arrived (a
+      // load that fails and then recovers through a project reload).
       const next: AgentRuntime = {
         ...runtime,
         hydration_status: "complete",
+        hydration_error: undefined,
       };
       if (next.meta === undefined && input.meta != null) {
         next.meta = {

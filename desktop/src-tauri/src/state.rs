@@ -119,6 +119,11 @@ pub enum TestSeam {
     /// the worker to stop rather than being released on "already claimed", and
     /// that dropping the first caller starts no second worker.
     Reclaim,
+    /// Inside `fork_agent_impl`, after the fork exists (for Codex, after Codex
+    /// created it) and before the re-check that guards registration. Lets a
+    /// test start a project deletion at exactly the moment a slow fork
+    /// creation would let one in.
+    ForkRegistration,
 }
 
 /// Two-way handshake for a [`TestSeam`].

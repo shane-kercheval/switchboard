@@ -62,13 +62,7 @@
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
   import { installDevTranscriptSeed } from "$lib/dev/seedTranscript";
   import { windowDragRegion } from "$lib/windowDrag";
-  import {
-    agentIsWorking,
-    hydrateAgent,
-    registerAgent,
-    runtimes,
-    transcripts,
-  } from "$lib/state/index.svelte";
+  import { agentIsWorking, registerAgent, runtimes, transcripts } from "$lib/state/index.svelte";
   import { buildUnifiedRows } from "$lib/state/unified";
   import { messageIdentityForRow, type PinnableMessageIdentity } from "$lib/messageIdentity";
   import {
@@ -81,6 +75,7 @@
     dismissProjectDeletionError,
     dismissAgentCreationFailure,
     dismissSeedPathUnresolved,
+    loadAttachedAgentHistory,
     loadWorkspace,
     nextUnreadCompletedProjectId,
     projects,
@@ -1024,10 +1019,9 @@
   }
 
   /// Create or attach an agent, register its listeners, and add it to the
-  /// roster named by the returned record. Attach kicks off per-agent hydration
-  /// so the brought-in harness session's history appears. `filledEmptyPane`
-  /// reports whether the agent landed in a visible empty pane, as its only
-  /// member.
+  /// roster named by the returned record. Attach then loads the brought-in
+  /// harness session's history. `filledEmptyPane` reports whether the agent
+  /// landed in a visible empty pane, as its only member.
   async function createOrAttachAndRegister(
     submission: AgentFormSubmit,
   ): Promise<{ agent: AgentRecord; filledEmptyPane: boolean }> {
@@ -1040,7 +1034,7 @@
     const rosterIds = (agentsByProject[agent.project_id] ?? []).map((item) => item.id);
     const paneId = assignAgentToFirstVisibleEmptyPane(agent.project_id, rosterIds, agent.id);
     if (submission.mode === "attach") {
-      void hydrateAgent(agent.id);
+      void loadAttachedAgentHistory(agent.id);
     }
     return { agent, filledEmptyPane: paneId !== null };
   }

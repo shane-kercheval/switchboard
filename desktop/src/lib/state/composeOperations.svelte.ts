@@ -52,6 +52,13 @@ export type ComposeOperationPhase =
 /// Phases are per-kind: a plain fork has nothing to render, and only a fork
 /// registers. Making the invalid combinations unrepresentable is cheaper than
 /// documenting them.
+///
+/// `menu_fork` is the one claim not taken by the compose bar: a Codex agent
+/// card's Fork item, which creates a fork and sends nothing. It holds the claim
+/// for the second Codex takes to create the fork, because the original's
+/// session is locked meanwhile, and a compose send to it in that second would
+/// be refused with "resend". Holding the claim disables the compose bar
+/// instead.
 export type ComposeOperation =
   | {
       id: string;
@@ -61,7 +68,7 @@ export type ComposeOperation =
   | { id: string; kind: "prompt_fork"; sourceId: AgentId; phase: ComposeOperationPhase }
   | {
       id: string;
-      kind: "plain_fork";
+      kind: "plain_fork" | "menu_fork";
       sourceId: AgentId;
       phase: Extract<ComposeOperationPhase, { name: "registering" }>;
     };
@@ -69,7 +76,7 @@ export type ComposeOperation =
 export type ComposeOperationInit =
   | { kind: "prompt_send" }
   | { kind: "prompt_fork"; sourceId: AgentId }
-  | { kind: "plain_fork"; sourceId: AgentId };
+  | { kind: "plain_fork" | "menu_fork"; sourceId: AgentId };
 
 /// A finished operation's message for the composer that is mounted *now*, which
 /// may not be the one that started it. `tone` selects the composer's error vs.
@@ -118,7 +125,7 @@ export function beginOperation(projectId: ProjectId, init: ComposeOperationInit)
   if (operations[projectId] !== undefined) return null;
   const id = crypto.randomUUID();
   operations[projectId] =
-    init.kind === "plain_fork"
+    init.kind === "plain_fork" || init.kind === "menu_fork"
       ? { id, kind: init.kind, sourceId: init.sourceId, phase: { name: "registering" } }
       : init.kind === "prompt_fork"
         ? { id, kind: init.kind, sourceId: init.sourceId, phase: { name: "rendering" } }
@@ -146,6 +153,7 @@ export function setOperationPhase(
       operations[projectId] = { ...current, phase };
       return;
     case "plain_fork":
+    case "menu_fork":
       if (phase.name !== "registering") return;
       operations[projectId] = { ...current, phase };
       return;

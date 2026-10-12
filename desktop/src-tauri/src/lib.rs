@@ -1088,7 +1088,7 @@ async fn fork_agent(state: State<'_, AppState>, agent_id: String) -> Result<Agen
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    fork_agent_impl(state.inner(), id, &home)
+    fork_agent_impl(state.inner(), id, &home, std::path::Path::new("codex"))
         .await
         .map_err(|e| e.to_string())
 }

@@ -23,7 +23,6 @@
   import {
     dispatchCompaction,
     dispatchContextReport,
-    retryAgentHydration,
     runtimes,
     stopAgent,
     transcripts,
@@ -33,6 +32,7 @@
     removeAgent,
     renameAgent,
     reorderAgents,
+    retryAgentHistory,
     setAgentSelection,
   } from "$lib/state/workspace.svelte";
   import { DRAG_SLOP_PX, dropIndexForPointer, movedOrder } from "$lib/agentReorder";
@@ -1415,7 +1415,7 @@
                   type="button"
                   class="text-accent hover:underline"
                   data-testid="agent-hydration-retry"
-                  onclick={() => void retryAgentHydration(agent.id)}
+                  onclick={() => void retryAgentHistory(agent.id)}
                 >
                   Retry
                 </button>

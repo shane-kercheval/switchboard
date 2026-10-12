@@ -30,13 +30,16 @@
     cancelSend,
     getLocalSend,
     getTranscriptRevision,
-    retryAgentHydration,
     retryAgentSubscription,
     runtimes,
     transcripts,
     type Turn,
   } from "$lib/state/index.svelte";
-  import { agentsByProject, isAwaitingForkHistory } from "$lib/state/workspace.svelte";
+  import {
+    agentsByProject,
+    isAwaitingForkHistory,
+    retryAgentHistory,
+  } from "$lib/state/workspace.svelte";
   import {
     answerItemsOf,
     answerTextOf,
@@ -2497,7 +2500,7 @@
     {@render failureBanner(
       "agent-hydration-failed",
       `Couldn't load ${agent.name}'s history.`,
-      () => void retryAgentHydration(agent.id),
+      () => void retryAgentHistory(agent.id),
       () =>
         openDetails(
           `Couldn't load ${agent.name}'s history`,

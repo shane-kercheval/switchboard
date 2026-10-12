@@ -1332,7 +1332,7 @@ describe("ComposeBar", () => {
       });
     }
 
-    it("is offered only for a single Claude recipient that has something to branch", async () => {
+    it("is offered only for a single recipient that has something to branch", async () => {
       const state = await loadState();
       await state.registerAgent(AGENT_A);
       await state.registerAgent(AGENT_B);
@@ -1346,9 +1346,96 @@ describe("ComposeBar", () => {
       await fireEvent.click(chip(AGENT_B.id));
       await waitFor(() => expect(forkHalf()).toBeNull());
 
-      // A single non-Claude recipient — no harness support.
+      // A single recipient with nothing to branch yet (bob has no session).
       await fireEvent.click(chip(AGENT_A.id));
       await waitFor(() => expect(forkHalf()).toBeNull());
+    });
+
+    const CODEX_AGENT: AgentRecord = {
+      ...AGENT_B,
+      session_locator: {
+        codex: {
+          thread_id: "01a12c22-a3f8-71e2-b51e-ca72562cfabb",
+          partition_date: "2026-10-11",
+        },
+      },
+    };
+    const CODEX_FORK_RECORD: AgentRecord = {
+      ...CODEX_AGENT,
+      id: "00000000-0000-7000-8000-000000000c0f",
+      name: "bob-fork",
+      session_locator: {
+        codex: {
+          thread_id: "01a12c22-df64-7103-9fc3-92f2e3595c02",
+          partition_date: "2026-10-11",
+        },
+      },
+      created_at: "2026-05-16T00:00:03Z",
+    };
+    const AGY_AGENT: AgentRecord = {
+      ...AGENT_A,
+      id: "00000000-0000-7000-8000-000000000ccc",
+      name: "gina",
+      harness: "antigravity",
+      session_locator: { uuid: "00000000-0000-7000-8000-000000000003" },
+    };
+
+    it("is offered for a single idle Codex recipient with a session", async () => {
+      const state = await loadState();
+      await state.registerAgent(CODEX_AGENT);
+      seedTurn(state, CODEX_AGENT.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+      expect(forkHalf()).toHaveAttribute("aria-label", expect.stringMatching(/fork bob/i));
+    });
+
+    it("forks a Codex agent from the keyboard and sends to the fork", async () => {
+      const state = await loadState();
+      await state.registerAgent(CODEX_AGENT);
+      seedTurn(state, CODEX_AGENT.id);
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "fork_agent") return CODEX_FORK_RECORD;
+        if (cmd === "send_message") return "msg-fork";
+        return null;
+      });
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+      await waitFor(() => expect(forkHalf()).not.toBeNull());
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch the codex agent" } });
+      await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
+
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("fork_agent", { agentId: CODEX_AGENT.id });
+      });
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith(
+          "send_message",
+          expect.objectContaining({ agentId: CODEX_FORK_RECORD.id }),
+        );
+      });
+      expect(invokeMock).not.toHaveBeenCalledWith(
+        "send_message",
+        expect.objectContaining({ agentId: CODEX_AGENT.id }),
+      );
+    });
+
+    it("is not offered for Antigravity, and the shortcut says which harnesses can branch", async () => {
+      const state = await loadState();
+      await state.registerAgent(AGY_AGENT);
+      seedTurn(state, AGY_AGENT.id);
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGY_AGENT] } });
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "branch" } });
+      expect(forkHalf()).toBeNull();
+
+      await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true, shiftKey: true });
+
+      expect(await screen.findByTestId("compose-send-error")).toHaveTextContent(
+        "Switchboard can branch only Claude Code and Codex sessions, and gina is Antigravity.",
+      );
+      expect(invokeMock).not.toHaveBeenCalledWith("fork_agent", expect.anything());
     });
 
     it("is not offered while the agent has no session to branch from", async () => {

@@ -11,6 +11,7 @@
   } from "$lib/state/index.svelte";
   import { createReachableFork, type ReachableFork } from "$lib/state/workspace.svelte";
   import { HARNESS_LABEL } from "$lib/harnessDisplay";
+  import { supportsComposeFork } from "$lib/harnessCapabilities";
   import {
     addHeldForward,
     removeHeldForward,
@@ -1350,9 +1351,8 @@
       // the branch's selection swap exists to prevent.
       return "Fork branches from one agent's own history — clear the forward sources first.";
     }
-    // Claude is the only harness Switchboard can branch (`supports_session_fork`).
-    if (candidate.harness !== "claude_code") {
-      return `Switchboard can only branch Claude Code sessions, and ${candidate.name} is ${HARNESS_LABEL[candidate.harness]}.`;
+    if (!supportsComposeFork(candidate.harness)) {
+      return `Switchboard can branch only Claude Code and Codex sessions, and ${candidate.name} is ${HARNESS_LABEL[candidate.harness]}.`;
     }
     if (!looksLikeItHasASession(candidate.id)) {
       return `${candidate.name} has no session to branch from yet — send it a message first.`;

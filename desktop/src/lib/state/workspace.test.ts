@@ -1484,6 +1484,176 @@ describe("forked-agent inherited-history refresh", () => {
   });
 });
 
+describe("eager (Codex) fork inherited history", () => {
+  const FORK_A = "00000000-0000-7000-8000-0000000000c1";
+  const FORK_B = "00000000-0000-7000-8000-0000000000c2";
+
+  beforeEach(async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    panes._testing.reset();
+  });
+
+  function codexAgent(id: string, name: string): AgentRecord {
+    return {
+      ...agent(id, PROJECT_1),
+      name,
+      harness: "codex",
+      session_locator: {
+        codex: { thread_id: `thread-${id.slice(-2)}`, partition_date: "2026-10-11" },
+      },
+    };
+  }
+
+  /// The project as the backend merges it once `forks` exist: each fork's
+  /// inherited prompt is an imported user message (no send), and its inherited
+  /// reply an agent turn carrying the parent's hydration key.
+  function conversationWith(forks: string[]): ProjectConversation {
+    return {
+      items: forks.flatMap((fork) => [
+        {
+          kind: "user_message" as const,
+          id: `imported-${fork}`,
+          send_id: null,
+          agent_ids: [fork],
+          text: `inherited prompt for ${fork}`,
+          at: "2026-05-15T00:00:00Z",
+        },
+        {
+          kind: "agent_turn" as const,
+          turn_id: `inherited-reply-${fork}`,
+          agent_id: fork,
+          send_id: null,
+          started_at: "2026-05-15T00:00:01Z",
+          ended_at: "2026-05-15T00:00:02Z",
+          status: "complete" as const,
+          items: [{ item_kind: "text" as const, kind: "text" as const, text: "inherited reply" }],
+          hydration_key: "parent-key",
+        },
+      ]),
+      agents: [AGENT_1, ...forks].map((agentId) => ({ agent_id: agentId, warnings: [] })),
+    };
+  }
+
+  function importedTexts(ws: Awaited<ReturnType<typeof loadWorkspaceState>>): string[] {
+    return (ws.conversations[PROJECT_1]?.items ?? [])
+      .filter((item) => item.kind === "user_message" && item.send_id == null)
+      .map((item) => (item.kind === "user_message" ? item.text : ""));
+  }
+
+  /// A hydrated project holding the Codex parent, with the IPC routed by
+  /// `respond` and every IPC command recorded in order.
+  async function codexProject(respond: (cmd: string, args: unknown) => Promise<unknown>): Promise<{
+    ws: Awaited<ReturnType<typeof loadWorkspaceState>>;
+    state: Awaited<ReturnType<typeof loadAgentState>>;
+    calls: string[];
+  }> {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const parent = codexAgent(AGENT_1, "cx");
+    const calls: string[] = [];
+    let opened = false;
+    invokeMock.mockImplementation(async (cmd: string, args: unknown) => {
+      if (!opened) {
+        return cmd === "load_project_conversation"
+          ? ({ items: [], agents: [] } satisfies ProjectConversation)
+          : undefined;
+      }
+      calls.push(cmd);
+      return await respond(cmd, args);
+    });
+    ws.agentsByProject[PROJECT_1] = [parent];
+    await state.registerAgent(parent);
+    await ws.hydrateProject(PROJECT_1);
+    expect(ws.conversations[PROJECT_1]?.status).toBe("complete");
+    opened = true;
+    return { ws, state, calls };
+  }
+
+  it("loads the fork's inherited history before returning, with no pending notice", async () => {
+    // Returning only after the read means the compose flow's send comes after
+    // it, so the earlier conversation is on screen before the first reply and
+    // the read never overlaps the fork's live turn.
+    const { ws, state, calls } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") return conversationWith([FORK_A]);
+      return undefined;
+    });
+
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+
+    expect(calls).toContain("load_project_conversation");
+    expect(calls).not.toContain("load_transcript");
+    expect(ws.isAwaitingForkHistory(FORK_A)).toBe(false);
+    expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
+    expect(state.transcripts[FORK_A]?.length).toBeGreaterThan(0);
+  });
+
+  it("shows each inherited message once after overlapping forks and a project refresh", async () => {
+    let forks = 0;
+    const { ws } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") {
+        forks += 1;
+        return forks === 1 ? codexAgent(FORK_A, "cx-fork") : codexAgent(FORK_B, "cx-fork-2");
+      }
+      if (cmd === "load_project_conversation") return conversationWith([FORK_A, FORK_B]);
+      return undefined;
+    });
+
+    await Promise.all([ws.forkAgentIntoOwnPane(AGENT_1), ws.forkAgentIntoOwnPane(AGENT_1)]);
+    await ws.retryProjectHydration(PROJECT_1);
+
+    expect(importedTexts(ws).sort()).toEqual(
+      [`inherited prompt for ${FORK_A}`, `inherited prompt for ${FORK_B}`].sort(),
+    );
+  });
+
+  it("keeps the fork when its history fails to load, and marks it failed", async () => {
+    // The fork exists in Codex and in the registry. Failing the whole fork here
+    // would leave the compose bar holding the message, and the user's retry
+    // would create a second fork.
+    const { ws, state } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") throw new Error("disk went away");
+      return undefined;
+    });
+
+    const fork = await ws.forkAgentIntoOwnPane(AGENT_1);
+
+    expect(fork.id).toBe(FORK_A);
+    expect(ws.agentsByProject[PROJECT_1]?.map((a) => a.id)).toContain(FORK_A);
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+    expect(state.runtimes[FORK_A]?.hydration_error).toContain("disk went away");
+    // The failure display explains the gap. A lazy fork's "earlier
+    // conversation is still coming" notice would promise history that no turn
+    // of this fork is going to bring, so it must never be armed.
+    expect(ws.isAwaitingForkHistory(FORK_A)).toBe(false);
+  });
+
+  it("retries a failed load through the project merge without forking again", async () => {
+    let failing = true;
+    const { ws, state, calls } = await codexProject(async (cmd) => {
+      if (cmd === "fork_agent") return codexAgent(FORK_A, "cx-fork");
+      if (cmd === "load_project_conversation") {
+        if (failing) throw new Error("disk went away");
+        return conversationWith([FORK_A]);
+      }
+      return undefined;
+    });
+    await ws.forkAgentIntoOwnPane(AGENT_1);
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
+    failing = false;
+    calls.length = 0;
+
+    await ws.retryAgentHistory(FORK_A);
+
+    expect(calls).toEqual(expect.arrayContaining(["load_project_conversation"]));
+    expect(calls).not.toContain("load_transcript");
+    expect(calls).not.toContain("fork_agent");
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("complete");
+    expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
+  });
+});
+
 describe("project idle predicate", () => {
   async function loadWorkflowState() {
     return await import("$lib/state/workflows.svelte");

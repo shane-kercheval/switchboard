@@ -19,6 +19,7 @@ vi.mock("$lib/state/workspace.svelte", () => ({
   renameAgent: vi.fn(async () => undefined),
   reorderAgents: (projectId: string, orderedIds: string[]) =>
     reorderAgentsMock(projectId, orderedIds),
+  retryAgentHistory: vi.fn(async () => undefined),
   setAgentSelection: vi.fn(async () => undefined),
 }));
 

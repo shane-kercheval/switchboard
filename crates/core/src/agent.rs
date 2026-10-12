@@ -200,8 +200,11 @@ pub struct AgentRecord {
     /// because Claude's fork is deferred and caller-assigned (see
     /// [`HarnessKind::supports_session_fork`]). A harness whose fork is *eager*
     /// would need job (2) and not job (1), and its lineage identity would not
-    /// be a Claude session UUID — so it needs its own sibling field, **not** a
-    /// widening or overloading of this one.
+    /// be a Claude session UUID, so it must never widen or overload this one.
+    /// Codex is that harness, and its fork leaves this `None`
+    /// ([`crate::project::Project::register_codex_fork`]): its lineage is in its
+    /// own rollout (`history_base`), which the transcript loader follows, and
+    /// nothing in Switchboard needs it on the record.
     ///
     /// Only harnesses where [`HarnessKind::supports_session_fork`] holds ever
     /// carry `Some` — enforced when writing, at the registration chokepoint

@@ -10,6 +10,7 @@ vi.mock("$lib/state/workspace.svelte", () => ({
   removeAgent: vi.fn(async () => undefined),
   renameAgent: vi.fn(async () => undefined),
   reorderAgents: vi.fn(async () => undefined),
+  retryAgentHistory: vi.fn(async () => undefined),
   setAgentSelection: vi.fn(async () => undefined),
 }));
 

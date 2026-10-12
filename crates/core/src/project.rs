@@ -294,6 +294,50 @@ impl Project {
         })
     }
 
+    /// Register an **eager fork** of a Codex source: a session Codex already
+    /// created (`switchboard_harness::fork_codex_session`), inheriting the
+    /// source's conversation through the pointer its own rollout stores.
+    ///
+    /// The record is an ordinary Codex agent. It gets the derived
+    /// `<source>-fork` name and a copy of the source's selection, as a Claude
+    /// fork does, and its locator is the created session's. It carries **no**
+    /// `forked_from_session`: that field is the lazy fork's materialization
+    /// token, and an eager fork has nothing left to materialize. Its lineage is
+    /// in its own rollout (`forked_from_id`, `history_base`), where the
+    /// transcript loader reads it.
+    ///
+    /// Like the `register_attached_*` methods, this doesn't check the session
+    /// file: the caller just created it and confirmed it exists. Same TOCTOU
+    /// caveat as [`Self::register_agent`]: callers serialize.
+    pub fn register_codex_fork(
+        &self,
+        source_agent_id: AgentId,
+        thread_id: String,
+        partition_date: chrono::NaiveDate,
+    ) -> Result<AgentRecord> {
+        let agents = self.list_agents()?;
+        let source = agents
+            .iter()
+            .find(|a| a.id == source_agent_id)
+            .ok_or(CoreError::AgentNotFound(source_agent_id))?;
+        if !source.harness.supports_fork_without_turn() {
+            return Err(CoreError::SessionForkUnsupported {
+                harness: source.harness,
+            });
+        }
+        let name = derive_fork_name(&agents, &source.name);
+        self.register_agent_inner(NewAgent {
+            name: &name,
+            harness: source.harness,
+            session_locator: Some(SessionLocator::Codex {
+                thread_id,
+                partition_date,
+            }),
+            selection: source.selection(),
+            forked_from_session: None,
+        })
+    }
+
     /// Register an attached **Claude Code** agent — one that wraps an
     /// already-existing harness session (e.g., a session the user started
     /// outside Switchboard). The provided `session_id` is the existing
@@ -1318,6 +1362,114 @@ mod tests {
             .unwrap();
 
         assert_eq!(record.forked_from_session, Some(parent));
+    }
+
+    fn codex_fork_date() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 11).unwrap()
+    }
+
+    #[test]
+    fn register_codex_fork_names_the_fork_and_copies_the_selection() {
+        let (_tmp, project) = fresh_project();
+        let source = project
+            .register_agent(
+                "alice",
+                HarnessKind::Codex,
+                AgentSelection {
+                    model: Some("gpt-6-luna".to_owned()),
+                    effort: Some("low".to_owned()),
+                    model_choices: vec!["gpt-6-luna".to_owned()],
+                    effort_choices: vec!["low".to_owned(), "high".to_owned()],
+                },
+            )
+            .unwrap();
+
+        let fork = project
+            .register_codex_fork(source.id, "fork-thread".to_owned(), codex_fork_date())
+            .unwrap();
+
+        assert_eq!(fork.name, "alice-fork");
+        assert_eq!(fork.harness, HarnessKind::Codex);
+        assert_eq!(fork.model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(fork.effort.as_deref(), Some("low"));
+        assert_eq!(fork.effort_choices, ["low", "high"]);
+        assert_eq!(
+            fork.session_locator,
+            Some(SessionLocator::Codex {
+                thread_id: "fork-thread".to_owned(),
+                partition_date: codex_fork_date(),
+            })
+        );
+        assert_eq!(project.list_agents().unwrap(), vec![source, fork]);
+    }
+
+    #[test]
+    fn register_codex_fork_carries_no_provenance() {
+        // Provenance is the lazy fork's "copy the parent on first turn" token.
+        // An eager fork already exists, so a record carrying it would be
+        // re-forked by the dispatch path.
+        let (_tmp, project) = fresh_project();
+        let source = project
+            .register_agent("alice", HarnessKind::Codex, AgentSelection::default())
+            .unwrap();
+
+        let fork = project
+            .register_codex_fork(source.id, "fork-thread".to_owned(), codex_fork_date())
+            .unwrap();
+
+        assert_eq!(fork.forked_from_session, None);
+    }
+
+    #[test]
+    fn register_codex_fork_disambiguates_repeated_forks() {
+        let (_tmp, project) = fresh_project();
+        let source = project
+            .register_agent("alice", HarnessKind::Codex, AgentSelection::default())
+            .unwrap();
+        let fork = |thread: &str| {
+            project
+                .register_codex_fork(source.id, thread.to_owned(), codex_fork_date())
+                .unwrap()
+                .name
+        };
+
+        assert_eq!(fork("one"), "alice-fork");
+        assert_eq!(fork("two"), "alice-fork-2");
+    }
+
+    #[test]
+    fn register_codex_fork_refuses_a_source_that_cannot_fork_eagerly() {
+        let (_tmp, project) = fresh_project();
+        for harness in [HarnessKind::ClaudeCode, HarnessKind::Antigravity] {
+            let source = project
+                .register_agent(&format!("{harness:?}"), harness, AgentSelection::default())
+                .unwrap();
+
+            let err = project
+                .register_codex_fork(source.id, "fork-thread".to_owned(), codex_fork_date())
+                .unwrap_err();
+
+            assert!(
+                matches!(err, CoreError::SessionForkUnsupported { harness: h } if h == harness),
+                "got: {err:?}"
+            );
+        }
+        assert_eq!(project.list_agents().unwrap().len(), 2, "no fork written");
+    }
+
+    #[test]
+    fn register_codex_fork_refuses_an_unknown_source() {
+        let (_tmp, project) = fresh_project();
+        let missing = Uuid::now_v7();
+
+        let err = project
+            .register_codex_fork(missing, "fork-thread".to_owned(), codex_fork_date())
+            .unwrap_err();
+
+        assert!(
+            matches!(err, CoreError::AgentNotFound(id) if id == missing),
+            "got: {err:?}"
+        );
     }
 
     #[test]

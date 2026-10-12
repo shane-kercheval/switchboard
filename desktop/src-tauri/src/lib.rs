@@ -1117,6 +1117,16 @@ async fn debug_ops(
     crate::debug_ops::run(app, request).await
 }
 
+/// The sync requests still waiting for the window's answer. The window calls
+/// this once it is listening, to answer any request emitted before then:
+/// Tauri does not replay events (see `WindowSync`).
+#[tauri::command]
+async fn desktop_pending_syncs(
+    sync: State<'_, Arc<crate::ops::desktop_sync::WindowSync>>,
+) -> Result<Vec<crate::ops::desktop_sync::PendingSync>, String> {
+    Ok(sync.pending())
+}
+
 /// The window's answer to a `desktop_sync_project` request: the project is
 /// loaded and every subscription has settled, or loading failed. An answer
 /// for a request nobody waits for any more is ignored.
@@ -2577,6 +2587,7 @@ pub fn run() {
             rename_agent,
             set_agent_selection,
             desktop_project_synced,
+            desktop_pending_syncs,
             debug_ops,
             reorder_agents,
             attach_agent,

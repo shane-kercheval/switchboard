@@ -22,6 +22,7 @@
 //! logging its receipt; that is how the round trip is checked with the
 //! window closed. The log line `window ready for a turn` carries its time.
 
+use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -200,7 +201,11 @@ pub fn serve_socket(app: &AppHandle) {
     };
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = std::fs::remove_file(&path);
+        let path = PathBuf::from(path);
+        if let Err(reason) = clear_socket_path(&path) {
+            tracing::warn!(path = %path.display(), reason, "debug_ops: not serving the debug socket");
+            return;
+        }
         let listener = match tokio::net::UnixListener::bind(&path) {
             Ok(listener) => listener,
             Err(error) => {
@@ -208,7 +213,13 @@ pub fn serve_socket(app: &AppHandle) {
                 return;
             }
         };
-        tracing::info!(path = %PathBuf::from(&path).display(), "debug_ops: listening");
+        // Owner-only, so no other account on the Mac can drive the app.
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::warn!(%error, "debug_ops: could not restrict the debug socket");
+            return;
+        }
+        tracing::info!(path = %path.display(), "debug_ops: listening");
         while let Ok((stream, _)) = listener.accept().await {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -233,4 +244,42 @@ pub fn serve_socket(app: &AppHandle) {
             });
         }
     });
+}
+
+/// Make `path` free for a new socket: nothing there, or a leftover socket,
+/// which is removed. Anything else is refused rather than deleted, so a
+/// mistyped path cannot cost a real file. Read without following a link.
+fn clear_socket_path(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            std::fs::remove_file(path).map_err(|e| e.to_string())
+        }
+        Ok(_) => Err("something other than a socket is at that path".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clear_socket_path;
+
+    #[test]
+    fn a_regular_file_at_the_socket_path_is_left_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "keep me").unwrap();
+        assert!(clear_socket_path(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn a_leftover_socket_is_removed_and_a_missing_path_is_fine() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("debug.sock");
+        assert!(clear_socket_path(&path).is_ok());
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(clear_socket_path(&path).is_ok());
+        assert!(!path.exists());
+    }
 }

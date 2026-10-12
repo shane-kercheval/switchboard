@@ -40,7 +40,7 @@ use super::send::{
     cancel_send, forward, refuse_if_busy, send, wait_agent, wait_send, wait_send_budget,
 };
 use super::test_support::*;
-use super::wait::WaitBudget;
+use super::wait::{FINAL_OBSERVATION_GRACE, WaitBudget};
 use super::workflow::{
     RunWorkflowRequest, WorkflowRunStatus, describe_workflow, run_workflow, wait_workflow,
 };
@@ -1371,7 +1371,7 @@ async fn a_missing_working_directory_refuses_the_send() {
 #[tokio::test]
 async fn a_recipient_the_window_cannot_hear_is_rejected_while_the_others_are_sent() {
     let (env, project_id, agents) = project_with_agents(&["a", "b"]);
-    *lock(&env.sync.unsubscribed) = vec![agents[1]];
+    env.sync.hear_all_but(&agents, &[agents[1]]);
     let receipt = send_now(
         env.handle(),
         env.home(),
@@ -1925,7 +1925,7 @@ async fn concurrent_selection_changes_both_survive() {
 #[tokio::test]
 async fn a_workflow_whose_steps_name_an_unheard_agent_is_refused() {
     let (env, project_id, agents) = workflow_env().await;
-    *lock(&env.sync.unsubscribed) = vec![agents[2]];
+    env.sync.hear_all_but(&agents, &[agents[2]]);
     let err = run_workflow(&env.state, &env.home(), pair_request(project_id, &agents))
         .await
         .unwrap_err();
@@ -2052,7 +2052,7 @@ async fn a_long_conversation_fits_the_budget_with_its_newest_items_intact() {
 #[tokio::test]
 async fn a_send_whose_only_recipient_is_unheard_reports_desktop_unavailable() {
     let (env, project_id, agents) = project_with_agents(&["a"]);
-    *lock(&env.sync.unsubscribed) = vec![agents[0]];
+    env.sync.hear_all_but(&agents, &[agents[0]]);
     let err = send_now(
         env.handle(),
         env.home(),
@@ -2268,7 +2268,7 @@ steps:
 async fn a_step_naming_an_unheard_agent_through_a_filter_is_not_sent() {
     let (env, project_id, agents) = workflow_env().await;
     std::fs::write(env.workflows_dir().join("lowered.yaml"), LOWER_WORKFLOW).unwrap();
-    *lock(&env.sync.unsubscribed) = vec![agents[0]];
+    env.sync.hear_all_but(&agents, &[agents[0]]);
     let request = RunWorkflowRequest {
         project_id,
         name: "lowered".to_owned(),
@@ -2473,7 +2473,7 @@ async fn the_merged_conversation_and_reply_paging_agree_on_every_turn() {
 async fn an_unheard_recipient_first_or_in_the_middle_does_not_stop_the_others() {
     for unheard in [0, 1] {
         let (env, project_id, agents) = project_with_agents(&["a", "b", "c"]);
-        *lock(&env.sync.unsubscribed) = vec![agents[unheard]];
+        env.sync.hear_all_but(&agents, &[agents[unheard]]);
         let receipt = send_now(
             env.handle(),
             env.home(),
@@ -2499,7 +2499,7 @@ async fn an_unheard_recipient_first_or_in_the_middle_does_not_stop_the_others() 
 #[tokio::test]
 async fn a_send_whose_recipients_are_all_unheard_reports_desktop_unavailable() {
     let (env, project_id, agents) = project_with_agents(&["a", "b"]);
-    *lock(&env.sync.unsubscribed) = agents.clone();
+    env.sync.hear_all_but(&agents, &agents);
     let err = send_now(
         env.handle(),
         env.home(),
@@ -2515,7 +2515,9 @@ async fn a_busy_check_whose_deadline_passed_before_asking_names_no_one_busy() {
     let (env, project_id, agents) = project_with_agents(&["a", "b"]);
     let roster = list_project_agents_readonly_impl(&env.state, project_id).unwrap();
     let budget = short();
-    tokio::time::advance(Duration::from_secs(2)).await;
+    // Past the deadline and the finishing allowance the check runs under.
+    tokio::time::advance(Duration::from_secs(1) + FINAL_OBSERVATION_GRACE + Duration::from_secs(1))
+        .await;
     let err = refuse_if_busy(&env.state, &budget, &agents, &[], &roster)
         .await
         .unwrap_err();
@@ -3066,10 +3068,8 @@ async fn a_cancelled_or_failed_turn_carries_its_outcome_however_the_conversation
 
 // --- The window round trip, through the production `WindowSync` ---
 
-fn ready(unsubscribed_agents: Vec<AgentId>) -> SyncAck {
-    SyncAck::Ready {
-        unsubscribed_agents,
-    }
+fn ready(listening_agents: Vec<AgentId>) -> SyncAck {
+    SyncAck::Ready { listening_agents }
 }
 
 #[tokio::test]
@@ -3137,7 +3137,7 @@ async fn a_window_that_cannot_load_the_project_refuses_the_send() {
 }
 
 #[tokio::test]
-async fn a_recipient_the_window_reports_unsubscribed_is_rejected_and_the_others_are_sent() {
+async fn a_recipient_the_window_does_not_list_as_heard_is_rejected_and_the_others_are_sent() {
     let (env, project_id, agents) = project_with_agents(&["a", "b"]);
     let (env, sync, _window, mut requests) = env.with_window(Duration::from_mins(1));
     let pending = tokio::spawn(send_now(
@@ -3146,7 +3146,9 @@ async fn a_recipient_the_window_reports_unsubscribed_is_rejected_and_the_others_
         text_send(project_id, agents.clone(), "hi"),
     ));
     let request = requests.recv().await.unwrap();
-    assert!(sync.acknowledge(request.request_id, ready(vec![agents[0]])));
+    // The window lists only "b": "a" is refused though nothing reported it
+    // failed, which is what an agent the window never heard of looks like.
+    assert!(sync.acknowledge(request.request_id, ready(vec![agents[1]])));
     let receipt = pending.await.unwrap().unwrap();
     assert_eq!(receipt.recipients[0].status, SendStatus::Rejected);
     assert_eq!(
@@ -3324,4 +3326,96 @@ async fn the_waits_can_run_as_tasks() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn a_window_that_answers_just_past_the_deadline_still_gets_the_send_out() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let (env, sync, _window, mut requests) = env.with_window(Duration::from_mins(1));
+    let heard = agents.clone();
+    let window = tokio::spawn(async move {
+        let request = requests.recv().await.unwrap();
+        // Past the one-second deadline, inside the finishing allowance.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(sync.acknowledge(request.request_id, ready(heard)));
+    });
+    let receipt = send(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents, "hi"),
+        WaitBudget::new(Some(1), false),
+    )
+    .await
+    .unwrap();
+    window.await.unwrap();
+    assert_eq!(receipt.recipients[0].status, SendStatus::Accepted);
+}
+
+#[tokio::test]
+async fn a_forward_asks_the_window_only_once_its_source_has_finished() {
+    let (env, project_id, agents) = project_with_agents(&["source", "target"]);
+    let (env, sync, _window, mut requests) = env.with_window(Duration::from_mins(1));
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("draft", &gate));
+    let first = tokio::spawn(send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agents[0]], "write"),
+    ));
+    let request = requests.recv().await.unwrap();
+    assert!(sync.acknowledge(request.request_id, ready(agents.clone())));
+    first.await.unwrap().unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+
+    let pending = tokio::spawn(forward(
+        env.handle(),
+        env.home(),
+        ForwardRequest {
+            project_id,
+            sources: vec![ForwardSourceRef {
+                agent_id: agents[0],
+                project_id,
+            }],
+            recipients: vec![agents[1]],
+            text: None,
+            prompt: None,
+            on_busy: OnBusyPolicy::Refuse,
+            idempotency_key: None,
+        },
+        WaitBudget::new(Some(30), false),
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        requests.try_recv().is_err(),
+        "the window is not asked while the source is still writing"
+    );
+    gate.notify_one();
+    let request = requests.recv().await.unwrap();
+    assert!(sync.acknowledge(request.request_id, ready(agents.clone())));
+    let receipt = pending.await.unwrap().unwrap();
+    assert_eq!(receipt.recipients[0].status, SendStatus::Accepted);
+}
+
+#[tokio::test]
+async fn a_request_the_window_missed_can_be_fetched_and_answered() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let (env, sync, _window, _requests) = env.with_window(Duration::from_mins(1));
+    let pending = tokio::spawn(send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "hi"),
+    ));
+    // The window was not listening when the request went out, so it fetches
+    // what is waiting instead.
+    let mut waiting = sync.pending();
+    while waiting.is_empty() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        waiting = sync.pending();
+    }
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].project_id, project_id);
+    assert!(sync.acknowledge(waiting[0].request_id, ready(agents)));
+    let receipt = pending.await.unwrap().unwrap();
+    assert_eq!(receipt.recipients[0].status, SendStatus::Accepted);
+    assert!(sync.pending().is_empty());
 }

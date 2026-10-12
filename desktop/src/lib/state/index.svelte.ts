@@ -332,6 +332,13 @@ export async function hydrateAgent(agentId: AgentId): Promise<void> {
   }
 }
 
+/// Whether the window is listening to this agent's events. A turn for an agent
+/// it is not listening to would run invisibly, and Tauri does not replay
+/// events, so the window reports exactly these agents as safe to send to.
+export function isListening(agentId: AgentId): boolean {
+  return listenerRegistry.has(agentId);
+}
+
 /// Re-attempt an agent's event subscription after [`registerAgent`] recorded a
 /// `listener_error`. Idempotent and safe to call repeatedly: `registerAgent`
 /// returns early once the listener is registered, and it never re-creates the
@@ -485,7 +492,10 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
   const pending = pendingRegistrations.get(agent.id);
   if (pending !== undefined) return pending;
 
-  const promise = (async () => {
+  // Held in an object the body can read: it compares against its own promise
+  // to tell whether it is still the registration in charge of this agent.
+  const own: { promise?: Promise<void> } = {};
+  own.promise = (async () => {
     try {
       // Initialize the runtime entry before subscribing — guarantees that
       // the first event arriving on the channel finds a runtime to
@@ -507,6 +517,13 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
         const unlisten = await listen<NormalizedEvent>(channel, (event) => {
           handleEvent(agent.id, event.payload);
         });
+        // Unregistered while subscribing (its project was deleted, or a
+        // roster refresh gave it up): drop the listener rather than leave one
+        // live for an agent nothing shows.
+        if (pendingRegistrations.get(agent.id) !== own.promise) {
+          unlisten();
+          return;
+        }
         listenerRegistry.set(agent.id, unlisten);
         const settled = runtimes[agent.id];
         if (settled?.listener_error !== undefined) {
@@ -532,11 +549,15 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
         }
       }
     } finally {
-      pendingRegistrations.delete(agent.id);
+      // Only its own entry: after an unregister, a newer registration of the
+      // same agent may own the slot.
+      if (pendingRegistrations.get(agent.id) === own.promise) {
+        pendingRegistrations.delete(agent.id);
+      }
     }
   })();
-  pendingRegistrations.set(agent.id, promise);
-  return promise;
+  pendingRegistrations.set(agent.id, own.promise);
+  return own.promise;
 }
 
 /// Synchronously append a user-role turn AND transition the agent's

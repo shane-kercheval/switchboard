@@ -86,7 +86,6 @@ pub async fn run_workflow(
 ) -> Result<Uuid, AppError> {
     let project_id = request.project_id;
     open_project_impl(state, project_id)?;
-    let report = state.desktop_sync.ensure_ready(project_id).await?;
     let effective = merge_workflow_forwards(
         state,
         &request.inputs,
@@ -95,6 +94,8 @@ pub async fn run_workflow(
         home_dir,
     )
     .await?;
+    // After the forwards are read, as a send checks just before dispatch.
+    let report = state.desktop_sync.ensure_ready(project_id).await?;
     let run_id = invoke_workflow_with(
         state,
         project_id,
@@ -104,7 +105,7 @@ pub async fn run_workflow(
         home_dir,
         &InvokeOptions {
             agent_inputs_are_ids: true,
-            unsubscribed_agents: report.unsubscribed_agents,
+            hearing: report.hearing,
         },
     )?;
     tracing::info!(%project_id, %run_id, workflow = %request.name, "workflow run started");

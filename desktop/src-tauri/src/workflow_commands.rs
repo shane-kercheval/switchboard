@@ -1284,10 +1284,11 @@ pub struct InvokeOptions {
     /// an earlier read — so a rename and name reuse between two reads cannot
     /// run the wrong agent.
     pub agent_inputs_are_ids: bool,
-    /// Agents the window reported it cannot listen to. A run whose steps
-    /// resolve to any of them is refused rather than running invisibly, the
-    /// same rule a send applies per recipient.
-    pub unsubscribed_agents: Vec<AgentId>,
+    /// The agents the window reported it is listening to. A run whose steps
+    /// resolve to any other agent is refused rather than running invisibly,
+    /// the same rule a send applies per recipient. Checked against the roster
+    /// this run binds with, which can be newer than the window's.
+    pub hearing: crate::ops::desktop_sync::Hearing,
 }
 
 /// [`invoke_workflow_impl`] with [`InvokeOptions`].
@@ -1343,10 +1344,11 @@ pub fn invoke_workflow_with(
         .iter()
         .map(|r| (canonicalize_for_uniqueness(&r.name), r.id))
         .collect();
+    let unheard = options.hearing.unheard(roster.iter().map(|r| r.id));
 
     let provider = Arc::new(
         ProjectDispatchFactoryProvider::new(state, &project, &roster, home_dir, generation)
-            .with_unheard(options.unsubscribed_agents.clone()),
+            .with_unheard(unheard.clone()),
     );
 
     let run_id = Uuid::now_v7();
@@ -1359,7 +1361,7 @@ pub fn invoke_workflow_with(
 
     // Live-view step snapshot with recipients resolved to the bound agent names.
     let resolved_steps = resolve_step_display(&step_display(&workflow), &bound);
-    refuse_unheard_recipients(&resolved_steps, &roster, &options.unsubscribed_agents)?;
+    refuse_unheard_recipients(&resolved_steps, &roster, &unheard)?;
 
     let sink = Arc::new(ChannelProgressSink::new(
         run_id,

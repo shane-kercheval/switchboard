@@ -37,13 +37,15 @@
 //! key: a retry gets the cancelled receipt rather than sending what the
 //! caller stopped.
 //!
-//! **What the budget bounds.** Everything before the first dispatch — the
-//! window sync, prompt rendering, a forward's compose — runs under the call's
-//! wait budget: at its deadline nothing has gone out, so the call fails and
-//! the key is released. The dispatch loop itself is never cut short. A retry
-//! that joins an in-flight send waits under its own budget and, if that ends
-//! first, reports `request_in_progress` with the send id, leaving the key
-//! claimed.
+//! **What the budget bounds.** Everything before the first dispatch runs
+//! under the call's wait budget: prompt rendering and a forward's compose
+//! under its deadline, then the window sync and the busy check, which run
+//! last so the window is known ready when the message goes out, under its
+//! finishing allowance. At the end of either, nothing has gone out, so the
+//! call fails and the key is released. The dispatch loop itself is never cut
+//! short. A retry that joins an in-flight send waits under its own budget
+//! and, if that ends first, reports `request_in_progress` with the send id,
+//! leaving the key claimed.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -437,14 +439,6 @@ async fn run_inner(
 ) -> Result<SendReceipt, AppError> {
     let project_id = plan.project_id;
     open_project_impl(state, project_id)?;
-    let report = match budget
-        .run(state.desktop_sync.ensure_ready(project_id))
-        .await
-    {
-        Outcome::Done(report) => report?,
-        Outcome::Timeout => return Err(AppError::ProjectLoadTimeout(project_id)),
-        Outcome::Cancelled => return Err(AppError::Interrupted),
-    };
     let project = lock(&state.projects)
         .get(&project_id)
         .cloned()
@@ -501,15 +495,22 @@ async fn run_inner(
     // recipient is dispatched.
     check_prompt_size(&body).map_err(AppError::PromptTooLarge)?;
 
+    // Last, right before dispatch: what has to hold is that the window was
+    // ready when the message went out, and a forward can wait a long time for
+    // its source above. Both checks are quick, so they share the call's
+    // finishing allowance; a source that finishes at the deadline must not
+    // fail an otherwise ready send.
+    let report = match budget
+        .run_with_grace(state.desktop_sync.ensure_ready(project_id))
+        .await
+    {
+        Outcome::Done(report) => report?,
+        Outcome::Timeout => return Err(AppError::ProjectLoadTimeout(project_id)),
+        Outcome::Cancelled => return Err(AppError::Interrupted),
+    };
+    let unheard = report.hearing.unheard(plan.recipients.iter().copied());
     if plan.on_busy == OnBusyPolicy::Refuse {
-        refuse_if_busy(
-            state,
-            budget,
-            &plan.recipients,
-            &report.unsubscribed_agents,
-            &roster,
-        )
-        .await?;
+        refuse_if_busy(state, budget, &plan.recipients, &unheard, &roster).await?;
     }
     dispatch_recipients(
         state,
@@ -517,7 +518,7 @@ async fn run_inner(
         send_id,
         &plan.recipients,
         plan.on_busy,
-        &report.unsubscribed_agents,
+        &unheard,
         &roster,
         &body,
     )
@@ -532,11 +533,12 @@ fn agent_name(roster: &[AgentRecord], agent_id: AgentId) -> String {
 }
 
 /// The up-front check under `refuse`: every recipient the window can hear is
-/// asked whether it would accept a send now, under the call's budget. Only an
-/// agent that answers "no" is busy. A deadline that passes first proves
-/// nothing about the rest — it can pass before an idle agent is even asked —
-/// so the send then fails with a timeout naming no one, unless an agent
-/// already answered "no".
+/// asked whether it would accept a send now, under the call's finishing
+/// allowance (it runs after the window sync, which shares it). Only an agent
+/// that answers "no" is busy. A deadline that passes first proves nothing
+/// about the rest — it can pass before an idle agent is even asked — so the
+/// send then fails with a timeout naming no one, unless an agent already
+/// answered "no".
 pub(super) async fn refuse_if_busy(
     state: &AppState,
     budget: &WaitBudget,
@@ -550,7 +552,10 @@ pub(super) async fn refuse_if_busy(
         .copied()
         .filter(|a| !unsubscribed.contains(a));
     for agent_id in candidates {
-        match budget.run(state.dispatcher.accepts_now(agent_id)).await {
+        match budget
+            .run_with_grace(state.dispatcher.accepts_now(agent_id))
+            .await
+        {
             Outcome::Done(true) => {}
             Outcome::Done(false) => busy.push(agent_name(roster, agent_id)),
             Outcome::Timeout if busy.is_empty() => {

@@ -32,14 +32,48 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::state::lock;
 
+/// Which agents' events the window is listening to.
+///
+/// **A list of the agents heard, not of the ones missed.** A turn for an agent
+/// the window is not listening to runs invisibly, and Tauri does not replay
+/// events, so it stays invisible. Naming the heard agents refuses every other
+/// one by construction, including an agent created after the window read its
+/// roster: a workflow binds its steps' agents by name against a roster read
+/// after the window answered, so such an agent can be a recipient.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Hearing {
+    /// There is no window to miss anything: a state built without one, or a
+    /// test that is not about the window.
+    #[default]
+    Everyone,
+    /// Exactly these agents.
+    Only(Vec<AgentId>),
+}
+
+impl Hearing {
+    #[must_use]
+    pub fn hears(&self, agent_id: AgentId) -> bool {
+        match self {
+            Self::Everyone => true,
+            Self::Only(agents) => agents.contains(&agent_id),
+        }
+    }
+
+    /// The agents among `agents` the window is not listening to.
+    #[must_use]
+    pub fn unheard(&self, agents: impl IntoIterator<Item = AgentId>) -> Vec<AgentId> {
+        agents.into_iter().filter(|a| !self.hears(*a)).collect()
+    }
+}
+
 /// What the window reports once a project is ready for a turn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadyReport {
-    /// Agents whose event subscription failed in the window. A send to one of
-    /// them is refused per recipient (`desktop_unavailable`) rather than run
-    /// invisibly, matching the window's own refusal to dispatch into a fork
-    /// whose subscription failed.
-    pub unsubscribed_agents: Vec<AgentId>,
+    /// A send to an agent the window does not hear is refused per recipient
+    /// (`desktop_unavailable`) rather than run invisibly, matching the
+    /// window's own refusal to dispatch into a fork whose subscription failed;
+    /// a workflow whose steps reach one is refused whole.
+    pub hearing: Hearing,
 }
 
 #[async_trait]
@@ -86,8 +120,9 @@ impl DesktopSync for NoopDesktopSync {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SyncAck {
-    /// Nothing is loading and every subscription has settled.
-    Ready { unsubscribed_agents: Vec<AgentId> },
+    /// Nothing is loading and every subscription has settled; these are the
+    /// agents whose events the window is listening to.
+    Ready { listening_agents: Vec<AgentId> },
     /// The window's open or roster read failed.
     Failed { message: String },
 }
@@ -96,7 +131,20 @@ pub enum SyncAck {
 /// load keeps running past it, so a retry usually succeeds.
 pub const SYNC_DEADLINE: Duration = Duration::from_secs(10);
 
-type Pending = Mutex<HashMap<Uuid, oneshot::Sender<SyncAck>>>;
+/// One request waiting for the window.
+struct Waiting {
+    project_id: ProjectId,
+    answer: oneshot::Sender<SyncAck>,
+}
+
+type Pending = Mutex<HashMap<Uuid, Waiting>>;
+
+/// A request still waiting for the window's answer, as the window fetches it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PendingSync {
+    pub request_id: Uuid,
+    pub project_id: ProjectId,
+}
 
 /// The production round trip: emits `desktop_sync_project { request_id,
 /// project_id }` to the window and waits for the matching
@@ -107,6 +155,14 @@ type Pending = Mutex<HashMap<Uuid, oneshot::Sender<SyncAck>>>;
 /// future is dropped (the send was cancelled mid-round-trip, or a deadline
 /// passed), its request is removed, and an acknowledgement that arrives
 /// afterwards is ignored.
+///
+/// **The window can also fetch what is waiting** ([`WindowSync::pending`]).
+/// The request is an event, and Tauri does not replay events, so a request
+/// emitted before the window is listening (its first seconds after launch,
+/// or a reload) would otherwise be lost and the send would time out. The
+/// window fetches the waiting requests once it is listening and answers them
+/// like the event; a request answered twice is answered once, since the
+/// second answer finds nothing waiting.
 pub struct WindowSync {
     window: Arc<dyn EventEmitter>,
     deadline: Duration,
@@ -134,13 +190,25 @@ impl WindowSync {
         let waiter = lock(&self.pending).remove(&request_id);
         // The waiter may also have been dropped between the removal and this
         // send; that is the same late acknowledgement, and also ignored.
-        if let Some(tx) = waiter
-            && tx.send(ack).is_ok()
+        if let Some(waiting) = waiter
+            && waiting.answer.send(ack).is_ok()
         {
             return true;
         }
         tracing::debug!(%request_id, "ignoring a window sync acknowledgement nobody is waiting for");
         false
+    }
+
+    /// The requests waiting for the window's answer.
+    #[must_use]
+    pub fn pending(&self) -> Vec<PendingSync> {
+        lock(&self.pending)
+            .iter()
+            .map(|(request_id, waiting)| PendingSync {
+                request_id: *request_id,
+                project_id: waiting.project_id,
+            })
+            .collect()
     }
 
     /// How many requests are waiting for the window.
@@ -166,8 +234,8 @@ impl Drop for PendingGuard<'_> {
 impl DesktopSync for WindowSync {
     async fn ensure_ready(&self, project_id: ProjectId) -> Result<ReadyReport, AppError> {
         let request_id = Uuid::now_v7();
-        let (tx, rx) = oneshot::channel();
-        lock(&self.pending).insert(request_id, tx);
+        let (answer, rx) = oneshot::channel();
+        lock(&self.pending).insert(request_id, Waiting { project_id, answer });
         let _guard = PendingGuard {
             pending: &self.pending,
             request_id,
@@ -180,12 +248,10 @@ impl DesktopSync for WindowSync {
         let answer = tokio::time::timeout(self.deadline, rx).await;
         let elapsed_ms = started.elapsed().as_millis();
         match answer {
-            Ok(Ok(SyncAck::Ready {
-                unsubscribed_agents,
-            })) => {
-                tracing::info!(%project_id, elapsed_ms, unsubscribed = unsubscribed_agents.len(), "window ready for a turn");
+            Ok(Ok(SyncAck::Ready { listening_agents })) => {
+                tracing::info!(%project_id, elapsed_ms, listening = listening_agents.len(), "window ready for a turn");
                 Ok(ReadyReport {
-                    unsubscribed_agents,
+                    hearing: Hearing::Only(listening_agents),
                 })
             }
             Ok(Ok(SyncAck::Failed { message })) => {

@@ -60,6 +60,7 @@ import { draftAttachmentPaths } from "$lib/state/composeStore";
 import { layout } from "$lib/layout.svelte";
 import {
   applyAgentHydrate,
+  isListening,
   markHydrationAttempted,
   registerAgent,
   runtimes,
@@ -652,6 +653,7 @@ export async function removeAgent(agentId: AgentId): Promise<void> {
   await api.removeAgent(agentId);
   for (const [projectId, agents] of Object.entries(agentsByProject)) {
     if (agents.some((a) => a.id === agentId)) {
+      markRosterChanged(projectId);
       agentsByProject[projectId] = agents.filter((a) => a.id !== agentId);
     }
   }
@@ -668,6 +670,7 @@ export async function removeAgent(agentId: AgentId): Promise<void> {
 /// surfaces them and stays in edit mode).
 export async function renameAgent(agentId: AgentId, newName: string): Promise<void> {
   const updated = await api.renameAgent(agentId, newName);
+  markRosterChanged(updated.project_id);
   replaceAgentRecord(agentId, updated);
 }
 
@@ -679,6 +682,7 @@ export async function setAgentSelection(
   changes: AgentSelectionChanges,
 ): Promise<void> {
   const updated = await api.setAgentSelection(agentId, changes);
+  markRosterChanged(updated.project_id);
   replaceAgentRecord(agentId, updated);
 }
 
@@ -719,15 +723,30 @@ export async function reorderAgents(projectId: ProjectId, orderedIds: AgentId[])
     optimistic.push(record);
   }
   if (optimistic.length === previous.length && orderedIds.length === previous.length) {
+    markRosterChanged(projectId);
     agentsByProject[projectId] = optimistic;
   }
   try {
-    agentsByProject[projectId] = await api.reorderAgents(projectId, orderedIds);
+    const reordered = await api.reorderAgents(projectId, orderedIds);
+    markRosterChanged(projectId);
+    agentsByProject[projectId] = reordered;
   } catch (e) {
+    markRosterChanged(projectId);
     agentsByProject[projectId] = previous;
     throw e;
   } finally {
     reorderInFlight.delete(projectId);
+    // Either write above replaces the whole list with one taken before or
+    // during the reorder, so an agent another client added meanwhile may be
+    // missing from it. Read the roster back.
+    if (loadStarted.has(projectId)) {
+      void refreshProjectRoster(projectId).catch((err: unknown) => {
+        console.warn("[switchboard] roster refresh after reorder failed", {
+          project_id: projectId,
+          error: err,
+        });
+      });
+    }
   }
 }
 
@@ -1272,28 +1291,114 @@ export async function retryProjectHydration(projectId: ProjectId): Promise<void>
 /// An agent already there is replaced in place: a roster refresh for another
 /// client's change can land between the window's own create and this call.
 export function addAgentToProjectRoster(agent: AgentRecord): void {
+  markRosterChanged(agent.project_id);
+  placeInRoster(agent);
+}
+
+function placeInRoster(agent: AgentRecord): void {
   const existing = agentsByProject[agent.project_id] ?? [];
   agentsByProject[agent.project_id] = existing.some((a) => a.id === agent.id)
     ? existing.map((a) => (a.id === agent.id ? agent : a))
     : [...existing, agent];
 }
 
+/// Counts the window's own changes to each project's roster: create, attach,
+/// fork, remove, rename, selection save, reorder. Bumped by those actions
+/// only, never by a roster refresh applying what it read, so overlapping
+/// refreshes cannot invalidate each other.
+// Bookkeeping only — never read during render.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const rosterChanges = new Map<ProjectId, number>();
+
+function markRosterChanged(projectId: ProjectId): void {
+  rosterChanges.set(projectId, (rosterChanges.get(projectId) ?? 0) + 1);
+}
+
+/// The roster read in flight per project, and whether a caller arrived during
+/// it and so needs one more read after it.
+// Bookkeeping only — never read during render.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const rosterReads = new Map<ProjectId, { done: Promise<void>; again: boolean }>();
+
+const ROSTER_READ_ATTEMPTS = 3;
+
 /// Re-read a loaded project's roster and fold in what another client changed:
 /// a new agent is registered and added (its card and compose chip appear), a
-/// renamed or reconfigured one is replaced in place. Registration comes first,
-/// as on every create path, so the agent is never on screen without its
-/// event subscription.
-async function refreshProjectRoster(projectId: ProjectId): Promise<void> {
-  const fetched = await api.listAgents(projectId);
-  for (const agent of fetched) {
-    const known = (agentsByProject[projectId] ?? []).find((a) => a.id === agent.id);
-    if (known === undefined) {
-      await registerAgent(agent);
-      addAgentToProjectRoster(agent);
-    } else if (JSON.stringify(known) !== JSON.stringify(agent)) {
-      replaceAgentRecord(agent.id, agent);
-    }
+/// renamed or reconfigured one is replaced in place.
+///
+/// **A read older than the user's own change is never applied.** It would
+/// put the old state back: a removed agent's card, a reverted name, a model
+/// the editor then compares against. So a read during which the window
+/// changed the roster is discarded and repeated, the shape the project-list
+/// read (`loadWorkspace`) has. Reads are one at a time per project, and a
+/// caller arriving during one shares it and gets one more read after it, so
+/// every caller resolves with a roster at least as new as its request. After
+/// `ROSTER_READ_ATTEMPTS` discarded reads it fails: a sync then answers
+/// failed and the backend sends nothing, rather than proceed on a roster it
+/// could not read.
+///
+/// Registration comes first, as on every create path, so an agent is never on
+/// screen without its event subscription; the read is checked again after it,
+/// since the user can change the roster or delete the project meanwhile.
+function refreshProjectRoster(projectId: ProjectId): Promise<void> {
+  const inFlight = rosterReads.get(projectId);
+  if (inFlight !== undefined) {
+    inFlight.again = true;
+    return inFlight.done;
   }
+  const read: { done: Promise<void>; again: boolean } = {
+    done: Promise.resolve(),
+    again: false,
+  };
+  read.done = (async () => {
+    try {
+      let discarded = 0;
+      for (;;) {
+        read.again = false;
+        const before = rosterChanges.get(projectId) ?? 0;
+        const fetched = await api.listAgents(projectId);
+        const fresh = (): boolean =>
+          loadStarted.has(projectId) && (rosterChanges.get(projectId) ?? 0) === before;
+        let added: AgentRecord[] = [];
+        if (fresh()) {
+          const shown = agentsByProject[projectId] ?? [];
+          added = fetched.filter((agent) => !shown.some((a) => a.id === agent.id));
+          await Promise.all(added.map((agent) => registerAgent(agent)));
+        }
+        // **No `await` from here to the end of the iteration**, so the check,
+        // the apply, and the decision to stop are one step no caller lands in.
+        if (!loadStarted.has(projectId)) {
+          unregisterAgents(added.map((agent) => agent.id));
+          return;
+        }
+        if (!fresh()) {
+          // Give up only what this read registered and nothing now shows.
+          const shown = agentsByProject[projectId] ?? [];
+          unregisterAgents(
+            added.filter((agent) => !shown.some((a) => a.id === agent.id)).map((a) => a.id),
+          );
+          discarded += 1;
+          if (discarded >= ROSTER_READ_ATTEMPTS) {
+            throw new Error("the project's agents kept changing while they were being read");
+          }
+          continue;
+        }
+        for (const agent of fetched) {
+          const known = (agentsByProject[projectId] ?? []).find((a) => a.id === agent.id);
+          if (known === undefined) {
+            placeInRoster(agent);
+          } else if (JSON.stringify(known) !== JSON.stringify(agent)) {
+            replaceAgentRecord(agent.id, agent);
+          }
+        }
+        if (!read.again) return;
+      }
+    } finally {
+      if (rosterReads.get(projectId) === read) rosterReads.delete(projectId);
+    }
+  })();
+  rosterReads.set(projectId, read);
+  return read.done;
 }
 
 /// Resolve once no read of the project is running or queued, including reads
@@ -1309,7 +1414,7 @@ async function settleProjectLoads(projectId: ProjectId): Promise<void> {
 }
 
 /// Get a project ready for a turn another client (an orchestrator over MCP)
-/// is about to start in it, and report the agents the window cannot hear.
+/// is about to start in it, and report the agents the window is listening to.
 /// Never changes the selection: the user keeps looking at what they were.
 ///
 /// Ready means nothing is in flight that the turn would race: the project is
@@ -1323,6 +1428,9 @@ async function settleProjectLoads(projectId: ProjectId): Promise<void> {
 export async function syncProjectForTurn(projectId: ProjectId): Promise<DesktopSyncAck> {
   try {
     await ensureProjectLoaded(projectId);
+    // After the request arrived, never from before it: every agent the
+    // backend could send to then exists in this read, and the window reports
+    // exactly the agents it hears, so a newer one is refused, not missed.
     await refreshProjectRoster(projectId);
   } catch (err) {
     return { status: "failed", message: err instanceof Error ? err.message : String(err) };
@@ -1343,8 +1451,8 @@ export async function syncProjectForTurn(projectId: ProjectId): Promise<DesktopS
   await settleProjectLoads(projectId);
   return {
     status: "ready",
-    unsubscribed_agents: (agentsByProject[projectId] ?? [])
-      .filter((agent) => runtimes[agent.id]?.listener_error != null)
+    listening_agents: (agentsByProject[projectId] ?? [])
+      .filter((agent) => isListening(agent.id))
       .map((agent) => agent.id),
   };
 }
@@ -1373,23 +1481,41 @@ function onRunsChanged(projectId: ProjectId): void {
 /// turn. Called once at app start; resolves to the uninstall.
 export async function installDesktopSync(): Promise<() => void> {
   const unlisteners = await Promise.all([
-    api.listenDesktopSyncProject((request) => {
-      void syncProjectForTurn(request.project_id)
-        .then((result) => api.desktopProjectSynced(request.request_id, result))
-        .catch((err: unknown) => {
-          console.warn("[switchboard] project sync acknowledgement failed", {
-            project_id: request.project_id,
-            error: err,
-          });
-        });
-    }),
+    api.listenDesktopSyncProject(answerSyncRequest),
     api.listenDesktopRosterChanged(onRosterChanged),
     api.listenProjectsChanged(() => void refreshProjectRegistry()),
     api.listenDesktopRunsChanged(onRunsChanged),
   ]);
+  // Requests emitted before the listener existed (the window's first seconds,
+  // or a reload) were lost as events; the backend still holds them.
+  try {
+    for (const request of await api.desktopPendingSyncs()) answerSyncRequest(request);
+  } catch (err) {
+    console.warn("[switchboard] could not fetch waiting sync requests", err);
+  }
   return () => {
     for (const unlisten of unlisteners) unlisten();
   };
+}
+
+/// Requests being answered, so one delivered both as an event and by the
+/// waiting-requests fetch is answered once.
+// Bookkeeping only — never read during render.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const syncsInFlight = new Set<string>();
+
+function answerSyncRequest(request: { request_id: string; project_id: ProjectId }): void {
+  if (syncsInFlight.has(request.request_id)) return;
+  syncsInFlight.add(request.request_id);
+  void syncProjectForTurn(request.project_id)
+    .then((result) => api.desktopProjectSynced(request.request_id, result))
+    .catch((err: unknown) => {
+      console.warn("[switchboard] project sync acknowledgement failed", {
+        project_id: request.project_id,
+        error: err,
+      });
+    })
+    .finally(() => syncsInFlight.delete(request.request_id));
 }
 
 /// Branch `sourceId`'s conversation into a new agent and make it the live one.
@@ -1653,6 +1779,9 @@ export const _testing = {
     forkHistoryPending.clear();
     refreshRequestedAgain.clear();
     projectLoadChain.clear();
+    rosterChanges.clear();
+    rosterReads.clear();
+    syncsInFlight.clear();
     setTurnTerminalHook(undefined);
     setDispatchFailedHook(undefined);
     loaderGeneration += 1;

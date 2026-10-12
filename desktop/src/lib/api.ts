@@ -139,6 +139,14 @@ export async function listenDesktopSyncProject(
   );
 }
 
+/// The sync requests still waiting for an answer, for a window that was not
+/// yet listening when they were emitted.
+export async function desktopPendingSyncs(): Promise<
+  { request_id: string; project_id: ProjectId }[]
+> {
+  return await invoke<{ request_id: string; project_id: ProjectId }[]>("desktop_pending_syncs");
+}
+
 export async function desktopProjectSynced(
   requestId: string,
   result: DesktopSyncAck,

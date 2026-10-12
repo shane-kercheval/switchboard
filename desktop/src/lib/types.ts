@@ -644,7 +644,7 @@ export type AgentSelectionChanges = Partial<AgentSelection>;
 /// The window's answer to the backend's request to get a project ready for a
 /// turn another client is about to start.
 export type DesktopSyncAck =
-  | { status: "ready"; unsubscribed_agents: AgentId[] }
+  | { status: "ready"; listening_agents: AgentId[] }
   | { status: "failed"; message: string };
 
 // Mirror of `crates/core::AgentRecord`. `session_locator` is `null` for

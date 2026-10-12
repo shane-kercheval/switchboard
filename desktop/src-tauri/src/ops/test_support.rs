@@ -23,7 +23,7 @@ use crate::commands::{create_project_impl, set_agent_session_locator_impl};
 use crate::error::AppError;
 use crate::state::{AppState, lock};
 
-use super::desktop_sync::{DesktopSync, ReadyReport, WindowSync};
+use super::desktop_sync::{DesktopSync, Hearing, ReadyReport, WindowSync};
 
 /// One scripted turn.
 #[derive(Clone)]
@@ -212,7 +212,8 @@ impl HarnessAdapter for ScriptedAdapter {
 /// delay, or with a load timeout; counts the notifications it received.
 #[derive(Default)]
 pub struct StubDesktopSync {
-    pub unsubscribed: Mutex<Vec<AgentId>>,
+    /// Who the window hears; everyone unless a test says otherwise.
+    pub hearing: Mutex<Hearing>,
     pub delay: Mutex<Option<Duration>>,
     pub times_out: Mutex<bool>,
     pub ready_calls: Mutex<Vec<ProjectId>>,
@@ -233,7 +234,7 @@ impl DesktopSync for StubDesktopSync {
             return Err(AppError::ProjectLoadTimeout(project_id));
         }
         Ok(ReadyReport {
-            unsubscribed_agents: lock(&self.unsubscribed).clone(),
+            hearing: lock(&self.hearing).clone(),
         })
     }
 
@@ -247,6 +248,19 @@ impl DesktopSync for StubDesktopSync {
 
     fn runs_changed(&self, project_id: ProjectId) {
         lock(&self.runs_changed).push(project_id);
+    }
+}
+
+impl StubDesktopSync {
+    /// The window hears every agent of `roster` except `unheard`.
+    pub fn hear_all_but(&self, roster: &[AgentId], unheard: &[AgentId]) {
+        *lock(&self.hearing) = Hearing::Only(
+            roster
+                .iter()
+                .copied()
+                .filter(|a| !unheard.contains(a))
+                .collect(),
+        );
     }
 }
 

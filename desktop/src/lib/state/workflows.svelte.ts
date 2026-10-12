@@ -27,6 +27,26 @@ const pendingSubs = new Map<ProjectId, Promise<void>>();
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const generation = new Map<ProjectId, number>();
 
+/// Every run this session has seen end, per project, with how it ended.
+///
+/// **A fetched run list can be older than an end the window already saw.**
+/// The backend announces a run's end before it drops the run from its live
+/// registry, and the list reports every live run as running, so a list read
+/// just after the end (the refresh a dismissal triggers, say) still says
+/// running, and no event is left to correct it. Every fetched list is
+/// therefore corrected by this: a completed or cancelled run is dropped, a
+/// failed one keeps its failure. A run the list no longer has stays gone.
+// Bookkeeping only — never read during render.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const ended = new Map<ProjectId, Map<string, WorkflowProgressPayload>>();
+
+/// The run-list fetch in flight per project: the progress that arrived during
+/// it, replayed over its answer, and whether a caller arrived during it and so
+/// needs one more fetch after it.
+type RunFetch = { done: Promise<void>; events: WorkflowProgressPayload[]; again: boolean };
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const fetches = new Map<ProjectId, RunFetch>();
+
 /// Subscribe to a project's workflow progress channel (idempotent). Installs the
 /// listener **first**, then seeds the current runs — so a run that terminalizes
 /// during project load isn't missed (the listener is already live). The
@@ -34,8 +54,7 @@ const generation = new Map<ProjectId, number>();
 /// down while either await is in flight.
 export async function subscribeProjectWorkflows(projectId: ProjectId): Promise<void> {
   // The in-flight subscribe first: the listener is installed before the seed
-  // lands, and a caller about to start a run must wait for the seed too, or
-  // the seed (read before the run existed) could replace the run's live state.
+  // lands, and a caller about to start a run must wait for the seed too.
   const pending = pendingSubs.get(projectId);
   if (pending !== undefined) return pending;
   if (subscriptions.has(projectId)) return;
@@ -54,18 +73,7 @@ export async function subscribeProjectWorkflows(projectId: ProjectId): Promise<v
         return;
       }
       subscriptions.set(projectId, unlisten);
-      let seeded: WorkflowRunInfo[];
-      try {
-        seeded = await api.listWorkflowRuns(projectId);
-      } catch (err) {
-        console.warn("[switchboard] listWorkflowRuns failed", err);
-        return;
-      }
-      // Discard a stale seed if torn down meanwhile. (A live progress event that
-      // landed between `listen` and here is overwritten by the seed — a
-      // project-open-only, millisecond window that self-heals on the next event.)
-      if (generation.get(projectId) !== gen) return;
-      workflowRuns[projectId] = seeded;
+      await refreshRuns(projectId);
     } finally {
       pendingSubs.delete(projectId);
     }
@@ -86,29 +94,107 @@ export function unsubscribeProjectWorkflows(projectIds: ProjectId[]): void {
       subscriptions.delete(projectId);
     }
     pendingSubs.delete(projectId);
+    ended.delete(projectId);
+    fetches.delete(projectId);
     delete workflowRuns[projectId];
   }
 }
 
-/// Re-query the authoritative 3-class run list for a project.
-export async function refreshRuns(projectId: ProjectId): Promise<void> {
-  try {
-    workflowRuns[projectId] = await api.listWorkflowRuns(projectId);
-  } catch (err) {
-    console.warn("[switchboard] listWorkflowRuns failed", err);
+/// Re-query the authoritative 3-class run list for a project, corrected by
+/// what the window already knows: the ends it has seen, and the progress that
+/// arrived while the query ran. Without that, the answer, which is read before
+/// it lands, could put back a run that ended meanwhile. One query per project
+/// at a time; a caller arriving during one gets one more after it. A failed
+/// query is logged and leaves the list as it was.
+export function refreshRuns(projectId: ProjectId): Promise<void> {
+  const inFlight = fetches.get(projectId);
+  if (inFlight !== undefined) {
+    inFlight.again = true;
+    return inFlight.done;
   }
+  const fetch: RunFetch = { done: Promise.resolve(), events: [], again: false };
+  fetch.done = (async () => {
+    try {
+      for (;;) {
+        fetch.again = false;
+        fetch.events = [];
+        const gen = generation.get(projectId);
+        let listed: WorkflowRunInfo[];
+        try {
+          listed = await api.listWorkflowRuns(projectId);
+        } catch (err) {
+          console.warn("[switchboard] listWorkflowRuns failed", err);
+          return;
+        }
+        // Torn down meanwhile: commit nothing for a project that is gone.
+        if (generation.get(projectId) !== gen) return;
+        workflowRuns[projectId] = correctRuns(projectId, listed, fetch.events);
+        if (!fetch.again) return;
+      }
+    } finally {
+      if (fetches.get(projectId) === fetch) fetches.delete(projectId);
+    }
+  })();
+  fetches.set(projectId, fetch);
+  return fetch.done;
 }
 
-/// Apply a progress event entirely from its payload — no re-query. The terminal
-/// event is emitted before the backend prunes its registry entry, so re-querying
-/// on it could observe the run as still-live and pin it "running"; the payload
-/// already carries the status, step, and reason. `running`/`failed` upsert the
-/// run **in place** (so the indicator list doesn't reshuffle on every step);
-/// `complete`/`cancelled` drop it. The `interrupted` class never arrives as an
-/// event (a crashed run has no live process) — it surfaces only via the
-/// seed-on-subscribe query.
+/// A fetched list made current: ends the window has seen applied, then the
+/// progress that arrived during the fetch replayed in order.
+function correctRuns(
+  projectId: ProjectId,
+  listed: WorkflowRunInfo[],
+  during: WorkflowProgressPayload[],
+): WorkflowRunInfo[] {
+  const seen = ended.get(projectId);
+  let runs = listed;
+  if (seen !== undefined) {
+    runs = runs.flatMap((run) => {
+      const end = seen.get(run.run_id);
+      if (end === undefined) return [run];
+      if (end.status !== "failed") return [];
+      return [{ ...run, status: "failed" as const, reason: end.reason, step: end.step }];
+    });
+  }
+  for (const payload of during) runs = applyProgress(runs, payload);
+  return runs;
+}
+
+/// One progress event applied to a run list, with no side effects, so a
+/// replay over a fetched list does exactly what the live event did.
+/// `running`/`failed` upsert the run **in place** (so the indicator list
+/// doesn't reshuffle on every step); `complete`/`cancelled` drop it.
+///
+/// The lean progress payload carries no `steps`; the snapshot the run was
+/// seeded with (from `list_workflow_runs`) is preserved when updating in place.
+/// Empty `steps` is therefore a normal *transient* state for a run first seen
+/// via an event before a seed/refresh populates it.
+function applyProgress(
+  runs: WorkflowRunInfo[],
+  payload: WorkflowProgressPayload,
+): WorkflowRunInfo[] {
+  if (payload.status === "complete" || payload.status === "cancelled") {
+    return runs.filter((r) => r.run_id !== payload.run_id);
+  }
+  const existing = runs.find((r) => r.run_id === payload.run_id);
+  const row: WorkflowRunInfo = {
+    run_id: payload.run_id,
+    workflow: payload.workflow,
+    step: payload.step,
+    total: payload.total,
+    status: payload.status === "failed" ? "failed" : "running",
+    reason: payload.status === "failed" ? payload.reason : null,
+    steps: existing?.steps ?? [],
+  };
+  return existing ? runs.map((r) => (r.run_id === payload.run_id ? row : r)) : [...runs, row];
+}
+
+/// Apply a progress event from its payload. The terminal event is emitted
+/// before the backend prunes its registry entry, so re-querying on it could
+/// observe the run as still-live; the payload already carries the status,
+/// step, and reason. The interrupted class never arrives as an event (a crashed
+/// run has no live process) — it surfaces only via the seed-on-subscribe query.
 function handleProgress(projectId: ProjectId, payload: WorkflowProgressPayload): void {
-  const current = workflowRuns[projectId] ?? [];
   if (payload.status !== "running") {
     // Record the run's outcome for the project's completion notification, before
     // the drop below. The drop is what flips the project idle, and today that
@@ -120,36 +206,25 @@ function handleProgress(projectId: ProjectId, payload: WorkflowProgressPayload):
     // *retained* rather than dropped, but it has still terminalized, so it is
     // recorded here either way.
     recordWorkflowTerminal(projectId, payload.workflow, payload.status);
+    // Bookkeeping only — never read during render.
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const seen = ended.get(projectId) ?? new Map<string, WorkflowProgressPayload>();
+    seen.set(payload.run_id, payload);
+    ended.set(projectId, seen);
   }
-  if (payload.status === "complete" || payload.status === "cancelled") {
-    workflowRuns[projectId] = current.filter((r) => r.run_id !== payload.run_id);
-    return;
-  }
-  // The lean progress payload carries no `steps`; preserve the snapshot the run
-  // was seeded with (from `list_workflow_runs`) when updating in place. Empty
-  // `steps` is therefore a normal *transient* state for a run first seen via an
-  // event before a seed/refresh populates it (not only a legacy disk file) — the
-  // live view refreshes on invoke / on an unknown running event to close
-  // that window before the progress view renders.
-  const existing = current.find((r) => r.run_id === payload.run_id);
-  const row: WorkflowRunInfo = {
-    run_id: payload.run_id,
-    workflow: payload.workflow,
-    step: payload.step,
-    total: payload.total,
-    status: payload.status === "failed" ? "failed" : "running",
-    reason: payload.status === "failed" ? payload.reason : null,
-    steps: existing?.steps ?? [],
-  };
-  workflowRuns[projectId] = existing
-    ? current.map((r) => (r.run_id === payload.run_id ? row : r))
-    : [...current, row];
+  fetches.get(projectId)?.events.push(payload);
+  const current = workflowRuns[projectId] ?? [];
+  const known = current.some((r) => r.run_id === payload.run_id);
+  workflowRuns[projectId] = applyProgress(current, payload);
   // A run first seen via an event — started outside the launching view (a
-  // background project, direct IPC), or before that view's post-invoke seed
-  // resolved — has no `steps`. Fetch the authoritative snapshot once so the live
-  // view renders labeled steps. Only the first event for the run hits this; later
-  // events find `existing` and update in place (preserving the fetched steps).
-  if (existing === undefined) void refreshRuns(projectId);
+  // background project, another client), or before that view's post-invoke
+  // seed resolved — has no `steps`. Fetch the authoritative snapshot once so
+  // the live view renders labeled steps. Only the first event for the run hits
+  // this; later events find it and update in place (preserving the fetched
+  // steps).
+  if (!known && (payload.status === "running" || payload.status === "failed")) {
+    void refreshRuns(projectId);
+  }
 }
 
 /// Cancel a live run (fire-and-forget on the backend; the channel event clears it).
@@ -171,6 +246,8 @@ export const _testing = {
     subscriptions.clear();
     pendingSubs.clear();
     generation.clear();
+    ended.clear();
+    fetches.clear();
     for (const key of Object.keys(workflowRuns)) delete workflowRuns[key];
   },
 };

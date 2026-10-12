@@ -714,3 +714,32 @@ pub async fn await_turn_running(state: &AppState, agent_id: AgentId) {
     }
     panic!("agent {agent_id} never started its turn");
 }
+
+/// A local saved prompt with one required argument, `who`.
+pub const GREET_PROMPT: &str = "---\nname: greet\ndescription: Greeting.\narguments:\n  - name: who\n    required: true\n---\nHi {{ who }}\n";
+
+/// A workflow that greets `coder` with the saved prompt, then `reviewers`,
+/// waiting for each.
+pub const PAIR_WORKFLOW: &str = "name: pair
+description: test
+inputs:
+  coder:
+    type: agent
+  reviewers:
+    type: [agent]
+steps:
+  - label: Greet
+    send:
+      to: \"{{ coder }}\"
+      prompt: \"local:greet\"
+  - label: Greeted
+    wait_for:
+      agent: \"{{ coder }}\"
+  - label: Review
+    send:
+      to: \"{{ reviewers }}\"
+      prompt: \"local:greet\"
+  - label: Reviewed
+    wait_for_all:
+      agents: \"{{ reviewers }}\"
+";

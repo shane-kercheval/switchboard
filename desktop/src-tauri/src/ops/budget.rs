@@ -88,8 +88,9 @@ pub struct BudgetSpec {
     /// A top-level key of the result whose array elements may be dropped
     /// oldest-first when cutting text is not enough.
     pub droppable_list: Option<&'static str>,
-    /// The call to read it in pages, for the error when one element cannot fit.
-    pub read_with: &'static str,
+    /// The call to read it in pages, for the error when one element cannot
+    /// fit, or `None` when the result type has none.
+    pub read_with: Option<&'static str>,
     /// For a cut field, the call that reads the rest, or `None` when nothing
     /// can. Its serialized length may depend on the cap only through the
     /// digit count of `kept_chars` (embedding the offset as a number does):
@@ -109,7 +110,19 @@ impl BudgetSpec {
         Self {
             budget_chars,
             droppable_list,
-            read_with,
+            read_with: Some(read_with),
+            pointer: Box::new(|_| None),
+        }
+    }
+
+    /// A spec for a result that is returned whole or not at all: nothing may
+    /// be dropped and nothing reads it in pages.
+    #[must_use]
+    pub fn whole(budget_chars: usize) -> Self {
+        Self {
+            budget_chars,
+            droppable_list: None,
+            read_with: None,
             pointer: Box::new(|_| None),
         }
     }
@@ -665,7 +678,7 @@ mod tests {
         let budget = BudgetSpec {
             budget_chars: 500,
             droppable_list: None,
-            read_with: "read_send_output",
+            read_with: Some("read_send_output"),
             pointer: Box::new(|site: &CutSite<'_>| {
                 let agent = site.ancestors.last()?.get("agent_id")?.clone();
                 Some(json!({
@@ -728,7 +741,7 @@ mod tests {
         assert!(matches!(
             err,
             AppError::ResultTooLarge {
-                read_with: "read_send_output"
+                read_with: Some("read_send_output")
             }
         ));
         let value = json!({ "name": "n".repeat(600) });
@@ -847,7 +860,12 @@ mod size_model {
         let value = recipients(&|i| "o".repeat(1_000 + i));
         let (serialized_before, visits_before) = (serializations(), field_visits());
         let err = fit(value, &BudgetSpec::unpageable(budget, None, "x")).unwrap_err();
-        assert!(matches!(err, AppError::ResultTooLarge { read_with: "x" }));
+        assert!(matches!(
+            err,
+            AppError::ResultTooLarge {
+                read_with: Some("x")
+            }
+        ));
         let serialized = serializations() - serialized_before;
         let visits = field_visits() - visits_before;
         // Every cut field costs at least 60 characters of record, so the walk

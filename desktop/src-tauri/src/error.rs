@@ -588,9 +588,11 @@ pub enum AppError {
     SendUnknown(SendId),
 
     /// A single result item cannot fit the reply budget even with every text
-    /// field emptied.
-    #[error("the result is too large to return whole; read it in pages with {read_with}")]
-    ResultTooLarge { read_with: &'static str },
+    /// field emptied. `read_with` names the call that reads it in pages, when
+    /// the result type has one; a result with none says only that it is too
+    /// large, because advice the caller cannot follow is worse than none.
+    #[error("{}", too_large_message(*read_with))]
+    ResultTooLarge { read_with: Option<&'static str> },
 
     /// An error shared between the request that raised it and any retry that
     /// joined it with the same key. Every `send` and `forward` error arrives in
@@ -637,6 +639,15 @@ pub enum AppError {
         #[source]
         source: std::io::Error,
     },
+}
+
+fn too_large_message(read_with: Option<&'static str>) -> String {
+    match read_with {
+        Some(call) => {
+            format!("the result is too large to return whole; read it in pages with {call}")
+        }
+        None => "the result is too large to return".to_owned(),
+    }
 }
 
 impl AppError {

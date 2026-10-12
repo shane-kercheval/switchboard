@@ -156,6 +156,7 @@ describe("AgentAccessSettings", () => {
     render(AgentAccessSettings);
     await waitFor(() => screen.getByTestId("agent-access-regenerate"));
     await fireEvent.click(screen.getByTestId("agent-access-regenerate"));
+    await fireEvent.click(screen.getByTestId("agent-access-token-reveal"));
     await waitFor(() =>
       expect(screen.getByTestId("agent-access-claude-code")).toHaveTextContent(
         "Bearer fresh-token-0000",
@@ -164,6 +165,41 @@ describe("AgentAccessSettings", () => {
     expect(screen.getByTestId("agent-access-codex-env")).toHaveTextContent(
       "SWITCHBOARD_TOKEN=fresh-token-0000",
     );
+  });
+
+  it("keeps the token off the screen until Show, while every Copy button copies it", async () => {
+    backend = listening();
+    const { container } = render(AgentAccessSettings);
+    await waitFor(() => screen.getByTestId("agent-access-clients"));
+
+    expect(container.textContent).not.toContain(TOKEN);
+    for (const id of [
+      "agent-access-claude-code",
+      "agent-access-codex-env",
+      "agent-access-claude-desktop",
+    ]) {
+      expect(screen.getByTestId(id)).toHaveTextContent("DEFG");
+    }
+    for (const id of [
+      "agent-access-claude-code-copy",
+      "agent-access-codex-env-copy",
+      "agent-access-claude-desktop-copy",
+    ]) {
+      copyTextMock.mockClear();
+      await fireEvent.click(screen.getByTestId(id));
+      await waitFor(() =>
+        expect(copyTextMock).toHaveBeenCalledWith(expect.stringContaining(TOKEN)),
+      );
+    }
+
+    await fireEvent.click(screen.getByTestId("agent-access-token-reveal"));
+    for (const id of [
+      "agent-access-claude-code",
+      "agent-access-codex-env",
+      "agent-access-claude-desktop",
+    ]) {
+      expect(screen.getByTestId(id)).toHaveTextContent(TOKEN);
+    }
   });
 
   it("shows a failed action and keeps the last known state", async () => {

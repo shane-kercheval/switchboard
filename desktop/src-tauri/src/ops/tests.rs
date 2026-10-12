@@ -700,7 +700,6 @@ async fn forward_with_a_mid_turn_source_past_the_budget_is_source_busy() {
     .expect("the key was released, so the natural retry succeeds");
 }
 
-const GREET_PROMPT: &str = "---\nname: greet\ndescription: Greeting.\narguments:\n  - name: who\n    required: true\n---\nHi {{ who }}\n";
 const REVIEW_PROMPT: &str = "---\nname: review\ndescription: Review.\narguments:\n  - name: diff\n    required: true\n---\nReview this:\n{{ diff }}\n";
 
 #[tokio::test]
@@ -1155,30 +1154,6 @@ async fn the_restart_fallback_answers_from_the_journal() {
 
 // --- workflows ---------------------------------------------------------------------
 
-const PAIR_WORKFLOW: &str = "name: pair
-description: test
-inputs:
-  coder:
-    type: agent
-  reviewers:
-    type: [agent]
-steps:
-  - label: Greet
-    send:
-      to: \"{{ coder }}\"
-      prompt: \"local:greet\"
-  - label: Greeted
-    wait_for:
-      agent: \"{{ coder }}\"
-  - label: Review
-    send:
-      to: \"{{ reviewers }}\"
-      prompt: \"local:greet\"
-  - label: Reviewed
-    wait_for_all:
-      agents: \"{{ reviewers }}\"
-";
-
 async fn workflow_env() -> (TestEnv, ProjectId, Vec<AgentId>) {
     let mut env = TestEnv::new().with_prompts_and_workflows();
     std::fs::write(env.prompts_dir().join("greet.md"), GREET_PROMPT).unwrap();
@@ -1221,9 +1196,14 @@ async fn describe_run_and_wait_a_workflow_with_agent_ids() {
         "a required argument derived from the saved prompt"
     );
 
-    let run_id = run_workflow(&env.state, &env.home(), pair_request(project_id, &agents))
-        .await
-        .unwrap();
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
     let reply = wait_workflow(
         &env.state,
         project_id,
@@ -1248,7 +1228,7 @@ async fn describe_run_and_wait_a_workflow_with_agent_ids() {
     let mut bad = pair_request(project_id, &agents);
     bad.inputs
         .insert("coder".to_owned(), InputValue::Text(foreign.to_string()));
-    let err = run_workflow(&env.state, &env.home(), bad)
+    let err = run_workflow(&env.state, &env.home(), bad, &WaitBudget::default_wait())
         .await
         .unwrap_err();
     assert_eq!(error_code(&err), error_code::UNKNOWN_RECIPIENT);
@@ -1258,9 +1238,14 @@ async fn describe_run_and_wait_a_workflow_with_agent_ids() {
 async fn a_failed_run_blocks_until_dismissed() {
     let (env, project_id, agents) = workflow_env().await;
     env.adapter.push(Script::failing("nope"));
-    let run_id = run_workflow(&env.state, &env.home(), pair_request(project_id, &agents))
-        .await
-        .unwrap();
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
     let reply = wait_workflow(
         &env.state,
         project_id,
@@ -1271,9 +1256,14 @@ async fn a_failed_run_blocks_until_dismissed() {
     .unwrap();
     assert_eq!(reply.status, WorkflowRunStatus::Failed);
 
-    let err = run_workflow(&env.state, &env.home(), pair_request(project_id, &agents))
-        .await
-        .unwrap_err();
+    let err = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(
         error_code(&err),
         error_code::WORKFLOW_RUN_REQUIRES_DISMISSAL
@@ -1285,9 +1275,14 @@ async fn a_failed_run_blocks_until_dismissed() {
     assert_eq!(dismissed.step, 1);
     assert!(dismissed.reason.is_some());
 
-    let rerun = run_workflow(&env.state, &env.home(), pair_request(project_id, &agents))
-        .await
-        .unwrap();
+    let rerun = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
     let reply = wait_workflow(
         &env.state,
         project_id,
@@ -1304,9 +1299,14 @@ async fn dismissing_a_live_or_completed_run_is_refused() {
     let (env, project_id, agents) = workflow_env().await;
     let gate = Arc::new(Notify::new());
     env.adapter.push(Script::parked("working", &gate));
-    let run_id = run_workflow(&env.state, &env.home(), pair_request(project_id, &agents))
-        .await
-        .unwrap();
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
     await_turn_running(&env.state, agents[0]).await;
     let err = dismiss_workflow_run(&env.state, project_id, run_id).unwrap_err();
     assert!(matches!(err, AppError::WorkflowRunActive { .. }));
@@ -1926,9 +1926,14 @@ async fn concurrent_selection_changes_both_survive() {
 async fn a_workflow_whose_steps_name_an_unheard_agent_is_refused() {
     let (env, project_id, agents) = workflow_env().await;
     env.sync.hear_all_but(&agents, &[agents[2]]);
-    let err = run_workflow(&env.state, &env.home(), pair_request(project_id, &agents))
-        .await
-        .unwrap_err();
+    let err = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error_code(&err), error_code::DESKTOP_UNAVAILABLE);
     assert!(
         lock(&env.state.workflow_runs).is_empty(),
@@ -1949,9 +1954,14 @@ async fn a_workflow_runs_the_agent_an_id_names_even_after_a_rename_and_name_reus
         None,
     )
     .unwrap();
-    let run_id = run_workflow(&env.state, &env.home(), pair_request(project_id, &agents))
-        .await
-        .unwrap();
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
     wait_workflow(
         &env.state,
         project_id,
@@ -2279,7 +2289,13 @@ async fn a_step_naming_an_unheard_agent_through_a_filter_is_not_sent() {
         ]),
         forward_sources: BTreeMap::new(),
     };
-    let outcome = run_workflow(&env.state, &env.home(), request).await;
+    let outcome = run_workflow(
+        &env.state,
+        &env.home(),
+        request,
+        &WaitBudget::default_wait(),
+    )
+    .await;
     if let Ok(run_id) = outcome {
         let reply = wait_workflow(
             &env.state,
@@ -3447,6 +3463,7 @@ async fn a_workflow_step_naming_an_agent_created_after_the_window_answered_is_re
                 inputs: BTreeMap::new(),
                 forward_sources: BTreeMap::new(),
             },
+            &WaitBudget::default_wait(),
         )
         .await
     });

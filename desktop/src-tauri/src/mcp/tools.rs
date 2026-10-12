@@ -113,6 +113,14 @@ macro_rules! tools {
             fn kind(self) -> ToolKind {
                 match self { $(Self::$variant => ToolKind::$kind,)* }
             }
+
+            /// Whether a stopping server still takes this call. Only the
+            /// cancels: they stop work and start none, and refusing one would
+            /// leave running the very work a client was trying to stop.
+            #[must_use]
+            pub fn allowed_while_stopping(self) -> bool {
+                self.kind() == ToolKind::Stops
+            }
         }
     };
 }
@@ -124,8 +132,10 @@ enum ToolKind {
     Read,
     /// Creates or renames; nothing is lost.
     Additive,
-    /// Starts agents, cancels work, or deletes a run's record.
+    /// Starts agents or deletes a run's record.
     Acts,
+    /// Stops work and starts none: the cancels.
+    Stops,
 }
 
 tools! {
@@ -210,27 +220,30 @@ tools! {
          The user sees the message in Switchboard's window, queued or running, and can cancel \
          it there.";
     Forward = "forward" (ForwardArgs) [Acts]
-        "Send agents' latest answers to other agents, composed the way the user's own forwards \
-         are: your text first, then each source's latest answer in a labeled block. Sources may \
-         be in other projects. Prefer this to copying a reply into send. A source still mid-turn \
-         is waited for within this call; if it is still running when the call's time ends, the \
-         forward fails with source_busy and nothing is sent: call wait_agent on the source, then \
-         retry. With a saved prompt, forward_args fills a prompt argument from sources instead. \
-         on_busy, idempotency_key, and the receipt work as in send.";
+        format!(
+            "Send agents' latest answers to other agents, composed the way the user's own \
+             forwards are: your text first, then each source's latest answer in a labeled block. \
+             Sources may be in other projects. Prefer this to copying a reply into send. A \
+             source still mid-turn is waited for, up to timeout_seconds; if it is still running \
+             then, the forward fails with source_busy and nothing is sent: call wait_agent on the \
+             source, then retry. With a saved prompt, forward_args fills a prompt argument from \
+             sources instead. on_busy, idempotency_key, and the receipt work as in send.\n\
+             {WAIT_HINTS}"
+        );
     RunWorkflow = "run_workflow" (RunWorkflowArgs) [Acts]
         "Start a workflow in a project and return its run_id; then call wait_workflow until \
          done. Pass inputs as describe_workflow lists them: an agent input takes an agent id, a \
          list input a list. forward_sources fills an input with agents' latest answers. The run \
          reports only its status: read outputs afterwards with read_agent_output. Refused with \
          workflow_run_requires_dismissal while a failed run is held in the project.";
-    CancelSend = "cancel_send" (SendIdArgs) [Acts]
+    CancelSend = "cancel_send" (SendIdArgs) [Stops]
         "Cancel a send: every recipient still queued or running is cancelled, and a send still \
          being prepared stops before reaching anyone else. Works for sends made since the app \
          last started.";
-    CancelAgent = "cancel_agent" (AgentArgs) [Acts]
+    CancelAgent = "cancel_agent" (AgentArgs) [Stops]
         "Stop an agent: cancel its running turn and drop every message queued for it, including \
          ones the user or a workflow queued.";
-    CancelWorkflowRun = "cancel_workflow_run" (RunArgs) [Acts]
+    CancelWorkflowRun = "cancel_workflow_run" (RunArgs) [Stops]
         "Cancel a running workflow run.";
     WaitSend = "wait_send" (WaitSendArgs) [Read]
         format!(
@@ -271,7 +284,7 @@ pub fn catalog() -> Vec<Tool> {
             let annotations = match tool.kind() {
                 ToolKind::Read => ToolAnnotations::new().read_only(true),
                 ToolKind::Additive => ToolAnnotations::new().read_only(false).destructive(false),
-                ToolKind::Acts => ToolAnnotations::new().read_only(false),
+                ToolKind::Acts | ToolKind::Stops => ToolAnnotations::new().read_only(false),
             };
             Tool::new(tool.as_str(), tool.description(), tool.schema())
                 .with_annotations(annotations)
@@ -592,6 +605,9 @@ pub struct ForwardArgs {
     on_busy: OnBusyArg,
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// Seconds to wait for a source still mid-turn. 50 by default.
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
 }
 
 /// A workflow input: a string, or a list of strings for a list input.
@@ -730,11 +746,12 @@ impl Reply {
     }
 
     /// Fit the result to the budget. A result type without rules of its own
-    /// has no field that may be cut, so it fits whole or is refused.
-    pub fn fit(self, tool: ToolName) -> Result<Budgeted, AppError> {
+    /// has no field that may be cut, so it fits whole or is refused, without
+    /// advice to read it in pages it does not have.
+    pub fn fit(self) -> Result<Budgeted, AppError> {
         let spec = self
             .spec
-            .unwrap_or_else(|| BudgetSpec::unpageable(RESULT_BUDGET_CHARS, None, tool.as_str()));
+            .unwrap_or_else(|| BudgetSpec::whole(RESULT_BUDGET_CHARS));
         fit(self.value, &spec)
     }
 }
@@ -900,7 +917,7 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 Arc::clone(&cx.handle),
                 cx.home.clone(),
                 request,
-                cx.budget(None),
+                cx.budget(a.timeout_seconds),
             )
             .await?;
             Reply::plain(&receipt)
@@ -918,7 +935,8 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                     .collect(),
                 forward_sources: source_map(a.forward_sources),
             };
-            let run_id = workflow::run_workflow(state, cx.home(), request).await?;
+            let run_id =
+                workflow::run_workflow(state, cx.home(), request, &cx.budget(None)).await?;
             Reply::plain(&serde_json::json!({ "run_id": run_id }))
         }
         ToolName::CancelSend => {

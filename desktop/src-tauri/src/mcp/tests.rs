@@ -762,3 +762,454 @@ fn port_zero_is_refused() {
         .unwrap();
     assert!(runtime.block_on(access.set_port(0)).is_err());
 }
+
+// --- every tool, and stopping ------------------------------------------------------
+
+fn tool_call(id: u64, name: &str, args: &Value, meta: Option<Value>) -> Value {
+    let mut params = json!({ "name": name, "arguments": args });
+    if let Some(meta) = meta {
+        params["_meta"] = meta;
+    }
+    json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params })
+}
+
+/// One tool call through the in-process router: whether it was an error, and
+/// its JSON body.
+async fn call_in_process(
+    router: &axum::Router,
+    session: &str,
+    id: u64,
+    name: &str,
+    args: &Value,
+) -> (bool, Value) {
+    let response = post_in_process(router, Some(session), &tool_call(id, name, args, None)).await;
+    let (message, _) = read_sse(response, id).await;
+    let is_error = message["result"]["isError"].as_bool().unwrap_or(false);
+    (is_error, tool_reply(&message))
+}
+
+#[tokio::test]
+async fn a_stopping_server_refuses_new_calls_but_lets_cancels_through() {
+    let (env, project_id, agent_id) = unopened_project(TestEnv::new());
+    let (router, shutdown) = in_process(&env);
+    let session = open_session(&router).await;
+
+    shutdown.begin();
+    let (is_error, body) = call_in_process(
+        &router,
+        &session,
+        2,
+        "create_agent",
+        &json!({ "project_id": project_id, "name": "late", "harness": "claude_code" }),
+    )
+    .await;
+    assert!(is_error, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("turning off"));
+    assert_eq!(
+        crate::commands::list_project_agents_readonly_impl(&env.state, project_id)
+            .unwrap()
+            .len(),
+        1,
+        "nothing was created"
+    );
+
+    let (is_error, body) = call_in_process(
+        &router,
+        &session,
+        3,
+        "cancel_agent",
+        &json!({ "project_id": project_id, "agent_id": agent_id }),
+    )
+    .await;
+    assert!(!is_error, "a cancel still goes through: {body}");
+}
+
+#[tokio::test]
+async fn a_send_waiting_on_the_window_when_the_server_stops_sends_nothing() {
+    let (env, project_id, agent_id) = unopened_project(TestEnv::new());
+    let (env, sync, _window, mut requests) = env.with_window(Duration::from_mins(1));
+    let (router, shutdown) = in_process(&env);
+    let session = open_session(&router).await;
+
+    let call = {
+        let router = router.clone();
+        let session = session.clone();
+        tokio::spawn(async move {
+            call_in_process(
+                &router,
+                &session,
+                2,
+                "send",
+                &json!({ "project_id": project_id, "recipients": [agent_id], "text": "hi" }),
+            )
+            .await
+        })
+    };
+    // The send is waiting for the window's answer, which never comes.
+    let _held = requests.recv().await.unwrap();
+    shutdown.run().await;
+
+    let (is_error, body) = call.await.unwrap();
+    assert!(is_error, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("shutting down"),
+        "{body}"
+    );
+    assert!(
+        crate::state::lock(&env.adapter.prompts).is_empty(),
+        "nothing was dispatched"
+    );
+    assert_eq!(
+        sync.pending_requests(),
+        0,
+        "the window request was withdrawn"
+    );
+}
+
+async fn workflow_env() -> (TestEnv, ProjectId, Vec<AgentId>) {
+    let mut env = TestEnv::new().with_prompts_and_workflows();
+    std::fs::write(
+        env.prompts_dir().join("greet.md"),
+        crate::ops::test_support::GREET_PROMPT,
+    )
+    .unwrap();
+    std::fs::write(
+        env.workflows_dir().join("pair.yaml"),
+        crate::ops::test_support::PAIR_WORKFLOW,
+    )
+    .unwrap();
+    env.state.prompts.sync().await;
+    let project_id = env.project("proj");
+    let agents = ["coder", "r1", "r2"]
+        .iter()
+        .map(|n| env.agent(project_id, n))
+        .collect();
+    (env, project_id, agents)
+}
+
+fn pair_inputs(agents: &[AgentId]) -> Value {
+    json!({ "coder": agents[0], "reviewers": [agents[1], agents[2]], "who": "bob" })
+}
+
+#[tokio::test]
+async fn a_workflow_start_waiting_on_the_window_when_the_server_stops_starts_no_run() {
+    let (env, project_id, agents) = workflow_env().await;
+    let (env, sync, _window, mut requests) = env.with_window(Duration::from_mins(1));
+    env.state.prompts.sync().await;
+    let (router, shutdown) = in_process(&env);
+    let session = open_session(&router).await;
+
+    let call = {
+        let router = router.clone();
+        let session = session.clone();
+        let inputs = pair_inputs(&agents);
+        tokio::spawn(async move {
+            call_in_process(
+                &router,
+                &session,
+                2,
+                "run_workflow",
+                &json!({ "project_id": project_id, "name": "pair", "inputs": inputs }),
+            )
+            .await
+        })
+    };
+    let held = requests.recv().await.unwrap();
+    shutdown.run().await;
+
+    let (is_error, body) = call.await.unwrap();
+    assert!(is_error, "{body}");
+    // The window's answer arriving late starts nothing either.
+    assert!(!sync.acknowledge(
+        held.request_id,
+        crate::ops::desktop_sync::SyncAck::Ready {
+            listening_agents: agents.clone(),
+        }
+    ));
+    assert!(
+        crate::state::lock(&env.state.workflow_runs).is_empty(),
+        "no run was registered"
+    );
+    assert!(crate::state::lock(&env.adapter.prompts).is_empty());
+}
+
+#[tokio::test]
+async fn turning_access_off_when_the_setting_cannot_be_saved_still_stops_it() {
+    let env = TestEnv::new();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (access, _secrets) = access(&env, &dir);
+    let port = free_port();
+    access.set_port(port).await.unwrap();
+    assert!(access.set_enabled(true).await.unwrap().listening);
+
+    // The settings file can no longer be written: a folder stands in its place.
+    let path = dir.path().join("config.yaml");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    let status = access.set_enabled(false).await.unwrap();
+    assert!(!status.enabled && !status.listening, "{status:?}");
+    assert!(
+        status
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("couldn't be saved")),
+        "{status:?}"
+    );
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        "the port is free"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_kept_alive_forward_waits_for_a_busy_source_with_progress_every_minute() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("p");
+    let source = env.agent(project_id, "src");
+    let recipient = env.agent(project_id, "r");
+    let env = env.restart();
+    let gate = Arc::new(Notify::new());
+    env.adapter
+        .push(Script::parked("the source's answer", &gate));
+    send_in_process(&env, project_id, source).await;
+    await_turn_running(&env.state, source).await;
+    let (router, _shutdown) = in_process(&env);
+    let session = open_session(&router).await;
+
+    let release = Arc::clone(&gate);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(450)).await;
+        release.notify_one();
+    });
+    let response = post_in_process(
+        &router,
+        Some(&session),
+        &tool_call(
+            2,
+            "forward",
+            &json!({
+                "project_id": project_id,
+                "sources": [{ "project_id": project_id, "agent_id": source }],
+                "recipients": [recipient],
+                "timeout_seconds": 900
+            }),
+            Some(json!({ "progressToken": "forward-1" })),
+        ),
+    )
+    .await;
+    let (message, progress) = read_sse(response, 2).await;
+
+    let reply = tool_reply(&message);
+    assert_eq!(
+        reply["result"]["recipients"][0]["status"], "accepted",
+        "{reply}"
+    );
+    assert_eq!(progress, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    let send_id: SendId = reply["result"]["send_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    crate::ops::send::wait_send(
+        &env.state,
+        project_id,
+        send_id,
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    let prompts = crate::state::lock(&env.adapter.prompts).clone();
+    assert!(
+        prompts.last().unwrap().contains("the source's answer"),
+        "the recipient was sent the source's finished answer: {prompts:?}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One call per tool, in the order an orchestrator would use them; linear.
+async fn every_tool_answers_a_valid_call_through_the_server() {
+    let (env, project_id, agents) = workflow_env().await;
+    let (coder, r1, r2) = (agents[0], agents[1], agents[2]);
+    let (router, _shutdown) = in_process(&env);
+    let session = open_session(&router).await;
+    let second_dir = tempfile::TempDir::new().unwrap();
+    let mut called: Vec<String> = Vec::new();
+    let mut id = 1;
+    let mut call = async |name: &str, args: Value| -> Value {
+        id += 1;
+        called.push(name.to_owned());
+        let (is_error, body) = call_in_process(&router, &session, id, name, &args).await;
+        assert!(!is_error, "{name} failed: {body}");
+        body["result"].clone()
+    };
+
+    let projects = call("list_projects", json!({})).await;
+    assert_eq!(uuid(&projects[0]["id"]), project_id);
+    assert_eq!(
+        call("list_agents", json!({ "project_id": project_id }))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let second = call(
+        "create_project",
+        json!({ "name": "second", "directory": second_dir.path() }),
+    )
+    .await;
+    let renamed = call(
+        "rename_project",
+        json!({ "project_id": second["id"], "name": "renamed" }),
+    )
+    .await;
+    assert_eq!(renamed["name"], "renamed");
+    let extra = call(
+        "create_agent",
+        json!({ "project_id": project_id, "name": "extra", "harness": "codex" }),
+    )
+    .await;
+    assert_eq!(extra["harness"], "codex");
+    let extra = call(
+        "rename_agent",
+        json!({ "project_id": project_id, "agent_id": extra["id"], "name": "extra2" }),
+    )
+    .await;
+    assert_eq!(extra["name"], "extra2");
+    let selected = call(
+        "set_agent_selection",
+        json!({ "project_id": project_id, "agent_id": coder, "model": "sonnet" }),
+    )
+    .await;
+    assert_eq!(selected["model"], "sonnet");
+    let prompts = call("list_prompts", json!({})).await;
+    assert!(
+        prompts
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "greet")
+    );
+    let workflows = call("list_workflows", json!({})).await;
+    assert!(
+        workflows
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["name"] == "pair")
+    );
+    call(
+        "describe_workflow",
+        json!({ "project_id": project_id, "name": "pair" }),
+    )
+    .await;
+
+    let receipt = call(
+        "send",
+        json!({ "project_id": project_id, "recipients": [coder], "text": "hi" }),
+    )
+    .await;
+    let send_id = receipt["send_id"].clone();
+    let waited = call(
+        "wait_send",
+        json!({ "project_id": project_id, "send_id": send_id, "timeout_seconds": 10 }),
+    )
+    .await;
+    assert_eq!(waited["done"], true);
+    assert_eq!(waited["recipients"][0]["text"], "ack: hi");
+    let page = call(
+        "read_send_output",
+        json!({ "project_id": project_id, "send_id": send_id, "agent_id": coder }),
+    )
+    .await;
+    assert_eq!(page["text"], "ack: hi");
+    let output = call(
+        "read_agent_output",
+        json!({ "project_id": project_id, "agent_id": coder }),
+    )
+    .await;
+    assert_eq!(output["status"], "completed");
+    let conversation = call("read_conversation", json!({ "project_id": project_id })).await;
+    assert!(!conversation["items"].as_array().unwrap().is_empty());
+
+    let forwarded = call(
+        "forward",
+        json!({
+            "project_id": project_id,
+            "sources": [{ "project_id": project_id, "agent_id": coder }],
+            "recipients": [r1],
+            "text": "see this"
+        }),
+    )
+    .await;
+    let idle = call(
+        "wait_agent",
+        json!({ "project_id": project_id, "agent_id": r1, "timeout_seconds": 10 }),
+    )
+    .await;
+    assert_eq!(idle["status"], "idle");
+    call(
+        "cancel_send",
+        json!({ "project_id": project_id, "send_id": forwarded["send_id"] }),
+    )
+    .await;
+    call(
+        "cancel_agent",
+        json!({ "project_id": project_id, "agent_id": r2 }),
+    )
+    .await;
+
+    // A run that fails, so it can be dismissed.
+    env.adapter.push(Script::failing("nope"));
+    let failed = call(
+        "run_workflow",
+        json!({ "project_id": project_id, "name": "pair", "inputs": pair_inputs(&agents) }),
+    )
+    .await;
+    let ended = call(
+        "wait_workflow",
+        json!({ "project_id": project_id, "run_id": failed["run_id"], "timeout_seconds": 10 }),
+    )
+    .await;
+    assert_eq!(ended["status"], "failed");
+    let runs = call("list_workflow_runs", json!({ "project_id": project_id })).await;
+    assert_eq!(runs.as_array().unwrap().len(), 1);
+    let dismissed = call(
+        "dismiss_workflow_run",
+        json!({ "project_id": project_id, "run_id": failed["run_id"] }),
+    )
+    .await;
+    assert_eq!(dismissed["status"], "failed");
+
+    // A run held mid-step, so it can be cancelled.
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("greeting", &gate));
+    let running = call(
+        "run_workflow",
+        json!({ "project_id": project_id, "name": "pair", "inputs": pair_inputs(&agents) }),
+    )
+    .await;
+    await_turn_running(&env.state, coder).await;
+    call(
+        "cancel_workflow_run",
+        json!({ "project_id": project_id, "run_id": running["run_id"] }),
+    )
+    .await;
+    let cancelled = call(
+        "wait_workflow",
+        json!({ "project_id": project_id, "run_id": running["run_id"], "timeout_seconds": 10 }),
+    )
+    .await;
+    assert_eq!(cancelled["status"], "cancelled");
+
+    called.sort();
+    called.dedup();
+    let mut every: Vec<String> = ToolName::ALL
+        .iter()
+        .map(|t| t.as_str().to_owned())
+        .collect();
+    every.sort();
+    assert_eq!(called, every, "every tool was called");
+}

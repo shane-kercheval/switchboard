@@ -1189,7 +1189,7 @@ pub fn wait_send_budget(project_id: ProjectId, send_id: SendId) -> BudgetSpec {
     BudgetSpec {
         budget_chars: RESULT_BUDGET_CHARS,
         droppable_list: None,
-        read_with: "read_send_output",
+        read_with: Some("read_send_output"),
         pointer: Box::new(move |site: &CutSite<'_>| {
             let agent_id = site.ancestors.last()?.get("agent_id")?.clone();
             Some(serde_json::json!({

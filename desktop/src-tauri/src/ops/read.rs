@@ -739,7 +739,7 @@ pub fn conversation_budget(project_id: ProjectId) -> BudgetSpec {
     BudgetSpec {
         budget_chars: RESULT_BUDGET_CHARS,
         droppable_list: Some("items"),
-        read_with: "read_conversation with a smaller last_n_items",
+        read_with: Some("read_conversation with a smaller last_n_items"),
         pointer: Box::new(move |site: &CutSite<'_>| {
             let item = site.ancestors.last()?;
             if site.key != "text"
@@ -770,7 +770,7 @@ pub fn agent_output_budget(project_id: ProjectId) -> BudgetSpec {
     BudgetSpec {
         budget_chars: RESULT_BUDGET_CHARS,
         droppable_list: None,
-        read_with: "read_send_output",
+        read_with: Some("read_send_output"),
         pointer: Box::new(move |site: &CutSite<'_>| {
             let output = site.ancestors.last()?;
             let send_id = output.get("send_id")?.as_str()?;

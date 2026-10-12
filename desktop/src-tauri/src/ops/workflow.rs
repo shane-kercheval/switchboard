@@ -19,7 +19,7 @@ use crate::workflow_commands::{
 
 use super::ledger::RunState;
 use super::read::project_readonly;
-use super::wait::{Observed, WaitBudget, wait_until};
+use super::wait::{Observed, Outcome, WaitBudget, wait_until};
 
 /// Resolve any forward fields (completed-only) and merge the composed text
 /// into the invocation inputs, so validation and launch see a forwarded field
@@ -79,23 +79,51 @@ pub struct RunWorkflowRequest {
 /// invocation, against the roster and workflow it binds with, so a rename and
 /// name reuse between two reads cannot run the wrong agent. The window's
 /// readiness report is enforced on every recipient the steps resolve to.
+///
+/// **Preparation runs under the call's budget, as a send's does.** Reading
+/// the forwarded sources and the window's readiness answer can each take
+/// seconds, and the server's stop must be able to end a start still waiting
+/// on them: otherwise a run could launch after agent access was turned off.
+/// The cancel is checked once more right before the run starts.
 pub async fn run_workflow(
     state: &AppState,
     home_dir: &Path,
     request: RunWorkflowRequest,
+    budget: &WaitBudget,
 ) -> Result<Uuid, AppError> {
     let project_id = request.project_id;
     open_project_impl(state, project_id)?;
-    let effective = merge_workflow_forwards(
-        state,
-        &request.inputs,
-        &request.forward_sources,
-        project_id,
-        home_dir,
-    )
-    .await?;
-    // After the forwards are read, as a send checks just before dispatch.
-    let report = state.desktop_sync.ensure_ready(project_id).await?;
+    let effective = match budget
+        .run(merge_workflow_forwards(
+            state,
+            &request.inputs,
+            &request.forward_sources,
+            project_id,
+            home_dir,
+        ))
+        .await
+    {
+        Outcome::Done(effective) => effective?,
+        Outcome::Timeout => {
+            return Err(AppError::TimedOut {
+                what: "reading the forwarded sources",
+            });
+        }
+        Outcome::Cancelled => return Err(AppError::Interrupted),
+    };
+    // After the forwards are read, as a send checks just before dispatch, and
+    // reported the way a send reports it.
+    let report = match budget
+        .run_with_grace(state.desktop_sync.ensure_ready(project_id))
+        .await
+    {
+        Outcome::Done(report) => report?,
+        Outcome::Timeout => return Err(AppError::ProjectLoadTimeout(project_id)),
+        Outcome::Cancelled => return Err(AppError::Interrupted),
+    };
+    if budget.cancel_token().is_cancelled() {
+        return Err(AppError::Interrupted);
+    }
     let run_id = invoke_workflow_with(
         state,
         project_id,

@@ -45,8 +45,9 @@ pub struct AgentAccessStatus {
     pub port: u16,
     /// Listening right now.
     pub listening: bool,
-    /// Why it is on but not listening (the port is taken), for Settings to
-    /// show instead of failing the app's start.
+    /// Why it is on but not listening (the port is taken), or that it is off
+    /// but the setting could not be saved, for Settings to show instead of
+    /// failing.
     pub error: Option<String>,
     /// The token clients present; `None` until agent access is first turned
     /// on.
@@ -113,21 +114,33 @@ impl AgentAccess {
 
     /// Turn agent access on or off, and remember the choice. Turning it on
     /// creates the token the first time.
+    ///
+    /// **Off stops before it saves.** Off is the user's brake, so it must not
+    /// depend on a disk write: the listener stops first, and a save that then
+    /// fails is reported alongside the stopped state rather than as a failure.
+    /// On saves first, so a failed save starts nothing.
     pub async fn set_enabled(&self, enabled: bool) -> Result<AgentAccessStatus, AppError> {
         let mut inner = self.inner.lock().await;
-        if enabled {
-            token::load_or_create(self.secrets.as_ref())?;
+        tracing::info!(enabled, "agent access setting changed");
+        if !enabled {
+            Self::stop(&mut inner).await;
+            inner.config.enabled = false;
+            if let Err(error) = self.persist(inner.config) {
+                tracing::warn!(%error, "agent access is off but the setting was not saved");
+                inner.error = Some(format!(
+                    "Agent access is off, but the setting couldn't be saved ({error}), so it may turn back on the next time Switchboard starts."
+                ));
+            }
+            return Ok(self.report(&inner));
         }
+        token::load_or_create(self.secrets.as_ref())?;
         self.persist(AgentAccessConfig {
-            enabled,
+            enabled: true,
             ..inner.config
         })?;
-        inner.config.enabled = enabled;
-        tracing::info!(enabled, "agent access setting changed");
+        inner.config.enabled = true;
         Self::stop(&mut inner).await;
-        if enabled {
-            self.listen(&mut inner).await;
-        }
+        self.listen(&mut inner).await;
         Ok(self.report(&inner))
     }
 

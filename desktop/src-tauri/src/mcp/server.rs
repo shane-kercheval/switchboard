@@ -10,9 +10,10 @@
 //! the only check of our own, in front of everything (see [`super::token`]).
 //!
 //! **How stopping ends everything, in order.** First every tool call is told
-//! to finish: a wait returns the state it has, and a send still preparing
-//! stops before dispatch (one already dispatching keeps going: each runs as
-//! its own task). The calls get a moment to answer, so a client waiting on
+//! to finish: a wait returns the state it has, and a send or workflow start
+//! still preparing stops before dispatch (a send already dispatching keeps
+//! going: each runs as its own task). From that moment every new call but a
+//! cancel is refused, because turning access off is the user's brake. The calls get a moment to answer, so a client waiting on
 //! one receives a reply rather than a dropped stream, which `rmcp`'s own
 //! client would retry forever. Then `rmcp`'s token ends every session and
 //! open stream, and only then is `axum` shut down: its graceful shutdown
@@ -153,6 +154,16 @@ impl ServerHandler for SwitchboardServer {
         };
         let args = request.arguments.unwrap_or_default();
         let ids = LoggedIds::from_args(&args);
+        // Turning agent access off is the user's brake: once a stop begins,
+        // nothing new starts. Its sessions stay open a moment so running calls
+        // can answer, and a call arriving then would otherwise run.
+        if self.calls.is_cancelled() && !tool.allowed_while_stopping() {
+            tracing::info!(tool = tool.as_str(), project_id = ?ids.project_id, agent_ids = ?ids.agent_ids, outcome = "refused", "agent access tool call");
+            return Ok(CallToolResult::error(vec![Content::text(
+                serde_json::json!({ "code": INTERNAL, "message": "agent access is turning off" })
+                    .to_string(),
+            )]));
+        }
         let progress_token = context.meta.get_progress_token();
         let cx = CallContext {
             handle: Arc::clone(&self.handle),
@@ -202,7 +213,7 @@ async fn run(
     args: rmcp::model::JsonObject,
     cx: &CallContext,
 ) -> Result<String, AppError> {
-    let fitted = tools::call(tool, args, cx).await?.fit(tool)?;
+    let fitted = tools::call(tool, args, cx).await?.fit()?;
     serde_json::to_string(&fitted)
         .map_err(|e| AppError::Internal(format!("could not serialize a result: {e}")))
 }
@@ -271,10 +282,16 @@ impl Shutdown {
         }
     }
 
+    /// The stop's first step: every in-flight call is told to finish, and
+    /// every new call but a cancel is refused.
+    pub(super) fn begin(&self) {
+        self.calls.cancel();
+    }
+
     /// End every in-flight call, give the replies a moment to reach their
     /// streams, then end every session.
-    async fn run(&self) {
-        self.calls.cancel();
+    pub(super) async fn run(&self) {
+        self.begin();
         if tokio::time::timeout(CALLS_GRACE, self.in_flight.drained())
             .await
             .is_err()

@@ -24,7 +24,15 @@
   let portDraft = $state("");
   let tokenVisible = $state(false);
 
+  /// The configuration each Copy button copies: always the real token.
   const snippets = $derived(status?.token ? agentAccessSnippets(status.url, status.token) : null);
+  /// The configuration shown on screen: the token masked like its own row
+  /// until Show, so a screen share of Settings never shows it by accident.
+  const shownSnippets = $derived(
+    status?.token
+      ? agentAccessSnippets(status.url, tokenVisible ? status.token : masked(status.token))
+      : null,
+  );
 
   onMount(() => {
     void load();
@@ -192,7 +200,7 @@
         </div>
         <pre
           class="border-border bg-surface text-fg overflow-x-auto rounded-md border px-3 py-2 font-mono text-[11px] leading-relaxed break-all whitespace-pre-wrap"
-          data-testid="agent-access-claude-code">{snippets.claudeCode}</pre>
+          data-testid="agent-access-claude-code">{shownSnippets?.claudeCode}</pre>
         <p class="text-muted text-xs leading-relaxed">
           Run this in the folder you'll orchestrate from, and choose a folder that isn't any
           project's folder. Claude Code's MCP configuration applies per folder, and the agents
@@ -212,7 +220,7 @@
         </div>
         <pre
           class="border-border bg-surface text-fg overflow-x-auto rounded-md border px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre"
-          data-testid="agent-access-codex">{snippets.codexConfig}</pre>
+          data-testid="agent-access-codex">{shownSnippets?.codexConfig}</pre>
         <p class="text-muted text-xs leading-relaxed">
           Put this in <span class="font-mono">.codex/config.toml</span> inside a folder Codex trusts
           that isn't any project's folder, not in
@@ -222,7 +230,7 @@
         <div class="flex items-center gap-2">
           <pre
             class="border-border bg-surface text-fg min-w-0 flex-1 overflow-x-auto rounded-md border px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre"
-            data-testid="agent-access-codex-env">{snippets.codexEnvironment}</pre>
+            data-testid="agent-access-codex-env">{shownSnippets?.codexEnvironment}</pre>
           <CopyButton
             text={snippets.codexEnvironment}
             label={`Copy the ${CODEX_TOKEN_VARIABLE} line`}
@@ -246,7 +254,7 @@
         </div>
         <pre
           class="border-border bg-surface text-fg max-h-64 overflow-auto rounded-md border px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre"
-          data-testid="agent-access-claude-desktop">{snippets.claudeDesktop}</pre>
+          data-testid="agent-access-claude-desktop">{shownSnippets?.claudeDesktop}</pre>
         <p class="text-muted text-xs leading-relaxed">
           Add this to <span class="font-mono">claude_desktop_config.json</span> (Claude Desktop:
           Settings → Developer → Edit Config). Replace the two paths with yours: run

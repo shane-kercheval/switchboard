@@ -29,6 +29,7 @@ Switchboard also has a **Git view** for reviewing repositories, complete branch 
 - **Keep track of work across projects.** The project list shows which projects are still running, marks background work when it finishes, and lets you jump directly to newly completed work you haven't viewed.
 - **macOS notifications.** Switchboard notifies you when your agents finish and when a workflow run ends, while you're working in another app. Clicking the notification brings Switchboard forward. An optional setting extends this to your other projects while you're still in Switchboard, so a project finishing in the background reaches you while you're reading a different one.
 - **Switch models and reasoning efforts independently.** Choose the quick choices each agent keeps for both axes, then switch either one from its sidebar card without reopening settings.
+- **Let another agent drive Switchboard.** Turn on agent access and Claude Code, Codex, or Claude Desktop can create agents, send and forward messages, wait for replies, and run workflows over MCP, with every message showing in the window like yours.
 
 ## Install
 
@@ -172,6 +173,28 @@ The first time it needs to notify you, macOS asks for permission. **The Allow bu
 <img src="docs/images/notification-permission.png" width="368" alt="macOS notification permission prompt, with Allow under the Options dropdown" />
 
 If you miss it, Settings → Notifications tells you macOS is blocking notifications and where to turn them back on (System Settings → Notifications → Applications → Switchboard).
+
+## Agent access
+
+**An agent connected over MCP has the same reach as the keyboard. Agents run without approval prompts, so any program holding the token can run commands on your Mac. It is off by default; regenerate the token in Settings → Agent access to revoke every client.**
+
+Agent access is an MCP server inside Switchboard, so an agent you run elsewhere (Claude Code, Codex, or Claude Desktop) can work your projects the way you do from the keyboard: create projects and agents, send a message to one or more agents and wait for the replies, forward one agent's answer to others, run workflows, and read the conversation. Every message it sends appears in Switchboard's window like your own, queued or running, and you can cancel it there.
+
+Turn it on in **Settings → Agent access**. Switchboard then listens on `127.0.0.1` only (port 47821 by default; change it there if another program uses it) and creates a token. Settings shows ready-to-paste setup for each client, with the token filled in:
+
+- **Claude Code**: a `claude mcp add` command. Run it in the folder you'll orchestrate from. It saves the server, token included, in your private `~/.claude.json`; don't use `--scope project`, which writes the token into a file meant to be committed.
+- **Codex**: a `[mcp_servers.switchboard]` block for `.codex/config.toml` in a folder Codex trusts, plus an `export SWITCHBOARD_TOKEN=…` line for the shell you start Codex from. Codex ends any tool call after 300 seconds; add `tool_timeout_sec = 900` to the block to let waits run longer.
+- **Claude Desktop**: an entry for `claude_desktop_config.json` (Settings → Developer → Edit Config) that runs [`mcp-remote`](https://github.com/geelen/mcp-remote) through `npx`. Replace the two placeholder paths with the output of `which npx` and its folder: Claude Desktop doesn't read your shell profile. It works in Chat and in Code with the Local environment; Code in the cloud can't reach your Mac.
+
+**Use a folder that isn't any project's folder.** The agents Switchboard launches run Claude Code or Codex in their project's folder, with your configuration. Register the server in a project's folder, or in `~/.codex/config.toml`, and those agents get these tools too. Register it in a separate folder and run your orchestrating session there.
+
+What else to know:
+
+- **Stop stops an orchestrator's messages too.** The compose bar's Stop, the project list's "stop all", and the sidebar's "Stop agent" also cancel messages an orchestrator queued, and the orchestrator is told they were cancelled.
+- **Turning agent access off disconnects every client at once**; work the agents already started keeps running. **Regenerating the token** does the same and refuses the old token from then on: give each client the new one. Until you do, Claude Code reports the server as failed with "missing or wrong bearer token", and Codex starts without the Switchboard tools and says they aren't available.
+- **Long waits.** An orchestrator sends, then waits for the replies in calls of up to a minute, or up to an hour from clients that can keep a call alive (Claude Code moves a long wait to the background and delivers the result when it arrives). The agents' work never depends on anyone waiting.
+- **On a Mac shared with other user accounts**, the token keeps them out only while Switchboard is running with agent access on. When it isn't, another account could listen on the same port and collect the token from the next client that starts. On a Mac with one account this doesn't apply.
+- While agent access is on, Switchboard asks macOS not to slow it down in the background, so a message from an orchestrator gets a prompt answer with the window closed. The Mac can still sleep.
 
 ## Design and discussion
 

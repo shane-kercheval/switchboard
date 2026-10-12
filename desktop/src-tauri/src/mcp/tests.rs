@@ -1213,3 +1213,183 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     every.sort();
     assert_eq!(called, every, "every tool was called");
 }
+
+// --- live: real clients ---------------------------------------------------------------
+//
+// These drive the server from the real Claude Code and Codex CLIs, so a client
+// update that changes how it calls the server is noticed. Switchboard's own
+// agents stay scripted: only the orchestrating client is real, and each test
+// costs one small orchestrator session.
+
+/// The smallest real loop: find ids, send, wait, read the reply.
+const LIVE_PROMPT: &str = "Use the switchboard MCP tools. Find the project named p and its \
+agent named worker. Send worker the message hello, wait until that send is done, then reply \
+with exactly the text worker answered and nothing else.";
+
+/// What the scripted worker answers `hello` with.
+const LIVE_REPLY: &str = "ack: hello";
+
+/// Run `command` to completion within five minutes and return its stdout. A
+/// client that fails or runs out of time is killed, never left running, and
+/// the failure shows the end of what it printed, so a client change that
+/// breaks the loop says how.
+async fn run_client(command: &mut tokio::process::Command) -> String {
+    use tokio::io::AsyncReadExt as _;
+    let mut child = command
+        // Empty input: `codex exec` otherwise waits for more of the prompt on
+        // an open stdin.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Its own process group, so a timeout stops the client and every
+        // process it started: Codex's launcher runs a separate worker that
+        // would otherwise outlive it and hold the output open.
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the client could be started");
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let stdout = tokio::spawn(async move {
+        let mut out = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut out).await;
+        String::from_utf8_lossy(&out).into_owned()
+    });
+    let stderr = tokio::spawn(async move {
+        let mut out = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut out).await;
+        String::from_utf8_lossy(&out).into_owned()
+    });
+    let status = tokio::time::timeout(Duration::from_mins(5), child.wait()).await;
+    if status.is_err() {
+        if let Some(group) = child.id() {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &format!("-{group}")])
+                .status();
+        }
+        let _ = child.kill().await;
+    }
+    let (stdout, stderr) = (stdout.await.unwrap(), stderr.await.unwrap());
+    let tail = |text: &str| {
+        let start = text.len().saturating_sub(4_000);
+        text.get(start..).unwrap_or(text).to_owned()
+    };
+    match status {
+        Ok(Ok(status)) if status.success() => stdout,
+        Ok(Ok(status)) => panic!(
+            "the client failed ({status}):\n{}\n{}",
+            tail(&stdout),
+            tail(&stderr)
+        ),
+        Ok(Err(error)) => panic!("the client could not be waited on: {error}"),
+        Err(elapsed) => panic!(
+            "the client did not finish within five minutes ({elapsed}):\n{}\n{}",
+            tail(&stdout),
+            tail(&stderr)
+        ),
+    }
+}
+
+/// The worker received the message the client sent.
+fn assert_worker_was_sent_hello(env: &TestEnv) {
+    let prompts = crate::state::lock(&env.adapter.prompts).clone();
+    assert!(
+        prompts.iter().any(|p| p.contains("hello")),
+        "the worker was sent hello: {prompts:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude auth login — run with: make test-live"]
+async fn live_claude_mcp_send_and_wait() {
+    let (env, _project_id, _agent_id) = unopened_project(TestEnv::new());
+    let (listener, url) = serve(&env).await;
+    let folder = tempfile::TempDir::new().unwrap();
+    let config = folder.path().join("mcp.json");
+    std::fs::write(
+        &config,
+        json!({ "mcpServers": { "switchboard": {
+            "type": "http",
+            "url": url,
+            "headers": { "Authorization": format!("Bearer {TOKEN}") }
+        } } })
+        .to_string(),
+    )
+    .unwrap();
+
+    let stdout = run_client(
+        tokio::process::Command::new("claude")
+            .current_dir(folder.path())
+            .args(["-p", "--model", "haiku", "--output-format", "json"])
+            .arg("--mcp-config")
+            .arg(&config)
+            // One `=` form: `--allowedTools` takes several values and would
+            // otherwise read the prompt as another tool name.
+            .args(["--strict-mcp-config", "--allowedTools=mcp__switchboard"])
+            .arg(LIVE_PROMPT),
+    )
+    .await;
+
+    let result: Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        result["result"]
+            .as_str()
+            .is_some_and(|r| r.contains(LIVE_REPLY)),
+        "Claude Code answered with the worker's reply: {stdout}"
+    );
+    assert_worker_was_sent_hello(&env);
+    listener.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires codex login — run with: make test-live"]
+async fn live_codex_mcp_send_and_wait() {
+    let (env, _project_id, _agent_id) = unopened_project(TestEnv::new());
+    let (listener, url) = serve(&env).await;
+    // The documented setup: a `.codex/config.toml` in a folder Codex trusts
+    // (a git repository, trusted explicitly) that is not a project's folder.
+    let folder = tempfile::TempDir::new().unwrap();
+    let root = folder.path().canonicalize().unwrap();
+    let git = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status()
+        .unwrap();
+    assert!(git.success());
+    std::fs::create_dir(root.join(".codex")).unwrap();
+    std::fs::write(
+        root.join(".codex/config.toml"),
+        format!(
+            "[mcp_servers.switchboard]\nurl = \"{url}\"\nbearer_token_env_var = \"SWITCHBOARD_TOKEN\"\ndefault_tools_approval_mode = \"approve\"\n"
+        ),
+    )
+    .unwrap();
+    let last_message = root.join("last-message.txt");
+
+    run_client(
+        tokio::process::Command::new("codex")
+            .current_dir(&root)
+            .env("SWITCHBOARD_TOKEN", TOKEN)
+            // Trust is set as the whole `projects` table, which is how it
+            // took effect when the clients were measured; a dotted key
+            // naming one folder's trust did not load the folder's config.
+            .args(["exec", "--json", "-c"])
+            .arg(format!(
+                "projects={{\"{}\"={{trust_level=\"trusted\"}}}}",
+                root.display()
+            ))
+            .args(["-c", "model_reasoning_effort=\"low\""])
+            .arg("--output-last-message")
+            .arg(&last_message)
+            .arg(LIVE_PROMPT),
+    )
+    .await;
+
+    let answer = std::fs::read_to_string(&last_message).unwrap();
+    assert!(
+        answer.contains(LIVE_REPLY),
+        "Codex answered with the worker's reply: {answer}"
+    );
+    assert_worker_was_sent_hello(&env);
+    listener.stop().await;
+}

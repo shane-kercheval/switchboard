@@ -58,6 +58,7 @@ use crate::ops::error_code::{INTERNAL, error_code};
 use crate::ops::handle::AppStateHandle;
 use crate::ops::wait::ProgressHook;
 
+use super::app_nap::NapExemption;
 use super::token;
 use super::tools::{self, CallContext, ToolName};
 
@@ -308,6 +309,8 @@ pub struct Listener {
     addr: SocketAddr,
     shutdown: Shutdown,
     task: JoinHandle<()>,
+    /// Keeps macOS from napping the app for as long as this listener lives.
+    _nap: NapExemption,
 }
 
 impl Listener {
@@ -358,6 +361,7 @@ pub async fn start(
         addr,
         shutdown,
         task,
+        _nap: NapExemption::begin(),
     })
 }
 

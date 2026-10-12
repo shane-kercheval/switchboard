@@ -17,6 +17,7 @@
 //! can call it: see [`server`] for the `Host`/`Origin` checks and [`token`]
 //! for the bearer token.
 
+pub mod app_nap;
 pub mod config;
 pub mod server;
 pub mod token;

@@ -8,6 +8,8 @@ More precisely, it is a **workflow engine for primitives, not for processes**. I
 
 The human stays in the loop where judgment matters (deciding what to route, when to revise, when to proceed) and is removed from the loop where mechanics waste time (copy-paste, template application, babysitting parallel agents).
 
+The director does not have to be a person at the keyboard. With **agent access** turned on, an agent the user runs elsewhere (Claude Code, Codex, Claude Desktop) connects to an MCP server inside Switchboard and directs the work through the same operations: create projects and agents, send and forward messages, wait for replies, run workflows, read the conversation. It works under the same rules as the user (the same contention, queueing, and journal), and every message it sends shows in the window as if typed there, so the user can still watch and stop it. §7 "Agent-directed use" describes it; the design and its security are in `docs/implementation_plans/2026-10-09-mcp.md`.
+
 This orchestration model has a useful side effect for prompt management. Because Switchboard resolves prompts itself and sends agents plain text, **prompt-provider configuration lives in *one place* (Switchboard) and works the same way across every agent backend**. A user's prompt library — whether in Tiddly, another MCP server, or Switchboard's local store — uses the same lookup and invocation surface across every harness, without configuring the prompt source in any of them. This is especially useful for harnesses whose native MCP prompt support is limited or absent. (The same does **not** hold for MCP tools or per-harness skills, which are invoked by the model mid-turn and must still be configured in the underlying agent; see section 6.)
 
 ## 2. Goals and non-goals
@@ -630,6 +632,23 @@ The user can cancel at three granularities:
 Cancellation is a **distinct outcome from failure.** A cancelled turn is intent-bearing — a human (or, later, the workflow engine, or app shutdown) stopped it deliberately — not a harness error. It is surfaced and recorded as cancelled, internally tagged with its source (user / workflow / shutdown).
 
 While the session is live, Switchboard's in-memory stream buffer holds whatever the agent produced before the kill, so the user can review that partial content in-app. That buffer is **in-memory only**; restarting Switchboard discards it. The *fact* that the turn was cancelled persists: cancelled (and failed) turns are recorded as **outcome markers** in Switchboard's conversation journal (outcome + source/reason + timestamp + agent/send, no content — see §3). On restart, history correctly shows the turn as cancelled (or failed) rather than silently omitting it, and — per §3 — any partial *content* shown after restart comes solely from the harness session file: Switchboard persists none of its own, so the post-restart partial is whatever that particular harness chose to keep (nothing, for Claude Code and Codex). This is the §3 split — Switchboard persists the user's sends and every non-completed turn's *outcome*; agent-produced *content* always comes from the harness session files, and the merge renders whatever they hold.
+
+### Agent-directed use
+
+Agent access (Settings → Agent access, off by default) runs an MCP server on `127.0.0.1` that an orchestrating agent calls instead of the user typing. Its tools are the operations the window performs, keyed by ids: list projects and agents, send to one or more agents, forward agents' latest answers, wait for a send, an agent, or a workflow run, read the conversation or one reply in pages, run and dismiss workflows, cancel. A send returns at once with an id; the orchestrator then waits in bounded calls (a minute, or up to an hour from a client that can keep a call alive) and calls again until the send is done, so no agent's work depends on a call staying open.
+
+Everything an orchestrator does goes through the same paths as the user's own actions, so the rules above hold unchanged: a busy recipient refuses or queues (the orchestrator chooses, refusing by default), outcomes are journaled, and the unified history groups each send once. Before an orchestrator's turn starts, the backend asks the window to load or refresh the project and waits for it, so the message and reply appear live, queued messages show with their cancel button, and the window's Stop controls cancel them like the user's own. The window can be closed: the app keeps running, and while agent access is on it asks macOS not to throttle it in the background.
+
+What it defends against, since a send runs an agent with permission prompts disabled:
+
+| Threat | Defended? | By |
+|---|---|---|
+| A web page in the user's browser reaches the server (DNS rebinding, cross-site request) | Yes | `Host` and `Origin` checks pinned to the port; a bearer token the page does not have; bound to `127.0.0.1` |
+| Another user account on the same Mac | Only while the app holds the port | The bearer token, kept in the Keychain and in each client's private configuration. While the app is quit or access is off, another account could listen on the port and collect the token from the next client that starts |
+| Another process running as the user | No | Out of scope: such a process can already run the agent CLIs itself |
+| The token committed to a repository | Yes, by setup | Settings gives only private-scope client configuration |
+| A client's model loops and burns quota | Partly | Turning access off stops the server at once; busy recipients refuse by default, so a loop cannot pile up queued turns |
+| Agents Switchboard launches get the tools | Partly | Setup tells the user to register the server outside every project's folder; a send to a busy agent, including the caller itself, is refused by default |
 
 ### Unified history after restart — worked examples
 

@@ -126,8 +126,12 @@ export function refreshRuns(projectId: ProjectId): Promise<void> {
           console.warn("[switchboard] listWorkflowRuns failed", err);
           return;
         }
-        // Torn down meanwhile: commit nothing for a project that is gone.
-        if (generation.get(projectId) !== gen) return;
+        // Torn down meanwhile (unsubscribing drops the fetch): commit nothing
+        // for a project that is gone.
+        if (fetches.get(projectId) !== fetch) return;
+        // Subscribed meanwhile: this read may have started before the window
+        // was listening and so miss a run that began in between. Read again.
+        if (generation.get(projectId) !== gen) continue;
         workflowRuns[projectId] = correctRuns(projectId, listed, fetch.events);
         if (!fetch.again) return;
       }

@@ -246,15 +246,23 @@ pub fn serve_socket(app: &AppHandle) {
     });
 }
 
-/// Make `path` free for a new socket: nothing there, or a leftover socket,
-/// which is removed. Anything else is refused rather than deleted, so a
-/// mistyped path cannot cost a real file. Read without following a link.
+/// Make `path` free for a new socket: nothing there, or a leftover socket
+/// nothing answers on, which is removed. Anything else is refused rather than
+/// deleted: a mistyped path cannot cost a real file, and a second copy of the
+/// app started with the same path cannot take the socket of one still running
+/// (the checks run two copies side by side). Read without following a link.
 fn clear_socket_path(path: &std::path::Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
         Ok(metadata) if metadata.file_type().is_socket() => {
-            std::fs::remove_file(path).map_err(|e| e.to_string())
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(_) => Err("another running copy of the app is using that socket".to_owned()),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(path).map_err(|e| e.to_string())
+                }
+                Err(error) => Err(error.to_string()),
+            }
         }
         Ok(_) => Err("something other than a socket is at that path".to_owned()),
     }
@@ -271,6 +279,15 @@ mod tests {
         std::fs::write(&path, "keep me").unwrap();
         assert!(clear_socket_path(&path).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn a_socket_another_copy_is_listening_on_is_left_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("debug.sock");
+        let _live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(clear_socket_path(&path).is_err());
+        assert!(path.exists());
     }
 
     #[test]

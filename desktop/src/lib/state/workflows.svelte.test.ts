@@ -358,3 +358,76 @@ describe("a run list fetched around a run's end", () => {
     expect(workflowRuns["p1"]?.[0]?.steps).toHaveLength(1);
   });
 });
+
+describe("a run-list fetch around the project's first subscription", () => {
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 10; i += 1) await new Promise((r) => setTimeout(r, 0));
+  }
+
+  function heldLists(): { release: (runs: WorkflowRunInfo[]) => void; held: () => number } {
+    const pending: ((runs: WorkflowRunInfo[]) => void)[] = [];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_workflow_runs") {
+        return await new Promise<WorkflowRunInfo[]>((resolve) => pending.push(resolve));
+      }
+      return undefined;
+    });
+    return {
+      release: (runs) => {
+        const next = pending.shift();
+        if (next === undefined) throw new Error("no list fetch in flight");
+        next(runs);
+      },
+      held: () => pending.length,
+    };
+  }
+
+  const failedRun: WorkflowRunInfo = {
+    run_id: "r-old",
+    workflow: "review-and-recommend",
+    step: 1,
+    total: 3,
+    status: "failed",
+    reason: "agent busy",
+    steps: [],
+  };
+
+  it("a fetch started before the first subscription still delivers the list", async () => {
+    const { refreshRuns } = await import("./workflows.svelte");
+    const lists = heldLists();
+    const early = refreshRuns("p1");
+    await settle();
+    let subscribedDone = false;
+    const subscribed = subscribeProjectWorkflows("p1").then(() => {
+      subscribedDone = true;
+    });
+    await settle();
+
+    // The early read may predate the listener, so it is read again.
+    lists.release([]);
+    await settle();
+    expect(lists.held()).toBe(1);
+    expect(subscribedDone).toBe(false);
+    lists.release([failedRun]);
+    await Promise.all([early, subscribed]);
+
+    expect(workflowRuns["p1"]).toEqual([failedRun]);
+  });
+
+  it("a fetch whose project is torn down meanwhile commits nothing", async () => {
+    const { refreshRuns } = await import("./workflows.svelte");
+    const lists = heldLists();
+    const subscribed = subscribeProjectWorkflows("p1");
+    await settle();
+    lists.release([]);
+    await subscribed;
+
+    const refreshed = refreshRuns("p1");
+    await settle();
+    unsubscribeProjectWorkflows(["p1"]);
+    lists.release([failedRun]);
+    await refreshed;
+
+    expect(workflowRuns["p1"]).toBeUndefined();
+  });
+});

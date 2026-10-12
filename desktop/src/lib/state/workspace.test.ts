@@ -3014,4 +3014,87 @@ describe("desktop sync for another client's turn", () => {
 
     expect(acks()).toHaveLength(1);
   });
+
+  function listensTo(channel: string): number {
+    return listenMock.mock.calls.filter(([name]) => name === channel).length;
+  }
+
+  it("a project deleted while the window prepares it for a turn answers failed and sets nothing up", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const backend = installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+    backend.roster = [...backend.roster, agent(AGENT_2, PROJECT_2)];
+    const listening = holdListen(`agent:${AGENT_2}`);
+    const workflowListens = listensTo(`workflow:${PROJECT_2}`);
+
+    requestSync(PROJECT_2);
+    await settle();
+    await ws.deleteProject(PROJECT_2);
+    listening.open();
+    await settle();
+
+    expect(acks()).toEqual([
+      {
+        requestId: REQUEST,
+        result: {
+          status: "failed",
+          message: "the project was removed while the window was loading it",
+        },
+      },
+    ]);
+    expect(ws.agentsByProject[PROJECT_2]).toBeUndefined();
+    expect(state._testing.hasListener(AGENT_2)).toBe(false);
+    expect(listensTo(`workflow:${PROJECT_2}`)).toBe(workflowListens);
+  });
+
+  it("a project deleted during its first background load is not brought back", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    const listening = holdListen(`agent:${AGENT_1}`);
+    const workflowListens = listensTo(`workflow:${PROJECT_2}`);
+
+    requestSync(PROJECT_2);
+    await settle();
+    await ws.deleteProject(PROJECT_2);
+    listening.open();
+    await settle();
+
+    expect(acks()).toEqual([
+      {
+        requestId: REQUEST,
+        result: {
+          status: "failed",
+          message: "the project was removed while the window was loading it",
+        },
+      },
+    ]);
+    expect(ws.agentsByProject[PROJECT_2]).toBeUndefined();
+    expect(ws.conversations[PROJECT_2]).toBeUndefined();
+    expect(state._testing.hasListener(AGENT_1)).toBe(false);
+    expect(listening.unlisten).toHaveBeenCalled();
+    expect(listensTo(`workflow:${PROJECT_2}`)).toBe(workflowListens);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "load_project_conversation")).toBe(false);
+  });
+
+  it("a history read queued when its project is deleted writes nothing", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const conversation = gate();
+    installBackend({ roster: [agent(AGENT_1, PROJECT_2)], conversation });
+    await ws.installDesktopSync();
+    requestSync(PROJECT_2);
+    await settle();
+
+    await ws.deleteProject(PROJECT_2);
+    conversation.open();
+    await settle();
+
+    expect(ws.conversations[PROJECT_2]).toBeUndefined();
+    expect(state.transcripts[AGENT_1]).toBeUndefined();
+  });
 });

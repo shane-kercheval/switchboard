@@ -3419,3 +3419,47 @@ async fn a_request_the_window_missed_can_be_fetched_and_answered() {
     assert_eq!(receipt.recipients[0].status, SendStatus::Accepted);
     assert!(sync.pending().is_empty());
 }
+
+const LITERAL_WORKFLOW: &str = "name: literal
+description: test
+steps:
+  - label: Greet
+    send:
+      to: worker
+      text: \"hello\"
+";
+
+#[tokio::test]
+async fn a_workflow_step_naming_an_agent_created_after_the_window_answered_is_refused() {
+    let (env, project_id, agents) = workflow_env().await;
+    std::fs::write(env.workflows_dir().join("literal.yaml"), LITERAL_WORKFLOW).unwrap();
+    let (env, sync, _window, mut requests) = env.with_window(Duration::from_mins(1));
+    let state = Arc::clone(&env.state);
+    let home = env.home();
+    let pending = tokio::spawn(async move {
+        run_workflow(
+            &state,
+            &home,
+            RunWorkflowRequest {
+                project_id,
+                name: "literal".to_owned(),
+                is_builtin: false,
+                inputs: BTreeMap::new(),
+                forward_sources: BTreeMap::new(),
+            },
+        )
+        .await
+    });
+    // The window read its roster and is answering; another client creates the
+    // agent the step names before the run binds its agents.
+    let request = requests.recv().await.unwrap();
+    env.agent(project_id, "worker");
+    assert!(sync.acknowledge(request.request_id, ready(agents)));
+    let err = pending.await.unwrap().unwrap_err();
+    assert_eq!(error_code(&err), error_code::DESKTOP_UNAVAILABLE);
+    assert!(
+        lock(&env.state.workflow_runs).is_empty(),
+        "no run was registered"
+    );
+    assert!(lock(&env.adapter.prompts).is_empty(), "nothing was sent");
+}

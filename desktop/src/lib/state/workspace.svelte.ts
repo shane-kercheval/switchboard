@@ -805,6 +805,7 @@ async function deleteProjectOnce(projectId: ProjectId): Promise<void> {
   const removedAgentIds = (agentsByProject[projectId] ?? []).map((a) => a.id);
 
   await api.deleteProject(projectId);
+  deletedProjects.add(projectId);
 
   layout.removeProjectPreferences(projectId);
   // The completion tracker goes *first*: run after `unregisterAgents`, its
@@ -990,11 +991,31 @@ export async function activateProject(projectId: ProjectId): Promise<ActivationR
   }
 }
 
+/// The error a load or refresh ends with when its project was deleted while it
+/// waited: a sync that meets it answers failed with the real reason.
+function projectRemoved(): Error {
+  return new Error("the project was removed while the window was loading it");
+}
+
+/// Open a project in the window: roster, agent subscriptions, workflow
+/// channel, first history read. Runs for a project the user selects, and in
+/// the background for one another client is about to start a turn in.
+///
+/// **A project deleted during any of its waits is not brought back.** Deleting
+/// drops the load from `loadStarted`, so after each wait the load checks it is
+/// still the project's own, and otherwise undoes what it set up and fails
+/// rather than re-create the roster, listeners, and history of a project that
+/// no longer exists.
 function ensureProjectLoaded(projectId: ProjectId): Promise<void> {
   const existing = loadStarted.get(projectId);
   if (existing !== undefined) return existing;
-  const load = (async () => {
+  deletedProjects.delete(projectId);
+  // Held in an object the body can read, to compare against its own promise.
+  const own: { load?: Promise<void> } = {};
+  const removed = (): boolean => loadStarted.get(projectId) !== own.load;
+  own.load = (async () => {
     await api.openProject(projectId);
+    if (removed()) throw projectRemoved();
     // **Before the roster, and awaited.** Reclaiming orphaned staged attachments
     // is only safe while no agent of this project can hold queued work, because a
     // queued send's attachment is referenced by neither the journal (written at
@@ -1002,9 +1023,16 @@ function ensureProjectLoaded(projectId: ProjectId): Promise<void> {
     // is what makes them targetable, so this is the last moment that holds — and
     // it has to be awaited, not fired off, or the registration below races it.
     await api.reclaimProjectAttachments(projectId, draftAttachmentPaths(projectId));
+    if (removed()) throw projectRemoved();
     const agents = await api.listAgents(projectId);
+    if (removed()) throw projectRemoved();
     agentsByProject[projectId] = agents;
     await Promise.all(agents.map((a) => registerAgent(a)));
+    if (removed()) {
+      unregisterAgents(agents.map((a) => a.id));
+      delete agentsByProject[projectId];
+      throw projectRemoved();
+    }
     // Subscribe to the project's workflow progress channel (not active-gated, so
     // a run in a background project keeps updating). Idempotent; seeds run state.
     void subscribeProjectWorkflows(projectId);
@@ -1014,10 +1042,13 @@ function ensureProjectLoaded(projectId: ProjectId): Promise<void> {
     // second `hydrateProject` would not: it returns "skipped" at once.
     void chainProjectLoad(projectId, () => hydrateProject(projectId));
   })();
+  const load = own.load;
   loadStarted.set(projectId, load);
   // Allow a retry if the load (open/lock/roster) failed — a transient failure
   // shouldn't permanently wedge the project as un-activatable.
-  load.catch(() => loadStarted.delete(projectId));
+  load.catch(() => {
+    if (loadStarted.get(projectId) === load) loadStarted.delete(projectId);
+  });
   return load;
 }
 
@@ -1055,6 +1086,11 @@ export async function hydrateProject(
 ): Promise<HydrateOutcome> {
   if (hydrationStarted.has(projectId)) return "skipped";
   hydrationStarted.add(projectId);
+  // A read of a deleted project writes nothing, whether it started before the
+  // deletion or was queued behind another read: it would put back the
+  // conversation and the agents' transcripts of a project that is gone.
+  const deleted = (): boolean => deletedProjects.has(projectId);
+  if (deleted()) return "failed";
   // A refresh (the only caller passing `agentTurnFilter`) re-reads over a
   // known-good loaded view, so it must be non-destructive: keep the current
   // conversation displayed while re-reading, and on failure leave it (and the
@@ -1079,6 +1115,7 @@ export async function hydrateProject(
   }
   try {
     const convo = await api.loadProjectConversation(projectId);
+    if (deleted()) return "failed";
 
     // Sends represented live in the slices this session own their rendering
     // there; drop the journal's copy of them from the overlay to avoid a doubled
@@ -1192,6 +1229,7 @@ export async function hydrateProject(
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     console.warn("[switchboard] hydrateProject failed", { project_id: projectId, error: e });
+    if (deleted()) return "failed";
     // A failed refresh keeps the prior loaded conversation (and its baseline)
     // intact — log only, so the next switch-back retries. A failed first
     // hydration/retry surfaces the error (there is no good view to protect).
@@ -1302,6 +1340,13 @@ function placeInRoster(agent: AgentRecord): void {
     : [...existing, agent];
 }
 
+/// Projects deleted this session, so a history read that was waiting or queued
+/// when its project was deleted can tell, and write nothing. A project opened
+/// again (its id restored to the store) leaves the set.
+// Bookkeeping only — never read during render.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const deletedProjects = new Set<ProjectId>();
+
 /// Counts the window's own changes to each project's roster: create, attach,
 /// fork, remove, rename, selection save, reorder. Bumped by those actions
 /// only, never by a roster refresh applying what it read, so overlapping
@@ -1369,7 +1414,7 @@ function refreshProjectRoster(projectId: ProjectId): Promise<void> {
         // the apply, and the decision to stop are one step no caller lands in.
         if (!loadStarted.has(projectId)) {
           unregisterAgents(added.map((agent) => agent.id));
-          return;
+          throw projectRemoved();
         }
         if (!fresh()) {
           // Give up only what this read registered and nothing now shows.
@@ -1435,9 +1480,13 @@ export async function syncProjectForTurn(projectId: ProjectId): Promise<DesktopS
   } catch (err) {
     return { status: "failed", message: err instanceof Error ? err.message : String(err) };
   }
+  // The project can be deleted during any wait here, after the re-read
+  // succeeded too; nothing is set up for it then, and the answer says why.
+  const removed: DesktopSyncAck = { status: "failed", message: projectRemoved().message };
   // Idempotent: settles any registration in flight and retries one that
   // failed, which gives an unreachable agent another chance on every sync.
   await Promise.all((agentsByProject[projectId] ?? []).map((agent) => registerAgent(agent)));
+  if (!loadStarted.has(projectId)) return removed;
   try {
     await subscribeProjectWorkflows(projectId);
   } catch (err) {
@@ -1449,6 +1498,7 @@ export async function syncProjectForTurn(projectId: ProjectId): Promise<DesktopS
     });
   }
   await settleProjectLoads(projectId);
+  if (!loadStarted.has(projectId)) return removed;
   return {
     status: "ready",
     listening_agents: (agentsByProject[projectId] ?? [])
@@ -1781,6 +1831,7 @@ export const _testing = {
     projectLoadChain.clear();
     rosterChanges.clear();
     rosterReads.clear();
+    deletedProjects.clear();
     syncsInFlight.clear();
     setTurnTerminalHook(undefined);
     setDispatchFailedHook(undefined);

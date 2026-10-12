@@ -60,9 +60,7 @@ import { supportsForkWithoutTurn } from "$lib/harnessCapabilities";
 import {
   agentIsWorking,
   applyAgentHydrate,
-  markHydrationAttempted,
   registerAgent,
-  retryAgentHydration,
   runtimes,
   setAgentIdleHook,
   setDispatchFailedHook,
@@ -994,7 +992,10 @@ function ensureProjectLoaded(projectId: ProjectId): Promise<void> {
     // Subscribe to the project's workflow progress channel (not active-gated, so
     // a run in a background project keeps updating). Idempotent; seeds run state.
     void subscribeProjectWorkflows(projectId);
-    void hydrateProject(projectId);
+    // Queued like every later read, so one that starts after it (an attached
+    // agent's history, say) waits for it and then sees what it missed, instead
+    // of running alongside it and racing to replace the overlay.
+    void chainProjectLoad(projectId, () => hydrateProject(projectId));
   })();
   loadStarted.set(projectId, load);
   // Allow a retry if the load (open/lock/roster) failed — a transient failure
@@ -1127,10 +1128,6 @@ export async function hydrateProject(
       // On refresh, leave non-refresh-capable agents' content frozen (see the
       // doc above) — their slice and prior state are untouched.
       if (agentTurnFilter !== undefined && !agentTurnFilter.has(agentId)) continue;
-      // Hydrating through `applyAgentHydrate` (or recording the failure) counts
-      // as this agent's one hydration for the session — mark it so the
-      // per-agent `hydrateAgent` path won't later re-parse and duplicate turns.
-      markHydrationAttempted(agentId);
       const meta = metaByAgent.get(agentId);
       if (meta?.load_error != null) {
         // This agent's transcript failed to load — record the error (surfaced
@@ -1293,19 +1290,18 @@ async function maybeRefreshProject(projectId: ProjectId): Promise<void> {
 /// another one, and the compose bar holds sends while a project's history is
 /// loading, so no reply can start in that wait either.
 export async function retryProjectHydration(projectId: ProjectId): Promise<void> {
-  // Re-entrancy guard, mirroring `retryAgentHydration`. `hydrateProject` also
-  // feeds each agent's turns through the per-agent append-merge
-  // (`applyAgentHydrate`), so two concurrent project retries duplicate agent
-  // turns just like the per-agent path — not only the `conversations` overlay
-  // (which is last-write-wins and would be fine).
+  // Re-entrancy guard. `hydrateProject` feeds each agent's turns through the
+  // per-agent append-merge (`applyAgentHydrate`), so two concurrent project
+  // retries would duplicate every turn without a stable key — not only the
+  // `conversations` overlay (which is last-write-wins and would be fine).
   const before = conversations[projectId];
   if (before?.status === "loading") return;
   if (projectHistoryRetryBlock(projectId) !== null) return;
   conversations[projectId] = { items: before?.items ?? [], status: "loading" };
   try {
-    // Chained like the two background readers, so "every read after the
-    // project's first is queued behind the others" holds by construction
-    // rather than by each caller remembering. The guard above catches a read
+    // Chained like every other read, so "every read of a project is queued
+    // behind the others" holds by construction rather than by each caller
+    // remembering. The guard above catches a read
     // that is already *running*; it cannot see one merely queued, and two
     // overlapping reads race to replace the whole overlay.
     await chainProjectLoad(projectId, async () => {
@@ -1352,8 +1348,9 @@ export function addAgentToProjectRoster(agent: AgentRecord): void {
 ///   come into being until someone messages it.
 /// - **Codex (eager, `supportsForkWithoutTurn`):** the backend has already
 ///   created the session, so the branch is complete on return, with its earlier
-///   conversation loaded. The load is awaited because the caller sends to the
-///   fork next, and that read must not overlap the fork's live first turn.
+///   conversation loaded, its load shown as failed, or its read left to a
+///   project reload under way. The load is awaited because the caller sends to
+///   the fork next, and that read must not overlap the fork's live first turn.
 export async function forkAgentIntoOwnPane(sourceId: AgentId): Promise<AgentRecord> {
   const fork = await registerForkInOwnPane(sourceId);
   if (supportsForkWithoutTurn(fork.harness)) {
@@ -1387,7 +1384,7 @@ export async function forkAgentWithoutSending(sourceId: AgentId): Promise<AgentR
   }
   const fork = await registerForkInOwnPane(sourceId);
   eagerForks.add(fork.id);
-  void loadEagerForkHistoryShowingProgress(fork.id);
+  void loadForkInheritedHistory(fork.id);
   return fork;
 }
 
@@ -1469,9 +1466,10 @@ const forkHistoryLoaded = new Set<AgentId>();
 
 /// Forks created **this session** by a harness that forks without a turn
 /// (Codex). They carry no `forked_from_session`, which is what marks a lazy
-/// fork, so this is how the inherited-history load and its Retry recognise
-/// them. After a restart nothing needs it: the ordinary project load follows
-/// the fork's pointer and includes its earlier conversation.
+/// fork, so this is how the load right after creation, and its automatic retry
+/// once the fork is idle, recognise them. After a restart nothing needs it: the
+/// ordinary project load follows the fork's pointer and includes its earlier
+/// conversation, and a failure there shows Retry like any agent's.
 // Bookkeeping only — never read during render, so it needs no reactivity.
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const eagerForks = new Set<AgentId>();
@@ -1510,8 +1508,9 @@ const projectLoadChain = new Map<ProjectId, Promise<unknown>>();
 /// second sees the first's promise and chains behind it instead.
 ///
 /// The chain is bounded in practice, not by construction: fork-history reads are
-/// one-shot per branch and the staleness refresh coalesces to one follow-up, so
-/// nothing here generates an unbounded queue. A future caller that fires per
+/// one-shot per branch, an agent's reread runs once per Retry click or attach
+/// and not while one is loading, and the staleness refresh coalesces to one
+/// follow-up, so nothing here generates an unbounded queue. A future caller that fires per
 /// event would need its own coalescing.
 async function chainProjectLoad<T>(projectId: ProjectId, load: () => Promise<T>): Promise<T> {
   const prior = projectLoadChain.get(projectId);
@@ -1569,102 +1568,133 @@ function seedPendingForkHistory(
   }
 }
 
-/// Load a freshly materialized fork's inherited history.
-///
-/// **Trigger is the outcome, not the file.** The frontend cannot stat a session
-/// file, so "did this turn materialize the branch?" is approximated by
-/// `Completed`, and cancelled/failed **re-arm** — a fork whose first turn was
-/// cancelled may still have a complete child file (harness-behavior §3.5), so it
-/// picks its history up on the next completed turn rather than never. The two
-/// alternatives are worse: spending the one shot on a failed turn leaves
-/// inherited history invisible until reopen, and a file-existence IPC invents a
-/// backend surface for a cosmetic gain.
-///
-/// **Goes through the project conversation merge**, not `hydrateAgent` /
-/// `retryAgentHydration`. The per-agent loader returns raw user turns, and the
-/// hydrate reducer's keyed dedup covers *agent* turns only — user turns are
-/// journal-overlay-owned. A per-agent reload would therefore duplicate both the
-/// inherited prompts and the fork's own live prompt. `hydrateProject` replaces
-/// the overlay wholesale (dup-safe) and applies agent turns for the filtered
-/// agent, where the live first reply collapses against its disk copy by
-/// `hydration_key`.
-async function loadForkInheritedHistory(agentId: AgentId): Promise<void> {
-  const agent = agentRecordById(agentId);
-  if (agent === undefined) return;
-  const eager = eagerForks.has(agentId);
-  if (agent.forked_from_session == null && !eager) return;
-  if (forkHistoryLoaded.has(agentId)) return;
-  const projectId = agent.project_id;
-  // Only meaningful once the project's own hydration has settled — before that
-  // the open path will read this session anyway. Not so for an eager fork: the
-  // in-flight load may have started before the fork existed, so it gets a
-  // failure it can retry rather than a skip nobody sees. Fork is offered only
-  // once the project has loaded, so this is the race where the project began
-  // reloading while the fork was being created.
-  if (conversations[projectId]?.status !== "complete") {
-    if (eager) {
-      markEagerForkHistoryFailed(
-        agentId,
-        "The project's history was reloading when this fork was created, so its earlier conversation wasn't read.",
-      );
-    }
-    return;
-  }
+/// What came of rereading one agent's history: `hydrateProject`'s outcome, or
+/// `not_loaded` when the project's own history wasn't loaded by the time the
+/// read's turn came, so nothing was read.
+type RereadOutcome = HydrateOutcome | "not_loaded";
 
-  // **Serialize, don't drop.** Two branches whose first turns land together
-  // would otherwise both clear `hydrationStarted` and both read: the delete
-  // below and `hydrateProject`'s guard check are in the same synchronous slice,
-  // so neither sees the other's guard. Coalescing instead — losers returning
-  // early — is *wrong here* even though it is right for `maybeRefreshProject`:
-  // that one retries on the next project switch, which happens constantly,
-  // whereas this retries on the next completed turn of this specific fork,
-  // which may never come. A dropped load leaves that branch's inherited history
-  // permanently missing behind a banner promising it. So the loser waits and
-  // then runs its own read: sequential rather than concurrent, one extra read,
-  // nothing lost. (Its `agentTurnFilter` names a different agent, so the
-  // winner's read cannot cover it.)
-  let refreshFailure: string | undefined;
-  const outcome = await chainProjectLoad(projectId, async () => {
+/// Reread one agent's history through the project read. This is how every
+/// one-agent history load runs: Retry, an agent attached to an existing
+/// session, and a fork's earlier conversation.
+///
+/// **The project read, not a per-agent load.** The agent's messages belong in
+/// the project's shared list, which this rebuilds whole, so a later project
+/// read can't add them a second time. It also keeps the notices the project
+/// read produces, such as "this fork's earlier conversation is unavailable".
+/// Agent turns are applied for this agent only, and a reply already on screen
+/// collapses against its saved copy by `hydration_key`.
+///
+/// **Waits its turn, then reads only if the project's history has loaded.** A
+/// project read already queued (the project's first load, or its Retry) may
+/// have started before this agent existed or before its file changed, so this
+/// one runs after it rather than beside it. If the project's history isn't
+/// loaded by then, nothing is read: a targeted read would mark the project
+/// loaded while holding only this agent's turns, and the pending project read,
+/// or the project's Retry, rereads every agent anyway.
+///
+/// A read that throws keeps the view that was loaded and reports why through
+/// `onFailure`. A failure to load this one agent is recorded on the agent by
+/// `hydrateProject`.
+async function rereadAgentHistory(
+  agent: AgentRecord,
+  onFailure: (message: string) => void,
+): Promise<RereadOutcome> {
+  const projectId = agent.project_id;
+  return await chainProjectLoad(projectId, async () => {
+    if (conversations[projectId]?.status !== "complete") return "not_loaded";
     hydrationStarted.delete(projectId);
-    return await hydrateProject(projectId, new Set([agentId]), (message) => {
-      refreshFailure = message;
-    });
+    return await hydrateProject(projectId, new Set([agent.id]), onFailure);
   });
-  // Only an `applied` read actually produced inherited history. Anything else
-  // leaves the one-shot unset so the next completed turn retries. Reading
-  // `conversations[projectId].status` here instead would report success for a
-  // failed read too — a refresh preserves the prior `"complete"` view when it
-  // throws, which is the whole reason this outcome exists.
-  if (outcome === "applied") {
-    forkHistoryLoaded.add(agentId);
-    forkHistoryPending.delete(agentId);
-    return;
-  }
-  // **An eager fork's failed load is shown, not just logged.** A lazy fork
-  // has its "earlier conversation is still coming" notice and retries after
-  // its next completed turn. An eager fork has neither: a menu-created one may
-  // never run a turn, and a filtered refresh that throws only logs. So the
-  // fork is marked failed, which shows the per-agent "Couldn't load history"
-  // display with Retry ([`retryAgentHistory`]). A per-agent parse failure has
-  // already been marked by `hydrateProject` with its own message.
-  if (eager) {
-    markEagerForkHistoryFailed(
-      agentId,
-      refreshFailure ?? "Switchboard couldn't load the conversation this fork inherited.",
-    );
-  }
 }
 
-/// Show an eager fork's history load as failed, with Retry, unless a more
-/// specific failure (a per-agent parse error `hydrateProject` recorded) is
-/// already showing.
-function markEagerForkHistoryFailed(agentId: AgentId, message: string): void {
+/// [`rereadAgentHistory`] with the agent shown as loading its history until the
+/// read settles: for Retry, an attached agent, and a Codex fork. While it shows
+/// loading, sends to it and workflow runs wait, so the read doesn't overlap a
+/// reply being written to the agent's session file.
+///
+/// **Never leaves it loading.** An applied read marks the agent complete, and a
+/// failed one marks it failed with the reason. A read that didn't run puts back
+/// what was showing before, rather than leave a spinner nothing will clear. An
+/// unexpected error marks it failed, with Retry.
+async function rereadAgentHistoryShowingProgress(agentId: AgentId): Promise<RereadOutcome> {
+  const agent = agentRecordById(agentId);
+  const before = runtimes[agentId];
+  if (agent === undefined || before === undefined || before.hydration_status === "loading") {
+    return "skipped";
+  }
+  runtimes[agentId] = { ...before, hydration_status: "loading", hydration_error: undefined };
+  let outcome: RereadOutcome;
+  try {
+    outcome = await rereadAgentHistory(agent, (message) => markHistoryFailed(agentId, message));
+  } catch (err) {
+    markHistoryFailed(agentId, err instanceof Error ? err.message : String(err));
+    return "failed";
+  }
+  const after = runtimes[agentId];
+  if (after?.hydration_status === "loading") {
+    runtimes[agentId] = {
+      ...after,
+      hydration_status: before.hydration_status,
+      hydration_error: before.hydration_error,
+    };
+  }
+  return outcome;
+}
+
+/// Show an agent's history load as failed, with Retry, unless a more specific
+/// failure (a per-agent load error `hydrateProject` recorded) is already showing.
+function markHistoryFailed(agentId: AgentId, message: string): void {
   const runtime = runtimes[agentId];
   if (runtime === undefined || runtime.hydration_status === "failed") return;
   runtimes[agentId] = { ...runtime, hydration_status: "failed", hydration_error: message };
 }
 
+/// Whether `agent` is a fork whose earlier conversation Switchboard loads after
+/// creating it: a Claude branch (marked by its parent session) or a Codex fork
+/// created this session.
+function isForkAwaitingHistoryLoad(agent: AgentRecord): boolean {
+  return agent.forked_from_session != null || eagerForks.has(agent.id);
+}
+
+/// Record that a fork's earlier conversation arrived, so the automatic reload
+/// stops and the transcript stops saying it is still coming.
+function noteForkHistoryLoaded(agentId: AgentId): void {
+  forkHistoryLoaded.add(agentId);
+  forkHistoryPending.delete(agentId);
+}
+
+/// Load a fork's earlier conversation, once it can be read.
+///
+/// - **A Claude fork** comes into existence during its first reply, so this
+///   runs after each completed reply until a read succeeds. The trigger is the
+///   outcome, not the file: the frontend can't stat a session file, so "did this
+///   turn materialize the branch?" is approximated by `Completed`, and
+///   cancelled or failed turns re-arm it (a fork whose first turn was cancelled
+///   may still have a complete child file, harness-behavior §3.5). Its file is
+///   safe to reread mid-reply, so nothing waits for this read.
+/// - **A Codex fork** exists once created, so this runs right after creation,
+///   and again once the fork is idle if that failed. It shows the fork as
+///   loading meanwhile, so nothing is sent to it during the read.
+///
+/// Two branches whose first replies land together each get their own read,
+/// queued one after the other ([`rereadAgentHistory`]): coalescing them would
+/// drop the second branch's history until its next completed reply, which may
+/// never come.
+async function loadForkInheritedHistory(agentId: AgentId): Promise<void> {
+  const agent = agentRecordById(agentId);
+  if (agent === undefined || !isForkAwaitingHistoryLoad(agent)) return;
+  if (forkHistoryLoaded.has(agentId)) return;
+  const outcome = eagerForks.has(agentId)
+    ? await rereadAgentHistoryShowingProgress(agentId)
+    : await rereadAgentHistory(agent, () => undefined);
+  if (outcome === "applied") noteForkHistoryLoaded(agentId);
+}
+
 /// Why `agent`'s history can't be retried right now, or `null` when it can.
+///
+/// **Not until the project's history has loaded.** Retry rereads through the
+/// project read, which needs it ([`rereadAgentHistory`]); until then the
+/// project's own load, or its Retry, reads this agent too.
 ///
 /// **Not while a reply is running or queued.** A reread then finds the reply
 /// half-written in the session file, and a Codex reply gets the id that matches
@@ -1679,64 +1709,38 @@ function markEagerForkHistoryFailed(agentId: AgentId, message: string): void {
 /// refusing it would leave the history missing until a restart, which is worse
 /// than one reply shown twice. Only the automatic retry skips such an agent.
 export function historyRetryBlock(agent: AgentRecord): string | null {
+  if (conversations[agent.project_id]?.status !== "complete") {
+    return "Retry is available once the project's history has loaded.";
+  }
   if (!agentIsWorking(runtimes[agent.id])) return null;
   return `Retry is available once ${agent.name} has finished replying, including any queued messages.`;
 }
 
-/// Retry loading an agent's history after a failure, through the path that
-/// loaded it.
-///
-/// An eager fork (Codex) goes back through the project merge, the same read
-/// that failed: the per-agent loader returns raw user turns, which the project
-/// merge owns, so it would show the fork's inherited messages twice. Every other
-/// agent goes through [`retryAgentHydration`].
+/// Retry loading an agent's history after a failure, through the project read
+/// like every one-agent history load ([`rereadAgentHistoryShowingProgress`]).
 export async function retryAgentHistory(agentId: AgentId): Promise<void> {
+  const agent = agentRecordById(agentId);
   // The buttons are disabled meanwhile (`historyRetryBlock`); this covers a
-  // click that lands as a reply starts.
-  if (agentIsWorking(runtimes[agentId])) return;
-  if (!eagerForks.has(agentId)) {
-    await retryAgentHydration(agentId);
-    return;
-  }
+  // click that lands as a reply starts or the project begins reloading.
+  if (agent === undefined || historyRetryBlock(agent) !== null) return;
   if (runtimes[agentId]?.hydration_status === "loading") return;
   // An explicit Retry always reads again. The once-per-fork mark only stops
   // the automatic reload after each turn from repeating a read that worked; a
   // fork that loaded once can still fail a later project reload.
   forkHistoryLoaded.delete(agentId);
-  await loadEagerForkHistoryShowingProgress(agentId);
+  const outcome = await rereadAgentHistoryShowingProgress(agentId);
+  if (outcome === "applied" && isForkAwaitingHistoryLoad(agent)) noteForkHistoryLoaded(agentId);
 }
 
-/// Load an eager fork's inherited history with the fork shown as loading it,
-/// for Retry, for the automatic retry once the fork is idle, and for a fork
-/// made from the agent card. Every caller starts it only while the fork has no
-/// reply running or queued, and while it shows loading the compose bar won't
-/// send to the fork, so the read doesn't overlap a reply being written to the
-/// fork's session file.
+/// Load the history of an agent just attached to an existing harness session.
 ///
-/// **Never leaves it loading.** The load either applies (which marks the agent
-/// complete) or fails (which marks it failed). It can also return without
-/// reading, e.g. when the fork was deleted meanwhile; then this puts back what
-/// was there rather than leave a spinner nothing will clear, and a fork made
-/// from the card, which started out complete, can be sent to. An unexpected
-/// error marks it failed, with Retry.
-async function loadEagerForkHistoryShowingProgress(agentId: AgentId): Promise<void> {
-  const before = runtimes[agentId];
-  if (before === undefined || before.hydration_status === "loading") return;
-  runtimes[agentId] = { ...before, hydration_status: "loading", hydration_error: undefined };
-  try {
-    await loadForkInheritedHistory(agentId);
-  } catch (err) {
-    markEagerForkHistoryFailed(agentId, err instanceof Error ? err.message : String(err));
-    return;
-  }
-  const after = runtimes[agentId];
-  if (after?.hydration_status === "loading") {
-    runtimes[agentId] = {
-      ...after,
-      hydration_status: before.hydration_status,
-      hydration_error: before.hydration_error,
-    };
-  }
+/// Through the project read, like every one-agent history load: the session's
+/// messages belong in the project's shared list, and a project read later on
+/// (switching back to the project, a fork) would otherwise add them a second
+/// time. If the project's first load is still running, this waits for it,
+/// because that read may have started before the agent existed.
+export async function loadAttachedAgentHistory(agentId: AgentId): Promise<void> {
+  await rereadAgentHistoryShowingProgress(agentId);
 }
 
 /// Wire the hooks that drive [`loadForkInheritedHistory`]: after a reply for a
@@ -1767,7 +1771,7 @@ export function installForkHistoryRefresh(): void {
   setAgentIdleHook((agentId) => {
     if (!eagerForks.has(agentId) || forkHistoryLoaded.has(agentId)) return;
     if (agentIsWorking(runtimes[agentId]) || showsUnmatchableReply(agentId)) return;
-    void loadEagerForkHistoryShowingProgress(agentId);
+    void loadForkInheritedHistory(agentId);
   });
 }
 

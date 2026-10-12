@@ -39,7 +39,6 @@ import {
   cancelTurn as apiCancelTurn,
   compactAgent as apiCompactAgent,
   contextReportAgent as apiContextReportAgent,
-  loadTranscript,
 } from "$lib/api";
 import type {
   AgentId,
@@ -272,75 +271,6 @@ type Heartbeat = { turn_id: TurnId; handle: ReturnType<typeof setTimeout> | unde
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const heartbeats = new Map<AgentId, Heartbeat>();
 
-/// Agents this session has already attempted to hydrate. Once an agent is
-/// in this set, subsequent `hydrateAgent` calls are no-ops — regardless of
-/// whether the prior attempt succeeded, failed, or is in flight. The set
-/// stays sticky across success AND failure for the duration of the session.
-///
-/// **Why sticky across failure**: parsers mint fresh `turn_id`s per-turn at
-/// parse time. If hydration ran twice for the same session file, the second
-/// call's turns would have different ids than the first's, and the reducer's
-/// `existingIds.has(t.turn_id)` dedupe in the `hydrate` arm would NOT catch
-/// the duplication — the same conversation lands twice. Even on the failure
-/// branch, the safer default is "don't retry implicitly" rather than risk
-/// the duplicate-content case. An explicit retry UX (per-agent retry button)
-/// is future work; it would mutate this set out-of-band.
-///
-/// **TODO**: clear this set when the bound directory rebinds — the agents
-/// in a different directory are a different population. Out of scope here
-/// (no directory-rebind path exists yet that wouldn't already reset the
-/// whole app state).
-// eslint-disable-next-line svelte/prefer-svelte-reactivity
-const hydrationAttempted = new Set<AgentId>();
-
-/// Hydrate an agent's transcript history from its harness session file.
-///
-/// Drives the `hydration_status` ladder: `pending` → `loading` → `complete`
-/// or `failed`. The hydrate reducer input is per-agent and non-destructive:
-/// live in-flight turns and already-populated runtime metadata are
-/// preserved (live > disk).
-///
-/// **Idempotency**. Tracked via `hydrationAttempted` (a module-scope Set),
-/// not via inspecting `hydration_status`. Earlier versions short-circuited
-/// on `complete`/`failed` — but that left the door open for a caller (e.g.,
-/// project-reopen) to forcibly reset `hydration_status: "pending"` and
-/// silently re-trigger hydration, producing duplicate turns since parsers
-/// mint fresh `turn_id`s at parse time. The set is authoritative; the
-/// status field is presentational.
-///
-/// **Failure scope**: lookup failures and cases where recorded history cannot
-/// be recovered land in `hydration_status: "failed"`. Per-line parse damage
-/// remains a successful best-effort load; only diagnostics owned by a tool row
-/// cross the UI boundary on that row.
-export async function hydrateAgent(agentId: AgentId): Promise<void> {
-  const current = runtimes[agentId];
-  if (current === undefined) {
-    console.error("[switchboard] hydrateAgent called for unregistered agent", {
-      agent_id: agentId,
-    });
-    return;
-  }
-  if (hydrationAttempted.has(agentId)) return;
-  hydrationAttempted.add(agentId);
-  runtimes[agentId] = { ...current, hydration_status: "loading" };
-  try {
-    const loaded = await loadTranscript(agentId);
-    applyAgentHydrate(agentId, loaded);
-  } catch (e) {
-    // Retain the error text on the runtime (not just `console.warn` it) so the
-    // failure is surfaced where the user is looking — the transcript-region
-    // banner and the sidebar line read the same `hydration_error` field. This
-    // mirrors the project-batch path (`workspace.svelte.ts`), which already
-    // sets `hydration_error` from the backend's per-agent `load_error`.
-    const message = e instanceof Error ? e.message : String(e);
-    console.warn("[switchboard] hydrateAgent failed", { agent_id: agentId, error: e });
-    const after = runtimes[agentId];
-    if (after !== undefined) {
-      runtimes[agentId] = { ...after, hydration_status: "failed", hydration_error: message };
-    }
-  }
-}
-
 /// Re-attempt an agent's event subscription after [`registerAgent`] recorded a
 /// `listener_error`. Idempotent and safe to call repeatedly: `registerAgent`
 /// returns early once the listener is registered, and it never re-creates the
@@ -349,43 +279,12 @@ export async function retryAgentSubscription(agent: AgentRecord): Promise<void> 
   await registerAgent(agent);
 }
 
-/// Re-attempt an agent's hydration after a failure. Clears the sticky
-/// `hydrationAttempted` guard (so `hydrateAgent` actually re-runs) and drops the
-/// prior `hydration_error` (so the UI shows the loading state, not a stale
-/// failure, during the re-attempt). Safe even without the idempotent merge: a
-/// failed hydration applies *nothing* (the load is all-or-nothing at the IPC
-/// boundary — `loadTranscript` either returns a complete value that is then
-/// applied, or throws and applies nothing), so a retry-after-failure cannot
-/// duplicate turns. Shared by the transcript-region and sidebar retry
-/// affordances.
-export async function retryAgentHydration(agentId: AgentId): Promise<void> {
-  const current = runtimes[agentId];
-  if (current === undefined) {
-    console.error("[switchboard] retryAgentHydration called for unregistered agent", {
-      agent_id: agentId,
-    });
-    return;
-  }
-  // Re-entrancy guard: a hydration is already in flight. Without this, a second
-  // retry would `hydrationAttempted.delete` the guard the first call just
-  // re-added and start a *second* concurrent `load_transcript`; both would
-  // resolve and both apply, and since each parse mints fresh `turn_id`s the
-  // un-keyed merge can't dedup them — duplicating the agent's history.
-  // `hydrateAgent` sets `"loading"` synchronously before its await, so a
-  // racing retry observes it here.
-  if (current.hydration_status === "loading") return;
-  hydrationAttempted.delete(agentId);
-  runtimes[agentId] = { ...current, hydration_error: undefined };
-  await hydrateAgent(agentId);
-}
-
 /// Apply a resolved hydration payload to an agent's transcript + runtime via
 /// the non-destructive `hydrate` reducer path (live in-flight turns win over
 /// disk; the runtime reducer flips `hydration_status` to `"complete"` and fills
-/// meta/rate-limit only where absent). Shared by the per-agent `hydrateAgent`
-/// path and the project-scoped hydration in the workspace store, which feeds
-/// agent-turn content regrouped from `load_project_conversation`. The caller
-/// owns idempotency (the per-agent `hydrationAttempted` set / the per-project
+/// meta/rate-limit only where absent). Called by the project-scoped hydration
+/// in the workspace store, which feeds agent-turn content regrouped from
+/// `load_project_conversation`. The caller owns idempotency (the per-project
 /// hydration guard) — this helper only applies.
 export function applyAgentHydrate(
   agentId: AgentId,
@@ -928,17 +827,6 @@ export function stopAgent(agentId: AgentId): void {
   void apiCancelAgent(agentId);
 }
 
-/// Mark an agent as already-hydrated so the per-agent `hydrateAgent` path
-/// won't re-parse it. Used by the project-scoped hydration in the workspace
-/// store, which hydrates roster agents through `applyAgentHydrate` directly:
-/// without this, a later `hydrateAgent` call on the same agent would re-parse
-/// its session file and duplicate its turns (the reducer dedups by `turn_id`,
-/// but parsers mint fresh ids each parse). Keeps the "hydrate an agent at most
-/// once per session" invariant holding regardless of which path runs first.
-export function markHydrationAttempted(agentId: AgentId): void {
-  hydrationAttempted.add(agentId);
-}
-
 /// Tear down per-agent state for the given agents: unsubscribe their event
 /// channels, cancel heartbeats, and drop their transcript/runtime/guard
 /// entries. Called when a directory is removed (the frontend lifecycle teardown
@@ -957,7 +845,6 @@ export function unregisterAgents(agentIds: AgentId[]): void {
       listenerRegistry.delete(agentId);
     }
     pendingRegistrations.delete(agentId);
-    hydrationAttempted.delete(agentId);
     agentHarness.delete(agentId);
     clearHeartbeat(agentId);
     delete transcripts[agentId];
@@ -1300,7 +1187,6 @@ export const _testing = {
     }
     listenerRegistry.clear();
     pendingRegistrations.clear();
-    hydrationAttempted.clear();
     agentHarness.clear();
     // The account-scoped usage store is app state like the rest of this module's,
     // so it is reset here too rather than leaving every suite to remember it.

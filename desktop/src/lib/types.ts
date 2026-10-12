@@ -414,49 +414,6 @@ export type NormalizedEvent =
 // inside `reduce()`).
 export type HeartbeatTimeout = { type: "heartbeat_timeout"; turn_id: TurnId; at: string };
 
-// Mirror of Rust `LoadedTranscript` from `crates/harness/src/transcript.rs`.
-// Used by the transcript-hydration flow: `load_transcript` Tauri command
-// returns this shape; the reducer's `hydrate` input consumes it.
-export type LoadedTranscript = {
-  turns: LoadedTurn[];
-  meta?: SessionMetaInfo | null;
-  last_rate_limit?: unknown;
-  /// Model captured with a stream-only rate-limit snapshot. This keeps a
-  /// model-specific quota label exact across app restarts.
-  last_rate_limit_model?: string | null;
-  /// Capture time of `last_rate_limit` when restored from the per-agent
-  /// metadata sidecar (a stream-only/class-C value, e.g. Claude's overage
-  /// signal, that would otherwise be lost on restart). ISO-8601 string.
-  /// `null` for live values and for class-B (already-durable) sources.
-  ///
-  /// **Three consumers, one meaning.** It is the instant the reading was
-  /// observed, so it both dates the reading for the user and orders it — against
-  /// other agents' readings of the same account quota, and per window against
-  /// another reading of the same window. All three are the same question asked of
-  /// one measurement, which is why they share a field.
-  ///
-  /// This is safe only because the dispatcher stamps it when the reading arrives
-  /// and every later write of that payload reuses it. A write that restamped it —
-  /// the model-label repair used to — makes a stale reading outrank a fresher one
-  /// and claims it was measured just now.
-  last_rate_limit_as_of?: string | null;
-  /// Capture time of `meta.inventory` when restored from the metadata sidecar
-  /// (ISO-8601). Same role as `last_rate_limit_as_of`: `null`/absent means the
-  /// inventory is live or re-read from a durable harness file, so the card
-  /// presents it without an "as of" qualifier.
-  meta_as_of?: string | null;
-  /// The newest `/context` breakdown recorded in this agent's session file, and
-  /// when the harness took it (ISO-8601). Projected by the loader because the
-  /// markers themselves never reach a per-agent turn list — `load_transcript`
-  /// filters `role: "system"` out before the IPC. Unlike the `*_as_of` fields
-  /// above this is carried by every report, live ones included: nothing
-  /// refreshes a breakdown, so a report with no time attached is a number the
-  /// user cannot interpret.
-  last_context_report?: ContextReport | null;
-  last_context_report_at?: string | null;
-  warnings: ParseWarning[];
-};
-
 export type ParseWarning = { line_number: number; reason: string };
 
 export type SessionMetaInfo = {
@@ -518,8 +475,8 @@ export type LoadedTurnItem =
       completed_at?: string | null;
     };
 
-// Hydrate reducer input — frontend-synthesized after a `load_transcript`
-// IPC reply lands. Per-agent scope. Non-destructive: existing in-flight
+// Hydrate reducer input — frontend-synthesized per agent from a
+// `load_project_conversation` reply. Per-agent scope. Non-destructive: existing in-flight
 // turns + already-populated runtime metadata are preserved (live > disk).
 //
 export type Hydrate = {
@@ -531,11 +488,11 @@ export type Hydrate = {
   /// Model captured with `last_rate_limit` in the metadata sidecar.
   last_rate_limit_model?: string | null;
   /// Capture time of `last_rate_limit` from the metadata sidecar (see
-  /// `LoadedTranscript.last_rate_limit_as_of`). `null` when the value is
+  /// Rust `LoadedTranscript::last_rate_limit_as_of`). `null` when the value is
   /// live or class-B.
   last_rate_limit_as_of?: string | null;
   /// Capture time of `meta.inventory` from the metadata sidecar (see
-  /// `LoadedTranscript.meta_as_of`).
+  /// Rust `LoadedTranscript::meta_as_of`).
   meta_as_of?: string | null;
   /// The newest `/context` breakdown from this agent's session file, and when
   /// the harness took it. Fills `AgentRuntime.last_context_report` only when the
@@ -971,8 +928,7 @@ export type ConversationItem =
       usage?: TurnUsage | null;
       // Per-turn model + effort reconstructed from the harness session file —
       // same source + meaning as `LoadedTurn.model`/`effort`. Carried so the
-      // footer's model survives restart (the project-conversation path, not just
-      // the per-agent `load_transcript` path).
+      // footer's model survives restart.
       model?: string | null;
       effort?: string | null;
       // Per-turn cost/overage re-joined from the turn-metadata sidecar on
@@ -1099,13 +1055,13 @@ export type AgentConversationMeta = {
   last_rate_limit_model?: string | null;
   /// Capture time of `last_rate_limit` from the metadata sidecar (ISO-8601);
   /// `null`/absent for live or class-B sources. See
-  /// `LoadedTranscript.last_rate_limit_as_of`.
+  /// Rust `LoadedTranscript::last_rate_limit_as_of`.
   last_rate_limit_as_of?: string | null;
   /// Capture time of `meta.inventory` from the metadata sidecar. See
-  /// `LoadedTranscript.meta_as_of`.
+  /// Rust `LoadedTranscript::meta_as_of`.
   meta_as_of?: string | null;
   /// The newest `/context` breakdown from this agent's session file, and when
-  /// the harness took it. See `LoadedTranscript.last_context_report`.
+  /// the harness took it. See Rust `LoadedTranscript::last_context_report`.
   last_context_report?: ContextReport | null;
   last_context_report_at?: string | null;
   warnings: ParseWarning[];

@@ -65,7 +65,6 @@ vi.mock("$lib/api", () => ({
   cancelTurn: vi.fn(),
   compactAgent: (agentId: string, sendId: string) => compactAgentMock(agentId, sendId),
   contextReportAgent: (agentId: string, sendId: string) => contextReportAgentMock(agentId, sendId),
-  loadTranscript: vi.fn(),
 }));
 
 const copyTextMock = vi.fn<(t: string) => Promise<void>>();

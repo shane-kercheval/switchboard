@@ -4857,47 +4857,14 @@ pub async fn drain_agents_then_release_locks(
     }
 }
 
-/// Reload an agent's prior conversation history from its harness session
-/// file. Per-harness parsers project the on-disk records into a normalized
-/// `LoadedTranscript`. The frontend feeds the result through the reducer's
-/// `hydrate` input to populate the unified-view transcript.
-///
-/// **Error scope.** `Err(AppError::LoadTranscript)` covers lookup failures and
-/// cases where recorded history cannot be recovered safely. Per-line parse
-/// damage remains a successful best-effort load in
-/// `LoadedTranscript.warnings`; never-dispatched sessions remain legitimately
-/// empty.
-///
-/// `home_dir` is passed in (not resolved here) so tests can stage a temp
-/// directory without mutating process-wide `$HOME`. The Tauri command shim
-/// reads `$HOME` and forwards.
-pub fn load_transcript_impl(
-    state: &AppState,
-    agent_id: AgentId,
-    home_dir: &Path,
-) -> Result<switchboard_harness::LoadedTranscript, AppError> {
-    let (project, agent) = lookup_agent(state, agent_id)?;
-    let mut transcript = load_agent_transcript(&project, &agent, home_dir)?;
-    // System markers (e.g. compaction) are surfaced only in the project-level
-    // unified conversation, where the merge turns them into `ConversationItem`s.
-    // This per-agent hydrate path serializes `Turn` straight to the wire, and the
-    // frontend's `LoadedTurn` only models `user`/`agent` — a `role:"system"` turn
-    // would be mis-normalized as an agent turn (no items/status). Drop them here,
-    // NOT in the shared `load_agent_transcript` (the project path calls that too
-    // and DOES need the markers).
-    transcript
-        .turns
-        .retain(|t| !matches!(t, switchboard_harness::Turn::System { .. }));
-    Ok(transcript)
-}
-
-/// Load one agent's prior conversation from its harness session file. The
-/// harness-dispatch body factored out of [`load_transcript_impl`] so the
-/// project-level conversation loader can reuse it per agent. Lookup failures
-/// and recorded history that cannot be recovered safely surface as errors;
-/// genuinely absent or never-started sessions remain successful empty loads.
-/// Session identity is read from the agent's registry record (`session_locator`),
-/// so there's no per-agent session-link sidecar to corrupt.
+/// Load one agent's prior conversation from its harness session file, for the
+/// project-level conversation loader, which loads every agent through it.
+/// Lookup failures and recorded history that cannot be recovered safely
+/// surface as errors; per-line parse damage remains a successful best-effort
+/// load in `LoadedTranscript.warnings`, and genuinely absent or never-started
+/// sessions remain successful empty loads. Session identity is read from the
+/// agent's registry record (`session_locator`), so there's no per-agent
+/// session-link sidecar to corrupt.
 fn load_agent_transcript(
     project: &Project,
     agent: &AgentRecord,
@@ -6739,9 +6706,8 @@ fn parse_outcome(outcome: &serde_json::Value) -> (OutcomeStatus, Option<String>,
 /// each agent's transcript via [`load_agent_transcript`] on the blocking pool,
 /// in parallel.
 ///
-/// **Per-agent load errors are non-fatal.** Unlike [`load_transcript_impl`]
-/// (single-agent, fail-loud), a corrupt sidecar or read failure for *one* agent
-/// here is recorded on that agent's [`AgentConversationMeta::load_error`] (with
+/// **Per-agent load errors are non-fatal.** A corrupt sidecar or read failure
+/// for *one* agent is recorded on that agent's [`AgentConversationMeta::load_error`] (with
 /// an empty transcript for it) and the rest of the project — journal plus the
 /// healthy agents — still renders. Corruption stays loud (surfaced per-agent),
 /// just not fatal to the whole project.
@@ -13964,6 +13930,17 @@ mod tests {
         }
     }
 
+    /// One agent's transcript as the project read loads it: the per-agent half
+    /// of `load_project_conversation_impl`.
+    fn load_agent_by_id(
+        state: &AppState,
+        agent_id: AgentId,
+        home_dir: &Path,
+    ) -> Result<switchboard_harness::LoadedTranscript, AppError> {
+        let (project, agent) = lookup_agent(state, agent_id)?;
+        load_agent_transcript(&project, &agent, home_dir)
+    }
+
     fn fresh_state_with_active_project(
         name: &str,
     ) -> (TempDir, TempDir, AppState, switchboard_core::ProjectSummary) {
@@ -14558,7 +14535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_for_claude_agent_with_no_session_file_returns_empty() {
+    async fn load_agent_transcript_for_claude_agent_with_no_session_file_returns_empty() {
         let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         // Stage the file so attach succeeds but the file content is empty.
@@ -14572,7 +14549,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty());
         assert!(result.warnings.is_empty());
         // No metadata sidecar staged → both rate-limit fields stay None.
@@ -14581,7 +14558,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_for_stale_codex_locator_is_a_hydration_error() {
+    async fn load_agent_transcript_for_stale_codex_locator_is_a_hydration_error() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
@@ -14596,7 +14573,7 @@ mod tests {
         .unwrap();
         std::fs::remove_file(path).unwrap();
 
-        let error = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap_err();
+        let error = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap_err();
         assert!(matches!(
             error,
             AppError::LoadTranscript(
@@ -15269,7 +15246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_rejoins_persisted_turn_spend_for_claude_agent() {
+    async fn load_agent_transcript_rejoins_persisted_turn_spend_for_claude_agent() {
         // End-to-end wiring through the real load path: a Claude agent whose
         // session file produces a turn with message id `msg_test31`, plus a
         // staged turnmeta sidecar record keyed on that id, surfaces the
@@ -15326,7 +15303,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap();
         let agent_turn = result
             .turns
             .iter()
@@ -15340,85 +15317,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_filters_system_markers_from_per_agent_wire() {
-        // A compaction marker is surfaced only in the project-level conversation.
-        // The per-agent hydrate path serializes `Turn` straight to the wire, where
-        // the frontend models only user/agent — so `load_transcript` must drop the
-        // `role:"system"` turn rather than leak one the frontend would
-        // mis-normalize as a content-less agent turn.
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
-        let session_id = Uuid::now_v7();
-        let canonical_cwd = tmp_workdir.path().canonicalize().unwrap();
-        let session_path = switchboard_harness::claude_session_file_path(
-            tmp_home.path(),
-            &canonical_cwd,
-            &session_id,
-        );
-        std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
-        let session_jsonl = [
-            serde_json::json!({
-                "type": "user",
-                "message": { "role": "user", "content": "hello" },
-                "timestamp": "2026-05-31T18:00:00Z",
-            }),
-            serde_json::json!({
-                "type": "assistant",
-                "message": {
-                    "id": "m1",
-                    "model": "claude-opus-4-8",
-                    "role": "assistant",
-                    "content": [{ "type": "text", "text": "hi" }],
-                    "stop_reason": "end_turn",
-                    "usage": { "input_tokens": 1, "output_tokens": 1 }
-                },
-                "timestamp": "2026-05-31T18:00:01Z",
-            }),
-            serde_json::json!({
-                "type": "system",
-                "subtype": "compact_boundary",
-                "timestamp": "2026-05-31T18:00:02Z",
-            }),
-            serde_json::json!({
-                "type": "user",
-                "message": { "role": "user", "content": "This session is being continued…" },
-                "isCompactSummary": true,
-                "timestamp": "2026-05-31T18:00:03Z",
-            }),
-        ]
-        .iter()
-        .map(|r| serde_json::to_string(r).unwrap())
-        .collect::<Vec<_>>()
-        .join("\n");
-        std::fs::write(&session_path, session_jsonl).unwrap();
-
-        let record = attach_agent_impl(
-            &state,
-            "x",
-            HarnessKind::ClaudeCode,
-            &session_id.to_string(),
-            tmp_home.path(),
-        )
-        .unwrap();
-
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
-        assert!(
-            !result
-                .turns
-                .iter()
-                .any(|t| matches!(t, switchboard_harness::Turn::System { .. })),
-            "no system marker reaches the per-agent hydrate wire"
-        );
-        assert!(
-            result
-                .turns
-                .iter()
-                .any(|t| matches!(t, switchboard_harness::Turn::Agent { .. })),
-            "the real agent turn still hydrates"
-        );
-    }
-
-    #[tokio::test]
-    async fn load_transcript_overlays_metadata_sidecar_for_claude_agent() {
+    async fn load_agent_transcript_overlays_metadata_sidecar_for_claude_agent() {
         // End-to-end wiring: a Claude agent with a staged metadata sidecar
         // surfaces the persisted rate-limit + its capture time through the
         // real load path (proves the sidecar-path resolution + overlay are
@@ -15450,7 +15349,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap();
         assert_eq!(
             result.last_rate_limit,
             Some(serde_json::json!({"isUsingOverage": true, "resetsAt": 1_778_701_800u64}))
@@ -15613,7 +15512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_for_codex_agent_without_sidecar_returns_meta_only_empty() {
+    async fn load_agent_transcript_for_codex_agent_without_sidecar_returns_meta_only_empty() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         // Create a Codex agent the normal way (no sidecar — no first dispatch).
         let record = create_agent_impl(
@@ -15624,16 +15523,16 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty());
         // Meta is populated from config loaders, never None.
         assert!(result.meta.is_some());
     }
 
     #[tokio::test]
-    async fn load_transcript_for_missing_agent_returns_agent_not_found() {
+    async fn load_agent_transcript_for_missing_agent_returns_agent_not_found() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
-        let err = load_transcript_impl(&state, Uuid::now_v7(), tmp_home.path()).unwrap_err();
+        let err = load_agent_by_id(&state, Uuid::now_v7(), tmp_home.path()).unwrap_err();
         assert!(matches!(err, AppError::AgentNotFound(_)));
     }
 
@@ -15683,7 +15582,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty(), "no transcript → no turns");
         assert!(result.meta.is_some(), "registry meta still surfaces");
     }
@@ -15745,7 +15644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_for_antigravity_agent_without_locator_returns_meta_only_empty() {
+    async fn load_agent_transcript_for_antigravity_agent_without_locator_returns_meta_only_empty() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         // Antigravity agent never dispatched → no locator → empty turns, but
         // loader-derived registry meta still surfaces (mirrors the Codex arm)
@@ -15758,13 +15657,13 @@ mod tests {
         )
         .unwrap();
         assert!(record.session_locator.is_none());
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty());
         assert!(result.meta.is_some());
     }
 
     #[tokio::test]
-    async fn load_transcript_for_antigravity_agent_hydrates_prior_turns() {
+    async fn load_agent_transcript_for_antigravity_agent_hydrates_prior_turns() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let agent = create_agent_impl(
             &state,
@@ -15797,7 +15696,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_transcript_impl(&state, agent.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, agent.id, tmp_home.path()).unwrap();
         assert_eq!(result.turns.len(), 2);
         assert!(result.meta.is_some());
     }

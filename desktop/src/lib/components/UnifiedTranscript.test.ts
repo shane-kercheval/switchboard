@@ -135,6 +135,7 @@ afterEach(async () => {
   cleanup();
   const { _testing } = await loadState();
   _testing.reset();
+  (await import("$lib/state/workspace.svelte"))._testing.reset();
   previewState.reset();
   (await import("$lib/state/transcriptJump.svelte"))._testing.reset();
   (await import("$lib/state/messagePins.svelte"))._testing.reset();
@@ -2857,7 +2858,26 @@ describe("UnifiedTranscript hydration failures", () => {
     );
   });
 
-  it("Retry on a per-agent banner re-invokes load_transcript and clears the banner on success", async () => {
+  /// A project whose history has loaded with `agent` in it, answering the
+  /// project read an agent's Retry makes with `read`.
+  async function loadedProjectWith(
+    agent: AgentRecord,
+    read: () => Promise<unknown>,
+  ): Promise<void> {
+    const ws = await import("$lib/state/workspace.svelte");
+    ws.agentsByProject[PROJECT_ID] = [agent];
+    ws.conversations[PROJECT_ID] = { items: [], status: "complete" };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") return await read();
+      return cmd === "project_session_fingerprints" ? [] : null;
+    });
+  }
+
+  function loadedAgent(agent: AgentRecord): unknown {
+    return { items: [], agents: [{ agent_id: agent.id, warnings: [], load_error: null }] };
+  }
+
+  it("Retry on a per-agent banner rereads through the project read and clears the banner on success", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     const rt = state.runtimes[CLAUDE_AGENT.id];
@@ -2867,26 +2887,61 @@ describe("UnifiedTranscript hydration failures", () => {
       hydration_status: "failed",
       hydration_error: "permission denied",
     };
+    await loadedProjectWith(CLAUDE_AGENT, async () => loadedAgent(CLAUDE_AGENT));
 
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     expect(screen.getByTestId("agent-hydration-failed")).toBeInTheDocument();
 
-    // Retry re-runs hydration; stage a successful load.
-    invokeMock.mockResolvedValueOnce({
-      turns: [],
-      meta: null,
-      last_rate_limit: null,
-      warnings: [],
-    });
     await fireEvent.click(screen.getByTestId("agent-hydration-failed-retry"));
 
     await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("load_transcript", { agentId: CLAUDE_AGENT.id }),
+      expect(invokeMock).toHaveBeenCalledWith("load_project_conversation", {
+        projectId: PROJECT_ID,
+      }),
     );
     await waitFor(() => expect(screen.queryByTestId("agent-hydration-failed")).toBeNull());
     expect(state.runtimes[CLAUDE_AGENT.id]?.hydration_status).toBe("complete");
     expect(state.runtimes[CLAUDE_AGENT.id]?.hydration_error).toBeUndefined();
+  });
+
+  it("keeps the per-agent Retry unavailable until the project's history has loaded", async () => {
+    // Retry rereads through the project read, which needs the project loaded;
+    // until then the project's own load reads this agent too.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...state.runtimes[CLAUDE_AGENT.id]!,
+      hydration_status: "failed",
+      hydration_error: "permission denied",
+    };
+    await loadedProjectWith(CLAUDE_AGENT, async () => loadedAgent(CLAUDE_AGENT));
+    const ws = await import("$lib/state/workspace.svelte");
+    ws.conversations[PROJECT_ID] = { items: [], status: "loading" };
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const retry = screen.getByTestId("agent-hydration-failed-retry");
+    expect(retry).toHaveAttribute("aria-disabled", "true");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await fireEvent.pointerEnter(retry);
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(screen.getByTestId("tooltip-content")).toHaveTextContent(
+        "Retry is available once the project's history has loaded.",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    await fireEvent.click(retry);
+    expect(invokeMock).not.toHaveBeenCalledWith("load_project_conversation", expect.anything());
+
+    ws.conversations[PROJECT_ID] = { items: [], status: "complete" };
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-hydration-failed-retry")).not.toHaveAttribute(
+        "aria-disabled",
+      ),
+    );
   });
 
   it("keeps the per-agent Retry unavailable while the agent is replying", async () => {
@@ -2900,6 +2955,8 @@ describe("UnifiedTranscript hydration failures", () => {
       hydration_status: "failed",
       hydration_error: "permission denied",
     };
+
+    await loadedProjectWith(CLAUDE_AGENT, async () => loadedAgent(CLAUDE_AGENT));
 
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
@@ -2916,7 +2973,7 @@ describe("UnifiedTranscript hydration failures", () => {
       vi.useRealTimers();
     }
     await fireEvent.click(retry);
-    expect(invokeMock).not.toHaveBeenCalledWith("load_transcript", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("load_project_conversation", expect.anything());
 
     state.runtimes[CLAUDE_AGENT.id] = { ...state.runtimes[CLAUDE_AGENT.id]!, run_status: "idle" };
     await waitFor(() =>
@@ -2924,15 +2981,11 @@ describe("UnifiedTranscript hydration failures", () => {
         "aria-disabled",
       ),
     );
-    invokeMock.mockResolvedValueOnce({
-      turns: [],
-      meta: null,
-      last_rate_limit: null,
-      warnings: [],
-    });
     await fireEvent.click(screen.getByTestId("agent-hydration-failed-retry"));
     await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("load_transcript", { agentId: CLAUDE_AGENT.id }),
+      expect(invokeMock).toHaveBeenCalledWith("load_project_conversation", {
+        projectId: PROJECT_ID,
+      }),
     );
   });
 
@@ -2947,10 +3000,13 @@ describe("UnifiedTranscript hydration failures", () => {
       hydration_error: "first error",
     };
 
+    await loadedProjectWith(CLAUDE_AGENT, async () => {
+      throw new Error("still broken");
+    });
+
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    invokeMock.mockRejectedValueOnce(new Error("still broken"));
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     await fireEvent.click(screen.getByTestId("agent-hydration-failed-retry"));
 

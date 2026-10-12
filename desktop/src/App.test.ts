@@ -284,8 +284,6 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       backend.rosters.set(pid, [...(backend.rosters.get(pid) ?? []), agent]);
       return agent;
     }
-    case "load_transcript":
-      return { turns: [], warnings: [] };
     case "load_project_conversation": {
       const pid = args?.projectId as string;
       backend.loadConvoCalls.push(pid);
@@ -1577,6 +1575,55 @@ describe("App", () => {
         effort_choices: ["medium", "high"],
       },
     });
+  });
+
+  it("loads an attached session's history through the project read, showing each message once", async () => {
+    // The session ran in a terminal before Switchboard saw it, so its prompt
+    // comes from the session file. Loading the agent on its own put that
+    // prompt in the agent's column as well as the project's shared list.
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
+    backend.agentQueue.push(
+      agent({ id: "ag-att", project_id: "p-a", name: "claude", session_locator: null }),
+    );
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
+    await waitFor(() => expect(backend.loadConvoCalls).toEqual(["p-a"]));
+    backend.conversations.set("p-a", {
+      items: [
+        {
+          kind: "user_message",
+          id: "imported-1",
+          send_id: null,
+          agent_ids: ["ag-att"],
+          text: "fix the build",
+          at: "2026-05-20T00:00:01Z",
+        },
+        {
+          kind: "agent_turn",
+          turn_id: "reply-1",
+          agent_id: "ag-att",
+          send_id: null,
+          started_at: "2026-05-20T00:00:02Z",
+          ended_at: "2026-05-20T00:00:03Z",
+          status: "complete",
+          items: [{ item_kind: "text", kind: "text", text: "build fixed" }],
+          hydration_key: "k1",
+        },
+      ],
+      agents: [{ agent_id: "ag-att", warnings: [], load_error: null }],
+    });
+
+    await fireEvent.click(screen.getByTestId("mode-attach"));
+    await fireEvent.input(screen.getByTestId("attach-session-id"), {
+      target: { value: "01a12d13-2870-7f61-8000-000000000001" },
+    });
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+
+    await waitFor(() => expect(screen.getByText("build fixed")).toBeInTheDocument());
+    expect(backend.loadConvoCalls).toEqual(["p-a", "p-a"]);
+    expect(screen.getAllByText("fix the build")).toHaveLength(1);
   });
 
   it("assigns the first agent to the pane already visible in a retained maximized layout", async () => {

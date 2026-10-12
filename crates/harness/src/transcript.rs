@@ -1,14 +1,13 @@
 //! Shared types for transcript hydration from harness session files.
 //!
 //! `Turn::User`/`Turn::Agent` and `TurnItem` mirror the TS shape in
-//! `desktop/src/lib/state/types.ts` verbatim — they round-trip through the per-agent
-//! hydration path (`load_transcript`) onto the frontend's `LoadedTurn`.
-//! `Turn::System` is the exception: it has **no** frontend `Turn`/`LoadedTurn`
-//! analog. It reaches the UI only as a `ConversationItem` via the project
-//! conversation merge, and `load_transcript_impl` (`desktop/src-tauri/src/commands.rs`)
-//! filters it out before the per-agent IPC. A new caller that serializes
-//! `LoadedTranscript` straight to the frontend must filter `Turn::System` too,
-//! or it re-introduces a `role:"system"` turn the frontend can't model.
+//! `desktop/src/lib/state/types.ts`. They reach the frontend through the project
+//! conversation merge (`load_project_conversation_impl` in
+//! `desktop/src-tauri/src/commands.rs`), which turns them into
+//! `ConversationItem`s. `Turn::System` has **no** frontend `Turn`/`LoadedTurn`
+//! analog and reaches the UI only as such an item. A new caller that serializes
+//! `LoadedTranscript` straight to the frontend must filter `Turn::System` out,
+//! or it introduces a `role:"system"` turn the frontend can't model.
 //! `items: Vec<TurnItem>` is a single ordered stream of text + tool entries —
 //! interleaved by arrival, not split into parallel arrays — so chronology
 //! observable from the session file survives serde without any boundary

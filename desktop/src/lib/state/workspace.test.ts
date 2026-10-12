@@ -635,6 +635,153 @@ describe("project staleness refresh", () => {
     ]);
   });
 
+  it("carries the rate-limit model onto the window a restored reading delivers", async () => {
+    const ws = await loadWorkspaceState();
+    const usage = await import("./harnessUsage.svelte");
+    installBackend([agent(AGENT_1, PROJECT_1)]);
+    conversation = {
+      items: [],
+      agents: [
+        {
+          agent_id: AGENT_1,
+          meta: null,
+          last_rate_limit: {
+            unifiedWindows: {
+              seven_day_overage_included: { utilization: 0.79, resetsAt: 1_800_000_000 },
+            },
+          },
+          last_rate_limit_model: "claude-fable-5-1",
+          last_rate_limit_as_of: "2026-09-17T12:00:00Z",
+          warnings: [],
+          load_error: null,
+        },
+      ],
+    };
+
+    await ws.activateProject(PROJECT_1);
+
+    await vi.waitFor(() =>
+      expect(usage.harnessUsage.claude_code?.windows?.seven_day_overage_included?.model).toBe(
+        "claude-fable-5-1",
+      ),
+    );
+    // **No contributing turn**, unlike a live reading. A restored window
+    // describes a turn that has already ended, so no live turn can claim to have
+    // measured it and none may name it.
+    expect(
+      usage.harnessUsage.claude_code?.windows?.seven_day_overage_included?.turn_id,
+    ).toBeUndefined();
+  });
+
+  it("does not restore a Codex reading from the rollout snapshot", async () => {
+    // The restored shape is the one-unnamed-bucket payload the account read
+    // replaces, so it would put the old shape back on screen at project open.
+    // The backend no longer sends one; this pins the frontend's own capability
+    // gate, so a harness that starts reporting a rollout reading again can't
+    // reach the store without that decision being made deliberately.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const usage = await import("./harnessUsage.svelte");
+    installBackend([{ ...agent(AGENT_1, PROJECT_1), harness: "codex" }]);
+    conversation = {
+      items: [],
+      agents: [
+        {
+          agent_id: AGENT_1,
+          meta: null,
+          last_rate_limit: { primary: { used_percent: 93, resets_at: 1_800_000_000 } },
+          last_rate_limit_as_of: "2026-09-17T12:00:00Z",
+          warnings: [],
+          load_error: null,
+        },
+      ],
+    };
+
+    await ws.activateProject(PROJECT_1);
+
+    await vi.waitFor(() => expect(ws.conversations[PROJECT_1]?.status).toBe("complete"));
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(usage.harnessUsage.codex).toBeUndefined();
+  });
+
+  it("keeps a live inventory that lands before the project read resolves, with no age", async () => {
+    // Ordering race: the hydrate fills meta only where absent, so a live
+    // `session_meta` that arrives first wins, and the saved snapshot's capture
+    // time must not be stamped onto it. An "as of" on a live inventory would
+    // age it past the staleness threshold.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend([agent(AGENT_1, PROJECT_1)]);
+    const backend = invokeMock.getMockImplementation()!;
+    const read = deferred<ProjectConversation>();
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "load_project_conversation" ? await read.promise : await backend(cmd, args),
+    );
+
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("load_project_conversation", expect.anything()),
+    );
+    fireTo(`agent:${AGENT_1}`, {
+      type: "session_meta",
+      agent_id: AGENT_1,
+      model: "claude-fable-5-1",
+      harness_version: "2.1.274",
+      inventory: { mcp_servers: [{ name: "gmail", status: "connected" }] },
+      raw: {},
+    });
+    read.resolve({
+      items: [],
+      agents: [
+        {
+          agent_id: AGENT_1,
+          meta: {
+            model: "claude-fable-5-1",
+            harness_version: "",
+            inventory: { mcp_servers: [{ name: "gmail", status: "needs-auth" }] },
+          },
+          last_rate_limit: null,
+          meta_as_of: "2026-09-17T12:00:00Z",
+          warnings: [],
+          load_error: null,
+        },
+      ],
+    });
+
+    await vi.waitFor(() => expect(ws.conversations[PROJECT_1]?.status).toBe("complete"));
+    expect(state.runtimes[AGENT_1]?.meta?.inventory.mcp_servers).toEqual([
+      { name: "gmail", status: "connected" },
+    ]);
+    expect(state.runtimes[AGENT_1]?.meta_as_of).toBeNull();
+  });
+
+  it("does not promote an agent's parse warnings onto its runtime", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend([agent(AGENT_1, PROJECT_1)]);
+    conversation = {
+      items: [],
+      agents: [
+        {
+          agent_id: AGENT_1,
+          meta: null,
+          last_rate_limit: null,
+          warnings: Array.from({ length: 500 }, (_, index) => ({
+            line_number: index + 1,
+            reason: `aggregate warning ${index + 1}`,
+          })),
+          load_error: null,
+        },
+      ],
+    };
+
+    await ws.activateProject(PROJECT_1);
+
+    await vi.waitFor(() => expect(ws.conversations[PROJECT_1]?.status).toBe("complete"));
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(state.runtimes[AGENT_1]).not.toHaveProperty("parse_warnings");
+  });
+
   it("re-reads on reactivation when a refresh-capable file advanced; the new turn appears exactly once", async () => {
     const ws = await loadWorkspaceState();
     const state = await loadAgentState();
@@ -1646,7 +1793,6 @@ describe("eager (Codex) fork inherited history", () => {
     await ws.forkAgentIntoOwnPane(AGENT_1);
 
     expect(calls).toContain("load_project_conversation");
-    expect(calls).not.toContain("load_transcript");
     expect(ws.isAwaitingForkHistory(FORK_A)).toBe(false);
     expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
     expect(state.transcripts[FORK_A]?.length).toBeGreaterThan(0);
@@ -1930,6 +2076,8 @@ describe("eager (Codex) fork inherited history", () => {
     const state = await loadAgentState();
     const plain = codexAgent(AGENT_2, "cx-2");
     await state.registerAgent(plain);
+    ws.agentsByProject[PROJECT_1] = [plain];
+    ws.conversations[PROJECT_1] = { items: [], status: "complete" };
     state.runtimes[AGENT_2] = {
       ...state.runtimes[AGENT_2]!,
       run_status: "processing",
@@ -1938,9 +2086,10 @@ describe("eager (Codex) fork inherited history", () => {
     };
     invokeMock.mockClear();
 
+    expect(ws.historyRetryBlock(plain)).toContain("has finished replying");
     await ws.retryAgentHistory(AGENT_2);
 
-    expect(invokeMock).not.toHaveBeenCalledWith("load_transcript", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("load_project_conversation", expect.anything());
     expect(state.runtimes[AGENT_2]?.hydration_error).toBe("unreadable");
   });
 
@@ -1979,8 +2128,11 @@ describe("eager (Codex) fork inherited history", () => {
     expect(state.transcripts[FORK_A]?.filter((turn) => turn.role === "agent")).toHaveLength(1);
   });
 
-  it("marks a fork failed, not silently skipped, when the project reloads during its creation", async () => {
-    const { ws, state } = await codexProject(async (cmd) => {
+  it("leaves a fork's read to a project reload that is under way when its turn comes", async () => {
+    // The reload rereads every agent, including the fork, so the fork's own
+    // read is skipped: a targeted read would mark the project loaded holding
+    // only the fork's turns. The fork shows no failure and isn't left loading.
+    const { ws, state, calls } = await codexProject(async (cmd) => {
       if (cmd === "fork_agent") {
         ws.conversations[PROJECT_1] = { items: [], status: "loading" };
         return codexAgent(FORK_A, "cx-fork");
@@ -1990,8 +2142,9 @@ describe("eager (Codex) fork inherited history", () => {
 
     await ws.forkAgentIntoOwnPane(AGENT_1);
 
-    expect(state.runtimes[FORK_A]?.hydration_status).toBe("failed");
-    expect(state.runtimes[FORK_A]?.hydration_error).toContain("reloading");
+    expect(calls).not.toContain("load_project_conversation");
+    expect(state.runtimes[FORK_A]?.hydration_status).toBe("complete");
+    expect(state.runtimes[FORK_A]?.hydration_error).toBeUndefined();
   });
 
   it("retries a failed load through the project merge without forking again", async () => {
@@ -2012,10 +2165,261 @@ describe("eager (Codex) fork inherited history", () => {
     await ws.retryAgentHistory(FORK_A);
 
     expect(calls).toEqual(expect.arrayContaining(["load_project_conversation"]));
-    expect(calls).not.toContain("load_transcript");
     expect(calls).not.toContain("fork_agent");
     expect(state.runtimes[FORK_A]?.hydration_status).toBe("complete");
     expect(importedTexts(ws)).toEqual([`inherited prompt for ${FORK_A}`]);
+  });
+});
+
+describe("one agent's history reread (Retry and attach)", () => {
+  const SEND_1 = "00000000-0000-7000-8000-0000000000e1";
+  const CODEX_FORK = "00000000-0000-7000-8000-0000000000c9";
+
+  /// `AGENT_1`'s one exchange as the project read merges it: the prompt from
+  /// the journal (send `SEND_1`), or from the session file when `imported`
+  /// (an attached session's history predates Switchboard), and the reply. With
+  /// `loadError` the agent's file couldn't be read, so only the journal's
+  /// prompt is there.
+  function exchange(opts: { loadError?: string; imported?: boolean } = {}): ProjectConversation {
+    const prompt: ConversationItem = {
+      kind: "user_message",
+      id: opts.imported ? "imported-1" : SEND_1,
+      send_id: opts.imported ? null : SEND_1,
+      agent_ids: [AGENT_1],
+      text: "hello",
+      at: "2026-05-16T00:00:01Z",
+    };
+    const replyItem: ConversationItem = {
+      kind: "agent_turn",
+      turn_id: "reply-1",
+      agent_id: AGENT_1,
+      send_id: opts.imported ? null : SEND_1,
+      started_at: "2026-05-16T00:00:02Z",
+      ended_at: "2026-05-16T00:00:03Z",
+      status: "complete",
+      items: [{ item_kind: "text", kind: "text", text: "hi" }],
+      hydration_key: "k1",
+    };
+    return {
+      items: opts.loadError === undefined ? [prompt, replyItem] : [prompt],
+      agents: [{ agent_id: AGENT_1, warnings: [], load_error: opts.loadError ?? null }],
+    };
+  }
+
+  /// Route the project IPC: `read` answers each project read (counted in
+  /// `reads()`), and the roster is whatever `roster` holds when asked.
+  function backend(
+    roster: () => AgentRecord[],
+    read: (n: number) => Promise<ProjectConversation>,
+  ): { reads: () => number } {
+    let reads = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      switch (cmd) {
+        case "open_project":
+          return { id: PROJECT_1, name: "p", created_at: "2026-05-16T00:00:00Z" };
+        case "list_agents":
+          return roster();
+        case "project_session_fingerprints":
+          return [];
+        case "load_project_conversation":
+          reads += 1;
+          return await read(reads);
+        default:
+          return undefined;
+      }
+    });
+    return { reads: () => reads };
+  }
+
+  /// How many times the prompt `text` shows in the project's transcript.
+  async function promptRows(text: string): Promise<number> {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const { buildUnifiedRows } = await import("./unified");
+    const turns = (ws.agentsByProject[PROJECT_1] ?? []).flatMap(
+      (member) => state.transcripts[member.id] ?? [],
+    );
+    return buildUnifiedRows(turns, ws.conversations[PROJECT_1]?.items ?? []).filter(
+      (row) => row.kind === "user" && row.text === text,
+    ).length;
+  }
+
+  it("shows an agent's messages once after Retry recovers its history", async () => {
+    // The project's journal already holds the agent's prompt. A Retry that
+    // loaded the agent on its own put its prompts in its own column as well,
+    // so each showed twice.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    let broken = true;
+    backend(
+      () => [agent(AGENT_1, PROJECT_1)],
+      async () => exchange(broken ? { loadError: "corrupt sidecar" } : {}),
+    );
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(state.runtimes[AGENT_1]?.hydration_status).toBe("failed"));
+    broken = false;
+
+    await ws.retryAgentHistory(AGENT_1);
+
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(state.runtimes[AGENT_1]?.hydration_error).toBeUndefined();
+    expect(state.transcripts[AGENT_1]?.filter((turn) => turn.role === "agent")).toHaveLength(1);
+    expect(await promptRows("hello")).toBe(1);
+  });
+
+  it("shows an attached session's messages once, also after a later project read", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const attached = agent(AGENT_1, PROJECT_1);
+    let roster: AgentRecord[] = [];
+    backend(
+      () => roster,
+      async () => (roster.length === 0 ? { items: [], agents: [] } : exchange({ imported: true })),
+    );
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(ws.conversations[PROJECT_1]?.status).toBe("complete"));
+
+    roster = [attached];
+    await state.registerAgent(attached);
+    ws.addAgentToProjectRoster(attached);
+    await ws.loadAttachedAgentHistory(AGENT_1);
+
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(await promptRows("hello")).toBe(1);
+
+    await ws.retryProjectHydration(PROJECT_1);
+    expect(await promptRows("hello")).toBe(1);
+  });
+
+  it("waits for the project's first load when attaching during it, then reads the agent", async () => {
+    // The first load may have started before the agent existed, so its result
+    // can't be relied on to include it. The attach's read waits behind it.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const attached = agent(AGENT_1, PROJECT_1);
+    const firstLoad = deferred<ProjectConversation>();
+    let roster: AgentRecord[] = [];
+    const { reads } = backend(
+      () => roster,
+      async (n) => (n === 1 ? await firstLoad.promise : exchange({ imported: true })),
+    );
+    await ws.activateProject(PROJECT_1);
+    expect(ws.conversations[PROJECT_1]?.status).toBe("loading");
+
+    roster = [attached];
+    await state.registerAgent(attached);
+    ws.addAgentToProjectRoster(attached);
+    const attaching = ws.loadAttachedAgentHistory(AGENT_1);
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("loading");
+    await flushAsync();
+    expect(reads()).toBe(1);
+
+    firstLoad.resolve({ items: [], agents: [] });
+    await attaching;
+
+    expect(reads()).toBe(2);
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(state.transcripts[AGENT_1]?.filter((turn) => turn.role === "agent")).toHaveLength(1);
+    expect(await promptRows("hello")).toBe(1);
+  });
+
+  it("refuses Retry until the project's history has loaded, and says why", async () => {
+    // Retry rereads through the project read. Run while the project's history
+    // is loading or failed, it would mark the project loaded holding only this
+    // agent's turns; the project's own load or Retry reads the agent anyway.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const failing = agent(AGENT_1, PROJECT_1);
+    const { reads } = backend(
+      () => [failing],
+      async () => exchange({ loadError: "corrupt sidecar" }),
+    );
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(state.runtimes[AGENT_1]?.hydration_status).toBe("failed"));
+
+    for (const status of ["loading", "failed"] as const) {
+      ws.conversations[PROJECT_1] = { items: [], status };
+      expect(ws.historyRetryBlock(failing)).toBe(
+        "Retry is available once the project's history has loaded.",
+      );
+      await ws.retryAgentHistory(AGENT_1);
+      expect(reads()).toBe(1);
+      expect(state.runtimes[AGENT_1]?.hydration_error).toBe("corrupt sidecar");
+    }
+
+    ws.conversations[PROJECT_1] = { items: [], status: "complete" };
+    expect(ws.historyRetryBlock(failing)).toBeNull();
+  });
+
+  it("reads once for overlapping Retry clicks, and shows a failed Retry's reason", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const gate = deferred<void>();
+    const { reads } = backend(
+      () => [agent(AGENT_1, PROJECT_1)],
+      async (n) => {
+        if (n === 1) return exchange({ loadError: "corrupt sidecar" });
+        await gate.promise;
+        throw new Error("still broken");
+      },
+    );
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(state.runtimes[AGENT_1]?.hydration_status).toBe("failed"));
+
+    const first = ws.retryAgentHistory(AGENT_1);
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("loading");
+    expect(state.runtimes[AGENT_1]?.hydration_error).toBeUndefined();
+    const second = ws.retryAgentHistory(AGENT_1);
+    gate.resolve();
+    await Promise.all([first, second]);
+
+    expect(reads()).toBe(2);
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("failed");
+    expect(state.runtimes[AGENT_1]?.hydration_error).toBe("still broken");
+  });
+
+  it("keeps a Codex fork's 'earlier conversation unavailable' notice when Retry runs after a restart", async () => {
+    // After a restart Switchboard no longer knows the agent is a fork, so its
+    // Retry is any agent's. The per-agent load it used to take dropped the
+    // notice, leaving the fork's history silently short.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const fork: AgentRecord = {
+      ...agent(CODEX_FORK, PROJECT_1),
+      name: "cx-fork",
+      harness: "codex",
+      session_locator: { codex: { thread_id: "thread-c9", partition_date: "2026-10-11" } },
+    };
+    const notice: ConversationItem = {
+      kind: "system_marker",
+      id: "gap-1",
+      agent_id: CODEX_FORK,
+      marker: {
+        marker_kind: "inherited_history_unavailable",
+        reason: "not_found",
+        rollout_id: "parent-rollout",
+      },
+      at: "2026-10-11T00:00:00Z",
+    };
+    let broken = true;
+    backend(
+      () => [fork],
+      async () =>
+        broken
+          ? {
+              items: [],
+              agents: [{ agent_id: CODEX_FORK, warnings: [], load_error: "unreadable" }],
+            }
+          : { items: [notice], agents: [{ agent_id: CODEX_FORK, warnings: [], load_error: null }] },
+    );
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(state.runtimes[CODEX_FORK]?.hydration_status).toBe("failed"));
+    broken = false;
+
+    await ws.retryAgentHistory(CODEX_FORK);
+
+    expect(state.runtimes[CODEX_FORK]?.hydration_status).toBe("complete");
+    expect(ws.conversations[PROJECT_1]?.items).toContainEqual(notice);
   });
 });
 

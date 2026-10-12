@@ -344,7 +344,7 @@ use crate::commands::{
     get_harness_usage_impl, get_preferences_impl, get_prompt_source_impl, harness_adapter_for,
     install_status_for_adapter, list_agents_impl, list_mcp_providers_impl, list_message_pins_impl,
     list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
-    load_project_conversation_impl, load_transcript_impl, migrate_message_pin_impl,
+    load_project_conversation_impl, migrate_message_pin_impl,
     open_branch_comparison_file_difftool_impl, open_commit_file_difftool_impl, open_project_impl,
     open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
     project_session_fingerprints_impl, read_codex_account_usage_impl,
@@ -1435,18 +1435,6 @@ async fn cancel_forward(state: State<'_, AppState>, forward_id: String) -> Resul
     // token and returns `Cancelled`.
     cancel_forward_impl(state.inner(), fid);
     Ok(())
-}
-
-#[tauri::command]
-async fn load_transcript(
-    state: State<'_, AppState>,
-    agent_id: String,
-) -> Result<switchboard_harness::LoadedTranscript, String> {
-    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    load_transcript_impl(state.inner(), id, &home).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2560,7 +2548,6 @@ pub fn run() {
             open_in_editor,
             open_in_terminal,
             reveal_in_finder,
-            load_transcript,
             load_project_conversation,
             reclaim_project_attachments,
             project_session_fingerprints,

@@ -295,10 +295,10 @@ describe("a Codex agent card's Fork item", () => {
     );
   });
 
-  it("never leaves the fork loading when the project reloads during its creation", async () => {
-    // The read is skipped then, because the reload may have started before the
-    // fork existed. The fork must end failed with Retry, and sendable, rather
-    // than loading forever with every send to it refused.
+  it("never leaves the fork loading when the project is reloading as its read comes up", async () => {
+    // The fork's read is skipped then, because the reload rereads every agent,
+    // the fork included. The fork must not be left loading, with every send to
+    // it refused.
     await openProject();
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [PARENT] } });
     const ws = await workspace();
@@ -310,8 +310,10 @@ describe("a Codex agent card's Fork item", () => {
     await chooseFork();
 
     const state = await agentState();
-    await waitFor(() => expect(state.runtimes[FORK_ID]?.hydration_status).toBe("failed"));
-    expect(state.runtimes[FORK_ID]?.hydration_error).toContain("reloading");
+    await waitFor(() => expect(state.runtimes[FORK_ID]).toBeDefined());
+    await waitFor(() => expect(state.runtimes[FORK_ID]?.hydration_status).not.toBe("loading"));
+    expect(state.runtimes[FORK_ID]?.hydration_status).toBe("complete");
+    expect(state.runtimes[FORK_ID]?.hydration_error).toBeUndefined();
   });
 
   it("shows a failed history load on the fork's card, and Retry loads it without a turn", async () => {
@@ -348,6 +350,5 @@ describe("a Codex agent card's Fork item", () => {
     expect(state.transcripts[FORK_ID]?.filter((turn) => turn.role === "agent")).toHaveLength(1);
     expect(calls.filter((cmd) => cmd === "fork_agent")).toHaveLength(1);
     expect(calls).not.toContain("send_message");
-    expect(calls).not.toContain("load_transcript");
   });
 });

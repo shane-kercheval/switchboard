@@ -33,6 +33,7 @@ For each crate's internal mechanics, read the source (the `*_impl` functions are
 - `ios/` — the iPhone app ([`ios/README.md`](ios/README.md)): `SwitchboardMobile.xcodeproj`, the app target, and the `SwitchboardMobileKit` package. `SwitchboardMobileKit/Generated/` is written by `make ios-crypto` and is not committed — run it before opening the project in Xcode. Signing is per developer: `Config/Signing.xcconfig` holds teamless defaults and includes a gitignored `Config/Local.xcconfig`, so no one's team id is committed.
 - `crates/` — shared Rust workspace members (`core`, `harness`, `dispatcher`, `git`, `prompts`, `workflow`, `migrate`, `remote-crypto`).
 - `tools/uniffi-bindgen/` — generates the iOS Swift bindings; its own Cargo workspace.
+- `scripts/` — repo-level dev scripts called from the `Makefile`.
 - `docs/` — design docs, milestone plans, research notes. Read before changing scope. Completed implementation plans are historical records: paths in those written before the `desktop/` and `ios/` move still name the old locations. The active plan's paths are kept current.
 - `docs/implementation_plans/` — per-milestone plans. The current milestone's plan is the ground truth for what to build.
 - `.github/workflows/` — CI definitions.
@@ -48,9 +49,11 @@ All via `make`:
 - `make test-browser` — runs the real-WebKit frontend suite (Vitest browser mode); ensures the WebKit binary first. Slower than `make test`; kept separate so the jsdom inner loop stays quick.
 - `make lint` — runs clippy, eslint, svelte-check.
 - `make fmt` — formats Rust + frontend.
-- `make check` — the desktop gate: fmt check, lint, test, type-check, **and** the browser suite. Run this before opening a PR. It is **not** everything CI runs: the iOS app is a separate CI job (`check-ios`), so run that too when a change touches `ios/` or `crates/remote-crypto`.
+- `make check` — the desktop gate: fmt check, lint, test, type-check, the browser suite, **and** `make test-scripts`. Run this before opening a PR. It is **not** everything CI runs: the iOS app is a separate CI job (`check-ios`), so run that too when a change touches `ios/` or `crates/remote-crypto`.
 - `make ios-crypto` — builds `crates/remote-crypto` for `aarch64-apple-ios` and `aarch64-apple-ios-sim`, packages it as an xcframework, and generates the Swift bindings into `ios/SwitchboardMobileKit/Generated/`, replacing that directory only once every output exists. Rerun after changing the crate.
 - `make check-ios` — `ios-crypto`, then `xcodebuild test` of the app scheme (builds the app and runs the package's tests) on the newest available iPhone simulator, a Release build, and checks on both built Info.plists (`ios/scripts/check-info-plist.sh`), and fails if any Swift outside the tests names the generated Mac-side handshake class `MacPairingHandshake` or function `acceptSession`, or the C functions UniFFI generates for them (`ios/scripts/check-test-only-calls.sh`, a name grep rather than a module boundary: a Mac-only export added later must be added to it); pass `IOS_SIMULATOR_ID=<udid>` to choose one. Needs Xcode 16 or later.
+- `make cli-surface HARNESS=<codex|claude|agy>` — snapshots a harness CLI's commands, subcommands, slash commands and (Codex) app-server methods into `docs/research/cli-surface/<harness>.txt` via `scripts/cli-surface.sh`, so a harness update review can `git diff` it for new capabilities. When to run it: `docs/harness-update-review.md` §2.
+- `make test-scripts` — tests the repo's dev scripts (today `scripts/cli-surface.sh` and its Makefile target) with fake CLIs on `PATH`, so it needs no harness installed or logged in.
 - `make clean-stale` — deletes build artifacts nothing has touched in a week, keeping the warm cache. **Run this when builds start feeling slow** — see "Build times are a `target/` problem" below. Needs `cargo install cargo-sweep` once.
 - `make clean` — removes all build artifacts (forces a full rebuild).
 

@@ -73,6 +73,18 @@ jobs:
       - name: make check-frontend
         run: make check-frontend
 
+  scripts:
+    name: Dev script tests (macos-15)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fake CLIs stand in for codex, claude and agy, so no harness is
+      # installed and nothing needs credentials.
+      - name: make test-scripts
+        run: make test-scripts
+
   ios:
     name: iOS build + test (macos-15)
     runs-on: macos-15

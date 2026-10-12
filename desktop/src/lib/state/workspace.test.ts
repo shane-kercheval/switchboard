@@ -2696,6 +2696,68 @@ describe("desktop sync for another client's turn", () => {
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "set_active_project")).toBe(false);
   });
 
+  it("prepares two projects for two orchestrators at once, each with its own agents, without changing the selection", async () => {
+    const ws = await loadWorkspaceState();
+    const PROJECT_3 = "00000000-0000-7000-8000-0000000000f3";
+    const FIRST = "00000000-0000-7000-8000-0000000000e2";
+    const SECOND = "00000000-0000-7000-8000-0000000000e3";
+    const histories: Record<string, Gate> = { [PROJECT_2]: gate(), [PROJECT_3]: gate() };
+    const rosters: Record<string, AgentRecord[]> = {
+      [PROJECT_2]: [agent(AGENT_1, PROJECT_2)],
+      [PROJECT_3]: [agent(AGENT_2, PROJECT_3)],
+    };
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+        const projectId = args?.projectId as string;
+        switch (cmd) {
+          case "open_project":
+            return { id: projectId, name: projectId, created_at: "2026-05-16T00:00:00Z" };
+          case "list_agents":
+            return rosters[projectId] ?? [];
+          case "desktop_pending_syncs":
+          case "project_session_fingerprints":
+          case "list_workflow_runs":
+          case "list_projects":
+            return [];
+          case "load_project_conversation":
+            await histories[projectId]?.promise;
+            return { items: [], agents: [] } satisfies ProjectConversation;
+          case "workspace_status":
+            return { persistable: true };
+          default:
+            return undefined;
+        }
+      },
+    );
+    await ws.installDesktopSync();
+    ws.selection.activeProjectId = PROJECT_1;
+
+    fireTo("desktop_sync_project", { request_id: FIRST, project_id: PROJECT_2 });
+    fireTo("desktop_sync_project", { request_id: SECOND, project_id: PROJECT_3 });
+    await settle();
+    // Both are being prepared at once: each project's own agents are
+    // registered while both histories are still loading.
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([AGENT_1]);
+    expect(ws.agentsByProject[PROJECT_3]?.map((a) => a.id)).toEqual([AGENT_2]);
+    expect(acks()).toEqual([]);
+
+    // The second project finishing first answers only its own request.
+    histories[PROJECT_3]!.open();
+    await settle();
+    expect(acks()).toEqual([
+      { requestId: SECOND, result: { status: "ready", listening_agents: [AGENT_2] } },
+    ]);
+
+    histories[PROJECT_2]!.open();
+    await settle();
+    expect(acks()).toEqual([
+      { requestId: SECOND, result: { status: "ready", listening_agents: [AGENT_2] } },
+      { requestId: FIRST, result: { status: "ready", listening_agents: [AGENT_1] } },
+    ]);
+    expect(ws.selection.activeProjectId).toBe(PROJECT_1);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "set_active_project")).toBe(false);
+  });
+
   it("waits for a loaded project's history load that is still running", async () => {
     const ws = await loadWorkspaceState();
     const conversation = gate();

@@ -1214,6 +1214,150 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     assert_eq!(called, every, "every tool was called");
 }
 
+// --- several orchestrators at once ---------------------------------------------------
+
+/// Each project's conversation holds its own message and none of the other's,
+/// and its replies come from its own agents.
+async fn assert_conversation_is_its_own(
+    client: &RunningService<RoleClient, Recorder>,
+    project_id: ProjectId,
+    own_agents: &[AgentId],
+    own_text: &str,
+    other_text: &str,
+) {
+    let conversation = ok(
+        client,
+        "read_conversation",
+        json!({ "project_id": project_id }),
+    )
+    .await;
+    let items = conversation["items"].as_array().unwrap();
+    let texts: Vec<&str> = items
+        .iter()
+        .filter(|i| i["kind"] == "user_message")
+        .filter_map(|i| i["text"].as_str())
+        .collect();
+    assert!(texts.iter().any(|t| t.contains(own_text)), "{texts:?}");
+    assert!(!texts.iter().any(|t| t.contains(other_text)), "{texts:?}");
+    for turn in items.iter().filter(|i| i["kind"] == "agent_turn") {
+        assert!(
+            own_agents.contains(&uuid(&turn["agent_id"])),
+            "a reply from another project's agent: {turn}"
+        );
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Two orchestrators through one shared timeline; linear.
+async fn two_orchestrators_work_in_two_projects_at_the_same_time() {
+    let (mut env, alpha, alpha_agents) = workflow_env().await;
+    let beta = env.project("beta");
+    let beta_agents: Vec<AgentId> = ["coder", "r1", "r2"]
+        .iter()
+        .map(|n| env.agent(beta, n))
+        .collect();
+    let (listener, url) = serve(&env).await;
+    let (one, two) = (connect(&url, TOKEN).await, connect(&url, TOKEN).await);
+
+    // Each project's first turn is held open, so both are running at once.
+    let (gate_a, gate_b) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    env.adapter.push(Script::parked("working", &gate_a));
+    env.adapter.push(Script::parked("working", &gate_b));
+    let alpha_send = ok(
+        &one,
+        "send",
+        json!({ "project_id": alpha, "recipients": [alpha_agents[0]], "text": "alpha task" }),
+    )
+    .await;
+    await_turn_running(&env.state, alpha_agents[0]).await;
+    let beta_send = ok(
+        &two,
+        "send",
+        json!({ "project_id": beta, "recipients": [beta_agents[0]], "text": "beta task" }),
+    )
+    .await;
+    await_turn_running(&env.state, beta_agents[0]).await;
+    let ids = [uuid(&alpha_send["send_id"]), uuid(&beta_send["send_id"])];
+    for id in ids {
+        assert_eq!(
+            env.state.ledger.send(id).unwrap().recipients[0].status,
+            SendStatus::Running,
+            "both projects' turns run at once"
+        );
+    }
+
+    gate_a.notify_one();
+    gate_b.notify_one();
+    let (alpha_done, beta_done) = tokio::join!(
+        ok(
+            &one,
+            "wait_send",
+            json!({ "project_id": alpha, "send_id": ids[0], "timeout_seconds": 10 }),
+        ),
+        ok(
+            &two,
+            "wait_send",
+            json!({ "project_id": beta, "send_id": ids[1], "timeout_seconds": 10 }),
+        ),
+    );
+    for done in [&alpha_done, &beta_done] {
+        assert_eq!(done["done"], true, "{done}");
+        assert_eq!(done["recipients"][0]["status"], "completed");
+    }
+    assert_conversation_is_its_own(&one, alpha, &alpha_agents, "alpha task", "beta task").await;
+    assert_conversation_is_its_own(&two, beta, &beta_agents, "beta task", "alpha task").await;
+
+    // Each project runs a workflow while the other's is running.
+    let (gate_c, gate_d) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    env.adapter.push(Script::parked("greeting", &gate_c));
+    env.adapter.push(Script::parked("greeting", &gate_d));
+    let alpha_run = ok(
+        &one,
+        "run_workflow",
+        json!({ "project_id": alpha, "name": "pair", "inputs": pair_inputs(&alpha_agents) }),
+    )
+    .await;
+    await_turn_running(&env.state, alpha_agents[0]).await;
+    let beta_run = ok(
+        &two,
+        "run_workflow",
+        json!({ "project_id": beta, "name": "pair", "inputs": pair_inputs(&beta_agents) }),
+    )
+    .await;
+    await_turn_running(&env.state, beta_agents[0]).await;
+    for (client, project_id) in [(&one, alpha), (&two, beta)] {
+        let runs = ok(
+            client,
+            "list_workflow_runs",
+            json!({ "project_id": project_id }),
+        )
+        .await;
+        assert_eq!(runs.as_array().unwrap().len(), 1, "{runs}");
+        assert_eq!(runs[0]["status"], "running");
+    }
+
+    gate_c.notify_one();
+    gate_d.notify_one();
+    let (alpha_ended, beta_ended) = tokio::join!(
+        ok(
+            &one,
+            "wait_workflow",
+            json!({ "project_id": alpha, "run_id": alpha_run["run_id"], "timeout_seconds": 10 }),
+        ),
+        ok(
+            &two,
+            "wait_workflow",
+            json!({ "project_id": beta, "run_id": beta_run["run_id"], "timeout_seconds": 10 }),
+        ),
+    );
+    assert_eq!(alpha_ended["status"], "completed", "{alpha_ended}");
+    assert_eq!(beta_ended["status"], "completed", "{beta_ended}");
+
+    one.cancel().await.unwrap();
+    two.cancel().await.unwrap();
+    listener.stop().await;
+}
+
 // --- live: real clients ---------------------------------------------------------------
 //
 // These drive the server from the real Claude Code and Codex CLIs, so a client

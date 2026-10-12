@@ -29,6 +29,8 @@
 pub mod account_usage;
 pub mod config;
 pub(crate) mod facets;
+pub mod fork;
+pub(crate) mod inherited_history;
 pub mod parser;
 pub mod session_file;
 pub mod skills;
@@ -53,16 +55,26 @@ use crate::facets::ToolFacet;
 use parser::{CodexParserState, parse_line};
 use session_file::{Enrichment, TokioSleeper};
 
-/// Codex's session locator carried through a dispatch: the runtime `thread_id`
-/// plus the **local** date its rollout file is partitioned under
-/// (`~/.codex/sessions/<YYYY>/<MM>/<DD>/`). On resume it's read from the agent's
-/// `SessionLocator::Codex`; on the first dispatch the `thread_id` is captured
-/// from `thread.started` and the date is stamped once (never recomputed). Used
-/// for both `exec resume` and post-terminal enrichment.
-#[derive(Clone)]
-struct CodexLocator {
-    thread_id: String,
-    partition_date: NaiveDate,
+/// Codex's session locator: the runtime `thread_id` plus the **local** date its
+/// rollout file is partitioned under (`~/.codex/sessions/<YYYY>/<MM>/<DD>/`).
+/// On resume it's read from the agent's `SessionLocator::Codex`; on the first
+/// dispatch the `thread_id` is captured from `thread.started` and the date is
+/// stamped once (never recomputed). Used for both `exec resume` and
+/// post-terminal enrichment, and returned by [`fork::fork_codex_session`] for
+/// the fork it creates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexLocator {
+    pub thread_id: String,
+    pub partition_date: NaiveDate,
+}
+
+impl From<CodexLocator> for SessionLocator {
+    fn from(locator: CodexLocator) -> Self {
+        SessionLocator::Codex {
+            thread_id: locator.thread_id,
+            partition_date: locator.partition_date,
+        }
+    }
 }
 
 /// Extract the Codex resume locator from an agent's registry record. `None` on
@@ -261,7 +273,7 @@ fn build_args(agent: &AgentRecord, prompt: &str, resume_thread_id: Option<&str>)
             "--skip-git-repo-check".to_owned(),
             "--dangerously-bypass-approvals-and-sandbox".to_owned(),
         ];
-        push_selection_flags(&mut args, agent);
+        push_selection_flags(&mut args, agent.model.as_deref(), agent.effort.as_deref());
         // End-of-options separator so the positionals (session id and,
         // critically, the prompt) are never parsed as flags. Without it a
         // prompt beginning with `-` (e.g. a markdown bullet) makes clap
@@ -285,7 +297,7 @@ fn build_args(agent: &AgentRecord, prompt: &str, resume_thread_id: Option<&str>)
             // the child's pwd, which IS cwd. Avoids encoding the path twice.
             ".".to_owned(),
         ];
-        push_selection_flags(&mut args, agent);
+        push_selection_flags(&mut args, agent.model.as_deref(), agent.effort.as_deref());
         // End-of-options separator (see the resume branch) — guards the
         // prompt positional against a leading `-`.
         args.push("--".to_owned());
@@ -299,12 +311,12 @@ fn build_args(agent: &AgentRecord, prompt: &str, resume_thread_id: Option<&str>)
 /// must precede the `--` separator so they parse as flags, not positionals.
 /// Codex has no dedicated effort flag — the reasoning level is a config override
 /// (`-c model_reasoning_effort=<level>`), recorded per turn in `turn_context`.
-fn push_selection_flags(args: &mut Vec<String>, agent: &AgentRecord) {
-    if let Some(model) = &agent.model {
+fn push_selection_flags(args: &mut Vec<String>, model: Option<&str>, effort: Option<&str>) {
+    if let Some(model) = model {
         args.push("-m".to_owned());
-        args.push(model.clone());
+        args.push(model.to_owned());
     }
-    if let Some(effort) = &agent.effort {
+    if let Some(effort) = effort {
         args.push("-c".to_owned());
         args.push(format!("model_reasoning_effort={effort}"));
     }

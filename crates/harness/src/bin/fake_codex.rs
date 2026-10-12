@@ -25,6 +25,10 @@
 //! `unsafe`-free in edition 2024. The reader matches on JSON-RPC id, so it does
 //! not care that this binary never reads the requests it is "answering."
 //!
+//! **The promptless fork works the same way.** `codex exec … fork <parent>`
+//! passes no prompt either, so its tests use the same shim, and the fixture
+//! lands after the parent id (`tests/codex_fork.rs`).
+//!
 //! Each non-empty, non-comment line of the fixture is written to stdout
 //! verbatim.
 //!
@@ -51,6 +55,16 @@
 //!     the case where the parent exits on SIGTERM but a descendant survives it
 //!     holding the stderr pipe — exercising `terminate_then_kill`'s
 //!     unconditional final group SIGKILL (without which the stderr drain hangs).
+//!   `// spawn_child_holding_only_stderr` (unix only) — fork a child that
+//!     inherits stderr but **not** stdout, and sleeps indefinitely. Models a
+//!     helper the harness leaves running after it exits on its own: stdout
+//!     reaches EOF when the parent exits, so the reader finishes normally,
+//!     while the child keeps the stderr pipe open. The promptless fork's tests
+//!     use it to check that a normal exit still sweeps the process group.
+//!   `// write_file:<path>` — create an empty file at the given path, and any
+//!     missing parent directories. The promptless fork test uses it to stand
+//!     in for the rollout Codex writes (`tests/codex_fork.rs`), so the code
+//!     under test finds a session file exactly where the fixture put it.
 //!   `// hang` — flush lines emitted so far, then sleep indefinitely (never
 //!     exit on our own), leaving the adapter's read parked so a cancellation
 //!     test can fire the token. Combine with `// spawn_child_holding_stderr`
@@ -116,54 +130,7 @@ fn main() {
             continue;
         }
 
-        if line.trim() == "// spawn_child_holding_stderr" {
-            #[cfg(unix)]
-            {
-                // Spawn `sleep` as a long-running child. By default
-                // std::process::Command inherits the parent's stdio, so
-                // the sleep child holds an FD to fake_codex's stderr
-                // pipe — exactly the "Rust child keeps the pipe alive
-                // after the Node parent dies" pattern in real Codex.
-                // The child inherits fake_codex's process group (set by
-                // the adapter's `process_group(0)` at spawn), so
-                // killpg(fake_codex_pid) reaches both. Plain
-                // kill(fake_codex_pid) would only reach the parent and
-                // leave the sleep child holding the pipe — exactly the
-                // hang we're testing against.
-                //
-                // We don't track the child handle: if the adapter's
-                // killpg works, the kernel reaps it; if it doesn't, the
-                // test fails loudly with a timeout. No reason to clean
-                // up explicitly.
-                let _ = std::process::Command::new("sleep").arg("3600").spawn();
-            }
-            #[cfg(not(unix))]
-            {
-                // No-op on non-unix; process groups aren't a thing.
-            }
-            continue;
-        }
-
-        if line.trim() == "// spawn_sigterm_immune_child_holding_stderr" {
-            #[cfg(unix)]
-            {
-                // Like `spawn_child_holding_stderr`, but the child **ignores
-                // SIGTERM** (`trap "" TERM`) and only dies on SIGKILL. This is
-                // the case `terminate_then_kill` must handle: when the parent
-                // (fake_codex) exits on SIGTERM but a descendant survives it
-                // while holding the inherited stderr pipe, waiting on the
-                // parent alone is not enough — the helper's unconditional final
-                // `killpg(SIGKILL)` is what reaps this child. Without that
-                // sweep, the adapter's stderr drain blocks forever.
-                let _ = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg("trap '' TERM; while :; do sleep 1; done")
-                    .spawn();
-            }
-            #[cfg(not(unix))]
-            {
-                // No-op on non-unix; process groups aren't a thing.
-            }
+        if spawn_directive(line.trim()) {
             continue;
         }
 
@@ -179,6 +146,15 @@ fn main() {
             {
                 let _ = path;
             }
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("// write_file:") {
+            let path = std::path::Path::new(path.trim());
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::File::create(path).ok();
             continue;
         }
 
@@ -204,4 +180,73 @@ fn main() {
     writeln!(err, "fake_codex: done").ok();
 
     process::exit(exit_code);
+}
+
+/// Run one of the `// spawn_…` directives, returning whether `directive` was
+/// one. Each starts a long-lived process in this process's group, standing in
+/// for a helper the real CLI might leave behind (see the module doc).
+fn spawn_directive(directive: &str) -> bool {
+    match directive {
+        "// spawn_child_holding_stderr" => {
+            #[cfg(unix)]
+            {
+                // Spawn `sleep` as a long-running child. By default
+                // std::process::Command inherits the parent's stdio, so
+                // the sleep child holds an FD to fake_codex's stderr
+                // pipe — exactly the "Rust child keeps the pipe alive
+                // after the Node parent dies" pattern in real Codex.
+                // The child inherits fake_codex's process group (set by
+                // the adapter's `process_group(0)` at spawn), so
+                // killpg(fake_codex_pid) reaches both. Plain
+                // kill(fake_codex_pid) would only reach the parent and
+                // leave the sleep child holding the pipe — exactly the
+                // hang we're testing against.
+                //
+                // We don't track the child handle: if the adapter's
+                // killpg works, the kernel reaps it; if it doesn't, the
+                // test fails loudly with a timeout. No reason to clean
+                // up explicitly.
+                let _ = std::process::Command::new("sleep").arg("3600").spawn();
+            }
+            #[cfg(not(unix))]
+            {
+                // No-op on non-unix; process groups aren't a thing.
+            }
+        }
+        "// spawn_sigterm_immune_child_holding_stderr" => {
+            #[cfg(unix)]
+            {
+                // Like `spawn_child_holding_stderr`, but the child **ignores
+                // SIGTERM** (`trap "" TERM`) and only dies on SIGKILL. This is
+                // the case `terminate_then_kill` must handle: when the parent
+                // (fake_codex) exits on SIGTERM but a descendant survives it
+                // while holding the inherited stderr pipe, waiting on the
+                // parent alone is not enough — the helper's unconditional final
+                // `killpg(SIGKILL)` is what reaps this child. Without that
+                // sweep, the adapter's stderr drain blocks forever.
+                let _ = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("trap '' TERM; while :; do sleep 1; done")
+                    .spawn();
+            }
+            #[cfg(not(unix))]
+            {
+                // No-op on non-unix; process groups aren't a thing.
+            }
+        }
+        "// spawn_child_holding_only_stderr" => {
+            #[cfg(unix)]
+            {
+                // Same group as this process (set by the caller's
+                // `process_group(0)`), so only a group-wide signal reaches it.
+                let _ = std::process::Command::new("sleep")
+                    .arg("3600")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .spawn();
+            }
+        }
+        _ => return false,
+    }
+    true
 }

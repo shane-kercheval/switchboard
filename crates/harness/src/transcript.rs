@@ -1,14 +1,13 @@
 //! Shared types for transcript hydration from harness session files.
 //!
 //! `Turn::User`/`Turn::Agent` and `TurnItem` mirror the TS shape in
-//! `desktop/src/lib/state/types.ts` verbatim — they round-trip through the per-agent
-//! hydration path (`load_transcript`) onto the frontend's `LoadedTurn`.
-//! `Turn::System` is the exception: it has **no** frontend `Turn`/`LoadedTurn`
-//! analog. It reaches the UI only as a `ConversationItem` via the project
-//! conversation merge, and `load_transcript_impl` (`desktop/src-tauri/src/commands.rs`)
-//! filters it out before the per-agent IPC. A new caller that serializes
-//! `LoadedTranscript` straight to the frontend must filter `Turn::System` too,
-//! or it re-introduces a `role:"system"` turn the frontend can't model.
+//! `desktop/src/lib/state/types.ts`. They reach the frontend through the project
+//! conversation merge (`load_project_conversation_impl` in
+//! `desktop/src-tauri/src/commands.rs`), which turns them into
+//! `ConversationItem`s. `Turn::System` has **no** frontend `Turn`/`LoadedTurn`
+//! analog and reaches the UI only as such an item. A new caller that serializes
+//! `LoadedTranscript` straight to the frontend must filter `Turn::System` out,
+//! or it introduces a `role:"system"` turn the frontend can't model.
 //! `items: Vec<TurnItem>` is a single ordered stream of text + tool entries —
 //! interleaved by arrival, not split into parallel arrays — so chronology
 //! observable from the session file survives serde without any boundary
@@ -87,6 +86,43 @@ pub enum SystemMarker {
     ContextReport {
         report: crate::context_report::ContextReport,
     },
+    /// A Codex fork whose inherited history could not be shown. A Codex fork's
+    /// rollout points into its parent's rollout instead of copying it, so the
+    /// loader follows that pointer (`codex::inherited_history`). When it can't,
+    /// it shows the fork's own turns and this marker, stamped with the fork's
+    /// creation time so it sits just above them, rather than a history that is
+    /// silently missing or only partly there. `rollout_id` names the file the
+    /// chain broke at, which may be a grandparent's.
+    InheritedHistoryUnavailable {
+        reason: InheritedHistoryGap,
+        rollout_id: String,
+    },
+}
+
+/// Why a Codex fork's inherited history could not be loaded. The frontend words
+/// each case for the user, because they mean different things: a missing file
+/// also stops Codex from running the fork, a compressed one does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum InheritedHistoryGap {
+    /// No rollout with that id under `~/.codex/sessions` or
+    /// `~/.codex/archived_sessions`, the two places Codex looks. Probed: Codex then
+    /// refuses to run the fork until the file is restored.
+    NotFound,
+    /// Only a compressed copy (`rollout-*.jsonl.zst`) exists. Codex can read
+    /// it; Switchboard can't yet (gap G40).
+    Compressed,
+    /// The file is shorter than the fork's recorded cut-off, or the cut-off
+    /// no longer falls on a line break, so it is not the file Codex forked.
+    Changed,
+    /// More than one rollout carries that id. Impossible by Codex's design,
+    /// so nothing is guessed.
+    Ambiguous,
+    /// The chain of forks loops back on itself.
+    Cycle,
+    /// The chain of forks is longer than the loader follows.
+    TooDeep,
 }
 
 /// One reconstructed turn. Discriminated by `role` matching the event-vocabulary

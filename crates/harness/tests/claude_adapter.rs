@@ -16,6 +16,11 @@ use std::time::Duration;
 #[cfg(unix)]
 use tokio_util::sync::CancellationToken;
 
+#[cfg(unix)]
+mod common;
+#[cfg(unix)]
+use common::{assert_group_reaped, wait_for_pgid};
+
 const FAKE_CLAUDE: &str = env!("CARGO_BIN_EXE_fake_claude");
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude");
 
@@ -746,35 +751,6 @@ async fn stderr_drain_no_deadlock() {
     );
 }
 
-/// Poll until `path` holds a parseable pgid (the fake wrote it on spawn),
-/// returning that pid. Bounded so a spawn failure surfaces as a panic, not a
-/// hang.
-#[cfg(unix)]
-async fn wait_for_pgid(path: &Path) -> Pid {
-    for _ in 0..200 {
-        if let Ok(s) = std::fs::read_to_string(path)
-            && let Ok(n) = s.trim().parse::<i32>()
-        {
-            return Pid::from_raw(n);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("fake_claude never wrote its pgid at {}", path.display());
-}
-
-/// Poll until the process group's leader is gone (`getpgid` → `ESRCH`),
-/// proving the adapter's `killpg` reaped the whole tree. Bounded.
-#[cfg(unix)]
-async fn assert_group_reaped(leader: Pid) {
-    for _ in 0..200 {
-        if getpgid(Some(leader)).is_err() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("process group {leader} still alive after cancel");
-}
-
 /// Build a fixture (in `tempdir`) that writes its pgid, optionally emits the
 /// first real stream line, then `// hang`s (parked read). Dispatch it with a
 /// fresh token, wait for the child to spawn, fire the token, and return the
@@ -785,7 +761,12 @@ async fn dispatch_then_cancel(emit_a_line: bool) -> Vec<AdapterEvent> {
     let pgid_path = tempdir.path().join("child.pgid");
     let fixture_path = tempdir.path().join("cancel-fixture.jsonl");
 
-    let mut body = format!("// pgid_to:{}\n", pgid_path.display());
+    // The child is what makes the whole-group check prove something: with the
+    // fake alone in its group, killing just the fake would also empty it.
+    let mut body = format!(
+        "// pgid_to:{}\n// spawn_child_holding_stderr\n",
+        pgid_path.display()
+    );
     if emit_a_line {
         let base = std::fs::read_to_string(fixture("text-only")).expect("read fixture");
         let first = base.lines().find(|l| !l.trim().is_empty()).expect("a line");

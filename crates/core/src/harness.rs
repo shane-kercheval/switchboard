@@ -135,12 +135,12 @@ impl HarnessKind {
     /// True only for Claude (`--resume <parent> --session-id <new>
     /// --fork-session`), the only harness offering that shape.
     ///
-    /// **A harness whose fork is *eager* does not belong here.** Codex's
-    /// experimental app-server `thread/fork` creates the new session
-    /// immediately and hands back its id, so it has no deferred state for the
-    /// provenance field to hold and would need its own registration path —
-    /// flipping this arm to `true` is *necessary but not sufficient* for it,
-    /// and doing only that would produce records
+    /// **A harness whose fork is *eager* does not belong here.** Codex creates
+    /// its fork immediately and hands back the new id, so it has no deferred
+    /// state for the provenance field to hold. It has its own capability,
+    /// [`Self::supports_fork_without_turn`], and its own registration path,
+    /// [`crate::project::Project::register_codex_fork`]. Flipping this arm to
+    /// `true` for it would produce records
     /// [`crate::project::Project::fork_agent`] cannot honor. Antigravity forks
     /// only server-side, on its own initiative. Per `harness-behavior.md` §3.5.
     ///
@@ -155,6 +155,27 @@ impl HarnessKind {
         match self {
             Self::ClaudeCode => true,
             Self::Codex | Self::Antigravity => false,
+        }
+    }
+
+    /// Whether Switchboard can **create a fork of this harness's session
+    /// without running a turn**: the new session exists, with the parent's
+    /// conversation inherited, as soon as the call returns, and is then driven
+    /// like any other agent.
+    ///
+    /// True only for Codex (a promptless `codex exec fork <parent>`,
+    /// `switchboard_harness::fork_codex_session`). Distinct from
+    /// [`Self::supports_session_fork`], which is Claude's lazy fork: a Claude
+    /// branch can only come into existence *as* its first turn, so it locks
+    /// its parent for that whole turn and can't be offered without a message.
+    /// An eager fork locks the parent only while it is created, and can be
+    /// offered on its own (the agent card's Fork item). Per
+    /// `harness-behavior.md` §3.5.
+    #[must_use]
+    pub fn supports_fork_without_turn(self) -> bool {
+        match self {
+            Self::Codex => true,
+            Self::ClaudeCode | Self::Antigravity => false,
         }
     }
 
@@ -374,11 +395,19 @@ mod tests {
 
     #[test]
     fn supports_session_fork_is_claude_only() {
-        // Codex's app-server `thread/fork` exists but is deliberately unwired in
-        // v1 — this gate is what keeps the Fork action off those agents.
+        // The lazy fork: Codex forks eagerly and has its own capability, so it
+        // must stay out of this one or it would be given provenance it can't
+        // honor.
         assert!(HarnessKind::ClaudeCode.supports_session_fork());
         assert!(!HarnessKind::Codex.supports_session_fork());
         assert!(!HarnessKind::Antigravity.supports_session_fork());
+    }
+
+    #[test]
+    fn supports_fork_without_turn_is_codex_only() {
+        assert!(HarnessKind::Codex.supports_fork_without_turn());
+        assert!(!HarnessKind::ClaudeCode.supports_fork_without_turn());
+        assert!(!HarnessKind::Antigravity.supports_fork_without_turn());
     }
 
     #[test]

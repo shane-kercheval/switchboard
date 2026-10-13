@@ -454,7 +454,7 @@ struct AgentTurnBuilder {
     /// (`claude_code/mod.rs`, gated on the same axis fact). Absent in two
     /// distinct cases that both hydrate as `None`: records written by older CLI
     /// versions (transient — resolves as sessions age out), and any turn run on
-    /// a no-axis model such as Haiku, which writes no key at any CLI version
+    /// a no-axis model such as Haiku 4.5, which writes no key at any CLI version
     /// (permanent — see `harness-behavior.md` §3.4 Caveats). A missing field
     /// here is expected shape, not drift.
     last_effort: Option<String>,

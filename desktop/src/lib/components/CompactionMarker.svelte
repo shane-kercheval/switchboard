@@ -1,6 +1,6 @@
 <script lang="ts">
   /// A compaction marker as a borderless row matching the tool-call and
-  /// thinking rows: history icon · "Conversation compacted" label · muted
+  /// thinking rows: history icon · "Context compacted" label · muted
   /// one-line glimpse of the recap · chevron. No status glyph — a compaction
   /// has no success/error state. Collapsed by default: the recap is a large
   /// verbatim harness block the user rarely needs, and it mounts only while
@@ -30,7 +30,7 @@
   {#if recap === null}
     <div class="flex min-h-7 w-full items-center gap-2 px-1.5 py-1" data-testid="compaction-row">
       <History class="text-muted h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-      <span class="text-fg shrink-0 font-medium">Conversation compacted</span>
+      <span class="text-fg shrink-0 font-medium">Context compacted</span>
     </div>
   {:else}
     <button
@@ -41,7 +41,7 @@
       onclick={() => (open = !open)}
     >
       <History class="text-muted h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-      <span class="text-fg shrink-0 font-medium">Conversation compacted</span>
+      <span class="text-fg shrink-0 font-medium">Context compacted</span>
       {#if open}
         <span class="flex-1"></span>
       {:else}

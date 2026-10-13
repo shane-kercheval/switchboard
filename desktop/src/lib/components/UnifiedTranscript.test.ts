@@ -4172,7 +4172,7 @@ describe("UnifiedTranscript compact mode", () => {
     // that mounts it open would flood long transcripts with full recaps. The
     // body renders only while open, so its absence is the collapsed proof.
     const marker = screen.getByTestId("compaction-marker");
-    expect(marker).toHaveTextContent("Conversation compacted");
+    expect(marker).toHaveTextContent("Context compacted");
     expect(screen.queryByTestId("compaction-body")).toBeNull();
 
     await fireEvent.click(within(marker).getByTestId("compaction-row"));
@@ -4202,7 +4202,7 @@ describe("UnifiedTranscript compact mode", () => {
       });
 
       const marker = screen.getByTestId("compaction-marker");
-      expect(marker).toHaveTextContent("Conversation compacted");
+      expect(marker).toHaveTextContent("Context compacted");
       expect(within(marker).getByTestId("compaction-row").tagName).not.toBe("BUTTON");
       expect(within(marker).queryByRole("button")).toBeNull();
       expect(screen.queryByTestId("compaction-preview")).toBeNull();

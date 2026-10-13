@@ -3,7 +3,7 @@
 //! to Tauri's `State<'_, AppState>` / `String` conventions; the free
 //! functions are what the unit tests target.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -2452,31 +2452,87 @@ pub fn create_agent_impl(
 }
 
 /// Branch `source_agent_id`'s conversation into a new agent, returning the new
-/// record. Registration only — the branch materializes when the caller
-/// dispatches its first turn (Claude has no copy-a-session operation; a fork can
-/// only come into existence *as* a turn, harness-behavior §3.5). The frontend
-/// pairs this with an immediate send, which is why the Fork affordance is a
-/// compose option rather than a standalone action.
+/// record. The frontend pairs this with an immediate send (the compose box's
+/// Fork) or, for a harness that can fork without a turn, uses it alone (the
+/// agent card's Fork).
+///
+/// Two lifecycles, one per harness that can fork:
+///
+/// - **Claude forks lazily.** This only registers the branch; it materializes
+///   when its first turn runs (Claude has no copy-a-session operation,
+///   harness-behavior §3.5), and that turn locks the parent for its whole
+///   length.
+/// - **Codex forks eagerly.** This creates the fork with a promptless
+///   `codex exec fork`, holding the parent's session lock only for that, then
+///   registers an ordinary Codex agent on the new session.
 ///
 /// Resolves the **source's own project** rather than the active one: this takes
 /// an agent id, and assuming the active project would silently fork into the
 /// wrong registry for a caller acting on a non-active project.
 ///
 /// The busy check here is an *early, friendly* gate so the user gets the error
-/// before an agent is created. It is **not** the authoritative one — a fork
-/// whose first turn failed retries through the ordinary send path and never
-/// calls this. See [`ensure_fork_source_free`].
+/// before an agent is created. For Claude it is **not** the authoritative one
+/// (a fork whose first turn failed retries through the ordinary send path and
+/// never calls this; see [`ensure_fork_source_free`]). For Codex the parent's
+/// session lock backs it up.
+///
+/// `codex_binary` is the Codex program to run, a parameter so app tests can
+/// point it at a stand-in (a shell script; the harness crate's `fake_codex`
+/// isn't built for this crate's tests).
 pub async fn fork_agent_impl(
     state: &AppState,
     source_agent_id: AgentId,
     home_dir: &Path,
+    codex_binary: &Path,
 ) -> Result<AgentRecord, AppError> {
-    let (project, source) = lookup_agent(state, source_agent_id)?;
-    if !source.harness.supports_session_fork() {
+    fork_agent_with(
+        state,
+        source_agent_id,
+        home_dir,
+        codex_binary,
+        switchboard_harness::subprocess::ensure_path_settled(CODEX_FORK_PATH_WAIT),
+    )
+    .await
+}
+
+/// How long a Codex fork waits for the login-shell PATH capture at launch.
+/// The same budget, and the same reason, as [`ACCOUNT_USAGE_PATH_WAIT`]:
+/// resolving `codex` against the provisional GUI PATH misses installs outside
+/// the fallback's well-known folders. Paid only while a capture is in flight.
+pub const CODEX_FORK_PATH_WAIT: std::time::Duration =
+    switchboard_harness::subprocess::capture_attempt_budget();
+
+/// [`fork_agent_impl`] with the PATH readiness it waits on injected, the same
+/// test seam [`read_codex_account_usage_with`] uses. **Every production call
+/// goes through the wrapper**; `path_ready` is not a knob.
+async fn fork_agent_with(
+    state: &AppState,
+    source_agent_id: AgentId,
+    home_dir: &Path,
+    codex_binary: &Path,
+    path_ready: impl std::future::Future<Output = PathSource>,
+) -> Result<AgentRecord, AppError> {
+    // Project, source and lifecycle generation from one instant, so step
+    // "re-check before registering" below can tell whether a lifecycle
+    // operation ran in between.
+    let (project, source, generation) = capture_dispatch_snapshot(state, source_agent_id)?;
+    let eager = source.harness.supports_fork_without_turn();
+    if !eager && !source.harness.supports_session_fork() {
         return Err(CoreError::SessionForkUnsupported {
             harness: source.harness,
         }
         .into());
+    }
+    if eager {
+        if !state.spawns_real_harnesses {
+            return Err(AppError::CodexForkNeedsRealHarness);
+        }
+        // Before the checks and the lock, not between them. A GUI launch can
+        // still be capturing the login-shell PATH, which takes seconds; waiting
+        // here means that wait never lengthens the time the parent is locked,
+        // and the idle check below reflects the parent just before locking.
+        // The source is discarded for the reason the account usage read gives.
+        let _ = path_ready.await;
     }
     // Eligibility is "a resumable session file exists", resolved through the
     // one per-harness path authority so the fork gate can't drift from what
@@ -2488,14 +2544,113 @@ pub async fn fork_agent_impl(
     }
     ensure_fork_source_free(state, &source).await?;
 
-    // Same TOCTOU protection as `create_agent_impl` — `fork_agent` has an
-    // internal read-check-then-append window.
-    let record = {
-        let _write = lock(&state.registry_write);
-        project.fork_agent(source_agent_id)?
+    let created = if eager {
+        Some(create_codex_fork(state, &project, &source, home_dir, codex_binary).await?)
+    } else {
+        None
     };
-    cache_agent(state, record.clone())?;
-    Ok(record)
+
+    #[cfg(test)]
+    wait_at_seam(test_seam(state, crate::state::TestSeam::ForkRegistration)).await;
+
+    // **Re-check before registering, under the same guard as the write.**
+    // Creating a Codex fork awaits a subprocess, and deleting the project or
+    // changing its folder in that time evicts it and bumps its generation
+    // (`begin_maintenance`). Registering anyway would write the fork into a
+    // project being deleted and report it created, then lose it, or leave it in
+    // the agent cache for a project no longer loaded. Ordinary sends guard the
+    // same pattern this way. Claude's fork waits only on a quick actor peek, but
+    // has the same shape, so it takes the same check. The source's continued
+    // existence is checked by the registration itself, which reads the registry.
+    let registered = {
+        let _write = lock(&state.registry_write);
+        reject_if_under_maintenance(state, project.id)
+            .and_then(|()| reject_if_generation_changed(state, project.id, generation))
+            .and_then(|()| {
+                let record = match &created {
+                    Some(locator) => project.register_codex_fork(
+                        source_agent_id,
+                        locator.thread_id.clone(),
+                        locator.partition_date,
+                    )?,
+                    None => project.fork_agent(source_agent_id)?,
+                };
+                cache_agent(state, record.clone())?;
+                Ok(record)
+            })
+    };
+    if let (Err(error), Some(locator)) = (&registered, &created) {
+        // Codex already created the session. Nothing in Switchboard refers to
+        // it, so it is a harmless stray in `~/.codex/sessions`.
+        tracing::warn!(
+            thread_id = %locator.thread_id,
+            %error,
+            "codex fork created but not registered"
+        );
+    }
+    registered
+}
+
+/// Create a Codex fork of `source` with no turn, holding the parent's session
+/// lock for exactly that long.
+///
+/// **Why the lock covers only the creation:** creation is where Codex picks the
+/// fork's cut-off in the parent's rollout (`history_base.end_byte_offset`).
+/// Every later fork turn re-reads the parent up to that cut-off
+/// (harness-behavior §3.5, probe 4), but rollouts are append-only, so those
+/// bytes never change, and only choosing the cut-off needs the parent idle. A
+/// parent turn that starts during creation is refused with `SessionInUse` after
+/// the lock's retries (about 155 ms), in this process or in another Switchboard
+/// instance, instead of racing the read. For Codex that makes the busy check an
+/// actual lock rather than only a check.
+async fn create_codex_fork(
+    state: &AppState,
+    project: &Project,
+    source: &AgentRecord,
+    home_dir: &Path,
+    codex_binary: &Path,
+) -> Result<switchboard_harness::CodexLocator, AppError> {
+    let parent =
+        source
+            .session_locator
+            .as_ref()
+            .ok_or_else(|| AppError::ForkSourceHasNoSession {
+                name: source.name.clone(),
+            })?;
+    let Some((parent_thread_id, _)) = parent.as_codex() else {
+        return Err(AppError::ForkSourceHasNoSession {
+            name: source.name.clone(),
+        });
+    };
+    let key = crate::session_lock::session_lock_key(source.harness, parent, &project.directory)?;
+    let lock_root = state.lock_root.clone();
+    // Off the async worker: acquisition opens a file and, when contended,
+    // sleeps through a backoff (see `ProjectDispatchContextFactory`).
+    let permit = tokio::task::spawn_blocking(move || {
+        crate::session_lock::acquire_session_locks(&lock_root, &BTreeSet::from([key]))
+    })
+    .await
+    .map_err(|e| AppError::CodexFork(switchboard_harness::CodexForkError::Internal(e.to_string())))?
+    .map_err(|error| match error {
+        // The parent started a turn after the idle check: a workflow step, or
+        // a second Switchboard instance. `SessionInUse` says "resend", which
+        // is advice for a message, not a fork.
+        AppError::SessionInUse => AppError::ForkSourceBusy {
+            name: source.name.clone(),
+        },
+        other => other,
+    })?;
+    let created = switchboard_harness::fork_codex_session(
+        codex_binary,
+        home_dir,
+        &project.directory,
+        parent_thread_id,
+        &source.selection(),
+        switchboard_harness::CODEX_FORK_TIMEOUT,
+    )
+    .await;
+    drop(permit);
+    Ok(created?)
 }
 
 /// Refuse if `source` is running a turn, so a branch can't be taken from a
@@ -4702,47 +4857,14 @@ pub async fn drain_agents_then_release_locks(
     }
 }
 
-/// Reload an agent's prior conversation history from its harness session
-/// file. Per-harness parsers project the on-disk records into a normalized
-/// `LoadedTranscript`. The frontend feeds the result through the reducer's
-/// `hydrate` input to populate the unified-view transcript.
-///
-/// **Error scope.** `Err(AppError::LoadTranscript)` covers lookup failures and
-/// cases where recorded history cannot be recovered safely. Per-line parse
-/// damage remains a successful best-effort load in
-/// `LoadedTranscript.warnings`; never-dispatched sessions remain legitimately
-/// empty.
-///
-/// `home_dir` is passed in (not resolved here) so tests can stage a temp
-/// directory without mutating process-wide `$HOME`. The Tauri command shim
-/// reads `$HOME` and forwards.
-pub fn load_transcript_impl(
-    state: &AppState,
-    agent_id: AgentId,
-    home_dir: &Path,
-) -> Result<switchboard_harness::LoadedTranscript, AppError> {
-    let (project, agent) = lookup_agent(state, agent_id)?;
-    let mut transcript = load_agent_transcript(&project, &agent, home_dir)?;
-    // System markers (e.g. compaction) are surfaced only in the project-level
-    // unified conversation, where the merge turns them into `ConversationItem`s.
-    // This per-agent hydrate path serializes `Turn` straight to the wire, and the
-    // frontend's `LoadedTurn` only models `user`/`agent` — a `role:"system"` turn
-    // would be mis-normalized as an agent turn (no items/status). Drop them here,
-    // NOT in the shared `load_agent_transcript` (the project path calls that too
-    // and DOES need the markers).
-    transcript
-        .turns
-        .retain(|t| !matches!(t, switchboard_harness::Turn::System { .. }));
-    Ok(transcript)
-}
-
-/// Load one agent's prior conversation from its harness session file. The
-/// harness-dispatch body factored out of [`load_transcript_impl`] so the
-/// project-level conversation loader can reuse it per agent. Lookup failures
-/// and recorded history that cannot be recovered safely surface as errors;
-/// genuinely absent or never-started sessions remain successful empty loads.
-/// Session identity is read from the agent's registry record (`session_locator`),
-/// so there's no per-agent session-link sidecar to corrupt.
+/// Load one agent's prior conversation from its harness session file, for the
+/// project-level conversation loader, which loads every agent through it.
+/// Lookup failures and recorded history that cannot be recovered safely
+/// surface as errors; per-line parse damage remains a successful best-effort
+/// load in `LoadedTranscript.warnings`, and genuinely absent or never-started
+/// sessions remain successful empty loads. Session identity is read from the
+/// agent's registry record (`session_locator`), so there's no per-agent
+/// session-link sidecar to corrupt.
 fn load_agent_transcript(
     project: &Project,
     agent: &AgentRecord,
@@ -6584,9 +6706,8 @@ fn parse_outcome(outcome: &serde_json::Value) -> (OutcomeStatus, Option<String>,
 /// each agent's transcript via [`load_agent_transcript`] on the blocking pool,
 /// in parallel.
 ///
-/// **Per-agent load errors are non-fatal.** Unlike [`load_transcript_impl`]
-/// (single-agent, fail-loud), a corrupt sidecar or read failure for *one* agent
-/// here is recorded on that agent's [`AgentConversationMeta::load_error`] (with
+/// **Per-agent load errors are non-fatal.** A corrupt sidecar or read failure
+/// for *one* agent is recorded on that agent's [`AgentConversationMeta::load_error`] (with
 /// an empty transcript for it) and the rest of the project — journal plus the
 /// healthy agents — still renders. Corruption stays loud (surfaced per-agent),
 /// just not fatal to the whole project.
@@ -7455,7 +7576,9 @@ mod tests {
     use async_trait::async_trait;
     use switchboard_core::CoreError;
     use switchboard_dispatcher::{EventEmitter, RecordingEmitter};
-    use switchboard_harness::{ClaudeCodeAdapter, HarnessAdapter, MockHarnessAdapter};
+    use switchboard_harness::{
+        ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, MockHarnessAdapter,
+    };
     use tempfile::TempDir;
 
     /// The working directories a test has registered per store, so
@@ -8021,7 +8144,7 @@ mod tests {
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let source = lock(&state.agents_by_id).get(&source_id).cloned().unwrap();
 
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .expect("forking an idle Claude agent with a session should succeed");
 
@@ -8047,7 +8170,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let (agent, _project_id) = project_with_agent(&state, &tmp);
 
-        let err = fork_agent_impl(&state, agent.id, home.path())
+        let err = fork_agent_impl(&state, agent.id, home.path(), Path::new("codex"))
             .await
             .expect_err("an agent with no session file must not be forkable");
 
@@ -8058,22 +8181,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_agent_rejects_a_non_claude_source() {
+    async fn fork_agent_rejects_a_harness_switchboard_cannot_fork() {
         let (tmp, state, _emitter) = fresh_state_with_mock();
         let home = TempDir::new().unwrap();
         let (_other, _project_id) = project_with_agent(&state, &tmp);
-        let codex =
-            create_agent_impl(&state, "cx", HarnessKind::Codex, AgentSelection::default()).unwrap();
+        let agy = create_agent_impl(
+            &state,
+            "g",
+            HarnessKind::Antigravity,
+            AgentSelection::default(),
+        )
+        .unwrap();
 
-        let err = fork_agent_impl(&state, codex.id, home.path())
+        let err = fork_agent_impl(&state, agy.id, home.path(), Path::new("codex"))
             .await
-            .expect_err("only Claude sessions can be branched");
+            .expect_err("Switchboard forks only Claude Code and Codex sessions");
 
         assert!(
             matches!(
                 err,
                 AppError::Core(CoreError::SessionForkUnsupported {
-                    harness: HarnessKind::Codex
+                    harness: HarnessKind::Antigravity
                 })
             ),
             "got: {err:?}"
@@ -8087,7 +8215,7 @@ mod tests {
         let (_other, _project_id) = project_with_agent(&state, &tmp);
         let missing = Uuid::now_v7();
 
-        let err = fork_agent_impl(&state, missing, home.path())
+        let err = fork_agent_impl(&state, missing, home.path(), Path::new("codex"))
             .await
             .expect_err("an unknown agent id must not fork");
 
@@ -8155,7 +8283,7 @@ mod tests {
             .unwrap();
         await_turn_running(&state, source_id).await;
 
-        let err = fork_agent_impl(&state, source_id, home.path())
+        let err = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .expect_err("forking a working agent must be refused");
         assert!(
@@ -8215,7 +8343,7 @@ mod tests {
         let other_project = create_project_in_only_dir(&state, "other-proj");
         set_active_project_impl(&state, other_project.id).unwrap();
 
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .expect("forking an agent outside the active project must work");
 
@@ -8235,6 +8363,495 @@ mod tests {
         );
     }
 
+    // ---- Fork: Codex's eager fork ----
+
+    /// The parent and fork ids of the Codex fork tests. Any ids work; these are
+    /// the probe chain's, so they read as Codex ids.
+    const CODEX_SOURCE_THREAD: &str = CODEX_FORK_PARENT;
+    const CODEX_NEW_FORK_THREAD: &str = CODEX_FORK_CHILD;
+
+    fn codex_fork_test_date() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 11).unwrap()
+    }
+
+    /// A Codex agent named `name` in the active project, with a selection and a
+    /// session locator whose rollout exists under `home`, so it has a session to
+    /// fork from.
+    fn seed_codex_source(state: &AppState, home: &Path, name: &str) -> AgentId {
+        let agent = create_agent_impl(
+            state,
+            name,
+            HarnessKind::Codex,
+            AgentSelection {
+                model: Some("gpt-6-luna".to_owned()),
+                effort: Some("low".to_owned()),
+                ..AgentSelection::default()
+            },
+        )
+        .unwrap();
+        set_agent_session_locator_impl(
+            state,
+            agent.id,
+            SessionLocator::Codex {
+                thread_id: CODEX_SOURCE_THREAD.to_owned(),
+                partition_date: codex_fork_test_date(),
+            },
+        )
+        .unwrap();
+        let folder = home.join(".codex/sessions/2026/10/11");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join(format!(
+                "rollout-2026-10-11T00-00-00-{CODEX_SOURCE_THREAD}.jsonl"
+            )),
+            "",
+        )
+        .unwrap();
+        agent.id
+    }
+
+    /// A stand-in for `codex exec fork`, written as a shell script because the
+    /// harness crate's `fake_codex` binary isn't built for this crate's tests.
+    /// It runs `before` (shell), then does what a promptless fork does: writes
+    /// the new rollout under `home` and prints `thread.started` with its id.
+    fn codex_fork_shim(dir: &Path, home: &Path, before: &str) -> PathBuf {
+        let folder = home.join(".codex/sessions/2026/10/11");
+        let script = format!(
+            "#!/bin/sh\n{before}\nmkdir -p '{folder}'\n: > '{folder}/rollout-2026-10-11T00-00-01-{CODEX_NEW_FORK_THREAD}.jsonl'\necho '{{\"type\":\"thread.started\",\"thread_id\":\"{CODEX_NEW_FORK_THREAD}\"}}'\n",
+            folder = folder.display(),
+        );
+        let shim = dir.join("codex");
+        std::fs::write(&shim, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        shim
+    }
+
+    /// A state that spawns real harnesses (so the Codex fork runs its binary),
+    /// with an active project.
+    fn codex_fork_state() -> (TempDir, TempDir, AppState, ProjectId) {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let state = state.with_real_harnesses(true);
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        (tmp, TempDir::new().unwrap(), state, project.id)
+    }
+
+    fn codex_parent_key(state: &AppState, project_id: ProjectId) -> String {
+        let directory = open_project_from_store(state, project_id)
+            .unwrap()
+            .directory
+            .clone();
+        crate::session_lock::session_lock_key(
+            HarnessKind::Codex,
+            &SessionLocator::Codex {
+                thread_id: CODEX_SOURCE_THREAD.to_owned(),
+                partition_date: codex_fork_test_date(),
+            },
+            &directory,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn codex_fork_registers_an_ordinary_codex_agent_on_the_new_session() {
+        let (_tmp, home, state, project_id) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let shim = codex_fork_shim(home.path(), home.path(), "");
+
+        let fork = fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
+            .await
+            .expect("forking an idle Codex agent with a session should succeed");
+
+        assert_eq!(fork.name, "cx-fork");
+        assert_eq!(fork.project_id, project_id);
+        assert_eq!(fork.harness, HarnessKind::Codex);
+        assert_eq!(fork.model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(fork.effort.as_deref(), Some("low"));
+        assert_eq!(
+            fork.session_locator,
+            Some(SessionLocator::Codex {
+                thread_id: CODEX_NEW_FORK_THREAD.to_owned(),
+                partition_date: codex_fork_test_date(),
+            })
+        );
+        assert_eq!(
+            fork.forked_from_session, None,
+            "an eager fork has nothing to materialize, so it carries no provenance"
+        );
+        assert!(lock(&state.agents_by_id).contains_key(&fork.id));
+    }
+
+    #[tokio::test]
+    async fn codex_fork_creation_failure_registers_nothing() {
+        let (_tmp, home, state, project_id) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let shim = codex_fork_shim(
+            home.path(),
+            home.path(),
+            "echo 'Error: could not fork' >&2; exit 1",
+        );
+        let before = lock(&state.agents_by_id).len();
+
+        let err = fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
+            .await
+            .expect_err("a fork Codex didn't create must not be registered");
+
+        assert!(
+            matches!(
+                &err,
+                AppError::CodexFork(switchboard_harness::CodexForkError::Exit {
+                    code: Some(1),
+                    ..
+                })
+            ),
+            "got: {err:?}"
+        );
+        assert!(err.to_string().contains("could not fork"), "got: {err}");
+        assert_eq!(lock(&state.agents_by_id).len(), before);
+        let registry = open_project_from_store(&state, project_id)
+            .unwrap()
+            .list_agents()
+            .unwrap();
+        assert_eq!(registry.len(), 1, "only the source is registered");
+    }
+
+    #[tokio::test]
+    async fn codex_fork_of_a_source_with_no_session_file_is_refused() {
+        let (_tmp, home, state, _project_id) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        std::fs::remove_dir_all(home.path().join(".codex")).unwrap();
+        let shim = codex_fork_shim(home.path(), home.path(), "");
+
+        let err = fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
+            .await
+            .expect_err("a source with no rollout has nothing to fork");
+
+        assert!(
+            matches!(err, AppError::ForkSourceHasNoSession { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_fork_is_refused_in_mock_mode_with_a_plain_message() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        let home = TempDir::new().unwrap();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+
+        let err = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
+            .await
+            .expect_err("mock mode spawns no CLIs, so Codex can't create the fork");
+
+        assert!(
+            matches!(err, AppError::CodexForkNeedsRealHarness),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_fork_while_the_parent_is_locked_names_the_busy_parent() {
+        // Another holder of the parent's session (a workflow step's turn, or a
+        // second Switchboard instance) took it after the idle check. The user
+        // forked, so the error must speak about the fork, not say "resend".
+        let (_tmp, home, state, project_id) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let shim = codex_fork_shim(home.path(), home.path(), "");
+        let _contender = crate::session_lock::acquire_session_locks(
+            &state.lock_root,
+            &BTreeSet::from([codex_parent_key(&state, project_id)]),
+        )
+        .unwrap();
+
+        let err = fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
+            .await
+            .expect_err("a locked parent must not be forked");
+
+        assert!(
+            matches!(&err, AppError::ForkSourceBusy { name } if name == "cx"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_fork_locks_the_parent_only_while_codex_creates_the_fork() {
+        // While Codex is creating the fork, a parent turn is refused: creation
+        // is where Codex picks the fork's cut-off in the parent's file. Once it
+        // returns, the parent is free again, and stays free while the fork's
+        // own first turn holds the fork's session.
+        let (_tmp, home, state, project_id) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let entered = home.path().join("entered");
+        let release = home.path().join("release");
+        let shim = codex_fork_shim(
+            home.path(),
+            home.path(),
+            &format!(
+                ": > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done",
+                entered.display(),
+                release.display()
+            ),
+        );
+        let parent_key = codex_parent_key(&state, project_id);
+        let state = Arc::new(state);
+
+        let forking = tokio::spawn({
+            let state = Arc::clone(&state);
+            let home = home.path().to_owned();
+            async move { fork_agent_with(&state, source_id, &home, &shim, path_settled()).await }
+        });
+        for _ in 0..250 {
+            if entered.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let during = crate::session_lock::acquire_session_locks(
+            &state.lock_root,
+            &BTreeSet::from([parent_key.clone()]),
+        );
+        std::fs::write(&release, "").unwrap();
+        let fork = tokio::time::timeout(WAIT, forking)
+            .await
+            .expect("the fork finishes once released")
+            .unwrap()
+            .expect("the fork is created");
+
+        assert!(entered.exists(), "Codex never started creating the fork");
+        assert!(
+            matches!(during, Err(AppError::SessionInUse)),
+            "the parent must be locked while Codex creates the fork"
+        );
+        let fork_turn = factory_for(&state, project_id, fork.id, home.path());
+        let fork_record = lock(&state.agents_by_id).get(&fork.id).cloned().unwrap();
+        let _fork_permit = fork_turn
+            .preflight(&fork_record)
+            .await
+            .expect("the fork's first turn takes its own session");
+        assert!(
+            crate::session_lock::acquire_session_locks(
+                &state.lock_root,
+                &BTreeSet::from([parent_key])
+            )
+            .is_ok(),
+            "the fork's first turn must not hold the parent's session"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_fork_waits_for_the_path_before_locking_the_parent() {
+        // At launch the login-shell PATH can take seconds to arrive. The fork
+        // waits for it before it checks or locks the parent, so that wait never
+        // stretches the time the parent is locked.
+        let (_tmp, home, state, project_id) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let started = home.path().join("codex-started");
+        let shim = codex_fork_shim(
+            home.path(),
+            home.path(),
+            &format!(": > '{}'", started.display()),
+        );
+        let parent_key = codex_parent_key(&state, project_id);
+        let state = Arc::new(state);
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let path_ready = {
+            let waiting = Arc::clone(&waiting);
+            let release = Arc::clone(&release);
+            async move {
+                // Announce that the fork has reached the wait, so the checks
+                // below run while it is waiting and not before it got here.
+                waiting.notify_one();
+                release.notified().await;
+                PathSource::LoginShell
+            }
+        };
+
+        let forking = tokio::spawn({
+            let state = Arc::clone(&state);
+            let home = home.path().to_owned();
+            async move { fork_agent_with(&state, source_id, &home, &shim, path_ready).await }
+        });
+        let reached = tokio::time::timeout(WAIT, waiting.notified()).await;
+        let parent_free = crate::session_lock::acquire_session_locks(
+            &state.lock_root,
+            &BTreeSet::from([parent_key]),
+        )
+        .map(drop);
+        let codex_started = started.exists();
+        release.notify_one();
+        let fork = tokio::time::timeout(WAIT, forking)
+            .await
+            .expect("the fork finishes once the PATH arrives")
+            .unwrap();
+
+        assert!(reached.is_ok(), "the fork never waited for the PATH");
+        assert!(
+            parent_free.is_ok(),
+            "the parent must not be locked while the fork waits for the PATH"
+        );
+        assert!(
+            !codex_started,
+            "Codex must not start before the PATH arrives"
+        );
+        assert!(fork.is_ok(), "got: {fork:?}");
+    }
+
+    #[tokio::test]
+    async fn codex_fork_of_a_working_agent_is_refused() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (codex, _prompts) = gated_adapter(&["parent"], &gate, 0);
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&mock),
+            codex,
+            Arc::clone(&mock),
+            Arc::new(RecordingEmitter::new()) as Arc<dyn EventEmitter>,
+        )
+        .with_real_harnesses(true);
+        let tmp = TempDir::new().unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        let home = TempDir::new().unwrap();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let shim = codex_fork_shim(home.path(), home.path(), "");
+        send_msg_with_home(&state, source_id, "long one", home.path())
+            .await
+            .unwrap();
+        await_turn_running(&state, source_id).await;
+        let before = lock(&state.agents_by_id).len();
+
+        let err = fork_agent_with(&state, source_id, home.path(), &shim, path_settled()).await;
+        gate.notify_waiters();
+
+        assert!(
+            matches!(&err, Err(AppError::ForkSourceBusy { .. })),
+            "got: {err:?}"
+        );
+        assert_eq!(lock(&state.agents_by_id).len(), before);
+    }
+
+    /// Fork `source_id`, pausing at the registration seam, delete its project
+    /// while paused, then let the fork finish. Returns the fork's result.
+    async fn fork_across_a_project_deletion(
+        state: Arc<AppState>,
+        project_id: ProjectId,
+        source_id: AgentId,
+        home: PathBuf,
+        codex_binary: PathBuf,
+    ) -> Result<AgentRecord, AppError> {
+        let barrier = Arc::new(crate::state::MaintenanceBarrier::default());
+        lock(&state.test_seams).insert(
+            crate::state::TestSeam::ForkRegistration,
+            Arc::clone(&barrier),
+        );
+        let entered = barrier.entered.notified();
+        tokio::pin!(entered);
+        let forking = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { fork_agent_with(&state, source_id, &home, &codex_binary, path_settled()).await }
+        });
+        let reached = tokio::time::timeout(WAIT, entered).await;
+        let deleted = delete_project_impl(&state, project_id).await;
+        barrier.release.notify_one();
+        let result = tokio::time::timeout(WAIT, forking)
+            .await
+            .expect("the fork finishes once released")
+            .unwrap();
+        assert!(
+            reached.is_ok(),
+            "the fork never reached the registration seam"
+        );
+        assert!(deleted.is_ok(), "the project deletion failed: {deleted:?}");
+        result
+    }
+
+    #[tokio::test]
+    async fn a_codex_fork_finishing_after_its_project_was_deleted_is_not_registered() {
+        let (_tmp, home, state, project_id) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let shim = codex_fork_shim(home.path(), home.path(), "");
+        let state = Arc::new(state);
+
+        let result = fork_across_a_project_deletion(
+            Arc::clone(&state),
+            project_id,
+            source_id,
+            home.path().to_owned(),
+            shim,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(AppError::ProjectUnderMaintenance(_) | AppError::ProjectViewStale(_))
+            ),
+            "got: {result:?}"
+        );
+        assert!(
+            !lock(&state.agents_by_id)
+                .values()
+                .any(|agent| agent.project_id == project_id),
+            "nothing of the deleted project may linger in the agent cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claude_fork_finishing_after_its_project_was_deleted_is_not_registered() {
+        // The re-check is shared: Claude's fork waits only on a quick actor peek,
+        // but registers through the same guarded section.
+        let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
+        let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
+        let state = Arc::new(state);
+
+        let result = fork_across_a_project_deletion(
+            Arc::clone(&state),
+            project_id,
+            source_id,
+            home.path().to_owned(),
+            PathBuf::from("codex"),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(AppError::ProjectUnderMaintenance(_) | AppError::ProjectViewStale(_))
+            ),
+            "got: {result:?}"
+        );
+        assert!(
+            !lock(&state.agents_by_id)
+                .values()
+                .any(|agent| agent.project_id == project_id),
+            "nothing of the deleted project may linger in the agent cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_fork_uses_the_sources_own_project_not_the_active_one() {
+        let (tmp, home, state, source_project) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let _ = tmp;
+        let other = create_project_in_only_dir(&state, "other-proj");
+        set_active_project_impl(&state, other.id).unwrap();
+        let shim = codex_fork_shim(home.path(), home.path(), "");
+
+        let fork = fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
+            .await
+            .expect("forking an agent outside the active project must work");
+
+        assert_eq!(fork.project_id, source_project);
+    }
+
     #[tokio::test]
     async fn sending_to_a_materializing_fork_is_refused_while_its_parent_runs() {
         // The authoritative gate. A branch taken mid-turn inherits a
@@ -8244,7 +8861,7 @@ mod tests {
         // the user is branching away from.
         let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .unwrap();
 
@@ -8374,7 +8991,7 @@ mod tests {
         let home = TempDir::new().unwrap();
 
         let source_id = seed_source(&state, home.path(), project.id, "alice", "hello");
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .unwrap();
 
@@ -8523,7 +9140,7 @@ mod tests {
         // pinned in `switchboard-dispatcher`.
         let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .unwrap();
 
@@ -9043,7 +9660,7 @@ mod tests {
         // the lock in place and pointed at the wrong file.
         let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .unwrap();
         // The parent is idle in this process — so the in-process fork gate
@@ -9072,7 +9689,7 @@ mod tests {
         let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let parent_key = own_session_key(&state, project_id, source_id);
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .unwrap();
 
@@ -9097,7 +9714,7 @@ mod tests {
         let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["done"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
         let parent_key = own_session_key(&state, project_id, source_id);
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .unwrap();
         let fork_key = own_session_key(&state, project_id, fork.id);
@@ -9139,7 +9756,7 @@ mod tests {
         // running at the same time, in both instances.
         let (_tmp, home, state, _gate, project_id) = state_with_parked_claude(&[]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .unwrap();
         {
@@ -9234,7 +9851,7 @@ mod tests {
         // the hook must cost nothing for every ordinary turn thereafter.
         let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .unwrap();
         // Give the fork its own session file: it is materialized from here on.
@@ -9275,7 +9892,7 @@ mod tests {
         // and it never calls the fork command.
         let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .unwrap();
 
@@ -9302,7 +9919,7 @@ mod tests {
         // the parent's session, so the gate is a no-op.
         let (_tmp, home, state, gate, project_id) = state_with_parked_claude(&["parent", "fork"]);
         let source_id = seed_source(&state, home.path(), project_id, "alice", "hello");
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .unwrap();
         let directory = lock(&state.projects)
@@ -9354,7 +9971,7 @@ mod tests {
             .get(&source_id)
             .and_then(|a| a.session_locator.as_ref().and_then(SessionLocator::as_uuid))
             .unwrap();
-        let fork = fork_agent_impl(&state, source_id, home.path())
+        let fork = fork_agent_impl(&state, source_id, home.path(), Path::new("codex"))
             .await
             .unwrap();
         lock(&state.agents_by_id).remove(&source_id);
@@ -12050,9 +12667,129 @@ mod tests {
         );
     }
 
+    /// The compose box's Codex fork, end to end through the app with the real
+    /// CLI: the fork is created without a turn, its first turn knows the
+    /// parent's conversation, and a message to the parent sent while that turn
+    /// runs starts at once, because the fork holds only its own session.
+    ///
+    /// Run with: `make test-live`.
+    #[tokio::test]
+    #[ignore = "requires codex installed — run with: make test-live"]
+    #[allow(clippy::too_many_lines)]
+    async fn live_codex_fork_through_the_app_leaves_the_parent_free_during_its_first_turn() {
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let codex: Arc<dyn HarnessAdapter> = Arc::new(CodexAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&mock),
+            codex,
+            Arc::clone(&mock),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        )
+        .with_real_harnesses(true);
+        let tmp = TempDir::new().unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("HOME must be set");
+        let parent = create_agent_impl(
+            &state,
+            "cx",
+            HarnessKind::Codex,
+            AgentSelection {
+                model: Some("gpt-6-luna".to_owned()),
+                effort: Some("low".to_owned()),
+                ..AgentSelection::default()
+            },
+        )
+        .unwrap();
+        let live_wait = std::time::Duration::from_mins(2);
+        // Takes the recorded events rather than reading the emitter itself:
+        // `wait_for` calls its predicate while holding the emitter's lock, so a
+        // predicate that took the lock again would deadlock.
+        let turn_ends = |events: &[(String, serde_json::Value)], agent: AgentId| {
+            let channel = format!("agent:{agent}");
+            events
+                .iter()
+                .filter(|(name, event)| *name == channel && event["type"] == "turn_end")
+                .map(|(_, event)| event.clone())
+                .collect::<Vec<_>>()
+        };
+
+        send_msg_with_home(
+            &state,
+            parent.id,
+            "Remember the code word 'MARMOT-31'. Reply with only 'ok'.",
+            &home,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            live_wait,
+            emitter.wait_for(|events| turn_ends(events, parent.id).len() == 1),
+        )
+        .await
+        .expect("the parent's first turn finishes");
+
+        let fork = fork_agent_impl(&state, parent.id, &home, Path::new("codex"))
+            .await
+            .expect("forking the idle Codex parent succeeds");
+        assert_eq!(fork.harness, HarnessKind::Codex);
+        assert_eq!(fork.forked_from_session, None);
+
+        send_msg_with_home(
+            &state,
+            fork.id,
+            "What code word did I ask you to remember? Reply with only the code word.",
+            &home,
+        )
+        .await
+        .unwrap();
+        await_turn_running(&state, fork.id).await;
+        send_msg_with_home(&state, parent.id, "Reply with only 'ok'.", &home)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            live_wait,
+            emitter.wait_for(|events| {
+                turn_ends(events, parent.id).len() == 2 && turn_ends(events, fork.id).len() == 1
+            }),
+        )
+        .await
+        .expect("both turns finish");
+
+        let refused: Vec<_> = emitter
+            .snapshot()
+            .into_iter()
+            .filter(|(_, event)| event["type"] == "message_failed")
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "no turn may be refused for a held session: {refused:?}"
+        );
+        assert_eq!(
+            turn_ends(&emitter.snapshot(), parent.id)[1]["outcome"]["status"],
+            "completed",
+            "the parent's turn during the fork's first turn must complete"
+        );
+        let fork_reply = emitter
+            .snapshot()
+            .into_iter()
+            .filter(|(name, event)| {
+                *name == format!("agent:{}", fork.id) && event["type"] == "content_chunk"
+            })
+            .filter_map(|(_, event)| event["text"].as_str().map(str::to_owned))
+            .collect::<String>();
+        assert!(
+            fork_reply.to_uppercase().contains("MARMOT-31"),
+            "the fork's first turn must know the parent's conversation; reply was {fork_reply:?}"
+        );
+    }
+
     #[test]
     fn check_codex_binary_with_missing_binary_returns_error() {
-        use switchboard_harness::CodexAdapter;
         let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let codex: Arc<dyn HarnessAdapter> =
             Arc::new(CodexAdapter::with_binary_path("/nonexistent/codex-xyz"));
@@ -13193,6 +13930,17 @@ mod tests {
         }
     }
 
+    /// One agent's transcript as the project read loads it: the per-agent half
+    /// of `load_project_conversation_impl`.
+    fn load_agent_by_id(
+        state: &AppState,
+        agent_id: AgentId,
+        home_dir: &Path,
+    ) -> Result<switchboard_harness::LoadedTranscript, AppError> {
+        let (project, agent) = lookup_agent(state, agent_id)?;
+        load_agent_transcript(&project, &agent, home_dir)
+    }
+
     fn fresh_state_with_active_project(
         name: &str,
     ) -> (TempDir, TempDir, AppState, switchboard_core::ProjectSummary) {
@@ -13787,7 +14535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_for_claude_agent_with_no_session_file_returns_empty() {
+    async fn load_agent_transcript_for_claude_agent_with_no_session_file_returns_empty() {
         let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         // Stage the file so attach succeeds but the file content is empty.
@@ -13801,7 +14549,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty());
         assert!(result.warnings.is_empty());
         // No metadata sidecar staged → both rate-limit fields stay None.
@@ -13810,7 +14558,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_for_stale_codex_locator_is_a_hydration_error() {
+    async fn load_agent_transcript_for_stale_codex_locator_is_a_hydration_error() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let session_id = Uuid::now_v7();
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
@@ -13825,7 +14573,7 @@ mod tests {
         .unwrap();
         std::fs::remove_file(path).unwrap();
 
-        let error = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap_err();
+        let error = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap_err();
         assert!(matches!(
             error,
             AppError::LoadTranscript(
@@ -14498,7 +15246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_rejoins_persisted_turn_spend_for_claude_agent() {
+    async fn load_agent_transcript_rejoins_persisted_turn_spend_for_claude_agent() {
         // End-to-end wiring through the real load path: a Claude agent whose
         // session file produces a turn with message id `msg_test31`, plus a
         // staged turnmeta sidecar record keyed on that id, surfaces the
@@ -14555,7 +15303,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap();
         let agent_turn = result
             .turns
             .iter()
@@ -14569,85 +15317,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_filters_system_markers_from_per_agent_wire() {
-        // A compaction marker is surfaced only in the project-level conversation.
-        // The per-agent hydrate path serializes `Turn` straight to the wire, where
-        // the frontend models only user/agent — so `load_transcript` must drop the
-        // `role:"system"` turn rather than leak one the frontend would
-        // mis-normalize as a content-less agent turn.
-        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
-        let session_id = Uuid::now_v7();
-        let canonical_cwd = tmp_workdir.path().canonicalize().unwrap();
-        let session_path = switchboard_harness::claude_session_file_path(
-            tmp_home.path(),
-            &canonical_cwd,
-            &session_id,
-        );
-        std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
-        let session_jsonl = [
-            serde_json::json!({
-                "type": "user",
-                "message": { "role": "user", "content": "hello" },
-                "timestamp": "2026-05-31T18:00:00Z",
-            }),
-            serde_json::json!({
-                "type": "assistant",
-                "message": {
-                    "id": "m1",
-                    "model": "claude-opus-4-8",
-                    "role": "assistant",
-                    "content": [{ "type": "text", "text": "hi" }],
-                    "stop_reason": "end_turn",
-                    "usage": { "input_tokens": 1, "output_tokens": 1 }
-                },
-                "timestamp": "2026-05-31T18:00:01Z",
-            }),
-            serde_json::json!({
-                "type": "system",
-                "subtype": "compact_boundary",
-                "timestamp": "2026-05-31T18:00:02Z",
-            }),
-            serde_json::json!({
-                "type": "user",
-                "message": { "role": "user", "content": "This session is being continued…" },
-                "isCompactSummary": true,
-                "timestamp": "2026-05-31T18:00:03Z",
-            }),
-        ]
-        .iter()
-        .map(|r| serde_json::to_string(r).unwrap())
-        .collect::<Vec<_>>()
-        .join("\n");
-        std::fs::write(&session_path, session_jsonl).unwrap();
-
-        let record = attach_agent_impl(
-            &state,
-            "x",
-            HarnessKind::ClaudeCode,
-            &session_id.to_string(),
-            tmp_home.path(),
-        )
-        .unwrap();
-
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
-        assert!(
-            !result
-                .turns
-                .iter()
-                .any(|t| matches!(t, switchboard_harness::Turn::System { .. })),
-            "no system marker reaches the per-agent hydrate wire"
-        );
-        assert!(
-            result
-                .turns
-                .iter()
-                .any(|t| matches!(t, switchboard_harness::Turn::Agent { .. })),
-            "the real agent turn still hydrates"
-        );
-    }
-
-    #[tokio::test]
-    async fn load_transcript_overlays_metadata_sidecar_for_claude_agent() {
+    async fn load_agent_transcript_overlays_metadata_sidecar_for_claude_agent() {
         // End-to-end wiring: a Claude agent with a staged metadata sidecar
         // surfaces the persisted rate-limit + its capture time through the
         // real load path (proves the sidecar-path resolution + overlay are
@@ -14679,7 +15349,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap();
         assert_eq!(
             result.last_rate_limit,
             Some(serde_json::json!({"isUsingOverage": true, "resetsAt": 1_778_701_800u64}))
@@ -14842,7 +15512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_for_codex_agent_without_sidecar_returns_meta_only_empty() {
+    async fn load_agent_transcript_for_codex_agent_without_sidecar_returns_meta_only_empty() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         // Create a Codex agent the normal way (no sidecar — no first dispatch).
         let record = create_agent_impl(
@@ -14853,16 +15523,16 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty());
         // Meta is populated from config loaders, never None.
         assert!(result.meta.is_some());
     }
 
     #[tokio::test]
-    async fn load_transcript_for_missing_agent_returns_agent_not_found() {
+    async fn load_agent_transcript_for_missing_agent_returns_agent_not_found() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
-        let err = load_transcript_impl(&state, Uuid::now_v7(), tmp_home.path()).unwrap_err();
+        let err = load_agent_by_id(&state, Uuid::now_v7(), tmp_home.path()).unwrap_err();
         assert!(matches!(err, AppError::AgentNotFound(_)));
     }
 
@@ -14912,7 +15582,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty(), "no transcript → no turns");
         assert!(result.meta.is_some(), "registry meta still surfaces");
     }
@@ -14974,7 +15644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_for_antigravity_agent_without_locator_returns_meta_only_empty() {
+    async fn load_agent_transcript_for_antigravity_agent_without_locator_returns_meta_only_empty() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         // Antigravity agent never dispatched → no locator → empty turns, but
         // loader-derived registry meta still surfaces (mirrors the Codex arm)
@@ -14987,13 +15657,13 @@ mod tests {
         )
         .unwrap();
         assert!(record.session_locator.is_none());
-        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty());
         assert!(result.meta.is_some());
     }
 
     #[tokio::test]
-    async fn load_transcript_for_antigravity_agent_hydrates_prior_turns() {
+    async fn load_agent_transcript_for_antigravity_agent_hydrates_prior_turns() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         let agent = create_agent_impl(
             &state,
@@ -15026,7 +15696,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_transcript_impl(&state, agent.id, tmp_home.path()).unwrap();
+        let result = load_agent_by_id(&state, agent.id, tmp_home.path()).unwrap();
         assert_eq!(result.turns.len(), 2);
         assert!(result.meta.is_some());
     }
@@ -18994,6 +19664,179 @@ mod tests {
                 (FORK_INHERITED_PROMPT, Some(parent_send)),
                 (FORK_INHERITED_PROMPT, None),
                 (FORK_OWN_PROMPT, Some(fork_send)),
+            ],
+        );
+    }
+
+    // A real Codex fork chain (harness-behavior §3.5), trimmed: the parent's
+    // first turn is inherited by the fork through `history_base`, the parent's
+    // second turn came after the fork, and the fork has two turns of its own.
+    const CODEX_FORK_PARENT: &str = "01a12c22-a3f8-71e2-b51e-ca72562cfabb";
+    const CODEX_FORK_CHILD: &str = "01a12c22-df64-7103-9fc3-92f2e3595c02";
+    const CODEX_PELICAN: &str = "Remember this code word: PELICAN-42. Reply with only: ok";
+    const CODEX_OTTER: &str = "Also remember a second code word: OTTER-7. Reply with only: ok";
+    const CODEX_CHILD_FIRST: &str =
+        "What code word did I ask you to remember? Reply with only the code word.";
+    const CODEX_CHILD_SECOND: &str = "List every code word I asked you to remember, separated by a comma. If there is only one, reply with just that one.";
+    const CODEX_PARENT_KEYS: [&str; 2] = [
+        "01a12c22-a467-7b02-afc3-fc1e2774e3f4",
+        "01a12c23-5549-7533-98df-4bc75c0e02b2",
+    ];
+    const CODEX_CHILD_KEYS: [&str; 2] = [
+        "01a12c23-085c-72f0-8d9f-971d943a67f4",
+        "01a12c23-63e0-74a1-914c-ed4186693a70",
+    ];
+
+    /// Stage the trimmed Codex fork chain in `home` and load `thread_id`'s
+    /// transcript through the real loader, which follows the fork's pointer.
+    fn load_codex_fork_fixture(
+        home: &TempDir,
+        agent: AgentId,
+        thread_id: &str,
+    ) -> LoadedTranscript {
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/harness/tests/fixtures/codex"
+        );
+        let folder = home.path().join(".codex/sessions/2026/10/11");
+        std::fs::create_dir_all(&folder).unwrap();
+        for (id, name) in [
+            (CODEX_FORK_PARENT, "fork-parent"),
+            (CODEX_FORK_CHILD, "fork-child"),
+        ] {
+            std::fs::copy(
+                format!("{fixtures}/{name}.session.jsonl"),
+                folder.join(format!("rollout-2026-10-11T00-00-00-{id}.jsonl")),
+            )
+            .unwrap();
+        }
+        switchboard_harness::load_codex_transcript(
+            home.path(),
+            home.path(),
+            thread_id,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 11).unwrap()),
+            agent,
+        )
+        .unwrap()
+    }
+
+    fn codex_send(send_id: SendId, agent: AgentId, prompt: &str, at: &str) -> JournalRecord {
+        JournalRecord::Send {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: agent,
+            prompt: prompt.to_owned(),
+            attachments: Vec::new(),
+            at: ts(at),
+        }
+    }
+
+    fn codex_link(send_id: SendId, agent: AgentId, key: &str, at: &str) -> JournalRecord {
+        JournalRecord::TurnLink {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: agent,
+            hydration_key: key.to_owned(),
+            at: ts(at),
+        }
+    }
+
+    #[test]
+    fn merge_codex_fork_renders_inherited_history_as_imported_beside_its_parent() {
+        // The fork's inherited turn carries the parent's prompt, timestamps and
+        // hydration key. With both agents in one project, the parent's turns
+        // claim only the parent's sends, the fork's inherited copy claims
+        // nothing, and the fork's own turns claim the fork's sends. The
+        // parent's second turn, written after the fork, appears only once.
+        let home = TempDir::new().unwrap();
+        let (parent, fork) = (Uuid::now_v7(), Uuid::now_v7());
+        let parent_transcript = load_codex_fork_fixture(&home, parent, CODEX_FORK_PARENT);
+        let fork_transcript = load_codex_fork_fixture(&home, fork, CODEX_FORK_CHILD);
+        let [p1, p2, f1, f2] = [
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        ];
+        let journal = vec![
+            codex_send(p1, parent, CODEX_PELICAN, "2026-10-11T18:03:50.000Z"),
+            codex_link(p1, parent, CODEX_PARENT_KEYS[0], "2026-10-11T18:03:52.600Z"),
+            codex_send(f1, fork, CODEX_CHILD_FIRST, "2026-10-11T18:04:15.000Z"),
+            codex_link(f1, fork, CODEX_CHILD_KEYS[0], "2026-10-11T18:04:17.900Z"),
+            codex_send(p2, parent, CODEX_OTTER, "2026-10-11T18:04:35.000Z"),
+            codex_link(p2, parent, CODEX_PARENT_KEYS[1], "2026-10-11T18:04:38.100Z"),
+            codex_send(f2, fork, CODEX_CHILD_SECOND, "2026-10-11T18:04:39.000Z"),
+            codex_link(f2, fork, CODEX_CHILD_KEYS[1], "2026-10-11T18:04:41.300Z"),
+        ];
+
+        let merged = merge_project_conversation(
+            journal,
+            vec![
+                (parent, parent_transcript, None),
+                (fork, fork_transcript, None),
+            ],
+        );
+
+        assert_eq!(
+            turns_of(&merged, parent),
+            vec![
+                (Some(CODEX_PARENT_KEYS[0]), Some(p1)),
+                (Some(CODEX_PARENT_KEYS[1]), Some(p2)),
+            ],
+            "the parent renders exactly as it would with no fork in the project"
+        );
+        assert_eq!(
+            turns_of(&merged, fork),
+            vec![
+                (Some(CODEX_PARENT_KEYS[0]), None),
+                (Some(CODEX_CHILD_KEYS[0]), Some(f1)),
+                (Some(CODEX_CHILD_KEYS[1]), Some(f2)),
+            ],
+            "the inherited turn claims nothing; the fork's own turns claim its sends"
+        );
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![
+                (CODEX_PELICAN, Some(p1)),
+                (CODEX_PELICAN, None),
+                (CODEX_CHILD_FIRST, Some(f1)),
+                (CODEX_OTTER, Some(p2)),
+                (CODEX_CHILD_SECOND, Some(f2)),
+            ],
+        );
+    }
+
+    #[test]
+    fn merge_codex_fork_without_turn_links_still_imports_its_inherited_prompt() {
+        // Codex prompts carry no provenance, so with no `TurnLink` to join on
+        // the merge falls back to counting turns against sends. The inherited
+        // turn predates the fork's first send, so it counts as history from
+        // before Switchboard dispatched anything, not as a reply to that send.
+        let home = TempDir::new().unwrap();
+        let fork = Uuid::now_v7();
+        let transcript = load_codex_fork_fixture(&home, fork, CODEX_FORK_CHILD);
+        let [f1, f2] = [Uuid::now_v7(), Uuid::now_v7()];
+        let journal = vec![
+            codex_send(f1, fork, CODEX_CHILD_FIRST, "2026-10-11T18:04:15.000Z"),
+            codex_send(f2, fork, CODEX_CHILD_SECOND, "2026-10-11T18:04:39.000Z"),
+        ];
+
+        let merged = merge_project_conversation(journal, vec![(fork, transcript, None)]);
+
+        assert_eq!(
+            rendered_prompts(&merged),
+            vec![
+                (CODEX_PELICAN, None),
+                (CODEX_CHILD_FIRST, Some(f1)),
+                (CODEX_CHILD_SECOND, Some(f2)),
+            ],
+        );
+        assert_eq!(
+            turns_of(&merged, fork),
+            vec![
+                (Some(CODEX_PARENT_KEYS[0]), None),
+                (Some(CODEX_CHILD_KEYS[0]), Some(f1)),
+                (Some(CODEX_CHILD_KEYS[1]), Some(f2)),
             ],
         );
     }

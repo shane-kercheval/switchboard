@@ -7,8 +7,9 @@
 //! and no parser warnings — plus the sidebar-bearing metadata fields
 //! (per-harness usage, rate-limit, registries) survive the round-trip.
 //!
-//! The Codex test exercises the **sidecar-driven** lookup path (matches
-//! `commands::load_transcript_impl`'s production path). The Codex
+//! The Codex test exercises the **sidecar-driven** lookup path (matches the
+//! production path, `commands::load_agent_transcript`, which the project read
+//! calls for each agent). The Codex
 //! attach-existing-session locator (`find_codex_session_file_for_attach`)
 //! has its own coverage and is not duplicated here.
 //!

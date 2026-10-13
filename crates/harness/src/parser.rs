@@ -467,9 +467,9 @@ impl ParserState {
 /// family word (`some-vendor-opus-proxy`).
 ///
 /// **Probed @ 2.1.241 with Switchboard's exact `-p` flags** (`claude-fable-5-1`
-/// added @ 2.1.257, `claude-opus-5-5` @ 2.1.280 and `claude-sonnet-5-5` @
-/// 2.1.284, each when its alias moved to it) — the requested level is written
-/// back verbatim for exactly these six:
+/// added @ 2.1.257, `claude-opus-5-5` @ 2.1.280, `claude-sonnet-5-5` @ 2.1.284
+/// and `claude-haiku-5-5` @ 2.1.296, each when its alias moved to it) — the
+/// requested level is written back verbatim for exactly these seven:
 ///
 /// | id | `--effort` sent | recorded |
 /// |---|---|---|
@@ -479,6 +479,7 @@ impl ParserState {
 /// | `claude-sonnet-5-5` | `low` / `max` | `"low"` / `"max"` (`max` recorded even with thinking disabled — no clamp) |
 /// | `claude-fable-5` | `low` | `"low"` (upper bound on disk unprobed; full-id pinning only) |
 /// | `claude-fable-5-1` | `low` / `max` | `"low"` / `"max"` (`max` is the live loop's standing check) |
+/// | `claude-haiku-5-5` | `low` / `max` | `"low"` / `"max"` (`max` recorded even with thinking disabled — no clamp) |
 /// | `claude-haiku-4-5-20251001` | `max` / `low` | *no key written* |
 ///
 /// Every other id — older, newer, or third-party — is **withheld because it is
@@ -493,13 +494,14 @@ impl ParserState {
 /// live-vs-disk mismatch — which is the signal to probe the new id and add it.
 /// See the "Model catalog" step in `harness-update-review.md`.
 fn model_records_effort(model: &str) -> bool {
-    const EFFORT_RECORDING_MODELS: [&str; 6] = [
+    const EFFORT_RECORDING_MODELS: [&str; 7] = [
         "claude-opus-5",
         "claude-opus-5-5",
         "claude-sonnet-5",
         "claude-sonnet-5-5",
         "claude-fable-5",
         "claude-fable-5-1",
+        "claude-haiku-5-5",
     ];
     EFFORT_RECORDING_MODELS.contains(&model)
 }
@@ -1861,6 +1863,7 @@ mod tests {
             "claude-sonnet-5-5",
             "claude-fable-5",
             "claude-fable-5-1",
+            "claude-haiku-5-5",
         ] {
             assert_eq!(
                 terminal_effort_for(model, Some("xhigh")),
@@ -1872,10 +1875,11 @@ mod tests {
 
     #[test]
     fn terminal_withholds_effort_for_a_model_with_no_effort_axis() {
-        // Haiku accepts `--effort` silently and records NO effort key, so
+        // Haiku 4.5 accepts `--effort` silently and records NO effort key, so
         // stamping would show a level live that vanishes on reopen. This is the
-        // regression that made the ungated stamp wrong for a default picker
-        // model (`harness-behavior.md` §3.4).
+        // regression that made the ungated stamp wrong while it was the `haiku`
+        // alias's model (`harness-behavior.md` §3.4); it is still selectable by
+        // its full id.
         assert_eq!(
             terminal_effort_for("claude-haiku-4-5-20251001", Some("max")),
             None

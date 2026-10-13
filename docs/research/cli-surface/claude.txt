@@ -1,4 +1,4 @@
-version: 2.1.284 (Claude Code)
+version: 2.1.296 (Claude Code)
 
 ===== claude --help
 Usage: claude [options] [command] [prompt]
@@ -64,12 +64,6 @@ Options:
   --brief                               Enable SendUserMessage tool for
                                         agent-to-user communication
   --chrome                              Enable Claude in Chrome integration
-  --client-data-url <url>               URL for a signed configuration document.
-                                        Claude Code exits if it cannot load it
-                                        or it does not cover the selected model.
-                                        Setting CLAUDE_CODE_CLIENT_DATA_URL
-                                        instead keeps the URL out of the process
-                                        list
   --cloud [description|session_id|url]  Create a cloud session with the given
                                         description, or attach to an existing
                                         one by session ID or claude.ai/code URL
@@ -83,6 +77,9 @@ Options:
                                         "!1p,!file")
   --debug-file <path>                   Write debug logs to a specific file path
                                         (implicitly enables debug mode)
+  --desktop                             Open in the Claude Desktop app instead
+                                        of the terminal (with --continue or
+                                        --resume <id> to pick the session)
   --disable-slash-commands              Disable all skills
   --disallowedTools, --disallowed-tools <tools...>
       Comma or space-separated list of tool names to deny (e.g. "Bash(git *)
@@ -270,10 +267,11 @@ Options:
 
 Commands:
   agents [options]                      Manage background agents
-  attach <id>                           Open a background session in this
+  attach <id|name>                      Open a background session in this
                                         terminal. <id> is the short id that
                                         `claude --bg` prints and `claude agents`
-                                        lists
+                                        lists. Part of the session name works
+                                        too
   auth                                  Manage authentication
   auto-mode                             Inspect or reset auto mode classifier
                                         configuration
@@ -289,11 +287,13 @@ Commands:
   install [options] [target]            Install Claude Code native build. Use
                                         [target] to specify version (stable,
                                         latest, or specific version)
-  logs <id>                             Print a background session's recent
+  logs <id|name>                        Print a background session's recent
                                         terminal output
   mcp                                   Configure and manage MCP servers
   plugin|plugins                        Manage Claude Code plugins
-  project                               Manage Claude Code project state
+  purge [options] [path]                Delete all Claude Code state for a
+                                        project (transcripts, tasks, file
+                                        history, config entry)
   respawn [options] [id]                Restart a background session, or all of
                                         them with --all, so it runs the current
                                         Claude Code version
@@ -360,9 +360,9 @@ Options:
                                         in dispatched sessions
 
 ===== claude attach --help
-Usage: claude attach <id>
+Usage: claude attach <id|name>
 
-  Open the background session in this terminal. ← returns to agent view, Ctrl+Z drops back to your shell. The session keeps running either way.
+  Open the background session in this terminal. ← returns to agent view, Ctrl+Z drops back to your shell. The session keeps running either way. Part of the session name works in place of the id. Put a name with spaces in quotes.
 
 ===== claude auth --help
 Usage: claude auth [options] [command]
@@ -510,9 +510,9 @@ Options:
   -h, --help  Display help for command
 
 ===== claude logs --help
-Usage: claude logs <id>
+Usage: claude logs <id|name>
 
-  Print the background session's recent terminal output.
+  Print the background session's recent terminal output. Part of the session name works in place of the id. Put a name with spaces in quotes.
 
 ===== claude mcp --help
 Usage: claude mcp [options] [command]
@@ -695,6 +695,9 @@ Options:
   -h, --help                           Display help for command
 
 Commands:
+  configure [options] <plugin>         Show a plugin's options and which are
+                                       unset, or save values from stdin with
+                                       --values-stdin
   details [options] <name>             Show a plugin's component inventory and
                                        projected token cost
   disable [options] [plugin]           Disable an enabled plugin
@@ -734,12 +737,25 @@ Commands:
                                        plugin release, validating that
                                        plugin.json and any enclosing marketplace
                                        entry agree
+  test [dir]                           Run a mod's tests
   uninstall|remove [options] <plugin>  Uninstall an installed plugin
   update [options] <plugin>            Update a plugin to the latest version
                                        (restart required to apply)
   validate [options] <path>            Validate a plugin or marketplace
                                        manifest, or the skills, agents, and
                                        commands in a directory
+
+===== claude plugin configure --help
+Usage: claude plugin configure [options] <plugin>
+
+Show a plugin's options and which are unset, or save values from stdin with
+--values-stdin
+
+Options:
+  -h, --help      Display help for command
+  --json          Output as JSON
+  --values-stdin  Read option values from stdin as a JSON object of single-line
+                  strings; options left out keep their values
 
 ===== claude plugin details --help
 Usage: claude plugin details [options] <name>
@@ -916,14 +932,22 @@ Options:
                              the run refuses and reports the command again, to
                              be shown to a person again
   --config <key=value>       Set a userConfig option declared in the plugin's
-                             manifest (repeatable). Values are validated against
-                             the schema and stored via the same path as the
+                             manifest, or a bundled .mcpb server's own
+                             user_config field as <server>.<key>=<value> (a bare
+                             key works when only one bundled server declares
+                             it). Repeatable. Values are validated against the
+                             schema and stored via the same path as the
                              interactive /plugin configure flow.
   -h, --help                 Display help for command
   --json                     Print one machine-readable result line on stdout
                              instead of the human message (same exit codes; a
                              marketplace-declared command is still shown and
                              must be confirmed — pass -y when not interactive)
+  --marketplace <source>     Install <plugin> (its bare name) from the
+                             marketplace at this source: owner/repo, a git or
+                             https URL, or a path. A marketplace not added yet
+                             is added first, in user settings, under the same
+                             checks as 'plugin marketplace add'
   --registry <url>           For a <package>@npm install: resolve and download
                              from this npm registry instead of the one your npm
                              configuration selects
@@ -941,9 +965,12 @@ Usage: claude plugin list [options]
 List installed plugins
 
 Options:
-  --available  Include available plugins from marketplaces (requires --json)
-  -h, --help   Display help for command
-  --json       Output as JSON
+  --available           Include available plugins from marketplaces (requires
+                        --json)
+  --data-size [plugin]  Measure each installed plugin's saved data directory, or
+                        only the named plugin's (requires --json)
+  -h, --help            Display help for command
+  --json                Output as JSON
 
 ===== claude plugin marketplace --help
 Usage: claude plugin marketplace [options] [command]
@@ -971,6 +998,8 @@ Options:
                        you, by its listed name or its local name (see: claude
                        plugin marketplace list)
   -h, --help           Display help for command
+  --json               Print one machine-readable result line as the last line
+                       on stdout (same exit codes)
   --scope <scope>      Where to declare the marketplace: user (default),
                        project, or local
   --sparse <paths...>  Limit checkout to specific directories via git
@@ -993,6 +1022,8 @@ Remove a configured marketplace
 
 Options:
   -h, --help       Display help for command
+  --json           Print one machine-readable result line as the last line on
+                   stdout (same exit codes)
   --scope <scope>  Remove the marketplace declaration from a specific settings
                    scope: user, project, or local. Omit to remove it from every
                    scope.
@@ -1004,6 +1035,8 @@ Update marketplace(s) from their source - updates all if no name specified
 
 Options:
   -h, --help  Display help for command
+  --json      With a marketplace name: print one machine-readable result line as
+              the last line on stdout (same exit codes)
 
 ===== claude plugin prune --help
 Usage: claude plugin prune|autoremove [options]
@@ -1030,6 +1063,21 @@ Options:
   -m, --message <msg>  Tag annotation message (use %s for the version)
   --push               Push the tag to --remote after creating it
   --remote <name>      Remote to push to with --push (default: "origin")
+
+===== claude plugin test --help
+Usage: claude plugin test [dir]
+
+Run a mod's tests
+
+Arguments:
+  dir         The mod's folder (default: the current folder)
+
+Options:
+  -h, --help  Display help for command
+
+Runs every *.test.ts and *.test.tsx under dir, each file in a child of this
+binary, in an environment like the one the mod's hooks run in. A test file
+imports its kit from 'claude-code/testing'. Exits 1 when a test fails.
 
 ===== claude plugin uninstall --help
 Usage: claude plugin uninstall|remove [options] <plugin>
@@ -1090,21 +1138,8 @@ Options:
               unrecognized fields, missing metadata, and other issues that the
               runtime tolerates.
 
-===== claude project --help
-Usage: claude project [options] [command]
-
-Manage Claude Code project state
-
-Options:
-  -h, --help              Display help for command
-
-Commands:
-  help [command]          display help for command
-  purge [options] [path]  Delete all Claude Code state for a project
-                          (transcripts, tasks, file history, config entry)
-
-===== claude project purge --help
-Usage: claude project purge [options] [path]
+===== claude purge --help
+Usage: claude purge [options] [path]
 
 Delete all Claude Code state for a project (transcripts, tasks, file history,
 config entry)
@@ -1205,7 +1240,6 @@ mcp
 model
 output-style
 plugin-authoring
-plugin-types
 recap
 reload-plugins
 reload-skills

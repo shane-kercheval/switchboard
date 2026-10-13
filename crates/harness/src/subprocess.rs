@@ -1511,6 +1511,30 @@ pub async fn terminate_then_kill(child: &mut tokio::process::Child) {
     }
 }
 
+/// SIGKILL every process left in the group `leader_pid` led, after the leader
+/// itself has exited and been reaped.
+///
+/// For a harness that exits on its own, where [`terminate_then_kill`] cannot
+/// be used: once the leader is reaped `Child::id()` is `None`, so the caller
+/// captures the pid at spawn and passes it here. Sending SIGTERM first is
+/// deliberately skipped, because nothing here is asking a healthy process to
+/// stop: the leader is already gone, and anything still in its group is a
+/// leftover.
+///
+/// Signalling a group after its leader was reaped carries the same small risk
+/// [`terminate_then_kill`] already accepts with its final sweep: a recycled pid.
+/// Pids are allocated sequentially, so the leader's pid is not handed out again
+/// for a long while after it is freed.
+pub fn kill_process_group(leader_pid: u32) {
+    #[cfg(unix)]
+    killpg_signal(
+        nix::unistd::Pid::from_raw(leader_pid.cast_signed()),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    #[cfg(not(unix))]
+    let _ = leader_pid;
+}
+
 /// Signal a process group, ignoring `ESRCH` ("no such process" — the group
 /// already exited between the caller's check and this signal, which is a
 /// no-op success, not a failure).

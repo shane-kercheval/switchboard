@@ -30,13 +30,18 @@
     cancelSend,
     getLocalSend,
     getTranscriptRevision,
-    retryAgentHydration,
     retryAgentSubscription,
     runtimes,
     transcripts,
     type Turn,
   } from "$lib/state/index.svelte";
-  import { agentsByProject, isAwaitingForkHistory } from "$lib/state/workspace.svelte";
+  import {
+    agentsByProject,
+    historyRetryBlock,
+    isAwaitingForkHistory,
+    projectHistoryRetryBlock,
+    retryAgentHistory,
+  } from "$lib/state/workspace.svelte";
   import {
     answerItemsOf,
     answerTextOf,
@@ -77,6 +82,7 @@
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import UserMessageBody from "$lib/components/UserMessageBody.svelte";
+  import { inheritedHistoryNotice } from "$lib/inheritedHistory";
   import { consumeJump, jumpRequest } from "$lib/state/transcriptJump.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import Button from "$lib/components/ui/Button.svelte";
@@ -105,6 +111,25 @@
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
   type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
+  type MarkerRow = Extract<UnifiedRow, { kind: "system_marker" }>;
+
+  /// What a marker row's hover copy button copies, and its label. A marker kind
+  /// with nothing worth copying gets an empty string, which hides the button.
+  function markerCopy(marker: MarkerRow["marker"]): { copyable: string; label: string } {
+    switch (marker.marker_kind) {
+      case "compaction":
+        return { copyable: marker.summary, label: "Copy summary" };
+      case "slash_command":
+        return { copyable: marker.command, label: "Copy command" };
+      case "inherited_history_unavailable": {
+        const notice = inheritedHistoryNotice(marker.reason);
+        const session = marker.rollout_id ? ` Codex session ${marker.rollout_id}` : "";
+        return { copyable: `${notice.title}. ${notice.detail}${session}`, label: "Copy notice" };
+      }
+      default:
+        return { copyable: "", label: "Copy" };
+    }
+  }
 
   /// `agents` is the active project's roster (for attribution + flattening
   /// their per-agent transcripts). `overlay` is the project's hydrated
@@ -1677,11 +1702,15 @@
   }
 </script>
 
+<!-- `retryBlock` is why Retry can't run right now; the button then stays on
+     screen, `aria-disabled` rather than `disabled` so hovering still opens the
+     tooltip that says why. -->
 {#snippet failureBanner(
   testid: string,
   message: string,
   onRetry: (() => void) | undefined,
   onDetails: () => void,
+  retryBlock: string | null = null,
 )}
   <div
     class="border-status-failed/40 bg-status-failed-soft/40 mb-3 flex items-center justify-between gap-3 rounded-md border px-3 py-2"
@@ -1689,7 +1718,22 @@
   >
     <span class="text-status-failed text-xs">{message}</span>
     <div class="flex shrink-0 items-center gap-2">
-      {#if onRetry}
+      {#if onRetry && retryBlock !== null}
+        <Tooltip label={retryBlock}>
+          {#snippet trigger(props)}
+            <Button
+              {...props}
+              variant="secondary"
+              size="sm"
+              aria-disabled="true"
+              class="cursor-not-allowed opacity-50"
+              data-testid={`${testid}-retry`}
+            >
+              Retry
+            </Button>
+          {/snippet}
+        </Tooltip>
+      {:else if onRetry}
         <Button variant="secondary" size="sm" data-testid={`${testid}-retry`} onclick={onRetry}>
           Retry
         </Button>
@@ -2408,6 +2452,20 @@
         >
           Ran <span class="font-mono normal-case">{row.marker.command}</span>
         </div>
+      {:else if row.marker.marker_kind === "inherited_history_unavailable"}
+        <!-- A Codex fork whose earlier conversation couldn't be loaded. Sits at
+             the fork's creation time, just above its own turns, so the gap is
+             explained where it is. -->
+        {@const notice = inheritedHistoryNotice(row.marker.reason)}
+        <div class="space-y-1 text-xs" data-testid="inherited-history-marker">
+          <div class="text-warning font-semibold">{notice.title}</div>
+          <p class="text-muted">{notice.detail}</p>
+          {#if row.marker.rollout_id}
+            <p class="text-muted" data-testid="inherited-history-session">
+              Codex session <span class="font-mono">{row.marker.rollout_id}</span>
+            </p>
+          {/if}
+        </div>
       {/if}
       <!-- Unknown marker_kind: render nothing (degrade gracefully on a future
            variant this build doesn't model). -->
@@ -2415,17 +2473,7 @@
     <!-- Same hover-revealed timestamp + copy as every other row (copies the
          verbatim recap). Also restores the inter-row spacing the bare disclosure
          lost. -->
-    {@render messageMeta({
-      at: row.at,
-      copyable:
-        row.marker.marker_kind === "compaction"
-          ? row.marker.summary
-          : row.marker.marker_kind === "slash_command"
-            ? row.marker.command
-            : "",
-      label: row.marker.marker_kind === "slash_command" ? "Copy command" : "Copy summary",
-      mt: "mt-2.5",
-    })}
+    {@render messageMeta({ at: row.at, ...markerCopy(row.marker), mt: "mt-2.5" })}
   </div>
 {/snippet}
 
@@ -2448,8 +2496,9 @@
       <p class="text-muted text-sm">Loading history…</p>
     </div>
   {:else if loadStatus === "loading"}
-    <!-- Rows are already on screen (per-agent hydration landed first) — a
-         small note above them, not a centered takeover over visible content. -->
+    <!-- Rows are already on screen (this session's live turns, or the view a
+         project Retry keeps while it rereads) — a small note above them, not a
+         centered takeover over visible content. -->
     <p class="text-muted mb-3 text-xs italic" data-testid="transcript-loading">Loading history…</p>
   {:else if loadStatus === "failed"}
     {@render failureBanner(
@@ -2462,6 +2511,7 @@
           "The project's conversation history failed to load. The exact error is below — copy it into a bug report.",
           loadError ?? "No error detail was reported.",
         ),
+      projectHistoryRetryBlock(projectId),
     )}
   {/if}
 
@@ -2473,13 +2523,14 @@
     {@render failureBanner(
       "agent-hydration-failed",
       `Couldn't load ${agent.name}'s history.`,
-      () => void retryAgentHydration(agent.id),
+      () => void retryAgentHistory(agent.id),
       () =>
         openDetails(
           `Couldn't load ${agent.name}'s history`,
           "This agent's history failed to load. The exact error is below — copy it into a bug report.",
           runtimes[agent.id]?.hydration_error ?? "No error detail was reported.",
         ),
+      historyRetryBlock(agent),
     )}
   {/each}
 

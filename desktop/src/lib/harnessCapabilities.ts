@@ -48,3 +48,25 @@ export function supportsContextReport(harness: HarnessKind | undefined): boolean
 export function supportsAccountUsageRead(harness: HarnessKind | undefined): boolean {
   return harness === "codex";
 }
+
+/// Whether the compose box offers **Fork** for this harness: send this message
+/// to a new agent that inherits the conversation so far.
+///
+/// Claude Code and Codex. They fork differently (Claude's branch comes into
+/// existence as its first turn, Codex's is created first and then sent to), but
+/// the compose action is the same for both. Antigravity forks only server-side,
+/// on its own initiative, so Switchboard can't offer it.
+export function supportsComposeFork(harness: HarnessKind | undefined): boolean {
+  return harness === "claude_code" || harness === "codex";
+}
+
+/// Whether this harness can fork **without a turn**: the new agent exists, with
+/// the conversation inherited, before anything is sent to it.
+///
+/// Codex only (`HarnessKind::supports_fork_without_turn`). Two things follow
+/// from it: such a fork's earlier conversation can be shown as soon as it is
+/// created, and it can be offered on its own, as the agent card's Fork item.
+/// A Claude branch can only come into existence as a turn, so it can't.
+export function supportsForkWithoutTurn(harness: HarnessKind | undefined): boolean {
+  return harness === "codex";
+}

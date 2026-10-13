@@ -12,9 +12,10 @@ use futures::StreamExt;
 use serde_json::json;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
-    AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
-    ContextWindowSource, DispatchOptions, EditChange, FailureKind, HarnessAdapter, RateLimitSource,
-    ToolFacet, Turn, TurnItem, TurnOutcome, UserPromptSource, claude_session_file_path,
+    AdapterEvent, AntigravityAdapter, CODEX_FORK_TIMEOUT, ClaudeCodeAdapter, CodexAdapter,
+    ContentKind, ContextWindowSource, DispatchOptions, EditChange, FailureKind, HarnessAdapter,
+    RateLimitSource, ToolFacet, Turn, TurnItem, TurnOutcome, UserPromptSource,
+    claude_session_file_path, find_codex_session_file_for_attach, fork_codex_session,
     load_antigravity_transcript, load_claude_transcript, load_codex_transcript,
 };
 use uuid::Uuid;
@@ -929,7 +930,7 @@ async fn live_claude_session_file_effort_matches_the_dispatched_level() {
     //
     //   - an effort-recording family that stopped recording would strand the
     //     reopen path while the live stamp kept claiming a level;
-    //   - Haiku *starting* to record would mean the gate is needlessly
+    //   - Haiku 4.5 *starting* to record would mean the gate is needlessly
     //     withholding a level we could show.
     //
     // It is also the staleness tripwire for the gate's exact-id allowlist: when
@@ -938,9 +939,11 @@ async fn live_claude_session_file_effort_matches_the_dispatched_level() {
     // the new id rather than letting it echo unverified.
     //
     // Either drift is silent offline, which is what let the ungated stamp ship.
-    // Every alias the gate echoes for, plus the one it withholds for. Covering
+    // Every alias the gate echoes for, plus one model it withholds for. Covering
     // only a subset would leave an upstream change to an uncovered family
-    // silently recreating the bug this gate exists to prevent.
+    // silently recreating the bug this gate exists to prevent. No alias points
+    // at a no-axis model since `haiku` moved to Haiku 5.5 (2.1.293), so the
+    // withheld case pins Haiku 4.5 by its full id, which is still selectable.
     //
     // Fable is sent `max`, the other recording families `low`: a boolean gate
     // cannot see a model that records a *clamped* level for an upper effort
@@ -952,7 +955,8 @@ async fn live_claude_session_file_effort_matches_the_dispatched_level() {
         ("opus", "low", Some("low")),
         ("sonnet", "low", Some("low")),
         ("fable", "max", Some("max")),
-        ("haiku", "low", None),
+        ("haiku", "low", Some("low")),
+        ("claude-haiku-4-5", "low", None),
     ] {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let adapter = ClaudeCodeAdapter::new();
@@ -2621,6 +2625,214 @@ async fn live_codex_resume_reuses_session() {
     assert!(
         codex_capture(&events2).is_none(),
         "a resume must not re-capture the locator"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_fork_without_a_prompt_creates_an_idle_session_that_inherits_context() {
+    // The promptless fork Switchboard uses to fork a Codex agent without
+    // locking its parent for a whole turn: create the fork with no turn, then
+    // send it an ordinary resume. The recall proves the fork carries the
+    // parent's conversation; the absence of `task_started` proves creation ran
+    // no turn. Pinned to the cheapest model at low effort, which also lets the
+    // test check that the selection reaches the fork.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+    let adapter = CodexAdapter::new();
+    let mut agent = live_codex_agent();
+    agent.model = Some("gpt-6-luna".to_owned());
+    agent.effort = Some("low".to_owned());
+
+    let parent_events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Remember the code word 'KESTREL-58'. Reply with only 'ok'.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("parent dispatch should succeed")
+        .collect()
+        .await;
+    let (parent_thread_id, _) =
+        codex_capture(&parent_events).expect("the parent's first dispatch captures a locator");
+
+    let fork = fork_codex_session(
+        Path::new("codex"),
+        &home,
+        tmp.path(),
+        &parent_thread_id,
+        &agent.selection(),
+        CODEX_FORK_TIMEOUT,
+    )
+    .await
+    .expect("a promptless fork should succeed");
+    assert_ne!(fork.thread_id, parent_thread_id);
+
+    let rollout = find_codex_session_file_for_attach(&home, &fork.thread_id)
+        .expect("the fork's rollout exists")
+        .0;
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&rollout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        !records
+            .iter()
+            .any(|r| r["payload"]["type"] == "task_started"),
+        "creating a fork must run no turn; records: {records:?}"
+    );
+    let meta = &records[0]["payload"];
+    assert_eq!(
+        meta["history_base"]["thread_id"], parent_thread_id,
+        "the fork must point into its parent's rollout"
+    );
+    let recorded_cwd = std::path::PathBuf::from(meta["cwd"].as_str().expect("session_meta.cwd"));
+    assert_eq!(
+        std::fs::canonicalize(recorded_cwd).unwrap(),
+        std::fs::canonicalize(tmp.path()).unwrap(),
+        "the fork must belong to the folder it was created in"
+    );
+    let settings = records
+        .iter()
+        .find(|r| r["payload"]["type"] == "thread_settings_applied")
+        .map(|r| &r["payload"]["thread_settings"])
+        .expect("the fork records its settings");
+    assert_eq!(settings["model"], "gpt-6-luna");
+    assert_eq!(settings["reasoning_effort"], "low");
+
+    let fork_agent = AgentRecord {
+        id: Uuid::now_v7(),
+        session_locator: Some(fork.into()),
+        ..agent.clone()
+    };
+    let fork_events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &fork_agent,
+            tmp.path(),
+            "What code word did I ask you to remember? Reply with only that word.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("the fork's first turn should dispatch")
+        .collect()
+        .await;
+    let reply: String = fork_events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        reply.to_uppercase().contains("KESTREL-58"),
+        "the fork's first turn must see the parent's conversation; reply was {reply:?}"
+    );
+}
+
+/// Dispatch one turn to `agent` in `cwd` and return its events.
+async fn live_codex_turn(
+    adapter: &CodexAdapter,
+    agent: &AgentRecord,
+    cwd: &Path,
+    prompt: &str,
+) -> Vec<AdapterEvent> {
+    adapter
+        .dispatch(
+            agent,
+            cwd,
+            prompt,
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed")
+        .collect()
+        .await
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_fork_loads_the_parents_history_up_to_the_fork_point() {
+    // The parent's history reaches a Codex fork only through the pointer the
+    // fork's rollout stores, so this is the end-to-end proof that the loader
+    // follows it, stops at the recorded cut-off, and never shows the parent's
+    // later turns. Pinned to the cheapest model at low effort.
+    const FIRST: &str = "Remember the word 'heron'. Reply with only 'ok'.";
+    const SECOND: &str = "Remember the word 'willow'. Reply with only 'ok'.";
+    const FORK_OWN: &str = "Reply with only 'ok'.";
+    const AFTER_FORK: &str = "Remember the word 'quartz'. Reply with only 'ok'.";
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+    let adapter = CodexAdapter::new();
+    let mut parent = live_codex_agent();
+    parent.model = Some("gpt-6-luna".to_owned());
+    parent.effort = Some("low".to_owned());
+
+    let first = live_codex_turn(&adapter, &parent, tmp.path(), FIRST).await;
+    let (parent_thread_id, partition_date) =
+        codex_capture(&first).expect("the parent's first dispatch captures a locator");
+    parent.session_locator = Some(SessionLocator::Codex {
+        thread_id: parent_thread_id.clone(),
+        partition_date,
+    });
+    live_codex_turn(&adapter, &parent, tmp.path(), SECOND).await;
+
+    let fork_locator = fork_codex_session(
+        Path::new("codex"),
+        &home,
+        tmp.path(),
+        &parent_thread_id,
+        &parent.selection(),
+        CODEX_FORK_TIMEOUT,
+    )
+    .await
+    .expect("a promptless fork should succeed");
+    let fork = AgentRecord {
+        id: Uuid::now_v7(),
+        session_locator: Some(fork_locator.clone().into()),
+        ..parent.clone()
+    };
+    live_codex_turn(&adapter, &fork, tmp.path(), FORK_OWN).await;
+    live_codex_turn(&adapter, &parent, tmp.path(), AFTER_FORK).await;
+
+    let transcript = load_codex_transcript(
+        &home,
+        tmp.path(),
+        &fork_locator.thread_id,
+        Some(fork_locator.partition_date),
+        fork.id,
+    )
+    .expect("the fork's transcript loads");
+    let prompts: Vec<&str> = transcript
+        .turns
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    // Printed so a person can compare the order with the rollouts by hand.
+    println!(
+        "fork {} prompts in order: {prompts:#?}",
+        fork_locator.thread_id
+    );
+    assert_eq!(
+        prompts,
+        [FIRST, SECOND, FORK_OWN],
+        "the parent's two turns before the fork, then the fork's own, and never the \
+         parent's turn after the fork"
+    );
+    assert!(
+        transcript
+            .turns
+            .iter()
+            .all(|turn| !matches!(turn, Turn::System { .. })),
+        "a fork whose parent is intact carries no unavailable-history marker"
     );
 }
 

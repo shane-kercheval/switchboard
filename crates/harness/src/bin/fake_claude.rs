@@ -25,6 +25,11 @@
 //!     (single line; empty when unset) to the given path. Tests use this to
 //!     assert the adapter ran us under the home it resolved the session file
 //!     under.
+//!   `// spawn_child_holding_stderr` (unix only) — start a child process that
+//!     inherits this process's stdio and process group and sleeps
+//!     indefinitely. Models a CLI that starts a helper: a teardown that kills
+//!     only the spawned process leaves this child running, so a whole-group
+//!     check catches it (`tests/common`). Same directive as `fake_codex`'s.
 //!   `// hang` — flush any lines emitted so far, then sleep indefinitely
 //!     (never exit on our own). Leaves the adapter's stdout read parked, so a
 //!     cancellation test can fire the token mid-stream (or, if `// hang` is the
@@ -106,6 +111,14 @@ fn main() {
             {
                 let _ = path;
             }
+            continue;
+        }
+
+        if line.trim() == "// spawn_child_holding_stderr" {
+            // Not tracked: the adapter's group kill reaps it, and if that kill
+            // regresses the test's whole-group check fails.
+            #[cfg(unix)]
+            let _ = std::process::Command::new("sleep").arg("3600").spawn();
             continue;
         }
 

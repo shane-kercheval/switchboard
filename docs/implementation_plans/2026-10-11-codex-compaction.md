@@ -9,7 +9,7 @@ Switchboard can compact a Claude Code agent's conversation on request, but not a
 These decisions came out of the investigation that preceded this plan and the plan's review. Each one states a reason that must survive into the code, as a comment next to the code it governs or in the commit message.
 
 - **The `compacted` record is the only source of a Codex compaction marker.** Codex writes two things per compaction: a top-level `compacted` record, and an `event_msg` → `item_completed` whose `item.type` is `ContextCompaction`. Codex's persistence policy writes `compacted` in every history mode, but writes the `item_completed` record only in "paginated" session files. Reading both would show two markers for one compaction. Reading only the item would miss compactions in older files.
-- **Only a compaction that runs as its own turn gets a marker. A compaction Codex runs on its own, partway through a reply, shows nothing, as today.** A compaction runs as its own turn when someone asked for it: Switchboard's "Compact context" (Milestone 3), or `/compact` in Codex's own interface. Codex's automatic compactions happen partway through a reply when the context fills, and they are the common kind: 387 of the 504 compactions counted on the developer's machine. The developer decided on 2026-10-12 not to mark them, for three reasons:
+- **Only a compaction that runs as its own turn gets a marker. A compaction Codex runs on its own, partway through a reply, shows nothing, as today.** A compaction runs as its own turn when someone asked for it: Switchboard's "Compact context" (Milestone 3), or `/compact` in Codex's own interface. Codex's automatic compactions happen inside a reply when the context fills, and they are the common kind. Of the 529 compactions in the developer's Codex rollouts (counted 2026-10-12), 408 came partway through a reply and 40 at its start, before any content. Only 81 ran as a turn of their own. The developer decided on 2026-10-12 not to mark them, for three reasons:
   - A Codex marker can only be a label, because Codex encrypts its summary (next decision). Claude Code's marker is worth showing mainly for its summary.
   - It would sit in the wrong place. A mid-reply marker would have to go after the whole reply, because splitting one Codex task into two agent turns on disk breaks the one-to-one match between a live turn and its disk turn, which the merge pairs by hydration key (`turn_context.turn_id`). This repo has already shipped that duplicated-transcript bug once, when Claude Code's mid-turn records split one live turn into several disk turns. Placed after the whole reply, a compaction followed by an hour of work would look as if it had just happened.
   - The sidebar's context bar already shows how full the context is.
@@ -44,8 +44,8 @@ Read these before writing code:
 
 **Outcomes:**
 
-- A user who reopens a project whose Codex agent ran a compaction as its own turn sees one "Conversation compacted" marker where it ran, and no empty agent turn before or after it. This covers 117 of the 504 compactions counted on the developer's machine, and any `/compact` run in Codex's own interface.
-- A turn in which Codex compacted on its own reads exactly as it does today: its content in full, and no marker.
+- A user who reopens a project whose Codex agent ran a compaction as its own turn sees one "Conversation compacted" marker where it ran, and no empty agent turn before or after it. That includes any `/compact` run in Codex's own interface. On the developer's machine it is 81 of 529 compactions (counted 2026-10-12).
+- A turn in which Codex compacted on its own reads exactly as it does today: its content in full, and no marker. That includes a compaction at the start of a turn, before any of its content.
 - A Codex turn that recorded no user prompt and no content shows nothing. Today such a turn shows as an empty agent turn with status `failed`. A cancelled compaction is the main source.
 - The Codex marker shows the label only: no summary preview, no expand control, no "Copy summary". Claude Code's marker looks exactly as it does today.
 - After reopening a project whose Codex agent's last turn was a compaction, the sidebar's context bar shows the last real turn's reading, not the compaction's figure.
@@ -86,7 +86,7 @@ Read these before writing code:
 - Update the Claude Code tests that construct `Compaction { summary }` to the new type. Their assertions don't change.
 - Docs:
   - In `docs/harness-behavior.md`, close G34 with the scope decided above: a compaction run as its own turn shows a summary-less marker, and a compaction Codex runs on its own partway through a reply shows nothing, by decision.
-  - Update §3.9's "Verified adjacent defect" paragraph and the paragraph after it to describe the current behavior, not the defect.
+  - Update §3.9's "Verified adjacent defect" paragraph and the paragraph after it to describe the current behavior, not the defect. In "How common it is", split the 117 compactions that "open their own turn": that count mixed compactions run as a turn of their own with ones at the start of a reply that has a prompt and content. A 2026-10-12 recount found 81 of the first kind and 40 of the second.
   - Add a README "Harness support and limitations" line: a Codex compaction marker shows no summary because Codex encrypts it, and a compaction Codex runs on its own partway through a reply shows no marker.
 
 ## Milestone 2: the Codex adapter can compact a session through a short-lived app-server

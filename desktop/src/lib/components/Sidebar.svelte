@@ -1209,15 +1209,13 @@
                 {:else if compactibleCount === 0}
                   <p class="font-medium">Nothing to compact</p>
                   <p class="text-primary-fg/70">
-                    Every agent was just compacted, hasn't been used yet, can't compact, or has a
-                    history that hasn't loaded. A failed load's Retry is on the agent's card.
+                    Every agent was just compacted, hasn't been used yet, or can't compact.
                   </p>
                 {:else}
                   <p class="font-medium">Compact every conversation</p>
                   <p class="text-primary-fg/70">
-                    Compacts {agentCount(compactibleCount)}, skipping any just compacted, never
-                    used, or whose history hasn't loaded. Each runs as a turn and queues if its
-                    agent is busy.
+                    Compacts {agentCount(compactibleCount)}, skipping any just compacted or never
+                    used. Each runs as a turn and queues if its agent is busy.
                   </p>
                 {/if}
               </div>

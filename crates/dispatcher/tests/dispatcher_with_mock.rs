@@ -311,6 +311,8 @@ type RateLimitCall = (AgentId, serde_json::Value, Option<String>, DateTime<Utc>)
 struct RecordingMetadataCache {
     calls: Mutex<Vec<RateLimitCall>>,
     context_window_calls: Mutex<Vec<ContextWindowCall>>,
+    /// `record_compaction_window` calls: agent, window, model, boundary id, time.
+    compaction_window_calls: Mutex<Vec<ContextWindowCall>>,
     turn_spend_calls: Mutex<Vec<TurnSpendCall>>,
     inventory_calls: Mutex<Vec<InventoryCall>>,
 }
@@ -342,6 +344,23 @@ impl MetadataCache for RecordingMetadataCache {
             context_window,
             model,
             message_id,
+            captured_at,
+        ));
+    }
+
+    fn record_compaction_window(
+        &self,
+        agent_id: AgentId,
+        context_window: u32,
+        model: String,
+        boundary_id: String,
+        captured_at: DateTime<Utc>,
+    ) {
+        self.compaction_window_calls.lock().unwrap().push((
+            agent_id,
+            context_window,
+            model,
+            boundary_id,
             captured_at,
         ));
     }
@@ -1818,6 +1837,62 @@ async fn stream_only_context_window_is_persisted_to_metadata_cache() {
     assert!(
         *captured_at >= before && *captured_at <= after,
         "captured_at must be stamped at record time (roughly now)"
+    );
+}
+
+#[tokio::test]
+async fn a_compactions_window_is_persisted_under_its_boundary_record() {
+    // A compaction has no message id, so its window is keyed by the
+    // `compact_boundary` record's `uuid` instead, through its own cache call.
+    // The message-keyed call must not fire for it: that snapshot belongs to
+    // the latest reply, and the compaction would overwrite it.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::CompletesWithContextWindow {
+            context_window: 200_000,
+            context_tokens_after_turn: Some(16_627),
+            stable_message_id: None,
+            source: ContextWindowSource::StreamOnlyCompaction {
+                model: "mock-model".to_owned(),
+                boundary_id: "boundary-uuid".to_owned(),
+            },
+        }],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let calls = metadata.compaction_window_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "persisted exactly once");
+    let (recorded_agent, context_window, model, boundary_id, _) = &calls[0];
+    assert_eq!(*recorded_agent, agent.id);
+    assert_eq!(*context_window, 200_000);
+    assert_eq!(model, "mock-model");
+    assert_eq!(boundary_id, "boundary-uuid");
+    assert!(
+        metadata.context_window_calls.lock().unwrap().is_empty(),
+        "the message-keyed snapshot is the latest reply's, not the compaction's"
     );
 }
 

@@ -972,7 +972,16 @@ export type ConversationItem =
 // bare `/compact`; other commands added as their shapes are observed) — shown so
 // the user sees it ran, but non-correlating.
 export type SystemMarker =
-  | { marker_kind: "compaction"; summary: string }
+  // `summary` is null when the harness wrote no readable recap (Codex encrypts
+  // its own), and the marker then renders as its label alone. `context_after`
+  // is how full the context is once the compaction is done, when the session
+  // file recorded it; the sidebar's context bar reads it after a reopen. Its
+  // `window` is null for Claude, whose file records none.
+  | {
+      marker_kind: "compaction";
+      summary: string | null;
+      context_after: { tokens: number; window: number | null } | null;
+    }
   | { marker_kind: "slash_command"; command: string }
   // A `/context` run recorded in the session file. Renders nothing — a report is
   // not conversation — and exists so a reopened project can fill the breakdown

@@ -66,7 +66,8 @@ export function forkBlockFor(projectId: ProjectId, agent: AgentRecord): string |
   return projectForkBlock(projectId) ?? agentForkBlock(agent);
 }
 
-/// Whether `agent` looks like it has a harness session to branch from.
+/// Whether `agent` looks like it has a harness session to branch from, or to
+/// compact: "Compact all" uses the same test to skip agents never sent anything.
 ///
 /// **A Codex session id is proof.** Switchboard records one only once Codex
 /// has created the session, so a Codex agent that has one has a session even
@@ -89,7 +90,7 @@ export function forkBlockFor(projectId: ProjectId, agent: AgentRecord): string |
 /// session file was written, which the backend then refuses with a precise
 /// error. Without a Codex session id, it refuses Fork for a real session that
 /// parses to zero turns (an empty or housekeeping-only file).
-function looksLikeItHasASession(agent: AgentRecord): boolean {
+export function looksLikeItHasASession(agent: AgentRecord): boolean {
   if (agent.session_locator !== null && "codex" in agent.session_locator) return true;
   if (runtimes[agent.id]?.hydration_status !== "complete") return true;
   return (transcripts[agent.id] ?? []).length > 0;

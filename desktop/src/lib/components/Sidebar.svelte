@@ -20,7 +20,7 @@
     X,
   } from "@lucide/svelte";
   import { flip } from "svelte/animate";
-  import type { AgentSelection, AgentRecord, AgentId, ProjectId } from "$lib/types";
+  import type { AgentSelection, AgentRecord, AgentId, ProjectId, TurnUsage } from "$lib/types";
   import {
     dispatchCompaction,
     dispatchContextReport,
@@ -34,6 +34,7 @@
     supportsManualCompaction,
   } from "$lib/harnessCapabilities";
   import {
+    conversations,
     forkAgentWithoutSending,
     historyRetryBlock,
     removeAgent,
@@ -65,7 +66,7 @@
     type AgentSessionInfo,
   } from "$lib/api";
   import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
-  import { cn, formatTokens } from "$lib/utils";
+  import { cn, formatTokens, isIsoTimestampAfter } from "$lib/utils";
   import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
@@ -87,6 +88,7 @@
     operationFor,
   } from "$lib/state/composeOperations.svelte";
   import { forkBlockFor } from "$lib/state/forkAvailability";
+  import { agentIsCompactible, compactAllBlock } from "$lib/state/compactionAvailability";
   import { workflowRuns } from "$lib/state/workflows.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
@@ -170,6 +172,12 @@
   /// Holds the armed button's confirm tooltip open. One boolean, because only
   /// one agent is ever armed, and it is bound only by the armed branch.
   let compactConfirmTooltipOpen = $state(false);
+  /// The header's "Compact all" button, armed the same way. Its own flag rather
+  /// than a sentinel in `compactConfirmAgentId`: the two are never armed at
+  /// once in practice (leaving one disarms it), and a sentinel would make every
+  /// per-agent comparison carry a special case.
+  let compactAllArmed = $state(false);
+  let compactAllTooltipOpen = $state(false);
   let removingAgentId = $state<AgentId | null>(null);
   let removeError = $state<{ agentId: AgentId; message: string } | null>(null);
   /// A failed Fork from an agent's menu, shown on that agent's card. A fork
@@ -712,6 +720,25 @@
     await dispatchCompaction(agentId, crypto.randomUUID());
   }
 
+  function disarmCompactAll(): void {
+    compactAllArmed = false;
+    compactAllTooltipOpen = false;
+  }
+
+  function agentCount(count: number): string {
+    return count === 1 ? "1 agent" : `${count} agents`;
+  }
+
+  /// Compact every agent that can be compacted, each as its own queued turn with
+  /// its own send id: a compaction is never a fan-out, so nothing groups them.
+  /// The eligible set is snapshotted first, because each dispatch registers a
+  /// pending compaction, which would remove that agent from the set mid-loop.
+  async function startCompactAll(): Promise<void> {
+    const ids = compactibleAgentIds;
+    disarmCompactAll();
+    await Promise.all(ids.map((id) => dispatchCompaction(id, crypto.randomUUID())));
+  }
+
   const COMPOSE_CLAIM_HELD = "Another send in this project is still in progress.";
 
   /// Why the menu's Fork item is unavailable for `agent`, or `null`. The
@@ -829,12 +856,74 @@
   }
 
   type ContextOccupancy = { usedTokens: number; windowTokens: number; fraction: number };
+  type CompactedReading = { at: string; tokens: number; window: number | null };
+
+  /// Each agent's newest compaction marker that recorded the compacted
+  /// context's size. Markers live in the project's merged conversation, not in
+  /// the agent's turn list, and that conversation changes only when history
+  /// loads or reloads. Derived once per such change rather than rescanned in
+  /// `contextOccupancy`, which reruns on every streamed update.
+  const latestCompactedContexts = $derived.by(() => {
+    // Rebuilt whole on each change, never mutated afterwards.
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const newest = new Map<AgentId, CompactedReading>();
+    for (const item of conversations[projectId]?.items ?? []) {
+      if (item.kind !== "system_marker") continue;
+      if (item.marker.marker_kind !== "compaction" || item.marker.context_after === null) continue;
+      const current = newest.get(item.agent_id);
+      if (current === undefined || isIsoTimestampAfter(item.at, current.at)) {
+        newest.set(item.agent_id, { at: item.at, ...item.marker.context_after });
+      }
+    }
+    return newest;
+  });
+
+  /// When each agent's newest compaction marker sits, sized or not: "Compact
+  /// all" skips an agent whose latest action is a compaction, and after a reopen
+  /// the marker is the compaction's only trace. Separate from the sized map
+  /// above so a Codex marker from a file that recorded no size still counts.
+  const latestCompactionMarkerTimes = $derived.by(() => {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const newest = new Map<AgentId, string>();
+    for (const item of conversations[projectId]?.items ?? []) {
+      if (item.kind !== "system_marker" || item.marker.marker_kind !== "compaction") continue;
+      const current = newest.get(item.agent_id);
+      if (current === undefined || isIsoTimestampAfter(item.at, current)) {
+        newest.set(item.agent_id, item.at);
+      }
+    }
+    return newest;
+  });
+
+  /// Why the header's "Compact all" is unavailable for the whole project (its
+  /// folder is gone, or its history hasn't loaded), or `null`.
+  const compactAllBlockReason = $derived(compactAllBlock(projectId));
+
+  /// The agents "Compact all" would compact, in roster order. None while the
+  /// button is blocked, so no count and no armed state can show.
+  const compactibleAgentIds = $derived(
+    compactAllBlockReason !== null
+      ? []
+      : agents
+          .filter((agent) => agentIsCompactible(agent, latestCompactionMarkerTimes.get(agent.id)))
+          .map((agent) => agent.id),
+  );
+
+  // An armed "Compact all" whose eligible set empties (the project went back to
+  // loading on a retry, or the last eligible agent's compaction was queued from
+  // its own button) disarms, so a later refill can't turn one click into a
+  // dispatch. Hiding the confirm while the set is empty is not enough: the
+  // flag would survive and the confirm would reappear with it.
+  $effect(() => {
+    if (compactAllArmed && compactibleAgentIds.length === 0) disarmCompactAll();
+  });
 
   /// Context occupancy — `context_tokens_after_turn` over `context_window`
-  /// from the most recent completed agent turn. Forward-looking signal ("how
-  /// full will the next turn's context be"). The raw operands come back beside
-  /// the fraction because the meter shows both, and rescanning the transcript
-  /// for them could disagree with the fraction on a mid-render update.
+  /// from the most recent completed agent turn, or the size a compaction newer
+  /// than that turn left behind. Forward-looking signal ("how full will the
+  /// next turn's context be"). The raw operands come back beside the fraction
+  /// because the meter shows both, and rescanning the transcript for them
+  /// could disagree with the fraction on a mid-render update.
   ///
   /// `context_input_tokens` is the harness-reconciled input-side occupancy
   /// (see `TurnUsage`): for Claude it sums the disjoint cache fields (cached +
@@ -848,8 +937,21 @@
   /// occupancy. Both it and `context_window` must be present; otherwise the bar
   /// is hidden. An impossible occupancy is hidden rather than clamped, so bad
   /// telemetry never masquerades as a plausible 100%.
+  ///
+  /// A compaction marker newer than that turn supersedes it. Live, a completed
+  /// compaction is itself a turn with usage, so this matters after a reopen,
+  /// when the marker is the compaction's only trace and the newest turn is the
+  /// reply before it: without the marker the bar would show the pre-compaction
+  /// size until the agent's next reply. A marker's own window is the one the
+  /// compaction ran with: Codex records it in the session file, and for Claude
+  /// the loader reattaches the window saved at compaction time. A marker with
+  /// none (a Claude compaction run outside Switchboard, or before that window
+  /// was saved) borrows the superseded turn's, which is wrong only if the
+  /// model's window changed between that reply and the compaction, and only
+  /// until the next reply.
   function contextOccupancy(agentId: AgentId): ContextOccupancy | undefined {
     const turns = transcripts[agentId] ?? [];
+    let latest: { at: string; usage: TurnUsage } | undefined;
     for (let i = turns.length - 1; i >= 0; i--) {
       const turn = turns[i];
       // A streaming turn has no terminal usage yet, so keep showing the last
@@ -858,14 +960,28 @@
       // falling back to an older, stale percentage.
       if (turn?.role !== "agent" || turn.status === "streaming" || turn.usage === undefined)
         continue;
-      const window = turn.usage.context_window;
-      if (window === undefined || window === null || window === 0) return undefined;
-      const occupancy = turn.usage.context_tokens_after_turn;
-      if (occupancy === undefined || occupancy === null) return undefined;
-      if (occupancy > window) return undefined;
-      return { usedTokens: occupancy, windowTokens: window, fraction: occupancy / window };
+      latest = { at: turn.ended_at ?? turn.started_at, usage: turn.usage };
+      break;
     }
-    return undefined;
+    const compacted = latestCompactedContexts.get(agentId);
+    if (
+      compacted !== undefined &&
+      (latest === undefined || isIsoTimestampAfter(compacted.at, latest.at))
+    ) {
+      return occupancyOf(compacted.tokens, compacted.window ?? latest?.usage.context_window);
+    }
+    if (latest === undefined) return undefined;
+    return occupancyOf(latest.usage.context_tokens_after_turn, latest.usage.context_window);
+  }
+
+  function occupancyOf(
+    occupancy: number | null | undefined,
+    window: number | null | undefined,
+  ): ContextOccupancy | undefined {
+    if (window === undefined || window === null || window === 0) return undefined;
+    if (occupancy === undefined || occupancy === null) return undefined;
+    if (occupancy > window) return undefined;
+    return { usedTokens: occupancy, windowTokens: window, fraction: occupancy / window };
   }
 
   function toggleCollapsed(agentId: AgentId): void {
@@ -1020,6 +1136,91 @@
           </Tooltip>
         {/if}
         {#if agents.length > 0}
+          {@const compactibleCount = compactibleAgentIds.length}
+          <!-- The same two-step as each agent's own compact button, for the same
+               reason, and with the count in the armed label and tooltip: this
+               spends several turns' worth of tokens at once, and the count is
+               the thing worth seeing before the second click. `aria-disabled`
+               rather than `disabled` when nothing is eligible, so hovering still
+               opens the tooltip that says why. -->
+          {#snippet compactAllButton(props: Record<string, unknown>, armed: boolean)}
+            {@const closeOnLeave = triggerHandler(props, "onpointerleave")}
+            {@const closeOnBlur = triggerHandler(props, "onblur")}
+            <button
+              {...props}
+              type="button"
+              class={armed
+                ? cn(ICON_BUTTON_ON_PANEL_CLASS, "text-accent")
+                : cn(
+                    ICON_BUTTON_ON_PANEL_CLASS,
+                    compactibleCount === 0 &&
+                      "hover:text-muted cursor-not-allowed opacity-40 hover:bg-transparent",
+                  )}
+              aria-label={armed
+                ? `Compact ${agentCount(compactibleCount)} now`
+                : "Compact all agents"}
+              aria-disabled={compactibleCount === 0 ? "true" : undefined}
+              data-armed={armed ? "true" : "false"}
+              data-testid="sidebar-compact-all"
+              onclick={() => {
+                if (compactibleCount === 0) return;
+                if (armed) {
+                  void startCompactAll();
+                } else {
+                  compactAllArmed = true;
+                  compactAllTooltipOpen = true;
+                }
+              }}
+              onpointerleave={(event) => {
+                closeOnLeave?.(event);
+                disarmCompactAll();
+              }}
+              onblur={(event) => {
+                closeOnBlur?.(event);
+                disarmCompactAll();
+              }}
+            >
+              {#if armed}
+                <Check size={14} strokeWidth={2.2} aria-hidden="true" />
+              {:else}
+                <RotateCcw size={14} strokeWidth={1.8} aria-hidden="true" />
+              {/if}
+            </button>
+          {/snippet}
+          {#if compactAllArmed && compactibleCount > 0}
+            <Tooltip
+              label={`Compact ${agentCount(compactibleCount)}?`}
+              side="bottom"
+              bind:open={compactAllTooltipOpen}
+            >
+              {#snippet trigger(props)}
+                {@render compactAllButton(props, true)}
+              {/snippet}
+            </Tooltip>
+          {:else}
+            <Tooltip side="bottom" reopen="fresh-hover">
+              {#snippet trigger(props)}
+                {@render compactAllButton(props, false)}
+              {/snippet}
+              <div class="max-w-xs space-y-1 text-[13px]">
+                {#if compactAllBlockReason !== null}
+                  <p class="font-medium">Compact every conversation</p>
+                  <p class="text-primary-fg/70">{compactAllBlockReason}</p>
+                {:else if compactibleCount === 0}
+                  <p class="font-medium">Nothing to compact</p>
+                  <p class="text-primary-fg/70">
+                    Every agent was just compacted, hasn't been used yet, or can't compact.
+                  </p>
+                {:else}
+                  <p class="font-medium">Compact every conversation</p>
+                  <p class="text-primary-fg/70">
+                    Compacts {agentCount(compactibleCount)}, skipping any just compacted or never
+                    used. Each runs as a turn and queues if its agent is busy.
+                  </p>
+                {/if}
+              </div>
+            </Tooltip>
+          {/if}
           <Tooltip label={allExpanded ? "Collapse all" : "Expand all"} side="bottom">
             {#snippet trigger(props)}
               <button

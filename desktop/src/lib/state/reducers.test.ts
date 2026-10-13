@@ -148,7 +148,7 @@ describe("transcriptReducer", () => {
         kind: "system_marker",
         id: "marker",
         agent_id: AGENT_A,
-        marker: { marker_kind: "compaction", summary: "recap" },
+        marker: { marker_kind: "compaction", summary: "recap", context_after: null },
         at: "2026-05-16T00:00:30Z",
       };
       expect(buildUnifiedRows(turns, [recap]).map((r) => r.kind)).toEqual([

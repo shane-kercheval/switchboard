@@ -55,15 +55,14 @@
 //! decided in `desktop/src/lib/usageWindows.ts`, which stays the single interpreting
 //! layer.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
+
+use super::app_server::{self, AppServer, Message};
 
 /// Production bound for an account usage read.
 ///
@@ -283,8 +282,8 @@ const RATE_LIMITS_ID: i64 = 1;
 /// detached task alone would clean up only once its own bound expired, leaving a
 /// server alive for up to `timeout` after the caller walked away, while a
 /// cancellation signal without the detached task would abandon the teardown
-/// midway. `kill_on_drop` is not a substitute either — by this module's own
-/// spawn comment it cannot reach a descendant.
+/// midway. `kill_on_drop` is not a substitute either: it signals only the
+/// spawned process, never a descendant in its group.
 ///
 /// **No caller triggers this today, and the honest reason to keep it is the
 /// contract rather than a current bug.** Two plausible triggers were considered
@@ -311,7 +310,8 @@ const RATE_LIMITS_ID: i64 = 1;
 ///
 /// **Worst-case occupancy is therefore more than the bound**, and a caller
 /// budgeting against the constant should use the total: `timeout`, plus
-/// `STDERR_SETTLE` (0.5s) on a failure that needs the server's last words, plus
+/// the stderr settle (0.5s, `AppServer::settle_stderr`) on a failure that needs
+/// the server's last words, plus
 /// `TERMINATE_GRACE` (2s) if the child ignores `SIGTERM`, plus the reap. Call it
 /// `timeout + ~2.5s`. In practice the settle ends on EOF almost immediately
 /// because the kill runs first, so this is a ceiling rather than a typical cost.
@@ -371,30 +371,15 @@ async fn read_on_task(
     let resolved =
         crate::subprocess::resolve_binary(binary).map_err(|_| AccountUsageError::BinaryNotFound)?;
 
-    let mut command = tokio::process::Command::new(&resolved);
-    command
-        .arg("app-server")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    crate::subprocess::apply_path_env(&mut command);
-    // Own process group, like a dispatched turn, so teardown can signal the
-    // whole tree rather than just the process we spawned. The probe saw no
-    // descendants, but "saw none once" is not a guarantee for a server process,
-    // and the cost of being wrong is an orphan holding a pipe.
-    #[cfg(unix)]
-    command.process_group(0);
-
-    // No `current_dir`: this call belongs to no project, so there is no working
-    // directory that would be correct to impose. The child inherits the app's.
+    // No working directory: this call belongs to no project, so there is none
+    // that would be correct to impose. The child inherits the app's.
     //
     // That absence is also why `NotFound` is unambiguous here and
     // `subprocess::map_spawn_error` is not used: it exists to tell a missing
     // binary apart from a working directory that no longer exists, and this
     // spawn sets no working directory. `resolve_binary` trusts an absolute path
     // without probing it, so this is the branch that catches one.
-    let mut child = command.spawn().map_err(|e| {
+    let mut server = AppServer::spawn(&resolved, None).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             AccountUsageError::BinaryNotFound
         } else {
@@ -402,33 +387,9 @@ async fn read_on_task(
         }
     })?;
 
-    // The child's error output is drained from here rather than from `converse`,
-    // and that placement is the whole reason these two functions are split.
-    // The tail has to outlive the read so it can be collected *after* the kill;
-    // see the sequencing note below.
-    let tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
-    let draining = child.stderr.take().map(|stderr| {
-        let tail = Arc::clone(&tail);
-        // Drained rather than nulled so a spawn that fails *after* exec (a
-        // panicking binary, a shim that errors) leaves a reason in the log.
-        // Drained rather than left unread so a chatty build cannot fill the
-        // pipe and wedge the child mid-answer. The loop itself is the shared
-        // one: a private copy of it is how this module lost the read-error
-        // branch and the tail's length bound the first time around.
-        tokio::spawn(async move {
-            if let Err(e) = crate::subprocess::drain_stderr_into_tail(stderr, tail, |line| {
-                tracing::debug!("codex app-server stderr: {line}");
-            })
-            .await
-            {
-                tracing::warn!(error = %e, "codex app-server stderr read error");
-            }
-        })
-    });
-
     let mut abandoned = false;
     let answer = tokio::select! {
-        result = converse(&mut child, deadline, timeout) => result,
+        result = converse(&mut server, deadline, timeout) => result,
         () = cancel.cancelled() => {
             abandoned = true;
             Err(AccountUsageError::NoResponse {
@@ -438,56 +399,41 @@ async fn read_on_task(
         }
     };
 
-    // Kill on *every* exit path, success included. The server holds stdio open
-    // and waits for more requests; without this it outlives the answer it gave
-    // us. Deliberately outside the deadline — see the bound's scope above.
-    crate::subprocess::terminate_then_kill(&mut child).await;
+    // Kill on *every* exit path, success included. Deliberately outside the
+    // deadline: see the bound's scope above.
+    server.shut_down().await;
 
     // Nobody is waiting for this, so there is no log line to complete.
     if abandoned {
         return answer;
     }
 
-    // **The kill has to come first, and this ordering is a correctness fix
-    // rather than tidiness.** Two reasons, both measured:
-    //
-    // - A hung child still holds its error pipe open, so the drain can never
-    //   reach EOF while it lives. Settling before the kill therefore always
-    //   burned the full `STDERR_SETTLE` budget and learned nothing by waiting —
-    //   2.51s observed against a 2.00s bound, three identical runs.
-    // - A line reader yields nothing for a final line with no trailing newline
-    //   until EOF. That is the canonical wedged-process shape — a half-written
-    //   diagnostic, then a stall — and before this ordering its message was
-    //   unreachable *entirely*, not merely late. `SIGKILL` closes the pipe, the
-    //   fragment arrives, and the settle returns in roughly no time.
-    //
-    // Still bounded: `terminate_then_kill` reaps our direct child, and a
-    // descendant holding the pipe would otherwise park this forever.
+    // Only the two silences need the server's last words, and collecting them
+    // has to wait for the kill (`AppServer::settle_stderr` says why).
     if matches!(
         answer,
         Err(AccountUsageError::Timeout { .. } | AccountUsageError::NoResponse { .. })
-    ) && let Some(draining) = draining
-    {
-        let _ = tokio::time::timeout(STDERR_SETTLE, draining).await;
+    ) {
+        server.settle_stderr().await;
     }
 
-    attach_stderr(answer, &tail)
+    attach_stderr(answer, server.stderr_tail())
 }
 
 /// Give a failure the server's own last words. Only the two variants that
 /// describe silence carry a tail; the rest already quote what Codex said.
 fn attach_stderr(
     answer: Result<CodexAccountUsage, AccountUsageError>,
-    tail: &Mutex<VecDeque<String>>,
+    tail: String,
 ) -> Result<CodexAccountUsage, AccountUsageError> {
     match answer {
         Err(AccountUsageError::Timeout { bound, .. }) => Err(AccountUsageError::Timeout {
             bound,
-            stderr: crate::subprocess::format_stderr_tail(tail),
+            stderr: tail,
         }),
         Err(AccountUsageError::NoResponse { detail, .. }) => Err(AccountUsageError::NoResponse {
             detail,
-            stderr: crate::subprocess::format_stderr_tail(tail),
+            stderr: tail,
         }),
         other => other,
     }
@@ -495,58 +441,32 @@ fn attach_stderr(
 
 /// The handshake, the write, and the wait for an answer.
 ///
-/// Split from [`read_on_task`] so the error output can be collected *after* the
-/// kill — the ordering documented there. This function therefore never attaches
-/// a stderr tail: it returns the bare failure and its caller fills one in.
+/// Never attaches a stderr tail: it returns the bare failure, and its caller
+/// fills one in after the kill.
 ///
 /// `bound` is carried alongside `deadline` only so a timeout can report the
 /// budget it exhausted; the deadline is what actually governs.
 async fn converse(
-    child: &mut tokio::process::Child,
+    server: &mut AppServer,
     deadline: tokio::time::Instant,
     bound: Duration,
 ) -> Result<CodexAccountUsage, AccountUsageError> {
-    let missing = || AccountUsageError::NoResponse {
-        detail: "the child exposed no pipes".to_owned(),
-        stderr: String::new(),
-    };
-    let stdout = child.stdout.take().ok_or_else(missing)?;
-    let mut stdin = child.stdin.take().ok_or_else(missing)?;
-
-    let requests = format!("{}\n{}\n", initialize_request(), rate_limits_request());
-    // A write failure means the child is already gone; read stdout anyway
-    // rather than returning here, so whatever it managed to say still reaches
-    // the error message.
-    let _ = stdin.write_all(requests.as_bytes()).await;
-    let _ = stdin.flush().await;
-
-    // **stdin stays open until the answer arrives**, and this is load-bearing
-    // rather than incidental tidiness. Closing it after the write — the obvious
-    // move, since we send nothing else — makes the server shut down *before*
-    // answering: on 0.154.0, 20 runs closing stdin produced no `id:1` response
-    // and 20 runs leaving it open answered every time. Re-probed on 0.155.1
-    // after the CLI bump — still 0 of 20 closed, 25 of 25 open — so this is a
-    // property of the protocol rather than a bug of one release. The child is
-    // reaped by the caller's kill, not by EOF on its input.
-    //
-    // The same behavior is the app's shutdown guarantee, which is easy to miss
-    // because it reads here purely as a hazard: when Switchboard exits, our end
-    // of this pipe closes, and that is what makes an `app-server` we never got
-    // to signal exit on its own.
-    let answer = match tokio::time::timeout_at(deadline, read_response(stdout)).await {
+    // stdin stays open until the caller's teardown. Closing it after the
+    // write makes the server exit without answering (`AppServer::send`).
+    server
+        .send(&[
+            app_server::initialize_request(INITIALIZE_ID),
+            rate_limits_request(),
+        ])
+        .await;
+    match tokio::time::timeout_at(deadline, read_response(server)).await {
         Ok(result) => result,
         Err(_) => Err(AccountUsageError::Timeout {
             bound,
             stderr: String::new(),
         }),
-    };
-    drop(stdin);
-    answer
+    }
 }
-
-/// How long to wait for the stderr drain to finish once the read has ended.
-/// Reached only on the failure paths, and only to make a log line complete.
-const STDERR_SETTLE: Duration = Duration::from_millis(500);
 
 /// Read stdout until one of the two requests is answered.
 ///
@@ -559,21 +479,11 @@ const STDERR_SETTLE: Duration = Duration::from_millis(500);
 ///
 /// The stderr tail is attached by the caller, which is where the drain can be
 /// settled first.
-async fn read_response(
-    stdout: tokio::process::ChildStdout,
-) -> Result<CodexAccountUsage, AccountUsageError> {
-    // Byte-oriented, then lossy. `lines()` aborts the whole read on invalid
-    // UTF-8, which would contradict `classify_line`'s deliberate tolerance of
-    // arbitrary non-JSON on this stream one function down — a channel we share
-    // with whatever the binary (or a shim around it) prints. Tolerating garbage
-    // text but not garbage bytes has no principle behind it, and the cost of
-    // the strict version is losing a valid answer that arrives after the noise.
-    let mut chunks = tokio::io::BufReader::new(stdout).split(b'\n');
+async fn read_response(server: &mut AppServer) -> Result<CodexAccountUsage, AccountUsageError> {
     loop {
-        match chunks.next_segment().await {
-            Ok(Some(chunk)) => {
-                let line = String::from_utf8_lossy(&chunk);
-                if let Some(verdict) = classify_line(&line) {
+        match server.next_message().await {
+            Ok(Some(message)) => {
+                if let Some(verdict) = classify(message) {
                     return verdict;
                 }
             }
@@ -591,29 +501,6 @@ async fn read_response(
             }
         }
     }
-}
-
-/// The `initialize` handshake. Required before any other method; the response
-/// is not read for content, only skipped on the way to ours.
-///
-/// **The `initialized` notification that a full client would send next is
-/// deliberately omitted** — probed, the usage read succeeds without it. Nothing
-/// here opens a thread or a session, so there is no negotiated state to
-/// complete.
-fn initialize_request() -> String {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": INITIALIZE_ID,
-        "method": "initialize",
-        "params": {
-            "clientInfo": {
-                "name": "switchboard",
-                "title": "Switchboard",
-                "version": env!("CARGO_PKG_VERSION"),
-            }
-        }
-    })
-    .to_string()
 }
 
 /// The usage read.
@@ -638,38 +525,34 @@ fn rate_limits_request() -> String {
     .to_string()
 }
 
-/// Decide what one line of the server's stdout means.
+/// Decide what one message from the server means.
 ///
 /// `None` is "not our answer — keep reading", which covers a *successful*
-/// handshake reply, unsolicited notifications, and any non-JSON the process
-/// prints. Non-JSON is skipped rather than failed on because stdout is a
-/// channel we share with whatever the binary (or a wrapper around it) decides
-/// to print; the id match is the real discriminator.
+/// handshake reply and every notification. The id match is the discriminator.
 ///
 /// A *failed* handshake is an answer, on the other id. See [`read_response`].
-fn classify_line(line: &str) -> Option<Result<CodexAccountUsage, AccountUsageError>> {
-    let message: serde_json::Value = serde_json::from_str(line).ok()?;
-    let id = message.get("id")?.as_i64()?;
+fn classify(message: Message) -> Option<Result<CodexAccountUsage, AccountUsageError>> {
+    let Message::Reply { id, result, error } = message else {
+        return None;
+    };
     if id == INITIALIZE_ID {
         // Only the failure is interesting. The successful reply carries the
         // server's user agent and home directory, neither of which we use.
-        return message
-            .get("error")
-            .map(|error| Err(AccountUsageError::Handshake(error.to_string())));
+        return error.map(|error| Err(AccountUsageError::Handshake(error.to_string())));
     }
     if id != RATE_LIMITS_ID {
         return None;
     }
-    if let Some(error) = message.get("error") {
+    if let Some(error) = error {
         return Some(Err(AccountUsageError::Rpc(error.to_string())));
     }
-    let Some(result) = message.get("result") else {
+    let Some(result) = result else {
         return Some(Err(AccountUsageError::Malformed {
             kind: "no-result-or-error",
             detail: "the response carried neither `result` nor `error`".to_owned(),
         }));
     };
-    Some(lift_usage(result))
+    Some(lift_usage(&result))
 }
 
 /// Lift the two fields we carry out of a `GetAccountRateLimitsResponse`.
@@ -753,6 +636,12 @@ mod tests {
     /// account whose ordinary weekly quota was spent. Trimmed of the fields
     /// this module does not carry, and with the account id replaced.
     const CAPTURED: &str = include_str!("../../tests/fixtures/codex/account-rate-limits.jsonl");
+
+    /// Read one line the way `read_response` does: parse it as the shared
+    /// server module does, then classify it.
+    fn classify_line(line: &str) -> Option<Result<CodexAccountUsage, AccountUsageError>> {
+        app_server::parse_line(line).and_then(classify)
+    }
 
     /// Drive `classify_line` over a whole recorded stream the way
     /// `read_response` does, so the fixture tests exercise the production

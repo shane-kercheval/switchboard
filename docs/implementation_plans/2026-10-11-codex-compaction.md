@@ -37,7 +37,6 @@ Read these before writing code:
   - <https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/app-server-protocol/src/protocol/common.rs>: the `thread/compact/start` and `thread/resume` request definitions, and their `serialization` key, which makes Codex run requests about one thread one at a time.
   - <https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/app-server/src/request_processors/thread_processor.rs> (`thread_compact_start_inner`): Codex queues the compaction before it sends the request's reply.
   - <https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/session/turn.rs> (`run_turn`): an automatic compaction at the start of a reply runs before the prompt is recorded.
-  - <https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/session/mod.rs>: `task_started` carries `turn_attribution` only for a regular reply task (`TaskKind::Regular`), not for a compaction task.
 - Codex's generated protocol schema, which is the authority for the app-server's request and notification shapes. Run `codex app-server generate-json-schema --out <dir>`, then read `v2/ThreadResumeParams.json`, `v2/ThreadCompactStartParams.json`, `v2/TurnCompletedNotification.json` and `ServerNotification.json`.
 
 ## Milestone 1: Codex transcripts read compaction turns correctly
@@ -48,7 +47,7 @@ Read these before writing code:
 
 - A user who reopens a project whose Codex agent ran a compaction as its own turn sees one "Conversation compacted" marker where it ran, and no empty agent turn before or after it. That includes any `/compact` run in Codex's own interface. On the developer's machine it is 81 of 529 compactions (counted 2026-10-12).
 - A turn in which Codex compacted on its own reads exactly as it does today: its content in full, and no marker. That includes a compaction at the start of a turn, before any of its content.
-- A Codex turn that recorded no user prompt and no content shows nothing. Today such a turn shows as an empty agent turn with status `failed`. A cancelled compaction is the main source.
+- A Codex turn that recorded no user prompt and no content, and didn't finish (it was cancelled or cut off), shows nothing. Today such a turn shows as an empty agent turn with status `failed`. A cancelled compaction is the main source. One that finished normally keeps its empty row, as today.
 - The Codex marker shows the label only: no summary preview, no expand control, no "Copy summary". Claude Code's marker looks exactly as it does today.
 - After reopening a project whose Codex agent's last turn was a compaction, the sidebar's context bar shows the last real turn's reading, not the compaction's figure.
 - Opening a project with a compacted Codex session doesn't duplicate any turn, and a live turn still pairs with its own disk turn.
@@ -58,17 +57,23 @@ Read these before writing code:
 **Implementation outline:**
 
 1. **Make the compaction summary optional.** In `crates/harness/src/transcript.rs`, `SystemMarker::Compaction { summary: String }` becomes `summary: Option<String>`. The Claude Code producer in `crates/harness/src/claude_code/session_file.rs` sets `Some(text)`. The type crosses IPC as `ConversationItem::SystemMarker` (`desktop/src-tauri/src/commands.rs`) and is never persisted: pins store only a message key, and no sidecar or journal stores markers. So this is a wire change with no stored-data impact, and backend and frontend ship together. Update the TypeScript `SystemMarker` union in `desktop/src/lib/types.ts`. Update `desktop/src/lib/components/CompactionMarker.svelte` and, in `UnifiedTranscript.svelte`, the marker row and its "Copy summary" action, so a marker whose summary is absent or blank renders the label only and offers no copy. Those are the summary's only frontend readers (checked 2026-10-12): `unified.ts` reads only the marker's kind, and `transcriptIndex.ts` skips markers. Only the `Compaction` variant changes. The `InheritedHistoryUnavailable` variant that the fork work added stays as it is.
-2. **Turn a compaction-only task into a marker.** In `crates/harness/src/codex/session_file.rs`, the reconstruction path (`CodexAgentBuilder` and `handle_event_msg`) currently drops top-level `compacted` records on its `_ => {}` arm. Note each one against the open task. When the task closes, it is a **compaction-only task** if all three of these hold:
-   1. Its `task_started` carries no `turn_attribution`. Codex 0.162.1 writes that field for every regular reply task and omits it for a compaction task. It matters because Codex can compact automatically at the start of a reply, before it records the prompt. If a prompt hook then rejects the prompt, or the file ends before the prompt is written, that regular task holds a compaction and nothing else, and only the field shows it was a reply. Files written before Codex recorded the field never carry it, so for them the next two conditions decide alone.
-   2. It recorded no user prompt. Set the task's prompt flag where the reader already creates the user turn: the legacy `user_message` arm of `handle_event_msg`, and the paginated `UserMessage` arm of the `item_completed` handler, including an attachment-only prompt with empty text. Never set it from `response_item` messages. The reader ignores those on purpose: in paginated files they duplicate the `item_completed` records, and they include context Codex injects with role `user`.
-   3. It produced no items.
+2. **Turn a compaction-only task into a marker.** In `crates/harness/src/codex/session_file.rs`, the reconstruction path (`CodexAgentBuilder` and `handle_event_msg`) currently drops top-level `compacted` records on its `_ => {}` arm. Note each one against the open task. When the task closes, it is a **compaction-only task** if it holds at least one noted record and both of these hold:
+   1. It recorded no user prompt. Set the task's prompt flag where the reader already creates the user turn: the legacy `user_message` arm of `handle_event_msg`, and the paginated `UserMessage` arm of the `item_completed` handler, including an attachment-only prompt with empty text. Never set it from `response_item` messages. The reader ignores those on purpose: in paginated files they duplicate the `item_completed` records, and they include context Codex injects with role `user`.
+   2. It produced no items.
+
+   The rule is structural on purpose, so it reads every Codex version the same way. A field Codex writes only on regular reply tasks (`turn_attribution` at 0.162.1) was considered and rejected: if a later Codex wrote it on compaction tasks too, every Codex marker would disappear without any test but a live one noticing. Its one benefit was an unseen case, listed under "Known limitations".
 
    For a compaction-only task, emit one `Turn::System { marker: Compaction { summary } }` per noted record, in order, in place of the agent turn:
    - `started_at` is the record's timestamp.
    - `summary` is `compacted.message` when it is non-empty, otherwise `None`.
 
    For any other task, discard its noted records, with a comment pointing to the decision above: that compaction was Codex's own, inside a reply, and it shows nothing. A `compacted` record with no open task (three `codex exec` rollouts from 2026-09-27 have one) also shows nothing, as today. Ignore `item_completed` records whose `item.type` is `ContextCompaction`, with a comment saying why: the `compacted` record is the single source.
-3. **Drop agent turns with no prompt and no content.** When a task closes, if it recorded no user prompt and produced no items, don't emit an agent turn for it. If it is a compaction-only task, emit only its markers (step 2). Otherwise emit nothing. This applies however the task closed: `task_complete`, an unhandled `turn_aborted`, the next `task_started`, or end of file. That task's token usage must not become any turn's usage, which is what keeps the reopened context bar on the last real turn. A normal turn records its user prompt inside its task (`task_started` comes before the prompt), so a cancelled normal turn still renders as it does today. A normal task whose prompt was never recorded has nothing to render, so it shows nothing.
+3. **Drop unfinished agent turns with no prompt and no content.** When a task closes having recorded no user prompt and produced no items:
+   - If it is a compaction-only task, emit only its markers (step 2), however it closed.
+   - Otherwise, if it closed with `task_complete`, keep its empty agent turn with status `Complete`, as today. A forward from an idle agent takes the newest finished agent turn (`latest_completed_agent_text`), and an empty one means there is nothing to forward. Dropping it would make the forward send an older reply, while a forward that waited on the same turn live gets nothing. Put that reason in a comment.
+   - Otherwise (an unhandled `turn_aborted`, the next `task_started`, or end of file), emit nothing. The reader marks those turns `Failed`, and forwarding reads only finished turns, so dropping them can't change what a forward sends.
+
+   A dropped task's token usage must not become any turn's usage, which is what keeps the reopened context bar on the last real turn. A normal turn records its user prompt inside its task (`task_started` comes before the prompt), so a cancelled normal turn still renders as it does today.
 4. **Leave the live path alone.** `parse_session_content`, which the adapter runs at the end of every live turn, keeps its current behavior. Taking its per-turn usage from the last `token_count` already reflects a mid-turn compaction correctly, because that count comes from a real model call made after the compaction.
 5. **Forks need no code of their own.** `load_inherited_history` (`codex/inherited_history.rs`) rebuilds each ancestor's segment with `parse_codex_transcript_content`, so steps 2 and 3 apply to every segment of a fork's chain. If a segment's cut-off falls inside a task, step 3's end-of-file close applies to it. Confirm this with the fork test below rather than assuming it.
 
@@ -83,10 +88,12 @@ Read these before writing code:
   6. A file holding both kinds yields markers only for its compaction-only tasks, in order.
   7. A non-empty `compacted.message` becomes the summary, and an empty one becomes `None`.
   8. A cancelled normal turn (with a user prompt) renders as it does today.
-  9. A regular task (its `task_started` carries `turn_attribution`) whose compaction came before a prompt that was never recorded yields nothing: no marker and no agent turn. Cover both a task that completes and a file that ends inside the task.
-  10. A paginated task with no `turn_attribution`, a prompt, a compaction and no reply content yields the prompt and no marker, so the prompt flag alone decides. Repeat it with an attachment-only prompt (empty text).
+  9. A task that completed with no prompt, no content and no compaction yields its empty agent turn with status `Complete`, as today. The same task cut off by the end of the file yields nothing.
+  10. A paginated task with a prompt, a compaction and no reply content yields the prompt and no marker, so the prompt flag alone decides. Repeat it with an attachment-only prompt (empty text).
   11. A `compacted` record before any task yields nothing.
-- A forwarding test next to the existing one in `codex/session_file.rs`: in a rollout whose last task is a completed compaction, `latest_completed_agent_text` returns the reply before it. Repeat it with a cancelled compaction as the last task.
+- Forwarding tests next to the existing one in `codex/session_file.rs`, using `latest_completed_agent_text`:
+  - A rollout whose last task is a completed compaction returns the reply before it. So does one whose last task is a cancelled compaction.
+  - A rollout whose last task completed with no prompt, no content and no compaction returns no forwardable text, as today.
 - A fork test in `codex/inherited_history.rs`, using that module's staged-rollout helpers: a fork whose original holds a compaction-only task shows the original's turns, then its marker, then the fork's own turns, with no empty agent turn.
 - Merge tests in `desktop/src-tauri/src/commands.rs`, through the real Codex parser, in the style of `merge_compaction_session_through_real_parser_does_not_duplicate_prompt`:
   - A compacted Codex session merges without duplicating any turn.
@@ -265,7 +272,7 @@ Record each of these in `docs/harness-behavior.md` §3.9, and the user-facing on
 
 - The Codex marker shows no summary, because Codex encrypts it.
 - A compaction Codex runs on its own, inside a reply, shows no marker. Claude Code shows its own, with its summary.
-- In files written before Codex recorded `turn_attribution`, an automatic compaction at the start of a reply whose prompt was rejected or never written shows a marker, because nothing in such a file tells it apart from a compaction run as its own turn.
+- An automatic compaction at the start of a reply whose prompt a Codex hook then rejected, or that the file ends after, shows a marker, because nothing structural tells it apart from a compaction run as its own turn. The marker sits where the compaction ran. If that reply had finished, a forward from the agent afterward sends the reply before it, while a forward that waited on the reply live gets nothing. No such task appears in the developer's rollouts.
 - A Codex compaction row shows no before/after token counts, and the context bar updates only on the next reply.
 - A compaction's cost appears in no figure Codex reports, so Switchboard can't show it.
 - During the session, the row stands in for a manual Codex compaction. Its marker appears when the project is next loaded in full, in practice after a restart. In a project that also has Claude Code agents, a later reread can show the marker under the row.

@@ -11452,28 +11452,85 @@ mod tests {
     #[tokio::test]
     async fn compaction_is_refused_for_every_harness_that_cannot_be_driven() {
         // The capability predicate is the authority, and this is the gate that
-        // stands between a Codex or Antigravity agent and a `/compact` *prompt*
-        // — which those harnesses answer with a model-authored claim of success
-        // while nothing is compacted. A silent no-op would be the worst outcome
+        // stands between an Antigravity agent and a `/compact` *prompt*, which
+        // Antigravity answers with a model-authored claim of success while
+        // nothing is compacted. A silent no-op would be the worst outcome
         // available, so the refusal must be typed and loud.
         let (_tmp, home, state, _gate, _project) =
             maintenance_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
-        for harness in [HarnessKind::Codex, HarnessKind::Antigravity] {
-            let agent = create_agent_impl(
-                &state,
-                &format!("agent-{harness}"),
-                harness,
-                AgentSelection::default(),
-            )
-            .unwrap();
-            let err = compact_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
-                .await
-                .expect_err("a harness Switchboard cannot compact must be refused");
-            assert!(
-                matches!(err, AppError::CompactionUnsupported { harness: h } if h == harness),
-                "got: {err:?}"
-            );
-        }
+        let harness = HarnessKind::Antigravity;
+        let agent = create_agent_impl(
+            &state,
+            &format!("agent-{harness}"),
+            harness,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        let err = compact_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
+            .await
+            .expect_err("a harness Switchboard cannot compact must be refused");
+        assert!(
+            matches!(err, AppError::CompactionUnsupported { harness: h } if h == harness),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_is_accepted_for_a_codex_agent_with_a_session() {
+        // Codex compacts through its own adapter operation, so the app gate lets
+        // it through to the Codex adapter like a Claude one. The Claude adapter
+        // here is the mock, which refuses compaction: a `turn_start` therefore
+        // proves the Codex adapter ran it.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&mock),
+            maintenance_adapter(&[], &gate, false),
+            Arc::clone(&mock),
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        let home = TempDir::new().unwrap();
+        let agent = seed_codex_source(&state, home.path(), "bob");
+
+        let message_id = compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
+            .await
+            .expect("a Codex agent with a session can be compacted");
+
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        let start = emitter
+            .snapshot()
+            .into_iter()
+            .find(|(_, v)| v["type"] == "turn_start")
+            .expect("turn_start");
+        assert_eq!(
+            start.1["message_id"].as_str().unwrap(),
+            message_id.to_string(),
+            "the receipt must correlate to the turn the frontend will render"
+        );
+        gate.notify_one();
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert!(
+            !emitter
+                .snapshot()
+                .iter()
+                .any(|(_, v)| v["type"] == "message_failed"),
+            "the compaction must not fail at dispatch"
+        );
     }
 
     #[tokio::test]

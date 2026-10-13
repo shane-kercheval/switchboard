@@ -6160,16 +6160,13 @@ describe("compaction rows", () => {
 
   /// Register the agent and queue a compaction against it, with the IPC resolved
   /// so the receipt is recorded.
-  async function queueCompaction(): Promise<Awaited<ReturnType<typeof loadState>>> {
+  async function queueCompaction(
+    agent: AgentRecord = CLAUDE_AGENT,
+  ): Promise<Awaited<ReturnType<typeof loadState>>> {
     const state = await loadState();
-    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(agent);
     invokeMock.mockResolvedValue(COMPACT_MESSAGE);
-    await state.dispatchCompaction(
-      CLAUDE_AGENT.id,
-      COMPACT_SEND,
-      COMPACT_PENDING,
-      "2026-05-16T00:00:05Z",
-    );
+    await state.dispatchCompaction(agent.id, COMPACT_SEND, COMPACT_PENDING, "2026-05-16T00:00:05Z");
     return state;
   }
 
@@ -6232,6 +6229,138 @@ describe("compaction rows", () => {
     expect(within(row).getByTestId("compaction-turn-counts")).toHaveTextContent(
       "120k → 18k tokens",
     );
+  });
+
+  it("renders a completed Codex compaction as compacted, with no counts", async () => {
+    // Codex reports no usage for a compaction that means anything (its figure
+    // leaves out the fixed instructions and tools), so the adapter sends none
+    // and the row is the label alone.
+    await queueCompaction(CODEX_AGENT);
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+    await screen.findByTestId("compaction-queued");
+
+    fireTo(`agent:${CODEX_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: COMPACT_TURN,
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      started_at: "2026-05-16T00:00:06Z",
+    } as NormalizedEvent);
+    await tick();
+    expect(await screen.findByTestId("compaction-turn")).toHaveTextContent(/compacting context/i);
+
+    fireTo(`agent:${CODEX_AGENT.id}`, {
+      type: "turn_end",
+      turn_id: COMPACT_TURN,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:07Z",
+    } as NormalizedEvent);
+    await tick();
+
+    const row = screen.getByTestId("compaction-turn");
+    expect(within(row).getByTestId("compaction-turn-label")).toHaveTextContent(
+      /^Context compacted$/,
+    );
+    expect(within(row).queryByTestId("compaction-turn-counts")).toBeNull();
+  });
+
+  it("finishes a Codex compaction without rereading history, and a reply queued behind it shows once", async () => {
+    // A project with only a Codex agent, and the fingerprint the backend
+    // returns for one: not refreshable, not statted. After a compaction the
+    // row is the record, so nothing rereads the history. A reread would also
+    // be unsafe here: a Codex reply is matched to its saved copy only when it
+    // ends, so a reread while the queued reply streams would show it twice.
+    const codex: AgentRecord = {
+      ...CODEX_AGENT,
+      session_locator: {
+        codex: { thread_id: "019a0000-0000-7000-8000-000000000c0d", partition_date: "2026-05-16" },
+      },
+    };
+    const QUEUED_SEND = "00000000-0000-7000-8000-00000000c005";
+    const QUEUED_MESSAGE = "00000000-0000-7000-8000-00000000c006";
+    const QUEUED_TURN = "00000000-0000-7000-8000-00000000c007";
+    const state = await loadState();
+    const ws = await import("$lib/state/workspace.svelte");
+    await state.registerAgent(codex);
+    ws.agentsByProject[PROJECT_ID] = [codex];
+    let loads = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "project_session_fingerprints") {
+        return [{ agent_id: codex.id, refresh_capable: false, fingerprint: null }];
+      }
+      if (cmd === "load_project_conversation") {
+        loads += 1;
+        return { items: [], agents: [] };
+      }
+      if (cmd === "compact_agent") return COMPACT_MESSAGE;
+      return null;
+    });
+    await ws.hydrateProject(PROJECT_ID);
+    ws.installForkHistoryRefresh();
+    expect(loads).toBe(1);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [codex], loadStatus: "complete" },
+    });
+    await state.dispatchCompaction(codex.id, COMPACT_SEND, COMPACT_PENDING, "2026-05-16T00:00:05Z");
+    fireTo(`agent:${codex.id}`, {
+      type: "turn_start",
+      turn_id: COMPACT_TURN,
+      message_id: COMPACT_MESSAGE,
+      send_id: COMPACT_SEND,
+      started_at: "2026-05-16T00:00:06Z",
+    } as NormalizedEvent);
+    // The message the user sends while the compaction runs queues behind it.
+    state.dispatchUserTurn(
+      codex.id,
+      "user-after-compaction",
+      "what was the code word?",
+      [],
+      QUEUED_SEND,
+      "2026-05-16T00:00:06Z",
+    );
+    state.recordSendAccepted(codex.id, "user-after-compaction", QUEUED_MESSAGE);
+    fireTo(`agent:${codex.id}`, {
+      type: "turn_end",
+      turn_id: COMPACT_TURN,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:08Z",
+    } as NormalizedEvent);
+    await waitFor(() =>
+      expect(screen.getByTestId("compaction-turn-label")).toHaveTextContent(/^Context compacted$/),
+    );
+
+    // The queued reply runs, streams and ends.
+    fireTo(`agent:${codex.id}`, {
+      type: "turn_start",
+      turn_id: QUEUED_TURN,
+      message_id: QUEUED_MESSAGE,
+      send_id: QUEUED_SEND,
+      started_at: "2026-05-16T00:00:09Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${codex.id}`, {
+      type: "content_chunk",
+      turn_id: QUEUED_TURN,
+      kind: "text",
+      text: "The code word is heron.",
+    } as NormalizedEvent);
+    fireTo(`agent:${codex.id}`, {
+      type: "turn_end",
+      turn_id: QUEUED_TURN,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:10Z",
+      hydration_key: "019a0000-0000-7000-8000-0000000000e1",
+    } as NormalizedEvent);
+    // Let any history read the two terminals could start run to completion.
+    for (let i = 0; i < 20; i += 1) {
+      await tick();
+      await new Promise((r) => setTimeout(r, 1));
+    }
+
+    expect(loads).toBe(1);
+    expect(screen.getAllByTestId("compaction-turn")).toHaveLength(1);
+    expect(screen.getAllByText("what was the code word?")).toHaveLength(1);
+    expect(screen.getAllByText("The code word is heron.")).toHaveLength(1);
   });
 
   it("shows the harness's own reason when a compaction is refused", async () => {

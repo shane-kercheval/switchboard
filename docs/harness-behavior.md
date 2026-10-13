@@ -391,7 +391,7 @@ Test: `live_claude_chrome_flag_toggles_browser_tools` (`crates/harness/tests/liv
 
 ### 3.9 Manual context compaction — can we trigger one?
 
-> **Status: shipped for Claude. Probed 2026-09-16 @ Claude 2.1.270 / codex-cli 0.154.0 / agy 1.2.2.** Claude ✅ — "Compact context" on the agent menu, dispatched through the ordinary `-p` path and gated on `HarnessKind::supports_manual_compaction`. Codex ✅ available, but **only** through the experimental app-server protocol — never through `codex exec`; unwired. Re-probed 2026-10-11 @ 0.162.1: a short-lived app-server, the pattern the quota read already uses, is enough ("Codex" below). Antigravity ❌ built upstream but feature-flag-gated off. The blocking cross-harness finding is in "The fake-success hazard" below: on Codex and Antigravity a `/compact` prompt is answered by the *model* claiming success while nothing compacts — which is why this is a per-harness predicate rather than a prompt Switchboard sends everywhere. What shipped, and the residuals it carries, is at the end of the section.
+> **Status: shipped for Claude and Codex. Probed 2026-09-16 @ Claude 2.1.270 / codex-cli 0.154.0 / agy 1.2.2.** Claude ✅ — "Compact context" on the agent menu, dispatched through the ordinary `-p` path. Codex ✅ — the same action since 2026-10-12, through a short-lived `codex app-server`, **never** `codex exec`, which cannot compact (re-probed 2026-10-11 @ 0.162.1, "Codex" below). Both are gated on `HarnessKind::supports_manual_compaction`. Antigravity ❌ built upstream but feature-flag-gated off. The blocking cross-harness finding is in "The fake-success hazard" below: on Codex and Antigravity a `/compact` prompt is answered by the *model* claiming success while nothing compacts — which is why this is a per-harness predicate rather than a prompt Switchboard sends everywhere. What shipped, and the residuals it carries, is at the end of the section.
 
 Distinct from the `Compaction` system marker in `transcript.rs` (which is how we *render* a compaction that already happened, §3.1). This is the *input* question: can Switchboard ask a harness to compact an existing conversation on demand — the affordance behind a per-agent "Compact" action?
 
@@ -441,11 +441,11 @@ Four consequences for an adapter:
 
 Also: `DISABLE_COMPACT=1` disables the command (and `--autocompact <auto|tokens>` / settings `autoCompactEnabled`, `autoCompactWindow` are the **threshold** knobs, not triggers — a separate, unbuilt surface).
 
-#### Codex — real, but behind a transport we do not have
+#### Codex — only through the app-server, never `codex exec`
 
 `thread/compact/start` takes `{ threadId }` and nothing else (confirmed against `codex app-server generate-json-schema`, which is the CLI's own generated protocol schema). Driven over stdio it produced `item/started`/`item/completed` for a `contextCompaction` item inside a synthetic turn, a `thread/tokenUsage/updated` showing the drop, and a durable `compacted` record with `replacement_history` in the rollout. Completion is also announced as a `thread/compacted` notification (deprecated in favor of the `ContextCompaction` item type).
 
-**The transport already exists.** Switchboard's Codex turns run through one `codex exec` subprocess each, and its quota read (`codex/account_usage.rs`) already starts a short-lived `codex app-server`, writes its requests, keeps stdin open until the answer and kills the process group. Compaction needs that same pattern with two more requests and a longer wait, not a long-lived server. The protocol is still marked `[experimental]` by OpenAI, the same accepted exposure as the quota read. It also exposes `modelContextWindow` and per-turn usage directly (**G23**-adjacent).
+**A short-lived server is enough.** Switchboard's Codex turns run through one `codex exec` subprocess each, and its quota read (`codex/account_usage.rs`) already started a short-lived `codex app-server`, wrote its requests, kept stdin open until the answer and killed the process group. Compaction uses that same pattern with two more requests and a longer wait, not a long-lived server, and both now share one implementation (`codex/app_server.rs`). The protocol is still marked `[experimental]` by OpenAI, the same accepted exposure as the quota read. It also exposes `modelContextWindow` and per-turn usage directly (**G23**-adjacent).
 
 **Re-probed 2026-10-11 @ codex-cli 0.162.1: a short-lived app-server compacts an `exec`-created session, the same start, ask, exit pattern the quota read uses (`codex/account_usage.rs`).** Probe session: two `codex exec` turns on `gpt-6-luna` / `low`, the first asking the model to remember a code word.
 
@@ -482,7 +482,7 @@ Compaction exists server-side and automatically (`AntigravityCompactionConfig{ma
 
 **Version caveat:** these probes ran at **agy 1.2.2**, ahead of the 1.1.26 recorded in §6 — the delta is unreviewed, so treat Antigravity rows elsewhere in this doc as last-verified at 1.1.26.
 
-#### What Switchboard ships (Claude only)
+#### What Switchboard ships: Claude
 
 **A compaction is a work item on the agent's queue, not a mode.** "Compact context" on the agent menu enqueues one behind the in-flight turn and any earlier queued sends, starts immediately when the agent is idle, and is cancellable through the same Stop / cancel-send affordances as a send. The dispatch is a **distinct adapter operation** (`ClaudeCodeAdapter::compact`) that shares every flag with a send and differs only in the positional — so §0's slash-escape is bypassed by construction rather than by an exception carved into it. Default compaction only; `/compact <instructions>` and the `--autocompact` threshold are deliberately unbuilt. Implementation: `docs/implementation_plans/2026-09-16-claude-compaction.md`.
 
@@ -501,6 +501,44 @@ Compaction exists server-side and automatically (`AntigravityCompactionConfig{ma
 - **Window resolution rests on the post-compaction `system/init` model.** If a future CLI stops re-emitting `init` and `result.model` stays absent, the bar clean-hides after a successful compaction until the next turn. The row's token counts are unaffected.
 
 Tests: `live_claude_compact_succeeds_and_reports_the_boundary` and `live_claude_compact_refusal_surfaces_as_a_failed_turn` (`crates/harness/tests/live.rs`) hold the protocol above against the real CLI — the refusal case is the one that pins `compact_result` over `result`. Fixture-driven: the parser's compaction mode in `crates/harness/src/parser.rs` (`success_folds_and_completes_with_occupancy_from_compact_metadata`, `a_failed_verdict_without_compact_error_falls_back_to_the_result_text`, `outside_compaction_mode_the_same_status_records_stay_liveness`), the adapter's argument and fail-closed contracts in `crates/harness/src/claude_code/mod.rs` (`compaction_argv_matches_send_argv_except_the_positional`, `compaction_always_resumes_its_own_session_never_forks`, `compact_refuses_an_agent_with_no_session_file`), and the queue / journal / cancel behavior in `crates/dispatcher/tests/dispatcher_with_mock.rs` (`compaction_queues_behind_the_running_turn_and_an_earlier_queued_send`, `a_failed_compaction_journals_nothing`, `a_cancelled_compactions_waiter_resolves_idle_not_cancelled`).
+
+#### What Switchboard ships: Codex
+
+**The same action as Claude's, through a different adapter operation.** "Compact context", on the agent menu and on the context bar, queues behind the running turn and earlier queued messages, runs at once on an idle agent, and is cancelled by Stop, exactly as above. The dispatcher, the app's gate, the journal (nothing is written) and forwarding (a forward waits for the compaction, then reads the last real reply) don't know which harness compacts. Everything Codex-specific is in `CodexAdapter::compact` (`crates/harness/src/codex/mod.rs` and `codex/compaction.rs`). It starts a bare `codex app-server` in the agent's working directory, through the lifecycle module it shares with the quota read (`codex/app_server.rs`), and never touches the user's shared Codex daemon. Implementation: `docs/implementation_plans/2026-10-11-codex-compaction.md`.
+
+**The protocol.** One write of three requests, with stdin kept open until the end, because closing it aborts the compaction (item 7 above):
+
+1. `initialize`.
+2. `thread/resume` with the thread id, the agent's working directory, `excludeTurns: true`, the agent's model, its effort as `config.model_reasoning_effort`, `sandbox: "danger-full-access"` and `approvalPolicy: "never"`. The last two are the settings `codex exec` runs with. Codex records each turn's settings, and the agent card's Environment section shows the latest turn's, so without them the card would call the agent read-only after a reload.
+3. `thread/compact/start`.
+
+The compaction turn is the first `turn/started` on the thread, whether it arrives before or after the reply to `thread/compact/start`. Its notifications keep the row's activity indicator alive. All three replies must arrive within 30 seconds. After that the compaction runs like any turn, with no bound but Stop. The server's process group is torn down before the event stream ends, on every path, because the end of the stream is what lets the dispatcher start the next queued turn.
+
+**How the outcome is reported.** Success needs three things, in any order: the `{}` reply to `thread/compact/start`, a completed `contextCompaction` item, and `turn/completed` with status `completed`.
+
+| What Codex does | What the row shows |
+|---|---|
+| All three of the above | "Context compacted" |
+| `turn/completed` `failed`, with `codexErrorInfo: "usageLimitExceeded"` | "Compaction failed" with Codex's message, as a usage-limit failure |
+| `turn/completed` `failed`, with `codexErrorInfo: "unauthorized"` | "Compaction failed" with the sign-in message a send shows for the same problem |
+| `turn/completed` `failed`, anything else | "Compaction failed" with Codex's message. When it is `Error running remote compact task: ` followed by the API's JSON body, the API's own message is shown instead |
+| `turn/completed` `interrupted` that Switchboard didn't ask for | "Compaction failed" with Codex's message, or "compaction was interrupted" |
+| `turn/completed` `completed` with no `contextCompaction` item | "Compaction failed: Codex finished without compacting and gave no reason" |
+| An error reply to `thread/resume` or `thread/compact/start` | "Compaction failed" with the message of the earliest request that failed. An unknown thread reads `no rollout found for thread id …`, and a fork whose original's rollout is gone reads `invalid paginated history lineage …` |
+| An error reply to `initialize`, the server exiting before the turn completes, or no replies within 30 seconds | "Compaction failed" with Switchboard's own reason |
+| The user presses Stop | "Compaction cancelled". The adapter ends the stream with no result and the dispatcher reports the turn cancelled, as for Claude |
+
+**Residuals, all accepted:**
+
+- **The row shows no before/after token counts, and the context bar doesn't move until the agent's next reply.** The compaction's own token figure leaves out Codex's fixed instructions and tools (item 6), so a bar fed it would drop and then jump back. The adapter reports no usage for a compaction.
+- **During the session the row is the only record of the compaction.** The marker the reader produces appears when the project next loads in full, in practice after a restart, where the row was, and as its label alone, because Codex encrypts the summary (item 10). The reread that puts Claude's recap under its row after a compaction isn't widened to Codex: it would add a second "compacted" line, and rereading a Codex agent while a queued reply is being written shows that reply twice (G46). In a project that also has Claude agents, a later reread can still show the marker under the row.
+- **A compaction Codex runs on its own, inside a reply, shows no marker**, by decision (the reader paragraph above).
+- **A compaction's cost appears in no figure Codex reports** (item 11), so Switchboard can't show it.
+- **Some Codex errors don't count as a failure.** The compaction turn then completes with no compaction and no message, and the row reads "Compaction failed: Codex finished without compacting and gave no reason".
+- **A failed or cancelled compaction leaves nothing after a reload**, with one exception: one that ends without compacting and without an error, in a brand-new fork with no reply yet or a conversation whose replies all came from a Codex that didn't mark them, reads as an empty agent turn (G34, residual 3).
+- **The app-server protocol is experimental.** The live tests are the drift detector, as for the quota read.
+
+Tests: `live_codex_compact_succeeds_and_the_conversation_continues`, `live_codex_compact_cancelled_leaves_no_compaction` and `live_codex_compact_of_a_fork_keeps_its_inherited_context` (`crates/harness/tests/live.rs`) hold the protocol against the real CLI, including the settings the compaction turn records and the fork's untouched original. Fixture-driven: `crates/harness/tests/codex_compaction.rs` (every row of the table above through `fake_codex`, the request contents, cancel and startup-timeout teardown, and the refusals), `compaction_is_accepted_for_a_codex_agent_with_a_session` (the app gate) in `desktop/src-tauri/src/commands.rs`, and the Codex cases of the Sidebar and `UnifiedTranscript` compaction tests.
 
 ### 3.10 Codex `world_state` — the environment inventory, and its snapshot/delta shape
 
@@ -903,7 +941,7 @@ Capabilities Switchboard would adopt for a harness that lacks them today, and wh
 
 | Capability | Harness | Status | Signal to look for | What we'd build |
 |---|---|---|---|---|
-| Manual compaction | Codex | **Buildable now** (investigated 2026-10-11, §3.9): a short-lived `codex app-server` compacts an `exec` session, the same pattern the quota read uses. Not built. The reader side (**G34**) is fixed, so a compaction turn already reads as a marker rather than an empty agent turn. | (signal seen) | "Compact context" on Codex agents, as on Claude agents. |
+| Manual compaction | Codex | **Built**: "Compact context" through a short-lived `codex app-server`, the same pattern the quota read uses, and a compaction turn reads as a marker on reload (**G34**) (§3.9). | (signal seen) | "Compact context" on Codex agents, as on Claude agents. |
 | Manual compaction | Antigravity | Built into `agy` but behind the server-side feature flag `enable-compact-slash-command`, off on the account probed (§3.9). | `compact` in the snapshot's `agy -p "/help"` list, then `agy -p "/compact"` writing a compaction boundary. | Same as above. |
 | Fork | Codex | **Built**: a promptless `codex exec fork`, then, from the compose box, the message as the fork's first turn; from the agent card's Fork item, nothing (§3.5). | (signal seen) | Fork on Codex agents, as on Claude agents. |
 | Fork | Antigravity | Unavailable. `agy` only forks on its own when a resumed conversation no longer exists server-side (§3.5). | A fork or branch flag or subcommand in the snapshot's `agy --help`. | Same as above. |

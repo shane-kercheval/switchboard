@@ -183,19 +183,23 @@ impl HarnessKind {
     /// conversation on demand** — summarize the history so far and continue
     /// from the summary, the headless equivalent of the interactive `/compact`.
     ///
-    /// True only for Claude, whose CLI marks `/compact` `supportsNonInteractive`
-    /// and intercepts it locally on the ordinary `-p` dispatch path: no new
-    /// transport, and the model never sees the command as a prompt.
+    /// True for Claude and Codex, each through a mechanism that compacts, never
+    /// a prompt:
     ///
-    /// **Codex can compact, but only through a transport we do not run.** Its
-    /// compaction exists solely as the experimental `codex app-server`
-    /// `thread/compact/start` RPC; `codex exec` — the one-shot subprocess the
-    /// Codex adapter drives — cannot do it at all. That is the same reasoning
-    /// [`Self::supports_session_fork`] gives for `thread/fork`, and the cost is
-    /// the transport, not the call. **Antigravity** ships the command in its
-    /// binary but behind the remote Unleash flag `enable-compact-slash-command`,
-    /// which is off; because the gate is a *remote* flag it can open without a
-    /// version bump, so re-probe rather than trusting this arm forever.
+    /// - **Claude's** CLI marks `/compact` `supportsNonInteractive` and
+    ///   intercepts it locally on the ordinary `-p` dispatch path, so the model
+    ///   never sees the command as a prompt.
+    /// - **Codex** compacts only through its experimental `codex app-server`
+    ///   `thread/compact/start` request; `codex exec`, which runs every other
+    ///   Codex turn, cannot. The adapter starts a short-lived app-server for the
+    ///   one request, and success requires Codex's own report that it compacted
+    ///   (a completed `contextCompaction` item), so a refusal or a no-op
+    ///   surfaces as a failure rather than as success.
+    ///
+    /// **Antigravity** ships the command in its binary but behind the remote
+    /// Unleash flag `enable-compact-slash-command`, which is off; because the
+    /// gate is a *remote* flag it can open without a version bump, so re-probe
+    /// rather than trusting this arm forever.
     ///
     /// **This predicate is the guard against a silent lie, not a mere feature
     /// gate.** Sending `/compact` as an ordinary *prompt* to Codex or
@@ -210,8 +214,8 @@ impl HarnessKind {
     #[must_use]
     pub fn supports_manual_compaction(self) -> bool {
         match self {
-            Self::ClaudeCode => true,
-            Self::Codex | Self::Antigravity => false,
+            Self::ClaudeCode | Self::Codex => true,
+            Self::Antigravity => false,
         }
     }
 
@@ -411,13 +415,14 @@ mod tests {
     }
 
     #[test]
-    fn supports_manual_compaction_is_claude_only() {
-        // Codex's compaction is real but lives behind the app-server transport
-        // the adapter doesn't run; Antigravity's is remote-flag-gated off. On
-        // both, a `/compact` *prompt* is answered with a fabricated success —
-        // this gate is what keeps the action off those agents.
+    fn supports_manual_compaction_is_claude_and_codex() {
+        // Claude intercepts `/compact` locally and Codex compacts through its
+        // app-server; neither sees it as a prompt. Antigravity's is
+        // remote-flag-gated off, and a `/compact` *prompt* there is answered
+        // with a fabricated success, so this gate is what keeps the action off
+        // its agents.
         assert!(HarnessKind::ClaudeCode.supports_manual_compaction());
-        assert!(!HarnessKind::Codex.supports_manual_compaction());
+        assert!(HarnessKind::Codex.supports_manual_compaction());
         assert!(!HarnessKind::Antigravity.supports_manual_compaction());
     }
 

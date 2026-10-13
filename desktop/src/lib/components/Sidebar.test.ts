@@ -2150,26 +2150,26 @@ describe("Sidebar — agent reordering", () => {
 });
 
 describe("compact context action", () => {
-  it("is offered for a Claude agent", async () => {
+  it.each([
+    ["Claude", CLAUDE_AGENT],
+    ["Codex", CODEX_AGENT],
+  ])("is offered for a %s agent", async (_harness, agent) => {
     const state = await loadState();
-    await state.registerAgent(CLAUDE_AGENT);
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     const menu = await openAgentActions();
     expect(within(menu).getByTestId("agent-action-compact")).toBeInTheDocument();
   });
 
-  it.each([
-    ["codex", CODEX_AGENT],
-    ["antigravity", ANTIGRAVITY_AGENT],
-  ])("is withheld from a %s agent", async (_harness, agent) => {
+  it("is withheld from an Antigravity agent", async () => {
     // The capability gate, on the surface a user actually touches. Offering it
     // here would produce a refusal at best — and the reason the refusal has to
-    // be real is that a `/compact` *prompt* to these harnesses returns a
+    // be real is that a `/compact` *prompt* to Antigravity returns a
     // model-authored claim of success while nothing compacted.
     const state = await loadState();
-    await state.registerAgent(agent);
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+    await state.registerAgent(ANTIGRAVITY_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [ANTIGRAVITY_AGENT] } });
 
     const menu = await openAgentActions();
     expect(within(menu).queryByTestId("agent-action-compact")).toBeNull();
@@ -2309,6 +2309,49 @@ describe("compact context action", () => {
     ];
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const bar = screen.getByTestId("agent-context-bar");
+    expect(bar).toHaveTextContent("120k / 200k");
+    expect(bar).toHaveTextContent("60%");
+  });
+
+  it("leaves the bar unchanged after a completed Codex compaction", async () => {
+    // A Codex compaction succeeds without usage: the figure Codex reports for
+    // it leaves out its fixed instructions and tools, so a bar moved to it
+    // would drop and then jump back on the next reply. The previous reply's
+    // reading stays until then.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          context_input_tokens: 120_000,
+          context_tokens_after_turn: 120_000,
+          context_window: 200_000,
+        },
+      },
+      {
+        role: "agent",
+        turn_id: "turn-compaction",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:02Z",
+        ended_at: "2026-05-16T00:00:03Z",
+        status: "complete",
+        kind: "compaction",
+        items: [],
+      },
+    ];
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     const bar = screen.getByTestId("agent-context-bar");
     expect(bar).toHaveTextContent("120k / 200k");
@@ -2782,27 +2825,27 @@ describe("compact button on the context bar", () => {
     ];
   }
 
-  it("is offered for a Claude agent, beside the bar it acts on", async () => {
+  it.each([
+    ["Claude", CLAUDE_AGENT],
+    ["Codex", CODEX_AGENT],
+  ])("is offered for a %s agent, beside the bar it acts on", async (_harness, agent) => {
     const state = await loadState();
-    await state.registerAgent(CLAUDE_AGENT);
-    seedContextBar(state, CLAUDE_AGENT);
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await state.registerAgent(agent);
+    seedContextBar(state, agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     const bar = await screen.findByTestId("agent-context-bar");
     expect(within(bar).getByTestId("agent-compact-button")).toBeInTheDocument();
   });
 
-  it.each([
-    ["codex", CODEX_AGENT],
-    ["antigravity", ANTIGRAVITY_AGENT],
-  ])("is withheld from a %s agent", async (_harness, agent) => {
-    // The same capability gate the menu item carries. Both harnesses report
-    // context, so the bar renders and only the button must be absent — which is
-    // what makes this a real gate test rather than an absent-bar test.
+  it("is withheld from an Antigravity agent", async () => {
+    // The same capability gate the menu item carries. The bar renders from the
+    // seeded usage, so only the button must be absent — which is what makes
+    // this a real gate test rather than an absent-bar test.
     const state = await loadState();
-    await state.registerAgent(agent);
-    seedContextBar(state, agent);
-    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+    await state.registerAgent(ANTIGRAVITY_AGENT);
+    seedContextBar(state, ANTIGRAVITY_AGENT);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [ANTIGRAVITY_AGENT] } });
 
     const bar = await screen.findByTestId("agent-context-bar");
     expect(within(bar).queryByTestId("agent-compact-button")).toBeNull();

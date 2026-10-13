@@ -157,6 +157,14 @@ pub(crate) async fn run(
         }
     };
 
+    // The teardown must finish before this function returns. The stream ends
+    // when it returns, and the dispatcher takes that as the server being gone:
+    // it then starts the agent's next queued turn, releases the session lock,
+    // and answers forwards waiting on the compaction. A teardown run in the
+    // background, or skipped, would let a `codex exec` turn run beside a server
+    // that still holds the thread. Stopping here loses nothing: Codex saves
+    // the compaction before it announces the turn finished (`flush_rollout`
+    // before `on_task_finished`, codex-cli 0.162.1).
     server.shut_down().await;
 
     let outcome = match ending {
@@ -334,7 +342,7 @@ fn reply_outcome(
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
-                .map_or_else(|| error.to_string(), unwrap_error_message);
+                .map_or_else(|| error.to_string(), readable_error);
             if id == INITIALIZE_ID {
                 // Our request is malformed against a protocol that moved, not
                 // Codex declining work it understood.
@@ -374,10 +382,15 @@ fn turn_outcome(turn: &Value, compacted: bool) -> TurnOutcome {
         .pointer("/error/message")
         .and_then(Value::as_str)
         .filter(|message| !message.trim().is_empty())
-        .map(unwrap_error_message);
+        .map(readable_error);
     match turn.get("status").and_then(Value::as_str) {
         Some("completed") if compacted => TurnOutcome::Completed,
-        Some("completed") => harness_error("compaction did not run".to_owned()),
+        // Some Codex errors don't count as a failure, and the turn then
+        // completes with no compaction and no message, so there is no reason
+        // to quote.
+        Some("completed") => {
+            harness_error("Codex finished without compacting and gave no reason".to_owned())
+        }
         Some("failed") => match turn
             .pointer("/error/codexErrorInfo")
             .and_then(Value::as_str)
@@ -399,6 +412,22 @@ fn turn_outcome(turn: &Value, compacted: bool) -> TurnOutcome {
             "the compaction turn ended with an unknown status: {}",
             other.unwrap_or("none")
         )),
+    }
+}
+
+/// Codex's text for a failed compaction, made readable.
+///
+/// An API error arrives as `Error running remote compact task: ` followed by
+/// the API's JSON body (captured 2026-10-12), so the API's own message is
+/// lifted out of the body. Anything else goes through `unwrap_error_message`,
+/// as on the send path, which leaves plain text unchanged.
+fn readable_error(raw: &str) -> String {
+    let body = raw.find('{').map_or(raw, |start| &raw[start..]);
+    let lifted = unwrap_error_message(body);
+    if lifted == body {
+        raw.to_owned()
+    } else {
+        lifted
     }
 }
 

@@ -33,6 +33,13 @@ const RECORDED: &str = concat!(
     "/tests/fixtures/codex/app-server-compact.jsonl"
 );
 
+/// A real failed compaction, captured the same way by resuming with a model
+/// the account can't use: the resume succeeds and the compaction turn fails.
+const RECORDED_FAILURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/codex/app-server-compact-failed.jsonl"
+);
+
 /// The thread and compaction turn in the recorded stream.
 const THREAD: &str = "01a13353-52b1-7fd1-b3e5-6ed192aef91d";
 const TURN: &str = "01a13353-903c-7e10-b66f-9116739d6a74";
@@ -484,6 +491,25 @@ async fn an_agent_with_no_model_or_effort_sends_neither() {
 // --- Codex reports a failure ---
 
 #[tokio::test]
+async fn the_recorded_failed_compaction_reports_the_apis_own_message() {
+    // Codex puts the API's JSON body behind an "Error running remote compact
+    // task: " prefix, so the readable message is lifted out of it. The `error`
+    // notification ahead of `turn/completed` carries the same text and is
+    // ignored, as are the resume's warnings about the unknown model.
+    let staged = Staged::new(&std::fs::read_to_string(RECORDED_FAILURE).unwrap());
+
+    assert_eq!(
+        failure(&staged.compact().await),
+        (
+            FailureKind::HarnessError,
+            "The 'gpt-nonexistent-model' model is not supported when using Codex with a \
+             ChatGPT account."
+                .to_owned()
+        )
+    );
+}
+
+#[tokio::test]
 async fn a_failed_compaction_turn_reports_codexs_unwrapped_text() {
     let staged = Staged::new(&ended(
         "failed",
@@ -558,7 +584,7 @@ async fn a_completed_turn_with_no_compaction_item_fails_closed() {
         failure(&staged.compact().await),
         (
             FailureKind::HarnessError,
-            "compaction did not run".to_owned()
+            "Codex finished without compacting and gave no reason".to_owned()
         )
     );
 }

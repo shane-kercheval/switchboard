@@ -1741,6 +1741,10 @@ struct CodexReconstruction {
     /// requires (observed paths are already absolute; this is the defensive
     /// lexical join).
     current_cwd: Option<std::path::PathBuf>,
+    /// A task earlier in this file carried `turn_attribution`, so this file
+    /// marks its replies, and a task without the field is not one. Files
+    /// written before Codex recorded the field never set it.
+    file_marks_replies: bool,
     /// Which rollout generation this file is (see [`HistoryMode`]). Set from
     /// `session_meta`, which Codex writes as the first record; a file with no
     /// `session_meta` at all keeps the `Missing` default and reads as legacy.
@@ -1852,10 +1856,30 @@ struct CodexAgentBuilder {
     /// The task's `compacted` records, in order. Whether they show is decided
     /// when the task closes (see [`CodexReconstruction::close_current_agent`]).
     compactions: Vec<PendingCompaction>,
-    /// The task's `task_started` carries `turn_attribution`, which Codex 0.162
-    /// writes for every regular reply task and never for a compaction task.
-    /// Absent in files written before Codex recorded it.
-    regular_reply: bool,
+    /// Whether the task's `task_started` says it is a regular reply.
+    reply_mark: ReplyMark,
+    /// The task's `task_complete` carries an `error`: the task finished
+    /// because it failed. A failed compaction ends this way, because Codex's
+    /// compaction task returns normally after a failure and attaches the error
+    /// to the completion (codex-cli 0.162.1, `CompactTask::run`; captured
+    /// 2026-10-12).
+    failed: bool,
+}
+
+/// What a task's `task_started` says about whether the task is a regular
+/// reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyMark {
+    /// It carries `turn_attribution`, which Codex 0.162 writes for every
+    /// regular reply task and never for a compaction task.
+    Reply,
+    /// It lacks the field in a file where an earlier task carried it, so it is
+    /// not a reply.
+    NotAReply,
+    /// It lacks the field and no earlier task in the same file carried it:
+    /// every file written before Codex recorded the field, and the first tasks
+    /// of a newer file, such as a brand-new fork's. Nothing says either way.
+    Unknown,
 }
 
 /// One `compacted` record, held until its task closes.
@@ -1933,6 +1957,7 @@ impl CodexReconstruction {
             current_model: None,
             current_effort: None,
             current_cwd: None,
+            file_marks_replies: false,
             history_mode: HistoryMode::Missing,
             open_wrapper: None,
         }
@@ -2049,6 +2074,14 @@ impl CodexReconstruction {
                     .and_then(|v| u32::try_from(v).ok());
                 // A new turn can never inherit a prior turn's wrapper interval.
                 self.open_wrapper = None;
+                let reply_mark = if p.get("turn_attribution").is_some_and(|a| !a.is_null()) {
+                    self.file_marks_replies = true;
+                    ReplyMark::Reply
+                } else if self.file_marks_replies {
+                    ReplyMark::NotAReply
+                } else {
+                    ReplyMark::Unknown
+                };
                 self.current_agent = Some(CodexAgentBuilder {
                     turn_id: Uuid::now_v7(),
                     agent_id: self.agent_id,
@@ -2069,10 +2102,14 @@ impl CodexReconstruction {
                     hydration_key: None,
                     has_prompt: false,
                     compactions: Vec::new(),
-                    regular_reply: p.get("turn_attribution").is_some_and(|a| !a.is_null()),
+                    reply_mark,
+                    failed: false,
                 });
             }
             "task_complete" => {
+                if let Some(builder) = self.current_agent.as_mut() {
+                    builder.failed = p.get("error").is_some_and(|e| !e.is_null());
+                }
                 self.close_current_agent(TurnStatus::Complete);
             }
             // Prompt and answer text is **single-sourced per mode**: legacy
@@ -2952,26 +2989,41 @@ impl CodexReconstruction {
         let mut markers = Vec::new();
         if !builder.has_prompt && items.is_empty() {
             let keep_turn = if builder.compactions.is_empty() {
-                // An empty task that didn't finish (a cancelled compaction,
-                // mostly) has nothing to show, so it is dropped, with two
-                // exceptions that keep the empty turn as it always was:
+                // An empty task with no compaction has nothing to show. Whether
+                // its empty turn stays depends on how Codex marked the task:
                 //
-                // - A finished one. A forward from an idle agent takes the newest
-                //   finished turn (`forward::latest_completed_agent_text`), and an
-                //   empty one means there is nothing to forward. Dropping it would
-                //   forward an older reply, while a forward that waited on the
-                //   same turn live would get nothing.
-                // - A regular reply Codex marked as one (`regular_reply`): a
-                //   message stopped before Codex recorded its prompt. The merge's
-                //   count-based pairing needs its turn to keep messages and
-                //   replies aligned; without it, a reply to a prompt typed in
-                //   Codex's own interface pairs with the stopped message and that
-                //   prompt is hidden (`classify_turns_by_count`). Unlike the
-                //   marker rule below, this may rest on the field: if Codex ever
-                //   wrote it on compaction tasks, a cancelled compaction would
-                //   show an empty failed row again, which is visible and was the
-                //   behavior before this rule.
-                status == TurnStatus::Complete || builder.regular_reply
+                // - `Reply`: kept, however it ended and with or without an
+                //   error. An unfinished one is a message stopped before Codex
+                //   recorded its prompt, and the merge's count-based pairing
+                //   needs its turn to keep messages and replies aligned; without
+                //   it, a reply to a prompt typed in Codex's own interface pairs
+                //   with the stopped message and that prompt is hidden
+                //   (`classify_turns_by_count`). A finished one is a reply that
+                //   produced nothing: a forward from an idle agent takes the
+                //   newest finished turn (`forward::latest_completed_agent_text`),
+                //   and an empty one means there is nothing to forward, which is
+                //   what a forward that waited on the same turn live gets.
+                //   Unlike the marker rule below, this may rest on the field: if
+                //   Codex ever wrote it on compaction tasks, a cancelled
+                //   compaction would show an empty failed row again, which is
+                //   visible and was the behavior before this rule.
+                // - `NotAReply`: dropped. E.g. a failed compaction, or one Codex
+                //   ended without compacting and without an error. Kept, a failed
+                //   compaction would make every forward from the agent send
+                //   nothing until its next reply, though a compaction must never
+                //   spoil a forward.
+                // - `Unknown`: kept only if it finished without an error, as a
+                //   reply that produced nothing, for the forward reason above.
+                //   An unfinished one has nothing to show. A failed one goes,
+                //   because a failed compaction finishes with its error attached.
+                //   The accepted gap: a compaction that ends without compacting
+                //   and without an error still shows an empty turn here, e.g. in
+                //   a brand-new fork's file or an old conversation's.
+                match builder.reply_mark {
+                    ReplyMark::Reply => true,
+                    ReplyMark::NotAReply => false,
+                    ReplyMark::Unknown => status == TurnStatus::Complete && !builder.failed,
+                }
             } else {
                 // A compaction that ran as a turn of its own ("Compact context",
                 // or `/compact` in Codex's own interface) becomes its marker,
@@ -2996,7 +3048,7 @@ impl CodexReconstruction {
                 // tasks.
                 markers = builder.compactions;
                 usage = None;
-                status != TurnStatus::Complete && builder.regular_reply
+                status != TurnStatus::Complete && builder.reply_mark == ReplyMark::Reply
             };
             if !keep_turn {
                 self.push_compaction_markers(builder.agent_id, markers);
@@ -8494,7 +8546,9 @@ not valid json
 
     /// A reply that finished with nothing in it still counts as the newest
     /// reply, so a forward reports nothing rather than an older answer. A
-    /// forward that waited on the same turn live gets nothing too.
+    /// forward that waited on the same turn live gets nothing too. This file
+    /// marks no replies (as before Codex recorded `turn_attribution`), so the
+    /// empty task is kept as it always was.
     #[test]
     fn a_forward_after_a_finished_empty_reply_sends_nothing() {
         let content = jsonl_lines(&[
@@ -8506,6 +8560,136 @@ not valid json
             task_done(),
         ]);
         let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let forwarded = crate::forward::latest_completed_agent_text(&result.turns);
+        assert!(
+            forwarded
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty()),
+            "{forwarded:?}"
+        );
+    }
+
+    /// The two records a failed compaction leaves, with their payloads
+    /// verbatim from codex-cli 0.162.1 (captured 2026-10-12 by resuming with a
+    /// model the account can't use): no prompt, no content, no
+    /// `turn_attribution`, and a completion that carries the error.
+    fn failed_compaction() -> [Value; 2] {
+        [
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started",
+                "turn_id":"01a13377-9996-7542-a2ad-1d771f8acb3a","root_turn_id":"01a13377-9996-7542-a2ad-1d771f8acb3a",
+                "started_at":1_791_864_838,"model_context_window":258_400,"collaboration_mode_kind":"default"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete",
+                "root_turn_id":"01a13377-9996-7542-a2ad-1d771f8acb3a","turn_id":"01a13377-9996-7542-a2ad-1d771f8acb3a",
+                "last_agent_message":null,
+                "error":{"message":"Error running remote compact task: {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-nonexistent-model' model is not supported when using Codex with a ChatGPT account.\"}}",
+                    "codex_error_info":"other"},
+                "started_at":1_791_864_838,"completed_at":1_791_864_839,"duration_ms":943}}),
+        ]
+    }
+
+    #[test]
+    fn a_failed_compaction_shows_nothing_and_a_forward_sends_the_reply_before_it() {
+        // Kept, it would read as an empty reply, and every forward from the
+        // agent would send nothing until its next reply. The unmarked start is
+        // an older conversation, compacted before its first reply from a Codex
+        // that marks replies: the error alone decides there.
+        for start in [regular_task_start("t-1"), task_start("t-1")] {
+            let reply = [
+                start,
+                legacy_prompt("go"),
+                legacy_answer("the answer"),
+                task_done(),
+            ];
+            let content = jsonl_lines(&[&reply[..], &failed_compaction()[..]].concat());
+            let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+            assert_eq!(turn_shapes(&result.turns), ["user", "agent:Complete"]);
+            assert_eq!(
+                crate::forward::latest_completed_agent_text(&result.turns).as_deref(),
+                Some("the answer")
+            );
+        }
+    }
+
+    #[test]
+    fn a_task_codex_did_not_mark_as_a_reply_shows_nothing_once_the_file_marks_replies() {
+        // E.g. a compaction Codex ended without compacting and without an
+        // error. The first reply comes from a Codex that didn't mark replies
+        // yet, as in a conversation that spans an upgrade.
+        let content = jsonl_lines(&[
+            task_start("t-0"),
+            legacy_prompt("before the upgrade"),
+            legacy_answer("older answer"),
+            task_done(),
+            regular_task_start("t-1"),
+            legacy_prompt("go"),
+            legacy_answer("the answer"),
+            task_done(),
+            task_start("t-2"),
+            task_done(),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert_eq!(
+            turn_shapes(&result.turns),
+            ["user", "agent:Complete", "user", "agent:Complete"]
+        );
+        assert_eq!(
+            crate::forward::latest_completed_agent_text(&result.turns).as_deref(),
+            Some("the answer")
+        );
+    }
+
+    #[test]
+    fn an_empty_reply_codex_marked_as_one_keeps_its_turn_after_other_replies() {
+        // The rule above must not reach real replies: this one finished with
+        // nothing in it, so a forward reports nothing rather than an older
+        // answer.
+        let content = jsonl_lines(&[
+            regular_task_start("t-1"),
+            legacy_prompt("go"),
+            legacy_answer("the answer"),
+            task_done(),
+            regular_task_start("t-2"),
+            task_done(),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert_eq!(
+            turn_shapes(&result.turns),
+            ["user", "agent:Complete", "agent:Complete"]
+        );
+        let forwarded = crate::forward::latest_completed_agent_text(&result.turns);
+        assert!(
+            forwarded
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty()),
+            "{forwarded:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_reply_codex_marked_as_one_keeps_its_turn_even_when_it_failed() {
+        // The error decides only when nothing marks the task. A marked reply
+        // that failed with nothing in it still holds its message's slot in the
+        // merge's pairing, and a forward reports nothing rather than an older
+        // answer.
+        let failed = serde_json::json!({"type":"event_msg","payload":{"type":"task_complete",
+            "error":{"message":"You've hit your usage limit.","codex_error_info":"usage_limit_exceeded"}}});
+        let content = jsonl_lines(&[
+            regular_task_start("t-1"),
+            legacy_prompt("go"),
+            legacy_answer("the answer"),
+            task_done(),
+            regular_task_start("t-2"),
+            failed,
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert_eq!(
+            turn_shapes(&result.turns),
+            ["user", "agent:Complete", "agent:Complete"]
+        );
         let forwarded = crate::forward::latest_completed_agent_text(&result.turns);
         assert!(
             forwarded

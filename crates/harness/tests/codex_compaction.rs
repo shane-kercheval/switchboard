@@ -252,7 +252,7 @@ fn lines(lines: &[String]) -> String {
 // --- Success ---
 
 #[tokio::test]
-async fn the_recorded_compaction_completes_with_no_usage_after_liveness() {
+async fn the_recorded_compaction_completes_with_the_compacted_size_after_liveness() {
     let staged = Staged::new(&std::fs::read_to_string(RECORDED).unwrap());
 
     let events = staged.compact().await;
@@ -274,9 +274,17 @@ async fn the_recorded_compaction_completes_with_no_usage_after_liveness() {
     else {
         unreachable!("checked by `terminal`");
     };
-    // The compaction's own token figure leaves out Codex's fixed instructions
-    // and tools, so the context bar must not see it.
-    assert!(usage.is_none());
+    // The compacted context's size and the window, from the compaction turn's
+    // `thread/tokenUsage/updated`. The recording also carries the resume's own
+    // usage notification for the thread's previous turn (21,226 tokens), which
+    // must not be taken for the compaction's.
+    let usage = usage
+        .as_ref()
+        .expect("a completed compaction reports its size");
+    assert_eq!(usage.context_tokens_after_turn, Some(9_686));
+    assert_eq!(usage.context_window, Some(258_400));
+    // No "before" figure, so the row shows its label alone.
+    assert_eq!(usage.context_input_tokens, None);
     assert!(context_window_source.is_none());
     assert!(spend.is_none());
     assert!(model.is_none() && effort.is_none());
@@ -291,6 +299,53 @@ async fn the_recorded_compaction_completes_with_no_usage_after_liveness() {
         events.len() > 1,
         "the running compaction must show activity before it ends"
     );
+}
+
+#[tokio::test]
+async fn a_compaction_whose_turn_reported_no_size_completes_without_one() {
+    // `thread/tokenUsage/updated` is Codex's to send. Without it the
+    // compaction is still a success, and the bar keeps the last reply's reading
+    // rather than hiding.
+    let staged = Staged::new(&lines(&[
+        init_ok(),
+        resume_ok(),
+        compact_ok(),
+        turn_started(),
+        compaction_item("item/started"),
+        compaction_item("item/completed"),
+        turn_completed("completed", &serde_json::Value::Null),
+    ]));
+
+    let events = staged.compact().await;
+
+    assert!(matches!(terminal(&events), TurnOutcome::Completed));
+    let Some(AdapterEvent::TurnEnd { usage, .. }) = events.last() else {
+        unreachable!("checked by `terminal`");
+    };
+    assert!(usage.is_none());
+}
+
+#[tokio::test]
+async fn a_failed_compaction_withholds_the_size_codex_sent() {
+    // The conversation is as it was, so the last reply's reading is still the
+    // truth; a figure here would move the bar on a compaction that didn't
+    // happen.
+    let staged = Staged::new(&lines(&[
+        init_ok(),
+        resume_ok(),
+        compact_ok(),
+        turn_started(),
+        token_usage(),
+        turn_completed("failed", &serde_json::json!({"message": "no"})),
+    ]));
+
+    let events = staged.compact().await;
+
+    assert!(matches!(terminal(&events), TurnOutcome::Failed { .. }));
+    let Some(AdapterEvent::TurnEnd { usage, .. }) = events.last() else {
+        unreachable!("checked by `terminal`");
+    };
+    assert!(usage.is_none());
 }
 
 #[tokio::test]

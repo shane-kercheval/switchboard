@@ -5031,6 +5031,36 @@ fn apply_meta_sidecar_overlay(
             }
         }
     }
+
+    // The window a compaction ran with, reattached to the marker the session
+    // file yields for the same `compact_boundary` record. Claude's file records
+    // the compacted size on that record but never a window, and the sidebar
+    // would otherwise borrow the previous reply's window, which is wrong when
+    // the model changed between that reply and the compaction. Only the newest
+    // marker with that record id is filled, like the turn above.
+    if let Some(snapshot) = sidecar.compaction_window {
+        for turn in transcript.turns.iter_mut().rev() {
+            if let switchboard_harness::Turn::System {
+                marker:
+                    switchboard_harness::SystemMarker::Compaction {
+                        record_id: Some(record_id),
+                        context_after: Some(context),
+                        ..
+                    },
+                ..
+            } = turn
+                && *record_id == snapshot.boundary_id
+            {
+                if context.window.is_none()
+                    && snapshot.context_window > 0
+                    && context.tokens <= u64::from(snapshot.context_window)
+                {
+                    context.window = Some(snapshot.context_window);
+                }
+                break;
+            }
+        }
+    }
 }
 
 /// The per-harness session-file load, without the metadata-sidecar overlay.
@@ -14730,6 +14760,7 @@ mod tests {
             }),
             context_window: None,
             inventory: None,
+            compaction_window: None,
         };
         apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
         assert_eq!(
@@ -14755,6 +14786,7 @@ mod tests {
                 inventory,
                 captured_at,
             }),
+            compaction_window: None,
         }
     }
 
@@ -14898,6 +14930,7 @@ mod tests {
             }),
             context_window: None,
             inventory: None,
+            compaction_window: None,
         };
         apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
         assert_eq!(
@@ -14973,6 +15006,7 @@ mod tests {
                 captured_at: chrono::Utc::now(),
             }),
             inventory: None,
+            compaction_window: None,
         }
     }
 
@@ -15002,6 +15036,107 @@ mod tests {
             None,
             "only the turn the bar reads is filled"
         );
+    }
+
+    /// A reopened compaction marker: the compacted size from the session file,
+    /// keyed by its boundary record, with no window of its own.
+    fn overlay_compaction_marker(record_id: &str, tokens: u64) -> switchboard_harness::Turn {
+        switchboard_harness::Turn::System {
+            turn_id: Uuid::now_v7(),
+            agent_id: Uuid::now_v7(),
+            started_at: chrono::Utc::now(),
+            marker: switchboard_harness::SystemMarker::Compaction {
+                summary: Some("recap".to_owned()),
+                context_after: Some(switchboard_harness::CompactedContext {
+                    tokens,
+                    window: None,
+                }),
+                record_id: Some(record_id.to_owned()),
+            },
+        }
+    }
+
+    fn overlay_marker_window(turn: &switchboard_harness::Turn) -> Option<u32> {
+        match turn {
+            switchboard_harness::Turn::System {
+                marker:
+                    switchboard_harness::SystemMarker::Compaction {
+                        context_after: Some(context),
+                        ..
+                    },
+                ..
+            } => context.window,
+            _ => None,
+        }
+    }
+
+    fn compaction_window_sidecar(
+        boundary_id: &str,
+        window: u32,
+    ) -> switchboard_harness::meta_sidecar::MetaSidecar {
+        switchboard_harness::meta_sidecar::MetaSidecar {
+            compaction_window: Some(
+                switchboard_harness::meta_sidecar::CompactionWindowSnapshot {
+                    context_window: window,
+                    model: "claude-sonnet-5".to_owned(),
+                    boundary_id: boundary_id.to_owned(),
+                    captured_at: chrono::Utc::now(),
+                },
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn overlay_fills_a_compactions_window_on_the_marker_with_its_boundary_record() {
+        // Claude's file records the compacted size but no window. The sidecar
+        // saved the window the compaction ran with under its boundary record,
+        // so the bar divides by that window and not the previous reply's, which
+        // differs when the model changed before the compaction.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![
+                overlay_agent_turn("msg-latest", Some(100), Some(1_000_000)),
+                overlay_compaction_marker("boundary-a", 16_627),
+                overlay_compaction_marker("boundary-b", 9_000),
+            ],
+            ..Default::default()
+        };
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(compaction_window_sidecar("boundary-b", 200_000)),
+        );
+        assert_eq!(overlay_marker_window(&transcript.turns[2]), Some(200_000));
+        assert_eq!(
+            overlay_marker_window(&transcript.turns[1]),
+            None,
+            "only the marker for the saved record is filled"
+        );
+        assert_eq!(
+            overlay_turn_window(&transcript.turns[0]),
+            Some(1_000_000),
+            "the reply's own window is untouched"
+        );
+    }
+
+    #[test]
+    fn overlay_leaves_a_compaction_marker_alone_without_its_record_or_with_an_impossible_window() {
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![overlay_compaction_marker("boundary-a", 16_627)],
+            ..Default::default()
+        };
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(compaction_window_sidecar("boundary-other", 200_000)),
+        );
+        assert_eq!(overlay_marker_window(&transcript.turns[0]), None);
+
+        // A window smaller than the compacted size can't be the one it ran
+        // with; it is not applied, so the bar hides rather than reads over 100%.
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(compaction_window_sidecar("boundary-a", 10_000)),
+        );
+        assert_eq!(overlay_marker_window(&transcript.turns[0]), None);
     }
 
     #[test]
@@ -18862,6 +18997,8 @@ mod tests {
             started_at: at(t),
             marker: SystemMarker::Compaction {
                 summary: Some(summary.to_owned()),
+                context_after: None,
+                record_id: None,
             },
         }
     }
@@ -18873,7 +19010,7 @@ mod tests {
             .iter()
             .filter_map(|i| match i {
                 ConversationItem::SystemMarker {
-                    marker: SystemMarker::Compaction { summary },
+                    marker: SystemMarker::Compaction { summary, .. },
                     ..
                 } => summary.as_deref(),
                 _ => None,
@@ -21639,7 +21776,7 @@ mod tests {
         assert!(merged.items.iter().any(|i| matches!(
             i,
             ConversationItem::SystemMarker {
-                marker: SystemMarker::Compaction { summary: None },
+                marker: SystemMarker::Compaction { summary: None, .. },
                 ..
             }
         )));

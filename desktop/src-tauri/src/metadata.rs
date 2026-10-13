@@ -125,6 +125,43 @@ impl MetadataCache for ProjectMetadataCache {
         }
     }
 
+    fn record_compaction_window(
+        &self,
+        agent_id: AgentId,
+        context_window: u32,
+        model: String,
+        boundary_id: String,
+        captured_at: DateTime<Utc>,
+    ) {
+        // Same per-agent wiring guard as the writers above.
+        debug_assert_eq!(
+            agent_id, self.agent_id,
+            "metadata cache built for {} received event for {agent_id}",
+            self.agent_id
+        );
+        if agent_id != self.agent_id {
+            tracing::warn!(
+                expected = %self.agent_id,
+                got = %agent_id,
+                "metadata cache agent_id mismatch — skipping compaction-window write to avoid persisting another agent's data"
+            );
+            return;
+        }
+        if let Err(e) = switchboard_harness::meta_sidecar::write_compaction_window(
+            &self.sidecar_path,
+            context_window,
+            model,
+            boundary_id,
+            captured_at,
+        ) {
+            tracing::warn!(
+                agent_id = %self.agent_id,
+                error = %e,
+                "failed to persist compaction-window snapshot to metadata sidecar — restart continuity degraded; turn unaffected"
+            );
+        }
+    }
+
     fn record_inventory(
         &self,
         agent_id: AgentId,

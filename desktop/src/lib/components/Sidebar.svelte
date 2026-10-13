@@ -20,7 +20,7 @@
     X,
   } from "@lucide/svelte";
   import { flip } from "svelte/animate";
-  import type { AgentSelection, AgentRecord, AgentId, ProjectId } from "$lib/types";
+  import type { AgentSelection, AgentRecord, AgentId, ProjectId, TurnUsage } from "$lib/types";
   import {
     dispatchCompaction,
     dispatchContextReport,
@@ -34,6 +34,7 @@
     supportsManualCompaction,
   } from "$lib/harnessCapabilities";
   import {
+    conversations,
     forkAgentWithoutSending,
     historyRetryBlock,
     removeAgent,
@@ -65,7 +66,7 @@
     type AgentSessionInfo,
   } from "$lib/api";
   import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
-  import { cn, formatTokens } from "$lib/utils";
+  import { cn, formatTokens, isIsoTimestampAfter } from "$lib/utils";
   import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
@@ -829,12 +830,34 @@
   }
 
   type ContextOccupancy = { usedTokens: number; windowTokens: number; fraction: number };
+  type CompactedReading = { at: string; tokens: number; window: number | null };
+
+  /// Each agent's newest compaction marker that recorded the compacted
+  /// context's size. Markers live in the project's merged conversation, not in
+  /// the agent's turn list, and that conversation changes only when history
+  /// loads or reloads. Derived once per such change rather than rescanned in
+  /// `contextOccupancy`, which reruns on every streamed update.
+  const latestCompactedContexts = $derived.by(() => {
+    // Rebuilt whole on each change, never mutated afterwards.
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const newest = new Map<AgentId, CompactedReading>();
+    for (const item of conversations[projectId]?.items ?? []) {
+      if (item.kind !== "system_marker") continue;
+      if (item.marker.marker_kind !== "compaction" || item.marker.context_after === null) continue;
+      const current = newest.get(item.agent_id);
+      if (current === undefined || isIsoTimestampAfter(item.at, current.at)) {
+        newest.set(item.agent_id, { at: item.at, ...item.marker.context_after });
+      }
+    }
+    return newest;
+  });
 
   /// Context occupancy — `context_tokens_after_turn` over `context_window`
-  /// from the most recent completed agent turn. Forward-looking signal ("how
-  /// full will the next turn's context be"). The raw operands come back beside
-  /// the fraction because the meter shows both, and rescanning the transcript
-  /// for them could disagree with the fraction on a mid-render update.
+  /// from the most recent completed agent turn, or the size a compaction newer
+  /// than that turn left behind. Forward-looking signal ("how full will the
+  /// next turn's context be"). The raw operands come back beside the fraction
+  /// because the meter shows both, and rescanning the transcript for them
+  /// could disagree with the fraction on a mid-render update.
   ///
   /// `context_input_tokens` is the harness-reconciled input-side occupancy
   /// (see `TurnUsage`): for Claude it sums the disjoint cache fields (cached +
@@ -848,8 +871,21 @@
   /// occupancy. Both it and `context_window` must be present; otherwise the bar
   /// is hidden. An impossible occupancy is hidden rather than clamped, so bad
   /// telemetry never masquerades as a plausible 100%.
+  ///
+  /// A compaction marker newer than that turn supersedes it. Live, a completed
+  /// compaction is itself a turn with usage, so this matters after a reopen,
+  /// when the marker is the compaction's only trace and the newest turn is the
+  /// reply before it: without the marker the bar would show the pre-compaction
+  /// size until the agent's next reply. A marker's own window is the one the
+  /// compaction ran with: Codex records it in the session file, and for Claude
+  /// the loader reattaches the window saved at compaction time. A marker with
+  /// none (a Claude compaction run outside Switchboard, or before that window
+  /// was saved) borrows the superseded turn's, which is wrong only if the
+  /// model's window changed between that reply and the compaction, and only
+  /// until the next reply.
   function contextOccupancy(agentId: AgentId): ContextOccupancy | undefined {
     const turns = transcripts[agentId] ?? [];
+    let latest: { at: string; usage: TurnUsage } | undefined;
     for (let i = turns.length - 1; i >= 0; i--) {
       const turn = turns[i];
       // A streaming turn has no terminal usage yet, so keep showing the last
@@ -858,14 +894,28 @@
       // falling back to an older, stale percentage.
       if (turn?.role !== "agent" || turn.status === "streaming" || turn.usage === undefined)
         continue;
-      const window = turn.usage.context_window;
-      if (window === undefined || window === null || window === 0) return undefined;
-      const occupancy = turn.usage.context_tokens_after_turn;
-      if (occupancy === undefined || occupancy === null) return undefined;
-      if (occupancy > window) return undefined;
-      return { usedTokens: occupancy, windowTokens: window, fraction: occupancy / window };
+      latest = { at: turn.ended_at ?? turn.started_at, usage: turn.usage };
+      break;
     }
-    return undefined;
+    const compacted = latestCompactedContexts.get(agentId);
+    if (
+      compacted !== undefined &&
+      (latest === undefined || isIsoTimestampAfter(compacted.at, latest.at))
+    ) {
+      return occupancyOf(compacted.tokens, compacted.window ?? latest?.usage.context_window);
+    }
+    if (latest === undefined) return undefined;
+    return occupancyOf(latest.usage.context_tokens_after_turn, latest.usage.context_window);
+  }
+
+  function occupancyOf(
+    occupancy: number | null | undefined,
+    window: number | null | undefined,
+  ): ContextOccupancy | undefined {
+    if (window === undefined || window === null || window === 0) return undefined;
+    if (occupancy === undefined || occupancy === null) return undefined;
+    if (occupancy > window) return undefined;
+    return { usedTokens: occupancy, windowTokens: window, fraction: occupancy / window };
   }
 
   function toggleCollapsed(agentId: AgentId): void {

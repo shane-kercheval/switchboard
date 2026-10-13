@@ -68,8 +68,8 @@ use crate::events::{
     TurnUsage,
 };
 use crate::transcript::{
-    LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, SystemMarker, Turn,
-    TurnItem, TurnStatus, merge_meta_with_loaders,
+    CompactedContext, LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo,
+    SystemMarker, Turn, TurnItem, TurnStatus, merge_meta_with_loaders,
 };
 
 use super::config::load_mcp_servers;
@@ -1842,6 +1842,11 @@ struct CodexAgentBuilder {
     superseded_rows: Vec<usize>,
     usage: Option<TurnUsage>,
     context_window: Option<u32>,
+    /// `last_token_usage.total_tokens` from the task's latest `token_count`.
+    /// On a compaction task it is the compacted context's size, which `usage`
+    /// can't carry: that record reports zero input and output tokens, so the
+    /// usual input-plus-output occupancy reads 0 there.
+    last_total_tokens: Option<u64>,
     pending_mcp_results: HashMap<String, McpResult>,
     /// Codex's harness-local per-turn id from this turn's `turn_context.turn_id`
     /// — re-parse-stable, so it serves as the hydration key (distinct from our
@@ -1888,6 +1893,9 @@ struct PendingCompaction {
     /// `compacted.message` when it has text. Codex leaves it empty and
     /// encrypts the real summary inside `replacement_history`.
     summary: Option<String>,
+    /// The compacted context's size, filled in when the task closes from its
+    /// `token_count`, which Codex writes after the `compacted` record.
+    context_after: Option<CompactedContext>,
 }
 
 /// Drop the `exec` wrapper rows their own children already render. Applied at
@@ -2046,6 +2054,7 @@ impl CodexReconstruction {
                     builder.compactions.push(PendingCompaction {
                         at: timestamp.unwrap_or(builder.last_seen_at),
                         summary,
+                        context_after: None,
                     });
                 }
             }
@@ -2091,6 +2100,7 @@ impl CodexReconstruction {
                     superseded_rows: Vec::new(),
                     usage: None,
                     context_window,
+                    last_total_tokens: None,
                     pending_mcp_results: HashMap::new(),
                     // Set when this turn's `turn_context` arrives (below). A fresh
                     // builder per turn means the key is reset by construction —
@@ -2168,9 +2178,25 @@ impl CodexReconstruction {
                 let Some(info) = p.get("info").filter(|v| !v.is_null()) else {
                     return;
                 };
+                // Files from Codex 0.77 through 0.99 write a null window on
+                // `task_started` and the real one here. Filled before the usage
+                // is built, so every usage record of the turn carries it, the
+                // first included.
+                if builder.context_window.is_none() {
+                    builder.context_window = info
+                        .get("model_context_window")
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok());
+                }
                 if let Some(usage) = turn_usage_from_token_count_info(info, builder.context_window)
                 {
                     builder.usage = Some(usage);
+                }
+                if let Some(total) = info
+                    .pointer("/last_token_usage/total_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    builder.last_total_tokens = Some(total);
                 }
             }
             // Paginated rollouts carry prompt, answer, and tool detail here
@@ -3027,9 +3053,10 @@ impl CodexReconstruction {
             } else {
                 // A compaction that ran as a turn of its own ("Compact context",
                 // or `/compact` in Codex's own interface) becomes its marker,
-                // never an empty reply. Its usage goes too: that figure isn't
-                // what the next turn will use, so the context bar keeps the last
-                // real reply's reading.
+                // never an empty reply. The task's `token_count` total is the
+                // compacted context's size, and it goes on the last marker, so
+                // the context bar reads it after a reopen; the task's `usage`
+                // itself goes, because its input-plus-output occupancy is 0.
                 //
                 // Structural on purpose, so every Codex version reads the same
                 // way. `task_started.turn_attribution` (written only on regular
@@ -3047,6 +3074,13 @@ impl CodexReconstruction {
                 // is unaffected even if Codex wrote the field on compaction
                 // tasks.
                 markers = builder.compactions;
+                if let (Some(last), Some(tokens)) = (markers.last_mut(), builder.last_total_tokens)
+                {
+                    last.context_after = Some(CompactedContext {
+                        tokens,
+                        window: builder.context_window,
+                    });
+                }
                 usage = None;
                 status != TurnStatus::Complete && builder.reply_mark == ReplyMark::Reply
             };
@@ -3097,6 +3131,8 @@ impl CodexReconstruction {
                 started_at: compaction.at,
                 marker: SystemMarker::Compaction {
                     summary: compaction.summary,
+                    context_after: compaction.context_after,
+                    record_id: None,
                 },
             });
         }
@@ -8163,7 +8199,7 @@ not valid json
             .iter()
             .filter_map(|turn| match turn {
                 Turn::System {
-                    marker: SystemMarker::Compaction { summary },
+                    marker: SystemMarker::Compaction { summary, .. },
                     ..
                 } => Some(summary.clone()),
                 _ => None,
@@ -8254,7 +8290,7 @@ not valid json
     }
 
     #[test]
-    fn a_compaction_run_as_its_own_turn_becomes_one_marker_and_leaves_usage_alone() {
+    fn a_compaction_run_as_its_own_turn_becomes_one_marker_carrying_the_compacted_size() {
         let content =
             std::fs::read_to_string(fixture_path("paginated-compaction.session.jsonl")).unwrap();
         let result = parse_codex_transcript_content(&content, Uuid::now_v7());
@@ -8267,7 +8303,12 @@ not valid json
             ["user", "agent:Complete", "marker", "user", "agent:Complete"]
         );
         assert_eq!(compaction_summaries(&result.turns), [None]);
-        let Turn::System { started_at, .. } = &result.turns[2] else {
+        let Turn::System {
+            started_at,
+            marker: SystemMarker::Compaction { context_after, .. },
+            ..
+        } = &result.turns[2]
+        else {
             unreachable!()
         };
         assert_eq!(
@@ -8275,8 +8316,16 @@ not valid json
             "2026-10-11T17:54:12+00:00",
             "the marker sits where the compaction ran"
         );
-        // The compaction's own figure (9,874 tokens, no input) is not what the
-        // next turn uses, so no turn may carry it.
+        // The compacted context's size, from the task's `token_count` total
+        // (its input and output are 0), with the window the task recorded.
+        assert_eq!(
+            *context_after,
+            Some(CompactedContext {
+                tokens: 9_874,
+                window: Some(258_400),
+            })
+        );
+        // That figure sits on the marker, never on a turn's usage.
         let inputs: Vec<u64> = result
             .turns
             .iter()
@@ -8291,6 +8340,60 @@ not valid json
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 
+    /// A `token_count` whose `last_token_usage` has the given figures and that
+    /// carries the model's window, as every Codex version writes it.
+    fn token_count(input: u64, output: u64, total: u64) -> Value {
+        serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{
+            "last_token_usage":{"input_tokens":input,"output_tokens":output,"total_tokens":total},
+            "model_context_window":258_400}}})
+    }
+
+    #[test]
+    fn a_task_without_a_window_on_its_start_record_takes_the_token_counts() {
+        // Codex 0.77 through 0.99 wrote a null `model_context_window` on
+        // `task_started` and the real one on each `token_count`. The first such
+        // record must supply the window before its own usage is built, for a
+        // reply and for the marker of a compaction alike.
+        let content = jsonl_lines(&[
+            task_start("t-1"),
+            legacy_prompt("go"),
+            legacy_answer("one"),
+            token_count(17_000, 5, 17_005),
+            task_done(),
+            task_start("t-2"),
+            compacted(""),
+            token_count(0, 0, 9_874),
+            task_done(),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert_eq!(
+            turn_shapes(&result.turns),
+            ["user", "agent:Complete", "marker"]
+        );
+        let Turn::Agent {
+            usage: Some(usage), ..
+        } = &result.turns[1]
+        else {
+            panic!("the reply carries usage: {:?}", result.turns[1]);
+        };
+        assert_eq!(usage.context_window, Some(258_400));
+        assert_eq!(usage.context_tokens_after_turn, Some(17_005));
+        assert!(matches!(
+            &result.turns[2],
+            Turn::System {
+                marker: SystemMarker::Compaction {
+                    context_after: Some(CompactedContext {
+                        tokens: 9_874,
+                        window: Some(258_400),
+                    }),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn a_legacy_compaction_only_task_becomes_one_marker() {
         let content = jsonl_lines(&[task_start("t-1"), compacted(""), task_done()]);
@@ -8298,6 +8401,17 @@ not valid json
 
         assert_eq!(turn_shapes(&result.turns), ["marker"]);
         assert_eq!(compaction_summaries(&result.turns), [None]);
+        // No `token_count` in the task, so no size to carry.
+        assert!(matches!(
+            &result.turns[0],
+            Turn::System {
+                marker: SystemMarker::Compaction {
+                    context_after: None,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, CODEX_FORK_TIMEOUT, ClaudeCodeAdapter, CodexAdapter,
     ContentKind, ContextWindowSource, DispatchOptions, EditChange, FailureKind, HarnessAdapter,
-    RateLimitSource, ToolFacet, Turn, TurnItem, TurnOutcome, UserPromptSource,
+    RateLimitSource, ToolFacet, Turn, TurnItem, TurnOutcome, TurnUsage, UserPromptSource,
     claude_session_file_path, find_codex_session_file_for_attach, fork_codex_session,
     load_antigravity_transcript, load_claude_transcript, load_codex_transcript,
 };
@@ -4330,11 +4330,11 @@ async fn live_codex_compact(
 }
 
 /// The stream's terminal outcome and usage, asserting there is exactly one.
-fn single_terminal(events: &[AdapterEvent]) -> (&TurnOutcome, bool) {
+fn single_terminal(events: &[AdapterEvent]) -> (&TurnOutcome, Option<&TurnUsage>) {
     let ends: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
-            AdapterEvent::TurnEnd { outcome, usage, .. } => Some((outcome, usage.is_some())),
+            AdapterEvent::TurnEnd { outcome, usage, .. } => Some((outcome, usage.as_ref())),
             _ => None,
         })
         .collect();
@@ -4421,9 +4421,9 @@ async fn live_codex_compact_succeeds_and_the_conversation_continues() {
     let started = std::time::Instant::now();
     let events = live_codex_compact(&adapter, &agent, tmp.path()).await;
     println!("compaction took {:?}", started.elapsed());
-    let (outcome, has_usage) = single_terminal(&events);
+    let (outcome, usage) = single_terminal(&events);
     assert!(matches!(outcome, TurnOutcome::Completed), "got {outcome:?}");
-    assert!(!has_usage, "a compaction reports no usage");
+    let usage = usage.expect("a completed compaction reports the compacted size");
     assert!(
         events
             .iter()
@@ -4433,6 +4433,23 @@ async fn live_codex_compact_succeeds_and_the_conversation_continues() {
 
     let records = codex_rollout_records(&thread_id);
     assert_eq!(codex_rollout_count(&records, "compacted"), 1);
+    // The size the adapter reported live is the one Codex saved as the
+    // compaction task's `token_count` total, so the bar reads the same after a
+    // reopen as it did when the row said "Context compacted".
+    let saved = records
+        .iter()
+        .rfind(|r| r["payload"]["type"] == "token_count")
+        .map(|r| &r["payload"]["info"])
+        .expect("the compaction task records a token_count");
+    assert_eq!(
+        usage.context_tokens_after_turn,
+        saved["last_token_usage"]["total_tokens"].as_u64(),
+        "live {usage:?} vs saved {saved}"
+    );
+    assert_eq!(
+        usage.context_window.map(u64::from),
+        saved["model_context_window"].as_u64()
+    );
     let contexts: Vec<&serde_json::Value> = records
         .iter()
         .filter(|r| r["type"] == "turn_context")
@@ -4456,6 +4473,22 @@ async fn live_codex_compact_succeeds_and_the_conversation_continues() {
     .expect("the transcript loads");
     assert_eq!(compaction_markers(&transcript), 1);
     assert_eq!(empty_or_unfinished_agent_turns(&transcript), 0);
+
+    let reopened = transcript.turns.iter().find_map(|turn| match turn {
+        Turn::System {
+            marker: switchboard_harness::SystemMarker::Compaction { context_after, .. },
+            ..
+        } => *context_after,
+        _ => None,
+    });
+    assert_eq!(
+        reopened,
+        Some(switchboard_harness::CompactedContext {
+            tokens: usage.context_tokens_after_turn.unwrap(),
+            window: usage.context_window,
+        }),
+        "the reader shows the same size the adapter reported"
+    );
 
     // A word only a command can read, so a right answer proves the command
     // ran, and ran without stopping for approval. Named plainly: asked to
@@ -5222,7 +5255,13 @@ async fn live_claude_compact_succeeds_and_reports_the_boundary() {
         .collect()
         .await;
 
-    let AdapterEvent::TurnEnd { outcome, usage, .. } = sole_live_terminal(&events) else {
+    let AdapterEvent::TurnEnd {
+        outcome,
+        usage,
+        context_window_source,
+        ..
+    } = sole_live_terminal(&events)
+    else {
         unreachable!("filtered to TurnEnd");
     };
     assert_eq!(
@@ -5230,6 +5269,14 @@ async fn live_claude_compact_succeeds_and_reports_the_boundary() {
         TurnOutcome::Completed,
         "compaction should complete, got {events:?}"
     );
+    // The window is keyed by the boundary record's `uuid`, which the session
+    // file must carry on the same record for the loader to reattach it.
+    let Some(ContextWindowSource::StreamOnlyCompaction { boundary_id, .. }) = context_window_source
+    else {
+        panic!(
+            "a compaction's window is keyed by its boundary record, got {context_window_source:?}"
+        );
+    };
     let usage = usage
         .as_ref()
         .expect("a successful compaction reports usage from compact_metadata");
@@ -5258,6 +5305,39 @@ async fn live_claude_compact_succeeds_and_reports_the_boundary() {
         contents.contains("\"compact_boundary\""),
         "session file at {} should record the compaction boundary",
         path.display()
+    );
+    // The saved boundary carries the same post-compaction size the stream
+    // reported, and the reader puts it on the marker, so the bar reads the same
+    // after a reopen as it did live.
+    let loaded = load_claude_transcript(&home_dir(), Path::new("/tmp"), session_id, agent.id)
+        .expect("the compacted session loads");
+    let reopened = loaded.turns.iter().find_map(|turn| match turn {
+        Turn::System {
+            marker: switchboard_harness::SystemMarker::Compaction { context_after, .. },
+            ..
+        } => *context_after,
+        _ => None,
+    });
+    assert_eq!(
+        reopened,
+        Some(switchboard_harness::CompactedContext {
+            tokens: after,
+            window: None,
+        }),
+        "turns: {:?}",
+        loaded.turns
+    );
+    let saved_record = loaded.turns.iter().find_map(|turn| match turn {
+        Turn::System {
+            marker: switchboard_harness::SystemMarker::Compaction { record_id, .. },
+            ..
+        } => record_id.clone(),
+        _ => None,
+    });
+    assert_eq!(
+        saved_record.as_deref(),
+        Some(boundary_id.as_str()),
+        "the saved boundary record carries the id the stream reported"
     );
 }
 

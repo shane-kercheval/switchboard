@@ -51,6 +51,25 @@ pub enum UserPromptSource {
     Unknown,
 }
 
+/// How full the context is once a compaction is done, as the harness recorded
+/// it in its session file: Claude's `compact_boundary` carries `postTokens`,
+/// and Codex's compaction turn records a `token_count` whose total is the
+/// compacted context. Each is the same figure the harness reports live, so the
+/// context bar reads the same after a reopen as it did when the compaction
+/// finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactedContext {
+    pub tokens: u64,
+    /// The model's context window the compaction ran with. Codex writes
+    /// `model_context_window` beside the figure. Claude's session file records
+    /// none, so the loader fills it from the window the dispatcher saved under
+    /// the marker's `record_id` when Switchboard ran the compaction. A marker
+    /// left without one (a compaction run in Claude's own terminal, before that
+    /// window was saved, or with unreadable metadata) makes the frontend borrow
+    /// the previous reply's window.
+    pub window: Option<u32>,
+}
+
 /// A non-conversational event the harness recorded between turns, surfaced in
 /// the transcript so the user can see it but deliberately invisible to the
 /// prompt↔send correlation (it is neither a user prompt nor an agent turn).
@@ -67,7 +86,24 @@ pub enum SystemMarker {
     /// `None` when the harness wrote no readable recap: Codex encrypts its
     /// summary and leaves `compacted.message` empty, so its marker can say a
     /// compaction happened and where, but not what it kept.
-    Compaction { summary: Option<String> },
+    ///
+    /// `context_after` is how full the context is once the compaction is done,
+    /// when the harness recorded it. The sidebar's context bar reads it after a
+    /// reopen, when the compaction is newer than the agent's last reply:
+    /// without it the bar would show the pre-compaction reading until that
+    /// reply. `None` when the record carries no figure.
+    Compaction {
+        summary: Option<String>,
+        context_after: Option<CompactedContext>,
+        /// Claude's `compact_boundary` record `uuid`, the key under which the
+        /// dispatcher saved the window the compaction ran with
+        /// (`ContextWindowSource::StreamOnlyCompaction`); the loader fills
+        /// `context_after.window` from it. Backend-only, like a turn's
+        /// `stable_message_id`: never on the wire. `None` for Codex, whose
+        /// record carries the window itself.
+        #[serde(default, skip_serializing)]
+        record_id: Option<String>,
+    },
     /// A state-changing slash command the harness recorded into the user
     /// channel — **confirmed for Claude's bare `/compact`**; other commands are
     /// routed here as their real bare-record shapes are observed (the parser

@@ -9,6 +9,7 @@ import type {
   ProjectListing,
   WorkflowRunInfo,
 } from "$lib/types";
+import type { Turn } from "$lib/state/types";
 // Static import so the component-tree transform happens at module collection,
 // not inside the first test's timeout (cold CI transforms have no vite cache).
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
@@ -32,10 +33,12 @@ const historyRetryBlockMock = vi.fn<(agent: AgentRecord) => string | null>();
 // The fork conditions the card shares with the compose box read the project's
 // folder and history-load state from here. A test about either sets it.
 const workspaceProjects = vi.hoisted(() => ({ list: [] as ProjectListing[] }));
-const workspaceConversations = vi.hoisted(
-  () => ({}) as Record<string, { items: ConversationItem[]; status: string }>,
-);
-vi.mock("$lib/state/workspace.svelte", () => ({
+// The real, reactive `conversations` store rather than a plain object: the
+// context bar derives its newest compaction from it, and a test about history
+// arriving after the sidebar is on screen needs the sidebar to notice.
+vi.mock("$lib/state/workspace.svelte", async (importOriginal) => ({
+  conversations: (await importOriginal<typeof import("$lib/state/workspace.svelte")>())
+    .conversations,
   renameAgent: (id: string, name: string) => renameAgentMock(id, name),
   removeAgent: (id: string) => removeAgentMock(id),
   setAgentSelection: (id: string, selection: AgentSelection) =>
@@ -46,8 +49,8 @@ vi.mock("$lib/state/workspace.svelte", () => ({
   retryAgentHistory: (agentId: string) => retryAgentHistoryMock(agentId),
   historyRetryBlock: (agent: AgentRecord) => historyRetryBlockMock(agent),
   projects: workspaceProjects,
-  conversations: workspaceConversations,
 }));
+const workspaceConversations = (await import("$lib/state/workspace.svelte")).conversations;
 
 const agentSessionInfoMock = vi.fn();
 const openSessionFileMock = vi.fn();
@@ -2315,11 +2318,9 @@ describe("compact context action", () => {
     expect(bar).toHaveTextContent("60%");
   });
 
-  it("leaves the bar unchanged after a completed Codex compaction", async () => {
-    // A Codex compaction succeeds without usage: the figure Codex reports for
-    // it leaves out its fixed instructions and tools, so a bar moved to it
-    // would drop and then jump back on the next reply. The previous reply's
-    // reading stays until then.
+  it("moves the bar to a Codex compaction's compacted size, which has no before figure", async () => {
+    // The adapter reports only the compacted context's size for Codex, so the
+    // row shows no counts, but the bar has what it needs.
     const state = await loadState();
     await state.registerAgent(CODEX_AGENT);
     state.transcripts[CODEX_AGENT.id] = [
@@ -2336,7 +2337,7 @@ describe("compact context action", () => {
           output_tokens: 5,
           context_input_tokens: 120_000,
           context_tokens_after_turn: 120_000,
-          context_window: 200_000,
+          context_window: 258_400,
         },
       },
       {
@@ -2348,14 +2349,171 @@ describe("compact context action", () => {
         status: "complete",
         kind: "compaction",
         items: [],
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          context_tokens_after_turn: 9_686,
+          context_window: 258_400,
+        },
       },
     ];
 
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     const bar = screen.getByTestId("agent-context-bar");
-    expect(bar).toHaveTextContent("120k / 200k");
-    expect(bar).toHaveTextContent("60%");
+    expect(bar).toHaveTextContent("9.7k / 258k");
+    expect(bar).toHaveTextContent("4%");
+  });
+
+  /// One completed reply at 120k of 200k, ending at `endedAt`.
+  function replyAt(agent: AgentRecord, endedAt: string): Turn {
+    return {
+      role: "agent",
+      turn_id: `turn-${endedAt}`,
+      agent_id: agent.id,
+      started_at: "2026-05-16T00:00:00Z",
+      ended_at: endedAt,
+      status: "complete",
+      items: [],
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        context_input_tokens: 120_000,
+        context_tokens_after_turn: 120_000,
+        context_window: 200_000,
+      },
+    };
+  }
+
+  /// A reopened compaction: the marker the session file yields, in the
+  /// project's merged conversation rather than the agent's turn list.
+  function compactionMarker(
+    agent: AgentRecord,
+    at: string,
+    context_after: { tokens: number; window: number | null } | null,
+  ): ConversationItem {
+    return {
+      kind: "system_marker",
+      id: `marker-${at}`,
+      agent_id: agent.id,
+      at,
+      marker: { marker_kind: "compaction", summary: null, context_after },
+    };
+  }
+
+  it("reads a reopened compaction's size, borrowing the previous reply's window", async () => {
+    // After a reopen the compaction row is gone and only its marker remains,
+    // newer than the last reply. Claude's session file records the compacted
+    // size but no window, so the bar takes the window from the reply before
+    // the compaction, the same session's model.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [replyAt(CLAUDE_AGENT, "2026-05-16T00:00:01Z")];
+    workspaceConversations[PROJECT_ID] = {
+      items: [
+        compactionMarker(CLAUDE_AGENT, "2026-05-16T00:00:02Z", { tokens: 16_627, window: null }),
+      ],
+      status: "complete",
+    };
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const bar = screen.getByTestId("agent-context-bar");
+    expect(bar).toHaveTextContent("17k / 200k");
+    expect(bar).toHaveTextContent("8%");
+  });
+
+  it("notices a compaction in history that loads after the sidebar is on screen", async () => {
+    // The real order in the app: the sidebar renders at once, and the saved
+    // history finishes loading afterwards. The bar must move when it arrives,
+    // not only when it was already there at first render.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [replyAt(CLAUDE_AGENT, "2026-05-16T00:00:01Z")];
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("120k / 200k");
+
+    workspaceConversations[PROJECT_ID] = {
+      items: [
+        compactionMarker(CLAUDE_AGENT, "2026-05-16T00:00:02Z", { tokens: 16_627, window: null }),
+      ],
+      status: "complete",
+    };
+
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("17k / 200k"),
+    );
+  });
+
+  it("uses a reopened Codex compaction's own window", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CODEX_AGENT.id] = [replyAt(CODEX_AGENT, "2026-05-16T00:00:01Z")];
+    workspaceConversations[PROJECT_ID] = {
+      items: [
+        compactionMarker(CODEX_AGENT, "2026-05-16T00:00:02Z", { tokens: 9_874, window: 258_400 }),
+      ],
+      status: "complete",
+    };
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+
+    const bar = screen.getByTestId("agent-context-bar");
+    expect(bar).toHaveTextContent("9.9k / 258k");
+    expect(bar).toHaveTextContent("4%");
+  });
+
+  it("lets a reply after the compaction win, as the newer measurement", async () => {
+    // The compaction's figure is where the next reply starts; once that reply
+    // has reported, its reading is the current one.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [replyAt(CLAUDE_AGENT, "2026-05-16T00:00:05Z")];
+    workspaceConversations[PROJECT_ID] = {
+      items: [
+        compactionMarker(CLAUDE_AGENT, "2026-05-16T00:00:02Z", { tokens: 16_627, window: null }),
+      ],
+      status: "complete",
+    };
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("120k / 200k");
+  });
+
+  it("ignores a reopened compaction that recorded no size, and another agent's", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [replyAt(CLAUDE_AGENT, "2026-05-16T00:00:01Z")];
+    workspaceConversations[PROJECT_ID] = {
+      items: [
+        compactionMarker(CLAUDE_AGENT, "2026-05-16T00:00:02Z", null),
+        compactionMarker(CODEX_AGENT, "2026-05-16T00:00:03Z", { tokens: 9_874, window: 258_400 }),
+      ],
+      status: "complete",
+    };
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("120k / 200k");
+  });
+
+  it("hides the bar when a reopened compaction has no window to borrow", async () => {
+    // Nothing before the compaction reported a window, so the figure has no
+    // denominator; an invented one would read as a measurement.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    workspaceConversations[PROJECT_ID] = {
+      items: [
+        compactionMarker(CLAUDE_AGENT, "2026-05-16T00:00:02Z", { tokens: 16_627, window: null }),
+      ],
+      status: "complete",
+    };
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    await screen.findAllByTestId("agent-actions-trigger");
+    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
   });
 });
 

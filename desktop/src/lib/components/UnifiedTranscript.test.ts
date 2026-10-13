@@ -4155,7 +4155,7 @@ describe("UnifiedTranscript compact mode", () => {
         kind: "system_marker",
         id: "marker-1",
         agent_id: CLAUDE_AGENT.id,
-        marker: { marker_kind: "compaction", summary: "the recap text" },
+        marker: { marker_kind: "compaction", summary: "the recap text", context_after: null },
         at: "2026-05-16T00:00:05Z",
       },
     ];
@@ -4192,7 +4192,7 @@ describe("UnifiedTranscript compact mode", () => {
           kind: "system_marker",
           id: "marker-1",
           agent_id: CODEX_AGENT.id,
-          marker: { marker_kind: "compaction", summary },
+          marker: { marker_kind: "compaction", summary, context_after: null },
           at: "2026-05-16T00:00:05Z",
         },
       ];
@@ -4221,7 +4221,7 @@ describe("UnifiedTranscript compact mode", () => {
         kind: "system_marker",
         id: "marker-1",
         agent_id: CLAUDE_AGENT.id,
-        marker: { marker_kind: "compaction", summary: "the recap text" },
+        marker: { marker_kind: "compaction", summary: "the recap text", context_after: null },
         at: "2026-05-16T00:00:05Z",
       },
     ];
@@ -6232,9 +6232,9 @@ describe("compaction rows", () => {
   });
 
   it("renders a completed Codex compaction as compacted, with no counts", async () => {
-    // Codex reports no usage for a compaction that means anything (its figure
-    // leaves out the fixed instructions and tools), so the adapter sends none
-    // and the row is the label alone.
+    // The adapter reports the compacted context's size for the bar, but
+    // nothing measures the context before a Codex compaction, so the row has
+    // no pair to show and is the label alone.
     await queueCompaction(CODEX_AGENT);
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
     await screen.findByTestId("compaction-queued");
@@ -6254,6 +6254,12 @@ describe("compaction rows", () => {
       turn_id: COMPACT_TURN,
       outcome: { status: "completed" },
       ended_at: "2026-05-16T00:00:07Z",
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        context_tokens_after_turn: 9_686,
+        context_window: 258_400,
+      },
     } as NormalizedEvent);
     await tick();
 

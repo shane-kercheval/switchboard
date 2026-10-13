@@ -710,7 +710,7 @@ mod tests {
                 Turn::User { .. } => "user".to_owned(),
                 Turn::Agent { status, .. } => format!("agent:{status:?}"),
                 Turn::System { marker, .. } => match marker {
-                    SystemMarker::Compaction { summary: None } => "compaction".to_owned(),
+                    SystemMarker::Compaction { summary: None, .. } => "compaction".to_owned(),
                     other => format!("{other:?}"),
                 },
             })

@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::app_server::{self, AppServer, Message};
 use super::parser::{CODEX_AUTH_MESSAGE, unwrap_error_message};
-use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome};
+use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome, TurnUsage};
 
 /// Production bound on a compaction's startup: all three requests answered.
 ///
@@ -190,15 +190,19 @@ pub(crate) async fn run(
             ))
         }
     };
+    // The compacted context's size, so the bar drops when the row says
+    // "Context compacted", as it does for Claude. Withheld on every failure:
+    // the conversation is then as it was, and the last reply's reading is still
+    // the truth.
+    let usage = match outcome {
+        TurnOutcome::Completed => progress.usage.take(),
+        _ => None,
+    };
     let _ = tx.send(AdapterEvent::TurnEnd {
         turn_id,
         outcome,
         ended_at: Utc::now(),
-        // Never a usage figure. The one Codex reports for a compaction leaves
-        // out its fixed instructions and tool definitions (about 17,000
-        // tokens), so the context bar would drop and then jump back on the next
-        // reply. The bar keeps the last real turn's reading instead.
-        usage: None,
+        usage,
         context_window_source: None,
         stable_message_id: None,
         first_message_id: None,
@@ -206,6 +210,36 @@ pub(crate) async fn run(
         model: None,
         effort: None,
     });
+}
+
+/// The compacted context's size from the compaction turn's
+/// `thread/tokenUsage/updated`: `tokenUsage.last.totalTokens`, with
+/// `modelContextWindow` as the window. `last` reports zero input and output
+/// tokens for a compaction, so the total is the only figure; it is the same
+/// one Codex saves as the turn's `token_count`, which the reader shows after a
+/// reopen. `None` when the notification carries no total.
+fn compacted_usage(params: &Value) -> Option<TurnUsage> {
+    let last = params.pointer("/tokenUsage/last")?;
+    let tokens = last.get("totalTokens").and_then(Value::as_u64)?;
+    Some(TurnUsage {
+        input_tokens: last.get("inputTokens").and_then(Value::as_u64).unwrap_or(0),
+        output_tokens: last
+            .get("outputTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cached_input_tokens: last.get("cachedInputTokens").and_then(Value::as_u64),
+        cache_creation_input_tokens: None,
+        // No "before" figure: the row then shows its label alone, as Codex
+        // reports nothing that measures the context before the compaction.
+        context_input_tokens: None,
+        context_tokens_after_turn: Some(tokens),
+        reasoning_output_tokens: None,
+        context_window: params
+            .pointer("/tokenUsage/modelContextWindow")
+            .and_then(Value::as_u64)
+            .and_then(|w| u32::try_from(w).ok()),
+        total_cost_usd: None,
+    })
 }
 
 /// Why the read loop stopped.
@@ -233,6 +267,9 @@ struct Progress {
     compacted: bool,
     /// That turn's `turn/completed` payload.
     finished: Option<Value>,
+    /// The compacted context's size, from that turn's latest
+    /// `thread/tokenUsage/updated`. Reported only on success.
+    usage: Option<TurnUsage>,
 }
 
 impl Progress {
@@ -243,6 +280,7 @@ impl Progress {
             turn: None,
             compacted: false,
             finished: None,
+            usage: None,
         }
     }
 
@@ -271,10 +309,11 @@ impl Progress {
         }
     }
 
-    /// Only `turn/*` and `item/*` notifications on the compaction turn count.
-    /// Everything else is ignored, including `thread/tokenUsage/updated`,
-    /// whose figure is the one the context bar must not show (see `run`), and
-    /// the server's own chatter (`mcpServer/startupStatus/updated`,
+    /// Only notifications on the compaction turn count: `turn/*` and `item/*`
+    /// as activity, and `thread/tokenUsage/updated` for the compacted
+    /// context's size. Everything else is ignored, including the resume's own
+    /// `thread/tokenUsage/updated`, which reports the thread's last turn, and
+    /// the server's chatter (`mcpServer/startupStatus/updated`,
     /// `account/updated`, `remoteControl/status/changed`, `deprecationNotice`).
     fn observe_notification(&mut self, method: &str, params: &Value) -> bool {
         if params.get("threadId").and_then(Value::as_str) != Some(&self.thread_id) {
@@ -300,6 +339,12 @@ impl Progress {
             }
             "turn/completed" => {
                 self.finished = params.get("turn").cloned();
+                return false;
+            }
+            "thread/tokenUsage/updated" => {
+                if let Some(usage) = compacted_usage(params) {
+                    self.usage = Some(usage);
+                }
                 return false;
             }
             _ => {}

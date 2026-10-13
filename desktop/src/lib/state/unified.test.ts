@@ -528,7 +528,7 @@ describe("buildUnifiedRows: system markers (compaction)", () => {
       kind: "system_marker",
       id: `marker:${agentId}:${at}`,
       agent_id: agentId,
-      marker: { marker_kind: "compaction", summary },
+      marker: { marker_kind: "compaction", summary, context_after: null },
       at,
     };
   }
@@ -545,7 +545,7 @@ describe("buildUnifiedRows: system markers (compaction)", () => {
     const marker = rows.find((r) => r.kind === "system_marker")!;
     expect(marker).toMatchObject({
       agent_id: AGENT_A,
-      marker: { marker_kind: "compaction", summary: "the recap text" },
+      marker: { marker_kind: "compaction", summary: "the recap text", context_after: null },
     });
     // It carries no send_id, so it never groups into a fan-out.
     expect((marker as Extract<UnifiedRow, { kind: "system_marker" }>).send_id).toBeUndefined();
@@ -599,7 +599,7 @@ describe("buildUnifiedRows: system markers (compaction)", () => {
         kind: "system_marker",
         id,
         agent_id: AGENT_A,
-        marker: { marker_kind: "compaction", summary: "recap" },
+        marker: { marker_kind: "compaction", summary: "recap", context_after: null },
         at,
       };
       const rows = buildUnifiedRows([], [item]);
@@ -979,7 +979,7 @@ describe("buildUnifiedRows: pending sends", () => {
       kind: "system_marker",
       id: "m",
       agent_id: AGENT_A,
-      marker: { marker_kind: "compaction", summary: "recap" },
+      marker: { marker_kind: "compaction", summary: "recap", context_after: null },
       at: at("05"),
     };
     const rows = buildUnifiedRows(

@@ -2152,6 +2152,42 @@ describe("Sidebar — agent reordering", () => {
   });
 });
 
+/// One completed reply at 120k of 200k, ending at `endedAt`.
+function replyAt(agent: AgentRecord, endedAt: string): Turn {
+  return {
+    role: "agent",
+    turn_id: `turn-${endedAt}`,
+    agent_id: agent.id,
+    started_at: "2026-05-16T00:00:00Z",
+    ended_at: endedAt,
+    status: "complete",
+    items: [],
+    usage: {
+      input_tokens: 10,
+      output_tokens: 5,
+      context_input_tokens: 120_000,
+      context_tokens_after_turn: 120_000,
+      context_window: 200_000,
+    },
+  };
+}
+
+/// A reopened compaction: the marker the session file yields, in the
+/// project's merged conversation rather than the agent's turn list.
+function compactionMarker(
+  agent: AgentRecord,
+  at: string,
+  context_after: { tokens: number; window: number | null } | null,
+): ConversationItem {
+  return {
+    kind: "system_marker",
+    id: `marker-${at}`,
+    agent_id: agent.id,
+    at,
+    marker: { marker_kind: "compaction", summary: null, context_after },
+  };
+}
+
 describe("compact context action", () => {
   it.each([
     ["Claude", CLAUDE_AGENT],
@@ -2364,42 +2400,6 @@ describe("compact context action", () => {
     expect(bar).toHaveTextContent("9.7k / 258k");
     expect(bar).toHaveTextContent("4%");
   });
-
-  /// One completed reply at 120k of 200k, ending at `endedAt`.
-  function replyAt(agent: AgentRecord, endedAt: string): Turn {
-    return {
-      role: "agent",
-      turn_id: `turn-${endedAt}`,
-      agent_id: agent.id,
-      started_at: "2026-05-16T00:00:00Z",
-      ended_at: endedAt,
-      status: "complete",
-      items: [],
-      usage: {
-        input_tokens: 10,
-        output_tokens: 5,
-        context_input_tokens: 120_000,
-        context_tokens_after_turn: 120_000,
-        context_window: 200_000,
-      },
-    };
-  }
-
-  /// A reopened compaction: the marker the session file yields, in the
-  /// project's merged conversation rather than the agent's turn list.
-  function compactionMarker(
-    agent: AgentRecord,
-    at: string,
-    context_after: { tokens: number; window: number | null } | null,
-  ): ConversationItem {
-    return {
-      kind: "system_marker",
-      id: `marker-${at}`,
-      agent_id: agent.id,
-      at,
-      marker: { marker_kind: "compaction", summary: null, context_after },
-    };
-  }
 
   it("reads a reopened compaction's size, borrowing the previous reply's window", async () => {
     // After a reopen the compaction row is gone and only its marker remains,
@@ -3166,5 +3166,284 @@ describe("compact button on the context bar", () => {
     await fireEvent.click(await screen.findByTestId("agent-compact-button"));
 
     await waitFor(() => expect(compactAgentMock).toHaveBeenCalledTimes(1));
+  });
+});
+
+describe("compact all button in the sidebar header", () => {
+  const T1 = "2026-05-16T00:00:01Z";
+  const T2 = "2026-05-16T00:00:02Z";
+  const T3 = "2026-05-16T00:00:03Z";
+
+  function claudeAgent(name: string, suffix: string): AgentRecord {
+    return { ...CLAUDE_AGENT, id: `00000000-0000-7000-8000-00000000${suffix}`, name };
+  }
+
+  /// A live compaction turn in the agent's own list: streaming, finished, or
+  /// one that compacted nothing.
+  function compactionTurn(
+    agent: AgentRecord,
+    status: "streaming" | "complete" | "failed" | "cancelled",
+    at: string,
+  ): Turn {
+    return {
+      role: "agent",
+      turn_id: `turn-compaction-${agent.id}`,
+      agent_id: agent.id,
+      started_at: at,
+      ...(status === "streaming" ? {} : { ended_at: at }),
+      status,
+      kind: "compaction",
+      items: [],
+    };
+  }
+
+  async function rosterAll(
+    state: Awaited<ReturnType<typeof loadState>>,
+    agents: AgentRecord[],
+  ): Promise<void> {
+    for (const agent of agents) await state.registerAgent(agent);
+  }
+
+  async function armAndConfirm(): Promise<void> {
+    await fireEvent.click(await screen.findByTestId("sidebar-compact-all"));
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar-compact-all")).toHaveAttribute("data-armed", "true"),
+    );
+    await fireEvent.click(screen.getByTestId("sidebar-compact-all"));
+  }
+
+  it("is greyed out, and does nothing when clicked, while no agent can be compacted", async () => {
+    // A Claude agent that was never sent anything (its history has loaded and
+    // is empty) and an Antigravity agent with a conversation: neither can be
+    // compacted, so the button must neither arm nor dispatch.
+    const state = await loadState();
+    await rosterAll(state, [CLAUDE_AGENT, ANTIGRAVITY_AGENT]);
+    state.transcripts[ANTIGRAVITY_AGENT.id] = [replyAt(ANTIGRAVITY_AGENT, T1)];
+    render(Sidebar, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, ANTIGRAVITY_AGENT] },
+    });
+
+    const button = await screen.findByTestId("sidebar-compact-all");
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    expect(button).toHaveAccessibleName("Compact all agents");
+    await fireEvent.click(button);
+    await fireEvent.click(screen.getByTestId("sidebar-compact-all"));
+
+    expect(screen.getByTestId("sidebar-compact-all")).toHaveAttribute("data-armed", "false");
+    expect(compactAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("arms on the first click, naming how many agents it will compact, without dispatching", async () => {
+    // The same safety property as the per-agent button, with the count in the
+    // armed label: this spends several turns' worth of tokens at once.
+    const state = await loadState();
+    const second = claudeAgent("claude-two", "ca02");
+    await rosterAll(state, [CLAUDE_AGENT, second]);
+    state.transcripts[CLAUDE_AGENT.id] = [replyAt(CLAUDE_AGENT, T1)];
+    state.transcripts[second.id] = [replyAt(second, T1)];
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, second] } });
+
+    const button = await screen.findByTestId("sidebar-compact-all");
+    expect(button).not.toHaveAttribute("aria-disabled");
+    expect(button).toHaveAttribute("data-armed", "false");
+    await fireEvent.click(button);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar-compact-all")).toHaveAttribute("data-armed", "true"),
+    );
+    expect(screen.getByTestId("sidebar-compact-all")).toHaveAccessibleName("Compact 2 agents now");
+    expect(compactAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("compacts every eligible agent on the second click, each with its own send id, and skips the rest", async () => {
+    // One roster covering the rules: a Claude agent and a Codex agent with
+    // conversations are compacted; a Claude agent whose latest action is a
+    // finished compaction, a Claude agent never used, and an Antigravity agent
+    // are skipped.
+    const state = await loadState();
+    const codex: AgentRecord = {
+      ...CODEX_AGENT,
+      session_locator: { codex: { thread_id: "thread-1", partition_date: "2026-05-16" } },
+    };
+    const compacted = claudeAgent("claude-compacted", "ca03");
+    const unused = claudeAgent("claude-unused", "ca04");
+    const roster = [CLAUDE_AGENT, codex, compacted, unused, ANTIGRAVITY_AGENT];
+    await rosterAll(state, roster);
+    state.transcripts[CLAUDE_AGENT.id] = [replyAt(CLAUDE_AGENT, T1)];
+    state.transcripts[codex.id] = [replyAt(codex, T1)];
+    state.transcripts[compacted.id] = [
+      replyAt(compacted, T1),
+      compactionTurn(compacted, "complete", T2),
+    ];
+    state.transcripts[ANTIGRAVITY_AGENT.id] = [replyAt(ANTIGRAVITY_AGENT, T1)];
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: roster } });
+
+    await fireEvent.click(await screen.findByTestId("sidebar-compact-all"));
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar-compact-all")).toHaveAccessibleName(
+        "Compact 2 agents now",
+      ),
+    );
+    await fireEvent.click(screen.getByTestId("sidebar-compact-all"));
+
+    await waitFor(() => expect(compactAgentMock).toHaveBeenCalledTimes(2));
+    const calls = compactAgentMock.mock.calls;
+    expect(calls.map(([agentId]) => agentId)).toEqual([CLAUDE_AGENT.id, codex.id]);
+    // One id per compaction: a compaction is never a fan-out, so nothing
+    // groups them, and each queued row needs its own id to cancel with.
+    const sendIds = calls.map(([, sendId]) => sendId);
+    expect(new Set(sendIds).size).toBe(2);
+    for (const sendId of sendIds) expect(sendId).toMatch(/^[0-9a-f-]{36}$/);
+    await waitFor(() => {
+      for (const agentId of [CLAUDE_AGENT.id, codex.id]) {
+        const pending = state.runtimes[agentId]?.pending_sends ?? [];
+        expect(pending).toHaveLength(1);
+        expect(pending[0]?.kind).toBe("compaction");
+      }
+    });
+    // Disarmed after firing, and with both compactions now queued nothing is
+    // left to compact, so a further click can't queue a second round.
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar-compact-all")).toHaveAttribute("data-armed", "false"),
+    );
+    expect(screen.getByTestId("sidebar-compact-all")).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("skips an agent whose compaction is queued or running, but not one whose compaction failed", async () => {
+    // A queued or streaming compaction is the agent's latest action already. A
+    // failed one compacted nothing, so that agent is still worth compacting.
+    const state = await loadState();
+    const queued = claudeAgent("claude-queued", "ca05");
+    const running = claudeAgent("claude-running", "ca06");
+    const failed = claudeAgent("claude-failed", "ca07");
+    await rosterAll(state, [queued, running, failed]);
+    state.transcripts[queued.id] = [replyAt(queued, T1)];
+    state.runtimes[queued.id] = {
+      ...state.runtimes[queued.id]!,
+      pending_sends: [
+        {
+          send_id: "00000000-0000-7000-8000-0000000000e1",
+          user_turn_id: "00000000-0000-7000-8000-0000000000e2",
+          kind: "compaction",
+          queued_at: T2,
+        },
+      ],
+    };
+    state.transcripts[running.id] = [
+      replyAt(running, T1),
+      compactionTurn(running, "streaming", T2),
+    ];
+    state.transcripts[failed.id] = [replyAt(failed, T1), compactionTurn(failed, "failed", T2)];
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [queued, running, failed] } });
+
+    await fireEvent.click(await screen.findByTestId("sidebar-compact-all"));
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar-compact-all")).toHaveAccessibleName("Compact 1 agent now"),
+    );
+    await fireEvent.click(screen.getByTestId("sidebar-compact-all"));
+
+    await waitFor(() => expect(compactAgentMock).toHaveBeenCalledTimes(1));
+    expect(compactAgentMock.mock.calls[0]![0]).toBe(failed.id);
+  });
+
+  it("treats a reopened compaction marker newer than the last reply as the agent's latest action", async () => {
+    // After a reopen the compaction row is gone and only its marker remains in
+    // the project's conversation. One agent's marker is newer than its last
+    // reply, so it is skipped; the other has replied since, so it is compacted.
+    // The skipped one's marker recorded no size, as a Codex marker from an
+    // older file does: the rule is about when it sits, not what it carries.
+    const state = await loadState();
+    const since = claudeAgent("claude-since", "ca08");
+    await rosterAll(state, [CLAUDE_AGENT, since]);
+    state.transcripts[CLAUDE_AGENT.id] = [replyAt(CLAUDE_AGENT, T1)];
+    state.transcripts[since.id] = [replyAt(since, T3)];
+    workspaceConversations[PROJECT_ID] = {
+      items: [
+        compactionMarker(CLAUDE_AGENT, T2, null),
+        compactionMarker(since, T2, { tokens: 16_627, window: null }),
+      ],
+      status: "complete",
+    };
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, since] } });
+
+    await fireEvent.click(await screen.findByTestId("sidebar-compact-all"));
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar-compact-all")).toHaveAccessibleName("Compact 1 agent now"),
+    );
+    await fireEvent.click(screen.getByTestId("sidebar-compact-all"));
+
+    await waitFor(() => expect(compactAgentMock).toHaveBeenCalledTimes(1));
+    expect(compactAgentMock.mock.calls[0]![0]).toBe(since.id);
+  });
+
+  it("includes a busy agent, whose compaction queues, and a hidden one", async () => {
+    // Busy is not a refusal, as on the per-agent button. Hiding is a view
+    // setting: a hidden agent still receives sends and still fills its context.
+    const state = await loadState();
+    const hidden = claudeAgent("claude-hidden", "ca09");
+    await rosterAll(state, [CLAUDE_AGENT, hidden]);
+    state.transcripts[CLAUDE_AGENT.id] = [replyAt(CLAUDE_AGENT, T1)];
+    state.transcripts[hidden.id] = [replyAt(hidden, T1)];
+    state.dispatchUserTurn(
+      CLAUDE_AGENT.id,
+      "00000000-0000-7000-8000-000000000001",
+      "go",
+      [],
+      "00000000-0000-7000-8000-0000000000d1",
+      T2,
+    );
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    panes.toggleAgentHidden(PROJECT_ID, [CLAUDE_AGENT.id, hidden.id], hidden.id);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, hidden] } });
+
+    expect(await screen.findByTestId("sidebar-show-all-agents")).toBeInTheDocument();
+    await armAndConfirm();
+
+    await waitFor(() => expect(compactAgentMock).toHaveBeenCalledTimes(2));
+    expect(compactAgentMock.mock.calls.map(([agentId]) => agentId)).toEqual([
+      CLAUDE_AGENT.id,
+      hidden.id,
+    ]);
+  });
+
+  it("counts an agent whose history is still loading, leaving the backend to refuse", async () => {
+    // An empty transcript proves nothing while the history is loading: the
+    // agent may have a long conversation. The backend's session check is the
+    // authority, and its refusal shows on that agent's row.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...state.runtimes[CLAUDE_AGENT.id]!,
+      hydration_status: "loading",
+    };
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const button = await screen.findByTestId("sidebar-compact-all");
+    expect(button).not.toHaveAttribute("aria-disabled");
+  });
+
+  it.each([
+    ["the pointer leaves", (el: HTMLElement) => fireEvent.pointerLeave(el)],
+    ["focus moves away", (el: HTMLElement) => fireEvent.blur(el)],
+  ])("disarms when %s, so a later click re-arms instead of firing", async (_when, leave) => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [replyAt(CLAUDE_AGENT, T1)];
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    await fireEvent.click(await screen.findByTestId("sidebar-compact-all"));
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar-compact-all")).toHaveAttribute("data-armed", "true"),
+    );
+    await leave(screen.getByTestId("sidebar-compact-all"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar-compact-all")).toHaveAttribute("data-armed", "false"),
+    );
+    await fireEvent.click(screen.getByTestId("sidebar-compact-all"));
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar-compact-all")).toHaveAttribute("data-armed", "true"),
+    );
+    expect(compactAgentMock).not.toHaveBeenCalled();
   });
 });

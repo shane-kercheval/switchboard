@@ -88,6 +88,7 @@
     operationFor,
   } from "$lib/state/composeOperations.svelte";
   import { forkBlockFor } from "$lib/state/forkAvailability";
+  import { agentIsCompactible } from "$lib/state/compactionAvailability";
   import { workflowRuns } from "$lib/state/workflows.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
@@ -171,6 +172,12 @@
   /// Holds the armed button's confirm tooltip open. One boolean, because only
   /// one agent is ever armed, and it is bound only by the armed branch.
   let compactConfirmTooltipOpen = $state(false);
+  /// The header's "Compact all" button, armed the same way. Its own flag rather
+  /// than a sentinel in `compactConfirmAgentId`: the two are never armed at
+  /// once in practice (leaving one disarms it), and a sentinel would make every
+  /// per-agent comparison carry a special case.
+  let compactAllArmed = $state(false);
+  let compactAllTooltipOpen = $state(false);
   let removingAgentId = $state<AgentId | null>(null);
   let removeError = $state<{ agentId: AgentId; message: string } | null>(null);
   /// A failed Fork from an agent's menu, shown on that agent's card. A fork
@@ -713,6 +720,25 @@
     await dispatchCompaction(agentId, crypto.randomUUID());
   }
 
+  function disarmCompactAll(): void {
+    compactAllArmed = false;
+    compactAllTooltipOpen = false;
+  }
+
+  function agentCount(count: number): string {
+    return count === 1 ? "1 agent" : `${count} agents`;
+  }
+
+  /// Compact every agent that can be compacted, each as its own queued turn with
+  /// its own send id: a compaction is never a fan-out, so nothing groups them.
+  /// The eligible set is snapshotted first, because each dispatch registers a
+  /// pending compaction, which would remove that agent from the set mid-loop.
+  async function startCompactAll(): Promise<void> {
+    const ids = compactibleAgentIds;
+    disarmCompactAll();
+    await Promise.all(ids.map((id) => dispatchCompaction(id, crypto.randomUUID())));
+  }
+
   const COMPOSE_CLAIM_HELD = "Another send in this project is still in progress.";
 
   /// Why the menu's Fork item is unavailable for `agent`, or `null`. The
@@ -851,6 +877,30 @@
     }
     return newest;
   });
+
+  /// When each agent's newest compaction marker sits, sized or not: "Compact
+  /// all" skips an agent whose latest action is a compaction, and after a reopen
+  /// the marker is the compaction's only trace. Separate from the sized map
+  /// above so a Codex marker from a file that recorded no size still counts.
+  const latestCompactionMarkerTimes = $derived.by(() => {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const newest = new Map<AgentId, string>();
+    for (const item of conversations[projectId]?.items ?? []) {
+      if (item.kind !== "system_marker" || item.marker.marker_kind !== "compaction") continue;
+      const current = newest.get(item.agent_id);
+      if (current === undefined || isIsoTimestampAfter(item.at, current)) {
+        newest.set(item.agent_id, item.at);
+      }
+    }
+    return newest;
+  });
+
+  /// The agents the header's "Compact all" would compact, in roster order.
+  const compactibleAgentIds = $derived(
+    agents
+      .filter((agent) => agentIsCompactible(agent, latestCompactionMarkerTimes.get(agent.id)))
+      .map((agent) => agent.id),
+  );
 
   /// Context occupancy — `context_tokens_after_turn` over `context_window`
   /// from the most recent completed agent turn, or the size a compaction newer
@@ -1070,6 +1120,88 @@
           </Tooltip>
         {/if}
         {#if agents.length > 0}
+          {@const compactibleCount = compactibleAgentIds.length}
+          <!-- The same two-step as each agent's own compact button, for the same
+               reason, and with the count in the armed label and tooltip: this
+               spends several turns' worth of tokens at once, and the count is
+               the thing worth seeing before the second click. `aria-disabled`
+               rather than `disabled` when nothing is eligible, so hovering still
+               opens the tooltip that says why. -->
+          {#snippet compactAllButton(props: Record<string, unknown>, armed: boolean)}
+            {@const closeOnLeave = triggerHandler(props, "onpointerleave")}
+            {@const closeOnBlur = triggerHandler(props, "onblur")}
+            <button
+              {...props}
+              type="button"
+              class={armed
+                ? cn(ICON_BUTTON_ON_PANEL_CLASS, "text-accent")
+                : cn(
+                    ICON_BUTTON_ON_PANEL_CLASS,
+                    compactibleCount === 0 &&
+                      "hover:text-muted cursor-not-allowed opacity-40 hover:bg-transparent",
+                  )}
+              aria-label={armed
+                ? `Compact ${agentCount(compactibleCount)} now`
+                : "Compact all agents"}
+              aria-disabled={compactibleCount === 0 ? "true" : undefined}
+              data-armed={armed ? "true" : "false"}
+              data-testid="sidebar-compact-all"
+              onclick={() => {
+                if (compactibleCount === 0) return;
+                if (armed) {
+                  void startCompactAll();
+                } else {
+                  compactAllArmed = true;
+                  compactAllTooltipOpen = true;
+                }
+              }}
+              onpointerleave={(event) => {
+                closeOnLeave?.(event);
+                disarmCompactAll();
+              }}
+              onblur={(event) => {
+                closeOnBlur?.(event);
+                disarmCompactAll();
+              }}
+            >
+              {#if armed}
+                <Check size={14} strokeWidth={2.2} aria-hidden="true" />
+              {:else}
+                <RotateCcw size={14} strokeWidth={1.8} aria-hidden="true" />
+              {/if}
+            </button>
+          {/snippet}
+          {#if compactAllArmed && compactibleCount > 0}
+            <Tooltip
+              label={`Compact ${agentCount(compactibleCount)}?`}
+              side="bottom"
+              bind:open={compactAllTooltipOpen}
+            >
+              {#snippet trigger(props)}
+                {@render compactAllButton(props, true)}
+              {/snippet}
+            </Tooltip>
+          {:else}
+            <Tooltip side="bottom" reopen="fresh-hover">
+              {#snippet trigger(props)}
+                {@render compactAllButton(props, false)}
+              {/snippet}
+              <div class="max-w-xs space-y-1 text-[13px]">
+                {#if compactibleCount === 0}
+                  <p class="font-medium">Nothing to compact</p>
+                  <p class="text-primary-fg/70">
+                    Every agent was just compacted, hasn't been used yet, or can't compact.
+                  </p>
+                {:else}
+                  <p class="font-medium">Compact every conversation</p>
+                  <p class="text-primary-fg/70">
+                    Compacts {agentCount(compactibleCount)}, skipping any just compacted or never
+                    used. Each runs as a turn and queues if its agent is busy.
+                  </p>
+                {/if}
+              </div>
+            </Tooltip>
+          {/if}
           <Tooltip label={allExpanded ? "Collapse all" : "Expand all"} side="bottom">
             {#snippet trigger(props)}
               <button

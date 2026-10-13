@@ -4296,6 +4296,347 @@ async fn live_codex_regular_reply_task_start_carries_turn_attribution() {
     );
 }
 
+/// The records of a Codex thread's rollout, in order.
+fn codex_rollout_records(thread_id: &str) -> Vec<serde_json::Value> {
+    let rollout = find_codex_session_file_for_attach(&home_dir(), thread_id)
+        .expect("the thread's rollout exists")
+        .0;
+    std::fs::read_to_string(&rollout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn codex_rollout_count(records: &[serde_json::Value], record_type: &str) -> usize {
+    records
+        .iter()
+        .filter(|r| r["type"] == record_type || r["payload"]["type"] == record_type)
+        .count()
+}
+
+/// Compact `agent` through the adapter and return the stream's events.
+async fn live_codex_compact(
+    adapter: &CodexAdapter,
+    agent: &AgentRecord,
+    cwd: &Path,
+) -> Vec<AdapterEvent> {
+    adapter
+        .compact(agent, cwd, Uuid::now_v7(), DispatchOptions::default())
+        .await
+        .expect("compact should start")
+        .collect()
+        .await
+}
+
+/// The stream's terminal outcome and usage, asserting there is exactly one.
+fn single_terminal(events: &[AdapterEvent]) -> (&TurnOutcome, bool) {
+    let ends: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::TurnEnd { outcome, usage, .. } => Some((outcome, usage.is_some())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends.len(), 1, "exactly one terminal; events: {events:?}");
+    ends[0]
+}
+
+fn compaction_markers(transcript: &switchboard_harness::LoadedTranscript) -> usize {
+    transcript
+        .turns
+        .iter()
+        .filter(|turn| {
+            matches!(
+                turn,
+                Turn::System {
+                    marker: switchboard_harness::SystemMarker::Compaction { .. },
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+/// Every agent turn in `transcript` that has no content or didn't finish.
+fn empty_or_unfinished_agent_turns(transcript: &switchboard_harness::LoadedTranscript) -> usize {
+    transcript
+        .turns
+        .iter()
+        .filter(|turn| {
+            matches!(turn, Turn::Agent { items, status, .. }
+                if items.is_empty() || *status != switchboard_harness::TurnStatus::Complete)
+        })
+        .count()
+}
+
+fn agent_reply(events: &[AdapterEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk {
+                kind: ContentKind::Text,
+                text,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+#[allow(clippy::too_many_lines)]
+async fn live_codex_compact_succeeds_and_the_conversation_continues() {
+    // The end-to-end proof that a compaction through a short-lived app-server
+    // is real: Codex writes its `compacted` record, records the turn with the
+    // agent's own settings, the reader shows one marker, and the next ordinary
+    // turn still knows the conversation and still runs commands unasked.
+    // Pinned to the cheapest model.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = home_dir();
+    let adapter = CodexAdapter::new();
+    let mut agent = live_codex_agent();
+    agent.model = Some("gpt-6-luna".to_owned());
+    agent.effort = Some("low".to_owned());
+
+    let first = live_codex_turn(
+        &adapter,
+        &agent,
+        tmp.path(),
+        "Remember the code word 'OSPREY-42'. Reply with only 'ok'.",
+    )
+    .await;
+    let (thread_id, partition_date) =
+        codex_capture(&first).expect("the first dispatch captures a locator");
+    agent.session_locator = Some(SessionLocator::Codex {
+        thread_id: thread_id.clone(),
+        partition_date,
+    });
+
+    // A different effort from the thread's last turn, so the compaction turn's
+    // record proves the compaction ran with the agent's selection rather than
+    // inheriting the thread's.
+    agent.effort = Some("medium".to_owned());
+    let started = std::time::Instant::now();
+    let events = live_codex_compact(&adapter, &agent, tmp.path()).await;
+    println!("compaction took {:?}", started.elapsed());
+    let (outcome, has_usage) = single_terminal(&events);
+    assert!(matches!(outcome, TurnOutcome::Completed), "got {outcome:?}");
+    assert!(!has_usage, "a compaction reports no usage");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::Liveness { .. })),
+        "the running compaction must show activity"
+    );
+
+    let records = codex_rollout_records(&thread_id);
+    assert_eq!(codex_rollout_count(&records, "compacted"), 1);
+    let contexts: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["type"] == "turn_context")
+        .map(|r| &r["payload"])
+        .collect();
+    let [reply, compaction] = contexts[..] else {
+        panic!("one reply and one compaction turn; got {contexts:?}");
+    };
+    assert_eq!(compaction["model"], "gpt-6-luna");
+    assert_eq!(compaction["effort"], "medium");
+    assert_eq!(compaction["sandbox_policy"], reply["sandbox_policy"]);
+    assert_eq!(compaction["approval_policy"], reply["approval_policy"]);
+
+    let transcript = load_codex_transcript(
+        &home,
+        tmp.path(),
+        &thread_id,
+        Some(partition_date),
+        agent.id,
+    )
+    .expect("the transcript loads");
+    assert_eq!(compaction_markers(&transcript), 1);
+    assert_eq!(empty_or_unfinished_agent_turns(&transcript), 0);
+
+    // A word only a command can read, so a right answer proves the command
+    // ran, and ran without stopping for approval. Named plainly: asked to
+    // `cat token.txt`, the model refused, reading the file as a secret.
+    std::fs::write(tmp.path().join("bird.txt"), "MERLIN-905\n").unwrap();
+    let after = live_codex_turn(
+        &adapter,
+        &agent,
+        tmp.path(),
+        "Run the shell command `cat bird.txt`. Then reply with the code word I asked \
+         you to remember, a space, and the file's contents, and nothing else.",
+    )
+    .await;
+    let (outcome, _) = single_terminal(&after);
+    assert!(matches!(outcome, TurnOutcome::Completed), "got {outcome:?}");
+    let reply = agent_reply(&after).to_uppercase();
+    assert!(
+        reply.contains("OSPREY-42") && reply.contains("MERLIN-905"),
+        "the turn after a compaction must remember the conversation and run the \
+         command; reply was {reply:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_compact_cancelled_leaves_no_compaction() {
+    // Stop pressed while a compaction runs: the server is torn down, Codex
+    // records an interrupted turn and no compaction, the reader shows nothing
+    // for it, and the conversation carries on.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = home_dir();
+    let adapter = CodexAdapter::new();
+    let mut agent = live_codex_agent();
+    agent.model = Some("gpt-6-luna".to_owned());
+    agent.effort = Some("low".to_owned());
+
+    let first = live_codex_turn(&adapter, &agent, tmp.path(), "Reply with only 'ok'.").await;
+    let (thread_id, partition_date) =
+        codex_capture(&first).expect("the first dispatch captures a locator");
+    agent.session_locator = Some(SessionLocator::Codex {
+        thread_id: thread_id.clone(),
+        partition_date,
+    });
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut stream = adapter
+        .compact(
+            &agent,
+            tmp.path(),
+            Uuid::now_v7(),
+            DispatchOptions {
+                cancel_token: cancel.clone(),
+                ..DispatchOptions::default()
+            },
+        )
+        .await
+        .expect("compact should start");
+    let first_event = stream.next().await;
+    assert!(
+        matches!(first_event, Some(AdapterEvent::Liveness { .. })),
+        "got {first_event:?}"
+    );
+    cancel.cancel();
+    let rest: Vec<AdapterEvent> = stream.collect().await;
+    assert!(
+        !rest
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+        "a cancelled compaction ends with no terminal; events: {rest:?}"
+    );
+
+    let records = codex_rollout_records(&thread_id);
+    assert_eq!(codex_rollout_count(&records, "compacted"), 0);
+    assert_eq!(codex_rollout_count(&records, "turn_aborted"), 1);
+    let transcript = load_codex_transcript(
+        &home,
+        tmp.path(),
+        &thread_id,
+        Some(partition_date),
+        agent.id,
+    )
+    .expect("the transcript loads");
+    assert_eq!(compaction_markers(&transcript), 0);
+    assert_eq!(empty_or_unfinished_agent_turns(&transcript), 0);
+
+    let after = live_codex_turn(&adapter, &agent, tmp.path(), "Reply with only 'ok'.").await;
+    let (outcome, _) = single_terminal(&after);
+    assert!(matches!(outcome, TurnOutcome::Completed), "got {outcome:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_compact_of_a_fork_keeps_its_inherited_context() {
+    // Codex continues a fork by re-reading its original's rollout up to the
+    // fork point, and the compaction reaches the fork through `thread/resume`
+    // rather than `codex exec`. This proves that path compacts the fork alone
+    // and keeps the inherited conversation.
+    const PARENT_PROMPT: &str = "Remember the code word 'EGRET-77'. Reply with only 'ok'.";
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = home_dir();
+    let adapter = CodexAdapter::new();
+    let mut parent = live_codex_agent();
+    parent.model = Some("gpt-6-luna".to_owned());
+    parent.effort = Some("low".to_owned());
+
+    let first = live_codex_turn(&adapter, &parent, tmp.path(), PARENT_PROMPT).await;
+    let (parent_thread_id, _) =
+        codex_capture(&first).expect("the parent's first dispatch captures a locator");
+    let fork_locator = fork_codex_session(
+        Path::new("codex"),
+        &home,
+        tmp.path(),
+        &parent_thread_id,
+        &parent.selection(),
+        CODEX_FORK_TIMEOUT,
+    )
+    .await
+    .expect("a promptless fork should succeed");
+    let fork = AgentRecord {
+        id: Uuid::now_v7(),
+        session_locator: Some(fork_locator.clone().into()),
+        ..parent.clone()
+    };
+    let parent_rollout = find_codex_session_file_for_attach(&home, &parent_thread_id)
+        .expect("the parent's rollout exists")
+        .0;
+    let parent_before = std::fs::read(&parent_rollout).unwrap();
+
+    let events = live_codex_compact(&adapter, &fork, tmp.path()).await;
+    let (outcome, _) = single_terminal(&events);
+    assert!(matches!(outcome, TurnOutcome::Completed), "got {outcome:?}");
+
+    assert_eq!(
+        codex_rollout_count(&codex_rollout_records(&fork_locator.thread_id), "compacted"),
+        1
+    );
+    assert_eq!(
+        std::fs::read(&parent_rollout).unwrap(),
+        parent_before,
+        "compacting a fork must not touch its original's rollout"
+    );
+
+    let transcript = load_codex_transcript(
+        &home,
+        tmp.path(),
+        &fork_locator.thread_id,
+        Some(fork_locator.partition_date),
+        fork.id,
+    )
+    .expect("the fork's transcript loads");
+    let shapes: Vec<&str> = transcript
+        .turns
+        .iter()
+        .map(|turn| match turn {
+            Turn::User { .. } => "user",
+            Turn::Agent { .. } => "agent",
+            Turn::System { .. } => "marker",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(
+        shapes,
+        ["user", "agent", "marker"],
+        "the original's exchange, then the fork's compaction; turns: {:#?}",
+        transcript.turns
+    );
+    assert_eq!(empty_or_unfinished_agent_turns(&transcript), 0);
+
+    let after = live_codex_turn(
+        &adapter,
+        &fork,
+        tmp.path(),
+        "What code word did I ask you to remember? Reply with only that word.",
+    )
+    .await;
+    assert!(
+        agent_reply(&after).to_uppercase().contains("EGRET-77"),
+        "the compacted fork must keep the conversation it inherited; events: {after:?}"
+    );
+}
+
 /// Restores `settings.json` from a byte-for-byte backup and deletes the backup
 /// on drop — covers normal completion AND assertion-panic unwinding. See the
 /// config-mutation protocol in `live_antigravity_model_change_announced_on_resume`.

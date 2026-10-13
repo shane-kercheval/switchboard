@@ -82,6 +82,7 @@
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import UserMessageBody from "$lib/components/UserMessageBody.svelte";
+  import { compactionRecap } from "$lib/compaction";
   import { inheritedHistoryNotice } from "$lib/inheritedHistory";
   import { consumeJump, jumpRequest } from "$lib/state/transcriptJump.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
@@ -118,7 +119,7 @@
   function markerCopy(marker: MarkerRow["marker"]): { copyable: string; label: string } {
     switch (marker.marker_kind) {
       case "compaction":
-        return { copyable: marker.summary, label: "Copy summary" };
+        return { copyable: compactionRecap(marker.summary) ?? "", label: "Copy summary" };
       case "slash_command":
         return { copyable: marker.command, label: "Copy command" };
       case "inherited_history_unavailable": {

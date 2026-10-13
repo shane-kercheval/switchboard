@@ -972,7 +972,9 @@ export type ConversationItem =
 // bare `/compact`; other commands added as their shapes are observed) — shown so
 // the user sees it ran, but non-correlating.
 export type SystemMarker =
-  | { marker_kind: "compaction"; summary: string }
+  // `summary` is null when the harness wrote no readable recap (Codex encrypts
+  // its own), and the marker then renders as its label alone.
+  | { marker_kind: "compaction"; summary: string | null }
   | { marker_kind: "slash_command"; command: string }
   // A `/context` run recorded in the session file. Renders nothing — a report is
   // not conversation — and exists so a reopened project can fill the breakdown

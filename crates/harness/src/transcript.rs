@@ -63,7 +63,11 @@ pub enum SystemMarker {
     /// The harness compacted the conversation's context. `summary` is the
     /// continuation recap the harness wrote (Claude's `isCompactSummary`
     /// record); rendered collapsed since it is a large structured block.
-    Compaction { summary: String },
+    ///
+    /// `None` when the harness wrote no readable recap: Codex encrypts its
+    /// summary and leaves `compacted.message` empty, so its marker can say a
+    /// compaction happened and where, but not what it kept.
+    Compaction { summary: Option<String> },
     /// A state-changing slash command the harness recorded into the user
     /// channel — **confirmed for Claude's bare `/compact`**; other commands are
     /// routed here as their real bare-record shapes are observed (the parser

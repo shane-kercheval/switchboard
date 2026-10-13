@@ -4249,6 +4249,53 @@ async fn live_codex_hydration_key_matches_live_turn_end() {
     );
 }
 
+/// The Codex reader keeps the empty turn of a message stopped before Codex
+/// recorded its prompt only when the task's `task_started` carries
+/// `turn_attribution`, which Codex 0.162 writes on every regular reply task
+/// (`close_current_agent` in `codex/session_file.rs`). Without the field, the
+/// merge's count-based pairing can put a reply typed in Codex's own interface
+/// under the stopped message. Offline fixtures can't notice Codex dropping the
+/// field; this does.
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_regular_reply_task_start_carries_turn_attribution() {
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = CodexAdapter::new();
+    let agent = live_codex_agent();
+
+    let events: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Reply with the single word 'ack'.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch")
+        .collect()
+        .await;
+    let (thread_id, _) = codex_capture(&events).expect("captured Codex locator");
+
+    let rollout = find_codex_session_file_for_attach(&home_dir(), &thread_id)
+        .expect("the turn's rollout exists")
+        .0;
+    let task_starts: Vec<serde_json::Value> = std::fs::read_to_string(&rollout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| {
+            record["type"] == "event_msg" && record["payload"]["type"] == "task_started"
+        })
+        .collect();
+    assert_eq!(task_starts.len(), 1, "one reply, one task");
+    assert!(
+        task_starts[0]["payload"]["turn_attribution"].is_object(),
+        "a regular reply's task_started must carry turn_attribution: {}",
+        task_starts[0]["payload"]
+    );
+}
+
 /// Restores `settings.json` from a byte-for-byte backup and deletes the backup
 /// on drop — covers normal completion AND assertion-panic unwinding. See the
 /// config-mutation protocol in `live_antigravity_model_change_announced_on_resume`.

@@ -4179,6 +4179,62 @@ describe("UnifiedTranscript compact mode", () => {
     expect(screen.getByTestId("compaction-body")).toHaveTextContent("the recap text");
   });
 
+  it("renders a compaction marker with no summary as its label alone", async () => {
+    // Codex encrypts its summary, so its marker carries none: no glimpse, no
+    // expand control, and no "Copy summary" that would copy nothing. A blank
+    // summary is treated the same way.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+
+    for (const summary of [null, "  \n"]) {
+      const overlay: ConversationItem[] = [
+        {
+          kind: "system_marker",
+          id: "marker-1",
+          agent_id: CODEX_AGENT.id,
+          marker: { marker_kind: "compaction", summary },
+          at: "2026-05-16T00:00:05Z",
+        },
+      ];
+
+      const { unmount } = render(UnifiedTranscript, {
+        props: { projectId: PROJECT_ID, agents: [CODEX_AGENT], overlay },
+      });
+
+      const marker = screen.getByTestId("compaction-marker");
+      expect(marker).toHaveTextContent("Conversation compacted");
+      expect(within(marker).getByTestId("compaction-row").tagName).not.toBe("BUTTON");
+      expect(within(marker).queryByRole("button")).toBeNull();
+      expect(screen.queryByTestId("compaction-preview")).toBeNull();
+      expect(
+        screen.getByTestId("system-marker").querySelector('[data-testid="message-copy"]'),
+      ).toBeNull();
+      unmount();
+    }
+  });
+
+  it("offers a compaction marker's summary for copying", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const overlay: ConversationItem[] = [
+      {
+        kind: "system_marker",
+        id: "marker-1",
+        agent_id: CLAUDE_AGENT.id,
+        marker: { marker_kind: "compaction", summary: "the recap text" },
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], overlay },
+    });
+
+    expect(
+      screen.getByTestId("system-marker").querySelector('[data-testid="message-copy"]'),
+    ).not.toBeNull();
+  });
+
   it("renders a slash-command marker with the command text", async () => {
     // A bare `/compact` (and future `/clear`, `/model`) surfaces as a
     // non-correlating SlashCommand marker — shown so the user sees it ran, but it

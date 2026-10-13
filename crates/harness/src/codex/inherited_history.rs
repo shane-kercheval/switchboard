@@ -676,6 +676,61 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_of_a_compacted_conversation_shows_the_originals_marker() {
+        // The original holds a reply, a compaction run as its own turn, a
+        // cancelled compaction and a second reply. Its segment goes through the
+        // same reader as any rollout, so the fork shows the marker in place and
+        // no empty reply for either compaction.
+        let home = Home::new();
+        let parent = fixture("paginated-compaction");
+        home.rollout(11, PARENT, &parent);
+        let own_turn = [
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"fork-1"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"UserMessage","id":"fu1","content":[{"type":"text","text":"And now?","text_elements":[]}]}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"AgentMessage","id":"fa1","content":[{"type":"Text","text":"HERON"}]}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}}),
+        ]
+        .iter()
+        .map(|record| record.to_string() + "\n")
+        .collect::<String>();
+        home.rollout(
+            11,
+            CHILD,
+            &(meta_line(CHILD, Some((PARENT, parent.len()))) + &own_turn),
+        );
+
+        let transcript = home.load(CHILD, 11);
+
+        let shapes: Vec<String> = transcript
+            .turns
+            .iter()
+            .map(|turn| match turn {
+                Turn::User { .. } => "user".to_owned(),
+                Turn::Agent { status, .. } => format!("agent:{status:?}"),
+                Turn::System { marker, .. } => match marker {
+                    SystemMarker::Compaction { summary: None } => "compaction".to_owned(),
+                    other => format!("{other:?}"),
+                },
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                "user",
+                "agent:Complete",
+                "compaction",
+                "user",
+                "agent:Complete",
+                "user",
+                "agent:Complete"
+            ]
+        );
+        assert_eq!(user_texts(&transcript)[2], "And now?");
+    }
+
+    #[test]
     fn a_chain_that_loops_back_is_refused() {
         // The fork points at A, and A points back at the fork.
         const FORK: &str = "00000000-0000-7000-8000-00000000f0f0";

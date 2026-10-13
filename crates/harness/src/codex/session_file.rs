@@ -1844,6 +1844,26 @@ struct CodexAgentBuilder {
     /// own `turn_id`, minted fresh each parse). Set when the turn's
     /// `turn_context` arrives; `None` for a turn that writes none.
     hydration_key: Option<String>,
+    /// The task recorded a user prompt. Set only where the reader creates the
+    /// user turn (the legacy `user_message` arm and the paginated `UserMessage`
+    /// arm), never from `response_item` messages, which duplicate those and
+    /// include context Codex injects with role `user`.
+    has_prompt: bool,
+    /// The task's `compacted` records, in order. Whether they show is decided
+    /// when the task closes (see [`CodexReconstruction::close_current_agent`]).
+    compactions: Vec<PendingCompaction>,
+    /// The task's `task_started` carries `turn_attribution`, which Codex 0.162
+    /// writes for every regular reply task and never for a compaction task.
+    /// Absent in files written before Codex recorded it.
+    regular_reply: bool,
+}
+
+/// One `compacted` record, held until its task closes.
+struct PendingCompaction {
+    at: DateTime<Utc>,
+    /// `compacted.message` when it has text. Codex leaves it empty and
+    /// encrypts the real summary inside `replacement_history`.
+    summary: Option<String>,
 }
 
 /// Drop the `exec` wrapper rows their own children already render. Applied at
@@ -1988,6 +2008,22 @@ impl CodexReconstruction {
                     }
                 }
             }
+            // Codex's record of a compaction, written in every history mode.
+            // Held against the open task; `close_current_agent` decides whether
+            // it shows. One outside any task shows nothing, as it always has.
+            "compacted" => {
+                if let Some(builder) = self.current_agent.as_mut() {
+                    let summary = payload
+                        .and_then(|p| p.get("message"))
+                        .and_then(Value::as_str)
+                        .filter(|message| !message.trim().is_empty())
+                        .map(str::to_owned);
+                    builder.compactions.push(PendingCompaction {
+                        at: timestamp.unwrap_or(builder.last_seen_at),
+                        summary,
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -2031,6 +2067,9 @@ impl CodexReconstruction {
                     // genuinely-new turn as "already seen" (lost output), which
                     // is worse than the duplication this key exists to prevent.
                     hydration_key: None,
+                    has_prompt: false,
+                    compactions: Vec::new(),
+                    regular_reply: p.get("turn_attribution").is_some_and(|a| !a.is_null()),
                 });
             }
             "task_complete" => {
@@ -2053,6 +2092,9 @@ impl CodexReconstruction {
                 let Some(message) = p.get("message").and_then(Value::as_str) else {
                     return;
                 };
+                if let Some(builder) = self.current_agent.as_mut() {
+                    builder.has_prompt = true;
+                }
                 let started_at = self.current_agent.as_ref().map_or_else(
                     || timestamp.unwrap_or_else(Utc::now),
                     |builder| builder.started_at,
@@ -2197,6 +2239,9 @@ impl CodexReconstruction {
                 // and the user turn is anchored to that task start — which keeps
                 // a timestamp-sorted transcript rendering the prompt directly
                 // above its reply.
+                if let Some(builder) = self.current_agent.as_mut() {
+                    builder.has_prompt = true;
+                }
                 let started_at = self.current_agent.as_ref().map_or_else(
                     || timestamp.unwrap_or_else(Utc::now),
                     |builder| builder.started_at,
@@ -2239,6 +2284,11 @@ impl CodexReconstruction {
             // summary is empty and the raw content is encrypted (§3.2). Skipped
             // for the same reason Codex reasoning has always been skipped, not
             // as an oversight.
+            //
+            // `ContextCompaction` is skipped too. Codex writes it only in
+            // paginated files, beside the top-level `compacted` record it writes
+            // in every mode, which is the single source of a compaction (see
+            // `ingest`). Reading both would show two markers for one compaction.
             _ => {}
         }
     }
@@ -2897,14 +2947,75 @@ impl CodexReconstruction {
         let Some(builder) = self.current_agent.take() else {
             return;
         };
+        let items = drop_superseded_rows(builder.items, &builder.superseded_rows);
+        let mut usage = builder.usage;
+        let mut markers = Vec::new();
+        if !builder.has_prompt && items.is_empty() {
+            let keep_turn = if builder.compactions.is_empty() {
+                // An empty task that didn't finish (a cancelled compaction,
+                // mostly) has nothing to show, so it is dropped, with two
+                // exceptions that keep the empty turn as it always was:
+                //
+                // - A finished one. A forward from an idle agent takes the newest
+                //   finished turn (`forward::latest_completed_agent_text`), and an
+                //   empty one means there is nothing to forward. Dropping it would
+                //   forward an older reply, while a forward that waited on the
+                //   same turn live would get nothing.
+                // - A regular reply Codex marked as one (`regular_reply`): a
+                //   message stopped before Codex recorded its prompt. The merge's
+                //   count-based pairing needs its turn to keep messages and
+                //   replies aligned; without it, a reply to a prompt typed in
+                //   Codex's own interface pairs with the stopped message and that
+                //   prompt is hidden (`classify_turns_by_count`). Unlike the
+                //   marker rule below, this may rest on the field: if Codex ever
+                //   wrote it on compaction tasks, a cancelled compaction would
+                //   show an empty failed row again, which is visible and was the
+                //   behavior before this rule.
+                status == TurnStatus::Complete || builder.regular_reply
+            } else {
+                // A compaction that ran as a turn of its own ("Compact context",
+                // or `/compact` in Codex's own interface) becomes its marker,
+                // never an empty reply. Its usage goes too: that figure isn't
+                // what the next turn will use, so the context bar keeps the last
+                // real reply's reading.
+                //
+                // Structural on purpose, so every Codex version reads the same
+                // way. `task_started.turn_attribution` (written only on regular
+                // reply tasks at 0.162.1) would also catch an automatic
+                // compaction before a prompt a hook rejected, but if Codex ever
+                // wrote it on compaction tasks, every Codex marker would
+                // silently disappear.
+                //
+                // One case keeps an empty turn beside the marker, with no usage:
+                // an unfinished task Codex marked as a regular reply. That is a
+                // message stopped after Codex compacted at the start of its reply
+                // and before Codex recorded its prompt, and its turn holds the
+                // message's place in the count-based pairing, as above. A
+                // finished one never keeps it, so a forward after a compaction
+                // is unaffected even if Codex wrote the field on compaction
+                // tasks.
+                markers = builder.compactions;
+                usage = None;
+                status != TurnStatus::Complete && builder.regular_reply
+            };
+            if !keep_turn {
+                self.push_compaction_markers(builder.agent_id, markers);
+                return;
+            }
+        }
+        // A compaction inside a reply shows nothing. Codex encrypts its summary,
+        // so the marker could only be a label, and it would have to sit after
+        // the whole reply: splitting one task into two agent turns breaks the
+        // one-to-one match between a live turn and its disk turn by hydration
+        // key, which once shipped as a duplicated-transcript bug for Claude.
         self.turns.push(Turn::Agent {
             turn_id: builder.turn_id,
             agent_id: builder.agent_id,
             started_at: builder.started_at,
             ended_at: Some(builder.last_seen_at),
             status,
-            items: drop_superseded_rows(builder.items, &builder.superseded_rows),
-            usage: builder.usage,
+            items,
+            usage,
             // Per-turn model + effort from this turn's `turn_context` (last-wins
             // up to this close). Distinct from the first-wins `meta.model`.
             model: self.current_model.clone(),
@@ -2922,6 +3033,21 @@ impl CodexReconstruction {
             continuation_of: None,
             stable_message_id: None,
         });
+        self.push_compaction_markers(builder.agent_id, markers);
+    }
+
+    /// Push one `Compaction` marker per held `compacted` record, in order.
+    fn push_compaction_markers(&mut self, agent_id: AgentId, markers: Vec<PendingCompaction>) {
+        for compaction in markers {
+            self.turns.push(Turn::System {
+                turn_id: Uuid::now_v7(),
+                agent_id,
+                started_at: compaction.at,
+                marker: SystemMarker::Compaction {
+                    summary: compaction.summary,
+                },
+            });
+        }
     }
 
     fn finalize(mut self) -> LoadedTranscript {
@@ -7972,5 +8098,420 @@ not valid json
             panic!("paginated edit facet expected");
         };
         assert_eq!(files[0].moved_to.as_deref(), Some("/tmp/new.txt"));
+    }
+
+    // --- Compactions ---
+    //
+    // Only a compaction that ran as a turn of its own (no prompt, no content)
+    // becomes a marker. One inside a reply shows nothing, and an empty task that
+    // didn't finish shows nothing (see `close_current_agent`).
+
+    fn compaction_summaries(turns: &[Turn]) -> Vec<Option<String>> {
+        turns
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::System {
+                    marker: SystemMarker::Compaction { summary },
+                    ..
+                } => Some(summary.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each turn as a short label, in order.
+    fn turn_shapes(turns: &[Turn]) -> Vec<String> {
+        turns
+            .iter()
+            .map(|turn| match turn {
+                Turn::User { .. } => "user".to_owned(),
+                Turn::Agent { status, .. } => format!("agent:{status:?}"),
+                Turn::System { .. } => "marker".to_owned(),
+            })
+            .collect()
+    }
+
+    fn task_start(turn_id: &str) -> Value {
+        serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id}})
+    }
+
+    fn task_done() -> Value {
+        serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}})
+    }
+
+    fn task_aborted() -> Value {
+        serde_json::json!({"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}})
+    }
+
+    fn legacy_prompt(text: &str) -> Value {
+        serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":text}})
+    }
+
+    fn legacy_answer(text: &str) -> Value {
+        serde_json::json!({"type":"event_msg","payload":{"type":"agent_message","message":text}})
+    }
+
+    fn compacted(message: &str) -> Value {
+        serde_json::json!({"type":"compacted","payload":{"message":message,"replacement_history":[]}})
+    }
+
+    #[test]
+    fn a_compaction_inside_a_reply_shows_no_marker_wherever_it_falls() {
+        let content = jsonl_lines(&[
+            // Before the prompt: Codex compacts at the start of a reply, before
+            // it records the prompt.
+            task_start("t-1"),
+            compacted(""),
+            legacy_prompt("go"),
+            legacy_answer("one"),
+            task_done(),
+            // Between two items.
+            task_start("t-2"),
+            legacy_prompt("go"),
+            legacy_answer("two"),
+            compacted(""),
+            legacy_answer("three"),
+            task_done(),
+            // After the last item.
+            task_start("t-3"),
+            legacy_prompt("go"),
+            legacy_answer("four"),
+            compacted(""),
+            task_done(),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert_eq!(
+            turn_shapes(&result.turns),
+            [
+                "user",
+                "agent:Complete",
+                "user",
+                "agent:Complete",
+                "user",
+                "agent:Complete"
+            ]
+        );
+        let answers: Vec<String> = result
+            .turns
+            .iter()
+            .filter(|turn| matches!(turn, Turn::Agent { .. }))
+            .map(agent_text)
+            .collect();
+        assert_eq!(answers, ["one", "two\n\nthree", "four"]);
+    }
+
+    #[test]
+    fn a_compaction_run_as_its_own_turn_becomes_one_marker_and_leaves_usage_alone() {
+        let content =
+            std::fs::read_to_string(fixture_path("paginated-compaction.session.jsonl")).unwrap();
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        // One marker, not an empty reply, even though the paginated file also
+        // records a `ContextCompaction` item. The cancelled compaction after it
+        // shows nothing.
+        assert_eq!(
+            turn_shapes(&result.turns),
+            ["user", "agent:Complete", "marker", "user", "agent:Complete"]
+        );
+        assert_eq!(compaction_summaries(&result.turns), [None]);
+        let Turn::System { started_at, .. } = &result.turns[2] else {
+            unreachable!()
+        };
+        assert_eq!(
+            started_at.to_rfc3339(),
+            "2026-10-11T17:54:12+00:00",
+            "the marker sits where the compaction ran"
+        );
+        // The compaction's own figure (9,874 tokens, no input) is not what the
+        // next turn uses, so no turn may carry it.
+        let inputs: Vec<u64> = result
+            .turns
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::Agent {
+                    usage: Some(usage), ..
+                } => Some(usage.input_tokens),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inputs, [17_000, 17_572]);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn a_legacy_compaction_only_task_becomes_one_marker() {
+        let content = jsonl_lines(&[task_start("t-1"), compacted(""), task_done()]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert_eq!(turn_shapes(&result.turns), ["marker"]);
+        assert_eq!(compaction_summaries(&result.turns), [None]);
+    }
+
+    #[test]
+    fn markers_come_only_from_compaction_only_tasks_in_order() {
+        let content = jsonl_lines(&[
+            task_start("t-1"),
+            legacy_prompt("go"),
+            legacy_answer("a"),
+            compacted("inside a reply"),
+            task_done(),
+            task_start("t-2"),
+            compacted("first"),
+            task_done(),
+            task_start("t-3"),
+            legacy_prompt("go"),
+            legacy_answer("b"),
+            task_done(),
+            task_start("t-4"),
+            compacted("second"),
+            compacted("third"),
+            task_done(),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert_eq!(
+            turn_shapes(&result.turns),
+            [
+                "user",
+                "agent:Complete",
+                "marker",
+                "user",
+                "agent:Complete",
+                "marker",
+                "marker"
+            ]
+        );
+        assert_eq!(
+            compaction_summaries(&result.turns),
+            [
+                Some("first".to_owned()),
+                Some("second".to_owned()),
+                Some("third".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_compaction_message_with_text_becomes_the_summary() {
+        let content = jsonl_lines(&[
+            task_start("t-1"),
+            compacted("the recap"),
+            task_done(),
+            task_start("t-2"),
+            compacted(""),
+            task_done(),
+            task_start("t-3"),
+            compacted("  \n"),
+            task_done(),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert_eq!(
+            compaction_summaries(&result.turns),
+            [Some("the recap".to_owned()), None, None]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_reply_with_a_prompt_still_renders() {
+        let content = jsonl_lines(&[
+            task_start("t-1"),
+            legacy_prompt("go"),
+            task_aborted(),
+            task_start("t-2"),
+            legacy_prompt("again"),
+            legacy_answer("done"),
+            task_done(),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert_eq!(
+            turn_shapes(&result.turns),
+            ["user", "agent:Failed", "user", "agent:Complete"]
+        );
+    }
+
+    #[test]
+    fn a_finished_empty_task_keeps_its_turn_and_an_unfinished_one_shows_nothing() {
+        let finished = jsonl_lines(&[task_start("t-1"), task_done()]);
+        let result = parse_codex_transcript_content(&finished, Uuid::now_v7());
+        assert_eq!(turn_shapes(&result.turns), ["agent:Complete"]);
+
+        let cancelled = jsonl_lines(&[task_start("t-1"), task_aborted(), task_start("t-2")]);
+        let result = parse_codex_transcript_content(&cancelled, Uuid::now_v7());
+        assert!(result.turns.is_empty(), "{:?}", turn_shapes(&result.turns));
+    }
+
+    /// A task start as Codex 0.162 writes it for a regular reply.
+    fn regular_task_start(turn_id: &str) -> Value {
+        serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id,
+            "turn_attribution":{"turn_id":turn_id,"turn_trigger":"exec","parent_turn_id":null,"root_turn_id":turn_id}}})
+    }
+
+    #[test]
+    fn a_stopped_reply_codex_marked_as_a_reply_keeps_its_empty_turn() {
+        // A message stopped before Codex recorded its prompt. Its empty turn
+        // keeps the merge's count-based pairing aligned, so it stays, whether
+        // the stop was recorded or the file ends inside the task.
+        let stopped = jsonl_lines(&[regular_task_start("t-1"), task_aborted(), task_start("t-2")]);
+        let result = parse_codex_transcript_content(&stopped, Uuid::now_v7());
+        assert_eq!(turn_shapes(&result.turns), ["agent:Failed"]);
+
+        let cut_off = jsonl_lines(&[regular_task_start("t-1")]);
+        let result = parse_codex_transcript_content(&cut_off, Uuid::now_v7());
+        assert_eq!(turn_shapes(&result.turns), ["agent:Failed"]);
+    }
+
+    #[test]
+    fn a_reply_stopped_after_its_start_of_reply_compaction_keeps_its_turn_without_usage() {
+        // Codex compacted at the start of a regular reply, then the message was
+        // stopped before Codex recorded its prompt. The marker shows, and so does
+        // the message's empty turn, which holds its place in the merge's pairing.
+        // The turn keeps its own identity but not the compaction's usage figure.
+        let task_ending_in = |last: Value| {
+            jsonl_lines(&[
+                serde_json::json!({"timestamp":"2026-10-11T10:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t-1",
+                "turn_attribution":{"turn_id":"t-1","turn_trigger":"exec"}}}),
+                serde_json::json!({"timestamp":"2026-10-11T10:00:05Z","type":"compacted","payload":{"message":""}}),
+                serde_json::json!({"timestamp":"2026-10-11T10:00:05Z","type":"turn_context","payload":{"turn_id":"ctx-1","model":"gpt-6-luna"}}),
+                serde_json::json!({"timestamp":"2026-10-11T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{
+                "last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":9874},
+                "total_token_usage":{"input_tokens":17000,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0,"total_tokens":17005},
+                "model_context_window":258_400}}}),
+                last,
+            ])
+        };
+        let content = task_ending_in(task_aborted());
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert_eq!(turn_shapes(&result.turns), ["agent:Failed", "marker"]);
+        let Turn::Agent {
+            started_at,
+            usage,
+            hydration_key,
+            ..
+        } = &result.turns[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(started_at.to_rfc3339(), "2026-10-11T10:00:00+00:00");
+        assert_eq!(hydration_key.as_deref(), Some("ctx-1"));
+        assert_eq!(
+            *usage, None,
+            "the compaction's figure must not reach the bar"
+        );
+
+        // A finished task never keeps the extra turn, so a forward after a
+        // compaction is unaffected.
+        let finished = task_ending_in(task_done());
+        let result = parse_codex_transcript_content(&finished, Uuid::now_v7());
+        assert_eq!(turn_shapes(&result.turns), ["marker"]);
+    }
+
+    #[test]
+    fn a_compaction_stopped_after_it_finished_keeps_its_marker() {
+        // The `compacted` record means the compaction happened, so the marker
+        // shows however the task ended. A compaction stopped before that record
+        // leaves nothing (see the fixture's cancelled compaction).
+        let stopped = jsonl_lines(&[
+            task_start("t-1"),
+            compacted(""),
+            task_aborted(),
+            task_start("t-2"),
+            legacy_prompt("go"),
+            legacy_answer("done"),
+            task_done(),
+        ]);
+        let result = parse_codex_transcript_content(&stopped, Uuid::now_v7());
+        assert_eq!(
+            turn_shapes(&result.turns),
+            ["marker", "user", "agent:Complete"]
+        );
+
+        let cut_off = jsonl_lines(&[task_start("t-1"), compacted("")]);
+        let result = parse_codex_transcript_content(&cut_off, Uuid::now_v7());
+        assert_eq!(turn_shapes(&result.turns), ["marker"]);
+    }
+
+    #[test]
+    fn a_prompt_with_a_compaction_and_no_reply_shows_the_prompt_and_no_marker() {
+        let text = serde_json::json!([{"type":"text","text":"go","text_elements":[]}]);
+        let attachment =
+            serde_json::json!([{"type":"image","image_url":"data:image/png;base64,AAAA"}]);
+        for prompt_content in [text, attachment] {
+            let content = jsonl_lines(&[
+                serde_json::json!({"type":"session_meta","payload":{"cli_version":"0.162.1","history_mode":"paginated"}}),
+                task_start("t-1"),
+                compacted(""),
+                serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                    "type":"UserMessage","id":"u1","content":prompt_content}}}),
+                task_done(),
+            ]);
+            let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+            assert_eq!(
+                turn_shapes(&result.turns),
+                ["user", "agent:Complete"],
+                "the prompt alone decides the task was a reply"
+            );
+        }
+    }
+
+    #[test]
+    fn a_compacted_record_outside_any_task_shows_nothing() {
+        let content = jsonl_lines(&[
+            compacted(""),
+            task_start("t-1"),
+            legacy_prompt("go"),
+            legacy_answer("done"),
+            task_done(),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+
+        assert_eq!(turn_shapes(&result.turns), ["user", "agent:Complete"]);
+    }
+
+    /// A forward from an idle agent reads its newest finished reply from disk.
+    /// A compaction, finished or cancelled, must not hide the reply before it.
+    #[test]
+    fn a_forward_after_a_compaction_sends_the_reply_before_it() {
+        let reply = [
+            task_start("t-1"),
+            legacy_prompt("go"),
+            legacy_answer("the answer"),
+            task_done(),
+        ];
+        let finished =
+            jsonl_lines(&[&reply[..], &[task_start("t-2"), compacted(""), task_done()]].concat());
+        let cancelled = jsonl_lines(&[&reply[..], &[task_start("t-2"), task_aborted()]].concat());
+        for content in [finished, cancelled] {
+            let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+            let forwarded = crate::forward::latest_completed_agent_text(&result.turns);
+            assert_eq!(forwarded.as_deref(), Some("the answer"));
+        }
+    }
+
+    /// A reply that finished with nothing in it still counts as the newest
+    /// reply, so a forward reports nothing rather than an older answer. A
+    /// forward that waited on the same turn live gets nothing too.
+    #[test]
+    fn a_forward_after_a_finished_empty_reply_sends_nothing() {
+        let content = jsonl_lines(&[
+            task_start("t-1"),
+            legacy_prompt("go"),
+            legacy_answer("the answer"),
+            task_done(),
+            task_start("t-2"),
+            task_done(),
+        ]);
+        let result = parse_codex_transcript_content(&content, Uuid::now_v7());
+        let forwarded = crate::forward::latest_completed_agent_text(&result.turns);
+        assert!(
+            forwarded
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty()),
+            "{forwarded:?}"
+        );
     }
 }

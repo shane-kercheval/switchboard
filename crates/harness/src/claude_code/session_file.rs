@@ -748,7 +748,7 @@ impl ReconstructionState {
                         agent_id: self.agent_id,
                         started_at,
                         marker: SystemMarker::Compaction {
-                            summary: text.clone(),
+                            summary: Some(text.clone()),
                         },
                     });
                     return;
@@ -3151,8 +3151,11 @@ mod tests {
             "the probe session was compacted twice; each boundary hydrates its own marker"
         );
         for marker in &markers {
-            let SystemMarker::Compaction { summary } = marker else {
-                panic!("expected a Compaction marker, got {marker:?}");
+            let SystemMarker::Compaction {
+                summary: Some(summary),
+            } = marker
+            else {
+                panic!("expected a Compaction marker with a summary, got {marker:?}");
             };
             assert!(
                 !summary.trim().is_empty(),
@@ -3820,8 +3823,8 @@ mod tests {
             panic!("expected a Compaction marker, got {:?}", markers[0]);
         };
         assert_eq!(
-            summary,
-            "This session is being continued from a previous conversation…"
+            summary.as_deref(),
+            Some("This session is being continued from a previous conversation…")
         );
         // It is not a user prompt — it must never reach prompt↔send correlation.
         assert!(user_sources(&result.turns).is_empty());

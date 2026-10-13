@@ -930,7 +930,7 @@ async fn live_claude_session_file_effort_matches_the_dispatched_level() {
     //
     //   - an effort-recording family that stopped recording would strand the
     //     reopen path while the live stamp kept claiming a level;
-    //   - Haiku *starting* to record would mean the gate is needlessly
+    //   - Haiku 4.5 *starting* to record would mean the gate is needlessly
     //     withholding a level we could show.
     //
     // It is also the staleness tripwire for the gate's exact-id allowlist: when
@@ -939,9 +939,11 @@ async fn live_claude_session_file_effort_matches_the_dispatched_level() {
     // the new id rather than letting it echo unverified.
     //
     // Either drift is silent offline, which is what let the ungated stamp ship.
-    // Every alias the gate echoes for, plus the one it withholds for. Covering
+    // Every alias the gate echoes for, plus one model it withholds for. Covering
     // only a subset would leave an upstream change to an uncovered family
-    // silently recreating the bug this gate exists to prevent.
+    // silently recreating the bug this gate exists to prevent. No alias points
+    // at a no-axis model since `haiku` moved to Haiku 5.5 (2.1.293), so the
+    // withheld case pins Haiku 4.5 by its full id, which is still selectable.
     //
     // Fable is sent `max`, the other recording families `low`: a boolean gate
     // cannot see a model that records a *clamped* level for an upper effort
@@ -953,7 +955,8 @@ async fn live_claude_session_file_effort_matches_the_dispatched_level() {
         ("opus", "low", Some("low")),
         ("sonnet", "low", Some("low")),
         ("fable", "max", Some("max")),
-        ("haiku", "low", None),
+        ("haiku", "low", Some("low")),
+        ("claude-haiku-4-5", "low", None),
     ] {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let adapter = ClaudeCodeAdapter::new();

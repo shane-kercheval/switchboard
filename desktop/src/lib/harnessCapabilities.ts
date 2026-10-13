@@ -10,24 +10,25 @@ import type { HarnessKind } from "$lib/types";
 
 /// Whether Switchboard can drive this harness's **manual context compaction**.
 ///
-/// Claude Code only. Codex can compact, but through an app-server protocol
-/// Switchboard does not speak; Antigravity has no compaction at all. Sending
-/// those harnesses a `/compact` *prompt* is not a substitute and is worse than
-/// refusing — the model answers with a claim that it compacted while nothing
-/// did, so the user believes their context shrank when it did not.
+/// Claude Code and Codex. Claude's CLI intercepts `/compact` locally, and Codex
+/// compacts through a request to its app-server, so neither sees the command as
+/// a prompt. Antigravity can't compact. Sending it a `/compact` *prompt* is not
+/// a substitute and is worse than refusing: the model answers with a claim that
+/// it compacted while nothing did, so the user believes their context shrank
+/// when it did not.
 export function supportsManualCompaction(harness: HarnessKind | undefined): boolean {
-  return harness === "claude_code";
+  return harness === "claude_code" || harness === "codex";
 }
 
 /// Whether Switchboard can ask this harness for a **context breakdown** — what
 /// is occupying the agent's context window.
 ///
-/// Claude Code only, and for the same reason as compaction rather than a
-/// coincidentally identical one: Claude's CLI intercepts `/context` locally and
-/// answers with a structured measurement, while the other two have no such
-/// interception, so the command reaches the model as an ordinary message and is
-/// answered with an invented breakdown. Every figure in that answer looks like a
-/// measurement, which makes it worse than no panel at all.
+/// Claude Code only, guarding against the same hazard as compaction: Claude's
+/// CLI intercepts `/context` locally and answers with a structured measurement,
+/// while the other two have no such interception, so the command reaches the
+/// model as an ordinary message and is answered with an invented breakdown.
+/// Every figure in that answer looks like a measurement, which makes it worse
+/// than no panel at all.
 export function supportsContextReport(harness: HarnessKind | undefined): boolean {
   return harness === "claude_code";
 }

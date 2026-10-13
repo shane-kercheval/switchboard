@@ -27,6 +27,8 @@
 //! before any model call (verified against codex-cli 0.136.0).
 
 pub mod account_usage;
+pub(crate) mod app_server;
+pub(crate) mod compaction;
 pub mod config;
 pub(crate) mod facets;
 pub mod fork;
@@ -40,6 +42,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{NaiveDate, Utc};
@@ -111,6 +114,10 @@ pub struct CodexAdapter {
     /// adapter. Empty string caches a failed/absent probe (version is
     /// display-only). Mirrors the Antigravity pattern.
     cached_version: OnceLock<String>,
+    /// How long a compaction's server has to answer its three requests.
+    /// [`compaction::COMPACTION_STARTUP_TIMEOUT`] in production; tests shorten
+    /// it to exercise the timeout without a thirty-second test.
+    compaction_startup_bound: Duration,
 }
 
 impl CodexAdapter {
@@ -122,6 +129,7 @@ impl CodexAdapter {
             codex_binary_path: PathBuf::from("codex"),
             home_dir_override: None,
             cached_version: OnceLock::new(),
+            compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
     }
 
@@ -131,6 +139,7 @@ impl CodexAdapter {
             codex_binary_path: path.into(),
             home_dir_override: None,
             cached_version: OnceLock::new(),
+            compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
     }
 
@@ -146,7 +155,16 @@ impl CodexAdapter {
             codex_binary_path: binary_path.into(),
             home_dir_override: Some(home_dir.into()),
             cached_version: OnceLock::new(),
+            compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
+    }
+
+    /// Override how long a compaction's server has to answer its requests —
+    /// used by tests of the startup timeout.
+    #[must_use]
+    pub fn with_compaction_startup_bound(mut self, bound: Duration) -> Self {
+        self.compaction_startup_bound = bound;
+        self
     }
 }
 
@@ -238,6 +256,65 @@ impl HarnessAdapter for CodexAdapter {
             dispatched_at,
         ));
 
+        Ok(Box::pin(UnboundedReceiverStream::new(rx)))
+    }
+
+    /// Compact this agent's Codex conversation through a short-lived `codex
+    /// app-server` (see [`compaction`]), with the agent's model, effort and
+    /// the permissions its turns run with.
+    ///
+    /// Fails closed when the agent has no locator or no rollout, as Claude
+    /// Code's compaction does: a compaction is never a session's first
+    /// dispatch, and Codex itself would only answer `thread not found`.
+    ///
+    /// The stream carries `Liveness` while the compaction runs and ends in one
+    /// `TurnEnd` with no usage, or with no terminal when cancelled.
+    async fn compact(
+        &self,
+        agent: &AgentRecord,
+        cwd: &Path,
+        turn_id: TurnId,
+        options: crate::DispatchOptions,
+    ) -> Result<EventStream, DispatchError> {
+        let Some(locator) = codex_locator(agent) else {
+            return Err(DispatchError::InvalidAgentState(format!(
+                "Codex agent {} has no session locator — there is no conversation to compact",
+                agent.id
+            )));
+        };
+        let home_dir = resolve_home_dir(self.home_dir_override.as_deref());
+        if session_file::locate_session_file(&home_dir, locator.partition_date, &locator.thread_id)
+            .is_none()
+        {
+            return Err(DispatchError::InvalidAgentState(format!(
+                "Codex agent {} has no session file yet — there is no conversation to compact",
+                agent.id
+            )));
+        }
+        // Anchored before the binary lookup and the spawn, so the bound covers
+        // everything up to the three replies.
+        let startup_deadline = tokio::time::Instant::now() + self.compaction_startup_bound;
+        let binary = crate::subprocess::resolve_binary(&self.codex_binary_path)?;
+        let server = app_server::AppServer::spawn(&binary, Some(cwd))
+            .map_err(|e| crate::subprocess::map_spawn_error(e, cwd))?;
+        let requests = compaction::requests(&compaction::CompactionTarget {
+            thread_id: &locator.thread_id,
+            cwd,
+            model: agent.model.as_deref(),
+            effort: agent.effort.as_deref(),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(compaction::run(
+            server,
+            requests,
+            locator.thread_id,
+            turn_id,
+            tx,
+            options.cancel_token,
+            startup_deadline,
+            self.compaction_startup_bound,
+        ));
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
     }
 }

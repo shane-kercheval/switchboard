@@ -278,6 +278,14 @@ pub enum ContextWindowSource {
     /// absent from the session file. The dispatcher persists it to the metadata
     /// sidecar so the context bar survives restart.
     StreamOnly { model: String },
+    /// Stream-only, for a compaction turn. A compaction makes no assistant
+    /// call, so there is no message id to persist its window under; the
+    /// `compact_boundary` record's `uuid` is the key instead. The session file
+    /// carries that record with the same `uuid` (verified live, 2026-10-13), so
+    /// the loader can reattach the window to the compaction's marker and the
+    /// context bar reads the compacted size over the right window after a
+    /// reopen, even when the model changed before the compaction.
+    StreamOnlyCompaction { model: String, boundary_id: String },
     /// Already durable in the harness's own session file (class B): Codex's
     /// post-terminal session-file enrichment fills the window. Not re-persisted.
     SessionFileBacked,

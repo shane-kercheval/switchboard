@@ -5183,6 +5183,36 @@ fn apply_meta_sidecar_overlay(
             }
         }
     }
+
+    // The window a compaction ran with, reattached to the marker the session
+    // file yields for the same `compact_boundary` record. Claude's file records
+    // the compacted size on that record but never a window, and the sidebar
+    // would otherwise borrow the previous reply's window, which is wrong when
+    // the model changed between that reply and the compaction. Only the newest
+    // marker with that record id is filled, like the turn above.
+    if let Some(snapshot) = sidecar.compaction_window {
+        for turn in transcript.turns.iter_mut().rev() {
+            if let switchboard_harness::Turn::System {
+                marker:
+                    switchboard_harness::SystemMarker::Compaction {
+                        record_id: Some(record_id),
+                        context_after: Some(context),
+                        ..
+                    },
+                ..
+            } = turn
+                && *record_id == snapshot.boundary_id
+            {
+                if context.window.is_none()
+                    && snapshot.context_window > 0
+                    && context.tokens <= u64::from(snapshot.context_window)
+                {
+                    context.window = Some(snapshot.context_window);
+                }
+                break;
+            }
+        }
+    }
 }
 
 /// The per-harness session-file load, without the metadata-sidecar overlay.
@@ -5984,14 +6014,22 @@ fn align_surplus_candidates(
 /// corresponds to a send: one *with* a reply iff that reply is journaled; a *dangling*
 /// (reply-less) one while `dangling_journaled` = sends-minus-journaled-replies remain.
 /// One positional edge persists, confined to the discouraged pattern of running
-/// the bare CLI on a session Switchboard is also driving, and pinned by a
-/// characterization test: a send cancelled before its prompt was recorded makes
-/// `dangling_journaled` overcount by one (no recorded text, so the identity join
-/// upstream cannot claim it either). The former second edge — two reply-less
+/// the bare CLI on a session Switchboard is also driving, and pinned by
+/// characterization tests: a send cancelled before the harness left any turn for
+/// it counts as still waiting (no recorded text, so the identity join upstream
+/// cannot claim it either). That is a send cancelled before the harness started
+/// its turn, or, for Codex, one cancelled before Codex recorded its prompt in a
+/// file written before Codex marked regular replies with `turn_attribution`: the
+/// reader drops that empty task, where current Codex files keep it. The phantom
+/// slot absorbs the next unpaired turn: `dangling_journaled` overcounts by one
+/// and drops an imported reply-less prompt, or a reply to a prompt typed in the
+/// harness's own interface pairs with the cancelled send while that prompt is
+/// hidden. The former second edge — two reply-less
 /// dangling sources being order-ambiguous — is resolved by the identity join
 /// ([`commit_identity_join`]) whenever the journaled prompt's text reconstructs;
 /// only a reconstruction/ambiguity decline reaches this walk with it intact. The
-/// durable key-join dissolves both for any turn that carries a link.
+/// durable key-join dissolves both for any turn that carries a link, but not
+/// for a cancel-time link naming a turn the reader dropped.
 fn classify_turns_by_count(
     turns: &[&switchboard_harness::Turn],
     all_sends: &[SendId],
@@ -6766,11 +6804,13 @@ fn merge_project_conversation(
         // residual classifiers (`classify_residual`: identity join, then
         // provenance/count). The residual's front-offset / dangling / straddling
         // reasoning — and the one known positional edge it still carries (a send
-        // cancelled before its prompt was recorded overcounts the dangling pool
-        // and can absorb an imported prompt; no recorded text means identity
-        // cannot help), confined to the discouraged bare-CLI-on-a-driven-session
-        // pattern and pinned by a characterization test — live in those helpers'
-        // docs. The key-join dissolves it for any turn that carries a link.
+        // cancelled before the harness left a turn for it counts as still
+        // waiting, so it can absorb an imported prompt or take a reply to a
+        // prompt typed in the harness's own interface; no recorded text means
+        // identity cannot help), confined to the discouraged
+        // bare-CLI-on-a-driven-session pattern and pinned by characterization
+        // tests — live in those helpers' docs. The key-join dissolves it for any
+        // turn that carries a link the reader still emits.
         // Durable key-join first (authoritative), positional fallback for the
         // residual. `classify_agent_turns` matches each content-bearing turn to its
         // send by `hydration_key` (suppressing the harness-echoed prompt via the
@@ -11688,28 +11728,85 @@ mod tests {
     #[tokio::test]
     async fn compaction_is_refused_for_every_harness_that_cannot_be_driven() {
         // The capability predicate is the authority, and this is the gate that
-        // stands between a Codex or Antigravity agent and a `/compact` *prompt*
-        // — which those harnesses answer with a model-authored claim of success
-        // while nothing is compacted. A silent no-op would be the worst outcome
+        // stands between an Antigravity agent and a `/compact` *prompt*, which
+        // Antigravity answers with a model-authored claim of success while
+        // nothing is compacted. A silent no-op would be the worst outcome
         // available, so the refusal must be typed and loud.
         let (_tmp, home, state, _gate, _project) =
             maintenance_fixture(&[], &Arc::new(tokio::sync::Notify::new()), false);
-        for harness in [HarnessKind::Codex, HarnessKind::Antigravity] {
-            let agent = create_agent_impl(
-                &state,
-                &format!("agent-{harness}"),
-                harness,
-                AgentSelection::default(),
-            )
-            .unwrap();
-            let err = compact_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
-                .await
-                .expect_err("a harness Switchboard cannot compact must be refused");
-            assert!(
-                matches!(err, AppError::CompactionUnsupported { harness: h } if h == harness),
-                "got: {err:?}"
-            );
-        }
+        let harness = HarnessKind::Antigravity;
+        let agent = create_agent_impl(
+            &state,
+            &format!("agent-{harness}"),
+            harness,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        let err = compact_agent_impl(&state, agent.id, SendId::now_v7(), home.path())
+            .await
+            .expect_err("a harness Switchboard cannot compact must be refused");
+        assert!(
+            matches!(err, AppError::CompactionUnsupported { harness: h } if h == harness),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_is_accepted_for_a_codex_agent_with_a_session() {
+        // Codex compacts through its own adapter operation, so the app gate lets
+        // it through to the Codex adapter like a Claude one. The Claude adapter
+        // here is the mock, which refuses compaction: a `turn_start` therefore
+        // proves the Codex adapter ran it.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&mock),
+            maintenance_adapter(&[], &gate, false),
+            Arc::clone(&mock),
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        let home = TempDir::new().unwrap();
+        let agent = seed_codex_source(&state, home.path(), "bob");
+
+        let message_id = compact_agent_impl(&state, agent, SendId::now_v7(), home.path())
+            .await
+            .expect("a Codex agent with a session can be compacted");
+
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        let start = emitter
+            .snapshot()
+            .into_iter()
+            .find(|(_, v)| v["type"] == "turn_start")
+            .expect("turn_start");
+        assert_eq!(
+            start.1["message_id"].as_str().unwrap(),
+            message_id.to_string(),
+            "the receipt must correlate to the turn the frontend will render"
+        );
+        gate.notify_one();
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert!(
+            !emitter
+                .snapshot()
+                .iter()
+                .any(|(_, v)| v["type"] == "message_failed"),
+            "the compaction must not fail at dispatch"
+        );
     }
 
     #[tokio::test]
@@ -14909,6 +15006,7 @@ mod tests {
             }),
             context_window: None,
             inventory: None,
+            compaction_window: None,
         };
         apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
         assert_eq!(
@@ -14934,6 +15032,7 @@ mod tests {
                 inventory,
                 captured_at,
             }),
+            compaction_window: None,
         }
     }
 
@@ -15077,6 +15176,7 @@ mod tests {
             }),
             context_window: None,
             inventory: None,
+            compaction_window: None,
         };
         apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
         assert_eq!(
@@ -15152,6 +15252,7 @@ mod tests {
                 captured_at: chrono::Utc::now(),
             }),
             inventory: None,
+            compaction_window: None,
         }
     }
 
@@ -15181,6 +15282,107 @@ mod tests {
             None,
             "only the turn the bar reads is filled"
         );
+    }
+
+    /// A reopened compaction marker: the compacted size from the session file,
+    /// keyed by its boundary record, with no window of its own.
+    fn overlay_compaction_marker(record_id: &str, tokens: u64) -> switchboard_harness::Turn {
+        switchboard_harness::Turn::System {
+            turn_id: Uuid::now_v7(),
+            agent_id: Uuid::now_v7(),
+            started_at: chrono::Utc::now(),
+            marker: switchboard_harness::SystemMarker::Compaction {
+                summary: Some("recap".to_owned()),
+                context_after: Some(switchboard_harness::CompactedContext {
+                    tokens,
+                    window: None,
+                }),
+                record_id: Some(record_id.to_owned()),
+            },
+        }
+    }
+
+    fn overlay_marker_window(turn: &switchboard_harness::Turn) -> Option<u32> {
+        match turn {
+            switchboard_harness::Turn::System {
+                marker:
+                    switchboard_harness::SystemMarker::Compaction {
+                        context_after: Some(context),
+                        ..
+                    },
+                ..
+            } => context.window,
+            _ => None,
+        }
+    }
+
+    fn compaction_window_sidecar(
+        boundary_id: &str,
+        window: u32,
+    ) -> switchboard_harness::meta_sidecar::MetaSidecar {
+        switchboard_harness::meta_sidecar::MetaSidecar {
+            compaction_window: Some(
+                switchboard_harness::meta_sidecar::CompactionWindowSnapshot {
+                    context_window: window,
+                    model: "claude-sonnet-5".to_owned(),
+                    boundary_id: boundary_id.to_owned(),
+                    captured_at: chrono::Utc::now(),
+                },
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn overlay_fills_a_compactions_window_on_the_marker_with_its_boundary_record() {
+        // Claude's file records the compacted size but no window. The sidecar
+        // saved the window the compaction ran with under its boundary record,
+        // so the bar divides by that window and not the previous reply's, which
+        // differs when the model changed before the compaction.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![
+                overlay_agent_turn("msg-latest", Some(100), Some(1_000_000)),
+                overlay_compaction_marker("boundary-a", 16_627),
+                overlay_compaction_marker("boundary-b", 9_000),
+            ],
+            ..Default::default()
+        };
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(compaction_window_sidecar("boundary-b", 200_000)),
+        );
+        assert_eq!(overlay_marker_window(&transcript.turns[2]), Some(200_000));
+        assert_eq!(
+            overlay_marker_window(&transcript.turns[1]),
+            None,
+            "only the marker for the saved record is filled"
+        );
+        assert_eq!(
+            overlay_turn_window(&transcript.turns[0]),
+            Some(1_000_000),
+            "the reply's own window is untouched"
+        );
+    }
+
+    #[test]
+    fn overlay_leaves_a_compaction_marker_alone_without_its_record_or_with_an_impossible_window() {
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![overlay_compaction_marker("boundary-a", 16_627)],
+            ..Default::default()
+        };
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(compaction_window_sidecar("boundary-other", 200_000)),
+        );
+        assert_eq!(overlay_marker_window(&transcript.turns[0]), None);
+
+        // A window smaller than the compacted size can't be the one it ran
+        // with; it is not applied, so the bar hides rather than reads over 100%.
+        apply_meta_sidecar_overlay(
+            &mut transcript,
+            Some(compaction_window_sidecar("boundary-a", 10_000)),
+        );
+        assert_eq!(overlay_marker_window(&transcript.turns[0]), None);
     }
 
     #[test]
@@ -19040,7 +19242,9 @@ mod tests {
             agent_id,
             started_at: at(t),
             marker: SystemMarker::Compaction {
-                summary: summary.to_owned(),
+                summary: Some(summary.to_owned()),
+                context_after: None,
+                record_id: None,
             },
         }
     }
@@ -19052,9 +19256,9 @@ mod tests {
             .iter()
             .filter_map(|i| match i {
                 ConversationItem::SystemMarker {
-                    marker: SystemMarker::Compaction { summary },
+                    marker: SystemMarker::Compaction { summary, .. },
                     ..
-                } => Some(summary.as_str()),
+                } => summary.as_deref(),
                 _ => None,
             })
             .collect()
@@ -21662,6 +21866,373 @@ mod tests {
             vec![Some(s1), Some(s2)],
             "each Codex reply key-joins to its send by turn_context.turn_id"
         );
+    }
+
+    /// Stage `lines` as a Codex rollout and load it through the real Codex
+    /// parser.
+    fn load_codex_rollout(agent: AgentId, lines: &[serde_json::Value]) -> LoadedTranscript {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = "0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeec";
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
+        let content = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let staged = stage_codex_session_file(home.path(), date, session_id);
+        std::fs::write(&staged, content).unwrap();
+        switchboard_harness::load_codex_transcript(
+            home.path(),
+            cwd.path(),
+            session_id,
+            Some(date),
+            agent,
+        )
+        .unwrap()
+    }
+
+    /// A Codex rollout holding a reply Codex compacted partway through, then a
+    /// compaction run as a turn of its own, then a second reply, loaded through
+    /// the real Codex parser.
+    fn load_compacted_codex_session(agent: AgentId) -> LoadedTranscript {
+        let ev = |ts: &str, payload: serde_json::Value| serde_json::json!({"timestamp": ts, "type": "event_msg", "payload": payload});
+        let turn_context = |ts: &str, turn_id: &str| serde_json::json!({"timestamp": ts, "type": "turn_context", "payload": {"model": "gpt-6-luna", "turn_id": turn_id}});
+        let compacted = |ts: &str| serde_json::json!({"timestamp": ts, "type": "compacted", "payload": {"message": "", "replacement_history": []}});
+        let lines = [
+            serde_json::json!({"timestamp":"2026-10-11T10:00:00Z","type":"session_meta","payload":{"cli_version":"0.162.1"}}),
+            ev(
+                "2026-10-11T10:00:01Z",
+                serde_json::json!({"type":"task_started","turn_id":"task-1"}),
+            ),
+            turn_context("2026-10-11T10:00:01Z", "ctx-1"),
+            ev(
+                "2026-10-11T10:00:01Z",
+                serde_json::json!({"type":"user_message","message":"prompt one"}),
+            ),
+            ev(
+                "2026-10-11T10:00:02Z",
+                serde_json::json!({"type":"agent_message","message":"reply one, part one"}),
+            ),
+            compacted("2026-10-11T10:00:03Z"),
+            ev(
+                "2026-10-11T10:00:04Z",
+                serde_json::json!({"type":"agent_message","message":"reply one, part two"}),
+            ),
+            ev(
+                "2026-10-11T10:00:04Z",
+                serde_json::json!({"type":"task_complete","turn_id":"task-1"}),
+            ),
+            ev(
+                "2026-10-11T10:00:10Z",
+                serde_json::json!({"type":"task_started","turn_id":"task-c"}),
+            ),
+            compacted("2026-10-11T10:00:12Z"),
+            turn_context("2026-10-11T10:00:12Z", "ctx-c"),
+            ev(
+                "2026-10-11T10:00:12Z",
+                serde_json::json!({"type":"task_complete","turn_id":"task-c"}),
+            ),
+            ev(
+                "2026-10-11T10:00:20Z",
+                serde_json::json!({"type":"task_started","turn_id":"task-2"}),
+            ),
+            turn_context("2026-10-11T10:00:20Z", "ctx-2"),
+            ev(
+                "2026-10-11T10:00:20Z",
+                serde_json::json!({"type":"user_message","message":"prompt two"}),
+            ),
+            ev(
+                "2026-10-11T10:00:21Z",
+                serde_json::json!({"type":"agent_message","message":"reply two"}),
+            ),
+            ev(
+                "2026-10-11T10:00:21Z",
+                serde_json::json!({"type":"task_complete","turn_id":"task-2"}),
+            ),
+        ];
+        load_codex_rollout(agent, &lines)
+    }
+
+    fn item_kinds(merged: &ProjectConversation) -> Vec<&'static str> {
+        merged
+            .items
+            .iter()
+            .map(|i| match i {
+                ConversationItem::UserMessage { .. } => "user",
+                ConversationItem::AgentTurn { .. } => "agent",
+                ConversationItem::SystemMarker { .. } => "marker",
+                ConversationItem::Outcome { .. } => "outcome",
+            })
+            .collect()
+    }
+
+    fn codex_compaction_journal(agent: AgentId, links: bool) -> (Vec<JournalRecord>, Uuid, Uuid) {
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let send = |send_id: Uuid, prompt: &str, at: &str| JournalRecord::Send {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: agent,
+            prompt: prompt.to_owned(),
+            attachments: Vec::new(),
+            at: at.parse().unwrap(),
+        };
+        let link = |send_id: Uuid, key: &str, at: &str| JournalRecord::TurnLink {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: agent,
+            hydration_key: key.to_owned(),
+            at: at.parse().unwrap(),
+        };
+        let mut journal = vec![
+            send(s1, "prompt one", "2026-10-11T10:00:00Z"),
+            send(s2, "prompt two", "2026-10-11T10:00:19Z"),
+        ];
+        if links {
+            journal.push(link(s1, "ctx-1", "2026-10-11T10:00:04Z"));
+            journal.push(link(s2, "ctx-2", "2026-10-11T10:00:21Z"));
+        }
+        (journal, s1, s2)
+    }
+
+    #[test]
+    fn merge_compacted_codex_session_through_real_parser_key_joins_each_reply_once() {
+        // The reply Codex compacted partway through is still one disk turn, so
+        // the link its live turn stamped joins it. The compaction run as its own
+        // turn is one marker between the replies, not an empty reply, and it
+        // shifts no prompt or reply.
+        let agent = Uuid::now_v7();
+        let transcript = load_compacted_codex_session(agent);
+        let (journal, s1, s2) = codex_compaction_journal(agent, true);
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(user_texts(&merged), vec!["prompt one", "prompt two"]);
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { send_id: None, .. })),
+            "no imported duplicate of a journaled prompt"
+        );
+        assert_eq!(agent_send_ids(&merged), vec![Some(s1), Some(s2)]);
+        assert_eq!(
+            item_kinds(&merged),
+            vec!["user", "agent", "marker", "user", "agent"]
+        );
+        assert!(merged.items.iter().any(|i| matches!(
+            i,
+            ConversationItem::SystemMarker {
+                marker: SystemMarker::Compaction { summary: None, .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn merge_compacted_codex_session_without_links_keeps_correlation() {
+        // With no links, the replies pair by position. The marker must be just as
+        // inert there.
+        let agent = Uuid::now_v7();
+        let transcript = load_compacted_codex_session(agent);
+        let (journal, s1, s2) = codex_compaction_journal(agent, false);
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(user_texts(&merged), vec!["prompt one", "prompt two"]);
+        assert_eq!(agent_send_ids(&merged), vec![Some(s1), Some(s2)]);
+        assert_eq!(
+            item_kinds(&merged),
+            vec!["user", "agent", "marker", "user", "agent"]
+        );
+    }
+
+    /// A Codex session where a Switchboard message ("stopped") was stopped
+    /// before Codex recorded its prompt, and a prompt was then typed into the
+    /// session from Codex's own interface and answered. `regular` writes the
+    /// `turn_attribution` Codex 0.162 puts on every regular reply's task start;
+    /// `compacted_first` has Codex compact at the start of the stopped reply,
+    /// before the stop; `stopped_key` gives the stopped task a `turn_context`,
+    /// which is what a cancel-time link would name.
+    fn stopped_send_then_terminal_exchange(
+        regular: bool,
+        compacted_first: bool,
+        stopped_key: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        let ev = |ts: &str, payload: serde_json::Value| serde_json::json!({"timestamp": ts, "type": "event_msg", "payload": payload});
+        let start = |ts: &str, turn: &str| {
+            let mut payload = serde_json::json!({"type": "task_started", "turn_id": turn});
+            if regular {
+                payload["turn_attribution"] =
+                    serde_json::json!({"turn_id": turn, "turn_trigger": "exec"});
+            }
+            ev(ts, payload)
+        };
+        let turn_context = |ts: &str, key: &str| serde_json::json!({"timestamp": ts, "type": "turn_context", "payload": {"model": "gpt-6-luna", "turn_id": key}});
+        let mut lines = vec![
+            serde_json::json!({"timestamp":"2026-10-11T10:00:00Z","type":"session_meta","payload":{"cli_version":"0.162.1"}}),
+            start("2026-10-11T10:00:01Z", "task-1"),
+            turn_context("2026-10-11T10:00:01Z", "ctx-1"),
+            ev(
+                "2026-10-11T10:00:01Z",
+                serde_json::json!({"type":"user_message","message":"first"}),
+            ),
+            ev(
+                "2026-10-11T10:00:02Z",
+                serde_json::json!({"type":"agent_message","message":"first reply"}),
+            ),
+            ev(
+                "2026-10-11T10:00:02Z",
+                serde_json::json!({"type":"task_complete"}),
+            ),
+            start("2026-10-11T10:00:11Z", "task-2"),
+        ];
+        if compacted_first {
+            lines.push(serde_json::json!({"timestamp": "2026-10-11T10:00:11Z", "type": "compacted", "payload": {"message": ""}}));
+        }
+        if let Some(key) = stopped_key {
+            lines.push(turn_context("2026-10-11T10:00:11Z", key));
+        }
+        lines.extend([
+            ev(
+                "2026-10-11T10:00:12Z",
+                serde_json::json!({"type":"turn_aborted","reason":"interrupted"}),
+            ),
+            start("2026-10-11T10:00:20Z", "task-3"),
+            turn_context("2026-10-11T10:00:20Z", "ctx-3"),
+            ev(
+                "2026-10-11T10:00:20Z",
+                serde_json::json!({"type":"user_message","message":"typed in terminal"}),
+            ),
+            ev(
+                "2026-10-11T10:00:21Z",
+                serde_json::json!({"type":"agent_message","message":"terminal reply"}),
+            ),
+            ev(
+                "2026-10-11T10:00:21Z",
+                serde_json::json!({"type":"task_complete"}),
+            ),
+        ]);
+        lines
+    }
+
+    fn stopped_send_journal(
+        agent: AgentId,
+        stopped_key: Option<&str>,
+    ) -> (Vec<JournalRecord>, Uuid, Uuid) {
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let t2 = Uuid::now_v7();
+        let mut journal = vec![
+            JournalRecord::Send {
+                send_id: s1,
+                turn_id: Uuid::now_v7(),
+                agent_id: agent,
+                prompt: "first".to_owned(),
+                attachments: Vec::new(),
+                at: "2026-10-11T10:00:00Z".parse().unwrap(),
+            },
+            JournalRecord::TurnLink {
+                send_id: s1,
+                turn_id: Uuid::now_v7(),
+                agent_id: agent,
+                hydration_key: "ctx-1".to_owned(),
+                at: "2026-10-11T10:00:02Z".parse().unwrap(),
+            },
+            JournalRecord::Send {
+                send_id: s2,
+                turn_id: t2,
+                agent_id: agent,
+                prompt: "stopped".to_owned(),
+                attachments: Vec::new(),
+                at: "2026-10-11T10:00:10Z".parse().unwrap(),
+            },
+            JournalRecord::Outcome {
+                send_id: s2,
+                turn_id: t2,
+                agent_id: agent,
+                outcome: serde_json::json!({"status": "cancelled", "source": "user"}),
+                started_at: "2026-10-11T10:00:10Z".parse().unwrap(),
+                ended_at: "2026-10-11T10:00:12Z".parse().unwrap(),
+            },
+        ];
+        if let Some(key) = stopped_key {
+            journal.push(JournalRecord::TurnLink {
+                send_id: s2,
+                turn_id: t2,
+                agent_id: agent,
+                hydration_key: key.to_owned(),
+                at: "2026-10-11T10:00:12Z".parse().unwrap(),
+            });
+        }
+        (journal, s1, s2)
+    }
+
+    #[test]
+    fn merge_terminal_exchange_after_a_stopped_codex_send_renders_as_imported() {
+        // Current Codex marks the stopped task as a regular reply, so the reader
+        // keeps its empty turn, including when Codex compacted at the start of
+        // that reply before the stop. That turn takes the stopped send's place,
+        // by its cancel-time link or in the count, and the exchange typed in
+        // Codex's own interface renders as imported, unpaired.
+        for (compacted_first, stopped_key) in [
+            (false, None),
+            (false, Some("ctx-2")),
+            (true, None),
+            (true, Some("ctx-2")),
+        ] {
+            let agent = Uuid::now_v7();
+            let transcript = load_codex_rollout(
+                agent,
+                &stopped_send_then_terminal_exchange(true, compacted_first, stopped_key),
+            );
+            let (journal, s1, s2) = stopped_send_journal(agent, stopped_key);
+            let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+            let case = format!("compacted_first={compacted_first} link={stopped_key:?}");
+            assert!(
+                merged.items.iter().any(|i| matches!(
+                    i,
+                    ConversationItem::UserMessage { send_id: None, text, .. } if text == "typed in terminal"
+                )),
+                "{case}"
+            );
+            assert_eq!(
+                agent_send_ids(&merged),
+                vec![Some(s1), Some(s2), None],
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_stopped_codex_send_without_a_reply_mark_misgroups_a_terminal_exchange() {
+        // CHARACTERIZATION, pinned not endorsed: the documented positional edge of
+        // `classify_turns_by_count`, reached through the real Codex reader. In a
+        // file written before Codex recorded `turn_attribution`, the reader drops
+        // the stopped task's empty turn, so the stopped send counts as still
+        // waiting. The terminal reply then pairs with it and the typed prompt is
+        // hidden. A cancel-time link doesn't help, because it names a turn the
+        // reader no longer emits.
+        //
+        // CORRECT would be the field-bearing case above: the typed prompt and its
+        // reply rendered as imported.
+        for stopped_key in [None, Some("ctx-2")] {
+            let agent = Uuid::now_v7();
+            let transcript = load_codex_rollout(
+                agent,
+                &stopped_send_then_terminal_exchange(false, false, stopped_key),
+            );
+            let (journal, s1, s2) = stopped_send_journal(agent, stopped_key);
+            let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+            assert!(
+                !user_texts(&merged).contains(&"typed in terminal"),
+                "documented limitation: the typed prompt is absorbed ({stopped_key:?})"
+            );
+            assert_eq!(
+                agent_send_ids(&merged),
+                vec![Some(s1), Some(s2)],
+                "documented limitation: the terminal reply pairs with the stopped send ({stopped_key:?})"
+            );
+        }
     }
 
     #[test]

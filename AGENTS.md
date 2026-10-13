@@ -85,15 +85,17 @@ Cargo never garbage-collects `target/`. It accumulates one artifact set per crat
 
 Two settings already work against regrowth, and both should stay: `CARGO_INCREMENTAL=0` on the whole-workspace `make` targets (incremental compilation exists for rebuilding one changed crate; on a build-everything target it buys nothing and grew 26 GB here), and `[profile.dev.package."*"] debug = false` in `Cargo.toml` (dependency debug symbols were the largest single contributor; our own crates keep theirs).
 
-### Agents: run long commands in the FOREGROUND, and wait
+### Agents: wait for long commands, in the foreground or the background
 
-**When an agent is driving this repo non-interactively (`claude -p` / SDK / CI), every child process is killed when the turn ends.** Backgrounding a long command does not survive the turn — not with the harness's own background flag, not with `nohup`, not with `&`. The command is SIGTERMed mid-run (`make: *** [target] Terminated: 15`) and you are left with a partial log that is easy to misread as a result.
+**Since Claude Code 2.1.292, a Claude agent's background work no longer dies when its reply ends.** When the agent runs non-interactively (`claude -p`, which is how Switchboard runs it, or the Agent SDK), a command started with the Bash tool's own background flag (`run_in_background`) keeps the turn open: the agent can reply, and when the command finishes it is woken with the result and carries on. Background sub-agents behave the same way. Verified at 2.1.296; `docs/harness-behavior.md` §6 has the probe.
 
-So: **run the slow targets synchronously and block on them**, with a generous timeout, even though it means the turn sits idle for minutes. That is the correct trade — it is the only way to get a real answer.
+So, for a slow target such as `make check` or `make test-live*`:
 
-- `make check` and `make test-live*` are the usual victims. They take minutes.
+- **Run it in the foreground when it fits the tool's timeout.** That is still the simplest way to get the result.
+- **If it does not fit, run it with `run_in_background` and wait for the completion notice**, rather than splitting it up or cutting it short. Set the command's `timeout` to cover the whole run: background commands are stopped after 30 minutes by default, and 2 hours at most.
+- **Do not detach it with `nohup` or `&`.** A command detached that way keeps running after the turn, but nothing waits for it and you are never told it finished, so you lose its result.
+- **On older Claude Code, and on other harnesses (Codex, Antigravity), this is unverified.** Assume background work dies when the reply ends: the command is killed mid-run (`make: *** [target] Terminated: 15`) and leaves a partial log that is easy to misread as a result. Run in the foreground, and split by package if a target does not fit.
 - If a command genuinely cannot fit in one turn, **do not fake it**: say what you ran, paste the partial output, and state plainly that the run did not complete. A truncated suite is not a passing suite. Never report a count from a killed run as if the suite finished — count the tests that actually reported, and label the run incomplete.
-- **Hitting the foreground timeout is not a reason to background it.** The tempting move — a foreground call is killed at the tool's timeout ceiling, so retry the same command with the background flag — produces _nothing_: backgrounding does not extend the deadline, it removes the completion record. Re-run in the foreground (a slow run is often a one-off: a wedged CLI turn, or a loaded machine), or split the target into per-crate invocations that each fit. If neither works, report the incomplete run per the bullet above. This has been fallen into after the rule was already written, so treat the foreground requirement as covering the retry too, not just the first attempt.
 - **Wall-clock assertions get flaky when a live suite is running.** `make test-live*` saturates the machine (observed load ~8), and the offline suite has bounded process-spawn waits — `fake_claude`'s pidfile handshake is 10s, and it starves under that load while taking 0.5s idle. Do not interleave the two, and before blaming a diff for a timing failure, re-measure on an idle machine.
 - This is about the _agent's_ process lifetime, not the app's. `make dev` is expected to be launched by a human and left running.
 

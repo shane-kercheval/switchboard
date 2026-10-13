@@ -27,14 +27,19 @@ pub async fn wait_for_pgid(path: &Path) -> Pid {
     panic!("the fake CLI never wrote its pgid at {}", path.display());
 }
 
-/// Poll until **every** process in the group is gone.
+/// Poll until **every** process the fixture started in the group is gone.
 ///
-/// Signal 0 to the group fails with `ESRCH` only when no member is left.
-/// Checking the leader alone (`getpgid(leader)`) is not enough: a teardown that
-/// kills only the spawned process passes that check while a child it started
-/// keeps running, which is the leak `terminate_then_kill` exists to prevent.
-/// Any other error (a permission error, say) is not evidence the group is
-/// gone, so it fails the test instead of passing it.
+/// Signal 0 to the group fails with `ESRCH` when no member is left, and with
+/// `EPERM` when none of the remaining members may be signaled by this process.
+/// The fixture's processes are ordinary children running as the test's own
+/// user, signalable for as long as they live, so either answer means none of
+/// them survives; `EPERM` says only that the group id now belongs to something
+/// else (another user's process, or a member no longer eligible for signals),
+/// and it does arise on a loaded machine. Checking the leader alone
+/// (`getpgid(leader)`) is not enough: a teardown that kills only the spawned
+/// process passes that check while a child it started keeps running, which is
+/// the leak `terminate_then_kill` exists to prevent. Any other error is not
+/// evidence the group is gone, so it fails the test instead of passing it.
 ///
 /// This proves something only when the fixture started a child (one of the
 /// fakes' `// spawn_child…` directives). With the leader alone in the group,
@@ -42,7 +47,7 @@ pub async fn wait_for_pgid(path: &Path) -> Pid {
 pub async fn assert_group_reaped(leader: Pid) {
     for _ in 0..200 {
         match killpg(leader, None) {
-            Err(Errno::ESRCH) => return,
+            Err(Errno::ESRCH | Errno::EPERM) => return,
             Ok(()) => tokio::time::sleep(Duration::from_millis(50)).await,
             Err(other) => panic!("couldn't check process group {leader}: {other}"),
         }

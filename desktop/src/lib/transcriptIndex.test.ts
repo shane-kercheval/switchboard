@@ -123,7 +123,7 @@ describe("buildNavigatorEntries", () => {
       rank: 2,
       key: "s:mark",
       agent_id: A,
-      marker: { marker_kind: "compaction", summary: "recap" },
+      marker: { marker_kind: "compaction", summary: "recap", context_after: null },
     };
     expect(buildNavigatorEntries([outcome, marker], NAMES)).toEqual([]);
   });

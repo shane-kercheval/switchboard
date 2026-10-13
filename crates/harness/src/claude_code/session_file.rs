@@ -70,8 +70,8 @@ use crate::context_report;
 use crate::events::{ContentKind, SessionInventory, SkillEntry, TurnId, TurnUsage};
 use crate::parser::{SessionTotals, UsageSeed, classify_claude_tool_kind};
 use crate::transcript::{
-    LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, SystemMarker, Turn,
-    TurnItem, TurnStatus, UserPromptSource, merge_meta_with_loaders,
+    CompactedContext, LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo,
+    SystemMarker, Turn, TurnItem, TurnStatus, UserPromptSource, merge_meta_with_loaders,
 };
 
 use super::claude_session_file_path;
@@ -395,6 +395,21 @@ struct ReconstructionState {
     /// investigate only alongside an observed duplication.
     commandish_not_reclassified: usize,
     pending_local_command: Option<PendingLocalCommand>,
+    /// What the latest `compact_boundary` record said, held for the
+    /// `isCompactSummary` record that follows it and becomes the marker. Claude
+    /// writes the two as a pair, boundary first.
+    pending_compaction: Option<PendingCompaction>,
+}
+
+/// The parts of a compaction marker that come from the `compact_boundary`
+/// record rather than the summary record.
+#[derive(Debug, Default)]
+struct PendingCompaction {
+    /// The compacted context's size, from `compactMetadata.postTokens`.
+    context_after: Option<CompactedContext>,
+    /// The record's `uuid`, under which the dispatcher saved the compaction's
+    /// window (`SystemMarker::Compaction::record_id`).
+    record_id: Option<String>,
 }
 
 struct PendingLocalCommand {
@@ -439,7 +454,7 @@ struct AgentTurnBuilder {
     /// (`claude_code/mod.rs`, gated on the same axis fact). Absent in two
     /// distinct cases that both hydrate as `None`: records written by older CLI
     /// versions (transient — resolves as sessions age out), and any turn run on
-    /// a no-axis model such as Haiku, which writes no key at any CLI version
+    /// a no-axis model such as Haiku 4.5, which writes no key at any CLI version
     /// (permanent — see `harness-behavior.md` §3.4 Caveats). A missing field
     /// here is expected shape, not drift.
     last_effort: Option<String>,
@@ -478,6 +493,7 @@ impl ReconstructionState {
             housekeeping_skipped: 0,
             commandish_not_reclassified: 0,
             pending_local_command: None,
+            pending_compaction: None,
         }
     }
 
@@ -513,6 +529,27 @@ impl ReconstructionState {
     }
 
     fn handle_system(&mut self, line_number: usize, record: &Value) {
+        // The boundary itself produces no turn; the `isCompactSummary` record
+        // after it becomes the marker. Its post-compaction size and its `uuid`
+        // are kept for that marker. The saved record spells the field
+        // `compactMetadata`, where the live stream's `compact_boundary` has
+        // `compact_metadata`.
+        if record.get("subtype").and_then(Value::as_str) == Some("compact_boundary") {
+            self.pending_compaction = Some(PendingCompaction {
+                context_after: record
+                    .pointer("/compactMetadata/postTokens")
+                    .and_then(Value::as_u64)
+                    .map(|tokens| CompactedContext {
+                        tokens,
+                        window: None,
+                    }),
+                record_id: record
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
+            return;
+        }
         if record.get("subtype").and_then(Value::as_str) != Some("local_command") {
             return;
         }
@@ -736,19 +773,23 @@ impl ReconstructionState {
                 // A compaction summary is not a user prompt, but unlike the other
                 // housekeeping records it is surfaced as a system marker rather
                 // than dropped, so the user can see where the conversation's
-                // context was compacted. Emitted from the summary record itself —
-                // it carries both the recap text and a timestamp — so no
-                // cross-record state with the preceding `compact_boundary` event
-                // is needed. Checked before the housekeeping drop, which would
-                // otherwise swallow it (`isCompactSummary` → housekeeping).
+                // context was compacted. The summary record supplies the recap
+                // and the timestamp; the `compact_boundary` record before it
+                // supplies the compacted context's size and its own `uuid`, held
+                // in `pending_compaction` (see `handle_system`). Checked
+                // before the housekeeping drop, which would otherwise swallow it
+                // (`isCompactSummary` → housekeeping).
                 if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
                     let started_at = parse_timestamp(record).unwrap_or_else(Utc::now);
+                    let pending = self.pending_compaction.take().unwrap_or_default();
                     self.turns.push(Turn::System {
                         turn_id: Uuid::now_v7(),
                         agent_id: self.agent_id,
                         started_at,
                         marker: SystemMarker::Compaction {
-                            summary: text.clone(),
+                            summary: Some(text.clone()),
+                            context_after: pending.context_after,
+                            record_id: pending.record_id,
                         },
                     });
                     return;
@@ -3151,8 +3192,12 @@ mod tests {
             "the probe session was compacted twice; each boundary hydrates its own marker"
         );
         for marker in &markers {
-            let SystemMarker::Compaction { summary } = marker else {
-                panic!("expected a Compaction marker, got {marker:?}");
+            let SystemMarker::Compaction {
+                summary: Some(summary),
+                ..
+            } = marker
+            else {
+                panic!("expected a Compaction marker with a summary, got {marker:?}");
             };
             assert!(
                 !summary.trim().is_empty(),
@@ -3816,12 +3861,22 @@ mod tests {
         ]);
         let markers = compaction_markers(&result.turns);
         assert_eq!(markers.len(), 1, "exactly one compaction marker");
-        let SystemMarker::Compaction { summary } = markers[0] else {
+        let SystemMarker::Compaction {
+            summary,
+            context_after,
+            record_id,
+        } = markers[0]
+        else {
             panic!("expected a Compaction marker, got {:?}", markers[0]);
         };
         assert_eq!(
-            summary,
-            "This session is being continued from a previous conversation…"
+            summary.as_deref(),
+            Some("This session is being continued from a previous conversation…")
+        );
+        assert_eq!(*context_after, None, "no boundary, so no size");
+        assert_eq!(
+            *record_id, None,
+            "no boundary, so no record to key a window on"
         );
         // It is not a user prompt — it must never reach prompt↔send correlation.
         assert!(user_sources(&result.turns).is_empty());
@@ -3840,7 +3895,8 @@ mod tests {
                 "claude-sonnet-4-6",
                 "2026-05-14T04:43:15Z",
             ),
-            json!({"type":"system","subtype":"compact_boundary","timestamp":"2026-05-14T04:43:16Z"}),
+            // The saved boundary's metadata is camelCase, unlike the stream's.
+            json!({"type":"system","subtype":"compact_boundary","timestamp":"2026-05-14T04:43:16Z","uuid":"0c9bf4f6-ad89-4e70-ba21-1048857baee5","compactMetadata":{"trigger":"manual","preTokens":683_174,"postTokens":16_627}}),
             json!({"type":"user","message":{"role":"user","content":"This session is being continued…"},"isCompactSummary":true,"timestamp":"2026-05-14T04:43:17Z"}),
             assistant_text_record(
                 "after compaction",
@@ -3848,6 +3904,21 @@ mod tests {
                 "2026-05-14T04:43:18Z",
             ),
         ]);
+        // The marker carries the boundary's post-compaction size, so the bar
+        // reads it after a reopen, and the boundary's `uuid`, under which the
+        // dispatcher saved the window the compaction ran with. The file itself
+        // records no window.
+        assert_eq!(
+            compaction_markers(&result.turns),
+            [&SystemMarker::Compaction {
+                summary: Some("This session is being continued…".to_owned()),
+                context_after: Some(CompactedContext {
+                    tokens: 16_627,
+                    window: None,
+                }),
+                record_id: Some("0c9bf4f6-ad89-4e70-ba21-1048857baee5".to_owned()),
+            }]
+        );
         let roles: Vec<&str> = result
             .turns
             .iter()

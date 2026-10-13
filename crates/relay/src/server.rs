@@ -2,36 +2,37 @@
 //! reading the socket, and one writer task draining that connection's queue.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use chrono::Utc;
-use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
+use futures::stream::SplitStream;
 use serde_json::json;
+use switchboard_remote_crypto::frame::MAX_FRAME_LEN;
 use switchboard_remote_crypto::identity::{Signature, VerifyingKey, verify_relay_challenge};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
+use crate::outbox::{Outbox, frame_cost};
 use crate::protocol::{
-    ClientMessage, DeviceId, ErrorCode, NONCE_LEN, RELAY_PROTOCOL, ServerMessage,
+    ClientMessage, DeviceId, ErrorCode, NONCE_LEN, PAIRING_TOKEN_LEN, RELAY_PROTOCOL, Role,
+    ServerMessage,
 };
-use crate::state::{Outbox, Relay};
+use crate::state::Relay;
 
-/// Messages queued for one connection before it counts as not reading and
-/// is closed. Holds a whole 8 MiB envelope's records with room to spare.
-const OUTBOUND_QUEUE: usize = 256;
 /// How long a closing connection's queued messages may take to go out.
-const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// Messages read and discarded while a closing connection waits for the
 /// client to answer its close; past this the socket is simply dropped.
 const DRAIN_LIMIT: usize = 64;
@@ -39,8 +40,13 @@ const DRAIN_LIMIT: usize = 64;
 struct Shared {
     config: Config,
     relay: Mutex<Relay>,
-    open_connections: AtomicUsize,
+    /// One permit per open socket, taken before the upgrade and held until
+    /// the socket is dropped, so `MAX_CONNECTIONS` bounds sockets and tasks.
+    admission: Arc<Semaphore>,
     shutdown: CancellationToken,
+    /// Every upgraded connection, so shutdown can wait for them: axum runs
+    /// them detached from the HTTP server's own graceful shutdown.
+    connections: TaskTracker,
 }
 
 impl Shared {
@@ -49,31 +55,44 @@ impl Shared {
     }
 }
 
-/// The relay's routes: `/connect` for the WebSocket, `/healthz` for the
-/// host's health check. Cancelling `shutdown` closes every connection.
-pub fn router(config: Config, shutdown: CancellationToken) -> Router {
-    let shared = Arc::new(Shared {
-        relay: Mutex::new(Relay::new(config.max_devices_per_mac)),
-        config,
-        open_connections: AtomicUsize::new(0),
-        shutdown,
-    });
-    Router::new()
-        .route("/connect", get(connect))
-        .route("/healthz", get(healthz))
-        .with_state(shared)
-}
-
-/// Serves until `shutdown` is cancelled and every connection has closed.
+/// Serves until `shutdown` is cancelled, then closes every connection and
+/// waits, for a bounded time, for each to finish closing. A connection still
+/// being upgraded when shutdown begins is not waited for.
 pub async fn serve(
     listener: TcpListener,
     config: Config,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
-    let app = router(config, shutdown.clone());
+    let config = config
+        .validated()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    tracing::info!(
+        memory_ceiling_bytes = config.memory_ceiling(),
+        "queues and read buffers are bounded"
+    );
+    let shared = Arc::new(Shared {
+        relay: Mutex::new(Relay::new(config.max_devices_per_mac)),
+        admission: Arc::new(Semaphore::new(config.max_connections)),
+        config,
+        shutdown: shutdown.clone(),
+        connections: TaskTracker::new(),
+    });
+    let app = Router::new()
+        .route("/connect", get(connect))
+        .route("/healthz", get(healthz))
+        .with_state(Arc::clone(&shared));
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await?;
+    shared.connections.close();
+    let closing = FLUSH_TIMEOUT + Duration::from_secs(1);
+    if tokio::time::timeout(closing, shared.connections.wait())
         .await
+        .is_err()
+    {
+        tracing::warn!("connections still closing at shutdown were abandoned");
+    }
+    Ok(())
 }
 
 /// A relay running in this process, for tests and local use.
@@ -85,6 +104,9 @@ pub struct RelayHandle {
 
 impl RelayHandle {
     pub async fn start(addr: SocketAddr, config: Config) -> std::io::Result<Self> {
+        let config = config
+            .validated()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
         let shutdown = CancellationToken::new();
@@ -104,87 +126,58 @@ impl RelayHandle {
         format!("ws://{}/connect", self.addr)
     }
 
-    /// Closes every connection and stops listening. Everything the relay
-    /// held is gone, as after a restart.
+    /// Closes every connection, waits for them to finish closing, and stops
+    /// listening. Everything the relay held is gone, as after a restart.
     pub async fn shutdown(self) -> std::io::Result<()> {
         self.shutdown.cancel();
         self.task.await.map_err(std::io::Error::other)?
     }
 }
 
-async fn healthz(State(shared): State<Arc<Shared>>) -> Response {
-    let (registered, forwarded) = {
-        let relay = shared.relay();
-        (relay.registered_count(), relay.forwarded_count())
-    };
-    axum::Json(json!({
-        "status": "ok",
-        "open_connections": shared.open_connections.load(Ordering::Relaxed),
-        "registered_devices": registered,
-        "forwarded_frames": forwarded,
-    }))
-    .into_response()
+/// Only the status: connection and device counts would tell anyone who can
+/// reach the relay how it is used.
+async fn healthz() -> Response {
+    axum::Json(json!({ "status": "ok" })).into_response()
 }
 
 async fn connect(State(shared): State<Arc<Shared>>, upgrade: WebSocketUpgrade) -> Response {
+    let Ok(permit) = Arc::clone(&shared.admission).try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this relay is at its connection limit",
+        )
+            .into_response();
+    };
     let max = shared.config.max_frame_bytes;
+    let tracker = shared.connections.clone();
+    // The permit moves into the closure: if the upgrade fails, axum drops
+    // the closure and the permit with it.
     upgrade
         .max_message_size(max)
         .max_frame_size(max)
-        .on_upgrade(move |socket| run_connection(socket, shared))
+        .on_upgrade(move |socket| tracker.track_future(run_connection(socket, shared, permit)))
 }
 
-/// A slot under `MAX_CONNECTIONS`, released when dropped.
-struct Slot(Arc<Shared>);
-
-impl Slot {
-    fn acquire(shared: &Arc<Shared>) -> Option<Self> {
-        let max = shared.config.max_connections;
-        shared
-            .open_connections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
-                (open < max).then_some(open + 1)
-            })
-            .ok()
-            .map(|_| Self(Arc::clone(shared)))
-    }
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        self.0.open_connections.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-async fn run_connection(socket: WebSocket, shared: Arc<Shared>) {
+async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSemaphorePermit) {
     let (sink, stream) = socket.split();
-    let (outbound, queue) = mpsc::channel(OUTBOUND_QUEUE);
-    let mut writer = tokio::spawn(write_queue(sink, queue));
-    let slot = Slot::acquire(&shared);
     let closed = shared.shutdown.child_token();
+    let (outbox, writer) = Outbox::new(shared.config.queue_bytes, closed.clone());
+    let mut writer = tokio::spawn(writer.run(sink));
     let mut connection = Connection {
+        limiter: RateLimiter::new(&shared.config, Instant::now()),
         shared: Arc::clone(&shared),
         stream,
-        outbox: Outbox::new(outbound, closed.clone()),
+        outbox,
         closed,
-        limiter: RateLimiter::new(shared.config.rate_limit, Instant::now()),
         registration: None,
     };
-    if slot.is_some() {
-        connection.run().await;
-    } else {
-        connection.refuse(
-            ErrorCode::RelayFull,
-            "this relay is at its connection limit",
-        );
+    connection.run().await;
+    if let Some(registration) = connection.registration.take() {
+        shared
+            .relay()
+            .unregister(&registration.id, registration.generation, Utc::now());
+        tracing::info!(device_id = %registration.id, "disconnected");
     }
-    if let Some((id, generation)) = connection.registration.take() {
-        shared.relay().unregister(&id, generation, Utc::now());
-        tracing::info!(device_id = %id, "disconnected");
-    }
-    // The slot covers the connection's working life, not its close, so a
-    // refused client cannot keep it by never answering.
-    drop(slot);
     // Dropping the outbox, the queue's last sender, lets the writer flush
     // and send its close. Reading on until the client answers that close
     // matters: closing a socket with the client's messages still unread
@@ -205,26 +198,23 @@ async fn run_connection(socket: WebSocket, shared: Arc<Shared>) {
     if flushed.await.is_err() {
         writer.abort();
     }
+    // Only now is the socket gone, so only now is its admission returned.
+    drop(permit);
 }
 
-async fn write_queue(
-    mut sink: SplitSink<WebSocket, Message>,
-    mut queue: mpsc::Receiver<ServerMessage>,
-) {
-    while let Some(message) = queue.recv().await {
-        let text = match serde_json::to_string(&message) {
-            Ok(text) => text,
-            Err(error) => {
-                tracing::error!(%error, "could not encode a message");
-                continue;
-            }
-        };
-        if sink.send(Message::Text(text.into())).await.is_err() {
-            return;
-        }
-    }
-    let _ = sink.send(Message::Close(None)).await;
-    let _ = sink.close().await;
+struct Registration {
+    id: DeviceId,
+    generation: u64,
+    is_mac: bool,
+}
+
+/// What a `register` message claims, checked by `Connection::register`.
+struct Claim {
+    relay_protocol: u32,
+    device_id: DeviceId,
+    identity_public_key: [u8; 32],
+    signature: [u8; 64],
+    role: Role,
 }
 
 struct Connection {
@@ -235,7 +225,7 @@ struct Connection {
     /// replaces this one, or when this connection stops reading.
     closed: CancellationToken,
     limiter: RateLimiter,
-    registration: Option<(DeviceId, u64)>,
+    registration: Option<Registration>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -265,23 +255,27 @@ impl Connection {
             tracing::error!(%error, "no randomness for a challenge");
             return;
         }
-        self.send(ServerMessage::Challenge { nonce });
-        let register_timeout = self.shared.config.register_timeout;
-        let register_by = tokio::time::Instant::now() + register_timeout;
+        self.send(ServerMessage::Challenge {
+            nonce,
+            relay_protocol: RELAY_PROTOCOL,
+        });
+        let register_by = tokio::time::Instant::now() + self.shared.config.register_timeout;
         match self.next(Deadline::At(register_by)).await {
             Incoming::Message(ClientMessage::Register {
                 relay_protocol,
                 device_id,
                 identity_public_key,
                 signature,
+                role,
             }) => {
-                if !self.register(
-                    &nonce,
+                let claim = Claim {
                     relay_protocol,
                     device_id,
-                    &identity_public_key,
-                    &signature,
-                ) {
+                    identity_public_key,
+                    signature,
+                    role,
+                };
+                if !self.register(&nonce, claim) {
                     return;
                 }
             }
@@ -293,76 +287,102 @@ impl Connection {
         }
         let idle_timeout = self.shared.config.idle_timeout;
         while let Incoming::Message(message) = self.next(Deadline::Idle(idle_timeout)).await {
-            if !self.handle(message) {
+            if !self.handle(message).await {
                 return;
             }
         }
     }
 
     /// Registers the connection, or queues the refusal and returns false.
-    fn register(
-        &mut self,
-        nonce: &[u8; NONCE_LEN],
-        relay_protocol: u32,
-        claimed: DeviceId,
-        identity_public_key: &[u8; 32],
-        signature: &[u8; 64],
-    ) -> bool {
-        if relay_protocol != RELAY_PROTOCOL {
+    fn register(&mut self, nonce: &[u8; NONCE_LEN], claim: Claim) -> bool {
+        if claim.relay_protocol != RELAY_PROTOCOL {
             self.refuse(
                 ErrorCode::ProtocolMismatch,
                 "this relay speaks relay protocol 1",
             );
             return false;
         }
-        let Ok(key) = VerifyingKey::from_bytes(identity_public_key) else {
+        let Ok(key) = VerifyingKey::from_bytes(&claim.identity_public_key) else {
             self.refuse(ErrorCode::RegistrationRefused, "not an Ed25519 public key");
             return false;
         };
-        if DeviceId::from_identity_key(&key) != claimed {
+        let id = claim.device_id;
+        if DeviceId::from_identity_key(&key) != id {
             self.refuse(
                 ErrorCode::RegistrationRefused,
                 "the device id is not this key's",
             );
             return false;
         }
-        if verify_relay_challenge(&key, nonce, &Signature::from_bytes(signature)).is_err() {
+        if verify_relay_challenge(&key, nonce, &Signature::from_bytes(&claim.signature)).is_err() {
             self.refuse(
                 ErrorCode::RegistrationRefused,
                 "the signature does not answer the challenge",
             );
             return false;
         }
-        if self.shared.config.deny_device_ids.contains(&claimed) {
-            tracing::info!(device_id = %claimed, "refused a denied device");
+        if self.shared.config.deny_device_ids.contains(&id) {
+            tracing::info!(device_id = %id, "refused a denied device");
             self.refuse(ErrorCode::RegistrationRefused, "this device is denied");
             return false;
         }
-        let generation =
+        match &claim.role {
+            Role::Mac { paired_devices } => tracing::info!(
+                device_id = %id,
+                paired_devices = ?paired_devices.iter().map(DeviceId::as_str).collect::<Vec<_>>(),
+                "registered a Mac"
+            ),
+            Role::Phone { mac } => tracing::info!(device_id = %id, %mac, "registered a phone"),
+        }
+        let is_mac = matches!(claim.role, Role::Mac { .. });
+        let registered =
             self.shared
                 .relay()
-                .register(claimed.clone(), self.outbox.clone(), Utc::now());
-        tracing::info!(device_id = %claimed, "registered");
-        self.registration = Some((claimed, generation));
-        true
+                .register(id.clone(), claim.role, self.outbox.clone(), Utc::now());
+        match registered {
+            Ok(generation) => {
+                self.registration = Some(Registration {
+                    id,
+                    generation,
+                    is_mac,
+                });
+                true
+            }
+            Err(refusal) => {
+                self.send(refusal.into_message());
+                false
+            }
+        }
     }
 
     /// Acts on one message from a registered client; false ends the
     /// connection.
-    fn handle(&mut self, message: ClientMessage) -> bool {
-        let Some((id, _)) = &self.registration else {
+    async fn handle(&mut self, message: ClientMessage) -> bool {
+        let Some(registration) = &self.registration else {
             return false;
         };
-        let id = id.clone();
+        let (id, is_mac) = (registration.id.clone(), registration.is_mac);
         let refusal = match message {
             ClientMessage::Frame {
                 to,
                 record,
                 pairing_token,
-            } => self
-                .shared
-                .relay()
-                .forward(&id, to, record, pairing_token, Instant::now()),
+            } => {
+                if record.len() > MAX_FRAME_LEN {
+                    self.refuse(ErrorCode::BadMessage, "a record longer than any frame");
+                    return false;
+                }
+                self.forward(&id, to, record, pairing_token).await;
+                Ok(())
+            }
+            ClientMessage::PairedDevices { .. }
+            | ClientMessage::PairingOpen { .. }
+            | ClientMessage::PairingClose
+                if !is_mac =>
+            {
+                self.refuse(ErrorCode::BadMessage, "only a Mac may send this");
+                return false;
+            }
             ClientMessage::PairedDevices { device_ids } => {
                 tracing::info!(
                     device_id = %id,
@@ -396,9 +416,44 @@ impl Connection {
         true
     }
 
+    /// Routes a frame and queues it for its recipient, waiting while the
+    /// recipient's queue is full. A refusal goes back to the sender; a frame
+    /// that cannot be queued because its recipient closed is dropped, and the
+    /// sender hears of that close through `peer_disconnected`.
+    async fn forward(
+        &self,
+        from: &DeviceId,
+        to: DeviceId,
+        record: Vec<u8>,
+        pairing_token: Option<[u8; PAIRING_TOKEN_LEN]>,
+    ) {
+        let routed = self
+            .shared
+            .relay()
+            .route(from, &to, pairing_token.as_ref(), Instant::now());
+        let recipient = match routed {
+            Ok(recipient) => recipient,
+            Err(refusal) => {
+                self.send(refusal.into_message());
+                return;
+            }
+        };
+        let cost = frame_cost(record.len());
+        let frame = ServerMessage::Frame {
+            to,
+            from: from.clone(),
+            record,
+            pairing_token,
+        };
+        recipient
+            .send_frame(frame, cost, self.shared.config.stall_timeout, &self.closed)
+            .await;
+    }
+
     /// The next client message, or `End` once the connection is over or
-    /// `deadline` passes. Pings and pongs count toward the rate limit and
-    /// an idle deadline, and are otherwise skipped.
+    /// `deadline` passes. Every message, pings and pongs included, is
+    /// charged to the rate limit; a client over it is not refused but waited
+    /// out before its message is acted on, which slows it through TCP.
     async fn next(&mut self, deadline: Deadline) -> Incoming {
         loop {
             let until = match deadline {
@@ -417,12 +472,17 @@ impl Connection {
                 Ok(Some(Ok(message))) => message,
                 Ok(None | Some(Err(_))) => return Incoming::End,
             };
-            if matches!(message, Message::Close(_)) {
-                return Incoming::End;
-            }
-            if !self.limiter.allow(Instant::now()) {
-                self.refuse(ErrorCode::RateLimited, "too many messages");
-                return Incoming::End;
+            let len = match &message {
+                Message::Close(_) => return Incoming::End,
+                Message::Text(text) => text.len(),
+                Message::Binary(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
+            };
+            let wait = self.limiter.charge(Instant::now(), len);
+            if !wait.is_zero() {
+                tokio::select! {
+                    () = self.closed.cancelled() => return Incoming::End,
+                    () = tokio::time::sleep(wait) => {}
+                }
             }
             let text = match message {
                 Message::Ping(_) | Message::Pong(_) | Message::Close(_) => continue,
@@ -455,33 +515,61 @@ impl Connection {
     }
 }
 
-/// A token bucket: `rate` messages a second, sustained, with bursts up to
-/// `rate`.
+/// Two token buckets, messages and bytes, each refilling at its rate. A
+/// charge may overdraw them; the overdraft is how long the reader waits.
 struct RateLimiter {
+    messages: Bucket,
+    bytes: Bucket,
+}
+
+impl RateLimiter {
+    fn new(config: &Config, now: Instant) -> Self {
+        let byte_rate = f64::from(config.rate_limit_bytes);
+        #[allow(clippy::cast_precision_loss)] // A frame limit is far below 2^52.
+        let byte_burst = byte_rate.max(config.max_frame_bytes as f64);
+        let message_rate = f64::from(config.rate_limit);
+        Self {
+            messages: Bucket::new(message_rate, message_rate, now),
+            bytes: Bucket::new(byte_rate, byte_burst, now),
+        }
+    }
+
+    /// Charges one message of `len` bytes and returns how long to wait
+    /// before acting on it.
+    fn charge(&mut self, now: Instant, len: usize) -> Duration {
+        #[allow(clippy::cast_precision_loss)] // A message is far below 2^52 bytes.
+        let len = len as f64;
+        self.messages
+            .charge(now, 1.0)
+            .max(self.bytes.charge(now, len))
+    }
+}
+
+struct Bucket {
     rate: f64,
+    capacity: f64,
     tokens: f64,
     last: Instant,
 }
 
-impl RateLimiter {
-    fn new(rate: u32, now: Instant) -> Self {
-        let rate = f64::from(rate);
+impl Bucket {
+    fn new(rate: f64, capacity: f64, now: Instant) -> Self {
         Self {
             rate,
-            tokens: rate,
+            capacity,
+            tokens: capacity,
             last: now,
         }
     }
 
-    fn allow(&mut self, now: Instant) -> bool {
+    fn charge(&mut self, now: Instant, amount: f64) -> Duration {
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.last = now;
-        self.tokens = (self.tokens + elapsed * self.rate).min(self.rate);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity) - amount;
+        if self.tokens >= 0.0 {
+            Duration::ZERO
         } else {
-            false
+            Duration::from_secs_f64(-self.tokens / self.rate)
         }
     }
 }
@@ -490,17 +578,37 @@ impl RateLimiter {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_limiter_allows_a_burst_of_its_rate_then_refills_over_time() {
+    fn limiter(
+        rate_limit: u32,
+        rate_limit_bytes: u32,
+        max_frame_bytes: usize,
+    ) -> (RateLimiter, Instant) {
         let start = Instant::now();
-        let mut limiter = RateLimiter::new(4, start);
-        assert!((0..4).all(|_| limiter.allow(start)));
-        assert!(!limiter.allow(start));
-        assert!(!limiter.allow(start + Duration::from_millis(200)));
-        assert!(limiter.allow(start + Duration::from_millis(260)));
-        assert!(!limiter.allow(start + Duration::from_millis(260)));
+        let config = Config {
+            rate_limit,
+            rate_limit_bytes,
+            max_frame_bytes,
+            ..Config::default()
+        };
+        (RateLimiter::new(&config, start), start)
+    }
+
+    #[test]
+    fn a_burst_of_the_message_rate_waits_for_nothing_and_the_next_waits_its_share() {
+        let (mut limiter, start) = limiter(4, 1_000_000, 1_000);
+        assert!((0..4).all(|_| limiter.charge(start, 1).is_zero()));
+        assert_eq!(limiter.charge(start, 1), Duration::from_millis(250));
+        // Waiting that long repays it; the next is due a quarter second on.
+        let repaid = start + Duration::from_millis(250);
+        assert_eq!(limiter.charge(repaid, 1), Duration::from_millis(250));
         let later = start + Duration::from_mins(1);
-        assert!((0..4).all(|_| limiter.allow(later)));
-        assert!(!limiter.allow(later));
+        assert!((0..4).all(|_| limiter.charge(later, 1).is_zero()));
+    }
+
+    #[test]
+    fn bytes_are_limited_too_and_one_full_message_always_fits_the_burst() {
+        let (mut limiter, start) = limiter(1_000, 1_000, 4_000);
+        assert!(limiter.charge(start, 4_000).is_zero());
+        assert_eq!(limiter.charge(start, 500), Duration::from_millis(500));
     }
 }

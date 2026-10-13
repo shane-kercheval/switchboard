@@ -83,6 +83,7 @@ pub enum ClientMessage {
         /// `DeviceKeys::sign_relay_challenge` over the challenge's nonce.
         #[serde(with = "base64")]
         signature: [u8; SIGNATURE_LEN],
+        role: Role,
     },
     /// A frame for another device. Any `from` a client includes is ignored:
     /// the relay names the sender itself.
@@ -98,11 +99,11 @@ pub enum ClientMessage {
         )]
         pairing_token: Option<[u8; PAIRING_TOKEN_LEN]>,
     },
-    /// The Mac's full set of paired phones, replacing any set the relay
-    /// holds for it. Sent after every registration and on every change.
+    /// A Mac's full set of paired phones, replacing the set it registered
+    /// with or last sent. Sent on every change. From a phone, `bad_message`.
     PairedDevices { device_ids: Vec<DeviceId> },
-    /// Opens a pairing window, replacing any open one. `expires_in` is in
-    /// seconds and is capped at 300.
+    /// Opens a Mac's pairing window, replacing any open one. `expires_in` is
+    /// in seconds and is capped at 300. From a phone, `bad_message`.
     PairingOpen {
         #[serde(with = "base64")]
         token_hash: [u8; TOKEN_HASH_LEN],
@@ -115,15 +116,33 @@ pub enum ClientMessage {
     Unknown,
 }
 
+/// What a device registers as. The relay routes by it, so a device's role is
+/// known from its first registered moment and cannot change on that
+/// connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Role {
+    /// A Mac and its full set of paired phones. The set may be empty.
+    Mac { paired_devices: Vec<DeviceId> },
+    /// A phone and the one Mac it is paired with, or is pairing with: the
+    /// relay lets only that Mac reach it. A phone with more than one Mac
+    /// would need a list here, and a new `relay_protocol`.
+    Phone { mac: DeviceId },
+}
+
 /// The relay's messages to a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ServerMessage {
-    /// The relay's first message on every connection.
+    /// The relay's first message on every connection. `relay_protocol` is
+    /// the relay's own, so a client that speaks another knows which side is
+    /// behind before it registers.
     Challenge {
         #[serde(with = "base64")]
         nonce: [u8; NONCE_LEN],
+        relay_protocol: u32,
     },
     /// Registration succeeded. Precedes every frame and notice for this
     /// connection.
@@ -171,15 +190,12 @@ pub enum ErrorCode {
     /// A bad signature, a key that does not hash to the claimed id, or a
     /// denied id. Closes the connection.
     RegistrationRefused,
-    /// `MAX_CONNECTIONS` reached. Closes the connection.
-    RelayFull,
-    /// Over the per-connection message rate. Closes the connection.
-    RateLimited,
-    /// A message that does not parse, a binary message, or a message out of
-    /// order. Closes the connection.
+    /// A message that does not parse, a binary message, a message out of
+    /// order or not allowed for the sender's role, or a record longer than
+    /// any frame. Closes the connection.
     BadMessage,
-    /// A `paired_devices` set above `MAX_DEVICES_PER_MAC`; the relay keeps
-    /// the set it held.
+    /// A paired set above `MAX_DEVICES_PER_MAC`. On `paired_devices` the
+    /// relay keeps the set it held; on `register` it closes the connection.
     LimitExceeded,
     MacOffline,
     PhoneOffline,

@@ -23,9 +23,10 @@ sha2.workspace = true
 switchboard-remote-crypto = { path = "../remote-crypto" }
 thiserror.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = "0.29"

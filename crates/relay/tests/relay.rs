@@ -1,21 +1,23 @@
 //! The relay over real sockets: registration, forwarding, pair scoping,
-//! pairing tokens, peer notices, and limits. The routing rules themselves are
-//! unit-tested in `src/state.rs`; these check that the server applies them in
-//! the order the protocol promises.
+//! pairing tokens, peer notices, flow control, and limits. The routing rules
+//! and the timing decisions are unit-tested in `src/`; these check that the
+//! server applies them in the order the protocol promises. They assert what
+//! happens, never how long it took.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use switchboard_relay::protocol::{
-    ClientMessage, DeviceId, ErrorCode, PAIRING_TOKEN_LEN, RELAY_PROTOCOL, ServerMessage,
+    ClientMessage, DeviceId, ErrorCode, PAIRING_TOKEN_LEN, RELAY_PROTOCOL, Role, ServerMessage,
     token_hash,
 };
 use switchboard_relay::{Config, RelayHandle};
 use switchboard_remote_crypto::DeviceKeys;
+use switchboard_remote_crypto::frame::MAX_FRAME_LEN;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -38,24 +40,49 @@ fn nobody() -> DeviceId {
     DeviceId::parse(&"z".repeat(26)).unwrap()
 }
 
+fn new_keys() -> DeviceKeys {
+    DeviceKeys::generate().unwrap()
+}
+
+fn id_of(keys: &DeviceKeys) -> DeviceId {
+    DeviceId::from_identity_key(&keys.identity_public_key())
+}
+
 fn copy(keys: &DeviceKeys) -> DeviceKeys {
     DeviceKeys::restore(&keys.storage_bytes()).unwrap()
 }
 
-fn register_message(keys: &DeviceKeys, nonce: &[u8]) -> ClientMessage {
-    ClientMessage::Register {
-        relay_protocol: RELAY_PROTOCOL,
-        device_id: DeviceId::from_identity_key(&keys.identity_public_key()),
-        identity_public_key: keys.identity_public_key().to_bytes(),
-        signature: keys.sign_relay_challenge(nonce).to_bytes(),
+fn mac_role(phones: &[&DeviceId]) -> Role {
+    Role::Mac {
+        paired_devices: phones.iter().map(|id| (*id).clone()).collect(),
     }
 }
 
-/// Opens a socket and reads the challenge.
+fn phone_role(mac: &DeviceId) -> Role {
+    Role::Phone { mac: mac.clone() }
+}
+
+fn register_message(keys: &DeviceKeys, nonce: &[u8], role: Role) -> ClientMessage {
+    ClientMessage::Register {
+        relay_protocol: RELAY_PROTOCOL,
+        device_id: id_of(keys),
+        identity_public_key: keys.identity_public_key().to_bytes(),
+        signature: keys.sign_relay_challenge(nonce).to_bytes(),
+        role,
+    }
+}
+
+/// Opens a socket and reads the challenge, which names the relay's protocol.
 async fn open(url: &str) -> (Socket, [u8; 32]) {
     let (mut socket, _) = connect_async(url).await.unwrap();
     match next(&mut socket).await {
-        Some(ServerMessage::Challenge { nonce }) => (socket, nonce),
+        Some(ServerMessage::Challenge {
+            nonce,
+            relay_protocol,
+        }) => {
+            assert_eq!(relay_protocol, RELAY_PROTOCOL);
+            (socket, nonce)
+        }
         other => panic!("expected a challenge, got {other:?}"),
     }
 }
@@ -83,6 +110,14 @@ async fn send_text(socket: &mut Socket, text: &str) {
     socket.send(Message::Text(text.into())).await.unwrap();
 }
 
+fn frame_message(to: &DeviceId, record: &[u8]) -> ClientMessage {
+    ClientMessage::Frame {
+        to: to.clone(),
+        record: record.to_vec(),
+        pairing_token: None,
+    }
+}
+
 /// Reads until the relay closes the socket; returns what it said first.
 async fn until_closed(socket: &mut Socket) -> Vec<ServerMessage> {
     let mut said = Vec::new();
@@ -99,6 +134,10 @@ fn error_code(message: &ServerMessage) -> ErrorCode {
     }
 }
 
+fn codes(messages: &[ServerMessage]) -> Vec<ErrorCode> {
+    messages.iter().map(error_code).collect()
+}
+
 struct Client {
     socket: Socket,
     keys: DeviceKeys,
@@ -106,15 +145,19 @@ struct Client {
 }
 
 impl Client {
-    async fn connect(relay: &RelayHandle) -> Self {
-        Self::connect_as(relay, DeviceKeys::generate().unwrap()).await
+    async fn mac(relay: &RelayHandle, keys: DeviceKeys, phones: &[&DeviceId]) -> Self {
+        Self::connect_as(relay, keys, mac_role(phones)).await
     }
 
-    async fn connect_as(relay: &RelayHandle, keys: DeviceKeys) -> Self {
+    async fn phone(relay: &RelayHandle, keys: DeviceKeys, mac: &DeviceId) -> Self {
+        Self::connect_as(relay, keys, phone_role(mac)).await
+    }
+
+    async fn connect_as(relay: &RelayHandle, keys: DeviceKeys, role: Role) -> Self {
         let (mut socket, nonce) = open(&relay.url()).await;
-        send(&mut socket, &register_message(&keys, &nonce)).await;
+        send(&mut socket, &register_message(&keys, &nonce, role)).await;
         assert_eq!(next(&mut socket).await, Some(ServerMessage::Registered));
-        let id = DeviceId::from_identity_key(&keys.identity_public_key());
+        let id = id_of(&keys);
         Self { socket, keys, id }
     }
 
@@ -123,12 +166,7 @@ impl Client {
     }
 
     async fn frame(&mut self, to: &DeviceId, record: &[u8]) {
-        self.send(&ClientMessage::Frame {
-            to: to.clone(),
-            record: record.to_vec(),
-            pairing_token: None,
-        })
-        .await;
+        self.send(&frame_message(to, record)).await;
     }
 
     async fn next(&mut self) -> ServerMessage {
@@ -151,17 +189,18 @@ impl Client {
         }
     }
 
-    async fn pair(&mut self, phones: &[&DeviceId]) {
-        self.send(&ClientMessage::PairedDevices {
-            device_ids: phones.iter().map(|id| (*id).clone()).collect(),
-        })
-        .await;
-        assert_eq!(self.sync().await, vec![]);
-    }
-
     async fn close(mut self) {
         self.socket.close(None).await.unwrap();
     }
+}
+
+/// A connected Mac with one connected phone paired.
+async fn paired(relay: &RelayHandle) -> (Client, Client) {
+    let (mac_keys, phone_keys) = (new_keys(), new_keys());
+    let mac_id = id_of(&mac_keys);
+    let phone = Client::phone(relay, phone_keys, &mac_id).await;
+    let mac = Client::mac(relay, mac_keys, &[&phone.id]).await;
+    (mac, phone)
 }
 
 fn frame_from(from: &DeviceId, to: &DeviceId, record: &[u8]) -> ServerMessage {
@@ -182,9 +221,7 @@ fn notice(device_id: &DeviceId) -> ServerMessage {
 #[tokio::test]
 async fn forwards_a_pairs_frames_in_order_with_the_relays_from() {
     let relay = start_default().await;
-    let mut mac = Client::connect(&relay).await;
-    let mut phone = Client::connect(&relay).await;
-    mac.pair(&[&phone.id]).await;
+    let (mut mac, mut phone) = paired(&relay).await;
 
     for n in 0..100u8 {
         // A client-supplied `from`, naming the Mac itself, is overwritten.
@@ -206,9 +243,7 @@ async fn forwards_a_pairs_frames_in_order_with_the_relays_from() {
 #[tokio::test]
 async fn an_offline_mac_is_reported_with_its_last_disconnect() {
     let relay = start_default().await;
-    let mut mac = Client::connect(&relay).await;
-    let mut phone = Client::connect(&relay).await;
-    mac.pair(&[&phone.id]).await;
+    let (mac, mut phone) = paired(&relay).await;
     let mac_id = mac.id.clone();
     mac.close().await;
     assert_eq!(phone.next().await, notice(&mac_id));
@@ -228,10 +263,8 @@ async fn an_offline_mac_is_reported_with_its_last_disconnect() {
 #[tokio::test]
 async fn an_offline_phone_is_reported_to_its_mac() {
     let relay = start_default().await;
-    let mut mac = Client::connect(&relay).await;
-    let phone = Client::connect(&relay).await;
+    let (mut mac, phone) = paired(&relay).await;
     let phone_id = phone.id.clone();
-    mac.pair(&[&phone_id]).await;
     phone.close().await;
     assert_eq!(mac.next().await, notice(&phone_id));
 
@@ -257,37 +290,49 @@ async fn registration_refusal(
     until_closed(&mut socket).await
 }
 
-fn codes(messages: &[ServerMessage]) -> Vec<ErrorCode> {
-    messages.iter().map(error_code).collect()
+fn with_register(
+    message: ClientMessage,
+    edit: impl FnOnce(&mut u32, &mut DeviceId, &mut [u8; 64]),
+) -> ClientMessage {
+    let ClientMessage::Register {
+        mut relay_protocol,
+        mut device_id,
+        identity_public_key,
+        mut signature,
+        role,
+    } = message
+    else {
+        unreachable!()
+    };
+    edit(&mut relay_protocol, &mut device_id, &mut signature);
+    ClientMessage::Register {
+        relay_protocol,
+        device_id,
+        identity_public_key,
+        signature,
+        role,
+    }
 }
 
 #[tokio::test]
 async fn registration_refuses_a_signature_over_another_challenge() {
-    let keys = DeviceKeys::generate().unwrap();
-    let said = registration_refusal(Config::default(), |_| register_message(&keys, &[0; 32])).await;
+    let keys = new_keys();
+    let said = registration_refusal(Config::default(), |_| {
+        register_message(&keys, &[0; 32], phone_role(&nobody()))
+    })
+    .await;
     assert_eq!(codes(&said), vec![ErrorCode::RegistrationRefused]);
 }
 
 #[tokio::test]
 async fn registration_refuses_an_id_that_is_not_the_keys() {
-    let keys = DeviceKeys::generate().unwrap();
-    let other = DeviceKeys::generate().unwrap();
+    let keys = new_keys();
+    let other = id_of(&new_keys());
     let said = registration_refusal(Config::default(), |nonce| {
-        let ClientMessage::Register {
-            relay_protocol,
-            identity_public_key,
-            signature,
-            ..
-        } = register_message(&keys, nonce)
-        else {
-            unreachable!()
-        };
-        ClientMessage::Register {
-            relay_protocol,
-            device_id: DeviceId::from_identity_key(&other.identity_public_key()),
-            identity_public_key,
-            signature,
-        }
+        with_register(
+            register_message(&keys, nonce, phone_role(&nobody())),
+            |_, id, _| *id = other,
+        )
     })
     .await;
     assert_eq!(codes(&said), vec![ErrorCode::RegistrationRefused]);
@@ -295,23 +340,12 @@ async fn registration_refuses_an_id_that_is_not_the_keys() {
 
 #[tokio::test]
 async fn registration_refuses_an_unsupported_relay_protocol() {
-    let keys = DeviceKeys::generate().unwrap();
+    let keys = new_keys();
     let said = registration_refusal(Config::default(), |nonce| {
-        let ClientMessage::Register {
-            device_id,
-            identity_public_key,
-            signature,
-            ..
-        } = register_message(&keys, nonce)
-        else {
-            unreachable!()
-        };
-        ClientMessage::Register {
-            relay_protocol: RELAY_PROTOCOL + 1,
-            device_id,
-            identity_public_key,
-            signature,
-        }
+        with_register(
+            register_message(&keys, nonce, phone_role(&nobody())),
+            |protocol, _, _| *protocol = RELAY_PROTOCOL + 1,
+        )
     })
     .await;
     assert_eq!(codes(&said), vec![ErrorCode::ProtocolMismatch]);
@@ -319,64 +353,73 @@ async fn registration_refuses_an_unsupported_relay_protocol() {
 
 #[tokio::test]
 async fn registration_refuses_a_denied_device() {
-    let keys = DeviceKeys::generate().unwrap();
-    let id = DeviceId::from_identity_key(&keys.identity_public_key());
+    let keys = new_keys();
     let config = Config {
-        deny_device_ids: [id].into(),
+        deny_device_ids: [id_of(&keys)].into(),
         ..Config::default()
     };
-    let said = registration_refusal(config, |nonce| register_message(&keys, nonce)).await;
+    let said = registration_refusal(config, |nonce| {
+        register_message(&keys, nonce, phone_role(&nobody()))
+    })
+    .await;
     assert_eq!(codes(&said), vec![ErrorCode::RegistrationRefused]);
 }
 
 #[tokio::test]
-async fn a_frame_before_registration_is_refused() {
-    let said = registration_refusal(Config::default(), |_| ClientMessage::Frame {
-        to: nobody(),
-        record: vec![1],
-        pairing_token: None,
+async fn registration_refuses_a_mac_with_too_many_phones() {
+    let keys = new_keys();
+    let config = Config {
+        max_devices_per_mac: 1,
+        ..Config::default()
+    };
+    let phones = [id_of(&new_keys()), id_of(&new_keys())];
+    let said = registration_refusal(config, |nonce| {
+        register_message(&keys, nonce, mac_role(&[&phones[0], &phones[1]]))
     })
     .await;
+    assert_eq!(codes(&said), vec![ErrorCode::LimitExceeded]);
+}
+
+#[tokio::test]
+async fn a_frame_before_registration_is_refused() {
+    let said = registration_refusal(Config::default(), |_| frame_message(&nobody(), &[1])).await;
     assert_eq!(codes(&said), vec![ErrorCode::BadMessage]);
 }
 
 #[tokio::test]
 async fn a_denied_device_cannot_be_reached() {
-    let denied = DeviceKeys::generate().unwrap();
-    let denied_id = DeviceId::from_identity_key(&denied.identity_public_key());
+    let denied = id_of(&new_keys());
     let relay = start(Config {
-        deny_device_ids: [denied_id.clone()].into(),
+        deny_device_ids: [denied.clone()].into(),
         ..Config::default()
     })
     .await;
-    let mut mac = Client::connect(&relay).await;
-    mac.pair(&[&denied_id]).await;
-
-    mac.frame(&denied_id, b"x").await;
-    let reply = mac.next().await;
-    assert_eq!(error_code(&reply), ErrorCode::PhoneOffline);
+    let mut mac = Client::mac(&relay, new_keys(), &[&denied]).await;
+    mac.frame(&denied, b"x").await;
+    assert_eq!(error_code(&mac.next().await), ErrorCode::PhoneOffline);
 }
 
 #[tokio::test]
 async fn an_impostor_is_refused_after_a_restart() {
     let relay = start_default().await;
     let addr = relay.addr();
-    let real = DeviceKeys::generate().unwrap();
-    let real_client = Client::connect_as(&relay, copy(&real)).await;
+    let real = new_keys();
+    let real_client = Client::phone(&relay, copy(&real), &nobody()).await;
     drop(real_client);
     relay.shutdown().await.unwrap();
 
     let relay = RelayHandle::start(addr, Config::default()).await.unwrap();
-    let impostor = DeviceKeys::generate().unwrap();
+    let impostor = new_keys();
     let (mut socket, nonce) = open(&relay.url()).await;
     // The real device's id and public key, but the impostor's signature.
     send(
         &mut socket,
         &ClientMessage::Register {
             relay_protocol: RELAY_PROTOCOL,
-            device_id: DeviceId::from_identity_key(&real.identity_public_key()),
+            device_id: id_of(&real),
             identity_public_key: real.identity_public_key().to_bytes(),
             signature: impostor.sign_relay_challenge(&nonce).to_bytes(),
+            role: phone_role(&nobody()),
         },
     )
     .await;
@@ -384,23 +427,21 @@ async fn an_impostor_is_refused_after_a_restart() {
         codes(&until_closed(&mut socket).await),
         vec![ErrorCode::RegistrationRefused]
     );
-    Client::connect_as(&relay, real).await;
+    Client::phone(&relay, real, &nobody()).await;
 }
 
 #[tokio::test]
 async fn a_phone_reconnecting_before_its_mac_after_a_restart_is_told_mac_offline() {
     let relay = start_default().await;
     let addr = relay.addr();
-    let mac_keys = DeviceKeys::generate().unwrap();
-    let phone_keys = DeviceKeys::generate().unwrap();
-    let mut mac = Client::connect_as(&relay, copy(&mac_keys)).await;
-    let phone = Client::connect_as(&relay, copy(&phone_keys)).await;
-    mac.pair(&[&phone.id]).await;
-    let mac_id = mac.id.clone();
+    let (mac_keys, phone_keys) = (new_keys(), new_keys());
+    let (mac_id, phone_id) = (id_of(&mac_keys), id_of(&phone_keys));
+    let _phone = Client::phone(&relay, copy(&phone_keys), &mac_id).await;
+    let _mac = Client::mac(&relay, copy(&mac_keys), &[&phone_id]).await;
     relay.shutdown().await.unwrap();
 
     let relay = RelayHandle::start(addr, Config::default()).await.unwrap();
-    let mut phone = Client::connect_as(&relay, phone_keys).await;
+    let mut phone = Client::phone(&relay, phone_keys, &mac_id).await;
     phone.frame(&mac_id, b"hello").await;
     assert_eq!(
         phone.next().await,
@@ -412,20 +453,17 @@ async fn a_phone_reconnecting_before_its_mac_after_a_restart_is_told_mac_offline
         }
     );
 
-    let mut mac = Client::connect_as(&relay, mac_keys).await;
-    mac.pair(&[&phone.id]).await;
+    let mut mac = Client::mac(&relay, mac_keys, &[&phone_id]).await;
     phone.frame(&mac_id, b"hello").await;
-    assert_eq!(mac.next().await, frame_from(&phone.id, &mac_id, b"hello"));
+    assert_eq!(mac.next().await, frame_from(&phone_id, &mac_id, b"hello"));
 }
 
 #[tokio::test]
-async fn a_device_outside_the_set_is_not_paired_whether_or_not_the_mac_is_connected() {
+async fn a_phone_outside_the_set_is_not_paired_whether_or_not_the_mac_is_connected() {
     let relay = start_default().await;
-    let mut mac = Client::connect(&relay).await;
-    let mut phone = Client::connect(&relay).await;
-    let mut stranger = Client::connect(&relay).await;
-    mac.pair(&[&phone.id]).await;
+    let (mac, mut phone) = paired(&relay).await;
     let mac_id = mac.id.clone();
+    let mut stranger = Client::phone(&relay, new_keys(), &mac_id).await;
 
     stranger.frame(&mac_id, b"probe").await;
     assert_eq!(error_code(&stranger.next().await), ErrorCode::NotPaired);
@@ -436,33 +474,65 @@ async fn a_device_outside_the_set_is_not_paired_whether_or_not_the_mac_is_connec
 }
 
 #[tokio::test]
+async fn a_macs_set_applies_from_its_first_registered_moment() {
+    let relay = start_default().await;
+    let mac_keys = new_keys();
+    let mac_id = id_of(&mac_keys);
+    let mut stranger = Client::phone(&relay, new_keys(), &mac_id).await;
+    let mut lister = Client::mac(&relay, new_keys(), &[&mac_id]).await;
+    let mut mac = Client::mac(&relay, mac_keys, &[&nobody()]).await;
+
+    stranger.frame(&mac_id, b"first").await;
+    assert_eq!(error_code(&stranger.next().await), ErrorCode::NotPaired);
+    lister.frame(&mac_id, b"first").await;
+    assert_eq!(error_code(&lister.next().await), ErrorCode::NotPaired);
+    assert_eq!(mac.sync().await, vec![]);
+}
+
+#[tokio::test]
+async fn a_phone_may_not_send_a_macs_messages() {
+    let relay = start_default().await;
+    let (_mac, mut phone) = paired(&relay).await;
+    phone
+        .send(&ClientMessage::PairedDevices {
+            device_ids: vec![nobody()],
+        })
+        .await;
+    assert_eq!(
+        codes(&until_closed(&mut phone.socket).await),
+        vec![ErrorCode::BadMessage]
+    );
+}
+
+#[tokio::test]
 async fn closing_notifies_paired_devices_and_no_one_else() {
     let relay = start_default().await;
-    let mut mac = Client::connect(&relay).await;
-    let phone = Client::connect(&relay).await;
-    let mut other_phone = Client::connect(&relay).await;
-    let mut stranger = Client::connect(&relay).await;
+    let mac_keys = new_keys();
+    let mac_id = id_of(&mac_keys);
+    let phone = Client::phone(&relay, new_keys(), &mac_id).await;
+    let mut other_phone = Client::phone(&relay, new_keys(), &mac_id).await;
+    let mut stranger = Client::phone(&relay, new_keys(), &mac_id).await;
+    let mut lister = Client::mac(&relay, new_keys(), &[&mac_id, &phone.id]).await;
+    let mut mac = Client::mac(&relay, mac_keys, &[&phone.id, &other_phone.id]).await;
     let phone_id = phone.id.clone();
-    mac.pair(&[&phone_id, &other_phone.id]).await;
 
     phone.close().await;
     assert_eq!(mac.next().await, notice(&phone_id));
-    let mac_id = mac.id.clone();
     mac.close().await;
     assert_eq!(other_phone.next().await, notice(&mac_id));
-    // Both notices went out before `other_phone` heard of the second, so
-    // anything for the stranger would already be queued ahead of its reply.
+    // Every notice went out before `other_phone` heard of the second, so
+    // anything for the stranger or the lister is already queued ahead of
+    // its reply.
     assert_eq!(stranger.sync().await, vec![]);
+    assert_eq!(lister.sync().await, vec![]);
 }
 
 #[tokio::test]
 async fn a_replacement_is_announced_before_its_first_frame_and_only_once() {
     let relay = start_default().await;
-    let mut mac = Client::connect(&relay).await;
-    let mut old_phone = Client::connect(&relay).await;
-    mac.pair(&[&old_phone.id]).await;
+    let (mut mac, mut old_phone) = paired(&relay).await;
 
-    let mut new_phone = Client::connect_as(&relay, copy(&old_phone.keys)).await;
+    let mut new_phone = Client::phone(&relay, copy(&old_phone.keys), &mac.id).await;
     let phone_id = new_phone.id.clone();
     new_phone.frame(&mac.id, b"first").await;
     assert_eq!(mac.next().await, notice(&phone_id));
@@ -478,26 +548,28 @@ async fn a_replacement_is_announced_before_its_first_frame_and_only_once() {
 #[tokio::test]
 async fn a_pairing_token_admits_its_first_device_until_confirmed() {
     let relay = start_default().await;
-    let mut mac = Client::connect(&relay).await;
-    let mut candidate = Client::connect(&relay).await;
-    let mut second = Client::connect(&relay).await;
+    let mac_keys = new_keys();
+    let mac_id = id_of(&mac_keys);
+    let mut mac = Client::mac(&relay, mac_keys, &[]).await;
+    let mut candidate = Client::phone(&relay, new_keys(), &mac_id).await;
+    let mut second = Client::phone(&relay, new_keys(), &mac_id).await;
     mac.send(&ClientMessage::PairingOpen {
         token_hash: token_hash(&TOKEN),
         expires_in: 300,
     })
     .await;
     assert_eq!(mac.sync().await, vec![]);
-    let with_token = |to: &DeviceId| ClientMessage::Frame {
-        to: to.clone(),
+    let with_token = ClientMessage::Frame {
+        to: mac_id.clone(),
         record: vec![1],
         pairing_token: Some(TOKEN),
     };
 
-    candidate.send(&with_token(&mac.id)).await;
+    candidate.send(&with_token).await;
     assert_eq!(
         mac.next().await,
         ServerMessage::Frame {
-            to: mac.id.clone(),
+            to: mac_id.clone(),
             from: candidate.id.clone(),
             record: vec![1],
             pairing_token: Some(TOKEN),
@@ -506,76 +578,104 @@ async fn a_pairing_token_admits_its_first_device_until_confirmed() {
     mac.frame(&candidate.id, b"message 2").await;
     assert_eq!(
         candidate.next().await,
-        frame_from(&mac.id, &candidate.id, b"message 2")
+        frame_from(&mac_id, &candidate.id, b"message 2")
     );
 
-    second.send(&with_token(&mac.id)).await;
+    second.send(&with_token).await;
     assert_eq!(error_code(&second.next().await), ErrorCode::PairingExpired);
 
-    mac.pair(&[&candidate.id]).await;
-    candidate.frame(&mac.id, b"paired").await;
+    mac.send(&ClientMessage::PairedDevices {
+        device_ids: vec![candidate.id.clone()],
+    })
+    .await;
+    assert_eq!(mac.sync().await, vec![]);
+    candidate.frame(&mac_id, b"paired").await;
     assert_eq!(
         mac.next().await,
-        frame_from(&candidate.id, &mac.id, b"paired")
+        frame_from(&candidate.id, &mac_id, b"paired")
     );
-    second.send(&with_token(&mac.id)).await;
+    second.send(&with_token).await;
     assert_eq!(error_code(&second.next().await), ErrorCode::PairingExpired);
 }
 
 #[tokio::test]
-async fn a_set_above_the_limit_is_refused() {
+async fn a_set_update_above_the_limit_is_refused_and_the_connection_kept() {
     let relay = start(Config {
         max_devices_per_mac: 1,
         ..Config::default()
     })
     .await;
-    let mut mac = Client::connect(&relay).await;
-    let phone = Client::connect(&relay).await;
-    mac.pair(&[&phone.id]).await;
-
+    let (mut mac, mut phone) = paired(&relay).await;
     mac.send(&ClientMessage::PairedDevices {
         device_ids: vec![phone.id.clone(), nobody()],
     })
     .await;
+    assert_eq!(codes(&mac.sync().await), vec![ErrorCode::LimitExceeded]);
+    phone.frame(&mac.id, b"still paired").await;
     assert_eq!(
-        codes(&mac.sync().await),
-        vec![ErrorCode::LimitExceeded],
-        "refused, and the connection stays open"
+        mac.next().await,
+        frame_from(&phone.id, &mac.id, b"still paired")
     );
 }
 
+/// Polls until a new connection is admitted, as the slot of a closed one
+/// comes free.
+async fn admitted_eventually(relay: &RelayHandle, within: Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        if let Ok((mut socket, _)) = connect_async(relay.url()).await
+            && matches!(
+                next(&mut socket).await,
+                Some(ServerMessage::Challenge { .. })
+            )
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no connection slot came free"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
-async fn connections_past_the_limit_are_refused() {
+async fn connections_past_the_limit_are_refused_before_the_upgrade() {
     let relay = start(Config {
         max_connections: 2,
         ..Config::default()
     })
     .await;
-    let first = Client::connect(&relay).await;
+    let first = Client::phone(&relay, new_keys(), &nobody()).await;
     let (_second, _) = open(&relay.url()).await;
 
-    let (mut third, _) = connect_async(relay.url()).await.unwrap();
-    assert_eq!(
-        codes(&until_closed(&mut third).await),
-        vec![ErrorCode::RelayFull]
-    );
+    match connect_async(relay.url()).await {
+        Err(tungstenite::Error::Http(response)) => assert_eq!(response.status(), 503),
+        other => panic!("expected HTTP 503, got {other:?}"),
+    }
 
     first.close().await;
-    let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
-        let (mut socket, _) = connect_async(relay.url()).await.unwrap();
-        if matches!(
-            next(&mut socket).await,
-            Some(ServerMessage::Challenge { .. })
-        ) {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the closed connection's slot was never released"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    admitted_eventually(&relay, WAIT).await;
+}
+
+#[tokio::test]
+async fn a_refused_client_that_never_answers_the_close_keeps_its_slot_only_briefly() {
+    let relay = start(Config {
+        max_connections: 1,
+        ..Config::default()
+    })
+    .await;
+    let mut refused = Client::phone(&relay, new_keys(), &nobody()).await;
+    refused
+        .socket
+        .send(Message::Binary(vec![1].into()))
+        .await
+        .unwrap();
+    // `refused` never reads again, so it never answers the relay's close.
+    // Its socket, and with it its slot, is dropped once the relay stops
+    // waiting for that answer.
+    admitted_eventually(&relay, WAIT).await;
+    drop(refused);
 }
 
 #[tokio::test]
@@ -587,8 +687,8 @@ async fn a_silent_client_is_closed_and_a_pinging_one_is_not() {
         ..Config::default()
     })
     .await;
-    let mut silent = Client::connect(&relay).await;
-    let mut pinging = Client::connect(&relay).await;
+    let mut silent = Client::phone(&relay, new_keys(), &nobody()).await;
+    let mut pinging = Client::phone(&relay, new_keys(), &nobody()).await;
 
     for _ in 0..30 {
         pinging
@@ -612,12 +712,7 @@ async fn pings_do_not_extend_the_registration_deadline() {
     })
     .await;
     let (mut socket, _) = open(&relay.url()).await;
-    let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a client that only pings was never closed"
-        );
+    for _ in 0..100 {
         if socket
             .send(Message::Ping(b"stalling".to_vec().into()))
             .await
@@ -632,78 +727,124 @@ async fn pings_do_not_extend_the_registration_deadline() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    panic!("a client that only pings was never closed");
 }
 
 #[tokio::test]
-async fn pings_count_toward_the_rate_limit() {
+async fn a_burst_over_the_rate_limit_is_slowed_and_delivered_whole() {
     let relay = start(Config {
-        rate_limit: 5,
+        rate_limit: 20,
         ..Config::default()
     })
     .await;
-    let mut client = Client::connect(&relay).await;
-    for _ in 0..20 {
-        if client
-            .socket
-            .send(Message::Ping(b"flood".to_vec().into()))
+    let (mut mac, mut phone) = paired(&relay).await;
+    for n in 0..60u8 {
+        phone.frame(&mac.id, &[n]).await;
+    }
+    for n in 0..60u8 {
+        assert_eq!(mac.next().await, frame_from(&phone.id, &mac.id, &[n]));
+    }
+    assert_eq!(phone.sync().await, vec![]);
+}
+
+#[tokio::test]
+async fn a_slow_reader_behind_a_burst_is_slowed_not_closed() {
+    // A budget of about twenty such frames, far below the burst.
+    let relay = start(Config {
+        queue_bytes: 96 * 1024,
+        ..Config::default()
+    })
+    .await;
+    let (mut mac, mut phone) = paired(&relay).await;
+    let phone_id = phone.id.clone();
+    let reader = tokio::spawn(async move {
+        for n in 0..300u16 {
+            match phone.next().await {
+                ServerMessage::Frame { record, .. } => {
+                    assert_eq!(record[..2], n.to_be_bytes());
+                }
+                other => panic!("expected frame {n}, got {other:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        phone
+    });
+    for n in 0..300u16 {
+        let mut record = n.to_be_bytes().to_vec();
+        record.resize(4096, 0);
+        mac.frame(&phone_id, &record).await;
+    }
+    let mut phone = reader.await.unwrap();
+    assert_eq!(phone.sync().await, vec![]);
+    assert_eq!(mac.sync().await, vec![]);
+}
+
+#[tokio::test]
+async fn a_phone_that_stops_reading_is_closed_and_its_mac_told() {
+    let relay = start(Config {
+        queue_bytes: 96 * 1024,
+        stall_timeout: Duration::from_millis(300),
+        rate_limit_bytes: 1 << 30,
+        ..Config::default()
+    })
+    .await;
+    let (mac, phone) = paired(&relay).await;
+    let phone_id = phone.id.clone();
+    let (mut to_relay, mut from_relay) = mac.socket.split();
+    // Large frames, until the socket buffers between the relay and the
+    // phone are full and the relay's queue with them; the phone reads none.
+    let sending = tokio::spawn({
+        let phone_id = phone_id.clone();
+        async move {
+            let record = vec![0; 60_000];
+            for _ in 0..2_000 {
+                let text = serde_json::to_string(&frame_message(&phone_id, &record)).unwrap();
+                if to_relay.send(Message::Text(text.into())).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let message = tokio::time::timeout_at(deadline, from_relay.next())
             .await
-            .is_err()
+            .expect("the stalled phone was never closed");
+        if let Some(Ok(Message::Text(text))) = message
+            && serde_json::from_str::<ServerMessage>(&text).unwrap() == notice(&phone_id)
         {
             break;
         }
     }
-    let said = until_closed(&mut client.socket).await;
-    assert_eq!(codes(&said), vec![ErrorCode::RateLimited]);
+    sending.abort();
+    drop(phone);
 }
 
 #[tokio::test]
-async fn a_refused_client_that_never_answers_the_close_does_not_keep_its_slot() {
+async fn a_client_that_never_reads_its_errors_is_closed() {
     let relay = start(Config {
-        max_connections: 1,
+        queue_bytes: 96 * 1024,
+        rate_limit: 1_000_000,
+        rate_limit_bytes: 1 << 30,
         ..Config::default()
     })
     .await;
-    let mut refused = Client::connect(&relay).await;
-    refused
-        .socket
-        .send(Message::Binary(vec![1].into()))
-        .await
-        .unwrap();
-    // `refused` never reads again, so it never answers the relay's close.
-    // Its slot must come free well before the relay stops waiting for that
-    // answer.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let (mut socket, _) = connect_async(relay.url()).await.unwrap();
-        if matches!(
-            next(&mut socket).await,
-            Some(ServerMessage::Challenge { .. })
-        ) {
-            break;
+    let mut flooder = Client::phone(&relay, new_keys(), &nobody()).await;
+    // Each frame earns an error the flooder never reads. Once the socket
+    // buffers are full they pile up in its queue, and past its room for
+    // control messages the relay closes it; its sends then fail.
+    let text = serde_json::to_string(&frame_message(&id_of(&new_keys()), b"x")).unwrap();
+    for _ in 0..2_000_000 {
+        if flooder
+            .socket
+            .send(Message::Text(text.clone().into()))
+            .await
+            .is_err()
+        {
+            return;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the refused connection kept its slot while closing"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    drop(refused);
-}
-
-#[tokio::test]
-async fn a_client_over_the_rate_limit_is_closed() {
-    let relay = start(Config {
-        rate_limit: 5,
-        ..Config::default()
-    })
-    .await;
-    let mut client = Client::connect(&relay).await;
-    for _ in 0..20 {
-        client.frame(&nobody(), b"x").await;
-    }
-    let said = until_closed(&mut client.socket).await;
-    assert_eq!(said.last().map(error_code), Some(ErrorCode::RateLimited));
-    assert!(said.len() < 20, "{said:?}");
+    panic!("a client that never read its errors was never closed");
 }
 
 #[tokio::test]
@@ -713,7 +854,7 @@ async fn a_message_over_the_frame_limit_closes_the_connection() {
         ..Config::default()
     })
     .await;
-    let mut client = Client::connect(&relay).await;
+    let mut client = Client::phone(&relay, new_keys(), &nobody()).await;
     client.frame(&nobody(), &[0; 256]).await;
     assert_eq!(error_code(&client.next().await), ErrorCode::MacOffline);
 
@@ -722,9 +863,22 @@ async fn a_message_over_the_frame_limit_closes_the_connection() {
 }
 
 #[tokio::test]
+async fn a_record_longer_than_any_frame_is_refused() {
+    let relay = start_default().await;
+    let (mut mac, mut phone) = paired(&relay).await;
+    phone.frame(&mac.id, &vec![0; MAX_FRAME_LEN]).await;
+    assert!(matches!(mac.next().await, ServerMessage::Frame { .. }));
+    phone.frame(&mac.id, &vec![0; MAX_FRAME_LEN + 1]).await;
+    assert_eq!(
+        codes(&until_closed(&mut phone.socket).await),
+        vec![ErrorCode::BadMessage]
+    );
+}
+
+#[tokio::test]
 async fn malformed_and_binary_messages_close_the_connection_and_unknown_types_do_not() {
     let relay = start_default().await;
-    let mut client = Client::connect(&relay).await;
+    let mut client = Client::phone(&relay, new_keys(), &nobody()).await;
     send_text(&mut client.socket, r#"{"type":"from_the_future"}"#).await;
     assert_eq!(client.sync().await, vec![]);
 
@@ -734,7 +888,7 @@ async fn malformed_and_binary_messages_close_the_connection_and_unknown_types_do
         vec![ErrorCode::BadMessage]
     );
 
-    let mut client = Client::connect(&relay).await;
+    let mut client = Client::phone(&relay, new_keys(), &nobody()).await;
     client
         .socket
         .send(Message::Binary(vec![1, 2, 3].into()))
@@ -747,12 +901,9 @@ async fn malformed_and_binary_messages_close_the_connection_and_unknown_types_do
 }
 
 #[tokio::test]
-async fn healthz_answers_with_counts() {
+async fn healthz_answers_only_its_status() {
     let relay = start_default().await;
-    let mut mac = Client::connect(&relay).await;
-    let phone = Client::connect(&relay).await;
-    mac.pair(&[&phone.id]).await;
-
+    let (_mac, _phone) = paired(&relay).await;
     let mut stream = TcpStream::connect(relay.addr()).await.unwrap();
     stream
         .write_all(b"GET /healthz HTTP/1.1\r\nHost: relay\r\nConnection: close\r\n\r\n")
@@ -763,7 +914,32 @@ async fn healthz_answers_with_counts() {
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let body: serde_json::Value =
         serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    assert_eq!(body["status"], "ok");
-    assert_eq!(body["registered_devices"], 2);
-    assert_eq!(body["open_connections"], 2);
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+}
+
+#[tokio::test]
+async fn shutdown_closes_every_connection_with_a_close_frame_before_returning() {
+    let relay = start_default().await;
+    let (mut mac, _phone) = paired(&relay).await;
+    let (_unread, _) = open(&relay.url()).await;
+    let stopping = tokio::spawn(relay.shutdown());
+    let closing = tokio::time::timeout(WAIT, async {
+        loop {
+            match mac.socket.next().await {
+                Some(Ok(Message::Close(_))) => return true,
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(closing, "the connection ended without a close frame");
+    // The unread connection never answers its close, so shutdown waits for
+    // it only as long as the relay waits for any closing connection.
+    tokio::time::timeout(WAIT, stopping)
+        .await
+        .expect("shutdown did not return")
+        .unwrap()
+        .unwrap();
 }

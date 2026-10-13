@@ -7,9 +7,10 @@
 //! relay needs.
 
 pub mod config;
+mod outbox;
 pub mod protocol;
 mod server;
 mod state;
 
 pub use config::{Config, ConfigError};
-pub use server::{RelayHandle, router, serve};
+pub use server::{RelayHandle, serve};

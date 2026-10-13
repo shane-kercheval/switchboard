@@ -1,17 +1,25 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use switchboard_remote_crypto::frame::MAX_FRAME_LEN;
+
+use crate::outbox::frame_cost;
 use crate::protocol::{DeviceId, InvalidDeviceId};
 
 /// The relay's limits and settings. `from_env` reads the deployment's
-/// environment; the timeouts are fixed there and settable only in code, for
-/// tests.
+/// environment; the timeouts and the queue budget are fixed there and
+/// settable only in code, for tests.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
     /// Messages per second a connection may send, sustained; a connection
-    /// may also burst up to this many at once. Pings and pongs count.
+    /// may also burst up to this many at once. Pings and pongs count. A
+    /// connection over it is not refused: the relay stops reading from it
+    /// until it is back under, which slows the sender through TCP.
     pub rate_limit: u32,
+    /// Bytes per second a connection may send, enforced the same way. A
+    /// burst may always reach one message of `max_frame_bytes`.
+    pub rate_limit_bytes: u32,
     /// The longest WebSocket message accepted. The default is above a frame
     /// carrying the longest record: 65,568 bytes, about 87,500 as base64.
     pub max_frame_bytes: usize,
@@ -24,6 +32,14 @@ pub struct Config {
     pub idle_timeout: Duration,
     /// How long a new connection has to answer the challenge.
     pub register_timeout: Duration,
+    /// Bytes of frames queued for one connection at most. A sender whose
+    /// recipient is full waits for room rather than losing the frame.
+    pub queue_bytes: usize,
+    /// A recipient that completes no send for this long while a sender
+    /// waits for room is closed as not reading. Below the phone's 10-second
+    /// wait for its handshake reply, so another phone's stall cannot make a
+    /// connecting phone give up.
+    pub stall_timeout: Duration,
 }
 
 impl Default for Config {
@@ -37,6 +53,9 @@ impl Default for Config {
             deny_device_ids: HashSet::new(),
             idle_timeout: Duration::from_secs(90),
             register_timeout: Duration::from_secs(10),
+            rate_limit_bytes: 16 * 1024 * 1024,
+            queue_bytes: 4 * 1024 * 1024,
+            stall_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -47,6 +66,8 @@ pub enum ConfigError {
     NotAPositiveInteger { name: &'static str, value: String },
     #[error("DENY_DEVICE_IDS: {0}")]
     DenyList(#[from] InvalidDeviceId),
+    #[error("{0}")]
+    Inconsistent(&'static str),
 }
 
 impl Config {
@@ -64,7 +85,7 @@ impl Config {
             .filter(|id| !id.is_empty())
             .map(DeviceId::parse)
             .collect::<Result<_, _>>()?;
-        Ok(Self {
+        Self {
             port: positive(&var, "PORT", defaults.port)?,
             rate_limit: positive(&var, "RATE_LIMIT", defaults.rate_limit)?,
             max_frame_bytes: positive(&var, "MAX_FRAME_BYTES", defaults.max_frame_bytes)?,
@@ -74,9 +95,30 @@ impl Config {
                 defaults.max_devices_per_mac,
             )?,
             max_connections: positive(&var, "MAX_CONNECTIONS", defaults.max_connections)?,
+            rate_limit_bytes: positive(&var, "RATE_LIMIT_BYTES", defaults.rate_limit_bytes)?,
             deny_device_ids,
             ..defaults
-        })
+        }
+        .validated()
+    }
+
+    /// Refuses settings the relay cannot work under: a queue budget smaller
+    /// than one frame of the longest record could never admit that frame,
+    /// and its recipient would be closed for a stall it did not cause.
+    pub fn validated(self) -> Result<Self, ConfigError> {
+        if self.queue_bytes < frame_cost(MAX_FRAME_LEN) {
+            return Err(ConfigError::Inconsistent(
+                "queue_bytes is below the cost of one frame of the longest record",
+            ));
+        }
+        Ok(self)
+    }
+
+    /// The most memory connections' queues and read buffers can hold: each
+    /// connection's queue budget and one message being read.
+    pub fn memory_ceiling(&self) -> usize {
+        self.max_connections
+            .saturating_mul(self.queue_bytes.saturating_add(self.max_frame_bytes))
     }
 }
 
@@ -142,6 +184,19 @@ mod tests {
             (9000, 10, 2048, 2, 3)
         );
         assert_eq!(config.deny_device_ids.len(), 2);
+    }
+
+    #[test]
+    fn a_queue_budget_below_one_full_frame_is_refused() {
+        let config = Config {
+            queue_bytes: frame_cost(MAX_FRAME_LEN) - 1,
+            ..Config::default()
+        };
+        assert!(matches!(
+            config.validated(),
+            Err(ConfigError::Inconsistent(_))
+        ));
+        assert!(Config::default().validated().is_ok());
     }
 
     #[test]

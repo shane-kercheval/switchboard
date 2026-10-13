@@ -88,7 +88,7 @@
     operationFor,
   } from "$lib/state/composeOperations.svelte";
   import { forkBlockFor } from "$lib/state/forkAvailability";
-  import { agentIsCompactible } from "$lib/state/compactionAvailability";
+  import { agentIsCompactible, compactAllBlock } from "$lib/state/compactionAvailability";
   import { workflowRuns } from "$lib/state/workflows.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
@@ -895,12 +895,28 @@
     return newest;
   });
 
-  /// The agents the header's "Compact all" would compact, in roster order.
+  /// Why the header's "Compact all" is unavailable for the whole project (its
+  /// folder is gone, or its history hasn't loaded), or `null`.
+  const compactAllBlockReason = $derived(compactAllBlock(projectId));
+
+  /// The agents "Compact all" would compact, in roster order. None while the
+  /// button is blocked, so no count and no armed state can show.
   const compactibleAgentIds = $derived(
-    agents
-      .filter((agent) => agentIsCompactible(agent, latestCompactionMarkerTimes.get(agent.id)))
-      .map((agent) => agent.id),
+    compactAllBlockReason !== null
+      ? []
+      : agents
+          .filter((agent) => agentIsCompactible(agent, latestCompactionMarkerTimes.get(agent.id)))
+          .map((agent) => agent.id),
   );
+
+  // An armed "Compact all" whose eligible set empties (the project went back to
+  // loading on a retry, or the last eligible agent's compaction was queued from
+  // its own button) disarms, so a later refill can't turn one click into a
+  // dispatch. Hiding the confirm while the set is empty is not enough: the
+  // flag would survive and the confirm would reappear with it.
+  $effect(() => {
+    if (compactAllArmed && compactibleAgentIds.length === 0) disarmCompactAll();
+  });
 
   /// Context occupancy — `context_tokens_after_turn` over `context_window`
   /// from the most recent completed agent turn, or the size a compaction newer
@@ -1187,16 +1203,21 @@
                 {@render compactAllButton(props, false)}
               {/snippet}
               <div class="max-w-xs space-y-1 text-[13px]">
-                {#if compactibleCount === 0}
+                {#if compactAllBlockReason !== null}
+                  <p class="font-medium">Compact every conversation</p>
+                  <p class="text-primary-fg/70">{compactAllBlockReason}</p>
+                {:else if compactibleCount === 0}
                   <p class="font-medium">Nothing to compact</p>
                   <p class="text-primary-fg/70">
-                    Every agent was just compacted, hasn't been used yet, or can't compact.
+                    Every agent was just compacted, hasn't been used yet, can't compact, or has a
+                    history that hasn't loaded. A failed load's Retry is on the agent's card.
                   </p>
                 {:else}
                   <p class="font-medium">Compact every conversation</p>
                   <p class="text-primary-fg/70">
-                    Compacts {agentCount(compactibleCount)}, skipping any just compacted or never
-                    used. Each runs as a turn and queues if its agent is busy.
+                    Compacts {agentCount(compactibleCount)}, skipping any just compacted, never
+                    used, or whose history hasn't loaded. Each runs as a turn and queues if its
+                    agent is busy.
                   </p>
                 {/if}
               </div>

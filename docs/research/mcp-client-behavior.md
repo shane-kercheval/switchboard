@@ -37,7 +37,8 @@ What the docs said, as of 2026-10-10, and what the measurements found:
 What was run, on a Mac with all three clients signed in.
 
 1. `cd tools/mcp-probe && cargo run --release --locked`, with `MCP_PROBE_TOKEN` set so the
-   token survives restarts. The probe logs every request and tool event to
+   token survives restarts. (The probe was removed after M4's manual session;
+   `git log -- tools/mcp-probe` finds its source.) The probe logs every request and tool event to
    `mcp-probe-log.jsonl` in that folder (never the token).
 2. Clients, configured so that no user configuration file was changed except Claude
    Desktop's:

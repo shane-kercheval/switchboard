@@ -119,7 +119,7 @@ describe("SettingsView", () => {
 
   it("persists independent quick choices and explicit defaults atomically", async () => {
     render(SettingsView, { props: { onClose: vi.fn(), initialSection: "agents" } });
-    await fireEvent.click(await screen.findByText("Codex", { selector: "summary" }));
+    await fireEvent.click(await screen.findByTestId("agent-defaults-codex-summary"));
     await fireEvent.click(screen.getByTestId("settings-selection-codex-model-choice-gpt-6-astra"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
@@ -136,6 +136,7 @@ describe("SettingsView", () => {
       }),
     );
 
+    expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("GPT-6.1 Sol");
     await fireEvent.change(screen.getByTestId("settings-selection-codex-model-current"), {
       target: { value: "gpt-5.6-terra" },
     });
@@ -153,6 +154,17 @@ describe("SettingsView", () => {
         }),
       }),
     );
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("GPT-5.6 Terra"),
+    );
+  });
+
+  it("shows custom model names and unset defaults in the headers", (): void => {
+    preferences.agent_defaults.codex.default_model = "custom-model";
+    preferences.agent_defaults.claude_code.default_model = null;
+    render(SettingsView, { props: { onClose: vi.fn(), initialSection: "agents" } });
+    expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("custom-model");
+    expect(screen.getByTestId("agent-defaults-claude_code-summary")).toHaveTextContent("Not set");
   });
 
   it("falls back to the first remaining default when the current choice is removed", async () => {
@@ -204,14 +216,18 @@ describe("SettingsView", () => {
       "Choose which models and reasoning efforts are available for quick switching from the Agents sidebar, and which ones new agents start with. New projects use the same defaults for their initial agents.",
     );
     const labels = Array.from(section.querySelectorAll("summary")).map((el) =>
-      el.textContent?.trim(),
+      el.textContent?.replace(/\s+/g, " ").trim(),
     );
-    expect(labels).toEqual(["Claude", "Codex", "Antigravity"]);
+    expect(labels).toEqual([
+      "Claude Default model: Opus",
+      "Codex Default model: GPT-6.1 Sol",
+      "Antigravity Default model: Gemini 3.8 Flash",
+    ]);
   });
 
   it("shows the Antigravity quick choices and defaults", async () => {
     render(SettingsView, { props: { onClose: vi.fn(), initialSection: "agents" } });
-    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
 
     expect(
       screen.getByTestId("settings-selection-antigravity-model-choice-gemini-3.1-pro"),
@@ -231,7 +247,7 @@ describe("SettingsView", () => {
       default_effort: "high",
     };
     const view = render(SettingsView, { props: { onClose: vi.fn(), initialSection: "agents" } });
-    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
     const effortDefault = screen.getByTestId("settings-selection-antigravity-effort-current");
     expect(within(effortDefault).getByRole("option", { name: "Medium" })).toBeDisabled();
     await fireEvent.change(effortDefault, { target: { value: "medium" } });
@@ -265,7 +281,7 @@ describe("SettingsView", () => {
     };
     preferences.agent_defaults.antigravity = structuredClone(storedDefaults);
     const view = render(SettingsView, { props: { onClose: vi.fn(), initialSection: "agents" } });
-    const antigravitySummary = screen.getByText("Antigravity", { selector: "summary" });
+    const antigravitySummary = screen.getByTestId("agent-defaults-antigravity-summary");
     await fireEvent.click(antigravitySummary);
 
     expect(screen.getByTestId("settings-selection-antigravity-invalid")).toBeInTheDocument();
@@ -323,7 +339,7 @@ describe("SettingsView", () => {
       default_effort: "medium",
     };
     const view = render(SettingsView, { props: { onClose: vi.fn(), initialSection: "agents" } });
-    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
     await fireEvent.click(screen.getByTestId("settings-selection-antigravity-effort-choice-high"));
     await waitFor(() =>
       expect(
@@ -333,7 +349,7 @@ describe("SettingsView", () => {
 
     view.unmount();
     render(SettingsView, { props: { onClose: vi.fn(), initialSection: "agents" } });
-    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
     expect(screen.getByTestId("settings-selection-antigravity-effort-choice-high")).toHaveAttribute(
       "aria-pressed",
       "false",
@@ -348,7 +364,7 @@ describe("SettingsView", () => {
       default_effort: "high",
     };
     render(SettingsView, { props: { onClose: vi.fn(), initialSection: "agents" } });
-    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
 
     const effortDefault = screen.getByTestId("settings-selection-antigravity-effort-current");
     expect(within(effortDefault).getByRole("option", { name: "Medium" })).toBeEnabled();

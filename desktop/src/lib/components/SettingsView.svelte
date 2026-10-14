@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { FolderOpen } from "@lucide/svelte";
+  import { ChevronRight, FolderOpen } from "@lucide/svelte";
   import { SETTINGS_SECTIONS, type SettingsSection } from "$lib/settingsSections";
   import { theme, type ThemeMode } from "$lib/theme.svelte";
   import { agentCopy } from "$lib/agentCopy.svelte";
@@ -39,7 +39,7 @@
     notificationAvailability,
   } from "$lib/api";
   import type { AgentSelection, HarnessKind, NotificationAvailability } from "$lib/types";
-  import { selectionIsValid } from "$lib/agentSelection";
+  import { MODEL_OPTIONS, selectionIsValid } from "$lib/agentSelection";
   import { HARNESS_LABEL, ALL_HARNESSES } from "$lib/harnessDisplay";
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
   import { promptAuthoringPrompt } from "$lib/promptAuthoring";
@@ -216,6 +216,12 @@
       model_choices: defaults.model_choices,
       effort_choices: defaults.effort_choices,
     };
+  }
+
+  function defaultModelLabel(harness: HarnessKind): string {
+    const model = preferences.agent_defaults[harness].default_model;
+    if (model === null) return "Not set";
+    return MODEL_OPTIONS[harness].find((option) => option.value === model)?.label ?? model;
   }
 
   function editableDefaultSelection(harness: HarnessKind): AgentSelection {
@@ -427,13 +433,25 @@
           <div class="space-y-2">
             {#each ALL_HARNESSES as harness (harness)}
               <details
-                class="border-border bg-raised rounded-md border"
+                class="group/defaults border-border bg-raised rounded-md border"
                 open={harness === "claude_code"}
               >
                 <summary
-                  class="text-fg hover:bg-hover cursor-pointer list-none rounded-md px-3 py-2.5 text-sm font-medium"
+                  class="text-fg hover:bg-hover focus-visible:ring-focus flex min-h-11 cursor-pointer list-none items-center gap-3 rounded-md px-3 py-2.5 text-sm font-medium outline-none focus-visible:ring-1 focus-visible:ring-inset [&::-webkit-details-marker]:hidden"
+                  data-testid={`agent-defaults-${harness}-summary`}
                 >
-                  {HARNESS_LABEL[harness]}
+                  <span class="shrink-0">{HARNESS_LABEL[harness]}</span>
+                  <span
+                    class="text-muted min-w-0 flex-1 text-right text-xs font-normal [overflow-wrap:anywhere]"
+                  >
+                    <span class="sr-only">Default model:&nbsp;</span>{defaultModelLabel(harness)}
+                  </span>
+                  <ChevronRight
+                    size={16}
+                    strokeWidth={1.8}
+                    aria-hidden="true"
+                    class="text-muted shrink-0 transition-transform group-open/defaults:rotate-90"
+                  />
                 </summary>
                 <div class="border-border border-t p-3">
                   <AgentSelectionEditor

@@ -54,6 +54,21 @@ for (const width of [760, 1100]) {
       }
     }
 
+    await navigation.getByRole("button", { name: "Agents", exact: true }).click();
+    const defaultSummary = page.getByTestId("agent-defaults-codex-summary");
+    const defaultDetails = defaultSummary.element().closest("details")!;
+    const chevron = defaultSummary.element().querySelector("svg")!;
+    await expect.element(defaultSummary).toHaveTextContent("GPT-6.1 Sol");
+    expect(defaultDetails.open).toBe(false);
+    const closedRotation = getComputedStyle(chevron).rotate;
+    (defaultSummary.element() as HTMLElement).focus();
+    await userEvent.keyboard("{Enter}");
+    await expect.poll(() => defaultDetails.open).toBe(true);
+    await expect.poll(() => getComputedStyle(chevron).rotate).not.toBe(closedRotation);
+    await userEvent.keyboard(" ");
+    await expect.poll(() => defaultDetails.open).toBe(false);
+    await expect.poll(() => getComputedStyle(chevron).rotate).toBe(closedRotation);
+
     await navigation.getByRole("button", { name: "Prompts", exact: true }).click();
     const addServer = page.getByRole("button", { name: "Add prompt server", exact: true });
     const addForm = page.getByTestId("mcp-add-form");

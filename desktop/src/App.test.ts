@@ -2702,32 +2702,46 @@ describe("App", () => {
     await fireEvent.click(screen.getByText("alpha"));
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
     expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
+    await fireEvent.input(screen.getByRole("textbox", { name: "Search projects" }), {
+      target: { value: "alpha" },
+    });
 
     await fireEvent.click(
       within(screen.getByTestId("projects-sidebar")).getByTestId("settings-button"),
     );
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+    expect(screen.getByTestId("projects-sidebar")).not.toBeVisible();
     expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
+    expect(screen.getByTestId("settings-sidebar")).toBeVisible();
     expect(screen.getByText("Theme")).toBeInTheDocument();
-    expect(screen.getByText("Shortcuts")).toBeInTheDocument();
-
-    await fireEvent.click(
-      within(screen.getByTestId("projects-sidebar")).getByTestId("settings-button"),
+    expect(screen.getByText("Shortcuts")).not.toBeVisible();
+    const settingsNav = within(screen.getByRole("navigation", { name: "Settings categories" }));
+    await fireEvent.click(settingsNav.getByRole("button", { name: "Notifications" }));
+    expect(screen.getByTestId("notify-toggle")).toBeVisible();
+    expect(screen.getByText("Theme")).not.toBeVisible();
+    expect(settingsNav.getByRole("button", { name: "Notifications" })).toHaveAttribute(
+      "aria-current",
+      "page",
     );
+
+    await fireEvent.click(screen.getByTestId("settings-back"));
     await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
     expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Search projects" })).toHaveValue("alpha");
 
     await fireEvent.click(
       within(screen.getByTestId("projects-sidebar")).getByTestId("settings-button"),
     );
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Notifications");
     await fireEvent.click(screen.getByTestId("settings-close"));
     await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
     expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
     expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Search projects" })).toHaveValue("alpha");
   });
 
-  it("settings button label reflects open/closed state for assistive technology", async () => {
+  it("settings navigation exposes the current page and a named return action", async () => {
     seedProject({
       projectId: "p-a",
       directory: DIR_A,
@@ -2744,11 +2758,12 @@ describe("App", () => {
 
     await fireEvent.click(settingsBtn);
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
-    expect(settingsBtn).toHaveAttribute("aria-label", "Close settings");
+    expect(screen.getByRole("button", { name: "General" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("button", { name: "Back to projects" })).toBeVisible();
 
-    await fireEvent.click(settingsBtn);
+    await fireEvent.click(screen.getByTestId("settings-back"));
     await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
-    expect(settingsBtn).toHaveAttribute("aria-label", "Open settings");
+    expect(screen.getByTestId("settings-button")).toHaveAttribute("aria-label", "Open settings");
   });
 
   it("settings is reachable from the title bar when the projects sidebar is collapsed", async () => {
@@ -2773,10 +2788,13 @@ describe("App", () => {
     // Opening and closing works from the title bar.
     await fireEvent.click(titleBarBtn);
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
-    expect(titleBarBtn).toHaveAttribute("aria-label", "Close settings");
+    expect(screen.getByTestId("settings-sidebar")).toBeVisible();
+    expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument();
 
-    await fireEvent.click(titleBarBtn);
+    await fireEvent.click(screen.getByTestId("settings-back"));
     await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
+    expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument();
+    expect(screen.getByTestId("settings-button")).toHaveAttribute("aria-label", "Open settings");
   });
 
   it("global shortcuts toggle sidebars and open settings", async () => {
@@ -2805,7 +2823,9 @@ describe("App", () => {
 
     await fireEvent.keyDown(window, { key: ",", metaKey: true });
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+    expect(screen.getByTestId("projects-sidebar")).not.toBeVisible();
     expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
+    expect(screen.getByTestId("settings-sidebar")).toBeVisible();
 
     await fireEvent.keyDown(window, { key: ",", metaKey: true });
     await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
@@ -4189,6 +4209,8 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
     expect(screen.getByTestId("prompt-settings-section")).toHaveTextContent("Prompt servers (MCP)");
+    expect(screen.getByTestId("prompt-settings-section")).toBeVisible();
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Prompts & workflows");
   });
 
   it("global shortcuts are suppressed inside non-composer editable elements", async () => {

@@ -9,6 +9,8 @@
   import CreateProjectForm from "$lib/components/CreateProjectForm.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import ProjectsSidebar from "$lib/components/ProjectsSidebar.svelte";
+  import SettingsSidebar from "$lib/components/SettingsSidebar.svelte";
+  import type { SettingsSection } from "$lib/settingsSections";
   import SettingsView from "$lib/components/SettingsView.svelte";
   import Sidebar from "$lib/components/Sidebar.svelte";
   import PinsSidebar from "$lib/components/PinsSidebar.svelte";
@@ -148,7 +150,7 @@
 
   let dirError = $state<string | null>(null);
   let settingsOpen = $state<boolean>(false);
-  let settingsInitialSection = $state<"prompts" | null>(null);
+  let settingsSection = $state<SettingsSection>("general");
   let editorShortcutError = $state<string | null>(null);
   let editorShortcutSeq = 0;
   let commandError = $state<string | null>(null);
@@ -387,18 +389,16 @@
   }
 
   function openSettings(): void {
-    settingsInitialSection = null;
     settingsOpen = true;
   }
 
   function openPromptSettings(): void {
-    settingsInitialSection = "prompts";
+    settingsSection = "prompts";
     settingsOpen = true;
   }
 
   function closeSettings(): void {
     settingsOpen = false;
-    settingsInitialSection = null;
   }
 
   function toggleSettings(): void {
@@ -1319,15 +1319,30 @@
 <main class="bg-surface text-fg flex h-full flex-col">
   <AppShell centerTestid="workspace-main">
     {#snippet left()}
-      {#if projectsSidebarVisible}
-        <ProjectsSidebar
-          onAddProject={openProjectDialog}
-          onOpenSettings={toggleSettings}
-          onProjectSelect={() => (settingsOpen = false)}
-          onToggleSidebar={() => (layout.projectsSidebarOpen = false)}
-          onLocateFolder={(project) => void locateProjectFolder(project)}
-          {settingsOpen}
+      {#if settingsOpen}
+        <SettingsSidebar
+          section={settingsSection}
+          onSelect={(section) => (settingsSection = section)}
+          onClose={closeSettings}
+          returnLabel={view.mode === "git"
+            ? "Back to Git"
+            : activeProject
+              ? "Back to project"
+              : "Back to projects"}
         />
+      {/if}
+      {#if projectsSidebarVisible}
+        <!-- Keep the project filter and scroll position when returning from settings. -->
+        <div hidden={settingsOpen} class:flex={!settingsOpen} class="min-h-0 shrink-0">
+          <ProjectsSidebar
+            onAddProject={openProjectDialog}
+            onOpenSettings={toggleSettings}
+            onProjectSelect={() => (settingsOpen = false)}
+            onToggleSidebar={() => (layout.projectsSidebarOpen = false)}
+            onLocateFolder={(project) => void locateProjectFolder(project)}
+            {settingsOpen}
+          />
+        </div>
       {/if}
     {/snippet}
 
@@ -1341,7 +1356,8 @@
         sync if that position changes.
       -->
       <div
-        class="border-border/80 bg-raised flex h-11 shrink-0 items-center gap-2 border-b pr-3 {projectsSidebarVisible
+        class="border-border/80 bg-raised flex h-11 shrink-0 items-center gap-2 border-b pr-3 {settingsOpen ||
+        projectsSidebarVisible
           ? 'pl-4'
           : 'pl-20'}"
         data-tauri-drag-region
@@ -1355,7 +1371,7 @@
         <!-- Title-bar Settings + re-open toggle appear only when the sidebar
              has content but is collapsed. In the no-project state there's no
              sidebar at all, so neither shows — the welcome screen stays clean. -->
-        {#if projectsSidebarHasContent && !layout.projectsSidebarOpen}
+        {#if !settingsOpen && projectsSidebarHasContent && !layout.projectsSidebarOpen}
           <SettingsButton
             pressed={settingsOpen}
             testid="settings-button"
@@ -1729,7 +1745,7 @@
 
       <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
         {#if settingsOpen}
-          <SettingsView onClose={closeSettings} initialSection={settingsInitialSection} />
+          <SettingsView onClose={closeSettings} initialSection={settingsSection} />
         {:else if view.mode === "git"}
           {#if gitViewResumePending}
             <div class="flex min-h-0 flex-1 flex-col overflow-hidden">

@@ -5,6 +5,8 @@
 //! happens, never how long it took.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -666,6 +668,8 @@ async fn a_refused_client_that_never_answers_the_close_keeps_its_slot_only_brief
 async fn a_silent_client_is_closed_and_a_pinging_one_is_not() {
     // Pings every 100 ms against a 2 s timeout, for longer than the timeout:
     // a twenty-fold margin, so a loaded machine cannot close the pinging one.
+    // The relay's own pings, 25 s apart, come too late to draw a pong from
+    // the silent one.
     let relay = start(Config {
         idle_timeout: Duration::from_secs(2),
         ..Config::default()
@@ -838,6 +842,121 @@ async fn a_phone_that_stops_reading_is_closed_and_its_mac_told() {
     drop(phone);
 }
 
+fn large_frame(to: &DeviceId) -> Message {
+    let text = serde_json::to_string(&frame_message(to, &vec![0; 60_000])).unwrap();
+    Message::Text(text.into())
+}
+
+#[tokio::test]
+async fn a_mac_waiting_on_a_phone_that_stopped_reading_still_hears_the_relays_pings() {
+    let relay = start(Config {
+        queue_bytes: 96 * 1024,
+        stall_timeout: Duration::from_mins(1),
+        rate_limit_bytes: 1 << 30,
+        ping_interval: Duration::from_millis(100),
+        ..Config::default()
+    })
+    .await;
+    let (mac, phone) = paired(&relay).await;
+    let (mut to_relay, mut from_relay) = mac.socket.split();
+    // More than every buffer between the Mac and the phone holds: the
+    // relay stops reading the Mac while it waits for room at the phone.
+    let frame = large_frame(&phone.id);
+    let sending = tokio::spawn(async move {
+        for _ in 0..2_000 {
+            to_relay.send(frame.clone()).await.unwrap();
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut pings = 0;
+    while pings < 5 {
+        match tokio::time::timeout(WAIT, from_relay.next()).await {
+            Ok(Some(Ok(Message::Ping(_)))) => pings += 1,
+            Ok(Some(Ok(_))) => {}
+            other => panic!("the relay stopped pinging the Mac: {other:?}"),
+        }
+    }
+    assert!(
+        !sending.is_finished(),
+        "the relay never stopped reading the Mac"
+    );
+    sending.abort();
+    drop(phone);
+}
+
+#[tokio::test]
+async fn a_phone_that_stops_reading_is_closed_and_its_macs_other_phone_gets_every_frame() {
+    let relay = start(Config {
+        queue_bytes: 96 * 1024,
+        stall_timeout: Duration::from_millis(300),
+        rate_limit_bytes: 1 << 30,
+        ..Config::default()
+    })
+    .await;
+    let mac_keys = new_keys();
+    let mac_id = id_of(&mac_keys);
+    let stalled = Client::phone(&relay, new_keys(), &mac_id).await;
+    let mut reading = Client::phone(&relay, new_keys(), &mac_id).await;
+    let mac = Client::mac(&relay, mac_keys, &[&stalled.id, &reading.id]).await;
+    let (stalled_id, reading_id) = (stalled.id.clone(), reading.id.clone());
+    let (mut to_relay, mut from_relay) = mac.socket.split();
+
+    let told = Arc::new(AtomicBool::new(false));
+    let listening = tokio::spawn({
+        let told = Arc::clone(&told);
+        let notice = notice(&stalled_id);
+        async move {
+            while let Some(Ok(message)) = from_relay.next().await {
+                if let Message::Text(text) = message
+                    && serde_json::from_str::<ServerMessage>(&text).unwrap() == notice
+                {
+                    told.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    });
+    // Each large frame for the stalled phone is followed by a numbered one
+    // for the reading phone, until a few rounds after the relay reports the
+    // stalled phone gone. Returns how many numbered frames went out.
+    let mut sending = tokio::spawn({
+        let reading_id = reading_id.clone();
+        async move {
+            let large = large_frame(&stalled_id);
+            let mut after_told = 0;
+            for n in 0..5_000u32 {
+                to_relay.send(large.clone()).await.unwrap();
+                let small = serde_json::to_string(&frame_message(&reading_id, &n.to_be_bytes()));
+                to_relay
+                    .send(Message::Text(small.unwrap().into()))
+                    .await
+                    .unwrap();
+                if told.load(Ordering::SeqCst) {
+                    after_told += 1;
+                    if after_told == 10 {
+                        return n + 1;
+                    }
+                }
+            }
+            panic!("the stalled phone was never closed");
+        }
+    });
+
+    let mut sent = None;
+    let mut received = 0u32;
+    while sent != Some(received) {
+        assert_eq!(
+            reading.next().await,
+            frame_from(&mac_id, &reading_id, &received.to_be_bytes())
+        );
+        received += 1;
+        if sent.is_none() && sending.is_finished() {
+            sent = Some((&mut sending).await.unwrap());
+        }
+    }
+    listening.abort();
+    drop(stalled);
+}
+
 #[tokio::test]
 async fn a_client_that_never_reads_its_errors_is_closed() {
     let relay = start(Config {
@@ -971,8 +1090,8 @@ async fn a_relay_full_of_websockets_still_answers_http_until_its_headroom_is_tak
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
     // Each socket that sends no request holds a place until its request
-    // head is overdue. Once they fill the headroom, the relay answers the
-    // next socket 503 itself and closes it.
+    // head is overdue. Once they fill the headroom, the relay closes the
+    // next socket as soon as it accepts it, unanswered.
     let mut held = Vec::new();
     let refused = loop {
         let mut socket = TcpStream::connect(relay.addr()).await.unwrap();
@@ -982,7 +1101,7 @@ async fn a_relay_full_of_websockets_still_answers_http_until_its_headroom_is_tak
             socket.read_to_end(&mut response),
         );
         if read.await.is_ok() {
-            break String::from_utf8_lossy(&response).into_owned();
+            break response;
         }
         held.push(socket);
         assert!(
@@ -990,7 +1109,7 @@ async fn a_relay_full_of_websockets_still_answers_http_until_its_headroom_is_tak
             "sockets past the limit were never refused"
         );
     };
-    assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
+    assert!(refused.is_empty(), "{}", String::from_utf8_lossy(&refused));
     assert!(!held.is_empty());
 
     drop(held);

@@ -60,7 +60,7 @@ jobs:
 
       - name: docker stop closes a live connection cleanly
         run: |
-          python -m pip install --quiet websockets
+          python -m pip install --quiet websockets==17.2
           cat > probe.py <<'EOF'
           import json, sys, time
           from websockets.sync.client import connect

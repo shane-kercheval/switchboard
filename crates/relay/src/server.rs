@@ -8,21 +8,23 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Extension, Router};
 use chrono::Utc;
 use futures::StreamExt;
 use futures::stream::SplitStream;
+use hyper::Request;
+use hyper::service::{Service as _, service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde_json::json;
 use switchboard_remote_crypto::frame::MAX_FRAME_LEN;
 use switchboard_remote_crypto::identity::{Signature, VerifyingKey, verify_relay_challenge};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
@@ -30,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
-use crate::outbox::{Outbox, frame_cost};
+use crate::outbox::{Outbox, Progress, frame_cost};
 use crate::protocol::{
     ClientMessage, DeviceId, ErrorCode, NONCE_LEN, PAIRING_TOKEN_LEN, RELAY_PROTOCOL, Register,
     Role, ServerMessage,
@@ -44,13 +46,13 @@ const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const DRAIN_LIMIT: usize = 64;
 /// Sockets accepted beyond `MAX_CONNECTIONS`, for plain HTTP: health checks,
 /// and upgrades refused because the relay is full. Past this the relay
-/// answers 503 itself and closes the socket unread.
+/// closes a new socket as soon as it accepts it, which a client sees as a
+/// reset; answering it would take a task per socket, which is what the limit
+/// is there to bound.
 pub(crate) const HTTP_HEADROOM: usize = 16;
 /// The longest request head read, and so the most a socket's HTTP buffers
 /// hold before it upgrades.
-pub(crate) const MAX_REQUEST_HEAD: usize = 16 * 1024;
-const FULL: &[u8] =
-    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+const MAX_REQUEST_HEAD: usize = 16 * 1024;
 
 struct Shared {
     config: Config,
@@ -88,14 +90,29 @@ fn validate(config: Config) -> io::Result<Config> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
+/// The most memory connections' queues and read buffers can hold: each
+/// WebSocket's queue budget and one message being read, and every socket's
+/// request head, read and answered, before it upgrades.
+fn memory_ceiling(config: &Config) -> usize {
+    let websockets = config
+        .max_connections
+        .saturating_mul(config.queue_bytes.saturating_add(config.max_frame_bytes));
+    let heads = config
+        .max_connections
+        .saturating_add(HTTP_HEADROOM)
+        .saturating_mul(2 * MAX_REQUEST_HEAD);
+    websockets.saturating_add(heads)
+}
+
 /// Accepts sockets itself rather than through `axum::serve`, so that every
 /// socket counts against a limit, not only upgraded ones, and a socket that
 /// has not upgraded is closed once a request head is overdue.
 async fn serve_validated(listener: TcpListener, config: Config, shutdown: CancellationToken) {
     tracing::info!(
-        memory_ceiling_bytes = config.memory_ceiling(),
+        memory_ceiling_bytes = memory_ceiling(&config),
         "queues and read buffers are bounded"
     );
+    // `validated` keeps this within the semaphore's limit.
     let sockets = Arc::new(Semaphore::new(config.max_connections + HTTP_HEADROOM));
     let shared = Arc::new(Shared {
         relay: Mutex::new(Relay::new(config.max_devices_per_mac)),
@@ -123,11 +140,12 @@ async fn serve_validated(listener: TcpListener, config: Config, shutdown: Cancel
             }
         };
         let Ok(permit) = Arc::clone(&sockets).try_acquire_owned() else {
-            shared.connections.spawn(refuse_socket(stream));
+            drop(stream);
             continue;
         };
         let socket = Admitted {
             stream,
+            progress: Progress::new(),
             _permit: permit,
         };
         shared
@@ -145,26 +163,23 @@ async fn serve_validated(listener: TcpListener, config: Config, shutdown: Cancel
     }
 }
 
-/// Answers 503 on a socket past the limit without reading its request.
-/// Bounded by time, so a refused socket holds nothing for long.
-async fn refuse_socket(mut stream: TcpStream) {
-    let _ = tokio::time::timeout(FLUSH_TIMEOUT, async {
-        stream.write_all(FULL).await?;
-        stream.shutdown().await
-    })
-    .await;
-}
-
 /// HTTP on one socket until it upgrades or closes. Each request head, the
 /// first included, must arrive within the time a client has to register, so
-/// a socket that sends nothing, or idles between requests, is closed.
+/// a socket that sends nothing, or idles between requests, is closed. Each
+/// request carries the socket's `Progress`, for its WebSocket's outbox.
 async fn serve_http(socket: Admitted, app: Router, shared: Arc<Shared>) {
     let mut http = hyper::server::conn::http1::Builder::new();
     http.timer(TokioTimer::new())
         .header_read_timeout(shared.config.register_timeout)
         .max_buf_size(MAX_REQUEST_HEAD);
+    let progress = socket.progress.clone();
+    let app = TowerToHyperService::new(app);
+    let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
+        request.extensions_mut().insert(progress.clone());
+        app.call(request)
+    });
     let mut connection = pin!(
-        http.serve_connection(TokioIo::new(socket), TowerToHyperService::new(app))
+        http.serve_connection(TokioIo::new(socket), service)
             .with_upgrades()
     );
     let served = tokio::select! {
@@ -180,10 +195,21 @@ async fn serve_http(socket: Admitted, app: Router, shared: Arc<Shared>) {
 }
 
 /// An accepted socket holding its share of the socket limit until it is
-/// dropped: after an upgrade, with the WebSocket.
+/// dropped: after an upgrade, with the WebSocket. Every write that the
+/// socket accepts bytes of stamps its progress.
 struct Admitted {
     stream: TcpStream,
+    progress: Progress,
     _permit: OwnedSemaphorePermit,
+}
+
+impl Admitted {
+    fn written(&self, written: Poll<io::Result<usize>>) -> Poll<io::Result<usize>> {
+        if let Poll::Ready(Ok(1..)) = written {
+            self.progress.stamp();
+        }
+        written
+    }
 }
 
 impl AsyncRead for Admitted {
@@ -202,7 +228,9 @@ impl AsyncWrite for Admitted {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+        let this = self.get_mut();
+        let written = Pin::new(&mut this.stream).poll_write(cx, buf);
+        this.written(written)
     }
 
     fn poll_write_vectored(
@@ -210,7 +238,9 @@ impl AsyncWrite for Admitted {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        let written = Pin::new(&mut this.stream).poll_write_vectored(cx, bufs);
+        this.written(written)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -269,7 +299,11 @@ async fn healthz() -> Response {
     axum::Json(json!({ "status": "ok" })).into_response()
 }
 
-async fn connect(State(shared): State<Arc<Shared>>, upgrade: WebSocketUpgrade) -> Response {
+async fn connect(
+    State(shared): State<Arc<Shared>>,
+    Extension(progress): Extension<Progress>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     let Ok(permit) = Arc::clone(&shared.admission).try_acquire_owned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -284,14 +318,21 @@ async fn connect(State(shared): State<Arc<Shared>>, upgrade: WebSocketUpgrade) -
     upgrade
         .max_message_size(max)
         .max_frame_size(max)
-        .on_upgrade(move |socket| tracker.track_future(run_connection(socket, shared, permit)))
+        .on_upgrade(move |socket| {
+            tracker.track_future(run_connection(socket, shared, progress, permit))
+        })
 }
 
-async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSemaphorePermit) {
+async fn run_connection(
+    socket: WebSocket,
+    shared: Arc<Shared>,
+    progress: Progress,
+    permit: OwnedSemaphorePermit,
+) {
     let (sink, stream) = socket.split();
     let closed = shared.shutdown.child_token();
-    let (outbox, writer) = Outbox::new(shared.config.queue_bytes, closed.clone());
-    let mut writer = tokio::spawn(writer.run(sink));
+    let (outbox, writer) = Outbox::new(shared.config.queue_bytes, closed.clone(), progress);
+    let mut writer = tokio::spawn(writer.run(sink, shared.config.ping_interval));
     let mut connection = Connection {
         limiter: RateLimiter::new(&shared.config, Instant::now()),
         shared: Arc::clone(&shared),
@@ -334,7 +375,6 @@ async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
 struct Registration {
     id: DeviceId,
     generation: u64,
-    is_mac: bool,
 }
 
 struct Connection {
@@ -433,26 +473,23 @@ impl Connection {
             self.refuse(ErrorCode::RegistrationRefused, "this device is denied");
             return false;
         }
-        match &claim.role {
-            Role::Mac { paired_devices } => tracing::info!(
-                device_id = %id,
-                paired_devices = ?paired_devices.iter().map(DeviceId::as_str).collect::<Vec<_>>(),
-                "registered a Mac"
-            ),
-            Role::Phone { mac } => tracing::info!(device_id = %id, %mac, "registered a phone"),
-        }
-        let is_mac = matches!(claim.role, Role::Mac { .. });
+        let role = claim.role.clone();
         let registered =
             self.shared
                 .relay()
                 .register(id.clone(), claim.role, self.outbox.clone(), Utc::now());
         match registered {
             Ok(generation) => {
-                self.registration = Some(Registration {
-                    id,
-                    generation,
-                    is_mac,
-                });
+                match role {
+                    Role::Mac { paired_devices } => {
+                        tracing::info!(device_id = %id, "registered a Mac");
+                        log_paired_devices(&id, &paired_devices);
+                    }
+                    Role::Phone { mac } => {
+                        tracing::info!(device_id = %id, %mac, "registered a phone");
+                    }
+                }
+                self.registration = Some(Registration { id, generation });
                 true
             }
             Err(refusal) => {
@@ -468,11 +505,7 @@ impl Connection {
         let Some(registration) = &self.registration else {
             return false;
         };
-        let (id, generation, is_mac) = (
-            registration.id.clone(),
-            registration.generation,
-            registration.is_mac,
-        );
+        let (id, generation) = (registration.id.clone(), registration.generation);
         let refusal = match message {
             ClientMessage::Frame {
                 to,
@@ -487,51 +520,41 @@ impl Connection {
                     .await;
                 Ok(())
             }
-            ClientMessage::PairedDevices { .. }
-            | ClientMessage::PairingOpen { .. }
-            | ClientMessage::PairingClose
-                if !is_mac =>
-            {
-                self.refuse(ErrorCode::BadMessage, "only a Mac may send this");
-                return false;
-            }
             ClientMessage::PairedDevices { device_ids } => {
-                tracing::info!(
-                    device_id = %id,
-                    paired_devices = ?device_ids.iter().map(DeviceId::as_str).collect::<Vec<_>>(),
-                    "paired devices"
-                );
-                self.shared
-                    .relay()
-                    .set_paired_devices(&id, generation, device_ids)
+                let changed =
+                    self.shared
+                        .relay()
+                        .set_paired_devices(&id, generation, device_ids.clone());
+                if changed == Ok(true) {
+                    log_paired_devices(&id, &device_ids);
+                }
+                changed.map(|_| ())
             }
             ClientMessage::PairingOpen {
                 token_hash,
                 expires_in,
-            } => {
-                self.shared.relay().open_pairing(
-                    &id,
-                    generation,
-                    token_hash,
-                    expires_in,
-                    Instant::now(),
-                );
-                Ok(())
-            }
-            ClientMessage::PairingClose => {
-                self.shared.relay().close_pairing(&id, generation);
-                Ok(())
-            }
+            } => self.shared.relay().open_pairing(
+                &id,
+                generation,
+                token_hash,
+                expires_in,
+                Instant::now(),
+            ),
+            ClientMessage::PairingClose => self.shared.relay().close_pairing(&id, generation),
             ClientMessage::Register(_) => {
                 self.refuse(ErrorCode::BadMessage, "already registered");
                 return false;
             }
             ClientMessage::Unknown => Ok(()),
         };
-        if let Err(refusal) = refusal {
-            self.send(refusal.into_message());
+        match refusal {
+            Ok(()) => true,
+            Err(refusal) => {
+                let ends = refusal.ends_connection();
+                self.send(refusal.into_message());
+                !ends
+            }
         }
-        true
     }
 
     /// Routes a frame and queues it for its recipient, waiting while the
@@ -612,9 +635,18 @@ impl Connection {
             };
             let wait = self.limiter.charge(Instant::now(), len);
             if !wait.is_zero() {
+                let resume = tokio::time::Instant::now() + wait;
+                let (until, past_deadline) = match deadline {
+                    Deadline::At(at) if at < resume => (at, true),
+                    _ => (resume, false),
+                };
                 tokio::select! {
                     () = self.closed.cancelled() => return Incoming::End,
-                    () = tokio::time::sleep(wait) => {}
+                    () = tokio::time::sleep_until(until) => {}
+                }
+                if past_deadline {
+                    tracing::debug!("closing a connection past its deadline");
+                    return Incoming::End;
                 }
             }
             let Some(text) = text else { continue };
@@ -639,6 +671,16 @@ impl Connection {
             last_seen: None,
         });
     }
+}
+
+/// The set at debug only: a client may send its set as often as its rate
+/// allows.
+fn log_paired_devices(id: &DeviceId, paired_devices: &[DeviceId]) {
+    tracing::debug!(
+        device_id = %id,
+        paired_devices = ?paired_devices.iter().map(DeviceId::as_str).collect::<Vec<_>>(),
+        "paired devices"
+    );
 }
 
 /// Two token buckets, messages and bytes, each refilling at its rate. A
@@ -729,6 +771,13 @@ mod tests {
         assert_eq!(limiter.charge(repaid, 1), Duration::from_millis(250));
         let later = start + Duration::from_mins(1);
         assert!((0..4).all(|_| limiter.charge(later, 1).is_zero()));
+    }
+
+    #[test]
+    fn the_default_memory_ceiling_is_about_267_mib() {
+        // 64 queues of 4 MiB with a 128 KiB message each, and 80 request
+        // heads of 32 KiB.
+        assert_eq!(memory_ceiling(&Config::default()), 279_445_504);
     }
 
     #[test]

@@ -2,10 +2,17 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use switchboard_remote_crypto::frame::MAX_FRAME_LEN;
+use tokio::sync::Semaphore;
 
 use crate::outbox::frame_cost;
 use crate::protocol::{DeviceId, InvalidDeviceId, longest_client_message};
-use crate::server::{HTTP_HEADROOM, MAX_REQUEST_HEAD};
+use crate::server::HTTP_HEADROOM;
+
+/// The most phones a Mac's set may hold, whatever `MAX_DEVICES_PER_MAC` says.
+const MAX_DEVICES_PER_MAC_CAP: usize = 1024;
+/// The longest message any setting may admit: well above the longest a
+/// client sends, and a bound on what one read may buffer.
+const MAX_FRAME_BYTES_CAP: usize = 16 * 1024 * 1024;
 
 /// The relay's limits and settings. `from_env` reads the deployment's
 /// environment; the timeouts and the queue budget are fixed there and
@@ -18,28 +25,35 @@ pub struct Config {
     /// connection over it is not refused: the relay stops reading from it
     /// until it is back under, which slows the sender through TCP.
     pub rate_limit: u32,
-    /// Bytes per second a connection may send, enforced the same way. A
-    /// burst may always reach one message of `max_frame_bytes`.
+    /// Bytes per second a connection may send, enforced the same way. At
+    /// least `max_frame_bytes`, so one message never waits longer than a
+    /// second, and a burst may always reach one message of that size.
     pub rate_limit_bytes: u32,
     /// The longest WebSocket message accepted. The default is above a frame
     /// carrying the longest record: 65,568 bytes, about 87,500 as base64.
     pub max_frame_bytes: usize,
+    /// At most 1024.
     pub max_devices_per_mac: usize,
     /// WebSocket connections, registered or not. A full relay answers an
     /// upgrade with HTTP 503. A few sockets more are accepted for plain HTTP,
     /// each closed once it idles for `register_timeout`.
     pub max_connections: usize,
     pub deny_device_ids: HashSet<DeviceId>,
-    /// A connection that sends nothing, pings included, for this long is
-    /// closed. Clients ping every 25 seconds.
+    /// A connection that sends nothing, pings and pongs included, for this
+    /// long is closed. The Mac pings every 25 seconds, and both clients
+    /// answer the relay's pings.
     pub idle_timeout: Duration,
+    /// How often the relay pings each connection. Below half the 50 seconds
+    /// of silence after which the Mac reconnects, so one late ping does not
+    /// make it give up on a working relay.
+    pub ping_interval: Duration,
     /// How long a new connection has to answer the challenge.
     pub register_timeout: Duration,
     /// Bytes of frames queued for one connection at most. A sender whose
     /// recipient is full waits for room rather than losing the frame.
     pub queue_bytes: usize,
-    /// A recipient that completes no send for this long while a sender
-    /// waits for room is closed as not reading. Below the phone's 10-second
+    /// A recipient whose socket accepts no bytes for this long while a
+    /// sender waits for room is closed as not reading. Below the phone's 10-second
     /// wait for its handshake reply, so another phone's stall cannot make a
     /// connecting phone give up.
     pub stall_timeout: Duration,
@@ -55,6 +69,7 @@ impl Default for Config {
             max_connections: 64,
             deny_device_ids: HashSet::new(),
             idle_timeout: Duration::from_secs(90),
+            ping_interval: Duration::from_secs(25),
             register_timeout: Duration::from_secs(10),
             rate_limit_bytes: 16 * 1024 * 1024,
             queue_bytes: 4 * 1024 * 1024,
@@ -105,16 +120,43 @@ impl Config {
         .validated()
     }
 
-    /// Refuses settings the relay cannot work under. A message limit below
-    /// the longest message a client sends would close any connection that
-    /// sends it. A queue budget smaller than one frame of the longest record
-    /// could never admit that frame, and its recipient would be closed for a
-    /// stall it did not cause.
+    /// Refuses settings the relay cannot work under. The caps come first,
+    /// so nothing after them sizes anything by an unbounded setting. A
+    /// message limit below the longest message a client sends would close
+    /// any connection that sends it, and a byte rate below it would hold
+    /// such a message for longer than a second. A queue budget smaller than
+    /// one frame of the longest record could never admit that frame, and
+    /// its recipient would be closed for a stall it did not cause.
     pub fn validated(self) -> Result<Self, ConfigError> {
+        if self.max_devices_per_mac > MAX_DEVICES_PER_MAC_CAP {
+            return Err(ConfigError::Inconsistent(
+                "MAX_DEVICES_PER_MAC may be at most 1024",
+            ));
+        }
+        if self.max_frame_bytes > MAX_FRAME_BYTES_CAP {
+            return Err(ConfigError::Inconsistent(
+                "MAX_FRAME_BYTES may be at most 16 MiB",
+            ));
+        }
+        if self
+            .max_connections
+            .checked_add(HTTP_HEADROOM)
+            .is_none_or(|sockets| sockets > Semaphore::MAX_PERMITS)
+        {
+            return Err(ConfigError::Inconsistent("MAX_CONNECTIONS is too large"));
+        }
+        if self.ping_interval.is_zero() {
+            return Err(ConfigError::Inconsistent("ping_interval must be positive"));
+        }
         if self.max_frame_bytes < longest_client_message(self.max_devices_per_mac) {
             return Err(ConfigError::Inconsistent(
                 "MAX_FRAME_BYTES is below the longest message a client sends: a frame of \
                  the longest record, or a registration naming MAX_DEVICES_PER_MAC phones",
+            ));
+        }
+        if usize::try_from(self.rate_limit_bytes).is_ok_and(|rate| rate < self.max_frame_bytes) {
+            return Err(ConfigError::Inconsistent(
+                "RATE_LIMIT_BYTES is below MAX_FRAME_BYTES",
             ));
         }
         if self.queue_bytes < frame_cost(MAX_FRAME_LEN) {
@@ -123,20 +165,6 @@ impl Config {
             ));
         }
         Ok(self)
-    }
-
-    /// The most memory connections' queues and read buffers can hold: each
-    /// WebSocket's queue budget and one message being read, and every
-    /// socket's request head, read and answered, before it upgrades.
-    pub fn memory_ceiling(&self) -> usize {
-        let websockets = self
-            .max_connections
-            .saturating_mul(self.queue_bytes.saturating_add(self.max_frame_bytes));
-        let heads = self
-            .max_connections
-            .saturating_add(HTTP_HEADROOM)
-            .saturating_mul(2 * MAX_REQUEST_HEAD);
-        websockets.saturating_add(heads)
     }
 }
 
@@ -219,15 +247,56 @@ mod tests {
 
     #[test]
     fn a_message_limit_below_the_longest_client_message_is_refused() {
+        assert!(matches!(
+            config(&[("MAX_FRAME_BYTES", "65536")]),
+            Err(ConfigError::Inconsistent(_))
+        ));
+    }
+
+    #[test]
+    fn settings_past_their_caps_are_refused() {
+        let huge = usize::MAX.to_string();
         for vars in [
-            &[("MAX_FRAME_BYTES", "65536")][..],
-            &[("MAX_DEVICES_PER_MAC", "10000")],
+            &[("MAX_DEVICES_PER_MAC", "1025")][..],
+            &[("MAX_DEVICES_PER_MAC", huge.as_str())],
+            &[("MAX_FRAME_BYTES", "16777217")],
+            &[("MAX_FRAME_BYTES", huge.as_str())],
+            &[("MAX_CONNECTIONS", huge.as_str())],
         ] {
             assert!(
                 matches!(config(vars), Err(ConfigError::Inconsistent(_))),
                 "{vars:?}"
             );
         }
+        assert!(config(&[("MAX_DEVICES_PER_MAC", "1024")]).is_ok());
+        assert!(
+            config(&[
+                ("MAX_FRAME_BYTES", "16777216"),
+                ("RATE_LIMIT_BYTES", "16777216")
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_byte_rate_below_the_message_limit_is_refused() {
+        assert!(matches!(
+            config(&[("RATE_LIMIT_BYTES", "131071")]),
+            Err(ConfigError::Inconsistent(_))
+        ));
+        assert!(config(&[("RATE_LIMIT_BYTES", "131072")]).is_ok());
+    }
+
+    #[test]
+    fn the_default_timings_keep_their_order() {
+        // The Mac reconnects after this long with nothing from the relay,
+        // and a phone gives up on a handshake reply after this long.
+        const CLIENT_SILENCE: Duration = Duration::from_secs(50);
+        const HANDSHAKE_WAIT: Duration = Duration::from_secs(10);
+        let config = Config::default();
+        assert!(config.ping_interval * 2 <= CLIENT_SILENCE);
+        assert!(config.stall_timeout < HANDSHAKE_WAIT);
+        assert!(config.ping_interval < config.idle_timeout);
     }
 
     #[test]

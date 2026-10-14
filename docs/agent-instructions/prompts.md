@@ -1,6 +1,6 @@
 # Authoring a local prompt for Switchboard
 
-> **Audience:** an AI coding agent (Claude Code or Codex) being asked to generate a starter local prompt for a Switchboard working directory. If you are a human author, this doc works for you too — you are just not the primary audience.
+> **Audience:** an AI coding agent helping a user create a reusable local prompt for Switchboard. Human authors can follow these instructions too.
 
 ## What a local prompt is
 
@@ -16,7 +16,7 @@ Default to writing the prompt into the default store (or, if the user keeps a pe
 
 ## File format
 
-A local prompt is **one markdown file** with YAML frontmatter at the top. The frontmatter declares metadata; the body is the prompt template.
+A local prompt is **one `.md` file** directly inside a local prompt store. Subfolders are not scanned. Start the file with YAML frontmatter between `---` lines. The frontmatter declares metadata; the body is the prompt template.
 
 ```markdown
 ---
@@ -62,7 +62,7 @@ arguments:
 
 - `name`: lowercase with underscores (matches the MiniJinja variable convention). Becomes the template variable.
 - `description`: shown to the user in the invocation form. Be specific.
-- `required`: defaults to `true` if omitted. If `false`, the user can leave it blank — the variable will be the empty string. Use `{% if arg %}…{% endif %}` to handle the blank case.
+- `required`: defaults to `false` if omitted. Set it explicitly for every argument. Missing optional arguments render as empty text and are false in `{% if arg %}…{% endif %}` conditions.
 
 There are no typed arguments in v1 — every argument is a string. (Numeric or list argument types are deferred to v2+.)
 
@@ -163,9 +163,9 @@ You can pass a list as a string and parse it, but more commonly the iteration ha
 
 ## After authoring
 
-1. Save the file in a local prompt store (the default user-global `prompts/` directory, or a directory the user lists in `local_prompt_dirs`). A `.md` filename matching the `name` field is the convention, though the `name` comes from the frontmatter, not the filename. Prompts are user-global — available in every project.
-2. The user invokes it by typing `/<name>` in the compose bar.
-3. The prompt appears in slash-command autocomplete once Switchboard refreshes its prompt list (the Sync action in Settings, or a restart).
+1. Save the file directly in a local prompt store (the default user-global `prompts/` directory, or a directory the user lists in `local_prompt_dirs`). A `.md` filename matching the `name` field is the convention, though the `name` comes from the frontmatter, not the filename. Prompts are available in every project.
+2. Open the prompt picker in the compose bar and choose **Sync prompts** to refresh the list.
+3. Select the new prompt, fill in its arguments, and review the rendered text before sending it to the selected agents. Typing `/` in an empty compose box also opens the picker.
 
 ## When to point at the formal spec
 

@@ -42,6 +42,7 @@
   import { selectionIsValid } from "$lib/agentSelection";
   import { HARNESS_LABEL, ALL_HARNESSES } from "$lib/harnessDisplay";
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
+  import { promptAuthoringPrompt } from "$lib/promptAuthoring";
 
   let {
     onClose,
@@ -59,6 +60,7 @@
   const activeSection = $derived(initialSection ?? "general");
   let agentDefaultDrafts = $state<Partial<Record<HarnessKind, AgentSelection>>>({});
   const workflowPrompt = $derived(workflowAuthoringPrompt(workflowsDir));
+  const localPromptInstructions = $derived(promptAuthoringPrompt(promptsDir));
 
   const themeOptions: { mode: ThemeMode; label: string }[] = [
     { mode: "system", label: "System" },
@@ -760,6 +762,34 @@
             {/snippet}
           </Tooltip>
         </div>
+        <Disclosure id="local-prompt-help" label="How to create local prompts">
+          <p>
+            Create a Markdown file in the folder above, then choose “Sync prompts” in the compose
+            bar's prompt picker.
+          </p>
+          <div class="flex items-start gap-2 py-2.5">
+            <div class="min-w-0 flex-1">
+              <h3 class="text-fg text-sm font-medium">Create with an AI agent</h3>
+              <p class="text-muted mt-0.5 text-xs leading-relaxed">
+                Copy these instructions into a coding agent to create a prompt for your task.
+              </p>
+            </div>
+            <Tooltip label="Copy Prompt" side="top">
+              {#snippet trigger(props)}
+                <span {...props} class="shrink-0">
+                  <CopyButton
+                    text={localPromptInstructions}
+                    label="Copy local prompt authoring instructions"
+                    testid="local-prompt-authoring-copy"
+                  />
+                </span>
+              {/snippet}
+            </Tooltip>
+          </div>
+          <pre
+            data-testid="local-prompt-authoring-prompt"
+            class="bg-raised text-fg max-h-80 overflow-auto rounded-md px-3 py-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">{localPromptInstructions}</pre>
+        </Disclosure>
       </section>
 
       <section class={cn(sectionClass, "mt-7")} data-testid="prompt-settings-section">

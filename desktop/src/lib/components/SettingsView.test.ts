@@ -760,6 +760,43 @@ describe("SettingsView", () => {
     expect(invokeMock).toHaveBeenCalledWith("open_workflows_dir", undefined);
   });
 
+  it("previews and copies local prompt instructions with the folder once it loads", async (): Promise<void> => {
+    let resolveFolder!: (path: string) => void;
+    const folder = new Promise<string>((resolve) => {
+      resolveFolder = resolve;
+    });
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "local_prompts_dir" ? folder : defaultInvoke(cmd, args),
+    );
+    render(SettingsView, { props: { onClose: vi.fn(), initialSection: "prompts" } });
+
+    const help = screen.getByRole("button", { name: "How to create local prompts" });
+    const preview = screen.getByTestId("local-prompt-authoring-prompt");
+    const copy = screen.getByTestId("local-prompt-authoring-copy");
+    expect(preview).not.toBeVisible();
+    await fireEvent.click(help);
+    expect(preview).toBeVisible();
+    expect(copy).toBeVisible();
+    await fireEvent.click(copy);
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledOnce());
+    expect(copyTextMock.mock.calls[0]![0]).toContain("Before saving, ask me for the folder path");
+
+    const destination = "/Users/test/My prompt library";
+    resolveFolder(destination);
+    await waitFor(() => expect(preview).toHaveTextContent(destination));
+    await fireEvent.click(copy);
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledTimes(2));
+    const copied = copyTextMock.mock.calls[1]![0];
+    expect(copied).toBe(preview.textContent);
+    expect(copied).toContain(destination);
+    expect(copied).not.toContain("Before saving, ask me for the folder path");
+    expect(copied).toContain("---\nname: explain-code");
+    expect(copied).toContain("{{ target }}");
+    expect(copied).toContain("Sync prompts");
+    await fireEvent.click(help);
+    expect(preview).not.toBeVisible();
+  });
+
   it("previews and copies the workflow authoring prompt", async () => {
     render(SettingsView, { props: { onClose: vi.fn(), initialSection: "workflows" } });
 

@@ -443,7 +443,7 @@
                 open={harness === "claude_code"}
               >
                 <summary
-                  class="text-fg hover:bg-hover focus-visible:ring-focus flex min-h-11 cursor-pointer list-none items-center gap-3 rounded-md px-3 py-2.5 text-sm font-medium outline-none focus-visible:ring-1 focus-visible:ring-inset [&::-webkit-details-marker]:hidden"
+                  class="bg-panel text-fg hover:bg-control-hover focus-visible:ring-focus flex min-h-11 cursor-pointer list-none items-center gap-3 rounded-md px-3 py-2.5 text-sm font-medium outline-none group-open/defaults:rounded-b-none focus-visible:ring-1 focus-visible:ring-inset [&::-webkit-details-marker]:hidden"
                   data-testid={`agent-defaults-${harness}-summary`}
                 >
                   <span class="shrink-0">{HARNESS_LABEL[harness]}</span>

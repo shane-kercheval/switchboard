@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
@@ -26,6 +26,8 @@
   let addFormOpen = $state(false);
   let addForm: HTMLDivElement | undefined;
   let addTrigger: HTMLButtonElement | undefined;
+  let addFocusController: AbortController | undefined;
+  onDestroy(() => addFocusController?.abort());
   let name = $state("");
   let url = $state("");
   // Widened to string for SegmentedSelect's bindable value; only "bearer" and
@@ -153,6 +155,20 @@
 
   async function handleAdd(): Promise<void> {
     if (!canSubmit) return;
+    let restoreFocus = addForm?.contains(document.activeElement) ?? false;
+    const focusController = new AbortController();
+    addFocusController = focusController;
+    const relinquishFocus = (event: Event): void => {
+      if (event.target instanceof Node && !addForm?.contains(event.target)) restoreFocus = false;
+    };
+    document.addEventListener("focusin", relinquishFocus, {
+      capture: true,
+      signal: focusController.signal,
+    });
+    document.addEventListener("pointerdown", relinquishFocus, {
+      capture: true,
+      signal: focusController.signal,
+    });
     adding = true;
     addError = null;
     try {
@@ -171,8 +187,10 @@
       return;
     } finally {
       adding = false;
+      focusController.abort();
+      addFocusController = undefined;
     }
-    await closeAddForm();
+    await closeAddForm(restoreFocus && (addTrigger?.getClientRects().length ?? 0) > 0);
   }
 
   async function handleTest(): Promise<void> {

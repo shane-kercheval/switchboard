@@ -6,8 +6,11 @@ import { _testing as prefsTesting } from "$lib/preferences.svelte";
 import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
 import { SETTINGS_SECTIONS } from "$lib/settingsSections";
 
+const addControl = vi.hoisted(() => ({ pending: null as Promise<null> | null }));
+
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (command: string): Promise<unknown> => {
+    if (command === "add_mcp_provider") return addControl.pending;
     if (command === "list_mcp_providers") return [];
     if (command === "mcp_status") {
       return { enabled: false, listening: false, port: 47821, url: null, token: null, error: null };
@@ -28,6 +31,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 vi.mock("$lib/native", () => ({ copyText: vi.fn(async (): Promise<void> => undefined) }));
 
 beforeEach((): void => {
+  addControl.pending = null;
   prefsTesting.reset({ ready: true });
   availabilityTesting.reset();
 });
@@ -127,5 +131,53 @@ for (const width of [760, 1100]) {
     const host = page.getByTestId("settings-host").element() as HTMLElement;
     expect(host.scrollWidth - host.clientWidth).toBeLessThanOrEqual(1);
     expect(host.scrollHeight - host.clientHeight).toBeLessThanOrEqual(1);
+  });
+}
+
+for (const nextAction of [
+  "stay",
+  "focus elsewhere",
+  "click elsewhere",
+  "change category",
+] as const) {
+  test(`server submission respects focus when users ${nextAction}`, async (): Promise<void> => {
+    let finishAdd!: (value: null) => void;
+    addControl.pending = new Promise<null>((resolve) => {
+      finishAdd = resolve;
+    });
+    await page.viewport(1100, 650);
+    render(SettingsHost, { width: 1100 });
+    const navigation = page.getByRole("navigation", { name: "Settings categories" });
+    await navigation.getByRole("button", { name: "Prompts", exact: true }).click();
+    await page.getByRole("button", { name: "Add prompt server", exact: true }).click();
+    await page.getByRole("textbox", { name: "Name", exact: true }).fill("my-server");
+    await page.getByRole("textbox", { name: "URL", exact: true }).fill("https://example.test/mcp");
+    const submit = page.getByTestId("mcp-add");
+    (submit.element() as HTMLButtonElement).focus();
+    await userEvent.keyboard("{Enter}");
+    await expect.element(submit).toBeDisabled();
+    await expect.poll(() => document.activeElement === document.body).toBe(true);
+
+    const elsewhere = page.getByTestId("local-prompts-open");
+    if (nextAction === "focus elsewhere") {
+      (elsewhere.element() as HTMLButtonElement).focus();
+    } else if (nextAction === "click elsewhere") {
+      await elsewhere.click();
+    } else if (nextAction === "change category") {
+      await navigation.getByRole("button", { name: "General", exact: true }).click();
+    }
+    const focusBeforeCompletion = document.activeElement;
+    finishAdd(null);
+    await expect
+      .poll(() => page.getByTestId("mcp-add-form").element().hasAttribute("hidden"))
+      .toBe(true);
+    if (nextAction === "stay") {
+      await expect.element(page.getByTestId("mcp-add-toggle")).toHaveFocus();
+    } else {
+      await expect.poll(() => document.activeElement).toBe(focusBeforeCompletion);
+      if (nextAction === "change category") {
+        await expect.element(page.getByTestId("settings-panel-general")).toBeVisible();
+      }
+    }
   });
 }

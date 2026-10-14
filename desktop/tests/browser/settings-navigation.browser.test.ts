@@ -58,7 +58,7 @@ for (const width of [760, 1100]) {
     const defaultSummary = page.getByTestId("agent-defaults-codex-summary");
     const defaultDetails = defaultSummary.element().closest("details")!;
     const chevron = defaultSummary.element().querySelector("svg")!;
-    await expect.element(defaultSummary).toHaveTextContent("GPT-6.1 Sol");
+    await expect.element(defaultSummary).toHaveTextContent("GPT-6.1 Sol · Default effort: Medium");
     expect(defaultDetails.open).toBe(false);
     const closedRotation = getComputedStyle(chevron).rotate;
     (defaultSummary.element() as HTMLElement).focus();

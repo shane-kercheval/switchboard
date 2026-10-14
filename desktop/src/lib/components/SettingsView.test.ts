@@ -159,12 +159,18 @@ describe("SettingsView", () => {
     );
   });
 
-  it("shows custom model names and unset defaults in the headers", (): void => {
+  it("shows custom model and effort names and unset defaults in the headers", (): void => {
     preferences.agent_defaults.codex.default_model = "custom-model";
+    preferences.agent_defaults.codex.default_effort = "custom-effort";
     preferences.agent_defaults.claude_code.default_model = null;
+    preferences.agent_defaults.claude_code.default_effort = null;
     render(SettingsView, { props: { onClose: vi.fn(), initialSection: "agents" } });
-    expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("custom-model");
-    expect(screen.getByTestId("agent-defaults-claude_code-summary")).toHaveTextContent("Not set");
+    expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent(
+      "Default model: custom-model · Default effort: custom-effort",
+    );
+    expect(screen.getByTestId("agent-defaults-claude_code-summary")).toHaveTextContent(
+      "Default model: Not set · Default effort: Not set",
+    );
   });
 
   it("falls back to the first remaining default when the current choice is removed", async () => {
@@ -192,6 +198,9 @@ describe("SettingsView", () => {
       }),
     );
 
+    expect(screen.getByTestId("agent-defaults-claude_code-summary")).toHaveTextContent(
+      "Default effort: High",
+    );
     await fireEvent.click(screen.getByTestId("settings-selection-claude_code-effort-choice-high"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
@@ -207,6 +216,11 @@ describe("SettingsView", () => {
         }),
       }),
     );
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-defaults-claude_code-summary")).toHaveTextContent(
+        "Default effort: Medium",
+      ),
+    );
   });
 
   it("lists every harness in Agent Defaults", () => {
@@ -219,9 +233,9 @@ describe("SettingsView", () => {
       el.textContent?.replace(/\s+/g, " ").trim(),
     );
     expect(labels).toEqual([
-      "Claude Default model: Opus",
-      "Codex Default model: GPT-6.1 Sol",
-      "Antigravity Default model: Gemini 3.8 Flash",
+      "Claude Default model: Opus · Default effort: Medium",
+      "Codex Default model: GPT-6.1 Sol · Default effort: Medium",
+      "Antigravity Default model: Gemini 3.8 Flash · Default effort: Medium",
     ]);
   });
 

@@ -39,7 +39,7 @@
     notificationAvailability,
   } from "$lib/api";
   import type { AgentSelection, HarnessKind, NotificationAvailability } from "$lib/types";
-  import { MODEL_OPTIONS, selectionIsValid } from "$lib/agentSelection";
+  import { EFFORT_OPTIONS, MODEL_OPTIONS, selectionIsValid } from "$lib/agentSelection";
   import { HARNESS_LABEL, ALL_HARNESSES } from "$lib/harnessDisplay";
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
   import { promptAuthoringPrompt } from "$lib/promptAuthoring";
@@ -222,6 +222,12 @@
     const model = preferences.agent_defaults[harness].default_model;
     if (model === null) return "Not set";
     return MODEL_OPTIONS[harness].find((option) => option.value === model)?.label ?? model;
+  }
+
+  function defaultEffortLabel(harness: HarnessKind): string {
+    const effort = preferences.agent_defaults[harness].default_effort;
+    if (effort === null) return "Not set";
+    return EFFORT_OPTIONS[harness].find((option) => option.value === effort)?.label ?? effort;
   }
 
   function editableDefaultSelection(harness: HarnessKind): AgentSelection {
@@ -444,7 +450,11 @@
                   <span
                     class="text-muted min-w-0 flex-1 text-right text-xs font-normal [overflow-wrap:anywhere]"
                   >
-                    <span class="sr-only">Default model:&nbsp;</span>{defaultModelLabel(harness)}
+                    <span class="sr-only">Default model:&nbsp;</span>{defaultModelLabel(
+                      harness,
+                    )}<span aria-hidden="true">&nbsp;·&nbsp;</span><span class="sr-only"
+                      >Default effort:&nbsp;</span
+                    >{defaultEffortLabel(harness)}
                   </span>
                   <ChevronRight
                     size={16}

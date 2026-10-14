@@ -1147,6 +1147,10 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     )
     .await;
     assert_eq!(output["status"], "completed");
+    assert_eq!(
+        output["text"], "ack: hi",
+        "the compaction did not replace the latest answer"
+    );
     let conversation = call("read_conversation", json!({ "project_id": project_id })).await;
     assert!(!conversation["items"].as_array().unwrap().is_empty());
 

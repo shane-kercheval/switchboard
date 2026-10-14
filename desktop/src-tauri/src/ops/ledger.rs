@@ -21,7 +21,8 @@
 //! Events for message ids the ledger never registered (compose sends,
 //! workflow steps) are ignored, except that every agent's latest `turn_start`
 //! is noted so a reader can tell whether the agent's newest turn is one the
-//! ledger holds.
+//! ledger holds. A compaction's `turn_start` is the exception: a compaction
+//! is not an answer, so the agent's newest answer stays readable through it.
 //!
 //! **Text.** What counts as an agent's answer is [`TextCapture`]'s rule,
 //! observed over the wire events; it is the same rule the dispatcher applies
@@ -53,16 +54,21 @@
 //! entry of kind [`SendKind::Compaction`], so `wait_send`, `cancel_send`, and
 //! the per-agent wake-ups cover it. Because a compaction always queues, one
 //! rule stops a looping client piling them up, decided under the ledger lock
-//! in [`SendLedger::claim_compaction`]: while the agent's newest unfinished
-//! entry, by the time it was admitted to the agent's queue, is a compaction
-//! not asked to cancel, a request returns that entry's receipt, whatever its
-//! key, and the key is associated with it; a request that finds a compaction
-//! still preparing (registered, not yet admitted) joins it and receives what
-//! its first caller receives. Admission time, not registration time: an entry
-//! is registered at its claim and admitted at dispatch, after preparation, so
-//! a message registered first can be admitted after a compaction registered
-//! later. The ledger holds only what orchestrators queued, so work the window
-//! queued is not seen; nothing is lost or duplicated either way.
+//! in [`SendLedger::claim_compaction`], in this order. A key already claimed
+//! joins its claim. A compaction for the agent whose dispatch has not settled
+//! is joined, whatever the key, and receives what its first caller receives:
+//! until `settle`, its dispatch can still fail and release it, and the release
+//! must reach every waiter, so no caller is handed an id the ledger then
+//! drops. A compaction whose dispatch has settled (it is queued or running in
+//! the dispatcher, not yet finished) is reused, returning its receipt, while
+//! it is the agent's newest unfinished entry by the time it was admitted to
+//! the agent's queue and was not asked to cancel. Otherwise a fresh entry is
+//! created under the same lock, so a concurrent request finds it. Admission
+//! time, not registration time: an entry is registered at its claim and
+//! admitted at dispatch, after preparation, so a message registered first can
+//! be admitted after a compaction registered later. The ledger holds only
+//! what orchestrators queued, so work the window queued is not seen; nothing
+//! is lost or duplicated either way.
 //!
 //! **Idempotency.** A caller's `idempotency_key`, scoped to the project, is
 //! claimed here under the ledger lock together with a hash of the request. A
@@ -231,8 +237,8 @@ pub enum SendKind {
 pub enum CompactionClaim {
     /// Queue a new compaction under this id.
     Fresh { send_id: SendId },
-    /// A compaction for the agent is still preparing, or this key was claimed
-    /// by the same request: wait for its result.
+    /// A compaction for the agent has not settled, or this key was claimed by
+    /// the same request: wait for its result.
     Joined {
         send_id: SendId,
         result: watch::Receiver<Option<ClaimResult>>,
@@ -448,14 +454,16 @@ impl SendLedger {
     }
 
     /// Claim a compaction for `agent_id`: the key's own claim first, then the
-    /// module doc's merge rule, then a fresh id. One lock, so two requests
-    /// arriving at once queue one compaction.
+    /// module doc's merge rule, then a fresh entry, created here under the same
+    /// lock, so two requests arriving at once queue one compaction. `cancel`
+    /// is the fresh entry's; a joined or reused request's is unused.
     pub fn claim_compaction(
         &self,
         project_id: ProjectId,
         agent_id: AgentId,
         key: Option<&str>,
         request_hash: &str,
+        cancel: CancellationToken,
     ) -> CompactionClaim {
         let mut inner = lock(&self.inner);
         if let Some(key) = key
@@ -469,30 +477,24 @@ impl SendLedger {
             }
             return CompactionClaim::Mismatch;
         }
-        // A compaction still preparing for the agent: join it.
+        // A compaction for the agent that has not settled, admitted or not:
+        // join it. Until `settle`, its dispatch can still fail and release it,
+        // so a receipt handed out now could name an id the ledger drops.
         let preparing = inner.send_order.iter().rev().find_map(|id| {
             let entry = inner.sends.get(id)?;
             (entry.kind == SendKind::Compaction
                 && entry.project_id == project_id
                 && !entry.settled
                 && !entry.cancel_requested
-                && entry.recipients.first().is_some_and(|r| {
-                    r.agent_id == agent_id && r.dispatch == SendStatus::NotDispatched
-                }))
+                && entry
+                    .recipients
+                    .first()
+                    .is_some_and(|r| r.agent_id == agent_id))
             .then_some(*id)
         });
         if let Some(send_id) = preparing {
             let result = inner.sends[&send_id].result.subscribe();
-            if let Some(key) = key {
-                inner.claims.insert(
-                    (project_id, key.to_owned()),
-                    KeyClaim {
-                        send_id,
-                        request_hash: request_hash.to_owned(),
-                        result: watch::Sender::new(None),
-                    },
-                );
-            }
+            claim_key(&mut inner, project_id, key, request_hash, send_id, None);
             return CompactionClaim::Joined { send_id, result };
         }
         // The newest entry admitted to the agent's queue and not yet finished.
@@ -512,72 +514,24 @@ impl SendLedger {
             && entry.kind == SendKind::Compaction
         {
             let receipt = receipt_of(send_id, entry);
-            if let Some(key) = key {
-                inner.claims.insert(
-                    (project_id, key.to_owned()),
-                    KeyClaim {
-                        send_id,
-                        request_hash: request_hash.to_owned(),
-                        result: watch::Sender::new(Some(Ok(receipt.clone()))),
-                    },
-                );
-            }
+            claim_key(
+                &mut inner,
+                project_id,
+                key,
+                request_hash,
+                send_id,
+                Some(Ok(receipt.clone())),
+            );
             return CompactionClaim::Reused { receipt };
         }
         let send_id = Uuid::now_v7();
-        if let Some(key) = key {
-            inner.claims.insert(
-                (project_id, key.to_owned()),
-                KeyClaim {
-                    send_id,
-                    request_hash: request_hash.to_owned(),
-                    result: watch::Sender::new(None),
-                },
-            );
-        }
-        CompactionClaim::Fresh { send_id }
-    }
-
-    /// Create the one-recipient entry for a fresh compaction, `NotDispatched`
-    /// until it is admitted. Must precede the dispatch, as `register_send`.
-    pub fn register_compaction(
-        &self,
-        send_id: SendId,
-        project_id: ProjectId,
-        agent_id: AgentId,
-        cancel: CancellationToken,
-    ) {
-        let now = Utc::now();
-        let mut inner = lock(&self.inner);
-        inner.sends.insert(
-            send_id,
-            SendEntry {
-                project_id,
-                created_at: now,
-                kind: SendKind::Compaction,
-                settled: false,
-                cancel_requested: false,
-                cancel,
-                recipients: vec![RecipientEntry {
-                    agent_id,
-                    message_id: None,
-                    turn_id: None,
-                    admitted_at: None,
-                    dispatch: SendStatus::NotDispatched,
-                    status: SendStatus::NotDispatched,
-                    text: None,
-                    error: None,
-                    code: None,
-                    failure_kind: None,
-                    capture: TextCapture::default(),
-                }],
-                result: watch::Sender::new(None),
-            },
-        );
-        inner.send_order.push_back(send_id);
-        prune(&mut inner, now);
+        claim_key(&mut inner, project_id, key, request_hash, send_id, None);
+        // The entry exists before the lock is released, so the next claim
+        // finds it.
+        insert_compaction(&mut inner, send_id, project_id, agent_id, cancel);
         drop(inner);
         self.bump();
+        CompactionClaim::Fresh { send_id }
     }
 
     /// Mint and register the `message_id` for one recipient, marking it
@@ -868,7 +822,17 @@ impl SendLedger {
     fn on_turn_start(&self, agent_id: AgentId, message_id: MessageId, turn_id: TurnId) -> bool {
         let mut inner = lock(&self.inner);
         let registered: LatestTurn = inner.by_message.get(&message_id).copied();
-        inner.latest_turn.insert(agent_id, registered);
+        // A compaction is not an answer: the agent's newest answer stays
+        // whatever it was, as it does for a compaction the window ran.
+        let compaction = registered.is_some_and(|(send_id, _)| {
+            inner
+                .sends
+                .get(&send_id)
+                .is_some_and(|e| e.kind == SendKind::Compaction)
+        });
+        if !compaction {
+            inner.latest_turn.insert(agent_id, registered);
+        }
         let Some((send_id, index)) = registered else {
             return false;
         };
@@ -1043,6 +1007,67 @@ fn release_locked(inner: &mut Inner, send_id: SendId, error: &Arc<AppError>) {
             claim.result.send_replace(Some(Err(Arc::clone(error))));
         }
     }
+}
+
+/// Record `key`, when given, as a claim pointing at `send_id`, settled already
+/// when `preset` carries the receipt it reuses.
+fn claim_key(
+    inner: &mut Inner,
+    project_id: ProjectId,
+    key: Option<&str>,
+    request_hash: &str,
+    send_id: SendId,
+    preset: Option<ClaimResult>,
+) {
+    if let Some(key) = key {
+        inner.claims.insert(
+            (project_id, key.to_owned()),
+            KeyClaim {
+                send_id,
+                request_hash: request_hash.to_owned(),
+                result: watch::Sender::new(preset),
+            },
+        );
+    }
+}
+
+/// The one-recipient entry of a fresh compaction, `NotDispatched` until it is
+/// admitted.
+fn insert_compaction(
+    inner: &mut Inner,
+    send_id: SendId,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    cancel: CancellationToken,
+) {
+    let now = Utc::now();
+    inner.sends.insert(
+        send_id,
+        SendEntry {
+            project_id,
+            created_at: now,
+            kind: SendKind::Compaction,
+            settled: false,
+            cancel_requested: false,
+            cancel,
+            recipients: vec![RecipientEntry {
+                agent_id,
+                message_id: None,
+                turn_id: None,
+                admitted_at: None,
+                dispatch: SendStatus::NotDispatched,
+                status: SendStatus::NotDispatched,
+                text: None,
+                error: None,
+                code: None,
+                failure_kind: None,
+                capture: TextCapture::default(),
+            }],
+            result: watch::Sender::new(None),
+        },
+    );
+    inner.send_order.push_back(send_id);
+    prune(inner, now);
 }
 
 /// The entry's receipt from its dispatch-time statuses.
@@ -1541,5 +1566,128 @@ mod tests {
         let recorded = inner.snapshot();
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0].1, payload);
+    }
+
+    fn compaction_claim(
+        ledger: &SendLedger,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        key: Option<&str>,
+    ) -> CompactionClaim {
+        ledger.claim_compaction(
+            project_id,
+            agent_id,
+            key,
+            "compact",
+            CancellationToken::new(),
+        )
+    }
+
+    #[test]
+    fn two_compaction_claims_in_a_row_queue_one() {
+        let ledger = SendLedger::new();
+        let (project_id, agent_id) = (Uuid::now_v7(), Uuid::now_v7());
+        let CompactionClaim::Fresh { send_id } =
+            compaction_claim(&ledger, project_id, agent_id, Some("k1"))
+        else {
+            panic!("fresh");
+        };
+        // Nothing ran between the two claims: the entry already exists.
+        let CompactionClaim::Joined {
+            send_id: joined, ..
+        } = compaction_claim(&ledger, project_id, agent_id, Some("k2"))
+        else {
+            panic!("the second claim joins the first");
+        };
+        assert_eq!(joined, send_id);
+        let CompactionClaim::Joined {
+            send_id: joined, ..
+        } = compaction_claim(&ledger, project_id, agent_id, None)
+        else {
+            panic!("a keyless claim joins too");
+        };
+        assert_eq!(joined, send_id);
+        // Another agent is unaffected.
+        assert!(matches!(
+            compaction_claim(&ledger, project_id, Uuid::now_v7(), None),
+            CompactionClaim::Fresh { .. }
+        ));
+    }
+
+    #[test]
+    fn a_compaction_marked_accepted_is_joined_until_it_settles_and_its_release_reaches_the_joiner()
+    {
+        let ledger = SendLedger::new();
+        let (project_id, agent_id) = (Uuid::now_v7(), Uuid::now_v7());
+        let CompactionClaim::Fresh { send_id } =
+            compaction_claim(&ledger, project_id, agent_id, None)
+        else {
+            panic!("fresh");
+        };
+        ledger.mark_accepted(send_id, agent_id).unwrap();
+        // Admitted but not settled: a dispatch can still fail and release it.
+        let CompactionClaim::Joined { result, .. } =
+            compaction_claim(&ledger, project_id, agent_id, Some("k"))
+        else {
+            panic!("joined, not reused");
+        };
+        ledger.release(send_id, &Arc::new(AppError::ProjectLoadTimeout(project_id)));
+        assert!(
+            matches!(result.borrow().as_ref(), Some(Err(e)) if matches!(**e, AppError::ProjectLoadTimeout(_))),
+            "the joiner receives the release's error"
+        );
+        assert!(ledger.send(send_id).is_none());
+        // Settled and still queued: reused.
+        let CompactionClaim::Fresh { send_id } =
+            compaction_claim(&ledger, project_id, agent_id, None)
+        else {
+            panic!("fresh after the release");
+        };
+        ledger.mark_accepted(send_id, agent_id).unwrap();
+        ledger.settle(send_id);
+        assert!(matches!(
+            compaction_claim(&ledger, project_id, agent_id, Some("k2")),
+            CompactionClaim::Reused { receipt } if receipt.send_id == send_id
+        ));
+    }
+
+    #[test]
+    fn a_compactions_turn_start_leaves_the_agents_newest_answer() {
+        let ledger = SendLedger::new();
+        let (project_id, send_id, agent_id, message_id) = registered(&ledger);
+        let turn_id = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(message_id, turn_id, send_id),
+        );
+        ledger.observe(&channel(agent_id), &chunk(turn_id, "hello"));
+        ledger.observe(
+            &channel(agent_id),
+            &turn_end(turn_id, &json!({ "status": "completed" })),
+        );
+        let CompactionClaim::Fresh {
+            send_id: compaction,
+        } = compaction_claim(&ledger, project_id, agent_id, None)
+        else {
+            panic!("fresh");
+        };
+        let compaction_message = ledger.mark_accepted(compaction, agent_id).unwrap();
+        ledger.settle(compaction);
+        let compaction_turn = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(compaction_message, compaction_turn, compaction),
+        );
+        let (latest_send, latest) = ledger.latest_turn(agent_id).unwrap();
+        assert_eq!(
+            latest_send, send_id,
+            "the answer before the compaction stays newest"
+        );
+        assert_eq!(latest.text.as_deref(), Some("hello"));
+        // The compaction's own lifecycle is still tracked.
+        assert_eq!(
+            ledger.send(compaction).unwrap().recipients[0].status,
+            SendStatus::Running
+        );
     }
 }

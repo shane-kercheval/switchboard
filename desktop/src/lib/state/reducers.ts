@@ -740,12 +740,16 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         message: input.error,
         kind: "adapter_failure",
       };
-      // Flip to idle only if this was the *starting* send. A queued send that
-      // fails pre-start (the agent is `processing` another turn) must not stomp
-      // the live turn — `AgentIdle` settles run_status when the backlog drains.
-      return runtime.run_status === "starting"
-        ? { ...runtime, run_status: "idle", pending_sends, last_error }
-        : { ...runtime, pending_sends, last_error };
+      // `starting` ends only when no queued entry is left
+      // (`runStatusAfterPendingRemoved`): a queued send that fails while
+      // another turn is `processing` must not stomp the live turn, and one
+      // that fails while another send is still queued leaves that one next.
+      return {
+        ...runtime,
+        run_status: runStatusAfterPendingRemoved(runtime, pending_sends),
+        pending_sends,
+        last_error,
+      };
     }
 
     case "message_cancelled": {
@@ -754,8 +758,9 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // races ahead of `recordSendAccepted`. Never infer by queue position: a
       // user may cancel any queued send. Cancellation is not an error, so no
       // `last_error`.
-      // Flip to idle only if this was the *starting* send (nothing is running);
-      // a queued send cancelled while another turn runs leaves run_status alone.
+      // `starting` ends only when the last queued entry goes
+      // (`runStatusAfterPendingRemoved`); a cancel while another turn runs, or
+      // while another send is still queued, leaves run_status alone.
       const exactMessageIdx =
         runtime.pending_sends?.findIndex((p) => p.message_id === input.message_id) ?? -1;
       const idx =
@@ -764,9 +769,11 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
           : (runtime.pending_sends?.findIndex((p) => p.send_id === input.send_id) ?? -1);
       if (idx < 0) return runtime;
       const pending_sends = removePending(runtime.pending_sends, idx);
-      return runtime.run_status === "starting" && idx === 0
-        ? { ...runtime, run_status: "idle", pending_sends }
-        : { ...runtime, pending_sends };
+      return {
+        ...runtime,
+        run_status: runStatusAfterPendingRemoved(runtime, pending_sends),
+        pending_sends,
+      };
     }
 
     case "turn_end":
@@ -802,9 +809,10 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // `agent_idle` arriving while `run_status === "starting"` (out of
       // protocol; the dispatcher shouldn't emit `AgentIdle` for a turn
       // that never got a `TurnStart`) would race the sendability gate
-      // back open before the legitimate `TurnStart` arrived. The only
-      // legal path from `starting → idle` is `failSendStart`. See the
-      // state-machine docstring on `AgentRuntime.run_status`.
+      // back open before the legitimate `TurnStart` arrived. `starting`
+      // ends when its last queued entry is resolved (`turn_start`,
+      // `message_failed`, `message_cancelled`, or `failSendStart`), never
+      // here. See the state-machine docstring on `AgentRuntime.run_status`.
       if (runtime.run_status !== "processing") return runtime;
       return {
         ...runtime,
@@ -997,6 +1005,24 @@ function removePending(
   if (pending === undefined || index < 0 || index >= pending.length) return pending;
   const next = [...pending.slice(0, index), ...pending.slice(index + 1)];
   return next.length === 0 ? undefined : next;
+}
+
+/// The run status after a queued entry left `pending_sends` without its turn
+/// starting (it failed, was cancelled, or its IPC was rejected). `"starting"`
+/// means a queued entry is about to start and nothing is running, so it ends
+/// only when no entry is left: while one remains, that one is next. Short of a
+/// `turn_start` this is the only way out of `"starting"`, because `agent_idle`
+/// deliberately cannot end it, so the rule relies on every queued entry being
+/// resolved by exactly one of `turn_start`, `message_failed`,
+/// `message_cancelled`, or `failSendStart`. An entry none of them reaches
+/// would keep the agent `"starting"`.
+export function runStatusAfterPendingRemoved(
+  runtime: Pick<AgentRuntime, "run_status">,
+  remaining: PendingSend[] | undefined,
+): AgentRuntime["run_status"] {
+  return runtime.run_status === "starting" && (remaining?.length ?? 0) === 0
+    ? "idle"
+    : runtime.run_status;
 }
 
 function updateTurn(turns: Turn[], turnId: TurnId, next: Turn): Turn[] {

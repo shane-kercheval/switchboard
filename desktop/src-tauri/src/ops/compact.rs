@@ -26,7 +26,8 @@ use switchboard_dispatcher::CompactOptions;
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::{
-    cancel_send_impl, compact_agent_with_impl, compaction_gates, open_project_impl,
+    cancel_send_impl, compact_agent_with_impl, compaction_gates, list_project_agents_readonly_impl,
+    open_project_impl,
 };
 use crate::error::AppError;
 use crate::state::{AppState, lock};
@@ -57,7 +58,16 @@ pub async fn compact(
     } = request;
     let hash = format!("compact:{project_id}:{agent_id}");
     let ledger: &SendLedger = &handle.app_state().ledger;
-    let send_id = match ledger.claim_compaction(project_id, agent_id, key.as_deref(), &hash) {
+    // A child of the call's cancel token: server shutdown fires it too, and
+    // the ledger's cancel flag tells the two apart.
+    let cancel = budget.cancel_token().child_token();
+    let send_id = match ledger.claim_compaction(
+        project_id,
+        agent_id,
+        key.as_deref(),
+        &hash,
+        cancel.clone(),
+    ) {
         CompactionClaim::Fresh { send_id } => send_id,
         CompactionClaim::Joined { send_id, result } => {
             return await_joined(&budget, result, send_id).await;
@@ -70,8 +80,6 @@ pub async fn compact(
             ));
         }
     };
-    let cancel = budget.cancel_token().child_token();
-    ledger.register_compaction(send_id, project_id, agent_id, cancel.clone());
     // Own task, as a send: the caller's future may be dropped at any point
     // from here on without affecting the compaction.
     let task = tokio::spawn(run(
@@ -136,14 +144,16 @@ async fn run_inner(
             path: project.directory.clone(),
         });
     }
-    // The gates first, on the record and the folder alone.
-    let (snapshot_project, _, _) = compaction_gates(state, agent_id, home_dir)?;
-    if snapshot_project.id != project_id {
+    // Membership first, as a send checks it, then the gates, on the record
+    // and the folder alone.
+    let roster = list_project_agents_readonly_impl(state, project_id)?;
+    if !roster.iter().any(|a| a.id == agent_id) {
         return Err(AppError::UnknownRecipient {
             project_id,
             agent_id,
         });
     }
+    compaction_gates(state, agent_id, home_dir)?;
     let report = match budget
         .run_with_grace(state.desktop_sync.ensure_ready(project_id))
         .await

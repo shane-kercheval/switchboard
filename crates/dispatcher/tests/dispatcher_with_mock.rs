@@ -14,7 +14,9 @@
 //! Every wait is wrapped in `tokio::time::timeout` so a logic bug surfaces as
 //! a bounded timeout rather than hanging the suite.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,11 +25,11 @@ use switchboard_core::{
     AgentId, AgentRecord, Attachment, AttachmentKind, HarnessKind, SendId, SessionLocator,
 };
 use switchboard_dispatcher::{
-    AwaitableSendOutcome, CancelOutcome, CompletionResult, ConversationJournal, CurrentTurnWait,
-    DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter, JournalError, MetadataCache,
-    NoopJournal, NoopMetadataCache, NoopSessionLocatorSink, OnBusy, PreflightRefusal,
-    RecordingEmitter, RemoveQueuedMessageError, SelectionSnapshot, SendOutcome,
-    SessionLocatorError, SessionLocatorSink, TurnKind, TurnPermit,
+    AwaitableSendOutcome, CancelOutcome, CompactOptions, CompletionResult, ConversationJournal,
+    CurrentTurnWait, DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter,
+    JournalError, MetadataCache, NoopJournal, NoopMetadataCache, NoopSessionLocatorSink, OnBusy,
+    PreflightRefusal, RecordingEmitter, RemoveQueuedMessageError, SelectionSnapshot, SendOptions,
+    SendOutcome, SessionLocatorError, SessionLocatorSink, TurnKind, TurnPermit,
 };
 use switchboard_harness::{
     AdapterEvent, CancelSource, ContentKind, ContextWindowSource, DispatchOptions, FailureKind,
@@ -7078,4 +7080,142 @@ mod accepts_now_and_caller_chosen_message_ids {
                 < position(&events, "turn_start", message_id)
         );
     }
+}
+
+/// An agent whose turn ends only when `release` fires, and which has started
+/// closing: its slot stays closing until then, so every new item is refused.
+/// Returns the release and the shutdown to await after it. The shutdown is
+/// polled once here, in this task, which marks the agent closing before its
+/// first wait: the closing state does not depend on the scheduler.
+async fn closing_agent<'a>(
+    dispatcher: &'a Arc<Dispatcher>,
+    emitter: &Arc<RecordingEmitter>,
+    agent: &AgentRecord,
+) -> (
+    Arc<tokio::sync::Notify>,
+    Pin<Box<dyn Future<Output = ()> + 'a>>,
+) {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let running = TestFactory::new(
+        MockScenario::CompletesOnSignal(Arc::clone(&release)),
+        agent.clone(),
+        Arc::clone(emitter),
+        noop_journal(),
+    );
+    dispatcher
+        .send_message(
+            agent.id,
+            "running",
+            vec![],
+            Uuid::now_v7(),
+            running,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        emitter,
+        "turn_start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    let mut shutdown: Pin<Box<dyn Future<Output = ()> + 'a>> =
+        Box::pin(dispatcher.shutdown_agent(agent.id, CancelSource::Shutdown));
+    assert!(
+        futures::poll!(shutdown.as_mut()).is_pending(),
+        "shutdown waits for the running turn"
+    );
+    (release, shutdown)
+}
+
+/// An item refused at enqueue because its agent is closing is announced first
+/// when it asked to be, so the window holds the entry the failure resolves
+/// against; an item that did not ask is only failed.
+#[tokio::test]
+async fn an_item_refused_at_enqueue_is_announced_before_it_fails_when_it_asked_to_be() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let (release, shutdown) = closing_agent(&dispatcher, &emitter, &agent).await;
+
+    let factory: Arc<dyn DispatchContextFactory> = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+    let announced_message = Uuid::now_v7();
+    let announced_send = Uuid::now_v7();
+    dispatcher
+        .send_message_with(
+            agent.id,
+            "announced",
+            vec![],
+            announced_send,
+            Arc::clone(&factory),
+            OnBusy::Enqueue,
+            SendOptions {
+                message_id: Some(announced_message),
+                emit_user_message: true,
+                announce_accepted: true,
+            },
+        )
+        .await;
+    let compaction_message = Uuid::now_v7();
+    dispatcher.compact_agent_with(
+        agent.id,
+        Uuid::now_v7(),
+        &factory,
+        CompactOptions {
+            message_id: Some(compaction_message),
+            announce_accepted: true,
+        },
+    );
+    let silent_message = accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "silent",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(&factory),
+                OnBusy::Enqueue,
+            )
+            .await,
+    );
+    within(
+        &emitter,
+        "three refusals",
+        emitter.wait_for_type("message_failed", 3),
+    )
+    .await;
+
+    let events = emitter.snapshot();
+    let position = |ty: &str, message_id: MessageId| {
+        events
+            .iter()
+            .position(|(_, e)| event_type(e) == ty && extract_message_id(e) == message_id)
+    };
+    for (message_id, kind) in [
+        (announced_message, serde_json::Value::Null),
+        (compaction_message, serde_json::json!("compaction")),
+    ] {
+        let announced = position("send_accepted", message_id).expect("announced");
+        let failed = position("message_failed", message_id).expect("failed");
+        assert!(announced < failed, "announced before it failed");
+        assert_eq!(events[announced].1["kind"], kind);
+        assert_eq!(events[failed].1["error"], "agent is shutting down");
+    }
+    assert_eq!(
+        events[position("send_accepted", announced_message).unwrap()].1["send_id"],
+        serde_json::json!(announced_send)
+    );
+    assert!(
+        position("send_accepted", silent_message).is_none(),
+        "an item that did not ask is only failed"
+    );
+    assert!(position("message_failed", silent_message).is_some());
+    assert_eq!(count_type(&events, "send_accepted"), 2);
+
+    release.notify_one();
+    shutdown.await;
 }

@@ -58,6 +58,7 @@ import {
   _internal,
   backendUserTurnId,
   freshRuntime,
+  runStatusAfterPendingRemoved,
   runtimeReducer,
   transcriptReducer,
 } from "./reducers";
@@ -794,9 +795,10 @@ export function recordSendAccepted(
 /// invoked the `send_message` Tauri IPC which rejected before the backend's
 /// `TurnStart` arrived. Prunes this send's pending entry (by `user_turn_id`,
 /// wherever it sits — a queued send's entry is not at the front) and surfaces
-/// `last_error`. Flips `run_status` back to `"idle"` only if this was the
-/// *starting* send; a queued send failing while another turn is `processing`
-/// must not stomp the live turn. The optimistic user turn stays in the
+/// `last_error`. Flips `run_status` back to `"idle"` only when no queued entry
+/// is left (`runStatusAfterPendingRemoved`): a queued send failing while
+/// another turn is `processing`, or while another send is still queued, must
+/// not stomp what is still going. The optimistic user turn stays in the
 /// transcript (the user did submit it) and a failed agent turn is appended
 /// beneath it, so the failure surfaces in the transcript rather than only in
 /// runtime `last_error`.
@@ -834,16 +836,13 @@ export function failSendStart(
     error !== undefined
       ? { ...runtime.context_report_request, phase: "failed" as const, error: error.message }
       : runtime.context_report_request;
-  runtimes[agentId] =
-    runtime.run_status === "starting"
-      ? {
-          ...runtime,
-          run_status: "idle",
-          last_error: error,
-          pending_sends,
-          context_report_request,
-        }
-      : { ...runtime, last_error: error, pending_sends, context_report_request };
+  runtimes[agentId] = {
+    ...runtime,
+    run_status: runStatusAfterPendingRemoved(runtime, pending_sends),
+    last_error: error,
+    pending_sends,
+    context_report_request,
+  };
   // Surface the failure in the transcript (the same place post-start failures
   // and the post-reload journal marker render it) rather than only in runtime
   // state. The optimistic user turn already sits above it; this adds the failed

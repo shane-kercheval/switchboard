@@ -299,6 +299,10 @@ pub struct StubDesktopSync {
     /// Who the window hears; everyone unless a test says otherwise.
     pub hearing: Mutex<Hearing>,
     pub delay: Mutex<Option<Duration>>,
+    /// Hold every readiness request: `entered` fires when one arrives,
+    /// `release` lets it answer. Deterministic ordering for tests that need
+    /// a request parked at the window wait.
+    pub hold: Mutex<Option<Arc<crate::state::MaintenanceBarrier>>>,
     pub times_out: Mutex<bool>,
     pub ready_calls: Mutex<Vec<ProjectId>>,
     pub roster_changed: Mutex<Vec<ProjectId>>,
@@ -310,6 +314,11 @@ pub struct StubDesktopSync {
 impl DesktopSync for StubDesktopSync {
     async fn ensure_ready(&self, project_id: ProjectId) -> Result<ReadyReport, AppError> {
         lock(&self.ready_calls).push(project_id);
+        let hold = lock(&self.hold).clone();
+        if let Some(hold) = hold {
+            hold.entered.notify_one();
+            hold.release.notified().await;
+        }
         let delay = *lock(&self.delay);
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;

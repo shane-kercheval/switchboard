@@ -1506,6 +1506,11 @@ impl Dispatcher {
         factory: &Arc<dyn DispatchContextFactory>,
     ) -> MessageId {
         let message_id = item.message_id;
+        let send_id = item.send_id;
+        // Taken before the item moves into the channel: an announced item that
+        // the actor refuses is still announced, so the window holds the entry
+        // its failure resolves against instead of guessing at another.
+        let announcement = announcement_of(&item);
         let failure = match self.ensure_actor(agent_id, Arc::clone(factory)) {
             None => Some("agent is shutting down"),
             Some(commands) => commands
@@ -1518,9 +1523,21 @@ impl Dispatcher {
                 .then_some("agent worker is unavailable"),
         };
         if let Some(reason) = failure {
+            let emitter = factory.idle_emitter();
+            let channel = channel_name(agent_id);
+            if let Some(announcement) = announcement {
+                emit_announcement(
+                    emitter.as_ref(),
+                    &channel,
+                    agent_id,
+                    message_id,
+                    send_id,
+                    announcement,
+                );
+            }
             emit_message_failed(
-                factory.idle_emitter().as_ref(),
-                &channel_name(agent_id),
+                emitter.as_ref(),
+                &channel,
                 message_id,
                 // Pre-`record_send`: the actor never ran it, so there is no
                 // durable record for a reload to reconstruct.
@@ -3091,7 +3108,23 @@ fn admit(
     channel: &str,
     agent_id: AgentId,
 ) {
-    let announced = match &item.payload {
+    if let Some(announcement) = announcement_of(&item) {
+        emit_announcement(
+            emitter,
+            channel,
+            agent_id,
+            item.message_id,
+            item.send_id,
+            announcement,
+        );
+    }
+    backlog.push_back(item);
+}
+
+/// What an item's announcement says, when the item asked for one: the text
+/// the window shows and what kind of work it is.
+fn announcement_of(item: &WorkItem) -> Option<(String, Option<AnnouncedSendKind>)> {
+    match &item.payload {
         WorkPayload::Send {
             prompt,
             announce_accepted: true,
@@ -3101,22 +3134,29 @@ fn admit(
             announce_accepted: true,
         } => Some((String::new(), Some(AnnouncedSendKind::Compaction))),
         _ => None,
-    };
-    if let Some((text, kind)) = announced {
-        emit_event(
-            emitter,
-            channel,
-            &NormalizedEvent::SendAccepted {
-                message_id: item.message_id,
-                send_id: item.send_id,
-                text,
-                at: Utc::now(),
-                kind,
-            },
-            agent_id,
-        );
     }
-    backlog.push_back(item);
+}
+
+fn emit_announcement(
+    emitter: &dyn EventEmitter,
+    channel: &str,
+    agent_id: AgentId,
+    message_id: MessageId,
+    send_id: SendId,
+    (text, kind): (String, Option<AnnouncedSendKind>),
+) {
+    emit_event(
+        emitter,
+        channel,
+        &NormalizedEvent::SendAccepted {
+            message_id,
+            send_id,
+            text,
+            at: Utc::now(),
+            kind,
+        },
+        agent_id,
+    );
 }
 
 /// The one admission rule for a `FailFast` send arriving while the actor is

@@ -745,6 +745,30 @@ describe("failSendStart", () => {
     });
   });
 
+  it("stays starting while another send is still queued, until that one's turn starts", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, "user-1", "first", [], "s1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-2", "second", [], "s2", "2026-05-16T00:00:01Z");
+    expect(state.runtimes[AGENT_A]?.pending_sends).toHaveLength(2);
+
+    state.failSendStart(AGENT_A, "user-1", { message: "boom", kind: "adapter_failure" });
+
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
+    expect(state.runtimes[AGENT_A]?.pending_sends).toEqual([
+      { send_id: "s2", user_turn_id: "user-2" },
+    ]);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      send_id: "s2",
+      started_at: "2026-05-16T00:00:02Z",
+    });
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+  });
+
   it("keeps the optimistic user turn and appends a failed agent turn beneath it", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
@@ -2382,6 +2406,57 @@ describe("send_accepted (a send another client made)", () => {
         (t) => t.turn_id !== TURN_1 && t.turn_id !== TURN_2,
       ),
     ).toEqual([]);
+  });
+
+  it("a failure naming an announced compaction removes its entry and leaves the user's own pending send alone", async () => {
+    // The user's own send has no receipt yet (its IPC is in flight): the
+    // entry a failure matched by position alone would take.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, "user-own", "mine", [], "send-own", "2026-05-16T00:00:00Z");
+    fireTo(`agent:${AGENT_A}`, acceptedCompaction());
+    expect(state.runtimes[AGENT_A]?.pending_sends).toHaveLength(2);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: COMPACTION_MESSAGE,
+      send_id: null,
+      agent_id: AGENT_A,
+      error: "agent is shutting down",
+      at: "2026-05-16T00:00:04Z",
+    });
+
+    expect(state.runtimes[AGENT_A]?.pending_sends).toEqual([
+      { send_id: "send-own", user_turn_id: "user-own" },
+    ]);
+    const failed = (state.transcripts[AGENT_A] ?? []).filter(
+      (t) => t.role === "agent" && t.status === "failed",
+    );
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.role === "agent" && failed[0].send_id).toBe(COMPACTION_SEND);
+    expect(failed[0]?.role === "agent" && failed[0].kind).toBe("compaction");
+
+    // The user's own send is still queued, so the agent is not idle. Its turn
+    // then starts and ends, and the agent is idle with an empty queue.
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      send_id: "send-own",
+      started_at: "2026-05-16T00:00:05Z",
+    });
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:09Z",
+    });
+    fireTo(`agent:${AGENT_A}`, { type: "agent_idle", agent_id: AGENT_A });
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("idle");
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
   });
 
   it("gives an idle agent the same starting row and pending entry as the window's own send", async () => {

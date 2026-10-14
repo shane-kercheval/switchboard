@@ -26,6 +26,7 @@
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import SettingsButton from "$lib/components/ui/SettingsButton.svelte";
   import CommandPaletteButton from "$lib/components/ui/CommandPaletteButton.svelte";
+  import NotificationsOffButton from "$lib/components/ui/NotificationsOffButton.svelte";
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
@@ -106,7 +107,12 @@
   import { pickDirectory } from "$lib/native";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
-  import { loadPreferences, preferences } from "$lib/preferences.svelte";
+  import {
+    loadPreferences,
+    preferenceLoadState,
+    preferences,
+    updatePreferences,
+  } from "$lib/preferences.svelte";
   import { loadPersistedUsage } from "$lib/state/harnessUsage.svelte";
   import { isReadingMode, toggleReadingMode } from "$lib/state/readingMode.svelte";
   import GitView from "$lib/components/GitView.svelte";
@@ -210,6 +216,22 @@
     // The open navigator is a focus-trapped modal; suppress other window chords
     // while it owns the keyboard, mirroring the palette above.
     if (navigatorState.open) return;
+
+    // ⌘⇧M flips the master notification switch (M for mute). Handled before the
+    // editable-target guard, like the palette: the chord inserts nothing, so no
+    // field needs it, and muting is wanted while typing somewhere else, in a
+    // Settings field most of all. The header shows a crossed-out bell while
+    // notifications are off, since the flip is otherwise invisible.
+    if (
+      (event.metaKey || event.ctrlKey) &&
+      event.shiftKey &&
+      !event.altKey &&
+      event.key.toLowerCase() === "m"
+    ) {
+      event.preventDefault();
+      toggleNotifications();
+      return;
+    }
 
     if (isEditableShortcutTarget(event.target) && !isComposerShortcutTarget(event.target)) return;
 
@@ -675,6 +697,15 @@
     if (selection.activeProjectId === null) return;
     toggleReadingMode(selection.activeProjectId);
   }
+  /// Flip the master notification switch, the preference Settings shows as
+  /// "Notify me when agents finish". Inert until preferences have loaded, as
+  /// the Settings switch is: before that the in-memory value is the default, so
+  /// a flip computed from it could land as the opposite of what the user meant
+  /// once their saved value arrives.
+  function toggleNotifications(): void {
+    if (!preferenceLoadState.ready) return;
+    void updatePreferences({ notify_on_completion: !preferences.notify_on_completion });
+  }
   // Reading mode's whole point is being notified about the project you're
   // watching, and that rides on a preference which defaults *off* — so a user on
   // defaults who turns reading mode on would get nothing and reasonably conclude
@@ -685,7 +716,7 @@
     !readingModeActive
       ? null
       : !preferences.notify_on_completion
-        ? "Notifications are turned off, so nothing will alert you while you read. Turn them on in Settings."
+        ? `Notifications are turned off, so nothing will alert you while you read. Press ${shortcut("mod", "shift", "M")} or click the crossed-out bell in the header to turn them on.`
         : !preferences.notify_while_focused
           ? "To be alerted about this project while you read it, turn on “Also notify me about other projects while I'm using Switchboard” in Settings."
           : null,
@@ -1125,6 +1156,15 @@
       run: () => toggleSettings(),
     });
     cmds.push({
+      id: "nav.toggle-notifications",
+      title: preferences.notify_on_completion ? "Turn off notifications" : "Turn on notifications",
+      group: "Navigation",
+      shortcut: ["mod", "shift", "M"],
+      keywords: "notify mute silence alerts finish",
+      disabled: !preferenceLoadState.ready,
+      run: () => toggleNotifications(),
+    });
+    cmds.push({
       id: "nav.toggle-projects-sidebar",
       title: layout.projectsSidebarOpen ? "Hide projects sidebar" : "Show projects sidebar",
       group: "Navigation",
@@ -1546,6 +1586,12 @@
             aria-hidden="true"
             data-testid="right-sidebar-command-divider"
           ></div>
+        {/if}
+        {#if preferenceLoadState.ready && !preferences.notify_on_completion}
+          <NotificationsOffButton
+            testid="notifications-off-button"
+            onclick={() => toggleNotifications()}
+          />
         {/if}
         <CommandPaletteButton testid="command-palette-button" onclick={() => togglePalette()} />
         <!-- Top-level Projects / Git view switch. Icon-only is an intentional

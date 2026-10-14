@@ -19,6 +19,7 @@
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
+  import { shortcut } from "$lib/platform";
   import {
     loadPreferences,
     preferenceLoadState,
@@ -549,7 +550,12 @@
         <div class="min-w-0">
           <div class="text-fg text-sm">Notify me when agents finish</div>
           <p class="text-muted mt-0.5 text-xs leading-relaxed">
-            Turn this off to stop all notifications, including the sound.
+            Turn this off to stop all notifications, including the sound. {shortcut(
+              "mod",
+              "shift",
+              "M",
+            )} does the same from anywhere; while they're off, a crossed-out bell in the header turns
+            them back on.
           </p>
         </div>
         <Switch

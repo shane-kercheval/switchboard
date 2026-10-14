@@ -4805,6 +4805,97 @@ describe("App", () => {
         /Also notify me about other projects/,
       ),
     );
+
+    // With notifications off altogether, the hint names the quick ways back on
+    // rather than sending the user to Settings.
+    const prefs = await import("$lib/preferences.svelte");
+    await waitFor(() => expect(prefs.preferenceLoadState.ready).toBe(true));
+    await fireEvent.keyDown(window, { key: "M", code: "KeyM", metaKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("reading-mode-hint")).toHaveTextContent(/crossed-out bell/),
+    );
+  });
+
+  // --- notifications toggle ---
+
+  /// The `notify_on_completion` value of the latest preference save, or
+  /// undefined when none has been issued.
+  function lastSavedNotifyPreference(): boolean | undefined {
+    const call = invokeMock.mock.calls.filter(([c]) => c === "set_preferences").at(-1);
+    const saved = call?.[1]?.preferences as { notify_on_completion?: boolean } | undefined;
+    return saved?.notify_on_completion;
+  }
+
+  it("⌘⇧M turns notifications off and on, with a crossed-out bell in the header while they are off", async () => {
+    const prefs = await import("$lib/preferences.svelte");
+    await openProjectAlpha();
+    await waitFor(() => expect(prefs.preferenceLoadState.ready).toBe(true));
+    expect(screen.queryByTestId("notifications-off-button")).toBeNull();
+
+    await fireEvent.keyDown(window, { key: "M", code: "KeyM", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("notifications-off-button")).toBeInTheDocument());
+    expect(prefs.preferences.notify_on_completion).toBe(false);
+    await waitFor(() => expect(lastSavedNotifyPreference()).toBe(false));
+
+    // The bell is the way back on.
+    await fireEvent.click(screen.getByTestId("notifications-off-button"));
+    await waitFor(() => expect(screen.queryByTestId("notifications-off-button")).toBeNull());
+    expect(prefs.preferences.notify_on_completion).toBe(true);
+    await waitFor(() => expect(lastSavedNotifyPreference()).toBe(true));
+  });
+
+  it("⌘⇧M works from a text field, where other chords are held back", async () => {
+    // A Settings field is where a user is most likely to reach for it, and the
+    // chord types nothing a field could need.
+    const prefs = await import("$lib/preferences.svelte");
+    await openProjectAlpha();
+    await waitFor(() => expect(prefs.preferenceLoadState.ready).toBe(true));
+    await fireEvent.keyDown(window, { key: ",", metaKey: true });
+    await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+
+    const field = screen.getByTestId("external-editor-command");
+    field.focus();
+    await fireEvent.keyDown(field, { key: "M", code: "KeyM", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("notifications-off-button")).toBeInTheDocument());
+    expect(prefs.preferences.notify_on_completion).toBe(false);
+  });
+
+  it("the palette lists the notifications toggle, titled by the current state", async () => {
+    await openProjectAlpha();
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+    const option = screen.getByTestId("command-option-nav.toggle-notifications");
+    expect(option).toHaveTextContent("Turn off notifications");
+    await fireEvent.click(option);
+    await waitFor(() => expect(screen.queryByTestId("command-palette")).toBeNull());
+    await waitFor(() => expect(screen.getByTestId("notifications-off-button")).toBeInTheDocument());
+
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("command-option-nav.toggle-notifications")).toHaveTextContent(
+        "Turn on notifications",
+      ),
+    );
+  });
+
+  it("the chord waits for preferences to load, so it never flips a value it has not seen", async () => {
+    // Before the saved preferences arrive the store holds the default (on). A
+    // flip computed from that could land as "off" for a user whose saved value
+    // was already off, the opposite of what they pressed for.
+    const prefs = await import("$lib/preferences.svelte");
+    const gate = deferred<void>();
+    backend.preferencesGate = gate.promise;
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
+
+    await fireEvent.keyDown(window, { key: "M", code: "KeyM", metaKey: true, shiftKey: true });
+    expect(prefs.preferences.notify_on_completion).toBe(true);
+    expect(lastSavedNotifyPreference()).toBeUndefined();
+
+    gate.resolve();
+    await waitFor(() => expect(prefs.preferenceLoadState.ready).toBe(true));
+    await fireEvent.keyDown(window, { key: "M", code: "KeyM", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(prefs.preferences.notify_on_completion).toBe(false));
   });
 
   describe("unavailable project directory", () => {

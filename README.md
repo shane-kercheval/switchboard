@@ -172,6 +172,8 @@ A turn can run for a long time, and the point of running several agents at once 
 
 Which notifications reach you depends on where you are. When Switchboard isn't the app you're using, everything notifies. When it is, the project on screen stays quiet, because its transcript is already telling you. Your other projects stay quiet too by default; the projects sidebar marks them as finished instead. Turn on the second setting in Settings → Notifications if you'd rather be interrupted than notice the marker later.
 
+Press ⌘⇧M to turn notifications off and on from anywhere in Switchboard (the command palette has the same command). While they're off, a crossed-out bell in the header reminds you, and clicking it turns them back on. It is the same switch as "Notify me when agents finish" in Settings → Notifications, so it silences everything, including your own sends and workflow runs.
+
 The first time it needs to notify you, macOS asks for permission. **The Allow button is behind the "Options" dropdown** — the prompt is easy to dismiss without noticing it:
 
 <!-- Sized in HTML, not scaled down on disk: the capture is 2x, so rendering it at

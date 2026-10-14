@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -28,6 +28,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -353,7 +354,7 @@ async fn run_connection(
             &registration.id,
             registration.generation,
             Utc::now(),
-            Instant::now(),
+            table_now(),
         );
         tracing::info!(device_id = %registration.id, "disconnected");
     }
@@ -401,7 +402,7 @@ struct Connection {
 enum Deadline {
     /// A fixed moment, unmoved by anything the client sends: the window to
     /// register, which pings must not stretch.
-    At(tokio::time::Instant),
+    At(Instant),
     /// This long after the client's last message of any kind.
     Idle(Duration),
 }
@@ -428,7 +429,7 @@ impl Connection {
             nonce,
             relay_protocol: RELAY_PROTOCOL,
         });
-        let register_by = tokio::time::Instant::now() + self.shared.config.register_timeout;
+        let register_by = Instant::now() + self.shared.config.register_timeout;
         match self.next(Deadline::At(register_by)).await {
             Incoming::Message(ClientMessage::Register(claim)) => {
                 if !self.register(&nonce, claim) {
@@ -491,7 +492,7 @@ impl Connection {
             claim.role,
             self.outbox.clone(),
             Utc::now(),
-            Instant::now(),
+            table_now(),
         );
         match registered {
             Ok(generation) => {
@@ -547,7 +548,7 @@ impl Connection {
                 generation,
                 token_hash,
                 expires_in,
-                Instant::now(),
+                table_now(),
             ),
             ClientMessage::PairingClose => self.shared.relay().close_pairing(&id, generation),
             ClientMessage::Register(_) => Err(Refusal::bad_message("already registered")),
@@ -581,7 +582,7 @@ impl Connection {
             generation,
             &to,
             pairing_token.as_ref(),
-            Instant::now(),
+            table_now(),
         )?;
         let cost = frame_cost(record.len());
         let wait = Wait {
@@ -605,7 +606,7 @@ impl Connection {
         };
         self.shared
             .relay()
-            .commit(from, generation, pending, Instant::now())
+            .commit(from, generation, pending, table_now())
     }
 
     /// The next client message, or `End` once the connection is over or
@@ -614,7 +615,7 @@ impl Connection {
     /// out before its message is acted on, which slows it through TCP.
     async fn next(&mut self, deadline: Deadline) -> Incoming {
         loop {
-            let now = tokio::time::Instant::now();
+            let now = Instant::now();
             let until = match deadline {
                 // Checked before reading, not only by the read's timeout,
                 // which never fires while a message is always ready.
@@ -648,7 +649,7 @@ impl Connection {
             };
             let wait = self.limiter.charge(Instant::now(), len);
             if !wait.is_zero() {
-                let resume = tokio::time::Instant::now() + wait;
+                let resume = Instant::now() + wait;
                 let (until, past_deadline) = match deadline {
                     Deadline::At(at) if at < resume => (at, true),
                     _ => (resume, false),
@@ -684,6 +685,12 @@ impl Connection {
             last_seen: None,
         });
     }
+}
+
+/// The time the routing table is given: tokio's clock, which tests can
+/// pause, as the type the clock-free table takes.
+fn table_now() -> std::time::Instant {
+    Instant::now().into_std()
 }
 
 /// A Mac's set, written out only when debug logging is on: a client may

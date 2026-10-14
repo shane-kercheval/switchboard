@@ -565,6 +565,10 @@ function admitAnnouncedSend(
   runtime: AgentRuntime,
   event: Extract<NormalizedEvent, { type: "send_accepted" }>,
 ): void {
+  if (event.kind === "compaction") {
+    admitAnnouncedCompaction(runtime, event);
+    return;
+  }
   const userTurnId = backendUserTurnId(event.send_id, runtime.agent_id);
   if ((transcripts[runtime.agent_id] ?? []).some((t) => t.turn_id === userTurnId)) return;
   addPendingUserTurn(
@@ -576,6 +580,35 @@ function admitAnnouncedSend(
     event.at,
     event.message_id,
   );
+}
+
+/// A compaction another client asked for was accepted into this agent's queue:
+/// register the pending entry the Compact button registers for its own
+/// (`dispatchCompaction`), carrying the receipt, and no user row, since a
+/// compaction is not something the user said. From here the existing paths
+/// apply: `turn_start` resolves the entry as a compaction, the terminal hook
+/// re-reads the project for the recap marker, and a queued one that is
+/// cancelled disappears. Idempotent on the send id, as the announcement can
+/// repeat.
+function admitAnnouncedCompaction(
+  runtime: AgentRuntime,
+  event: Extract<NormalizedEvent, { type: "send_accepted" }>,
+): void {
+  if ((runtime.pending_sends ?? []).some((p) => p.send_id === event.send_id)) return;
+  const pending = [
+    ...(runtime.pending_sends ?? []),
+    {
+      send_id: event.send_id,
+      user_turn_id: backendUserTurnId(event.send_id, runtime.agent_id),
+      kind: "compaction" as const,
+      queued_at: event.at,
+      message_id: event.message_id,
+    },
+  ];
+  runtimes[runtime.agent_id] =
+    runtime.run_status === "idle"
+      ? { ...runtime, run_status: "starting", last_error: undefined, pending_sends: pending }
+      : { ...runtime, pending_sends: pending };
 }
 
 /// Ask `agentId` to compact its own conversation, and register the pending entry

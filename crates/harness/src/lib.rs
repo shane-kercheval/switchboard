@@ -44,10 +44,10 @@ pub use codex::session_file::{
 pub use codex::{CodexAdapter, CodexLocator};
 pub use context_report::{ContextCategory, ContextItem, ContextReport};
 pub use events::{
-    AdapterEvent, CancelSource, ContentKind, ContextWindowSource, FailureKind, McpServerStatus,
-    MessageFailureKind, MessageId, NormalizedEvent, PluginEntry, RateLimitSource, SessionInventory,
-    SessionMetaSource, SettingPair, SkillEntry, ToolKind, TurnId, TurnOutcome, TurnSpend,
-    TurnUsage,
+    AdapterEvent, AnnouncedSendKind, CancelSource, ContentKind, ContextWindowSource, FailureKind,
+    McpServerStatus, MessageFailureKind, MessageId, NormalizedEvent, PluginEntry, RateLimitSource,
+    SessionInventory, SessionMetaSource, SettingPair, SkillEntry, ToolKind, TurnId, TurnOutcome,
+    TurnSpend, TurnUsage,
 };
 pub use facets::{
     EditChange, EditPair, EditedFile, Finding, FindingOutcome, FindingVerdict, FindingsReport,

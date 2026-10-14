@@ -34,6 +34,7 @@
 
 pub mod budget;
 pub mod change;
+pub mod compact;
 pub mod context;
 pub mod desktop_sync;
 pub mod error_code;

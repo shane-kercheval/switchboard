@@ -102,6 +102,8 @@ pub struct ScriptedAdapter {
     scripts: Mutex<VecDeque<Script>>,
     home: PathBuf,
     pub prompts: Mutex<Vec<String>>,
+    /// The agents whose compactions ran, in order.
+    pub compactions: Mutex<Vec<AgentId>>,
 }
 
 impl ScriptedAdapter {
@@ -110,6 +112,7 @@ impl ScriptedAdapter {
             scripts: Mutex::new(scripts.into()),
             home: home.to_path_buf(),
             prompts: Mutex::new(Vec::new()),
+            compactions: Mutex::new(Vec::new()),
         }
     }
 
@@ -217,17 +220,62 @@ impl HarnessAdapter for ScriptedAdapter {
         ))
     }
 
+    /// A compaction: the next script decides whether it parks or fails, and
+    /// its end carries the compacted size (18,000 of 200,000), the figure the
+    /// mock harness reports. No content, no file write.
     async fn compact(
         &self,
         agent: &AgentRecord,
         _cwd: &Path,
-        _turn_id: TurnId,
-        _options: DispatchOptions,
+        turn_id: TurnId,
+        options: DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
-        Err(DispatchError::UnsupportedOperation {
-            harness: agent.harness,
-            operation: "compact",
-        })
+        lock(&self.compactions).push(agent.id);
+        let script = lock(&self.scripts)
+            .pop_front()
+            .unwrap_or_else(|| Script::reply("compacted"));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            if let Some(gate) = &script.park {
+                tokio::select! {
+                    () = gate.notified() => {}
+                    () = options.cancel_token.cancelled() => return,
+                }
+            }
+            let outcome = if script.fail {
+                TurnOutcome::Failed {
+                    kind: switchboard_harness::FailureKind::HarnessError,
+                    message: "scripted failure".to_owned(),
+                }
+            } else {
+                TurnOutcome::Completed
+            };
+            let _ = tx.send(AdapterEvent::TurnEnd {
+                turn_id,
+                outcome,
+                ended_at: Utc::now(),
+                usage: (!script.fail).then_some(TurnUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                    context_input_tokens: Some(120_000),
+                    context_tokens_after_turn: Some(18_000),
+                    reasoning_output_tokens: None,
+                    context_window: Some(200_000),
+                    total_cost_usd: None,
+                }),
+                context_window_source: None,
+                stable_message_id: None,
+                first_message_id: None,
+                spend: None,
+                model: None,
+                effort: None,
+            });
+        });
+        Ok(Box::pin(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        ))
     }
 
     async fn context_report(
@@ -345,6 +393,9 @@ pub struct TestEnv {
     pub state: Arc<AppState>,
     pub store_root: TempDir,
     pub home: TempDir,
+    /// The real home directory, for a live environment whose agents write
+    /// their session files there.
+    home_override: Option<PathBuf>,
     /// `prompts/` and `workflows/` for a state built with
     /// [`TestEnv::with_prompts_and_workflows`].
     pub library: TempDir,
@@ -371,6 +422,41 @@ impl TestEnv {
             state,
             store_root,
             home,
+            home_override: None,
+            library,
+            adapter,
+            emitter,
+            sync,
+            dirs: Vec::new(),
+            library_enabled: false,
+        }
+    }
+
+    /// An environment whose Claude and Codex agents are the real CLIs, for
+    /// live tests: real harnesses, the real home directory for their session
+    /// files, and no scripted adapter in the way.
+    pub fn live() -> Self {
+        let store_root = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let adapter = Arc::new(ScriptedAdapter::new(Vec::new(), home.path()));
+        let real_home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set");
+        let (state, emitter, sync) = build_state_with(
+            store_root.path(),
+            Arc::new(switchboard_harness::ClaudeCodeAdapter::new()),
+            Arc::new(switchboard_harness::CodexAdapter::new()),
+            Arc::clone(&adapter) as Arc<dyn HarnessAdapter>,
+            None,
+            None,
+            true,
+        );
+        Self {
+            state,
+            store_root,
+            home,
+            home_override: Some(real_home),
             library,
             adapter,
             emitter,
@@ -452,7 +538,9 @@ impl TestEnv {
     }
 
     pub fn home(&self) -> PathBuf {
-        self.home.path().to_path_buf()
+        self.home_override
+            .clone()
+            .unwrap_or_else(|| self.home.path().to_path_buf())
     }
 
     pub fn handle(&self) -> Arc<dyn super::handle::AppStateHandle> {
@@ -678,15 +766,36 @@ fn build_state(
     library: Option<PathBuf>,
     desktop_sync: Option<Arc<dyn DesktopSync>>,
 ) -> (Arc<AppState>, Arc<RecordingEmitter>, Arc<StubDesktopSync>) {
-    let emitter = Arc::new(RecordingEmitter::new());
-    let sync = Arc::new(StubDesktopSync::default());
-    let mut state = AppState::new_for_test_at(
+    build_state_with(
         store_root,
         Arc::clone(adapter) as Arc<dyn HarnessAdapter>,
         Arc::clone(adapter) as Arc<dyn HarnessAdapter>,
         Arc::clone(adapter) as Arc<dyn HarnessAdapter>,
+        library,
+        desktop_sync,
+        false,
+    )
+}
+
+fn build_state_with(
+    store_root: &Path,
+    claude: Arc<dyn HarnessAdapter>,
+    codex: Arc<dyn HarnessAdapter>,
+    antigravity: Arc<dyn HarnessAdapter>,
+    library: Option<PathBuf>,
+    desktop_sync: Option<Arc<dyn DesktopSync>>,
+    real_harnesses: bool,
+) -> (Arc<AppState>, Arc<RecordingEmitter>, Arc<StubDesktopSync>) {
+    let emitter = Arc::new(RecordingEmitter::new());
+    let sync = Arc::new(StubDesktopSync::default());
+    let mut state = AppState::new_for_test_at(
+        store_root,
+        claude,
+        codex,
+        antigravity,
         Arc::clone(&emitter) as Arc<dyn EventEmitter>,
     )
+    .with_real_harnesses(real_harnesses)
     .with_desktop_sync(desktop_sync.unwrap_or_else(|| Arc::clone(&sync) as Arc<dyn DesktopSync>));
     if let Some(library) = library {
         let prompts_dir = library.join("prompts");

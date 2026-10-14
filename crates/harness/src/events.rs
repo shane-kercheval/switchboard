@@ -291,6 +291,15 @@ pub enum ContextWindowSource {
     SessionFileBacked,
 }
 
+/// What an announced send is, when it is not a message. Additive on the wire:
+/// a window that does not know a kind treats the announcement as a message.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AnnouncedSendKind {
+    Compaction,
+}
+
 /// Per-turn usage and cost. Carried on `TurnEnd.usage`.
 ///
 /// `total_cost_usd` is Claude Code only (subscription auth has no dollar
@@ -624,11 +633,17 @@ pub enum NormalizedEvent {
     /// cancel it from. The window turns it into the same pending entry and
     /// queued row it creates for its own sends. Only sends that ask for it
     /// carry it; the window's own sends and workflow sends do not.
+    ///
+    /// `kind` says what was admitted when it is not a message: a compaction
+    /// another client asked for, which the window shows as the compaction row
+    /// its own Compact button makes, with no user row. Absent for a message.
     SendAccepted {
         message_id: MessageId,
         send_id: SendId,
         text: String,
         at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<AnnouncedSendKind>,
     },
     ContentChunk {
         turn_id: TurnId,

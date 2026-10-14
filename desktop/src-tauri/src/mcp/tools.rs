@@ -39,6 +39,7 @@ use crate::error::AppError;
 use crate::ops::RESULT_BUDGET_CHARS;
 use crate::ops::budget::{BudgetSpec, Budgeted, fit};
 use crate::ops::change::{self, SelectionChange};
+use crate::ops::compact::{self, CompactRequest};
 use crate::ops::handle::AppStateHandle;
 use crate::ops::read::{self, ReadFrom};
 use crate::ops::send::{
@@ -224,6 +225,17 @@ tools! {
         "Delete a failed or interrupted workflow run's record, which otherwise blocks every new \
          workflow in the project. Returns the step that failed and why, which this removes from \
          the window, so read it. Refuses a running or completed run.";
+    CompactAgent = "compact_agent" (CompactArgs) [Acts]
+        "Compact an agent's conversation: its harness summarizes the history so far and continues \
+         from the summary, freeing context. Read context from list_agents to decide when. Claude \
+         Code and Codex agents only (compaction_unsupported otherwise); the agent must have replied \
+         at least once (no_session), and a Claude fork must have had its first turn \
+         (fork_not_materialized). The compaction waits behind the agent's running and queued work \
+         and returns a send_id at once: call wait_send until done (the recipient carries no \
+         text), and cancel_send cancels it while queued. idempotency_key as in send. While a \
+         compaction is queued or running for the agent, another request returns its send_id \
+         instead of queuing a second. The user sees it in Switchboard's window as a compaction \
+         row and can cancel it there.";
     Send = "send" (SendArgs) [Acts]
         "Send one message to one or more agents of a project. Returns at once with a send_id and \
          each recipient's status at dispatch: accepted, rejected (with a code), or \
@@ -536,6 +548,18 @@ struct PromptArg {
     name: String,
     #[serde(default)]
     args: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub struct CompactArgs {
+    #[schemars(with = "String")]
+    project_id: ProjectId,
+    #[schemars(with = "String")]
+    agent_id: AgentId,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -920,6 +944,21 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 Arc::clone(&cx.handle),
                 cx.home.clone(),
                 request,
+                cx.budget(None),
+            )
+            .await?;
+            Reply::plain(&receipt)
+        }
+        ToolName::CompactAgent => {
+            let a: CompactArgs = parse(args)?;
+            let receipt = compact::compact(
+                Arc::clone(&cx.handle),
+                cx.home.clone(),
+                CompactRequest {
+                    project_id: a.project_id,
+                    agent_id: a.agent_id,
+                    idempotency_key: a.idempotency_key,
+                },
                 cx.budget(None),
             )
             .await?;

@@ -1828,7 +1828,6 @@ async fn the_task_guard_settles_or_releases_without_the_caller() {
         send_id,
         project_id,
         &agents,
-        Some("g1"),
         tokio_util::sync::CancellationToken::new(),
     );
     super::send::settle_abnormally(&env.state, send_id);
@@ -1845,7 +1844,6 @@ async fn the_task_guard_settles_or_releases_without_the_caller() {
         send_id,
         project_id,
         &agents,
-        Some("g2"),
         tokio_util::sync::CancellationToken::new(),
     );
     env.state.ledger.mark_accepted(send_id, agents[0]).unwrap();
@@ -3826,4 +3824,424 @@ async fn a_listing_cancelled_during_a_busy_check_is_interrupted() {
     held.notify_one();
     let receipt = send.await.unwrap().unwrap();
     wait_done(&env, project_id, receipt.send_id).await;
+}
+
+// --- compaction ----------------------------------------------------------------------
+
+use super::compact::{CompactRequest, compact};
+
+/// A project whose one Claude agent has a session (one seeded reply), so the
+/// compaction gates pass. The scripted adapter appends every later reply to
+/// that session file.
+fn compactable_agent() -> (TestEnv, ProjectId, AgentId) {
+    let mut env = TestEnv::new();
+    let project_id = env.project("p");
+    let agent_id = env.agent(project_id, "a");
+    env.seed_claude_turn(project_id, agent_id, "seeded", "s1");
+    (env.restart(), project_id, agent_id)
+}
+
+fn compact_request(project_id: ProjectId, agent_id: AgentId, key: Option<&str>) -> CompactRequest {
+    CompactRequest {
+        project_id,
+        agent_id,
+        idempotency_key: key.map(str::to_owned),
+    }
+}
+
+async fn compact_now(
+    env: &TestEnv,
+    request: CompactRequest,
+) -> Result<super::ledger::SendReceipt, AppError> {
+    compact(
+        env.handle(),
+        env.home(),
+        request,
+        WaitBudget::default_wait(),
+    )
+    .await
+}
+
+fn announced_compactions(env: &TestEnv) -> Vec<serde_json::Value> {
+    env.emitter
+        .snapshot()
+        .into_iter()
+        .filter(|(_, event)| event["type"] == "send_accepted" && event["kind"] == "compaction")
+        .map(|(_, event)| event)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_compaction_of_an_idle_agent_completes_and_reports_the_compacted_size() {
+    let (env, project_id, agent_id) = compactable_agent();
+    let receipt = compact_now(&env, compact_request(project_id, agent_id, None))
+        .await
+        .unwrap();
+    assert_eq!(receipt.recipients.len(), 1);
+    assert_eq!(receipt.recipients[0].status, SendStatus::Accepted);
+
+    let reply = wait_done(&env, project_id, receipt.send_id).await;
+    assert!(reply.done);
+    assert_eq!(reply.recipients[0].status, SendStatus::Completed);
+    assert!(
+        reply.recipients[0].text.as_deref().unwrap_or("").is_empty(),
+        "a compaction emits no reply text"
+    );
+    assert_eq!(*lock(&env.adapter.compactions), vec![agent_id]);
+    // Announced at admission with its kind and no text, so the window shows
+    // the compaction row.
+    let announced = announced_compactions(&env);
+    assert_eq!(announced.len(), 1);
+    assert_eq!(announced[0]["text"], "");
+    assert_eq!(announced[0]["send_id"], serde_json::json!(receipt.send_id));
+    // The compacted size reaches the context figures.
+    let listed = list_agents(
+        &env.state,
+        project_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed[0].context, Some(context_figures(18_000, 200_000)));
+}
+
+#[tokio::test]
+async fn a_compaction_queues_behind_a_running_turn_and_runs_after_it() {
+    let (env, project_id, agent_id) = compactable_agent();
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("busy", &gate));
+    let busy = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agent_id], "work"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agent_id).await;
+
+    let receipt = compact_now(&env, compact_request(project_id, agent_id, None))
+        .await
+        .unwrap();
+    assert_eq!(receipt.recipients[0].status, SendStatus::Accepted);
+    let waiting = wait_send(
+        &env.state,
+        project_id,
+        receipt.send_id,
+        &short(),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert!(!waiting.done, "queued behind the running turn");
+    assert!(lock(&env.adapter.compactions).is_empty());
+
+    gate.notify_one();
+    wait_done(&env, project_id, busy.send_id).await;
+    let reply = wait_done(&env, project_id, receipt.send_id).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Completed);
+    assert_eq!(*lock(&env.adapter.compactions), vec![agent_id]);
+}
+
+#[tokio::test]
+async fn cancel_send_cancels_a_queued_compaction() {
+    let (env, project_id, agent_id) = compactable_agent();
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("busy", &gate));
+    let busy = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agent_id], "work"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agent_id).await;
+    let receipt = compact_now(&env, compact_request(project_id, agent_id, None))
+        .await
+        .unwrap();
+
+    cancel_send(&env.state, project_id, receipt.send_id).unwrap();
+    gate.notify_one();
+    wait_done(&env, project_id, busy.send_id).await;
+    let reply = wait_done(&env, project_id, receipt.send_id).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Cancelled);
+    assert!(lock(&env.adapter.compactions).is_empty(), "nothing ran");
+}
+
+#[tokio::test]
+async fn an_unsupported_harness_and_an_agent_without_a_session_are_refused_before_the_window() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("p");
+    let no_session = env.agent(project_id, "fresh");
+    let antigravity = crate::commands::create_agent_in_project_impl(
+        &env.state,
+        project_id,
+        "ag",
+        switchboard_core::HarnessKind::Antigravity,
+        switchboard_core::AgentSelection::default(),
+    )
+    .unwrap()
+    .id;
+    let env = env.restart();
+
+    let err = compact_now(&env, compact_request(project_id, antigravity, Some("k1")))
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), error_code::COMPACTION_UNSUPPORTED);
+    let err = compact_now(&env, compact_request(project_id, no_session, Some("k2")))
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), error_code::NO_SESSION);
+    assert!(
+        lock(&env.sync.ready_calls).is_empty(),
+        "refused before any window round trip"
+    );
+    assert!(announced_compactions(&env).is_empty());
+}
+
+#[tokio::test]
+async fn a_repeat_with_the_same_key_returns_the_same_receipt_and_queues_nothing() {
+    let (env, project_id, agent_id) = compactable_agent();
+    let first = compact_now(&env, compact_request(project_id, agent_id, Some("k")))
+        .await
+        .unwrap();
+    wait_done(&env, project_id, first.send_id).await;
+    let again = compact_now(&env, compact_request(project_id, agent_id, Some("k")))
+        .await
+        .unwrap();
+    assert_eq!(again.send_id, first.send_id);
+    assert_eq!(lock(&env.adapter.compactions).len(), 1);
+}
+
+#[tokio::test]
+async fn a_request_while_a_compaction_is_queued_returns_its_receipt_whatever_the_key() {
+    let (env, project_id, agent_id) = compactable_agent();
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("busy", &gate));
+    let busy = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agent_id], "work"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agent_id).await;
+
+    let first = compact_now(&env, compact_request(project_id, agent_id, Some("k1")))
+        .await
+        .unwrap();
+    let other_key = compact_now(&env, compact_request(project_id, agent_id, Some("k2")))
+        .await
+        .unwrap();
+    let no_key = compact_now(&env, compact_request(project_id, agent_id, None))
+        .await
+        .unwrap();
+    assert_eq!(other_key.send_id, first.send_id);
+    assert_eq!(no_key.send_id, first.send_id);
+    // The new key is associated with the reused receipt: a repeat under it
+    // returns the same receipt too.
+    let repeat = compact_now(&env, compact_request(project_id, agent_id, Some("k2")))
+        .await
+        .unwrap();
+    assert_eq!(repeat.send_id, first.send_id);
+
+    gate.notify_one();
+    wait_done(&env, project_id, busy.send_id).await;
+    wait_done(&env, project_id, first.send_id).await;
+    assert_eq!(
+        lock(&env.adapter.compactions).len(),
+        1,
+        "one compaction queued"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_requests_with_different_keys_queue_one_compaction() {
+    let (env, project_id, agent_id) = compactable_agent();
+    // A slow window: the first request is still preparing when the second
+    // arrives, which joins it.
+    *lock(&env.sync.delay) = Some(Duration::from_millis(200));
+    let (one, two) = tokio::join!(
+        compact_now(&env, compact_request(project_id, agent_id, Some("k1"))),
+        compact_now(&env, compact_request(project_id, agent_id, Some("k2"))),
+    );
+    let (one, two) = (one.unwrap(), two.unwrap());
+    assert_eq!(one.send_id, two.send_id);
+    wait_done(&env, project_id, one.send_id).await;
+    assert_eq!(lock(&env.adapter.compactions).len(), 1);
+}
+
+#[tokio::test]
+async fn a_compaction_then_a_message_then_a_compaction_queues_two() {
+    let (env, project_id, agent_id) = compactable_agent();
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("busy", &gate));
+    let busy = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agent_id], "work"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agent_id).await;
+
+    let first = compact_now(&env, compact_request(project_id, agent_id, None))
+        .await
+        .unwrap();
+    let mut message = text_send(project_id, vec![agent_id], "after");
+    message.on_busy = OnBusyPolicy::Queue;
+    let queued = send_now(env.handle(), env.home(), message).await.unwrap();
+    let second = compact_now(&env, compact_request(project_id, agent_id, None))
+        .await
+        .unwrap();
+    assert_ne!(second.send_id, first.send_id, "a message sits between them");
+
+    gate.notify_one();
+    wait_done(&env, project_id, busy.send_id).await;
+    wait_done(&env, project_id, first.send_id).await;
+    wait_done(&env, project_id, queued.send_id).await;
+    wait_done(&env, project_id, second.send_id).await;
+    assert_eq!(lock(&env.adapter.compactions).len(), 2);
+}
+
+#[tokio::test]
+async fn a_message_registered_before_a_compaction_but_admitted_after_it_keeps_the_next_compaction_separate()
+ {
+    // The message is a forward whose source is still replying: registered at
+    // its claim, admitted only once the source finishes. The first compaction
+    // is requested meanwhile, admitted at once, and parks running.
+    let mut env = TestEnv::new();
+    let project_id = env.project("p");
+    let target = env.agent(project_id, "target");
+    let source = env.agent(project_id, "source");
+    env.seed_claude_turn(project_id, target, "seeded", "s1");
+    let env = env.restart();
+    let source_gate = Arc::new(Notify::new());
+    env.adapter
+        .push(Script::parked("source reply", &source_gate));
+    let source_send = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![source], "think"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, source).await;
+
+    let held = tokio::spawn({
+        let (handle, home) = (env.handle(), env.home());
+        async move {
+            forward(
+                handle,
+                home,
+                ForwardRequest {
+                    project_id,
+                    sources: vec![ForwardSourceRef {
+                        agent_id: source,
+                        project_id,
+                    }],
+                    recipients: vec![target],
+                    text: Some("see this".to_owned()),
+                    prompt: None,
+                    on_busy: OnBusyPolicy::Queue,
+                    idempotency_key: None,
+                },
+                WaitBudget::default_wait(),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let compacting = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("compacting", &compacting));
+    let first = compact_now(&env, compact_request(project_id, target, None))
+        .await
+        .unwrap();
+    await_turn_running(&env.state, target).await;
+
+    // The source finishes: the forward composes and is admitted, after the
+    // compaction.
+    source_gate.notify_one();
+    wait_done(&env, project_id, source_send.send_id).await;
+    let held = held.await.unwrap().unwrap();
+    assert_eq!(held.recipients[0].status, SendStatus::Accepted);
+
+    let second = compact_now(&env, compact_request(project_id, target, None))
+        .await
+        .unwrap();
+    assert_ne!(
+        second.send_id, first.send_id,
+        "the message was admitted after the first compaction, so a new one queues"
+    );
+
+    compacting.notify_one();
+    wait_done(&env, project_id, first.send_id).await;
+    wait_done(&env, project_id, held.send_id).await;
+    wait_done(&env, project_id, second.send_id).await;
+    assert_eq!(lock(&env.adapter.compactions).len(), 2);
+}
+
+#[tokio::test]
+async fn a_request_during_the_window_wait_gets_the_first_receipt_or_its_error() {
+    let (env, project_id, agent_id) = compactable_agent();
+    *lock(&env.sync.delay) = Some(Duration::from_millis(300));
+    let first = tokio::spawn({
+        let handle = env.handle();
+        let home = env.home();
+        async move {
+            compact(
+                handle,
+                home,
+                compact_request(project_id, agent_id, Some("k1")),
+                WaitBudget::default_wait(),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = compact_now(&env, compact_request(project_id, agent_id, Some("k2")))
+        .await
+        .unwrap();
+    let first = first.await.unwrap().unwrap();
+    assert_eq!(second.send_id, first.send_id);
+    wait_done(&env, project_id, first.send_id).await;
+
+    // The window times out: both callers get the error, never an id the
+    // ledger does not know.
+    *lock(&env.sync.times_out) = true;
+    let first = tokio::spawn({
+        let handle = env.handle();
+        let home = env.home();
+        async move {
+            compact(
+                handle,
+                home,
+                compact_request(project_id, agent_id, Some("k3")),
+                WaitBudget::default_wait(),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = compact_now(&env, compact_request(project_id, agent_id, Some("k4")))
+        .await
+        .unwrap_err();
+    let first = first.await.unwrap().unwrap_err();
+    assert_eq!(error_code(&first), error_code::PROJECT_LOAD_TIMEOUT);
+    assert_eq!(error_code(&second), error_code::PROJECT_LOAD_TIMEOUT);
+}
+
+#[tokio::test]
+async fn after_a_restart_a_compaction_reports_unknown() {
+    let (env, project_id, agent_id) = compactable_agent();
+    let receipt = compact_now(&env, compact_request(project_id, agent_id, None))
+        .await
+        .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+    let env = env.restart();
+    let reply = wait_done(&env, project_id, receipt.send_id).await;
+    assert!(reply.done);
+    assert_eq!(reply.source, WaitSource::Unknown);
+    assert!(reply.recipients.is_empty());
 }

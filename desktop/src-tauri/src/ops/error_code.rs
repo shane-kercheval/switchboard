@@ -32,6 +32,9 @@ pub const WORKFLOW_RUN_REQUIRES_DISMISSAL: &str = "workflow_run_requires_dismiss
 pub const WORKFLOW_ALREADY_RUNNING: &str = "workflow_already_running";
 pub const RESULT_TOO_LARGE: &str = "result_too_large";
 pub const REQUEST_IN_PROGRESS: &str = "request_in_progress";
+pub const COMPACTION_UNSUPPORTED: &str = "compaction_unsupported";
+pub const NO_SESSION: &str = "no_session";
+pub const FORK_NOT_MATERIALIZED: &str = "fork_not_materialized";
 pub const INVALID_ARGUMENT: &str = "invalid_argument";
 pub const INTERNAL: &str = "internal";
 
@@ -63,6 +66,11 @@ pub fn error_code(error: &AppError) -> &'static str {
         AppError::WorkflowAlreadyRunning { .. } => WORKFLOW_ALREADY_RUNNING,
         AppError::ResultTooLarge { .. } => RESULT_TOO_LARGE,
         AppError::RequestInProgress { .. } => REQUEST_IN_PROGRESS,
+        AppError::CompactionUnsupported { .. } => COMPACTION_UNSUPPORTED,
+        AppError::CompactionSourceHasNoSession { .. } | AppError::ForkSourceHasNoSession { .. } => {
+            NO_SESSION
+        }
+        AppError::CompactionForkNotMaterialized { .. } => FORK_NOT_MATERIALIZED,
         AppError::Shared(original) => error_code(original),
         AppError::InvalidArgument(_)
         | AppError::InvalidUuid { .. }
@@ -71,8 +79,7 @@ pub fn error_code(error: &AppError) -> &'static str {
         | AppError::WorkflowNotFound { .. }
         | AppError::WorkflowStepUnsupported
         | AppError::WorkflowRunActive { .. }
-        | AppError::ForkSourceBusy { .. }
-        | AppError::ForkSourceHasNoSession { .. } => INVALID_ARGUMENT,
+        | AppError::ForkSourceBusy { .. } => INVALID_ARGUMENT,
         // Includes `TimedOut`, `Interrupted`, and `Internal`: operational
         // failures, not the caller's input; their messages say to try again.
         _ => INTERNAL,

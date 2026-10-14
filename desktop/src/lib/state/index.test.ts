@@ -2289,6 +2289,101 @@ describe("send_accepted (a send another client made)", () => {
     };
   }
 
+  const COMPACTION_SEND = "00000000-0000-7000-8000-0000000000c3";
+  const COMPACTION_MESSAGE = "00000000-0000-7000-8000-0000000000c4";
+  const COMPACTION_TURN = "00000000-0000-7000-8000-0000000000c5";
+
+  function acceptedCompaction(): NormalizedEvent {
+    return {
+      type: "send_accepted",
+      message_id: COMPACTION_MESSAGE,
+      send_id: COMPACTION_SEND,
+      text: "",
+      at: "2026-05-16T00:00:02Z",
+      kind: "compaction",
+    };
+  }
+
+  it("a compaction another client asked for gets the compaction entry and no user row", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+
+    fireTo(`agent:${AGENT_A}`, acceptedCompaction());
+    fireTo(`agent:${AGENT_A}`, acceptedCompaction());
+
+    // The same entry the Compact button registers, with the receipt already known.
+    expect(state.runtimes[AGENT_A]?.pending_sends).toEqual([
+      {
+        send_id: COMPACTION_SEND,
+        user_turn_id: `user:${COMPACTION_SEND}:${AGENT_A}`,
+        kind: "compaction",
+        queued_at: "2026-05-16T00:00:02Z",
+        message_id: COMPACTION_MESSAGE,
+      },
+    ]);
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
+    expect(state.transcripts[AGENT_A] ?? []).toEqual([]);
+  });
+
+  it("its turn_start keeps it a compaction and its completion re-reads the project", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    const seen: { outcome: string; kind?: string }[] = [];
+    state.setTurnTerminalHook((_agentId, outcome, kind) => seen.push({ outcome, kind }));
+
+    fireTo(`agent:${AGENT_A}`, acceptedCompaction());
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: COMPACTION_TURN,
+      message_id: COMPACTION_MESSAGE,
+      send_id: COMPACTION_SEND,
+      started_at: "2026-05-16T00:00:03Z",
+    });
+    const turn = state.transcripts[AGENT_A]?.find((t) => t.turn_id === COMPACTION_TURN);
+    expect(turn?.role === "agent" && turn.kind).toBe("compaction");
+    expect(turn?.role === "agent" && turn.send_id).toBe(COMPACTION_SEND);
+    expect((state.transcripts[AGENT_A] ?? []).filter((t) => t.role === "user")).toHaveLength(0);
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: COMPACTION_TURN,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:09Z",
+    });
+    expect(seen).toEqual([{ outcome: "completed", kind: "compaction" }]);
+    state.setTurnTerminalHook(undefined);
+  });
+
+  it("a queued one that is cancelled disappears without a row", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, TURN_1, "go", [], "send-1", "2026-05-16T00:00:00Z");
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_2,
+      message_id: MESSAGE_1,
+      send_id: "send-1",
+      started_at: "2026-05-16T00:00:01Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, acceptedCompaction());
+    expect(state.runtimes[AGENT_A]?.pending_sends).toHaveLength(1);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_cancelled",
+      message_id: COMPACTION_MESSAGE,
+      send_id: COMPACTION_SEND,
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:04Z",
+    });
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+    expect(
+      (state.transcripts[AGENT_A] ?? []).filter(
+        (t) => t.turn_id !== TURN_1 && t.turn_id !== TURN_2,
+      ),
+    ).toEqual([]);
+  });
+
   it("gives an idle agent the same starting row and pending entry as the window's own send", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));

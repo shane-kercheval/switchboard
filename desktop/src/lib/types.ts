@@ -288,7 +288,17 @@ export type NormalizedEvent =
   // this agent's queue. Arrives before the send's `turn_start`, idle or busy;
   // the window turns it into the same pending entry and queued row it creates
   // for its own sends. The window's own sends never carry it.
-  | { type: "send_accepted"; message_id: MessageId; send_id: SendId; text: string; at: string }
+  // `kind` says what was admitted when it is not a message: a compaction
+  // another client asked for, shown as the compaction row the Compact button
+  // makes, with no user row. Absent for a message.
+  | {
+      type: "send_accepted";
+      message_id: MessageId;
+      send_id: SendId;
+      text: string;
+      at: string;
+      kind?: "compaction";
+    }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
   // Content-free liveness signal: the harness is still alive mid-turn but
   // produced no renderable content (e.g. Claude Opus 4.8's redacted thinking

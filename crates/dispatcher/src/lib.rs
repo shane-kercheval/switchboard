@@ -124,10 +124,10 @@ use switchboard_core::{
     AgentId, AgentRecord, Attachment, SendId, SessionLocator, render_prompt_with_attachments,
 };
 use switchboard_harness::{
-    AdapterEvent, CancelSource, ContextWindowSource, DispatchOptions, EventStream, FailureKind,
-    HarnessAdapter, MessageFailureKind, MessageId, NormalizedEvent, RateLimitSource,
-    SessionInventory, SessionMetaSource, TextCapture, TurnId, TurnOutcome, TurnSpend,
-    check_prompt_size,
+    AdapterEvent, AnnouncedSendKind, CancelSource, ContextWindowSource, DispatchOptions,
+    EventStream, FailureKind, HarnessAdapter, MessageFailureKind, MessageId, NormalizedEvent,
+    RateLimitSource, SessionInventory, SessionMetaSource, TextCapture, TurnId, TurnOutcome,
+    TurnSpend, check_prompt_size,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -267,8 +267,11 @@ enum WorkPayload {
     },
     /// Ask the harness to compact the agent's **own existing conversation**.
     /// Carries no prompt and no attachments — it is not something the user said,
-    /// and nothing about it is journaled.
-    Compact,
+    /// and nothing about it is journaled. `announce_accepted` as for a send: a
+    /// compaction another client asked for is announced at admission, with
+    /// its kind, so the window shows the compaction row it would show for
+    /// its own.
+    Compact { announce_accepted: bool },
     /// Ask the harness what is occupying the agent's context window. Like
     /// `Compact` it carries no prompt and journals nothing; unlike it, it costs
     /// nothing and changes nothing — but it still writes to the session file, so
@@ -281,7 +284,7 @@ impl WorkPayload {
     fn kind(&self) -> TurnKind {
         match self {
             Self::Send { .. } => TurnKind::Send,
-            Self::Compact => TurnKind::Compaction,
+            Self::Compact { .. } => TurnKind::Compaction,
             Self::ContextReport => TurnKind::ContextReport,
         }
     }
@@ -466,6 +469,15 @@ pub enum OnBusy {
 pub struct SendOptions {
     pub message_id: Option<MessageId>,
     pub emit_user_message: bool,
+    pub announce_accepted: bool,
+}
+
+/// How a compaction is queued: the receipt's `message_id`, when the caller
+/// registered it ahead of the actor's first event, and whether its admission
+/// is announced (`NormalizedEvent::SendAccepted` with `kind: compaction`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactOptions {
+    pub message_id: Option<MessageId>,
     pub announce_accepted: bool,
 }
 
@@ -1287,14 +1299,29 @@ impl Dispatcher {
         send_id: SendId,
         factory: &Arc<dyn DispatchContextFactory>,
     ) -> MessageId {
+        self.compact_agent_with(agent_id, send_id, factory, CompactOptions::default())
+    }
+
+    /// [`Self::compact_agent`] with the receipt's `message_id` chosen by the
+    /// caller and the admission announced, for a compaction another client
+    /// asked for; the `send_message_with` pattern.
+    pub fn compact_agent_with(
+        &self,
+        agent_id: AgentId,
+        send_id: SendId,
+        factory: &Arc<dyn DispatchContextFactory>,
+        options: CompactOptions,
+    ) -> MessageId {
         // Snapshotted like a send's: the compaction must run under the model the
         // user had selected when they asked for it, not whatever is selected by
         // the time the backlog reaches it.
         let selection = factory.selection_snapshot();
         let item = WorkItem {
-            message_id: Uuid::now_v7(),
+            message_id: options.message_id.unwrap_or_else(Uuid::now_v7),
             send_id,
-            payload: WorkPayload::Compact,
+            payload: WorkPayload::Compact {
+                announce_accepted: options.announce_accepted,
+            },
             selection,
             completion: None,
         };
@@ -2200,7 +2227,7 @@ async fn run_turn(
         // nothing is compacted, so the refusal has to live in the type of the
         // call. `options` rides through unchanged — the cancel token is what
         // makes a compaction cancellable like any other turn.
-        WorkPayload::Compact => adapter.compact(&agent, &cwd, turn_id, options).await,
+        WorkPayload::Compact { .. } => adapter.compact(&agent, &cwd, turn_id, options).await,
         // Same reasoning as the compaction above, and the same hazard: a
         // `/context` *prompt* on a harness without the local interception is
         // answered by the model with an invented breakdown, so the refusal has
@@ -3064,20 +3091,27 @@ fn admit(
     channel: &str,
     agent_id: AgentId,
 ) {
-    if let WorkPayload::Send {
-        prompt,
-        announce_accepted: true,
-        ..
-    } = &item.payload
-    {
+    let announced = match &item.payload {
+        WorkPayload::Send {
+            prompt,
+            announce_accepted: true,
+            ..
+        } => Some((prompt.clone(), None)),
+        WorkPayload::Compact {
+            announce_accepted: true,
+        } => Some((String::new(), Some(AnnouncedSendKind::Compaction))),
+        _ => None,
+    };
+    if let Some((text, kind)) = announced {
         emit_event(
             emitter,
             channel,
             &NormalizedEvent::SendAccepted {
                 message_id: item.message_id,
                 send_id: item.send_id,
-                text: prompt.clone(),
+                text,
                 at: Utc::now(),
+                kind,
             },
             agent_id,
         );

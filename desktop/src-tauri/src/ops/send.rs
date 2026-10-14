@@ -56,6 +56,7 @@ use sha2::{Digest, Sha256};
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId};
 use switchboard_dispatcher::{OnBusy, SendOptions};
 use switchboard_harness::{TurnStatus, check_prompt_size};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -72,7 +73,7 @@ use super::RESULT_BUDGET_CHARS;
 use super::budget::{BudgetSpec, CutSite};
 use super::error_code::error_code;
 use super::handle::AppStateHandle;
-use super::ledger::{Claim, RecipientSnapshot, SendReceipt, SendStatus};
+use super::ledger::{Claim, ClaimResult, RecipientSnapshot, SendReceipt, SendStatus};
 use super::read::{
     AgentOutput, agent_in_project, correlate_turns, project_readonly, read_agent_output,
     read_journal,
@@ -280,26 +281,8 @@ async fn begin(
         Claim::Fresh { send_id } => send_id,
         Claim::Joined {
             send_id: original,
-            mut result,
-        } => {
-            return match budget.run(result.wait_for(Option::is_some)).await {
-                Outcome::Done(Ok(settled)) => match settled.clone() {
-                    Some(Ok(receipt)) => Ok(receipt),
-                    Some(Err(original)) => Err(AppError::Shared(original)),
-                    None => Err(AppError::Internal(
-                        "the original request settled without a result".to_owned(),
-                    )),
-                },
-                Outcome::Done(Err(_)) => Err(AppError::Internal(
-                    "the original request's record was dropped before it settled".to_owned(),
-                )),
-                // The original keeps running and keeps its key: the caller
-                // calls again with the same key.
-                Outcome::Timeout | Outcome::Cancelled => {
-                    Err(AppError::RequestInProgress { send_id: original })
-                }
-            };
-        }
+            result,
+        } => return await_joined(&budget, result, original).await,
         Claim::Mismatch => {
             return Err(AppError::InvalidArgument(
                 "idempotency_key was already used for a different request in this project"
@@ -314,7 +297,6 @@ async fn begin(
         send_id,
         project_id,
         &plan.recipients,
-        key.as_deref(),
         send_cancel.clone(),
     );
     // Own task: see the module doc. The caller's future may be dropped at
@@ -325,6 +307,32 @@ async fn begin(
             "the send task did not finish: {join_error}"
         )))
     })
+}
+
+/// What a request that joined another's claim receives: the original's
+/// receipt or error once it settles, or `request_in_progress` if the budget
+/// runs out first (the original keeps running and keeps its key: the caller
+/// calls again with the same key).
+pub(super) async fn await_joined(
+    budget: &WaitBudget,
+    mut result: watch::Receiver<Option<ClaimResult>>,
+    original: SendId,
+) -> Result<SendReceipt, AppError> {
+    match budget.run(result.wait_for(Option::is_some)).await {
+        Outcome::Done(Ok(settled)) => match settled.clone() {
+            Some(Ok(receipt)) => Ok(receipt),
+            Some(Err(original)) => Err(AppError::Shared(original)),
+            None => Err(AppError::Internal(
+                "the original request settled without a result".to_owned(),
+            )),
+        },
+        Outcome::Done(Err(_)) => Err(AppError::Internal(
+            "the original request's record was dropped before it settled".to_owned(),
+        )),
+        Outcome::Timeout | Outcome::Cancelled => {
+            Err(AppError::RequestInProgress { send_id: original })
+        }
+    }
 }
 
 /// Settles the send's ledger entry however the task ends. Lives in the task,
@@ -339,10 +347,10 @@ async fn begin(
 /// from the journal. That is also why a recipient marked accepted just before
 /// a panic, but never admitted, is not reconciled here — the case cannot
 /// happen in the shipped app.
-struct SettleGuard<'a> {
-    state: &'a AppState,
-    send_id: SendId,
-    armed: bool,
+pub(super) struct SettleGuard<'a> {
+    pub(super) state: &'a AppState,
+    pub(super) send_id: SendId,
+    pub(super) armed: bool,
 }
 
 impl Drop for SettleGuard<'_> {
@@ -361,7 +369,7 @@ pub(crate) fn settle_abnormally(state: &AppState, send_id: SendId) {
     } else {
         state.ledger.release(
             send_id,
-            Arc::new(AppError::Internal(
+            &Arc::new(AppError::Internal(
                 "the send task ended before dispatching".to_owned(),
             )),
         );
@@ -413,7 +421,7 @@ async fn run(
         Err(error) => {
             tracing::info!(%project_id, %send_id, code = error_code(&error), "send refused");
             let error = Arc::new(error);
-            state.ledger.release(send_id, Arc::clone(&error));
+            state.ledger.release(send_id, &error);
             Err(AppError::Shared(error))
         }
     }
@@ -422,7 +430,7 @@ async fn run(
 /// Settle a send `cancel_send` stopped: every recipient not yet offered is
 /// `cancelled`, admitted ones finish through the dispatcher's cancel, and the
 /// key is kept so a retry returns this receipt.
-fn settle_cancelled(state: &AppState, send_id: SendId) -> Result<SendReceipt, AppError> {
+pub(super) fn settle_cancelled(state: &AppState, send_id: SendId) -> Result<SendReceipt, AppError> {
     tracing::info!(%send_id, "send cancelled before it finished dispatching");
     state.ledger.cancel_undispatched(send_id);
     state.ledger.settle(send_id).ok_or_else(|| {

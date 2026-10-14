@@ -16,8 +16,9 @@ use switchboard_core::{
     SessionLocator, normalize_agent_selection,
 };
 use switchboard_dispatcher::{
-    CancelOutcome, CurrentTurnWait, DispatchContextFactory, Dispatcher, EventEmitter, OnBusy,
-    RemoveQueuedMessageError, RemovedQueuedMessage, SendOptions, SendOutcome, TurnKind,
+    CancelOutcome, CompactOptions, CurrentTurnWait, DispatchContextFactory, Dispatcher,
+    EventEmitter, OnBusy, RemoveQueuedMessageError, RemovedQueuedMessage, SendOptions, SendOutcome,
+    TurnKind,
 };
 use switchboard_harness::{
     CancelSource, ForwardedBlock, HarnessAdapter, MessageId, TurnOutcome,
@@ -3967,8 +3968,26 @@ pub async fn compact_agent_impl(
     send_id: SendId,
     home_dir: &Path,
 ) -> Result<MessageId, AppError> {
+    compact_agent_with_impl(
+        state,
+        agent_id,
+        send_id,
+        home_dir,
+        CompactOptions::default(),
+    )
+    .await
+}
+
+/// The three gates in front of a compaction, on the agent record and the
+/// project folder alone, so a caller that must refuse before any other work
+/// (agent access, before its window round trip) can ask first. Returns the
+/// snapshot the compaction is then dispatched under.
+pub(crate) fn compaction_gates(
+    state: &AppState,
+    agent_id: AgentId,
+    home_dir: &Path,
+) -> Result<(Project, AgentRecord, u64), AppError> {
     let (project, agent, generation) = capture_dispatch_snapshot(state, agent_id)?;
-    let project_id = project.id;
     if !agent.harness.supports_manual_compaction() {
         return Err(AppError::CompactionUnsupported {
             harness: agent.harness,
@@ -3984,6 +4003,20 @@ pub async fn compact_agent_impl(
             name: agent.name.clone(),
         });
     }
+    Ok((project, agent, generation))
+}
+
+/// [`compact_agent_impl`] with the receipt's `message_id` chosen by the caller
+/// and the admission announced: the compaction another client asked for.
+pub async fn compact_agent_with_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    send_id: SendId,
+    home_dir: &Path,
+    options: CompactOptions,
+) -> Result<MessageId, AppError> {
+    let (project, agent, generation) = compaction_gates(state, agent_id, home_dir)?;
+    let project_id = project.id;
     let adapter = adapter_for(state, &agent)?;
     let factory: Arc<dyn DispatchContextFactory> = Arc::new(ProjectDispatchContextFactory::new(
         project,
@@ -4005,10 +4038,12 @@ pub async fn compact_agent_impl(
     // Same last-moment check as a send: refuse if the project moved under us
     // while the awaits above were pending.
     reject_if_generation_changed(state, project_id, generation)?;
-    // `send_id` is minted by the frontend so it can cancel the compaction while
+    // `send_id` is minted by the caller so it can cancel the compaction while
     // it is still queued, before any `TurnStart` carries the id back. Unlike a
     // send's it groups nothing — a compaction is never a fan-out.
-    Ok(state.dispatcher.compact_agent(agent_id, send_id, &factory))
+    Ok(state
+        .dispatcher
+        .compact_agent_with(agent_id, send_id, &factory, options))
 }
 
 /// Ask `agent_id`'s harness what is occupying its context window, and return the

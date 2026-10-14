@@ -880,10 +880,12 @@ async fn workflow_env() -> (TestEnv, ProjectId, Vec<AgentId>) {
     .unwrap();
     env.state.prompts.sync().await;
     let project_id = env.project("proj");
-    let agents = ["coder", "r1", "r2"]
+    let agents: Vec<AgentId> = ["coder", "r1", "r2"]
         .iter()
         .map(|n| env.agent(project_id, n))
         .collect();
+    // coder has a session, so a compaction's gates pass.
+    env.seed_claude_turn(project_id, agents[0], "seeded", "s0");
     (env, project_id, agents)
 }
 
@@ -1127,6 +1129,18 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     )
     .await;
     assert_eq!(page["text"], "ack: hi");
+    let compacted = call(
+        "compact_agent",
+        json!({ "project_id": project_id, "agent_id": coder }),
+    )
+    .await;
+    let waited = call(
+        "wait_send",
+        json!({ "project_id": project_id, "send_id": compacted["send_id"], "timeout_seconds": 10 }),
+    )
+    .await;
+    assert_eq!(waited["done"], true);
+    assert_eq!(waited["recipients"][0]["status"], "completed");
     let output = call(
         "read_agent_output",
         json!({ "project_id": project_id, "agent_id": coder }),
@@ -1667,4 +1681,119 @@ async fn live_codex_mcp_send_and_wait() {
     );
     assert_worker_was_sent_hello(&env);
     listener.stop().await;
+}
+
+/// The path from a real harness's compaction into M5's figure and the
+/// conversation's marker, driven from the in-process client: two one-word
+/// exchanges, a compaction, and the marker's figure reported by `list_agents`.
+async fn live_compact_through_the_server(harness: switchboard_core::HarnessKind) {
+    let mut env = TestEnv::live();
+    let project_id = env.project("p");
+    let agent_id = crate::commands::create_agent_in_project_impl(
+        &env.state,
+        project_id,
+        "worker",
+        harness,
+        switchboard_core::AgentSelection::default(),
+    )
+    .unwrap()
+    .id;
+    let (router, _shutdown) = in_process(&env);
+    let session = open_session(&router).await;
+    let mut id = 1;
+    let mut call = async |name: &str, args: Value| -> Value {
+        id += 1;
+        let (is_error, body) = call_in_process(&router, &session, id, name, &args).await;
+        assert!(!is_error, "{name} failed: {body}");
+        body["result"].clone()
+    };
+    for text in [
+        "Reply with only the word ack.",
+        "Reply with only the word ok.",
+    ] {
+        let receipt = call(
+            "send",
+            json!({ "project_id": project_id, "recipients": [agent_id], "text": text }),
+        )
+        .await;
+        let waited = call(
+            "wait_send",
+            json!({ "project_id": project_id, "send_id": receipt["send_id"], "timeout_seconds": 180 }),
+        )
+        .await;
+        assert_eq!(waited["done"], true, "{waited}");
+        assert_eq!(waited["recipients"][0]["status"], "completed", "{waited}");
+    }
+
+    let compacted = call(
+        "compact_agent",
+        json!({ "project_id": project_id, "agent_id": agent_id }),
+    )
+    .await;
+    let waited = call(
+        "wait_send",
+        json!({ "project_id": project_id, "send_id": compacted["send_id"], "timeout_seconds": 300 }),
+    )
+    .await;
+    assert_eq!(waited["done"], true, "{waited}");
+    assert_eq!(waited["recipients"][0]["status"], "completed", "{waited}");
+
+    let conversation = call("read_conversation", json!({ "project_id": project_id })).await;
+    assert!(
+        conversation["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["kind"] == "compacted" && uuid(&item["agent_id"]) == agent_id),
+        "the conversation shows the compaction marker: {conversation}"
+    );
+    let project = crate::ops::read::project_readonly(&env.state, project_id).unwrap();
+    let record = project
+        .list_agents()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.id == agent_id)
+        .unwrap();
+    let transcript =
+        crate::commands::load_agent_transcript(&project, &record, &env.home()).unwrap();
+    let marker_figure = transcript
+        .turns
+        .iter()
+        .filter_map(|turn| match turn {
+            switchboard_harness::Turn::System {
+                marker:
+                    switchboard_harness::SystemMarker::Compaction {
+                        context_after: Some(context),
+                        ..
+                    },
+                ..
+            } => Some(context.tokens),
+            _ => None,
+        })
+        .next_back()
+        .expect("the session file records the compacted size");
+    let agents = call("list_agents", json!({ "project_id": project_id })).await;
+    let listed = agents
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| uuid(&a["id"]) == agent_id)
+        .unwrap();
+    assert_eq!(
+        listed["context"]["used_tokens"],
+        json!(marker_figure),
+        "list_agents reports the marker's figure: {listed}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_mcp_compact() {
+    live_compact_through_the_server(switchboard_core::HarnessKind::ClaudeCode).await;
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_mcp_compact() {
+    live_compact_through_the_server(switchboard_core::HarnessKind::Codex).await;
 }

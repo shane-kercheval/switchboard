@@ -15,6 +15,7 @@ vi.mock("$lib/api", () => ({
 // module has grown a dependency it shouldn't have.
 const {
   registerSend,
+  registerAnnouncedRecipient,
   markRecipientStarted: recordStartedRecipient,
   noteProjectStates,
   recordWorkflowTerminal,
@@ -563,6 +564,60 @@ describe("workflow run terminals", () => {
 
     expect(notifyMock).toHaveBeenCalledOnce();
     expect(lastCall()[2]).toBe("switchboard: claude, never-seen");
+  });
+});
+
+describe("a send another client made", () => {
+  // The dispatcher announces such a send on each recipient's channel as it
+  // admits that recipient, so the recipient set is registered one agent at a
+  // time rather than whole.
+  const announce = (recipient: { id: AgentId; name: string }, sendId: SendId = SEND): void =>
+    registerAnnouncedRecipient(sendId, PROJECT, recipient);
+
+  it("notifies once when the project goes quiet, naming every announced recipient", () => {
+    announce({ id: A, name: "claude" });
+    markRecipientStarted(SEND, A);
+    announce({ id: B, name: "codex" });
+    markRecipientStarted(SEND, B);
+    pushBusy(true);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+    expect(notifyMock).not.toHaveBeenCalled();
+
+    settleRecipient(SEND, B, "completed");
+    settleAgentIdle(B);
+    pushBusy(false);
+    expect(notifyMock).toHaveBeenCalledOnce();
+    expect(lastCall()).toEqual([PROJECT, "Agents finished", "switchboard: claude, codex"]);
+  });
+
+  it("a repeated announcement adds no second slot to wait on", () => {
+    announce({ id: A, name: "claude" });
+    announce({ id: A, name: "claude" });
+    markRecipientStarted(SEND, A);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+    expect(notifyMock).toHaveBeenCalledOnce();
+    expect(lastCall()[1]).toBe("Agent finished");
+  });
+
+  it("joins the window's own send in the project's one notification", () => {
+    register();
+    markRecipientStarted(SEND, A);
+    announce({ id: B, name: "codex" }, SECOND_SEND);
+    markRecipientStarted(SECOND_SEND, B);
+    settleRecipient(SEND, A, "completed");
+    settleAgentIdle(A);
+    expect(notifyMock).not.toHaveBeenCalled();
+
+    settleRecipient(SECOND_SEND, B, "failed");
+    settleAgentIdle(B);
+    expect(notifyMock).toHaveBeenCalledOnce();
+    expect(lastCall()).toEqual([
+      PROJECT,
+      "Agents finished, some failed",
+      "switchboard: claude, codex",
+    ]);
   });
 });
 

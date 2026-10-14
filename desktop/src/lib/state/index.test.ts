@@ -2328,6 +2328,62 @@ describe("send_accepted (a send another client made)", () => {
     };
   }
 
+  it("notifies when the project goes quiet, as the window's own send does", async () => {
+    const state = await loadState();
+    const tracker = await import("./sendCompletion");
+    tracker._testing.reset();
+    await state.registerAgent(agentRecord(AGENT_A, "claude"));
+    invokeMock.mockClear();
+    const notified = (): unknown[] =>
+      invokeMock.mock.calls.filter((c) => c[0] === "notify").map((c) => c[1]);
+
+    fireTo(`agent:${AGENT_A}`, accepted());
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: ORCHESTRATOR_MESSAGE,
+      send_id: ORCHESTRATOR_SEND,
+      started_at: "2026-05-16T00:00:03Z",
+    } as NormalizedEvent);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:09Z",
+    } as NormalizedEvent);
+    expect(notified()).toEqual([]);
+
+    fireTo(`agent:${AGENT_A}`, { type: "agent_idle", agent_id: AGENT_A });
+    expect(notified()).toEqual([
+      { projectId: agentRecord(AGENT_A).project_id, title: "Agent finished", body: "claude" },
+    ]);
+  });
+
+  it("a compaction another client asked for raises no notification, as the Compact button's does not", async () => {
+    const state = await loadState();
+    const tracker = await import("./sendCompletion");
+    tracker._testing.reset();
+    await state.registerAgent(agentRecord(AGENT_A));
+    invokeMock.mockClear();
+
+    fireTo(`agent:${AGENT_A}`, acceptedCompaction());
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: COMPACTION_TURN,
+      message_id: COMPACTION_MESSAGE,
+      send_id: COMPACTION_SEND,
+      started_at: "2026-05-16T00:00:03Z",
+    });
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: COMPACTION_TURN,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:09Z",
+    });
+    fireTo(`agent:${AGENT_A}`, { type: "agent_idle", agent_id: AGENT_A });
+    expect(invokeMock.mock.calls.some((c) => c[0] === "notify")).toBe(false);
+  });
+
   it("a compaction another client asked for gets the compaction entry and no user row", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));

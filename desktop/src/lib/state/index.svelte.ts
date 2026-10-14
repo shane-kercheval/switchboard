@@ -64,6 +64,7 @@ import {
 } from "./reducers";
 import {
   markRecipientStarted,
+  registerAnnouncedRecipient,
   settleAgentIdle,
   settleAgentsRemoved,
   settleRecipient,
@@ -256,6 +257,15 @@ const listenerRegistry = new Map<AgentId, UnlistenFn>();
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const agentHarness = new Map<AgentId, HarnessKind>();
 
+/// Each registered agent's project and display name, for registering a send
+/// another client made with the completion tracker as its announcement arrives.
+/// The compose bar passes both for its own sends; an announcement carries
+/// neither, and the roster that knows them imports this module. Written on
+/// every `registerAgent` call, including the no-op ones for an agent already
+/// registered, so a rename reaches it with the next roster pass.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const agentIdentity = new Map<AgentId, { projectId: ProjectId; name: string }>();
+
 /// In-flight `registerAgent` promises, keyed by `agent_id`. Without this
 /// map, two overlapping `registerAgent` calls for the same agent both
 /// pass the `listenerRegistry.has` check before either reaches the post-
@@ -403,6 +413,7 @@ function recordRestoredUsage(agentId: AgentId, hydrate: Required<Hydrate>): void
 /// and a freshly-created agent that's also in `list_agents()` would
 /// otherwise double-register.
 export async function registerAgent(agent: AgentRecord): Promise<void> {
+  agentIdentity.set(agent.id, { projectId: agent.project_id, name: agent.name });
   if (listenerRegistry.has(agent.id)) return;
   const pending = pendingRegistrations.get(agent.id);
   if (pending !== undefined) return pending;
@@ -560,8 +571,11 @@ function addPendingUserTurn(
 /// send's later `user_message` derives, so that event finds it rather than
 /// adding a second; the entry carries the receipt, so `turn_start`,
 /// `message_cancelled`, and `message_failed` resolve this send and never the
-/// window's own pending one. Not registered with the completion tracker: the
-/// user did not send it, so it raises no notification.
+/// window's own pending one. Registered with the completion tracker as the
+/// compose bar registers its own, one recipient per announcement, so the
+/// project's quiet-down notification covers it: whoever sent the message, the
+/// user is the one waiting for the project to go quiet. A compaction is not
+/// registered, as the Compact button's is not.
 function admitAnnouncedSend(
   runtime: AgentRuntime,
   event: Extract<NormalizedEvent, { type: "send_accepted" }>,
@@ -572,6 +586,18 @@ function admitAnnouncedSend(
   }
   const userTurnId = backendUserTurnId(event.send_id, runtime.agent_id);
   if ((transcripts[runtime.agent_id] ?? []).some((t) => t.turn_id === userTurnId)) return;
+  const identity = agentIdentity.get(runtime.agent_id);
+  if (identity === undefined) {
+    console.error("[switchboard] send announced to an agent with no identity", {
+      agent_id: runtime.agent_id,
+      send_id: event.send_id,
+    });
+  } else {
+    registerAnnouncedRecipient(event.send_id, identity.projectId, {
+      id: runtime.agent_id,
+      name: identity.name,
+    });
+  }
   addPendingUserTurn(
     runtime,
     userTurnId,
@@ -948,6 +974,7 @@ export function unregisterAgents(agentIds: AgentId[]): void {
     }
     pendingRegistrations.delete(agentId);
     agentHarness.delete(agentId);
+    agentIdentity.delete(agentId);
     clearHeartbeat(agentId);
     delete transcripts[agentId];
     delete runtimes[agentId];

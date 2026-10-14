@@ -763,6 +763,13 @@ describe("SettingsView", () => {
   it("previews and copies the workflow authoring prompt", async () => {
     render(SettingsView, { props: { onClose: vi.fn(), initialSection: "workflows" } });
 
+    const help = screen.getByRole("button", { name: "How to create and run workflows" });
+    expect(help).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("workflow-authoring-copy")).not.toBeVisible();
+    expect(screen.getByTestId("workflows-open")).toBeVisible();
+    await fireEvent.click(help);
+    expect(screen.getByTestId("workflow-authoring-copy")).toBeVisible();
+
     const toggle = screen.getByTestId("workflow-authoring-toggle");
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByTestId("workflow-authoring-prompt")).not.toBeInTheDocument();
@@ -859,8 +866,13 @@ describe("SettingsView — notifications", () => {
     // impossible when it is actually a macOS setting.
     render(SettingsView, { props: { onClose: vi.fn(), initialSection: "notifications" } });
     const section = screen.getByTestId("notification-prefs");
-    expect(within(section).getByText(/the project on screen never notifies/i)).toBeInTheDocument();
-    expect(within(section).getByText(/System Settings → Notifications/i)).toBeInTheDocument();
+    const help = within(section).getByRole("button", { name: "How notifications work" });
+    expect(within(section).getByText(/System Settings → Notifications/i)).not.toBeVisible();
+    await fireEvent.click(help);
+    expect(
+      within(section).getByText(/The project on screen only notifies when reading mode is on/i),
+    ).toBeVisible();
+    expect(within(section).getByText(/System Settings → Notifications/i)).toBeVisible();
   });
 
   it("toggle reflects the stored preference and persists a flip", async () => {

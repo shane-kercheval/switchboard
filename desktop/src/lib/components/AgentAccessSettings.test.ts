@@ -62,6 +62,12 @@ beforeEach(() => {
   });
 });
 
+async function openClientSetup(): Promise<void> {
+  for (const name of ["Claude Code", "Codex", "Claude Desktop"]) {
+    await fireEvent.click(await screen.findByRole("button", { name: `Connect ${name}` }));
+  }
+}
+
 describe("AgentAccessSettings", () => {
   it("starts off with no token and no client configuration", async () => {
     render(AgentAccessSettings);
@@ -88,6 +94,14 @@ describe("AgentAccessSettings", () => {
     await fireEvent.click(screen.getByTestId("agent-access-token-reveal"));
     expect(screen.getByTestId("agent-access-token")).toHaveTextContent(TOKEN);
 
+    expect(screen.getByTestId("agent-access-claude-code")).not.toBeVisible();
+    expect(screen.getByTestId("agent-access-codex")).not.toBeVisible();
+    expect(screen.getByTestId("agent-access-claude-desktop")).not.toBeVisible();
+    await openClientSetup();
+    expect(screen.getByTestId("agent-access-claude-code")).toBeVisible();
+    expect(screen.getByTestId("agent-access-codex")).toBeVisible();
+    expect(screen.getByTestId("agent-access-claude-desktop")).toBeVisible();
+
     expect(screen.getByTestId("agent-access-claude-code")).toHaveTextContent(
       `claude mcp add --transport http switchboard http://127.0.0.1:47822/mcp --header "Authorization: Bearer ${TOKEN}"`,
     );
@@ -105,7 +119,7 @@ describe("AgentAccessSettings", () => {
   it("tells Codex users to keep the token in a private file and Claude Code users to remove before re-adding", async () => {
     backend = listening();
     render(AgentAccessSettings);
-    await waitFor(() => screen.getByTestId("agent-access-codex-token-file"));
+    await openClientSetup();
     expect(screen.getByTestId("agent-access-codex-token-file")).toHaveTextContent(
       "chmod 600 ~/.switchboard-token",
     );
@@ -166,7 +180,7 @@ describe("AgentAccessSettings", () => {
   it("regenerating shows the new token in every client's configuration", async () => {
     backend = listening();
     render(AgentAccessSettings);
-    await waitFor(() => screen.getByTestId("agent-access-regenerate"));
+    await openClientSetup();
     await fireEvent.click(screen.getByTestId("agent-access-regenerate"));
     await fireEvent.click(screen.getByTestId("agent-access-token-reveal"));
     await waitFor(() =>
@@ -182,7 +196,7 @@ describe("AgentAccessSettings", () => {
   it("keeps the token off the screen until Show, while every Copy button copies it", async () => {
     backend = listening();
     const { container } = render(AgentAccessSettings);
-    await waitFor(() => screen.getByTestId("agent-access-clients"));
+    await openClientSetup();
 
     expect(container.textContent).not.toContain(TOKEN);
     for (const id of [

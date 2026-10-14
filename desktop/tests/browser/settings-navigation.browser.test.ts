@@ -54,6 +54,27 @@ for (const width of [760, 1100]) {
       }
     }
 
+    await navigation.getByRole("button", { name: "Notifications", exact: true }).click();
+    const help = page.getByRole("button", { name: "How reading mode works", exact: true });
+    const details = document.getElementById(help.element().getAttribute("aria-controls")!)!;
+    const notifications = page.getByTestId("settings-panel-notifications").element() as HTMLElement;
+    const content = notifications.firstElementChild!;
+    const collapsedHeight = content.getBoundingClientRect().height;
+    expect(details.getBoundingClientRect().height).toBe(0);
+    await expect.element(page.getByTestId("auto-reading-mode-toggle")).toBeVisible();
+    (help.element() as HTMLButtonElement).focus();
+    await userEvent.keyboard("{Enter}");
+    await expect.element(help).toHaveAttribute("aria-expanded", "true");
+    await expect.poll(() => details.getBoundingClientRect().height).toBeGreaterThan(0);
+    expect(content.getBoundingClientRect().height).toBeGreaterThan(collapsedHeight);
+    expect(navigation.element().getBoundingClientRect().top).toBe(initialTop);
+    await navigation.getByRole("button", { name: "General", exact: true }).click();
+    await navigation.getByRole("button", { name: "Notifications", exact: true }).click();
+    await expect.element(help).toHaveAttribute("aria-expanded", "true");
+    (help.element() as HTMLButtonElement).focus();
+    await userEvent.keyboard(" ");
+    await expect.poll(() => details.getBoundingClientRect().height).toBe(0);
+
     const accessButton = navigation.getByRole("button", { name: "Agent MCP Server", exact: true });
     (accessButton.element() as HTMLButtonElement).focus();
     await expect.element(accessButton).toHaveFocus();

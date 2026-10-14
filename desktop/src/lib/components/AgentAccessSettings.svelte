@@ -7,6 +7,7 @@
   import Button from "$lib/components/ui/Button.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import Input from "$lib/components/ui/Input.svelte";
+  import Disclosure from "$lib/components/ui/Disclosure.svelte";
   import Switch from "$lib/components/ui/Switch.svelte";
   import {
     agentAccessStatus,
@@ -189,7 +190,7 @@
 
   {#if snippets}
     <div class="space-y-3" data-testid="agent-access-clients">
-      <div class="space-y-1.5">
+      <Disclosure id="agent-access-claude-code-setup" label="Connect Claude Code">
         <div class="flex items-center justify-between gap-2">
           <div class="text-fg text-sm font-medium">Claude Code</div>
           <CopyButton
@@ -213,9 +214,9 @@
           <span class="font-mono">claude mcp remove switchboard --scope local</span> in that folder first:
           adding a name that already exists fails.
         </p>
-      </div>
+      </Disclosure>
 
-      <div class="space-y-1.5">
+      <Disclosure id="agent-access-codex-setup" label="Connect Codex">
         <div class="flex items-center justify-between gap-2">
           <div class="text-fg text-sm font-medium">Codex</div>
           <CopyButton
@@ -257,9 +258,9 @@
           Codex ends any tool call after 300 seconds. To let one wait longer, add
           <span class="font-mono">tool_timeout_sec = 900</span> to the block.
         </p>
-      </div>
+      </Disclosure>
 
-      <div class="space-y-1.5">
+      <Disclosure id="agent-access-claude-desktop-setup" label="Connect Claude Desktop">
         <div class="flex items-center justify-between gap-2">
           <div class="text-fg text-sm font-medium">Claude Desktop</div>
           <CopyButton
@@ -280,7 +281,7 @@
           needs both spelled out. It works in Chat and in Code with the Local environment; Code in
           the cloud can't reach your Mac.
         </p>
-      </div>
+      </Disclosure>
     </div>
   {:else}
     <p class="text-muted text-xs leading-relaxed">

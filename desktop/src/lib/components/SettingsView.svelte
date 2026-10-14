@@ -16,6 +16,7 @@
   import HarnessStatusList from "$lib/components/HarnessStatusList.svelte";
   import AgentSelectionEditor from "$lib/components/AgentSelectionEditor.svelte";
   import Input from "$lib/components/ui/Input.svelte";
+  import Disclosure from "$lib/components/ui/Disclosure.svelte";
   import Switch from "$lib/components/ui/Switch.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -466,18 +467,8 @@
           <h2 class={sectionHeadingClass}>Browser access</h2>
           <p class="text-muted mt-1 text-sm leading-relaxed">
             Claude agents can work in Chrome — opening pages, reading console errors, filling forms,
-            checking a page you just changed. They act in a visible window and share your existing
-            logins, so they reach anything you're already signed in to.
-          </p>
-          <p class="text-muted mt-2 text-sm leading-relaxed">
-            This needs the <span class="text-fg">Claude in Chrome</span> extension installed, and a Claude
-            Pro, Max, Team, or Enterprise plan. Switchboard can't tell whether the extension is there
-            — if it isn't, agents run normally and simply report that the browser is unavailable when
-            they try to use it.
-          </p>
-          <p class="text-muted mt-2 text-sm leading-relaxed">
-            Codex's browser access is separate and is configured in the ChatGPT desktop app. This
-            setting doesn't affect it.
+            checking a page you just changed. Requires the Claude in Chrome extension. Agents share
+            your existing logins, so they reach anything you're already signed in to.
           </p>
         </div>
 
@@ -493,15 +484,6 @@
               Changes take effect on each agent's next turn. A turn already running keeps browser
               access until it finishes — cancel it to stop sooner.
             </p>
-            <p class="text-muted mt-1 text-xs leading-relaxed">
-              Browser tools are loaded on every Claude turn while this is on, which uses a little
-              context whether or not the agent reaches for them.
-            </p>
-            <p class="text-muted mt-1 text-xs leading-relaxed">
-              If more than one browser is connected to your Claude account, the first agent that
-              needs the browser will ask which one to use. Answer it once and the choice is
-              remembered.
-            </p>
           </div>
           <Switch
             checked={preferences.claude_chrome_enabled}
@@ -512,6 +494,27 @@
               void updatePreferences({ claude_chrome_enabled: !preferences.claude_chrome_enabled })}
           />
         </div>
+
+        <Disclosure id="browser-access-help" label="Chrome setup and usage details">
+          <p class="text-muted mt-2 text-sm leading-relaxed">
+            This needs the <span class="text-fg">Claude in Chrome</span> extension installed, and a Claude
+            Pro, Max, Team, or Enterprise plan. Switchboard can't tell whether the extension is there
+            — if it isn't, agents run normally and simply report that the browser is unavailable when
+            they try to use it.
+          </p>
+          <p class="text-muted mt-2 text-sm leading-relaxed">
+            Codex's browser access is separate and is configured in the ChatGPT desktop app. This
+            setting doesn't affect it.
+          </p>
+          <p class="text-muted mt-1 text-xs leading-relaxed">
+            Browser tools are loaded on every Claude turn while this is on, which uses a little
+            context whether or not the agent reaches for them.
+          </p>
+          <p class="text-muted mt-1 text-xs leading-relaxed">
+            If more than one browser is connected to your Claude account, the first agent that needs
+            the browser will ask which one to use. Answer it once and the choice is remembered.
+          </p>
+        </Disclosure>
 
         {#if saveFailedFor("claude_chrome_enabled")}
           <p
@@ -536,17 +539,8 @@
         <div>
           <h2 class={sectionHeadingClass}>Notifications</h2>
           <p class="text-muted mt-1 text-sm leading-relaxed">
-            Switchboard can post a macOS notification when your agents finish — after every
-            recipient has responded and any work queued behind it has also finished, and when a
-            workflow run reaches its end.
-          </p>
-          <p class="text-muted mt-2 text-sm leading-relaxed">
-            While you're working in Switchboard, the project on screen never notifies. Other
-            projects stay quiet too, unless you turn on the setting below.
-          </p>
-          <p class="text-muted mt-2 text-sm leading-relaxed">
-            Whether a notification appears as a banner, plays a sound, or both is set in System
-            Settings → Notifications → Applications → Switchboard.
+            Get a macOS notification when a project's agents and queued work finish, or a workflow
+            ends.
           </p>
         </div>
 
@@ -554,12 +548,7 @@
           <div class="min-w-0">
             <div class="text-fg text-sm">Notify me when agents finish</div>
             <p class="text-muted mt-0.5 text-xs leading-relaxed">
-              Turn this off to stop all notifications, including the sound. {shortcut(
-                "mod",
-                "shift",
-                "M",
-              )} does the same from anywhere; while they're off, a crossed-out bell in the header turns
-              them back on.
+              Turn this off to stop all notifications, including sound.
             </p>
           </div>
           <Switch
@@ -582,11 +571,7 @@
               this on to get a notification too.
             </p>
             <p class="text-muted mt-1 text-xs leading-relaxed">
-              This also covers the project you're looking at while <span class="text-fg"
-                >reading mode</span
-              >
-              is on for it — reading mode asks Switchboard to treat you as though you weren't there, so
-              its completion notification follows this setting instead of being skipped.
+              Also applies to the project on screen when reading mode is on.
             </p>
           </div>
           <Switch
@@ -598,6 +583,27 @@
               void updatePreferences({ notify_while_focused: !preferences.notify_while_focused })}
           />
         </div>
+
+        <Disclosure id="notification-help" label="How notifications work">
+          <p class="text-muted mt-1 text-sm leading-relaxed">
+            Switchboard can post a macOS notification when your agents finish — after every
+            recipient has responded and any work queued behind it has also finished, and when a
+            workflow run reaches its end.
+          </p>
+          <p class="text-muted mt-2 text-sm leading-relaxed">
+            While you're using Switchboard, notifications require “Also notify me about other
+            projects while I'm using Switchboard” to be on. The project on screen only notifies when
+            reading mode is on.
+          </p>
+          <p class="text-muted mt-2 text-sm leading-relaxed">
+            Whether a notification appears as a banner, plays a sound, or both is set in System
+            Settings → Notifications → Applications → Switchboard.
+          </p>
+          <p>
+            Press {shortcut("mod", "shift", "M")} to toggle notifications from anywhere. While they're
+            off, a crossed-out bell in the header turns them back on.
+          </p>
+        </Disclosure>
 
         {#if saveFailedFor("notify_on_completion", "notify_while_focused")}
           <p class="text-status-failed text-xs leading-relaxed" data-testid="notify-save-error">
@@ -619,17 +625,8 @@
           <div class="min-w-0">
             <div class="text-fg text-sm">Turn on reading mode automatically when I send</div>
             <p class="text-muted mt-0.5 text-xs leading-relaxed">
-              Every message you send — and every workflow you start — puts that project into
-              <span class="text-fg">reading mode</span>, exactly as if you'd pressed the
-              reading-mode button yourself: the compose box hides until the project finishes, and
-              the project's completion notifies you like any other project's. Reading mode turns
-              itself off when the project goes quiet.
-            </p>
-            <p class="text-muted mt-1 text-xs leading-relaxed">
-              To send a follow-up while agents are still working, leave reading mode first — click
-              the highlighted reading-mode button in the pane header, or press ⌘⇧R. And while you're
-              working in Switchboard, the completion alert only arrives if “Also notify me about
-              other projects while I'm using Switchboard” is on in Notifications.
+              Hide the compose box after sending a message or starting a workflow, until the project
+              finishes.
             </p>
           </div>
           <Switch
@@ -641,6 +638,22 @@
               void updatePreferences({ auto_reading_mode: !preferences.auto_reading_mode })}
           />
         </div>
+
+        <Disclosure id="reading-mode-help" label="How reading mode works">
+          <p class="text-muted mt-0.5 text-xs leading-relaxed">
+            Every message you send — and every workflow you start — puts that project into
+            <span class="text-fg">reading mode</span>, exactly as if you'd pressed the reading-mode
+            button yourself: the compose box hides until the project finishes, and the project's
+            completion notifies you like any other project's. Reading mode turns itself off when the
+            project goes quiet.
+          </p>
+          <p class="text-muted mt-1 text-xs leading-relaxed">
+            To send a follow-up while agents are still working, leave reading mode first — click the
+            highlighted reading-mode button in the pane header, or press ⌘⇧R. And while you're
+            working in Switchboard, the completion alert only arrives if “Also notify me about other
+            projects while I'm using Switchboard” is on in Notifications.
+          </p>
+        </Disclosure>
 
         {#if saveFailedFor("auto_reading_mode")}
           <p
@@ -792,9 +805,7 @@
         <div>
           <h2 class={sectionHeadingClass}>Workflows</h2>
           <p class="text-muted mt-1 text-sm leading-relaxed">
-            Your workflows are user-global — the same set is available in every project. Drop YAML
-            files in this folder (or use “Copy to my workflows” on a built-in), then invoke them
-            from the compose bar's <span class="font-medium">Workflow</span> button.
+            Your workflows are available in every project on this Mac.
           </p>
         </div>
         <div
@@ -851,55 +862,61 @@
           </Tooltip>
         </div>
 
-        <div
-          class="border-border bg-panel overflow-hidden rounded-md border"
-          data-testid="workflow-authoring"
-        >
-          <div class="flex items-start gap-2 p-2.5">
-            <button
-              type="button"
-              class="focus-visible:ring-focus flex min-w-0 flex-1 items-start gap-2 rounded-sm text-left outline-none focus-visible:ring-1"
-              aria-expanded={workflowPromptOpen}
-              aria-controls="workflow-authoring-prompt"
-              data-testid="workflow-authoring-toggle"
-              onclick={() => (workflowPromptOpen = !workflowPromptOpen)}
-            >
-              <ChevronRight
-                size={15}
-                strokeWidth={1.8}
-                aria-hidden="true"
-                class={cn(
-                  "text-muted mt-0.5 shrink-0 transition-transform",
-                  workflowPromptOpen && "rotate-90",
-                )}
-              />
-              <span class="min-w-0">
-                <span class="text-fg block text-sm font-medium">Create with an AI agent</span>
-                <span class="text-muted mt-0.5 block text-xs leading-relaxed">
-                  Copy this prompt into a coding agent to create a custom workflow.
+        <Disclosure id="workflow-help" label="How to create and run workflows">
+          <p class="text-muted mt-1 text-sm leading-relaxed">
+            Add YAML files to the folder above, or use “Copy to my workflows” on a built-in. Run
+            them from the compose bar's <span class="font-medium">Workflow</span> button.
+          </p>
+          <div
+            class="border-border bg-panel overflow-hidden rounded-md border"
+            data-testid="workflow-authoring"
+          >
+            <div class="flex items-start gap-2 p-2.5">
+              <button
+                type="button"
+                class="focus-visible:ring-focus flex min-w-0 flex-1 items-start gap-2 rounded-sm text-left outline-none focus-visible:ring-1"
+                aria-expanded={workflowPromptOpen}
+                aria-controls="workflow-authoring-prompt"
+                data-testid="workflow-authoring-toggle"
+                onclick={() => (workflowPromptOpen = !workflowPromptOpen)}
+              >
+                <ChevronRight
+                  size={15}
+                  strokeWidth={1.8}
+                  aria-hidden="true"
+                  class={cn(
+                    "text-muted mt-0.5 shrink-0 transition-transform",
+                    workflowPromptOpen && "rotate-90",
+                  )}
+                />
+                <span class="min-w-0">
+                  <span class="text-fg block text-sm font-medium">Create with an AI agent</span>
+                  <span class="text-muted mt-0.5 block text-xs leading-relaxed">
+                    Copy this prompt into a coding agent to create a custom workflow.
+                  </span>
                 </span>
-              </span>
-            </button>
-            <Tooltip label="Copy Prompt" side="top">
-              {#snippet trigger(props)}
-                <span {...props} class="shrink-0">
-                  <CopyButton
-                    text={workflowPrompt}
-                    label="Copy workflow authoring prompt"
-                    testid="workflow-authoring-copy"
-                  />
-                </span>
-              {/snippet}
-            </Tooltip>
-          </div>
+              </button>
+              <Tooltip label="Copy Prompt" side="top">
+                {#snippet trigger(props)}
+                  <span {...props} class="shrink-0">
+                    <CopyButton
+                      text={workflowPrompt}
+                      label="Copy workflow authoring prompt"
+                      testid="workflow-authoring-copy"
+                    />
+                  </span>
+                {/snippet}
+              </Tooltip>
+            </div>
 
-          {#if workflowPromptOpen}
-            <pre
-              id="workflow-authoring-prompt"
-              data-testid="workflow-authoring-prompt"
-              class="border-border bg-surface text-fg max-h-80 overflow-auto border-t px-3 py-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">{workflowPrompt}</pre>
-          {/if}
-        </div>
+            {#if workflowPromptOpen}
+              <pre
+                id="workflow-authoring-prompt"
+                data-testid="workflow-authoring-prompt"
+                class="border-border bg-surface text-fg max-h-80 overflow-auto border-t px-3 py-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">{workflowPrompt}</pre>
+            {/if}
+          </div>
+        </Disclosure>
       </section>
     </div>
   </div>

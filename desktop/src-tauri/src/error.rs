@@ -203,7 +203,7 @@ pub enum AppError {
     ResumeUnavailable,
 
     #[error(
-        "unsupported terminal app {terminal_app:?} — choose Terminal or iTerm in Settings → External apps"
+        "unsupported terminal app {terminal_app:?} — choose Terminal or iTerm in Settings → General → External Apps"
     )]
     UnsupportedTerminalApp { terminal_app: String },
 

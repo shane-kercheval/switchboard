@@ -28,7 +28,7 @@
   <div
     {id}
     hidden={!expanded}
-    class="border-border text-muted space-y-3 border-t px-3 py-3 text-xs leading-relaxed"
+    class="border-border text-muted space-y-3 border-t px-3 py-3 text-sm leading-relaxed"
   >
     {@render children()}
   </div>

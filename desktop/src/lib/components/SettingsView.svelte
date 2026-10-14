@@ -44,10 +44,8 @@
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
   import { promptAuthoringPrompt } from "$lib/promptAuthoring";
 
-  let {
-    onClose,
-    initialSection = null,
-  }: { onClose: () => void; initialSection?: SettingsSection | null } = $props();
+  let { onClose, section = null }: { onClose: () => void; section?: SettingsSection | null } =
+    $props();
   // What macOS will actually do, as opposed to what the toggle below says. Only
   // the suppressed case is surfaced; `unavailable` (a dev build that isn't an
   // installed app) earns its place by *not* rendering that warning, since
@@ -57,7 +55,7 @@
   let promptsDirError = $state<string | null>(null);
   let workflowsDir = $state<string | null>(null);
   let workflowsDirError = $state<string | null>(null);
-  const activeSection = $derived(initialSection ?? "general");
+  const activeSection = $derived(section ?? "general");
   let agentDefaultDrafts = $state<Partial<Record<HarnessKind, AgentSelection>>>({});
   const workflowPrompt = $derived(workflowAuthoringPrompt(workflowsDir));
   const localPromptInstructions = $derived(promptAuthoringPrompt(promptsDir));
@@ -99,6 +97,7 @@
     { action: "Toggle Agents / Pins sidebar", keys: ["⌘", "⌥", "P"] },
     { action: "Toggle both sidebars", keys: ["⌘", "⌥", "B"] },
     { action: "Toggle settings", keys: ["⌘", ","] },
+    { action: "Toggle notifications", keys: ["⌘", "⇧", "M"] },
     {
       action: "Toggle a compose recipient",
       keys: ["⌘", "1–9"],
@@ -525,21 +524,21 @@
         </div>
 
         <Disclosure id="browser-access-help" label="Chrome setup and usage details">
-          <p class="text-muted mt-2 text-sm leading-relaxed">
+          <p>
             This needs the <span class="text-fg">Claude in Chrome</span> extension installed, and a Claude
             Pro, Max, Team, or Enterprise plan. Switchboard can't tell whether the extension is there
             — if it isn't, agents run normally and simply report that the browser is unavailable when
             they try to use it.
           </p>
-          <p class="text-muted mt-2 text-sm leading-relaxed">
+          <p>
             Codex's browser access is separate and is configured in the ChatGPT desktop app. This
             setting doesn't affect it.
           </p>
-          <p class="text-muted mt-1 text-xs leading-relaxed">
+          <p>
             Browser tools are loaded on every Claude turn while this is on, which uses a little
             context whether or not the agent reaches for them.
           </p>
-          <p class="text-muted mt-1 text-xs leading-relaxed">
+          <p>
             If more than one browser is connected to your Claude account, the first agent that needs
             the browser will ask which one to use. Answer it once and the choice is remembered.
           </p>
@@ -614,17 +613,17 @@
         </div>
 
         <Disclosure id="notification-help" label="How notifications work">
-          <p class="text-muted mt-1 text-sm leading-relaxed">
+          <p>
             Switchboard can post a macOS notification when your agents finish — after every
             recipient has responded and any work queued behind it has also finished, and when a
             workflow run reaches its end.
           </p>
-          <p class="text-muted mt-2 text-sm leading-relaxed">
+          <p>
             While you're using Switchboard, notifications require “Also notify me about other
             projects while I'm using Switchboard” to be on. The project on screen only notifies when
             reading mode is on.
           </p>
-          <p class="text-muted mt-2 text-sm leading-relaxed">
+          <p>
             Whether a notification appears as a banner, plays a sound, or both is set in System
             Settings → Notifications → Applications → Switchboard.
           </p>
@@ -669,14 +668,14 @@
         </div>
 
         <Disclosure id="reading-mode-help" label="How reading mode works">
-          <p class="text-muted mt-0.5 text-xs leading-relaxed">
+          <p>
             Every message you send — and every workflow you start — puts that project into
             <span class="text-fg">reading mode</span>, exactly as if you'd pressed the reading-mode
             button yourself: the compose box hides until the project finishes, and the project's
             completion notifies you like any other project's. Reading mode turns itself off when the
             project goes quiet.
           </p>
-          <p class="text-muted mt-1 text-xs leading-relaxed">
+          <p>
             To send a follow-up while agents are still working, leave reading mode first — click the
             highlighted reading-mode button in the pane header, or press ⌘⇧R. And while you're
             working in Switchboard, the completion alert only arrives if “Also notify me about other
@@ -798,9 +797,7 @@
           <div class="flex items-start gap-2 py-2.5">
             <div class="min-w-0 flex-1">
               <h3 class="text-fg text-sm font-medium">Create with an AI agent</h3>
-              <p class="text-muted mt-0.5 text-xs leading-relaxed">
-                Copy these instructions into a coding agent to create a prompt for your task.
-              </p>
+              <p>Copy these instructions into a coding agent to create a prompt for your task.</p>
             </div>
             <Tooltip label="Copy Prompt" side="top">
               {#snippet trigger(props)}
@@ -930,7 +927,7 @@
         </div>
 
         <Disclosure id="workflow-help" label="How to create and run workflows">
-          <p class="text-muted mt-1 text-sm leading-relaxed">
+          <p>
             Add YAML files to the folder above, or use “Copy to my workflows” on a built-in. Run
             them from the compose bar's <span class="font-medium">Workflow</span> button.
           </p>
@@ -938,9 +935,7 @@
             <div class="flex items-start gap-2 py-2.5">
               <div class="min-w-0 flex-1">
                 <h3 class="text-fg text-sm font-medium">Create with an AI agent</h3>
-                <p class="text-muted mt-0.5 text-xs leading-relaxed">
-                  Copy this prompt into a coding agent to create a custom workflow.
-                </p>
+                <p>Copy this prompt into a coding agent to create a custom workflow.</p>
               </div>
               <Tooltip label="Copy Prompt" side="top">
                 {#snippet trigger(props)}
@@ -1001,15 +996,15 @@
         <h2 class={sectionHeadingClass}>Shortcuts</h2>
 
         <div>
-          {#each shortcuts as shortcut (shortcut.action)}
+          {#each shortcuts as entry (entry.action)}
             <div class="flex min-h-11 items-center justify-between gap-4 py-2">
               <div class="text-fg text-sm" data-testid="shortcut-action">
-                {shortcut.action}{#if shortcut.note}<span class="text-muted ml-1 text-xs"
-                    >({shortcut.note})</span
+                {entry.action}{#if entry.note}<span class="text-muted ml-1 text-xs"
+                    >({entry.note})</span
                   >{/if}
               </div>
               <div class="flex items-center gap-1">
-                {#each shortcut.keys as key, index (`${shortcut.action}-${index}`)}
+                {#each entry.keys as key, index (`${entry.action}-${index}`)}
                   <kbd
                     class="border-border bg-raised text-muted flex h-6 min-w-6 items-center justify-center rounded border px-1.5 font-mono text-[11px] font-medium"
                   >

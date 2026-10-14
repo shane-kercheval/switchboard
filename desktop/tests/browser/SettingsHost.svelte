@@ -15,7 +15,7 @@
     {/snippet}
     {#snippet center()}
       <div class="h-11 shrink-0">Settings</div>
-      <SettingsView initialSection={section} onClose={() => {}} />
+      <SettingsView {section} onClose={() => {}} />
     {/snippet}
   </AppShell>
 </div>

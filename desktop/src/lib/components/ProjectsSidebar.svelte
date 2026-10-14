@@ -72,7 +72,6 @@
     onProjectSelect,
     onToggleSidebar,
     onLocateFolder,
-    settingsOpen = false,
   }: {
     onAddProject: () => void;
     onOpenSettings: () => void;
@@ -82,7 +81,6 @@
     /// folder picker, the pending/error state) so the banner and this menu can't
     /// drift; the row only asks for it.
     onLocateFolder: (project: ProjectListing) => void;
-    settingsOpen?: boolean;
   } = $props();
 
   function cancelAllForProject(projectId: string): void {
@@ -454,12 +452,7 @@
     data-tauri-drag-region
     use:windowDragRegion
   >
-    <SettingsButton
-      pressed={settingsOpen}
-      testid="settings-button"
-      class="hover:bg-raised"
-      onclick={onOpenSettings}
-    />
+    <SettingsButton testid="settings-button" class="hover:bg-raised" onclick={onOpenSettings} />
     <SidebarToggleButton
       side="left"
       expanded={true}

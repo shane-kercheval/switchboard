@@ -4839,6 +4839,18 @@ describe("App", () => {
     );
   });
 
+  it("opens Notifications from the reading-mode hint after visiting another settings page", async (): Promise<void> => {
+    await openProjectAlpha();
+    await fireEvent.click(screen.getByTestId("settings-button"));
+    await fireEvent.click(screen.getByRole("button", { name: "Prompts" }));
+    await fireEvent.click(screen.getByTestId("settings-close"));
+    await fireEvent.click(screen.getByTestId("reading-mode-toggle"));
+    const hint = await screen.findByTestId("reading-mode-hint");
+    await fireEvent.click(within(hint).getByRole("button", { name: "Open settings" }));
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Notifications");
+    expect(screen.getByTestId("notify-while-focused-toggle")).toBeVisible();
+  });
+
   // --- notifications toggle ---
 
   /// The `notify_on_completion` value of the latest preference save, or

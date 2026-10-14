@@ -202,14 +202,14 @@
         <pre
           class="bg-raised text-fg overflow-x-auto rounded-md px-3 py-2 font-mono text-[11px] leading-relaxed break-all whitespace-pre-wrap"
           data-testid="agent-access-claude-code">{shownSnippets?.claudeCode}</pre>
-        <p class="text-muted text-xs leading-relaxed">
+        <p>
           Run this in the folder you'll orchestrate from, and choose a folder that isn't any
           project's folder. Claude Code's MCP configuration applies per folder, and the agents
           Switchboard launches run Claude Code in their project's folder, so registering it there
           would give them these tools too. For the same reason, don't add
           <span class="font-mono">--scope user</span>.
         </p>
-        <p class="text-muted text-xs leading-relaxed" data-testid="agent-access-claude-code-readd">
+        <p data-testid="agent-access-claude-code-readd">
           After regenerating the token or changing the port, run
           <span class="font-mono">claude mcp remove switchboard --scope local</span> in that folder first:
           adding a name that already exists fails.
@@ -228,7 +228,7 @@
         <pre
           class="bg-raised text-fg overflow-x-auto rounded-md px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre"
           data-testid="agent-access-codex">{shownSnippets?.codexConfig}</pre>
-        <p class="text-muted text-xs leading-relaxed">
+        <p>
           Put this in <span class="font-mono">.codex/config.toml</span> inside a folder Codex trusts
           that isn't any project's folder, not in
           <span class="font-mono">~/.codex/config.toml</span>, which every Codex agent Switchboard
@@ -244,7 +244,7 @@
             testid="agent-access-codex-env-copy"
           />
         </div>
-        <p class="text-muted text-xs leading-relaxed" data-testid="agent-access-codex-token-file">
+        <p data-testid="agent-access-codex-token-file">
           Keep that line in a file only you can read, not in your shell profile itself: a profile
           such as <span class="font-mono">~/.zshrc</span> can be read by other accounts on this Mac.
           Run
@@ -254,7 +254,7 @@
           <span class="font-mono">source ~/.switchboard-token</span> to your profile. After regenerating
           the token, update that file and open a new shell.
         </p>
-        <p class="text-muted text-xs leading-relaxed">
+        <p>
           Codex ends any tool call after 300 seconds. To let one wait longer, add
           <span class="font-mono">tool_timeout_sec = 900</span> to the block.
         </p>
@@ -272,7 +272,7 @@
         <pre
           class="bg-raised text-fg max-h-64 overflow-auto rounded-md px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre"
           data-testid="agent-access-claude-desktop">{shownSnippets?.claudeDesktop}</pre>
-        <p class="text-muted text-xs leading-relaxed">
+        <p>
           Add this to <span class="font-mono">claude_desktop_config.json</span> (Claude Desktop:
           Settings → Developer → Edit Config). Replace the two paths with yours: run
           <span class="font-mono">which npx</span> in a terminal, and use that path for

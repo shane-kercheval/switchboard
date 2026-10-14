@@ -392,8 +392,8 @@
     settingsOpen = true;
   }
 
-  function openPromptSettings(): void {
-    settingsSection = "prompts";
+  function openSettingsAt(section: SettingsSection): void {
+    settingsSection = section;
     settingsOpen = true;
   }
 
@@ -1340,7 +1340,6 @@
             onProjectSelect={() => (settingsOpen = false)}
             onToggleSidebar={() => (layout.projectsSidebarOpen = false)}
             onLocateFolder={(project) => void locateProjectFolder(project)}
-            {settingsOpen}
           />
         </div>
       {/if}
@@ -1372,11 +1371,7 @@
              has content but is collapsed. In the no-project state there's no
              sidebar at all, so neither shows — the welcome screen stays clean. -->
         {#if !settingsOpen && projectsSidebarHasContent && !layout.projectsSidebarOpen}
-          <SettingsButton
-            pressed={settingsOpen}
-            testid="settings-button"
-            onclick={toggleSettings}
-          />
+          <SettingsButton testid="settings-button" onclick={toggleSettings} />
           <SidebarToggleButton
             side="left"
             expanded={false}
@@ -1675,7 +1670,7 @@
 
       {#if seedPathUnresolved.value}
         <Banner
-          message="Couldn't finish detecting your installed CLIs, so this project may be missing an agent. Use + to add one, or open Settings → Supported CLIs and press Refresh."
+          message="Couldn't finish detecting your installed CLIs, so this project may be missing an agent. Use + to add one, or open Settings → Agents → Supported CLIs and press Refresh."
           testid="banner-seed-path-unresolved"
           onDismiss={dismissSeedPathUnresolved}
         />
@@ -1745,7 +1740,7 @@
 
       <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
         {#if settingsOpen}
-          <SettingsView onClose={closeSettings} initialSection={settingsSection} />
+          <SettingsView onClose={closeSettings} section={settingsSection} />
         {:else if view.mode === "git"}
           {#if gitViewResumePending}
             <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -1933,7 +1928,7 @@
                   agents={activeAgents}
                   focusOnMount={true}
                   focusRequest={composeFocusRequest}
-                  onConfigurePrompts={openPromptSettings}
+                  onConfigurePrompts={() => openSettingsAt("prompts")}
                 />
               {/key}
               {#if readingModeNotifyHint !== null}
@@ -1946,7 +1941,7 @@
                     <button
                       type="button"
                       class="text-accent hover:underline"
-                      onclick={openSettings}
+                      onclick={() => openSettingsAt("notifications")}
                     >
                       Open settings
                     </button>

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ChevronRight, FolderOpen } from "@lucide/svelte";
+  import { FolderOpen } from "@lucide/svelte";
   import { SETTINGS_SECTIONS, type SettingsSection } from "$lib/settingsSections";
   import { theme, type ThemeMode } from "$lib/theme.svelte";
   import { agentCopy } from "$lib/agentCopy.svelte";
@@ -56,7 +56,6 @@
   let promptsDirError = $state<string | null>(null);
   let workflowsDir = $state<string | null>(null);
   let workflowsDirError = $state<string | null>(null);
-  let workflowPromptOpen = $state(false);
   const activeSection = $derived(initialSection ?? "general");
   let agentDefaultDrafts = $state<Partial<Record<HarnessKind, AgentSelection>>>({});
   const workflowPrompt = $derived(workflowAuthoringPrompt(workflowsDir));
@@ -869,30 +868,12 @@
           </p>
           <div class="overflow-hidden" data-testid="workflow-authoring">
             <div class="flex items-start gap-2 py-2.5">
-              <button
-                type="button"
-                class="focus-visible:ring-focus flex min-w-0 flex-1 items-start gap-2 rounded-sm text-left outline-none focus-visible:ring-1"
-                aria-expanded={workflowPromptOpen}
-                aria-controls="workflow-authoring-prompt"
-                data-testid="workflow-authoring-toggle"
-                onclick={() => (workflowPromptOpen = !workflowPromptOpen)}
-              >
-                <ChevronRight
-                  size={15}
-                  strokeWidth={1.8}
-                  aria-hidden="true"
-                  class={cn(
-                    "text-muted mt-0.5 shrink-0 transition-transform",
-                    workflowPromptOpen && "rotate-90",
-                  )}
-                />
-                <span class="min-w-0">
-                  <span class="text-fg block text-sm font-medium">Create with an AI agent</span>
-                  <span class="text-muted mt-0.5 block text-xs leading-relaxed">
-                    Copy this prompt into a coding agent to create a custom workflow.
-                  </span>
-                </span>
-              </button>
+              <div class="min-w-0 flex-1">
+                <h3 class="text-fg text-sm font-medium">Create with an AI agent</h3>
+                <p class="text-muted mt-0.5 text-xs leading-relaxed">
+                  Copy this prompt into a coding agent to create a custom workflow.
+                </p>
+              </div>
               <Tooltip label="Copy Prompt" side="top">
                 {#snippet trigger(props)}
                   <span {...props} class="shrink-0">
@@ -906,12 +887,10 @@
               </Tooltip>
             </div>
 
-            {#if workflowPromptOpen}
-              <pre
-                id="workflow-authoring-prompt"
-                data-testid="workflow-authoring-prompt"
-                class="bg-raised text-fg max-h-80 overflow-auto rounded-md px-3 py-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">{workflowPrompt}</pre>
-            {/if}
+            <pre
+              id="workflow-authoring-prompt"
+              data-testid="workflow-authoring-prompt"
+              class="bg-raised text-fg max-h-80 overflow-auto rounded-md px-3 py-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">{workflowPrompt}</pre>
           </div>
         </Disclosure>
       </section>

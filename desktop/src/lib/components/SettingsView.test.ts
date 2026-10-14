@@ -766,13 +766,12 @@ describe("SettingsView", () => {
     const help = screen.getByRole("button", { name: "How to create and run workflows" });
     expect(help).toHaveAttribute("aria-expanded", "false");
     expect(screen.getByTestId("workflow-authoring-copy")).not.toBeVisible();
+    expect(screen.getByTestId("workflow-authoring-prompt")).not.toBeVisible();
     expect(screen.getByTestId("workflows-open")).toBeVisible();
     await fireEvent.click(help);
     expect(screen.getByTestId("workflow-authoring-copy")).toBeVisible();
 
-    const toggle = screen.getByTestId("workflow-authoring-toggle");
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByTestId("workflow-authoring-prompt")).not.toBeInTheDocument();
+    expect(screen.getByTestId("workflow-authoring-prompt")).toBeVisible();
 
     await waitFor(() => expect(screen.getByTestId("workflows-dir")).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId("workflow-authoring-copy"));
@@ -782,9 +781,9 @@ describe("SettingsView", () => {
     expect(copied).toContain(WORKFLOW_AUTHORING_GUIDE_URL);
     expect(copied).toContain("/Users/test/Library/Application Support/switchboard/workflows");
 
-    await fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByTestId("workflow-authoring-prompt").textContent).toBe(copied);
+    await fireEvent.click(help);
+    expect(screen.getByTestId("workflow-authoring-prompt")).not.toBeVisible();
   });
 });
 

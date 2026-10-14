@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use futures::{SinkExt, StreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use switchboard_relay::protocol::{
     ClientMessage, DeviceId, ErrorCode, PAIRING_TOKEN_LEN, RELAY_PROTOCOL, Register, Role,
     ServerMessage, token_hash,
@@ -90,7 +90,9 @@ async fn open(url: &str) -> (Socket, [u8; 32]) {
 }
 
 /// The next relay message, skipping pongs; `None` once the socket closes.
-async fn next(socket: &mut Socket) -> Option<ServerMessage> {
+async fn next(
+    socket: &mut (impl Stream<Item = Result<Message, tungstenite::Error>> + Unpin),
+) -> Option<ServerMessage> {
     loop {
         let message = tokio::time::timeout(WAIT, socket.next())
             .await
@@ -104,11 +106,17 @@ async fn next(socket: &mut Socket) -> Option<ServerMessage> {
     }
 }
 
-async fn send(socket: &mut Socket, message: &ClientMessage) {
+async fn send(
+    socket: &mut (impl Sink<Message, Error = tungstenite::Error> + Unpin),
+    message: &ClientMessage,
+) {
     send_text(socket, &serde_json::to_string(message).unwrap()).await;
 }
 
-async fn send_text(socket: &mut Socket, text: &str) {
+async fn send_text(
+    socket: &mut (impl Sink<Message, Error = tungstenite::Error> + Unpin),
+    text: &str,
+) {
     socket.send(Message::Text(text.into())).await.unwrap();
 }
 
@@ -1169,4 +1177,180 @@ async fn shutdown_closes_every_connection_with_a_close_frame_before_returning() 
         .expect("shutdown did not return")
         .unwrap()
         .unwrap();
+}
+
+/// Byte-level progress through real sockets. Linux only: elsewhere the
+/// relay leaves the kernel's unsent bytes unlimited, and the kernel reports
+/// progress too coarsely for a slow phone to be told from a stalled one.
+#[cfg(target_os = "linux")]
+mod slow_reader {
+    use std::future::Future;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicU16;
+    use std::task::{Context, Poll, ready};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::net::TcpSocket;
+    use tokio_tungstenite::client_async;
+
+    use super::*;
+
+    /// A socket that hands over at most `CHUNK` bytes a read, with a pause
+    /// after each: a phone on a slow link.
+    struct Slow {
+        stream: TcpStream,
+        pause: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    const CHUNK: usize = 2048;
+    /// Frames the Mac sends: far more than the phone's budget and the
+    /// kernel's few unsent bytes hold, so while the phone reads, the relay's
+    /// reader waits for room.
+    const SENT: u16 = 30;
+
+    impl AsyncRead for Slow {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if let Some(pause) = &mut this.pause {
+                ready!(pause.as_mut().poll(cx));
+                this.pause = None;
+            }
+            let mut chunk = [0; CHUNK];
+            let len = CHUNK.min(buf.remaining());
+            let mut limited = ReadBuf::new(&mut chunk[..len]);
+            ready!(Pin::new(&mut this.stream).poll_read(cx, &mut limited))?;
+            buf.put_slice(limited.filled());
+            if !limited.filled().is_empty() {
+                this.pause = Some(Box::pin(tokio::time::sleep(Duration::from_millis(20))));
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Slow {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_phone_reading_slowly_but_steadily_is_waited_for_not_closed() {
+        // Each frame takes the phone several stall periods to take in, while
+        // its socket keeps accepting bytes: progress, not a stall.
+        let relay = start(Config {
+            queue_bytes: 96 * 1024,
+            stall_timeout: Duration::from_millis(300),
+            rate_limit: 1_000_000,
+            rate_limit_bytes: 1 << 30,
+            ..Config::default()
+        })
+        .await;
+        let mac_keys = new_keys();
+        let mac_id = id_of(&mac_keys);
+        let phone_keys = new_keys();
+        let phone_id = id_of(&phone_keys);
+
+        // A small receive buffer, so the relay's writes wait on the phone's
+        // reads rather than filling kernel buffers.
+        let tcp = TcpSocket::new_v4().unwrap();
+        tcp.set_recv_buffer_size(4096).unwrap();
+        let stream = tcp.connect(relay.addr()).await.unwrap();
+        let (mut phone, _) = client_async(
+            relay.url(),
+            Slow {
+                stream,
+                pause: None,
+            },
+        )
+        .await
+        .unwrap();
+        let Some(ServerMessage::Challenge { nonce, .. }) = next(&mut phone).await else {
+            panic!("expected a challenge");
+        };
+        send(
+            &mut phone,
+            &register_message(&phone_keys, &nonce, phone_role(&mac_id)),
+        )
+        .await;
+        assert_eq!(next(&mut phone).await, Some(ServerMessage::Registered));
+
+        let mac = Client::mac(&relay, mac_keys, &[&phone_id]).await;
+        let (mut to_relay, mut from_relay) = mac.socket.split();
+        let told = Arc::new(AtomicBool::new(false));
+        let listening = tokio::spawn({
+            let told = Arc::clone(&told);
+            let notice = notice(&phone_id);
+            async move {
+                while let Some(Ok(message)) = from_relay.next().await {
+                    if let Message::Text(text) = message
+                        && serde_json::from_str::<ServerMessage>(&text).unwrap() == notice
+                    {
+                        told.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+        let sending = tokio::spawn({
+            let phone_id = phone_id.clone();
+            async move {
+                for n in 0..SENT {
+                    let mut record = n.to_be_bytes().to_vec();
+                    record.resize(60_000, 0);
+                    let text = serde_json::to_string(&frame_message(&phone_id, &record)).unwrap();
+                    to_relay.send(Message::Text(text.into())).await.unwrap();
+                }
+            }
+        });
+        let received = Arc::new(AtomicU16::new(0));
+        let reading = tokio::spawn({
+            let received = Arc::clone(&received);
+            async move {
+                while let Some(message) = next(&mut phone).await {
+                    match message {
+                        ServerMessage::Frame { record, .. } => {
+                            let n = received.load(Ordering::SeqCst);
+                            assert_eq!(record[..2], n.to_be_bytes());
+                            received.store(n + 1, Ordering::SeqCst);
+                        }
+                        other => panic!("expected a frame, got {other:?}"),
+                    }
+                }
+                panic!("the slow phone was closed");
+            }
+        });
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !told.load(Ordering::SeqCst),
+            "the Mac was told the phone left"
+        );
+        assert!(!reading.is_finished(), "{:?}", reading.await);
+        // The phone has taken a few frames, and the rest are still behind the
+        // one its queue holds: the relay waited for room all along.
+        let received = received.load(Ordering::SeqCst);
+        assert!(
+            (1..SENT - 3).contains(&received),
+            "{received} of {SENT} frames arrived, so the relay never waited on the phone"
+        );
+        reading.abort();
+        sending.abort();
+        listening.abort();
+    }
 }

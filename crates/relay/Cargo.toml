@@ -32,3 +32,6 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = "0.29.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "0.6.5", features = ["all"] }

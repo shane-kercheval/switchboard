@@ -150,6 +150,7 @@ async fn serve_validated(listener: TcpListener, config: Config, shutdown: Cancel
             drop(stream);
             continue;
         };
+        limit_unsent(&stream);
         let socket = Admitted {
             stream,
             progress: Progress::new(),
@@ -169,6 +170,25 @@ async fn serve_validated(listener: TcpListener, config: Config, shutdown: Cancel
         tracing::warn!("connections still closing at shutdown were abandoned");
     }
 }
+
+/// Unsent bytes the kernel holds for a socket before it reports the socket
+/// full. Without a limit it reports a socket writable again only once much
+/// of a large send buffer has drained, so a phone reading steadily would
+/// show no progress for seconds at a time and be closed as stalled. At this
+/// size progress shows at least every 5 s down to about 13 kbps, below the
+/// slowest link a phone can use. Linux only, where the relay is deployed.
+#[cfg(target_os = "linux")]
+const UNSENT_LIMIT: u32 = 8 * 1024;
+
+#[cfg(target_os = "linux")]
+fn limit_unsent(stream: &TcpStream) {
+    if let Err(error) = socket2::SockRef::from(stream).set_tcp_notsent_lowat(UNSENT_LIMIT) {
+        tracing::warn!(%error, "could not limit a socket's unsent bytes");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn limit_unsent(_: &TcpStream) {}
 
 /// HTTP on one socket until it upgrades or closes. Each request head, the
 /// first included, must arrive within the time a client has to register, so

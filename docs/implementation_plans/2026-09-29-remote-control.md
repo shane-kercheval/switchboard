@@ -1377,8 +1377,11 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   room; the recipient is closed only if its socket accepts no bytes for 5 seconds while a
   sender waits, measured from the later of the wait's start and the last bytes accepted, so a
   long message going out slowly is progress and a queue idle before a burst is not a stall
-  (progress is seen when the kernel reports the socket writable, which with a large send
-  buffer comes only after much of it has drained);
+  (progress is seen when the kernel reports the socket writable; left alone it does so only
+  after much of a large send buffer has drained, seconds apart for a phone reading steadily,
+  so the relay limits each socket's unsent bytes to 8 KiB with `TCP_NOTSENT_LOWAT`, which
+  shows progress at least every 5 seconds down to about 13 kbps; Linux only, where the relay
+  is deployed);
   if it frees no room for the waiting frame within 60 seconds however many bytes it accepts,
   which is a phone below about 12 kbps or one trickling bytes to hold its Mac; or if even its
   own control messages no longer fit, which is a client not reading its own errors. The 60
@@ -1458,7 +1461,8 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   re-registered is answered `mac_offline`; relay errors carry the addressed `device_id`;
   token forwarding, expiry, and second-device refusal, and a Mac's reply after expiry
   refused; a burst over the rate delivered whole; a slow reader behind a burst slowed and not
-  closed; a stalled reader closed and its Mac told, while the Mac's other phone receives
+  closed; a phone reading slowly but steadily waited for and not closed (Linux, the only
+  place the relay limits unsent bytes); a stalled reader closed and its Mac told, while the Mac's other phone receives
   every frame in order; the relay's pings reaching a Mac whose reader waits on a stalled
   phone; a client that never reads its errors closed; frame and record limits; settings
   past their caps refused; held sets pruned after mass disconnects; a socket past the
@@ -1466,8 +1470,9 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   other's end; shutdown closing
   every connection with a close frame; the fixtures match the encoding. The timing decisions
   (rate buckets, stall detection, waiting for room) are tested on virtual time; the socket
-  tests assert outcomes, not durations. CI builds the image with `make relay-image`, checks
-  `/healthz`, and checks that `docker stop` closes a live connection with a close frame.
+  tests assert outcomes, not durations. CI runs the relay's tests on Linux, builds the image
+  with `make relay-image`, checks `/healthz`, and checks that `docker stop` closes a live
+  connection with a close frame.
 
 ## 7. iOS app — SwiftUI, `ios/`
 

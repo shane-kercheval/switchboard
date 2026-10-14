@@ -920,3 +920,63 @@ describe("codexAccountUsageView against the recorded credits-covered response", 
     expect(codexAccountUsageView(captured, justBeforeReset).diagnostics).toEqual([]);
   });
 });
+
+/// The stored map agent access reads for `get_usage` (`ops/usage.rs`), with
+/// what it reports. The meter draws a subset of that: the same keys, fractions,
+/// resets, and instants, so the two readers cannot drift apart silently.
+describe("the shared usage fixture", () => {
+  type ExpectedWindow = {
+    key: string;
+    scope: "account" | "model";
+    used_fraction: number;
+    resets_at: string | null;
+    observed_at?: string;
+  };
+  const fixture = JSON.parse(
+    readFileSync(resolve(__dirname, "../../tests/fixtures/usage-readings.json"), "utf8"),
+  ) as {
+    now: string;
+    harnesses: {
+      claude_code: { payload: unknown; windows: Record<string, StoredUsageWindow> };
+      codex: { payload: unknown };
+    };
+    expected: { claude_code: { windows: ExpectedWindow[] }; codex: { windows: ExpectedWindow[] } };
+  };
+  const nowMs = Date.parse(fixture.now);
+  const iso = (ms: number): string => new Date(ms).toISOString().replace(".000Z", "Z");
+
+  it("draws the Claude windows agent access reports, in the same order", () => {
+    const stored = fixture.harnesses.claude_code;
+    const view = claudeRateLimitView(stored.payload, stored.windows, nowMs);
+    expect(
+      view?.windows.map((w) => ({
+        key: w.key,
+        used_fraction: w.usedFraction,
+        resets_at: w.resetsAtMs === null ? null : iso(w.resetsAtMs),
+        observed_at: w.measuredAt,
+      })),
+    ).toEqual(
+      fixture.expected.claude_code.windows.map((w) => ({
+        key: w.key,
+        used_fraction: w.used_fraction,
+        resets_at: w.resets_at,
+        observed_at: w.observed_at,
+      })),
+    );
+  });
+
+  it("draws the account-scoped Codex windows agent access reports, and no reserve", () => {
+    const view = codexAccountUsageView(fixture.harnesses.codex.payload, nowMs);
+    expect(
+      view.windows.map((w) => ({
+        key: w.key.replace(":", "."),
+        used_fraction: w.usedFraction,
+        resets_at: w.resetsAtMs === null ? null : iso(w.resetsAtMs),
+      })),
+    ).toEqual(
+      fixture.expected.codex.windows
+        .filter((w) => w.scope === "account")
+        .map((w) => ({ key: w.key, used_fraction: w.used_fraction, resets_at: w.resets_at })),
+    );
+  });
+});

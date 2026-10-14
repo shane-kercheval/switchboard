@@ -1043,7 +1043,15 @@ async fn journal_fallback(
     let recipients = futures::future::join_all(order.into_iter().map(|agent_id| {
         let view = views.get(&agent_id);
         let agent = roster.iter().find(|a| a.id == agent_id);
-        fallback_recipient(&project, send_id, agent_id, view, agent, home_dir)
+        fallback_recipient(
+            &project,
+            send_id,
+            agent_id,
+            view,
+            agent,
+            home_dir,
+            &state.context,
+        )
     }))
     .await;
     Ok(WaitSendReply {
@@ -1065,6 +1073,7 @@ async fn fallback_recipient(
     view: Option<&AgentJournalView>,
     agent: Option<&AgentRecord>,
     home_dir: &Path,
+    context: &super::context::ContextStore,
 ) -> RecipientSnapshot {
     let mut recipient = RecipientSnapshot {
         agent_id,
@@ -1085,7 +1094,7 @@ async fn fallback_recipient(
             let (Some(view), Some(agent)) = (view, agent) else {
                 return recipient;
             };
-            match correlate_turns(project, agent, view, home_dir).await {
+            match correlate_turns(project, agent, view, home_dir, context).await {
                 Ok(turns) => {
                     if let Some(turn) = turns.into_iter().rev().find(|t| {
                         t.send_id == Some(send_id)

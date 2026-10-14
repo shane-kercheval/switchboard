@@ -17,8 +17,11 @@ use uuid::Uuid;
 use crate::git_registry::{self, GitRegistry};
 use crate::harness_usage::{self, HarnessUsage};
 use crate::notification::{Notifier, NullNotifier};
+use crate::ops::context::ContextStore;
 use crate::ops::desktop_sync::{DesktopSync, NoopDesktopSync};
+use crate::ops::handle::AppStateHandle;
 use crate::ops::ledger::{OpsLedgerEmitter, SendLedger};
+use crate::ops::usage::CodexUsageReader;
 use crate::preferences::{self, Preferences};
 use crate::wake_lock::WakeLock;
 use crate::workspace::{self, Workspace};
@@ -568,6 +571,30 @@ pub struct AppState {
     /// something. `None` is "nothing has failed since startup", which is why
     /// recovery logs too.
     pub last_account_usage_failure: Mutex<Option<&'static str>>,
+
+    /// Each agent's context fullness as the read tier reports it, fed by the
+    /// emitter decorator and by every transcript parse (`ops::context`).
+    pub context: Arc<ContextStore>,
+    /// Agent access's own Codex account reads, one in flight, never written
+    /// to `harness_usage` (`ops::usage`).
+    pub codex_usage_reader: Arc<CodexUsageReader>,
+}
+
+/// The production Codex account read, the same one the window's meter refreshes
+/// with: `codex` resolved on the login-shell PATH, under the read's own bound.
+fn production_codex_read(
+    handle: Arc<dyn AppStateHandle>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Option<switchboard_harness::CodexAccountUsage>> + Send>,
+> {
+    Box::pin(async move {
+        crate::commands::read_codex_account_usage_impl(
+            handle.app_state(),
+            std::path::Path::new("codex"),
+            switchboard_harness::ACCOUNT_USAGE_TIMEOUT,
+        )
+        .await
+    })
 }
 
 impl AppState {
@@ -580,8 +607,12 @@ impl AppState {
         lock_root: PathBuf,
     ) -> Self {
         let ledger = Arc::new(SendLedger::new());
-        let emitter: Arc<dyn EventEmitter> =
-            Arc::new(OpsLedgerEmitter::new(emitter, Arc::clone(&ledger)));
+        let context = Arc::new(ContextStore::new());
+        let emitter: Arc<dyn EventEmitter> = Arc::new(OpsLedgerEmitter::new(
+            emitter,
+            Arc::clone(&ledger),
+            Arc::clone(&context),
+        ));
         Self {
             ledger,
             desktop_sync: Arc::new(NoopDesktopSync),
@@ -629,6 +660,8 @@ impl AppState {
             // through this seam; production overrides it in `run`.
             spawns_real_harnesses: false,
             last_account_usage_failure: Mutex::new(None),
+            context,
+            codex_usage_reader: Arc::new(CodexUsageReader::new(Arc::new(production_codex_read))),
         }
     }
 

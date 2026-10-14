@@ -7191,12 +7191,20 @@ pub async fn load_project_conversation_impl(
         let home_dir = home_dir.to_path_buf();
         async move {
             let agent_id = agent.id;
+            // Captured before the parse, so a reply that lands during a long
+            // parse keeps its figures over the file's (see `ops::context`).
+            let generation = state.context.generation(agent_id);
             let result = tokio::task::spawn_blocking(move || {
                 load_agent_transcript(&project, &agent, &home_dir)
             })
             .await;
             match result {
-                Ok(Ok(transcript)) => (agent_id, transcript, None),
+                Ok(Ok(transcript)) => {
+                    state
+                        .context
+                        .record_from_transcript(agent_id, generation, &transcript);
+                    (agent_id, transcript, None)
+                }
                 Ok(Err(err)) => (
                     agent_id,
                     switchboard_harness::LoadedTranscript::default(),

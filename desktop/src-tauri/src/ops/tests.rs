@@ -113,7 +113,7 @@ async fn agent_lifecycle_on_an_unopened_project() {
     }
 
     assert!(
-        list_agents(&env.state, project_id)
+        list_agents(&env.state, project_id, &env.home())
             .await
             .unwrap()
             .is_empty()
@@ -163,7 +163,9 @@ async fn agent_lifecycle_on_an_unopened_project() {
     .unwrap();
     assert_eq!(reset.model, None, "null resets to the harness default");
 
-    let listed = list_agents(&env.state, project_id).await.unwrap();
+    let listed = list_agents(&env.state, project_id, &env.home())
+        .await
+        .unwrap();
     assert_eq!(listed.len(), 1);
     assert!(!listed[0].busy);
 
@@ -3479,4 +3481,172 @@ async fn a_workflow_step_naming_an_agent_created_after_the_window_answered_is_re
         "no run was registered"
     );
     assert!(lock(&env.adapter.prompts).is_empty(), "nothing was sent");
+}
+
+// --- context fullness ------------------------------------------------------------
+
+#[allow(clippy::cast_precision_loss)] // Test figures are small.
+fn context_figures(used: u64, window: u32) -> super::context::ContextFigures {
+    super::context::ContextFigures {
+        used_tokens: used,
+        window_tokens: window,
+        fraction: used as f64 / f64::from(window),
+    }
+}
+
+/// A seeded Claude turn's figures: the parser's after-turn count for the
+/// seeded usage (`input_tokens: 10, output_tokens: 5`), with the window the
+/// sidecar saved for that message.
+const SEEDED_AFTER_TURN: u64 = 15;
+
+fn save_window_for(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    key: &str,
+    window: u32,
+) {
+    let root = super::read::project_readonly(&env.state, project_id)
+        .unwrap()
+        .root;
+    switchboard_harness::meta_sidecar::write_context_window(
+        &switchboard_harness::meta_sidecar::meta_sidecar_path(&root, agent_id),
+        window,
+        "claude-sonnet-4-6".to_owned(),
+        key.to_owned(),
+        Utc::now(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn list_agents_reports_the_context_a_live_turn_ended_with() {
+    let mut env = TestEnv::with_scripts(vec![Script::reply("ack").with_context(1_200, 200_000)]);
+    let project_id = env.project("p");
+    let agent_id = env.agent(project_id, "a");
+
+    // Never dispatched and no file: settled as nothing, and not pending.
+    let listed = list_agents(&env.state, project_id, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(listed[0].context, None);
+    assert!(!listed[0].context_pending);
+
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agent_id], "hi"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+    let listed = list_agents(&env.state, project_id, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(listed[0].context, Some(context_figures(1_200, 200_000)));
+    assert!(!listed[0].context_pending);
+}
+
+#[tokio::test]
+async fn list_agents_reads_an_agents_file_once_and_not_again() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("p");
+    let agent_id = env.agent(project_id, "a");
+    let at = Utc::now() - chrono::Duration::hours(1);
+    env.seed_claude_turns(project_id, agent_id, &[("one", "answer", "a1", at)]);
+    save_window_for(&env, project_id, agent_id, "a1", 200_000);
+    let env = env.restart();
+
+    let listed = list_agents(&env.state, project_id, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        listed[0].context,
+        Some(context_figures(SEEDED_AFTER_TURN, 200_000))
+    );
+    assert!(!listed[0].context_pending);
+
+    // A newer turn appears in the file; a second read would take it.
+    env.overwrite_claude_turns(
+        project_id,
+        agent_id,
+        &[
+            ("one", "answer", "a1", at),
+            ("two", "later", "a2", at + chrono::Duration::minutes(10)),
+        ],
+    );
+    save_window_for(&env, project_id, agent_id, "a2", 100_000);
+    let listed = list_agents(&env.state, project_id, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        listed[0].context,
+        Some(context_figures(SEEDED_AFTER_TURN, 200_000)),
+        "the file was not read again"
+    );
+}
+
+#[tokio::test]
+async fn list_agents_does_not_read_a_file_the_project_load_parsed() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("p");
+    let agent_id = env.agent(project_id, "a");
+    let at = Utc::now() - chrono::Duration::hours(1);
+    env.seed_claude_turns(project_id, agent_id, &[("one", "answer", "a1", at)]);
+    save_window_for(&env, project_id, agent_id, "a1", 200_000);
+    let env = env.restart();
+
+    load_project_conversation_impl(&env.state, project_id, &env.home())
+        .await
+        .unwrap();
+    env.overwrite_claude_turns(
+        project_id,
+        agent_id,
+        &[
+            ("one", "answer", "a1", at),
+            ("two", "later", "a2", at + chrono::Duration::minutes(10)),
+        ],
+    );
+    save_window_for(&env, project_id, agent_id, "a2", 100_000);
+    let listed = list_agents(&env.state, project_id, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        listed[0].context,
+        Some(context_figures(SEEDED_AFTER_TURN, 200_000)),
+        "the project load's figures stand; no read ran"
+    );
+    assert!(!listed[0].context_pending);
+}
+
+#[tokio::test]
+async fn list_agents_settles_an_unreadable_file_as_no_context() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("p");
+    let agent_id = env.agent(project_id, "a");
+    env.seed_unreadable_session(project_id, agent_id);
+    let env = env.restart();
+    let listed = list_agents(&env.state, project_id, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(listed[0].context, None);
+    assert!(!listed[0].context_pending);
+}
+
+#[tokio::test]
+async fn read_agent_output_records_the_figures_it_parsed() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("p");
+    let agent_id = env.agent(project_id, "a");
+    let at = Utc::now() - chrono::Duration::hours(1);
+    env.seed_claude_turns(project_id, agent_id, &[("one", "answer", "a1", at)]);
+    save_window_for(&env, project_id, agent_id, "a1", 200_000);
+    let env = env.restart();
+    read_agent_output(&env.state, project_id, agent_id, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        env.state.context.lookup(agent_id),
+        super::context::ContextState::Known(Some(context_figures(SEEDED_AFTER_TURN, 200_000)))
+    );
 }

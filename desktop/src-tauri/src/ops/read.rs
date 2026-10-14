@@ -21,6 +21,7 @@ use crate::state::{AppState, lock};
 use crate::workflow_commands::{WorkflowListing, list_workflows_impl};
 
 use super::budget::{BudgetSpec, CutSite, json_escaped_len};
+use super::context::{CONTEXT_READ_WAIT, ContextFigures, ContextState, ContextStore};
 use super::ledger::SendStatus;
 use super::{OUTPUT_PAGE_CHARS, RESULT_BUDGET_CHARS};
 
@@ -76,26 +77,69 @@ async fn project_is_busy(state: &AppState, project_id: ProjectId) -> bool {
     false
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AgentListing {
     #[serde(flatten)]
     pub record: AgentRecord,
     /// Whether a send to the agent would be refused right now (an
     /// observation; another caller can occupy it before the next send).
     pub busy: bool,
+    /// The agent's context fullness from its newest finished turn, or a newer
+    /// compaction, as the sidebar's bar shows it. `None` while unknown, when
+    /// that turn's figures are unusable, or when the harness reports no window.
+    pub context: Option<ContextFigures>,
+    /// The agent's session file is still being read for `context`; call again.
+    pub context_pending: bool,
 }
 
-/// The project's roster with each agent's model, effort, quick choices, and
-/// whether it would accept a send now.
+/// The project's roster with each agent's model, effort, quick choices,
+/// whether it would accept a send now, and its context fullness. An agent
+/// nothing has parsed since launch has its file read once, here, waiting
+/// [`CONTEXT_READ_WAIT`] for it; a read still running is reported as pending.
 pub async fn list_agents(
     state: &AppState,
     project_id: ProjectId,
+    home_dir: &Path,
 ) -> Result<Vec<AgentListing>, AppError> {
     let records = list_project_agents_readonly_impl(state, project_id)?;
+    let mut reads = Vec::new();
+    for record in &records {
+        if state.context.lookup(record.id) != ContextState::Unknown {
+            continue;
+        }
+        let project = project_readonly(state, project_id)?;
+        let agent = record.clone();
+        let home_dir = home_dir.to_path_buf();
+        reads.push(state.context.ensure_reading(record.id, async move {
+            tokio::task::spawn_blocking(move || load_agent_transcript(&project, &agent, &home_dir))
+                .await
+                .map_err(|e| AppError::Internal(format!("transcript load task failed: {e}")))?
+        }));
+    }
+    if !reads.is_empty() {
+        let _ = tokio::time::timeout(
+            CONTEXT_READ_WAIT,
+            futures::future::join_all(reads.into_iter().map(|mut done| async move {
+                // The guard the wait returns is dropped here, so nothing
+                // non-`Send` is held across the join.
+                let _ = done.wait_for(|done| *done).await;
+            })),
+        )
+        .await;
+    }
     let mut out = Vec::with_capacity(records.len());
     for record in records {
         let busy = !state.dispatcher.accepts_now(record.id).await;
-        out.push(AgentListing { record, busy });
+        let (context, context_pending) = match state.context.lookup(record.id) {
+            ContextState::Known(figures) => (figures, false),
+            ContextState::Unknown => (None, true),
+        };
+        out.push(AgentListing {
+            record,
+            busy,
+            context,
+            context_pending,
+        });
     }
     Ok(out)
 }
@@ -538,7 +582,9 @@ pub(crate) async fn correlate_turns(
     agent: &AgentRecord,
     view: &AgentJournalView,
     home_dir: &Path,
+    context: &ContextStore,
 ) -> Result<Vec<CorrelatedTurn>, AppError> {
+    let generation = context.generation(agent.id);
     let transcript = {
         let project = project.clone();
         let agent = agent.clone();
@@ -547,6 +593,7 @@ pub(crate) async fn correlate_turns(
             .await
             .map_err(|e| AppError::Internal(format!("transcript load task failed: {e}")))??
     };
+    context.record_from_transcript(agent.id, generation, &transcript);
     let renders = view.classify(&transcript.turns);
     Ok(transcript
         .turns
@@ -581,7 +628,7 @@ async fn correlate_agent(
     let project = project_readonly(state, project_id)?;
     let records = read_journal(&project).await?;
     let view = AgentJournalView::from_records(&records, agent.id);
-    let turns = correlate_turns(&project, agent, &view, home_dir).await?;
+    let turns = correlate_turns(&project, agent, &view, home_dir, &state.context).await?;
     Ok((view, turns))
 }
 
@@ -702,7 +749,7 @@ pub async fn read_agent_output(
         });
     }
     let view = AgentJournalView::from_records(&records, agent_id);
-    let correlated = correlate_turns(&project, &agent, &view, home_dir).await?;
+    let correlated = correlate_turns(&project, &agent, &view, home_dir, &state.context).await?;
     let latest = correlated
         .into_iter()
         .rev()

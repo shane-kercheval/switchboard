@@ -1047,6 +1047,8 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
 
     let projects = call("list_projects", json!({})).await;
     assert_eq!(uuid(&projects[0]["id"]), project_id);
+    // No account has reported in a test state, and no Codex CLI runs here.
+    assert_eq!(call("get_usage", json!({})).await, json!([]));
     assert_eq!(
         call("list_agents", json!({ "project_id": project_id }))
             .await

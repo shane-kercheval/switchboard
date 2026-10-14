@@ -1,0 +1,401 @@
+{
+  "$comment": "Cases of the context-fullness rule, run by both copies: the sidebar's (desktop/src/lib/contextOccupancy.ts) and agent access's (desktop/src-tauri/src/ops/context.rs). turns are one agent's turns in file order; compaction is the agent's newest sized compaction marker, if any.",
+  "cases": [
+    {
+      "name": "the newest finished turn with figures",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:00:00Z",
+          "ended_at": "2026-10-13T10:01:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 100,
+            "context_window": 200000
+          }
+        },
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:05:00Z",
+          "ended_at": "2026-10-13T10:06:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 150,
+            "context_window": 200000
+          }
+        }
+      ],
+      "compaction": null,
+      "expected": {
+        "used_tokens": 150,
+        "window_tokens": 200000,
+        "fraction": 0.00075
+      }
+    },
+    {
+      "name": "a streaming turn is skipped and the previous finished turn counts",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:00:00Z",
+          "ended_at": "2026-10-13T10:01:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 100,
+            "context_window": 200000
+          }
+        },
+        {
+          "role": "agent",
+          "status": "streaming",
+          "started_at": "2026-10-13T10:05:00Z",
+          "ended_at": null,
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 180,
+            "context_window": 200000
+          }
+        }
+      ],
+      "compaction": null,
+      "expected": {
+        "used_tokens": 100,
+        "window_tokens": 200000,
+        "fraction": 0.0005
+      }
+    },
+    {
+      "name": "a turn without a usage record is skipped",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:00:00Z",
+          "ended_at": "2026-10-13T10:01:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 100,
+            "context_window": 200000
+          }
+        },
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:05:00Z",
+          "ended_at": "2026-10-13T10:06:00Z",
+          "usage": null
+        }
+      ],
+      "compaction": null,
+      "expected": {
+        "used_tokens": 100,
+        "window_tokens": 200000,
+        "fraction": 0.0005
+      }
+    },
+    {
+      "name": "the newest usage-bearing turn without a window hides the figures, with no fall back",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:00:00Z",
+          "ended_at": "2026-10-13T10:01:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 100,
+            "context_window": 200000
+          }
+        },
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:05:00Z",
+          "ended_at": "2026-10-13T10:06:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 150,
+            "context_window": null
+          }
+        }
+      ],
+      "compaction": null,
+      "expected": null
+    },
+    {
+      "name": "used above the window is impossible and hidden",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:00:00Z",
+          "ended_at": "2026-10-13T10:01:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 250000,
+            "context_window": 200000
+          }
+        }
+      ],
+      "compaction": null,
+      "expected": null
+    },
+    {
+      "name": "a zero window hides the figures",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:00:00Z",
+          "ended_at": "2026-10-13T10:01:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 100,
+            "context_window": 0
+          }
+        }
+      ],
+      "compaction": null,
+      "expected": null
+    },
+    {
+      "name": "a failed turn with usage counts",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:00:00Z",
+          "ended_at": "2026-10-13T10:01:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 100,
+            "context_window": 200000
+          }
+        },
+        {
+          "role": "agent",
+          "status": "failed",
+          "started_at": "2026-10-13T10:05:00Z",
+          "ended_at": "2026-10-13T10:06:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 170,
+            "context_window": 200000
+          }
+        }
+      ],
+      "compaction": null,
+      "expected": {
+        "used_tokens": 170,
+        "window_tokens": 200000,
+        "fraction": 0.00085
+      }
+    },
+    {
+      "name": "a newer compaction with its own window supersedes the turn",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:05:00Z",
+          "ended_at": "2026-10-13T10:06:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 150,
+            "context_window": 200000
+          }
+        }
+      ],
+      "compaction": {
+        "at": "2026-10-13T10:10:00Z",
+        "tokens": 40,
+        "window": 100000
+      },
+      "expected": {
+        "used_tokens": 40,
+        "window_tokens": 100000,
+        "fraction": 0.0004
+      }
+    },
+    {
+      "name": "a newer compaction without a window borrows the turn's",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:05:00Z",
+          "ended_at": "2026-10-13T10:06:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 150,
+            "context_window": 200000
+          }
+        }
+      ],
+      "compaction": {
+        "at": "2026-10-13T10:10:00Z",
+        "tokens": 40,
+        "window": null
+      },
+      "expected": {
+        "used_tokens": 40,
+        "window_tokens": 200000,
+        "fraction": 0.0002
+      }
+    },
+    {
+      "name": "a compaction older than the newest turn does not count",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:05:00Z",
+          "ended_at": "2026-10-13T10:06:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 150,
+            "context_window": 200000
+          }
+        }
+      ],
+      "compaction": {
+        "at": "2026-10-13T10:00:00Z",
+        "tokens": 40,
+        "window": 100000
+      },
+      "expected": {
+        "used_tokens": 150,
+        "window_tokens": 200000,
+        "fraction": 0.00075
+      }
+    },
+    {
+      "name": "a compaction at the same instant as the turn's end does not supersede it",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:05:00Z",
+          "ended_at": "2026-10-13T10:06:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 150,
+            "context_window": 200000
+          }
+        }
+      ],
+      "compaction": {
+        "at": "2026-10-13T10:06:00Z",
+        "tokens": 40,
+        "window": 100000
+      },
+      "expected": {
+        "used_tokens": 150,
+        "window_tokens": 200000,
+        "fraction": 0.00075
+      }
+    },
+    {
+      "name": "a compaction alone with a window",
+      "turns": [],
+      "compaction": {
+        "at": "2026-10-13T10:10:00Z",
+        "tokens": 40,
+        "window": 100000
+      },
+      "expected": {
+        "used_tokens": 40,
+        "window_tokens": 100000,
+        "fraction": 0.0004
+      }
+    },
+    {
+      "name": "a compaction alone without a window hides the figures",
+      "turns": [],
+      "compaction": {
+        "at": "2026-10-13T10:10:00Z",
+        "tokens": 40,
+        "window": null
+      },
+      "expected": null
+    },
+    {
+      "name": "nothing reported",
+      "turns": [],
+      "compaction": null,
+      "expected": null
+    },
+    {
+      "name": "a user turn is not a usage-bearing turn",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:00:00Z",
+          "ended_at": "2026-10-13T10:01:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 100,
+            "context_window": 200000
+          }
+        },
+        {
+          "role": "user",
+          "started_at": "2026-10-13T10:05:00Z"
+        }
+      ],
+      "compaction": null,
+      "expected": {
+        "used_tokens": 100,
+        "window_tokens": 200000,
+        "fraction": 0.0005
+      }
+    },
+    {
+      "name": "a turn is ordered by its end, so one that ended after the compaction wins",
+      "turns": [
+        {
+          "role": "agent",
+          "status": "complete",
+          "started_at": "2026-10-13T10:00:00Z",
+          "ended_at": "2026-10-13T10:20:00Z",
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "context_tokens_after_turn": 150,
+            "context_window": 200000
+          }
+        }
+      ],
+      "compaction": {
+        "at": "2026-10-13T10:10:00Z",
+        "tokens": 40,
+        "window": 100000
+      },
+      "expected": {
+        "used_tokens": 150,
+        "window_tokens": 200000,
+        "fraction": 0.00075
+      }
+    }
+  ]
+}

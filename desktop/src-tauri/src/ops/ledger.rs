@@ -9,7 +9,9 @@
 //! of send, queued or not. Reading it once, in process, gives one source of
 //! truth for every caller that is not the window. [`OpsLedgerEmitter`] is the
 //! same shape as the wake-lock decorator: it wraps the base emitter where
-//! `AppState.emitter` is built, observes, and forwards unchanged.
+//! `AppState.emitter` is built, observes, and forwards unchanged. It also
+//! feeds every turn end's usage to [`super::context`], the read tier's record
+//! of each agent's context fullness.
 //!
 //! **Correlation.** `ops` chooses each send's `message_id` and registers it
 //! here *before* dispatching, so the first event the actor emits for it lands
@@ -958,20 +960,27 @@ fn field_uuid(payload: &serde_json::Value, key: &str) -> Option<Uuid> {
 pub struct OpsLedgerEmitter {
     inner: std::sync::Arc<dyn EventEmitter>,
     ledger: std::sync::Arc<SendLedger>,
+    context: std::sync::Arc<super::context::ContextStore>,
 }
 
 impl OpsLedgerEmitter {
     pub fn new(
         inner: std::sync::Arc<dyn EventEmitter>,
         ledger: std::sync::Arc<SendLedger>,
+        context: std::sync::Arc<super::context::ContextStore>,
     ) -> Self {
-        Self { inner, ledger }
+        Self {
+            inner,
+            ledger,
+            context,
+        }
     }
 }
 
 impl EventEmitter for OpsLedgerEmitter {
     fn emit(&self, name: &str, payload: serde_json::Value) {
         self.ledger.observe(name, &payload);
+        self.context.observe(name, &payload);
         self.inner.emit(name, payload);
     }
 }
@@ -1352,6 +1361,7 @@ mod tests {
         let emitter = OpsLedgerEmitter::new(
             std::sync::Arc::clone(&inner) as std::sync::Arc<dyn EventEmitter>,
             ledger,
+            std::sync::Arc::new(super::super::context::ContextStore::new()),
         );
         let payload = json!({ "type": "agent_idle", "agent_id": Uuid::now_v7() });
         emitter.emit("agent:x", payload.clone());

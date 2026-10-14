@@ -44,6 +44,7 @@ use crate::ops::read::{self, ReadFrom};
 use crate::ops::send::{
     self, Body, ForwardPrompt, ForwardRequest, OnBusyPolicy, SendRequest, wait_send_budget,
 };
+use crate::ops::usage;
 use crate::ops::wait::{ProgressHook, WaitBudget};
 use crate::ops::workflow::{self, RunWorkflowRequest};
 use crate::state::AppState;
@@ -145,8 +146,27 @@ tools! {
          here: every other tool takes a project_id.";
     ListAgents = "list_agents" (ProjectArgs) [Read]
         "A project's agents: id, name, harness, model, effort, the quick-choice lists of models \
-         and efforts, and busy. busy is an observation: the user or a workflow can occupy an idle \
-         agent before your next send.";
+         and efforts, busy, and context. busy is an observation: the user or a workflow can occupy \
+         an idle agent before your next send. context is the agent's context fullness \
+         ({used_tokens, window_tokens, fraction}) after its newest finished turn, or after a newer \
+         compaction, the same figure Switchboard's sidebar shows; null when nothing has reported \
+         it or the harness reports no window (Antigravity). It is the latest Switchboard observed: \
+         a turn the agent ran outside Switchboard (continued in a terminal) shows after \
+         Switchboard's next turn for it or the window's next reread. context_pending is true \
+         while the agent's session file is still being read for it: call again.";
+    GetUsage = "get_usage" (NoArgs) [Read]
+        "How much of each harness account's limits is used, for choosing a model and effort for \
+         the work at hand. One entry per account the app has a reading for: {harness, \
+         observed_at, ordinary_usage_allowed, plan, windows}, each window {key, scope, model, \
+         used_fraction (0 to 1), resets_at, duration_minutes, observed_at, is_using_overage, \
+         credits}, fields a reading lacks left out. scope is account (ordinary work on any model) \
+         or model (a reserve for one model or a set, named in model when known): do not read a \
+         reserve's headroom as the allowance governing ordinary work. ordinary_usage_allowed and \
+         is_using_overage are observed facts, not permission to incur charges. Freshness: Claude \
+         reports its limits only with a reply, so its reading is as old as the newest Claude \
+         reply in the app (each window's observed_at says); Codex is read from the account on \
+         request when that finishes in time, else the newest stored reading. Empty when no \
+         account has reported.";
     ReadConversation = "read_conversation" (ReadConversationArgs) [Read]
         "A project's conversation in time order: each message sent (text and recipients), each \
          agent turn's answer text with its send_id and status (complete, running, failed, \
@@ -772,7 +792,14 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
         }
         ToolName::ListAgents => {
             let a: ProjectArgs = parse(args)?;
-            Reply::plain(&read::list_agents(state, a.project_id).await?)
+            Reply::plain(&read::list_agents(state, a.project_id, cx.home()).await?)
+        }
+        ToolName::GetUsage => {
+            parse::<NoArgs>(args)?;
+            Reply::plain(
+                &usage::get_usage(Arc::clone(&cx.handle), usage::CODEX_READ_BUDGET, &cx.cancel)
+                    .await?,
+            )
         }
         ToolName::ReadConversation => {
             let a: ReadConversationArgs = parse(args)?;

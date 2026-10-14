@@ -19,6 +19,14 @@
 //! division as [`crate::workspace`], which persists view-state it does not
 //! interpret.
 //!
+//! **Read by agent access.** `crate::ops::usage` reads this map to answer
+//! `get_usage`, and reads exactly these fields of it: a harness entry's
+//! `payload` (Codex's account read) and `observed_at`, and each `windows`
+//! entry's `window`, `model`, `observed_at`, and `is_using_overage` (Claude).
+//! It still interprets nothing about which reading is newest; it reads the
+//! vendor fields the way the meter does, so a change to the stored shape is
+//! made in both places.
+//!
 //! A missing or corrupt `usage.yaml` degrades to empty. Nothing here is
 //! load-bearing: the cost is an empty usage section until the next turn reports
 //! a reading, never a failed load, and every window in a reading carries its own

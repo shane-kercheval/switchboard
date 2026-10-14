@@ -34,12 +34,14 @@
 
 pub mod budget;
 pub mod change;
+pub mod context;
 pub mod desktop_sync;
 pub mod error_code;
 pub mod handle;
 pub mod ledger;
 pub mod read;
 pub mod send;
+pub mod usage;
 pub mod wait;
 pub mod workflow;
 

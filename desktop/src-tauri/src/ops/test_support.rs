@@ -13,7 +13,7 @@ use switchboard_core::{AgentId, AgentRecord, ProjectId, SessionLocator};
 use switchboard_dispatcher::{EventEmitter, RecordingEmitter};
 use switchboard_harness::{
     AdapterEvent, ContentKind, DispatchError, DispatchOptions, EventStream, HarnessAdapter, TurnId,
-    TurnOutcome,
+    TurnOutcome, TurnUsage,
 };
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -41,6 +41,9 @@ pub struct Script {
     /// Keep the stream open past a cancellation until the gate fires, so a
     /// test can hold an agent in its closing state.
     pub ignore_cancel: bool,
+    /// Context figures the turn's end reports: tokens after the turn and the
+    /// window.
+    pub context: Option<(u64, u32)>,
 }
 
 impl Script {
@@ -51,6 +54,14 @@ impl Script {
             fail: false,
             key: None,
             ignore_cancel: false,
+            context: None,
+        }
+    }
+
+    pub fn with_context(self, used_tokens: u64, window_tokens: u32) -> Self {
+        Self {
+            context: Some((used_tokens, window_tokens)),
+            ..self
         }
     }
 
@@ -167,7 +178,17 @@ impl HarnessAdapter for ScriptedAdapter {
                 turn_id,
                 outcome,
                 ended_at: Utc::now(),
-                usage: None,
+                usage: script.context.map(|(used, window)| TurnUsage {
+                    input_tokens: used,
+                    output_tokens: 0,
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                    context_input_tokens: Some(used),
+                    context_tokens_after_turn: Some(used),
+                    reasoning_output_tokens: None,
+                    context_window: Some(window),
+                    total_cost_usd: None,
+                }),
                 context_window_source: None,
                 stable_message_id: Some(key.clone()),
                 first_message_id: Some(key),
@@ -502,27 +523,38 @@ impl TestEnv {
         agent_id: AgentId,
         turns: &[(&str, &str, &str, chrono::DateTime<Utc>)],
     ) {
-        let mut lines = Vec::new();
-        for (prompt, answer, key, at) in turns {
-            lines.push(serde_json::json!({
-                "type": "user",
-                "message": { "role": "user", "content": prompt },
-                "timestamp": at.to_rfc3339(),
-            }));
-            lines.push(serde_json::json!({
-                "type": "assistant",
-                "message": {
-                    "id": key,
-                    "model": "claude-sonnet-4-6",
-                    "role": "assistant",
-                    "content": [{ "type": "text", "text": answer }],
-                    "stop_reason": "end_turn",
-                    "usage": { "input_tokens": 10, "output_tokens": 5 },
-                },
-                "timestamp": (*at + chrono::Duration::milliseconds(500)).to_rfc3339(),
-            }));
-        }
-        self.write_claude_session(project_id, agent_id, &lines);
+        self.write_claude_session(project_id, agent_id, &claude_turn_lines(turns));
+    }
+
+    /// Rewrite the agent's current Claude session file (the one its locator
+    /// names, without minting a new session) with these turns, through the
+    /// store rather than the loaded-project map, so it works after a restart.
+    pub fn overwrite_claude_turns(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        turns: &[(&str, &str, &str, chrono::DateTime<Utc>)],
+    ) {
+        let project = super::read::project_readonly(&self.state, project_id).unwrap();
+        let agent = project
+            .list_agents()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == agent_id)
+            .unwrap();
+        let Some(SessionLocator::Uuid(session)) = agent.session_locator else {
+            panic!("the agent has a Claude session");
+        };
+        let path = switchboard_harness::claude_session_file_path(
+            self.home.path(),
+            &project.directory,
+            &session,
+        );
+        let body: String = claude_turn_lines(turns)
+            .iter()
+            .map(|l| serde_json::to_string(l).unwrap() + "\n")
+            .collect();
+        std::fs::write(&path, body).unwrap();
     }
 
     /// Give the agent a Claude session file holding one completed turn that
@@ -661,6 +693,32 @@ fn build_state(
 
 /// One completed Claude turn as the session file records it, stamped now so
 /// it falls inside any journaled send's dispatch window.
+pub fn claude_turn_lines(
+    turns: &[(&str, &str, &str, chrono::DateTime<Utc>)],
+) -> Vec<serde_json::Value> {
+    let mut lines = Vec::new();
+    for (prompt, answer, key, at) in turns {
+        lines.push(serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": prompt },
+            "timestamp": at.to_rfc3339(),
+        }));
+        lines.push(serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "id": key,
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": answer }],
+                "stop_reason": "end_turn",
+                "usage": { "input_tokens": 10, "output_tokens": 5 },
+            },
+            "timestamp": (*at + chrono::Duration::milliseconds(500)).to_rfc3339(),
+        }));
+    }
+    lines
+}
+
 pub fn claude_session_jsonl(prompt: &str, text: &str, key: &str) -> String {
     let now = Utc::now();
     [

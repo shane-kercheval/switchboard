@@ -58,16 +58,33 @@ projects; each project has a working folder and any number of agents. These tool
 the way the user does from Switchboard's window. Every tool takes ids: call list_projects, then \
 list_agents, and use the ids they return (names are for display and can change).
 
+An agent is a persistent session of its harness, run in the project's folder with the user's \
+own configuration for that harness (including the folder's instructions file, such as CLAUDE.md \
+or AGENTS.md) and the harness's full tools: it reads and edits files, runs commands, and uses \
+git. It receives your message as if the user had typed it and cannot tell you from the user. \
+Each send continues its conversation: it keeps earlier sends and its own replies until its \
+context is compacted, so a follow-up need not repeat what it already knows. Its reply is the \
+text it writes; tool calls and thinking are not returned. These tools read no files: to learn \
+how the code works, ask an agent.
+
 The loop: send a message to one or more agents with send (or pass agents' latest answers to \
 others with forward). It returns a send_id at once. Call wait_send with that id until done is \
 true; each call waits up to its timeout and returns the current state either way, so call it \
 again. The replies come back in wait_send's final answer. read_conversation shows a project's \
 whole history; read_agent_output shows an agent's latest answer, including turns you did not \
-send.
+send. The user's saved prompts (list_prompts) and workflows (list_workflows) are their standing \
+instructions and procedures, such as a code review: use one when it fits rather than writing \
+your own.
 
 Results are JSON: {\"result\": …, \"truncated\": […], \"items_omitted\": n}. A result is kept \
 under 100,000 characters: long text may be cut, and each cut is listed in truncated with the \
-call that reads the rest (read_with), when there is one.
+call that reads the rest (read_with), when there is one. An error is {\"code\": …, \
+\"message\": …}; the message says what to do.
+
+Some conditions need the user at the Mac, not a retry: a turn that failed with failure_kind \
+usage_limit or auth_failure; prompt_needs_sign_in (a prompt server's sign-in lapsed); \
+directory_missing (the project's folder is gone); agent_busy_elsewhere (another program holds \
+the agent's session); a workflow whose invocable is false. Report them and stop.
 
 The agents run without approval prompts and act on the user's files. The user sees every \
 message you send, queued or running, in Switchboard's window and can cancel it there.";
@@ -192,11 +209,15 @@ tools! {
          agent first, use wait_agent.";
     ListPrompts = "list_prompts" (NoArgs) [Read]
         "The user's saved prompts, local and from prompt servers: provider, name, description, \
-         and arguments. Use one in send or forward as prompt: {provider, name, args}.";
+         and arguments. They are the user's standing instructions (a code review, a security \
+         review, an analysis of reviewers' findings): when one fits the task, send it rather than \
+         writing your own. Use one in send or forward as prompt: {provider, name, args}.";
     ListWorkflows = "list_workflows" (NoArgs) [Read]
-        "The user's workflows: name, is_builtin, description, declared inputs, and invocable \
-         (false when a step needs the user at the Mac). Call describe_workflow before \
-         run_workflow: it also lists the arguments the workflow's saved prompts need.";
+        "The user's workflows, saved multi-agent procedures (send to several reviewers and gather \
+         their findings, for example): name, is_builtin, description, declared inputs, and \
+         invocable (false when a step needs the user at the Mac). Prefer one to running its steps \
+         by hand. Call describe_workflow before run_workflow: it also lists the arguments the \
+         workflow's saved prompts need.";
     DescribeWorkflow = "describe_workflow" (DescribeWorkflowArgs) [Read]
         "Everything run_workflow needs for one workflow: its declared inputs (an agent input \
          takes an agent id, a list input a list) and the arguments derived from its saved \
@@ -228,8 +249,10 @@ tools! {
          the window, so read it. Refuses a running or completed run.";
     CompactAgent = "compact_agent" (CompactArgs) [Acts]
         "Compact an agent's conversation: its harness summarizes the history so far and continues \
-         from the summary, freeing context. Read context from list_agents to decide when. Claude \
-         Code and Codex agents only (compaction_unsupported otherwise); the agent must have replied \
+         from the summary, freeing context. Read context from list_agents to decide when: the \
+         harness compacts on its own once the context fills, possibly mid-task, so compact between \
+         tasks while context is high. Claude Code and Codex agents only (compaction_unsupported \
+         otherwise); the agent must have replied \
          at least once (no_session), and a Claude fork must have had its first turn \
          (fork_not_materialized). The compaction waits behind the agent's running and queued work \
          and returns a send_id at once: call wait_send until done (the recipient carries no \
@@ -259,9 +282,10 @@ tools! {
          Nothing over MCP removes an agent, so forks stay until the user removes them: fork for a \
          reason, not per message.";
     Send = "send" (SendArgs) [Acts]
-        "Send one message to one or more agents of a project. Returns at once with a send_id and \
-         each recipient's status at dispatch: accepted, rejected (with a code), or \
-         not_dispatched. Then call wait_send until done.\n\
+        "Send one message to one or more agents of a project, as the user's next message in each \
+         one's conversation. Returns at once with a send_id and each recipient's status at \
+         dispatch: accepted, rejected (with a code), or not_dispatched. Then call wait_send until \
+         done.\n\
          The message is text, or a saved prompt ({provider, name, args}) with text appended \
          after it.\n\
          on_busy: refuse (the default) sends to no one if any recipient is busy; if one becomes \
@@ -431,6 +455,7 @@ pub struct ReadSendOutputArgs {
 pub struct DescribeWorkflowArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
+    /// The workflow's name, as `list_workflows` reports it.
     name: String,
     /// Whether the workflow is one of Switchboard's built-ins, as
     /// `list_workflows` reports it.
@@ -442,6 +467,7 @@ pub struct DescribeWorkflowArgs {
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
 pub struct CreateProjectArgs {
+    /// Letters, digits, `_` and `-`; unique among projects.
     name: String,
     /// An existing folder on this Mac, as an absolute path.
     directory: String,
@@ -453,6 +479,7 @@ pub struct CreateProjectArgs {
 pub struct RenameProjectArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
+    /// The new name: letters, digits, `_` and `-`.
     name: String,
 }
 
@@ -481,10 +508,15 @@ impl From<HarnessArg> for HarnessKind {
 pub struct CreateAgentArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
+    /// Letters, digits, `_` and `-`; must not match another agent's name in
+    /// the project (case and `-`/`_` do not distinguish names).
     name: String,
     harness: HarnessArg,
+    /// The model, in the harness's own naming; `list_agents` shows the known
+    /// values. Omit for the user's default.
     #[serde(default)]
     model: Option<String>,
+    /// The effort, in the harness's own naming. Omit for the user's default.
     #[serde(default)]
     effort: Option<String>,
 }
@@ -497,6 +529,7 @@ pub struct RenameAgentArgs {
     project_id: ProjectId,
     #[schemars(with = "String")]
     agent_id: AgentId,
+    /// The new name: letters, digits, `_` and `-`.
     name: String,
 }
 
@@ -526,6 +559,7 @@ pub struct SetAgentSelectionArgs {
 pub struct RunArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
+    /// The run id `run_workflow` or `list_workflow_runs` returned.
     #[schemars(with = "String")]
     run_id: Uuid,
 }
@@ -536,6 +570,8 @@ pub struct RunArgs {
 pub struct SendIdArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
+    /// The send_id that `send`, `forward`, `compact_agent`, or `fork_agent`
+    /// returned.
     #[schemars(with = "String")]
     send_id: SendId,
 }
@@ -566,8 +602,11 @@ impl From<OnBusyArg> for OnBusyPolicy {
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
 struct PromptArg {
+    /// The prompt's provider, as `list_prompts` reports it.
     provider: String,
+    /// The prompt's name within that provider.
     name: String,
+    /// Argument values by name, as `list_prompts` declares them.
     #[serde(default)]
     args: BTreeMap<String, String>,
 }
@@ -580,6 +619,7 @@ pub struct CompactArgs {
     project_id: ProjectId,
     #[schemars(with = "String")]
     agent_id: AgentId,
+    /// Any string unique to this request; a retry passes the same one.
     #[serde(default)]
     idempotency_key: Option<String>,
 }
@@ -678,8 +718,11 @@ fn source_map(args: BTreeMap<String, Vec<SourceArg>>) -> BTreeMap<String, Vec<Fo
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
 struct ForwardPromptArg {
+    /// The prompt's provider, as `list_prompts` reports it.
     provider: String,
+    /// The prompt's name within that provider.
     name: String,
+    /// Argument values by name, as `list_prompts` declares them.
     #[serde(default)]
     args: BTreeMap<String, String>,
     /// Prompt arguments filled from sources: each named argument becomes its
@@ -703,10 +746,13 @@ pub struct ForwardArgs {
     /// Text placed before the forwarded answers.
     #[serde(default)]
     text: Option<String>,
+    /// A saved prompt to send, rendered with its args; its forward_args fill
+    /// arguments from sources.
     #[serde(default)]
     prompt: Option<ForwardPromptArg>,
     #[serde(default)]
     on_busy: OnBusyArg,
+    /// Any string unique to this request; a retry passes the same one.
     #[serde(default)]
     idempotency_key: Option<String>,
     /// Seconds to wait for a source still mid-turn. 50 by default.
@@ -738,7 +784,10 @@ impl From<InputArg> for InputValue {
 pub struct RunWorkflowArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
+    /// The workflow's name, as `list_workflows` reports it.
     name: String,
+    /// Whether the workflow is one of Switchboard's built-ins, as
+    /// `list_workflows` reports it.
     #[serde(default)]
     is_builtin: bool,
     /// Declared inputs and prompt arguments by name. Agent inputs take
@@ -756,6 +805,8 @@ pub struct RunWorkflowArgs {
 pub struct WaitSendArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
+    /// The send_id that `send`, `forward`, `compact_agent`, or `fork_agent`
+    /// returned.
     #[schemars(with = "String")]
     send_id: SendId,
     /// Seconds to wait before returning the current state. 50 by default.
@@ -782,6 +833,7 @@ pub struct WaitAgentArgs {
 pub struct WaitWorkflowArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
+    /// The run id `run_workflow` or `list_workflow_runs` returned.
     #[schemars(with = "String")]
     run_id: Uuid,
     /// Seconds to wait before returning the current state. 50 by default.

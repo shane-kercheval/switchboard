@@ -30,7 +30,7 @@ use super::change::{
 };
 use super::desktop_sync::{Hearing, SyncAck, SyncFork};
 use super::error_code::{self, error_code};
-use super::ledger::SendStatus;
+use super::ledger::{ForkClaim, SendStatus};
 use super::read::conversation_budget;
 use super::read::{
     AgentOutputStatus, DigestItem, DigestTurnStatus, OutputSource, ProjectStatus, ReadFrom,
@@ -4731,14 +4731,33 @@ async fn stopping_the_server_after_the_fork_exists_leaves_it_with_nothing_sent()
     hold.entered.notified().await;
     stop.cancel();
     hold.release.notify_one();
-    let receipt = task.await.unwrap().unwrap();
-    let fork_record = fork_of(&receipt);
-    assert_eq!(receipt.send.recipients[0].status, SendStatus::Rejected);
+    // The stop is answered at once; the task settles the entry behind it,
+    // with the fork recorded and its message refused.
+    let err = task.await.unwrap().unwrap_err();
+    assert!(matches!(err, AppError::Interrupted), "{err:?}");
+    let send_id = env.state.ledger.send_id_for_key(project_id, "k").unwrap();
+    for _ in 0..500 {
+        if env
+            .state
+            .ledger
+            .send(send_id)
+            .is_some_and(|snapshot| snapshot.settled)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let snapshot = env.state.ledger.send(send_id).unwrap();
+    assert!(snapshot.settled, "the task settled its entry");
+    assert_eq!(snapshot.recipients[0].status, SendStatus::Rejected);
     assert!(lock(&env.adapter.prompts).is_empty(), "nothing was sent");
-    assert!(
-        roster(&env, project_id)
-            .iter()
-            .any(|a| a.id == fork_record.id)
+    let fork_record = roster(&env, project_id)
+        .into_iter()
+        .find(|a| a.id != source)
+        .expect("the fork exists");
+    assert_eq!(
+        env.state.ledger.fork_for_key(project_id, "k").map(|f| f.id),
+        Some(fork_record.id)
     );
 
     // Access on again: the same request sends to the fork.
@@ -4871,4 +4890,215 @@ async fn a_codex_source_is_forked_through_codex_and_the_fork_is_an_ordinary_code
     let done = wait_done(&env, project_id, receipt.send.send_id).await;
     assert_eq!(done.recipients[0].text.as_deref(), Some("ack: branch"));
     assert_eq!(roster(&env, project_id).len(), 2);
+}
+
+#[tokio::test]
+async fn a_repeat_that_joined_the_refused_attempt_keeps_its_receipt_when_another_repeat_resumes() {
+    // Ledger only, no tasks: the joiner's slot is inspected unpolled.
+    let (env, project_id, source) = forkable_source();
+    let fork = roster(&env, project_id).remove(0);
+    let ledger = &env.state.ledger;
+    let ForkClaim::Fresh { send_id } =
+        ledger.claim_fork(project_id, Some("k"), "h", CancellationToken::new())
+    else {
+        panic!("fresh");
+    };
+    ledger.attach_fork(send_id, &fork);
+    let ForkClaim::Joined { result: joiner, .. } =
+        ledger.claim_fork(project_id, Some("k"), "h", CancellationToken::new())
+    else {
+        panic!("joined while in flight");
+    };
+    ledger.reject_undispatched(send_id, error_code::PROJECT_LOAD_TIMEOUT, "late");
+    ledger.settle(send_id).unwrap();
+
+    let ForkClaim::Resume {
+        send_id: resumed,
+        fork: again,
+    } = ledger.claim_fork(project_id, Some("k"), "h", CancellationToken::new())
+    else {
+        panic!("resumed");
+    };
+    assert_ne!(resumed, send_id);
+    assert_eq!(again.id, fork.id);
+    assert_eq!(ledger.send_id_for_key(project_id, "k"), Some(resumed));
+    let held = joiner.borrow().clone();
+    assert!(
+        matches!(&held, Some(Ok(receipt)) if receipt.send_id == send_id
+            && receipt.recipients[0].status == SendStatus::Rejected),
+        "the joiner keeps the refused attempt's receipt: {held:?}"
+    );
+    assert_eq!(source, source);
+}
+
+/// A source whose reply is complete but whose stream stays open, as Codex's
+/// does while it reads its rollout: the actor still holds its session.
+async fn source_holding_its_session_after_a_reply(
+    env: &TestEnv,
+    project_id: ProjectId,
+    source: AgentId,
+) -> Arc<Notify> {
+    let drain = Arc::new(Notify::new());
+    env.adapter.push(Script::reply("done").draining(&drain));
+    let reply = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![source], "work"),
+    )
+    .await
+    .unwrap();
+    let done = wait_done(env, project_id, reply.send_id).await;
+    assert_eq!(done.recipients[0].status, SendStatus::Completed);
+    assert!(
+        env.state.dispatcher.has_pending_work(source).await,
+        "the reply is complete but the session is still held"
+    );
+    drain
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fork_requested_while_the_source_still_holds_its_session_waits_for_the_release() {
+    let (env, project_id, source) = forkable_source();
+    let drain = source_holding_its_session_after_a_reply(&env, project_id, source).await;
+
+    let task = spawn_fork(&env, fork_request(project_id, source, "branch", Some("k")));
+    // Under the paused clock time moves only while every task is parked: the
+    // fork is waiting for the release, not refused and not created.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!task.is_finished(), "waiting for the release");
+    assert_eq!(roster(&env, project_id).len(), 1);
+
+    drain.notify_one();
+    let receipt = task.await.unwrap().unwrap();
+    assert_eq!(receipt.send.recipients[0].status, SendStatus::Accepted);
+    let done = wait_done(&env, project_id, receipt.send.send_id).await;
+    assert_eq!(done.recipients[0].text.as_deref(), Some("ack: branch"));
+    assert_eq!(roster(&env, project_id).len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_source_holding_its_session_past_the_budget_refuses_the_fork_and_the_same_key_forks_after_the_release()
+ {
+    let (env, project_id, source) = forkable_source();
+    let drain = source_holding_its_session_after_a_reply(&env, project_id, source).await;
+
+    let (handle, home) = (env.handle(), env.home());
+    let err = fork(
+        handle,
+        home,
+        fork_request(project_id, source, "branch", Some("k")),
+        WaitBudget::new(Some(2), false),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error_code(&err), error_code::SOURCE_BUSY);
+    assert_eq!(roster(&env, project_id).len(), 1, "nothing was created");
+
+    // The key was released: the same request forks once the source lets go.
+    drain.notify_one();
+    let receipt = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    assert!(receipt.fork.is_some());
+    assert_eq!(receipt.send.recipients[0].status, SendStatus::Accepted);
+    assert_eq!(roster(&env, project_id).len(), 2);
+}
+
+#[tokio::test]
+async fn a_stop_while_the_sources_agent_is_preparing_a_turn_interrupts_the_fork_at_once() {
+    let (env, project_id, source) = forkable_source();
+    let held = Arc::new(Notify::new());
+    env.adapter
+        .push(Script::reply("ack").holding_dispatch(&held));
+    // A send whose dispatch the adapter holds: the actor is preparing the
+    // turn and answers no question.
+    let send = tokio::spawn(send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![source], "hi"),
+    ));
+    for _ in 0..500 {
+        if !lock(&env.adapter.prompts).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !lock(&env.adapter.prompts).is_empty(),
+        "the actor reached the adapter"
+    );
+
+    let stop = CancellationToken::new();
+    let (handle, home) = (env.handle(), env.home());
+    let budget = WaitBudget::default_wait().with_cancel(stop.clone());
+    let task = tokio::spawn(async move {
+        fork(
+            handle,
+            home,
+            fork_request(project_id, source, "branch", Some("k")),
+            budget,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!task.is_finished(), "blocked on the actor's answer");
+    stop.cancel();
+    let err = task.await.unwrap().unwrap_err();
+    assert!(matches!(err, AppError::Interrupted), "{err:?}");
+    assert_eq!(roster(&env, project_id).len(), 1, "nothing was created");
+
+    held.notify_one();
+    let receipt = send.await.unwrap().unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+}
+
+#[tokio::test]
+async fn a_stop_during_the_forks_creation_is_answered_at_once_and_the_fork_is_recorded_with_nothing_sent()
+ {
+    let (env, project_id, source) = forkable_source();
+    let seam = env.seam(TestSeam::ForkRegistration);
+    let stop = CancellationToken::new();
+    let (handle, home) = (env.handle(), env.home());
+    let budget = WaitBudget::default_wait().with_cancel(stop.clone());
+    let task = tokio::spawn(async move {
+        fork(
+            handle,
+            home,
+            fork_request(project_id, source, "branch", Some("k")),
+            budget,
+        )
+        .await
+    });
+    seam.entered.notified().await;
+    stop.cancel();
+    let err = task.await.unwrap().unwrap_err();
+    assert!(matches!(err, AppError::Interrupted), "{err:?}");
+    assert_eq!(roster(&env, project_id).len(), 1, "creation is still held");
+
+    // The task runs on: the fork is registered, its message refused, not sent.
+    seam.release.notify_one();
+    let send_id = env.state.ledger.send_id_for_key(project_id, "k").unwrap();
+    for _ in 0..500 {
+        if env
+            .state
+            .ledger
+            .send(send_id)
+            .is_some_and(|snapshot| snapshot.settled)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let snapshot = env.state.ledger.send(send_id).unwrap();
+    assert!(snapshot.settled, "the task settled its entry");
+    assert_eq!(snapshot.recipients[0].status, SendStatus::Rejected);
+    assert!(lock(&env.adapter.prompts).is_empty(), "nothing was sent");
+    assert_eq!(roster(&env, project_id).len(), 2);
+
+    env.clear_seam(TestSeam::ForkRegistration);
+    let resent = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    assert_eq!(resent.send.recipients[0].status, SendStatus::Accepted);
+    assert_eq!(roster(&env, project_id).len(), 2, "the same fork, resumed");
 }

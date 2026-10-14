@@ -670,6 +670,7 @@ export async function removeAgent(agentId: AgentId): Promise<void> {
     }
   }
   unregisterAgents([agentId]);
+  forksLoadedWithProject.delete(agentId);
 }
 
 /// Rename an agent. The backend re-validates format + uniqueness (the frontend
@@ -1555,6 +1556,9 @@ export async function syncProjectForTurn(
   projectId: ProjectId,
   fork?: DesktopSyncFork,
 ): Promise<DesktopSyncAck> {
+  // Whether this request is what opens the project: its first load then
+  // starts after the fork exists and reads the fork's conversation too.
+  const opensProject = !loadStarted.has(projectId);
   try {
     await ensureProjectLoaded(projectId);
     // After the request arrived, never from before it: every agent the
@@ -1571,7 +1575,7 @@ export async function syncProjectForTurn(
   // failed, which gives an unreachable agent another chance on every sync.
   await Promise.all((agentsByProject[projectId] ?? []).map((agent) => registerAgent(agent)));
   if (!loadStarted.has(projectId)) return removed;
-  if (fork !== undefined) placeCarriedFork(projectId, fork);
+  if (fork !== undefined) placeCarriedFork(projectId, fork, opensProject);
   try {
     await subscribeProjectWorkflows(projectId);
   } catch (err) {
@@ -1614,7 +1618,23 @@ export async function syncProjectForTurn(
 /// handlers can be here at once. Works on the fork's current record from the
 /// roster just refreshed, never a creation-time one, so a retry cannot revert
 /// a rename, and a fork removed between attempts is not restored.
-function placeCarriedFork(projectId: ProjectId, carried: DesktopSyncFork): void {
+///
+/// **No second read when the request opened the project.** The backend
+/// creates the fork before it asks, so a first load this request started
+/// read the roster with the fork in it and, for a Codex fork, followed its
+/// pointer to its earlier conversation, as the load after a restart does.
+/// Reading again would read the whole project twice before answering, on a
+/// large project past the backend's deadline. Such a fork is remembered in
+/// [`forksLoadedWithProject`], so a retry or an overlapping handler does not
+/// read either, and it is not an eager fork: a failed load of its history
+/// shows Retry, as after a restart, with no automatic retry. A load that was
+/// already running or done before the request may predate the fork, so the
+/// read stays.
+function placeCarriedFork(
+  projectId: ProjectId,
+  carried: DesktopSyncFork,
+  opensProject: boolean,
+): void {
   const roster = agentsByProject[projectId] ?? [];
   const fork = roster.find((a) => a.id === carried.fork_id);
   if (fork === undefined) return;
@@ -1629,12 +1649,21 @@ function placeCarriedFork(projectId: ProjectId, carried: DesktopSyncFork): void 
     }
   }
   if (supportsForkWithoutTurn(fork.harness)) {
+    if (opensProject) forksLoadedWithProject.add(fork.id);
+    if (forksLoadedWithProject.has(fork.id)) return;
     eagerForks.add(fork.id);
     if (!agentIsWorking(runtimes[fork.id])) void loadForkInheritedHistory(fork.id);
   } else if (!forkHistoryLoaded.has(fork.id)) {
     forkHistoryPending.add(fork.id);
   }
 }
+
+/// Codex forks another client created whose earlier conversation came in
+/// with the project's own first load, which a readiness request carrying the
+/// fork started (`placeCarriedFork`), so no read of their own is queued.
+// Bookkeeping only — never read during render.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const forksLoadedWithProject = new Set<AgentId>();
 
 /// Another client changed a project's roster. A loaded project re-reads it so
 /// the change shows without a reload; a project not loaded reads it when it
@@ -2182,6 +2211,7 @@ export const _testing = {
     forkHistoryLoaded.clear();
     forkHistoryPending.clear();
     eagerForks.clear();
+    forksLoadedWithProject.clear();
     refreshRequestedAgain.clear();
     projectLoadChain.clear();
     rosterChanges.clear();

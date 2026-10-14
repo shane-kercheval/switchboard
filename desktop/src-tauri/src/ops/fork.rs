@@ -31,6 +31,16 @@
 //! resent. Concurrent repeats join one attempt. A failed admitted turn is
 //! observed through `wait_send`, never rerun here. The rule is the ledger's
 //! ([`SendLedger::claim_fork`]).
+//!
+//! **Stopping.** Everything before the fork's creation runs under the call's
+//! budget and ends at once on a server stop: the login-shell PATH wait a
+//! Codex fork needs at launch, the questions to the source's agent, the wait
+//! for its session. The creation itself cannot be cut short: a Codex fork
+//! holds the parent's session lock while `codex exec fork` runs, and dropping
+//! it mid-way would release that lock while the process is still being
+//! killed. So on a stop the call answers `interrupted` at once while its task
+//! finishes the creation, records the fork, and sends nothing; a repeat under
+//! the key then resumes.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -129,12 +139,19 @@ pub async fn fork(
     };
     // Own task, as a send: the caller's future may be dropped at any point
     // from here on without affecting the fork or its message.
+    let stop = budget.cancel_token().clone();
     let task = tokio::spawn(run(handle, home_dir, plan, budget, cancel));
-    task.await.unwrap_or_else(|join_error| {
-        Err(AppError::Internal(format!(
-            "the fork task did not finish: {join_error}"
-        )))
-    })
+    tokio::select! {
+        biased;
+        // A server stop is answered at once; the task runs on to settle the
+        // entry (see the module doc).
+        () = stop.cancelled() => Err(AppError::Interrupted),
+        joined = task => joined.unwrap_or_else(|join_error| {
+            Err(AppError::Internal(format!(
+                "the fork task did not finish: {join_error}"
+            )))
+        }),
+    }
 }
 
 struct Plan {
@@ -203,7 +220,9 @@ async fn run(
 /// refused as busy though the caller did as told. So the fork waits for the
 /// release, under the call's budget, woken by the agent's events. A source
 /// with a turn running is refused at once: that wait is the caller's, with
-/// `wait_agent`.
+/// `wait_agent`. The questions to the agent run under the call's finishing
+/// allowance, as the send's busy check does: an agent preparing a turn
+/// answers none for seconds, and a stop must not leave the call hanging.
 async fn await_source_released(
     state: &AppState,
     source: AgentId,
@@ -214,12 +233,36 @@ async fn await_source_released(
     // park is seen.
     let mut signal = state.ledger.subscribe_agent(source);
     loop {
-        if state.dispatcher.running_turn_kind(source).await.is_some() {
+        let running = match budget
+            .run_with_grace(state.dispatcher.running_turn_kind(source))
+            .await
+        {
+            Outcome::Done(kind) => kind.is_some(),
+            Outcome::Timeout => {
+                return Err(AppError::TimedOut {
+                    what: "asking whether the source is running a turn",
+                });
+            }
+            Outcome::Cancelled => return Err(AppError::Interrupted),
+        };
+        if running {
             return Err(AppError::ForkSourceBusy {
                 name: source_name.to_owned(),
             });
         }
-        if !state.dispatcher.has_pending_work(source).await {
+        let pending = match budget
+            .run_with_grace(state.dispatcher.has_pending_work(source))
+            .await
+        {
+            Outcome::Done(pending) => pending,
+            Outcome::Timeout => {
+                return Err(AppError::TimedOut {
+                    what: "asking whether the source still holds its session",
+                });
+            }
+            Outcome::Cancelled => return Err(AppError::Interrupted),
+        };
+        if !pending {
             return Ok(());
         }
         match budget.run(signal.changed()).await {
@@ -278,10 +321,26 @@ async fn run_inner(
     }
     let text = render_body(state, home_dir, project_id, body.into(), budget).await?;
     if fork.is_none() {
-        let source_name = list_project_agents_readonly_impl(state, project_id)?
+        let source_record = list_project_agents_readonly_impl(state, project_id)?
             .into_iter()
-            .find(|a| a.id == source)
-            .map_or_else(|| source.to_string(), |a| a.name);
+            .find(|a| a.id == source);
+        let source_name = source_record
+            .as_ref()
+            .map_or_else(|| source.to_string(), |a| a.name.clone());
+        // A Codex fork runs `codex` on the login-shell PATH, whose capture at
+        // launch can take seconds: waited for here, under the budget, so a
+        // stop ends it; the creation then finds it settled.
+        if source_record.is_some_and(|a| a.harness.supports_fork_without_turn()) {
+            match budget.run(crate::commands::fork_path_ready()).await {
+                Outcome::Done(_) => {}
+                Outcome::Timeout => {
+                    return Err(AppError::TimedOut {
+                        what: "waiting for the login-shell PATH",
+                    });
+                }
+                Outcome::Cancelled => return Err(AppError::Interrupted),
+            }
+        }
         await_source_released(state, source, &source_name, budget).await?;
         let created = fork_agent_impl(state, source, home_dir, &state.codex_binary).await?;
         state.ledger.attach_fork(send_id, &created);

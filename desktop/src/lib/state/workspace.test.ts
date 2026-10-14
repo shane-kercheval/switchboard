@@ -3827,12 +3827,16 @@ describe("desktop sync for another client's turn", () => {
       });
     });
 
-    it("reads a Codex fork's earlier conversation before answering ready", async () => {
+    it("reads a Codex fork's earlier conversation before answering ready, when the project was loaded before the request", async () => {
+      // A load that was running or done before the request may predate the
+      // fork, so the fork's own read is still needed.
       const ws = await loadWorkspaceState();
       const source = agent(AGENT_1, PROJECT_2);
       const hold = gate();
       // The project's own load answers at once; the fork's read waits.
       const loads = installHistoryBackend([source, codexFork()], 2, hold);
+      await ws.activateProject(PROJECT_2);
+      expect(loads()).toBe(1);
       await ws.installDesktopSync();
 
       requestWithFork();
@@ -3846,6 +3850,46 @@ describe("desktop sync for another client's turn", () => {
         { requestId: REQUEST, result: { status: "ready", listening_agents: [source.id, FORK] } },
       ]);
       expect(loads()).toBe(2);
+    });
+
+    it("reads the project once when the request itself opens it: that load already holds the fork's earlier conversation", async () => {
+      const ws = await loadWorkspaceState();
+      const source = agent(AGENT_1, PROJECT_2);
+      const loads = installHistoryBackend([source, codexFork()], 0, gate());
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      await settle();
+
+      expect(loads()).toBe(1);
+      expect(acks()).toEqual([
+        { requestId: REQUEST, result: { status: "ready", listening_agents: [source.id, FORK] } },
+      ]);
+      expect(ws.isAwaitingForkHistory(FORK)).toBe(false);
+    });
+
+    it("two requests overlapping the project's first load still read it once", async () => {
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const hold = gate();
+      const loads = installHistoryBackend([source, codexFork()], 1, hold);
+      await ws.installDesktopSync();
+      const SECOND = "00000000-0000-7000-8000-0000000000e2";
+
+      requestWithFork();
+      requestWithFork(SECOND);
+      await settle();
+      expect(loads()).toBe(1);
+      expect(acks()).toEqual([]);
+
+      hold.open();
+      await settle();
+      expect(loads()).toBe(1);
+      expect(acks().map((a) => (a as { requestId: string }).requestId)).toEqual([REQUEST, SECOND]);
+      const rosterIds = [source.id, FORK];
+      expect(panes.layoutFor(PROJECT_2, rosterIds).panes).toHaveLength(2);
+      expect(panes.paneOfAgent(PROJECT_2, rosterIds, FORK)?.members).toEqual([FORK]);
     });
 
     it("does not read a Codex fork's earlier conversation while the fork has a turn running", async () => {
@@ -3877,12 +3921,13 @@ describe("desktop sync for another client's turn", () => {
     it("a retry whose request overlaps the first handler's read neither reads nor places again", async () => {
       // The first request's handler keeps running past the backend's
       // deadline; the retry carries the same fork while that read is in
-      // flight.
+      // flight. The project was loaded before, so the fork's read is needed.
       const ws = await loadWorkspaceState();
       const panes = await import("$lib/state/transcriptPanes.svelte");
       const source = agent(AGENT_1, PROJECT_2);
       const hold = gate();
       const loads = installHistoryBackend([source, codexFork()], 2, hold);
+      await ws.activateProject(PROJECT_2);
       await ws.installDesktopSync();
       const SECOND = "00000000-0000-7000-8000-0000000000e2";
 

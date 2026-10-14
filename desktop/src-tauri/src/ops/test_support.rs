@@ -48,6 +48,10 @@ pub struct Script {
     /// fires: the agent's actor is then preparing the turn and answers no
     /// busy check.
     pub hold_dispatch: Option<Arc<Notify>>,
+    /// Keep the stream open after the turn's end until the gate fires, as
+    /// Codex's stays open while it reads its rollout: the actor holds the
+    /// agent's session meanwhile, though the reply is complete.
+    pub drain: Option<Arc<Notify>>,
 }
 
 impl Script {
@@ -60,6 +64,14 @@ impl Script {
             ignore_cancel: false,
             context: None,
             hold_dispatch: None,
+            drain: None,
+        }
+    }
+
+    pub fn draining(self, gate: &Arc<Notify>) -> Self {
+        Self {
+            drain: Some(Arc::clone(gate)),
+            ..self
         }
     }
 
@@ -228,6 +240,10 @@ impl HarnessAdapter for ScriptedAdapter {
                 model: None,
                 effort: None,
             });
+            if let Some(gate) = &script.drain {
+                gate.notified().await;
+            }
+            drop(tx);
         });
         Ok(Box::pin(
             tokio_stream::wrappers::UnboundedReceiverStream::new(rx),

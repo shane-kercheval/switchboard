@@ -504,13 +504,13 @@ impl SendLedger {
                     Some(fork.clone()),
                     cancel,
                 );
-                // The key moves to the new attempt and starts waiting again:
-                // a repeat that joined the failed attempt and is still parked
-                // gets this attempt's result.
+                // The key moves to the new attempt with a result slot of its
+                // own: a repeat that joined the refused attempt keeps that
+                // attempt's receipt, however the two are scheduled.
                 if let Some(claim) = inner.claims.get_mut(&(project_id, key.to_owned())) {
                     claim.send_id = send_id;
                     claim.claimed_at = Utc::now();
-                    claim.result.send_replace(None);
+                    claim.result = watch::Sender::new(None);
                 }
                 drop(inner);
                 self.bump();

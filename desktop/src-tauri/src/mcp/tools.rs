@@ -251,8 +251,10 @@ tools! {
          started (recipients[0] is rejected, with a code) a retry with the same key sends it \
          again to the same fork rather than making a second, and a different key makes another \
          fork. The user sees the fork in its own pane in Switchboard's window, with its earlier \
-         conversation. Nothing over MCP removes an agent, so forks stay until the user removes \
-         them: fork for a reason, not per message.";
+         conversation. If the message started and then failed (wait_send says failed), the fork \
+         exists: send to it by its agent_id rather than forking again; a Claude fork then branches \
+         from the source's conversation as it is at that send. Nothing over MCP removes an agent, \
+         so forks stay until the user removes them: fork for a reason, not per message.";
     Send = "send" (SendArgs) [Acts]
         "Send one message to one or more agents of a project. Returns at once with a send_id and \
          each recipient's status at dispatch: accepted, rejected (with a code), or \

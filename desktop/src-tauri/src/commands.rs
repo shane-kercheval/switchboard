@@ -2545,12 +2545,12 @@ pub async fn fork_agent_impl(
 /// the capture runs the machine's login shell, which no test may depend on,
 /// and the wait's own tests inject their readiness into `fork_agent_with`.
 #[cfg(not(test))]
-fn fork_path_ready() -> impl std::future::Future<Output = PathSource> {
+pub(crate) fn fork_path_ready() -> impl std::future::Future<Output = PathSource> {
     switchboard_harness::subprocess::ensure_path_settled(CODEX_FORK_PATH_WAIT)
 }
 
 #[cfg(test)]
-fn fork_path_ready() -> impl std::future::Future<Output = PathSource> {
+pub(crate) fn fork_path_ready() -> impl std::future::Future<Output = PathSource> {
     std::future::ready(PathSource::LoginShell)
 }
 

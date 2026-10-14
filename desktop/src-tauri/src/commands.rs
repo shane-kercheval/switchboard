@@ -7191,29 +7191,25 @@ pub async fn load_project_conversation_impl(
         let home_dir = home_dir.to_path_buf();
         async move {
             let agent_id = agent.id;
-            // Captured before the parse, so a reply that lands during a long
+            // Through the context store, which captures the agent's live
+            // generation before the parse so a reply that lands during a long
             // parse keeps its figures over the file's (see `ops::context`).
-            let generation = state.context.generation(agent_id);
-            let result = tokio::task::spawn_blocking(move || {
-                load_agent_transcript(&project, &agent, &home_dir)
-            })
-            .await;
+            let result = state
+                .context
+                .parse_recording(agent_id, async move {
+                    tokio::task::spawn_blocking(move || {
+                        load_agent_transcript(&project, &agent, &home_dir)
+                    })
+                    .await
+                    .map_err(|e| AppError::Internal(format!("transcript load task failed: {e}")))?
+                })
+                .await;
             match result {
-                Ok(Ok(transcript)) => {
-                    state
-                        .context
-                        .record_from_transcript(agent_id, generation, &transcript);
-                    (agent_id, transcript, None)
-                }
-                Ok(Err(err)) => (
+                Ok(transcript) => (agent_id, transcript, None),
+                Err(err) => (
                     agent_id,
                     switchboard_harness::LoadedTranscript::default(),
                     Some(err.to_string()),
-                ),
-                Err(join_err) => (
-                    agent_id,
-                    switchboard_harness::LoadedTranscript::default(),
-                    Some(join_err.to_string()),
                 ),
             }
         }

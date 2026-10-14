@@ -24,7 +24,9 @@
 //! and returns it dated now, or the newer of the stored and its own last
 //! reading when the read fails or does not finish in time. One read is in
 //! flight at a time, shared by concurrent calls; the read is skipped when the
-//! newer of the stored reading and this module's own is under a minute old;
+//! newest of the stored reading, this module's own reading, and its last
+//! attempt (failed or not, so a hanging Codex costs one slow call per minute,
+//! not one per call) is under a minute old;
 //! and the result is never written back to the map, which the window replaces
 //! whole on its next save (and the window deliberately runs one further read
 //! after an in-flight one, which joining its calls to a shared read would
@@ -48,11 +50,14 @@ use crate::ops::handle::AppStateHandle;
 use crate::state::lock;
 
 /// How long `get_usage` waits for a Codex account read before answering from
-/// what is stored. Covers the read's own bound and the PATH wait before it,
-/// inside every client's shortest call limit.
+/// what is stored. Covers the read's own bound (30 seconds plus its teardown),
+/// inside every client's shortest call limit, but not the launch-time wait for
+/// the login-shell PATH (about 22 seconds more): during that wait a call
+/// answers from the stored reading and the read lands for the next.
 pub const CODEX_READ_BUDGET: Duration = Duration::from_secs(45);
 
-/// A Codex reading younger than this is returned without a new read.
+/// A Codex reading younger than this is returned without a new read, and an
+/// attempt younger than this is not repeated.
 const FRESH_FOR: chrono::Duration = chrono::Duration::seconds(60);
 
 /// Claude's limit windows, in the meter's order, with each key's scope and
@@ -135,6 +140,8 @@ type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
 struct ReaderInner {
     latest: Option<CodexReading>,
+    /// When the last read ended, whatever it returned.
+    last_attempt_at: Option<DateTime<Utc>>,
     /// The read in flight: `true` once it has finished.
     in_flight: Option<watch::Sender<bool>>,
 }
@@ -155,6 +162,7 @@ impl CodexUsageReader {
             read: Mutex::new(read),
             inner: Mutex::new(ReaderInner {
                 latest: None,
+                last_attempt_at: None,
                 in_flight: None,
             }),
             #[cfg(test)]
@@ -181,9 +189,10 @@ impl CodexUsageReader {
         Utc::now()
     }
 
-    /// This module's newest Codex reading after reading if the newer of
-    /// `stored_at` (the window's reading) and its own is a minute old or more,
-    /// waiting up to `budget` for a read in flight, its own or one joined.
+    /// This module's newest Codex reading after reading if the newest of
+    /// `stored_at` (the window's reading), its own reading, and its last
+    /// attempt is a minute old or more, waiting up to `budget` for a read in
+    /// flight, its own or one joined.
     pub async fn reading(
         self: &Arc<Self>,
         handle: Arc<dyn AppStateHandle>,
@@ -195,10 +204,10 @@ impl CodexUsageReader {
         let receiver = {
             let mut inner = lock(&self.inner);
             let own_at = inner.latest.as_ref().map(|(_, at)| *at);
-            let newest = match (stored_at, own_at) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
+            let newest = [stored_at, own_at, inner.last_attempt_at]
+                .into_iter()
+                .flatten()
+                .max();
             if newest.is_some_and(|at| now - at < FRESH_FOR) {
                 return inner.latest.clone();
             }
@@ -212,8 +221,10 @@ impl CodexUsageReader {
                     tokio::spawn(async move {
                         let result = read(handle).await;
                         let mut inner = lock(&reader.inner);
+                        let ended = reader.now();
+                        inner.last_attempt_at = Some(ended);
                         if let Some(usage) = result {
-                            inner.latest = Some((usage, reader.now()));
+                            inner.latest = Some((usage, ended));
                         }
                         inner.in_flight = None;
                         drop(inner);
@@ -243,8 +254,7 @@ pub async fn get_usage(
     cancel: &CancellationToken,
 ) -> Result<Vec<HarnessUsageReport>, AppError> {
     let state = handle.app_state();
-    let stored = lock(&state.harness_usage).clone();
-    let stored_codex_at = stored
+    let stored_codex_at = lock(&state.harness_usage)
         .harnesses
         .get("codex")
         .and_then(|reading| reading.get("observed_at"))
@@ -253,6 +263,9 @@ pub async fn get_usage(
         .codex_usage_reader
         .reading(Arc::clone(&handle), stored_codex_at, budget, cancel)
         .await;
+    // Read again after the wait: a reading the window saved meanwhile is the
+    // one to report.
+    let stored = lock(&state.harness_usage).clone();
     Ok(report(&stored, fresh.as_ref(), Utc::now()))
 }
 
@@ -448,27 +461,57 @@ mod tests {
         "/../tests/fixtures/usage-readings.json"
     ));
 
-    fn fixture() -> (HarnessUsage, DateTime<Utc>, Value) {
+    /// The fixture's cases: name, the stored map, `now`, and the expected
+    /// report keyed by harness.
+    fn fixture_cases() -> Vec<(String, HarnessUsage, DateTime<Utc>, Value)> {
         let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
-        let stored = HarnessUsage {
-            harnesses: serde_json::from_value(fixture["harnesses"].clone()).unwrap(),
-        };
-        let now = DateTime::parse_from_rfc3339(fixture["now"].as_str().unwrap())
+        fixture["cases"]
+            .as_array()
             .unwrap()
-            .with_timezone(&Utc);
-        (stored, now, fixture["expected"].clone())
+            .iter()
+            .map(|case| {
+                let stored = HarnessUsage {
+                    harnesses: serde_json::from_value(case["harnesses"].clone()).unwrap(),
+                };
+                let now = DateTime::parse_from_rfc3339(case["now"].as_str().unwrap())
+                    .unwrap()
+                    .with_timezone(&Utc);
+                (
+                    case["name"].as_str().unwrap().to_owned(),
+                    stored,
+                    now,
+                    case["expected"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The first case: the full store, for the tests that need one.
+    fn fixture() -> (HarnessUsage, DateTime<Utc>, Value) {
+        let (_, stored, now, expected) = fixture_cases().into_iter().next().unwrap();
+        (stored, now, expected)
     }
 
     #[test]
     fn the_report_over_the_shared_fixture_is_what_both_readers_expect() {
-        let (stored, now, expected) = fixture();
-        let report = report(&stored, None, now);
-        assert_eq!(report.len(), 2);
-        assert_eq!(
-            serde_json::to_value(&report[0]).unwrap(),
-            expected["claude_code"]
-        );
-        assert_eq!(serde_json::to_value(&report[1]).unwrap(), expected["codex"]);
+        let cases = fixture_cases();
+        assert!(cases.len() >= 2, "the fixture holds the cases");
+        for (name, stored, now, expected) in cases {
+            let report = report(&stored, None, now);
+            assert_eq!(
+                report.len(),
+                expected.as_object().unwrap().len(),
+                "{name}: one entry per expected harness"
+            );
+            for entry in &report {
+                assert_eq!(
+                    serde_json::to_value(entry).unwrap(),
+                    expected[&entry.harness],
+                    "{name}: {}",
+                    entry.harness
+                );
+            }
+        }
     }
 
     #[test]
@@ -690,5 +733,115 @@ mod tests {
         assert_eq!(report[0].observed_at, Some(observed));
         assert_eq!(report[0].windows[0].key, "codex.primary");
         assert!((report[0].windows[0].used_fraction - 0.12).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_counts_toward_the_minute_so_a_hanging_codex_costs_one_read_per_minute()
+     {
+        let env = TestEnv::new();
+        let (reader, runs) = counting_reader(None, None);
+        let clock = Arc::new(Mutex::new(at(0)));
+        reader.set_clock(Arc::new({
+            let clock = Arc::clone(&clock);
+            move || *lock(&clock)
+        }));
+        let cancel = CancellationToken::new();
+        let budget = Duration::from_secs(5);
+        assert_eq!(
+            reader.reading(env.handle(), None, budget, &cancel).await,
+            None
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        *lock(&clock) = at(30);
+        assert_eq!(
+            reader.reading(env.handle(), None, budget, &cancel).await,
+            None
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "no retry within the minute");
+
+        *lock(&clock) = at(61);
+        assert_eq!(
+            reader.reading(env.handle(), None, budget, &cancel).await,
+            None
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "retried after the minute");
+    }
+
+    #[tokio::test]
+    async fn the_report_takes_readings_the_window_saved_during_the_codex_wait() {
+        let env = TestEnv::new();
+        let gate = Arc::new(Notify::new());
+        // The read says when it has entered, so the test can be sure the
+        // call's first look at the store came before the swap below.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+        // The reader under test is the state's own, so `get_usage` uses it.
+        env.state.codex_usage_reader.set_read(Arc::new({
+            let gate = Arc::clone(&gate);
+            move |_handle| {
+                let gate = Arc::clone(&gate);
+                let entered_tx = Arc::clone(&entered_tx);
+                Box::pin(async move {
+                    if let Some(entered) = lock(&entered_tx).take() {
+                        let _ = entered.send(());
+                    }
+                    gate.notified().await;
+                    None
+                })
+            }
+        }));
+        let resets = (Utc::now() + chrono::Duration::days(1)).timestamp();
+        let claude = |utilization: f64, observed: DateTime<Utc>| {
+            json!({
+                "observed_at": observed.to_rfc3339(),
+                "payload": {},
+                "windows": { "five_hour": {
+                    "window": { "utilization": utilization, "resetsAt": resets },
+                    "observed_at": observed.to_rfc3339(), "model": "claude-fable-5-1",
+                } },
+            })
+        };
+        let codex = |used: u64, observed: DateTime<Utc>| {
+            json!({
+                "observed_at": observed.to_rfc3339(),
+                "payload": { "ordinaryUsageAllowed": true, "rateLimitsByLimitId": {
+                    "codex": { "normalModelSlug": null, "planType": "plus",
+                               "primary": { "usedPercent": used, "resetsAt": resets, "windowDurationMins": 300 },
+                               "secondary": null } } },
+            })
+        };
+        let earlier = Utc::now() - chrono::Duration::minutes(10);
+        let later = Utc::now() - chrono::Duration::minutes(2);
+        *lock(&env.state.harness_usage) = HarnessUsage {
+            harnesses: [
+                ("claude_code".to_owned(), claude(0.2, earlier)),
+                ("codex".to_owned(), codex(10, earlier)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let call = tokio::spawn({
+            let handle = env.handle();
+            async move { get_usage(handle, Duration::from_secs(5), &CancellationToken::new()).await }
+        });
+        entered_rx.await.unwrap();
+        // The window saves newer readings for both harnesses while the read
+        // is held open.
+        *lock(&env.state.harness_usage) = HarnessUsage {
+            harnesses: [
+                ("claude_code".to_owned(), claude(0.9, later)),
+                ("codex".to_owned(), codex(95, later)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        gate.notify_one();
+        let report = call.await.unwrap().unwrap();
+        let claude = report.iter().find(|r| r.harness == "claude_code").unwrap();
+        assert!((claude.windows[0].used_fraction - 0.9).abs() < f64::EPSILON);
+        let codex = report.iter().find(|r| r.harness == "codex").unwrap();
+        assert!((codex.windows[0].used_fraction - 0.95).abs() < f64::EPSILON);
+        assert_eq!(codex.observed_at, Some(later));
     }
 }

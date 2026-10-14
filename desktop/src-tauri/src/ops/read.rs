@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId};
 use switchboard_harness::{SystemMarker, Turn, TurnOutcome, TurnStatus, turn_answer_text};
+use tokio_util::sync::CancellationToken;
 
 use crate::commands::{
     AgentJournalView, ConversationItem, OutcomeStatus, ProjectConversation, ProjectListing,
@@ -42,12 +43,17 @@ pub struct ProjectStatusListing {
 }
 
 /// Every project in the store with whether it is busy. A project nobody has
-/// opened has no registered agents and no run, so it is idle.
-pub async fn list_projects(state: &AppState) -> Result<Vec<ProjectStatusListing>, AppError> {
+/// opened has no registered agents and no run, so it is idle. Each agent's
+/// busy check asks its actor, which answers nothing while it prepares a turn,
+/// so the checks end on `cancel` (the server's stop) with `Interrupted`.
+pub async fn list_projects(
+    state: &AppState,
+    cancel: &CancellationToken,
+) -> Result<Vec<ProjectStatusListing>, AppError> {
     let listings = list_projects_impl(state)?;
     let mut out = Vec::with_capacity(listings.len());
     for listing in listings {
-        let status = if project_is_busy(state, listing.id).await {
+        let status = if project_is_busy(state, listing.id, cancel).await? {
             ProjectStatus::Busy
         } else {
             ProjectStatus::Idle
@@ -57,12 +63,16 @@ pub async fn list_projects(state: &AppState) -> Result<Vec<ProjectStatusListing>
     Ok(out)
 }
 
-async fn project_is_busy(state: &AppState, project_id: ProjectId) -> bool {
+async fn project_is_busy(
+    state: &AppState,
+    project_id: ProjectId,
+    cancel: &CancellationToken,
+) -> Result<bool, AppError> {
     if lock(&state.workflow_runs)
         .values()
         .any(|run| run.project_id == project_id)
     {
-        return true;
+        return Ok(true);
     }
     let agents: Vec<AgentId> = lock(&state.agents_by_id)
         .values()
@@ -70,11 +80,16 @@ async fn project_is_busy(state: &AppState, project_id: ProjectId) -> bool {
         .map(|a| a.id)
         .collect();
     for agent_id in agents {
-        if state.dispatcher.has_pending_work(agent_id).await {
-            return true;
+        let pending = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(AppError::Interrupted),
+            pending = state.dispatcher.has_pending_work(agent_id) => pending,
+        };
+        if pending {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -95,11 +110,15 @@ pub struct AgentListing {
 /// The project's roster with each agent's model, effort, quick choices,
 /// whether it would accept a send now, and its context fullness. An agent
 /// nothing has parsed since launch has its file read once, here, waiting
-/// [`CONTEXT_READ_WAIT`] for it; a read still running is reported as pending.
+/// [`CONTEXT_READ_WAIT`] for it; a read still running is reported as pending
+/// and finishes on its own. `cancel` (the server's stop) ends the wait and the
+/// busy checks after it with `Interrupted`, since an actor preparing a turn
+/// answers no check until it is ready.
 pub async fn list_agents(
     state: &AppState,
     project_id: ProjectId,
     home_dir: &Path,
+    cancel: &CancellationToken,
 ) -> Result<Vec<AgentListing>, AppError> {
     let records = list_project_agents_readonly_impl(state, project_id)?;
     let mut reads = Vec::new();
@@ -117,19 +136,24 @@ pub async fn list_agents(
         }));
     }
     if !reads.is_empty() {
-        let _ = tokio::time::timeout(
-            CONTEXT_READ_WAIT,
-            futures::future::join_all(reads.into_iter().map(|mut done| async move {
-                // The guard the wait returns is dropped here, so nothing
-                // non-`Send` is held across the join.
-                let _ = done.wait_for(|done| *done).await;
-            })),
-        )
-        .await;
+        let finished = futures::future::join_all(reads.into_iter().map(|mut done| async move {
+            // The guard the wait returns is dropped here, so nothing
+            // non-`Send` is held across the join.
+            let _ = done.wait_for(|done| *done).await;
+        }));
+        tokio::select! {
+            () = cancel.cancelled() => {}
+            _ = tokio::time::timeout(CONTEXT_READ_WAIT, finished) => {}
+        }
     }
     let mut out = Vec::with_capacity(records.len());
     for record in records {
-        let busy = !state.dispatcher.accepts_now(record.id).await;
+        let accepts = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(AppError::Interrupted),
+            accepts = state.dispatcher.accepts_now(record.id) => accepts,
+        };
+        let busy = !accepts;
         let (context, context_pending) = match state.context.lookup(record.id) {
             ContextState::Known(figures) => (figures, false),
             ContextState::Unknown => (None, true),
@@ -584,16 +608,20 @@ pub(crate) async fn correlate_turns(
     home_dir: &Path,
     context: &ContextStore,
 ) -> Result<Vec<CorrelatedTurn>, AppError> {
-    let generation = context.generation(agent.id);
     let transcript = {
         let project = project.clone();
         let agent = agent.clone();
         let home_dir = home_dir.to_path_buf();
-        tokio::task::spawn_blocking(move || load_agent_transcript(&project, &agent, &home_dir))
-            .await
-            .map_err(|e| AppError::Internal(format!("transcript load task failed: {e}")))??
+        context
+            .parse_recording(agent.id, async move {
+                tokio::task::spawn_blocking(move || {
+                    load_agent_transcript(&project, &agent, &home_dir)
+                })
+                .await
+                .map_err(|e| AppError::Internal(format!("transcript load task failed: {e}")))?
+            })
+            .await?
     };
-    context.record_from_transcript(agent.id, generation, &transcript);
     let renders = view.classify(&transcript.turns);
     Ok(transcript
         .turns

@@ -14,14 +14,15 @@
 //! **Two sources, one store point each.** Live figures come from every
 //! `turn_end` the ledger's emitter decorator sees, for every turn whatever its
 //! origin; a completed compaction is a turn whose figures are the compacted
-//! size. Disk figures come from every transcript parse the app makes (the
+//! size. Disk figures come from every transcript parse that records figures (the
 //! window's project load, the read tier's loads, and this module's own
-//! fallback read), all recorded through [`ContextStore::record_from_transcript`]
-//! under one guard: a reader captures the agent's live generation before it
-//! parses, and its result lands only if no live figure arrived meanwhile and
-//! it is not older than what is held; equal times keep the live fact. A large
+//! fallback read), all run through [`ContextStore::parse_recording`] under one
+//! guard: the store captures the agent's live generation before the parse
+//! runs, and the result lands only if no live figure arrived meanwhile and it
+//! is not older than what is held; equal times keep the live fact. A large
 //! file can take seconds to parse, so a read can finish after the reply or
-//! compaction it did not see.
+//! compaction it did not see. The capture happens inside the store, so a parse
+//! site cannot take it late.
 //!
 //! **The fallback read.** An agent nothing has parsed since launch is read
 //! once, the way `read_agent_output` reads it, by the first listing that needs
@@ -144,9 +145,8 @@ impl ContextStore {
         }
     }
 
-    /// The agent's live generation, for a reader to capture before it parses.
-    #[must_use]
-    pub fn generation(&self, agent_id: AgentId) -> u64 {
+    /// The agent's live generation, captured before a parse.
+    fn generation(&self, agent_id: AgentId) -> u64 {
         lock(&self.agents)
             .get(&agent_id)
             .map_or(0, |a| a.generation)
@@ -196,11 +196,37 @@ impl ContextStore {
         }));
     }
 
-    /// Record what a transcript parse found. `generation_before` is what
-    /// [`Self::generation`] returned to the reader before it parsed: the
-    /// result lands only if no live fact arrived since, and only if it is not
-    /// older than what is held (a tie keeps a live fact).
-    pub fn record_from_transcript(
+    /// Run a transcript parse and record what it found. The agent's live
+    /// generation is captured here, before `read` runs; the result lands only
+    /// if no live fact arrived since, and only if it is not older than what is
+    /// held (a tie keeps a live fact). A failed parse settles an agent nothing
+    /// has reported for as having no figures, so a later listing does not run
+    /// one more read that fails the same way. Every parse that records figures goes through
+    /// this, so the capture cannot come late.
+    pub async fn parse_recording<F>(
+        &self,
+        agent_id: AgentId,
+        read: F,
+    ) -> Result<LoadedTranscript, AppError>
+    where
+        F: Future<Output = Result<LoadedTranscript, AppError>>,
+    {
+        let generation = self.generation(agent_id);
+        match read.await {
+            Ok(transcript) => {
+                self.record_from_transcript(agent_id, generation, &transcript);
+                Ok(transcript)
+            }
+            Err(error) => {
+                self.record_read_failed(agent_id, generation);
+                Err(error)
+            }
+        }
+    }
+
+    /// Record what a transcript parse found under the generation captured
+    /// before it ran.
+    fn record_from_transcript(
         &self,
         agent_id: AgentId,
         generation_before: u64,
@@ -260,13 +286,8 @@ impl ContextStore {
             // Taken before the generation is captured, so a live fact that
             // lands while this read waits its turn is seen by the capture.
             let _permit = store.reads.acquire().await;
-            let generation = store.generation(agent_id);
-            match read.await {
-                Ok(transcript) => store.record_from_transcript(agent_id, generation, &transcript),
-                Err(error) => {
-                    tracing::warn!(%agent_id, %error, "context read of the agent's session file failed");
-                    store.record_read_failed(agent_id, generation);
-                }
+            if let Err(error) = store.parse_recording(agent_id, read).await {
+                tracing::warn!(%agent_id, %error, "context read of the agent's session file failed");
             }
             let mut agents = lock(&store.agents);
             if let Some(entry) = agents.get_mut(&agent_id) {
@@ -715,5 +736,35 @@ mod tests {
         });
         done.wait_for(|done| *done).await.unwrap();
         assert_eq!(store.lookup(agent_id), ContextState::Known(None));
+    }
+
+    #[tokio::test]
+    async fn a_parse_through_the_store_records_its_result_and_settles_a_failure() {
+        let store = ContextStore::new();
+        let agent_id = Uuid::now_v7();
+        let parsed = store
+            .parse_recording(agent_id, async {
+                Ok(file_with("2026-10-13T10:00:00Z", 100, 1000))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            parsed.turns.len(),
+            1,
+            "the transcript comes back to the caller"
+        );
+        assert_eq!(
+            store.lookup(agent_id),
+            ContextState::Known(Some(figures(100, 1000)))
+        );
+
+        let other = Uuid::now_v7();
+        let failed = store
+            .parse_recording(other, async {
+                Err(AppError::Internal("unreadable".to_owned()))
+            })
+            .await;
+        assert!(failed.is_err(), "the error reaches the caller");
+        assert_eq!(store.lookup(other), ContextState::Known(None));
     }
 }

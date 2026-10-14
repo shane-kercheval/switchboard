@@ -165,8 +165,9 @@ tools! {
          is_using_overage are observed facts, not permission to incur charges. Freshness: Claude \
          reports its limits only with a reply, so its reading is as old as the newest Claude \
          reply in the app (each window's observed_at says); Codex is read from the account on \
-         request when that finishes in time, else the newest stored reading. Empty when no \
-         account has reported.";
+         request, unless a reading under a minute old is held or a read failed under a minute \
+         ago, and when the read does not finish in time the newest stored reading is returned \
+         with its own observed_at. Empty when no account has reported.";
     ReadConversation = "read_conversation" (ReadConversationArgs) [Read]
         "A project's conversation in time order: each message sent (text and recipients), each \
          agent turn's answer text with its send_id and status (complete, running, failed, \
@@ -788,11 +789,11 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
     match tool {
         ToolName::ListProjects => {
             parse::<NoArgs>(args)?;
-            Reply::plain(&read::list_projects(state).await?)
+            Reply::plain(&read::list_projects(state, &cx.cancel).await?)
         }
         ToolName::ListAgents => {
             let a: ProjectArgs = parse(args)?;
-            Reply::plain(&read::list_agents(state, a.project_id, cx.home()).await?)
+            Reply::plain(&read::list_agents(state, a.project_id, cx.home(), &cx.cancel).await?)
         }
         ToolName::GetUsage => {
             parse::<NoArgs>(args)?;

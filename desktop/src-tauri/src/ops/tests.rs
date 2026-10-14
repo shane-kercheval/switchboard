@@ -113,10 +113,15 @@ async fn agent_lifecycle_on_an_unopened_project() {
     }
 
     assert!(
-        list_agents(&env.state, project_id, &env.home())
-            .await
-            .unwrap()
-            .is_empty()
+        list_agents(
+            &env.state,
+            project_id,
+            &env.home(),
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .is_empty()
     );
     assert!(lock(&env.state.projects).is_empty(), "a list opens nothing");
 
@@ -163,9 +168,14 @@ async fn agent_lifecycle_on_an_unopened_project() {
     .unwrap();
     assert_eq!(reset.model, None, "null resets to the harness default");
 
-    let listed = list_agents(&env.state, project_id, &env.home())
-        .await
-        .unwrap();
+    let listed = list_agents(
+        &env.state,
+        project_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(listed.len(), 1);
     assert!(!listed[0].busy);
 
@@ -210,7 +220,9 @@ async fn list_projects_reports_busy_and_idle() {
         env2.project("other")
     };
     let _ = other;
-    let listed = list_projects(&env.state).await.unwrap();
+    let listed = list_projects(&env.state, &CancellationToken::new())
+        .await
+        .unwrap();
     assert_eq!(listed[0].status, ProjectStatus::Idle);
 
     let gate = Arc::new(Notify::new());
@@ -223,7 +235,9 @@ async fn list_projects_reports_busy_and_idle() {
     .await
     .unwrap();
     await_turn_running(&env.state, agents[0]).await;
-    let listed = list_projects(&env.state).await.unwrap();
+    let listed = list_projects(&env.state, &CancellationToken::new())
+        .await
+        .unwrap();
     assert_eq!(listed[0].status, ProjectStatus::Busy);
     gate.notify_waiters();
 }
@@ -3526,9 +3540,14 @@ async fn list_agents_reports_the_context_a_live_turn_ended_with() {
     let agent_id = env.agent(project_id, "a");
 
     // Never dispatched and no file: settled as nothing, and not pending.
-    let listed = list_agents(&env.state, project_id, &env.home())
-        .await
-        .unwrap();
+    let listed = list_agents(
+        &env.state,
+        project_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(listed[0].context, None);
     assert!(!listed[0].context_pending);
 
@@ -3540,9 +3559,14 @@ async fn list_agents_reports_the_context_a_live_turn_ended_with() {
     .await
     .unwrap();
     wait_done(&env, project_id, receipt.send_id).await;
-    let listed = list_agents(&env.state, project_id, &env.home())
-        .await
-        .unwrap();
+    let listed = list_agents(
+        &env.state,
+        project_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(listed[0].context, Some(context_figures(1_200, 200_000)));
     assert!(!listed[0].context_pending);
 }
@@ -3557,9 +3581,14 @@ async fn list_agents_reads_an_agents_file_once_and_not_again() {
     save_window_for(&env, project_id, agent_id, "a1", 200_000);
     let env = env.restart();
 
-    let listed = list_agents(&env.state, project_id, &env.home())
-        .await
-        .unwrap();
+    let listed = list_agents(
+        &env.state,
+        project_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         listed[0].context,
         Some(context_figures(SEEDED_AFTER_TURN, 200_000))
@@ -3576,9 +3605,14 @@ async fn list_agents_reads_an_agents_file_once_and_not_again() {
         ],
     );
     save_window_for(&env, project_id, agent_id, "a2", 100_000);
-    let listed = list_agents(&env.state, project_id, &env.home())
-        .await
-        .unwrap();
+    let listed = list_agents(
+        &env.state,
+        project_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         listed[0].context,
         Some(context_figures(SEEDED_AFTER_TURN, 200_000)),
@@ -3608,9 +3642,14 @@ async fn list_agents_does_not_read_a_file_the_project_load_parsed() {
         ],
     );
     save_window_for(&env, project_id, agent_id, "a2", 100_000);
-    let listed = list_agents(&env.state, project_id, &env.home())
-        .await
-        .unwrap();
+    let listed = list_agents(
+        &env.state,
+        project_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         listed[0].context,
         Some(context_figures(SEEDED_AFTER_TURN, 200_000)),
@@ -3626,9 +3665,14 @@ async fn list_agents_settles_an_unreadable_file_as_no_context() {
     let agent_id = env.agent(project_id, "a");
     env.seed_unreadable_session(project_id, agent_id);
     let env = env.restart();
-    let listed = list_agents(&env.state, project_id, &env.home())
-        .await
-        .unwrap();
+    let listed = list_agents(
+        &env.state,
+        project_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(listed[0].context, None);
     assert!(!listed[0].context_pending);
 }
@@ -3649,4 +3693,137 @@ async fn read_agent_output_records_the_figures_it_parsed() {
         env.state.context.lookup(agent_id),
         super::context::ContextState::Known(Some(context_figures(SEEDED_AFTER_TURN, 200_000)))
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn list_agents_reports_pending_context_when_a_read_outlasts_its_wait() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("p");
+    let agent_id = env.agent(project_id, "a");
+    // A read held open, which the listing joins rather than starting its own.
+    let gate = Arc::new(Notify::new());
+    let mut done = env.state.context.ensure_reading(agent_id, {
+        let gate = Arc::clone(&gate);
+        async move {
+            gate.notified().await;
+            Ok(switchboard_harness::LoadedTranscript::default())
+        }
+    });
+    let started = tokio::time::Instant::now();
+    let listed = list_agents(
+        &env.state,
+        project_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        started.elapsed() >= super::context::CONTEXT_READ_WAIT,
+        "the listing waited out its bound"
+    );
+    assert_eq!(listed[0].context, None);
+    assert!(listed[0].context_pending, "the read is still running");
+    gate.notify_one();
+    done.wait_for(|done| *done).await.unwrap();
+    assert_eq!(
+        env.state.context.lookup(agent_id),
+        super::context::ContextState::Known(None),
+        "the read finished on its own"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_listing_cancelled_during_its_context_wait_is_interrupted() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("p");
+    let agent_id = env.agent(project_id, "a");
+    let gate = Arc::new(Notify::new());
+    let mut done = env.state.context.ensure_reading(agent_id, {
+        let gate = Arc::clone(&gate);
+        async move {
+            gate.notified().await;
+            Ok(switchboard_harness::LoadedTranscript::default())
+        }
+    });
+    let cancel = CancellationToken::new();
+    let call = tokio::spawn({
+        let (state, home, cancel) = (Arc::clone(&env.state), env.home(), cancel.clone());
+        async move { list_agents(&state, project_id, &home, &cancel).await }
+    });
+    // One virtual second in: the call is inside its five-second wait.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let cancelled_at = tokio::time::Instant::now();
+    cancel.cancel();
+    let result = call.await.unwrap();
+    assert!(matches!(result, Err(AppError::Interrupted)), "{result:?}");
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(1),
+        "the stop ended the wait at once"
+    );
+    gate.notify_one();
+    done.wait_for(|done| *done).await.unwrap();
+}
+
+/// Both listings ask each agent's actor whether it is busy, and an actor
+/// preparing a turn answers nothing until it is ready, so the stop must end
+/// that wait too.
+#[tokio::test]
+async fn a_listing_cancelled_during_a_busy_check_is_interrupted() {
+    let held = Arc::new(Notify::new());
+    let mut env = TestEnv::with_scripts(vec![Script::reply("ack").holding_dispatch(&held)]);
+    let project_id = env.project("p");
+    let agent_id = env.agent(project_id, "a");
+    // Known context first, so the listings go straight to their busy checks.
+    list_agents(
+        &env.state,
+        project_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    // A send whose dispatch the adapter holds: the actor is preparing the turn.
+    let send = tokio::spawn(send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agent_id], "hi"),
+    ));
+    for _ in 0..500 {
+        if !lock(&env.adapter.prompts).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !lock(&env.adapter.prompts).is_empty(),
+        "the actor reached the adapter"
+    );
+
+    let cancel = CancellationToken::new();
+    let agents = tokio::spawn({
+        let (state, home, cancel) = (Arc::clone(&env.state), env.home(), cancel.clone());
+        async move { list_agents(&state, project_id, &home, &cancel).await }
+    });
+    let projects = tokio::spawn({
+        let (state, cancel) = (Arc::clone(&env.state), cancel.clone());
+        async move { list_projects(&state, &cancel).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !agents.is_finished() && !projects.is_finished(),
+        "both are blocked on the actor"
+    );
+    cancel.cancel();
+    let agents = agents.await.unwrap();
+    let projects = projects.await.unwrap();
+    assert!(matches!(agents, Err(AppError::Interrupted)), "{agents:?}");
+    assert!(
+        matches!(projects, Err(AppError::Interrupted)),
+        "{projects:?}"
+    );
+
+    held.notify_one();
+    let receipt = send.await.unwrap().unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
 }

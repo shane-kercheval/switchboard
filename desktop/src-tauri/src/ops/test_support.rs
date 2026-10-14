@@ -44,6 +44,10 @@ pub struct Script {
     /// Context figures the turn's end reports: tokens after the turn and the
     /// window.
     pub context: Option<(u64, u32)>,
+    /// Hold `dispatch` itself, before it returns its stream, until the gate
+    /// fires: the agent's actor is then preparing the turn and answers no
+    /// busy check.
+    pub hold_dispatch: Option<Arc<Notify>>,
 }
 
 impl Script {
@@ -55,6 +59,14 @@ impl Script {
             key: None,
             ignore_cancel: false,
             context: None,
+            hold_dispatch: None,
+        }
+    }
+
+    pub fn holding_dispatch(self, gate: &Arc<Notify>) -> Self {
+        Self {
+            hold_dispatch: Some(Arc::clone(gate)),
+            ..self
         }
     }
 
@@ -128,6 +140,9 @@ impl HarnessAdapter for ScriptedAdapter {
         let script = lock(&self.scripts)
             .pop_front()
             .unwrap_or_else(|| Script::reply(&format!("ack: {prompt}")));
+        if let Some(gate) = &script.hold_dispatch {
+            gate.notified().await;
+        }
         let session_file = match &agent.session_locator {
             Some(SessionLocator::Uuid(session)) => Some(
                 switchboard_harness::claude_session_file_path(&self.home, cwd, session),

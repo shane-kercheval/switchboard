@@ -932,51 +932,65 @@ describe("the shared usage fixture", () => {
     resets_at: string | null;
     observed_at?: string;
   };
-  const fixture = JSON.parse(
-    readFileSync(resolve(__dirname, "../../tests/fixtures/usage-readings.json"), "utf8"),
-  ) as {
+  type Case = {
+    name: string;
     now: string;
     harnesses: {
-      claude_code: { payload: unknown; windows: Record<string, StoredUsageWindow> };
-      codex: { payload: unknown };
+      claude_code?: { payload: unknown; windows: Record<string, StoredUsageWindow> };
+      codex?: { payload: unknown };
     };
-    expected: { claude_code: { windows: ExpectedWindow[] }; codex: { windows: ExpectedWindow[] } };
+    expected: {
+      claude_code?: { windows: ExpectedWindow[] };
+      codex?: { windows: ExpectedWindow[] };
+    };
   };
-  const nowMs = Date.parse(fixture.now);
+  const fixture = JSON.parse(
+    readFileSync(resolve(__dirname, "../../tests/fixtures/usage-readings.json"), "utf8"),
+  ) as { cases: Case[] };
   const iso = (ms: number): string => new Date(ms).toISOString().replace(".000Z", "Z");
 
-  it("draws the Claude windows agent access reports, in the same order", () => {
-    const stored = fixture.harnesses.claude_code;
-    const view = claudeRateLimitView(stored.payload, stored.windows, nowMs);
-    expect(
-      view?.windows.map((w) => ({
-        key: w.key,
-        used_fraction: w.usedFraction,
-        resets_at: w.resetsAtMs === null ? null : iso(w.resetsAtMs),
-        observed_at: w.measuredAt,
-      })),
-    ).toEqual(
-      fixture.expected.claude_code.windows.map((w) => ({
-        key: w.key,
-        used_fraction: w.used_fraction,
-        resets_at: w.resets_at,
-        observed_at: w.observed_at,
-      })),
-    );
+  it("holds cases", () => {
+    expect(fixture.cases.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("draws the account-scoped Codex windows agent access reports, and no reserve", () => {
-    const view = codexAccountUsageView(fixture.harnesses.codex.payload, nowMs);
-    expect(
-      view.windows.map((w) => ({
-        key: w.key.replace(":", "."),
-        used_fraction: w.usedFraction,
-        resets_at: w.resetsAtMs === null ? null : iso(w.resetsAtMs),
-      })),
-    ).toEqual(
-      fixture.expected.codex.windows
-        .filter((w) => w.scope === "account")
-        .map((w) => ({ key: w.key, used_fraction: w.used_fraction, resets_at: w.resets_at })),
-    );
-  });
+  for (const c of fixture.cases) {
+    const nowMs = Date.parse(c.now);
+    if (c.harnesses.claude_code !== undefined) {
+      it(`${c.name}: draws the Claude windows agent access reports, in the same order`, () => {
+        const stored = c.harnesses.claude_code!;
+        const view = claudeRateLimitView(stored.payload, stored.windows, nowMs);
+        expect(
+          view?.windows.map((w) => ({
+            key: w.key,
+            used_fraction: w.usedFraction,
+            resets_at: w.resetsAtMs === null ? null : iso(w.resetsAtMs),
+            observed_at: w.measuredAt,
+          })),
+        ).toEqual(
+          c.expected.claude_code?.windows.map((w) => ({
+            key: w.key,
+            used_fraction: w.used_fraction,
+            resets_at: w.resets_at,
+            observed_at: w.observed_at,
+          })),
+        );
+      });
+    }
+    if (c.harnesses.codex !== undefined) {
+      it(`${c.name}: draws the account-scoped Codex windows agent access reports, and no reserve`, () => {
+        const view = codexAccountUsageView(c.harnesses.codex!.payload, nowMs);
+        expect(
+          view.windows.map((w) => ({
+            key: w.key.replace(":", "."),
+            used_fraction: w.usedFraction,
+            resets_at: w.resetsAtMs === null ? null : iso(w.resetsAtMs),
+          })),
+        ).toEqual(
+          c.expected.codex?.windows
+            .filter((w) => w.scope === "account")
+            .map((w) => ({ key: w.key, used_fraction: w.used_fraction, resets_at: w.resets_at })),
+        );
+      });
+    }
+  }
 });

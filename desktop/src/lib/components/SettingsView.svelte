@@ -867,11 +867,8 @@
             Add YAML files to the folder above, or use “Copy to my workflows” on a built-in. Run
             them from the compose bar's <span class="font-medium">Workflow</span> button.
           </p>
-          <div
-            class="border-border bg-panel overflow-hidden rounded-md border"
-            data-testid="workflow-authoring"
-          >
-            <div class="flex items-start gap-2 p-2.5">
+          <div class="overflow-hidden" data-testid="workflow-authoring">
+            <div class="flex items-start gap-2 py-2.5">
               <button
                 type="button"
                 class="focus-visible:ring-focus flex min-w-0 flex-1 items-start gap-2 rounded-sm text-left outline-none focus-visible:ring-1"
@@ -913,7 +910,7 @@
               <pre
                 id="workflow-authoring-prompt"
                 data-testid="workflow-authoring-prompt"
-                class="border-border bg-surface text-fg max-h-80 overflow-auto border-t px-3 py-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">{workflowPrompt}</pre>
+                class="bg-raised text-fg max-h-80 overflow-auto rounded-md px-3 py-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">{workflowPrompt}</pre>
             {/if}
           </div>
         </Disclosure>

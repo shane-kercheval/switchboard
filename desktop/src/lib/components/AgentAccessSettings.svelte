@@ -200,7 +200,7 @@
           />
         </div>
         <pre
-          class="border-border bg-surface text-fg overflow-x-auto rounded-md border px-3 py-2 font-mono text-[11px] leading-relaxed break-all whitespace-pre-wrap"
+          class="bg-raised text-fg overflow-x-auto rounded-md px-3 py-2 font-mono text-[11px] leading-relaxed break-all whitespace-pre-wrap"
           data-testid="agent-access-claude-code">{shownSnippets?.claudeCode}</pre>
         <p class="text-muted text-xs leading-relaxed">
           Run this in the folder you'll orchestrate from, and choose a folder that isn't any
@@ -226,7 +226,7 @@
           />
         </div>
         <pre
-          class="border-border bg-surface text-fg overflow-x-auto rounded-md border px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre"
+          class="bg-raised text-fg overflow-x-auto rounded-md px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre"
           data-testid="agent-access-codex">{shownSnippets?.codexConfig}</pre>
         <p class="text-muted text-xs leading-relaxed">
           Put this in <span class="font-mono">.codex/config.toml</span> inside a folder Codex trusts
@@ -236,7 +236,7 @@
         </p>
         <div class="flex items-center gap-2">
           <pre
-            class="border-border bg-surface text-fg min-w-0 flex-1 overflow-x-auto rounded-md border px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre"
+            class="bg-raised text-fg min-w-0 flex-1 overflow-x-auto rounded-md px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre"
             data-testid="agent-access-codex-env">{shownSnippets?.codexEnvironment}</pre>
           <CopyButton
             text={snippets.codexEnvironment}
@@ -270,7 +270,7 @@
           />
         </div>
         <pre
-          class="border-border bg-surface text-fg max-h-64 overflow-auto rounded-md border px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre"
+          class="bg-raised text-fg max-h-64 overflow-auto rounded-md px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre"
           data-testid="agent-access-claude-desktop">{shownSnippets?.claudeDesktop}</pre>
         <p class="text-muted text-xs leading-relaxed">
           Add this to <span class="font-mono">claude_desktop_config.json</span> (Claude Desktop:

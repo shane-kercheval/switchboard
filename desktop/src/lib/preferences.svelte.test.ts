@@ -21,7 +21,8 @@ const PREFS = (editor: string | null, terminal: string): Preferences => ({
   editor_command: editor,
   terminal_app: terminal,
   diff_style: "side_by_side",
-  show_builtins: true,
+  show_builtin_prompts: true,
+  show_builtin_workflows: true,
   claude_chrome_enabled: false,
   auto_reading_mode: false,
   notify_on_completion: true,
@@ -112,18 +113,33 @@ describe("preferences store", () => {
     expect(preferences.terminal_app).toBe("iTerm");
   });
 
-  it("loads and persists the show_builtins toggle", async () => {
+  it("loads and persists independent built-in visibility choices", async () => {
     _testing.reset({ ready: false });
-    invokeMock.mockResolvedValueOnce({ ...PREFS("code", "Terminal"), show_builtins: false });
+    invokeMock.mockResolvedValueOnce({
+      ...PREFS("code", "Terminal"),
+      show_builtin_prompts: false,
+      show_builtin_workflows: true,
+    });
     await loadPreferences();
-    expect(preferences.show_builtins).toBe(false);
+    expect(preferences.show_builtin_prompts).toBe(false);
+    expect(preferences.show_builtin_workflows).toBe(true);
 
-    invokeMock.mockResolvedValueOnce(null);
-    await updatePreferences({ show_builtins: true });
-    expect(preferences.show_builtins).toBe(true);
-    // The whole merged value is sent to the backend.
+    invokeMock.mockResolvedValue(null);
+    await updatePreferences({ show_builtin_workflows: false });
     expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
-      preferences: expect.objectContaining({ show_builtins: true }),
+      preferences: expect.objectContaining({
+        show_builtin_prompts: false,
+        show_builtin_workflows: false,
+      }),
+    });
+    await updatePreferences({ show_builtin_prompts: true });
+    expect(preferences.show_builtin_prompts).toBe(true);
+    expect(preferences.show_builtin_workflows).toBe(false);
+    expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
+      preferences: expect.objectContaining({
+        show_builtin_prompts: true,
+        show_builtin_workflows: false,
+      }),
     });
   });
 

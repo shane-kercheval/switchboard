@@ -885,8 +885,8 @@ export type DiffStyle = "side_by_side" | "unified";
 // Mirror of Rust `Preferences` (`desktop/src-tauri/src/preferences.rs`) — backend-owned
 // `config.yaml`. `editor_command` defaults to "code"; null → OS default
 // folder-open. `terminal_app` defaults to "Terminal"; `diff_style` defaults to
-// "unified". `show_builtins` defaults to true (the read-only built-in prompts &
-// workflows appear in the pickers; off → only the user's own content).
+// "unified". `show_builtin_prompts` and `show_builtin_workflows` default to true
+// and independently control whether examples appear in their respective pickers.
 // `claude_chrome_enabled` defaults to false (Claude agents get browser tools via
 // the Claude in Chrome extension; Claude-only, since Codex's equivalent is
 // configured in the ChatGPT desktop app).
@@ -897,7 +897,8 @@ export type Preferences = {
   editor_command: string | null;
   terminal_app: string;
   diff_style: DiffStyle;
-  show_builtins: boolean;
+  show_builtin_prompts: boolean;
+  show_builtin_workflows: boolean;
   claude_chrome_enabled: boolean;
   auto_reading_mode: boolean;
   notify_on_completion: boolean;

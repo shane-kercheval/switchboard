@@ -322,7 +322,8 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
         editor_command: null,
         terminal_app: "Terminal",
         diff_style: "side_by_side",
-        show_builtins: true,
+        show_builtin_prompts: true,
+        show_builtin_workflows: true,
         claude_chrome_enabled: false,
         agent_defaults: backend.agentDefaults,
       };

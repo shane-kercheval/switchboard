@@ -909,7 +909,7 @@ export async function getPromptSource(
 
 // ── Workflows ─────────────────────────────────────────────────────────────────
 
-/// All workflows: the read-only built-in library (when `show_builtins` is on)
+/// All workflows: the read-only built-in library (when `show_builtin_workflows` is on)
 /// merged with the user-global workflows folder. User-global — the same set is
 /// available from every project.
 export async function listWorkflows(): Promise<WorkflowListing[]> {

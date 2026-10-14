@@ -27,7 +27,8 @@ const defaultInvoke = async (cmd: string, _args?: Record<string, unknown>): Prom
       editor_command: "code",
       terminal_app: "Terminal",
       diff_style: "unified",
-      show_builtins: true,
+      show_builtin_prompts: true,
+      show_builtin_workflows: true,
       claude_chrome_enabled: false,
       auto_reading_mode: false,
       notify_on_completion: true,
@@ -400,7 +401,8 @@ describe("SettingsView", () => {
       editor_command: "zed",
       terminal_app: "iTerm",
       diff_style: "unified",
-      show_builtins: true,
+      show_builtin_prompts: true,
+      show_builtin_workflows: true,
       claude_chrome_enabled: false,
       auto_reading_mode: false,
       notify_on_completion: true,
@@ -524,7 +526,8 @@ describe("SettingsView", () => {
           editor_command: "cursor",
           terminal_app: "Terminal",
           diff_style: "unified",
-          show_builtins: true,
+          show_builtin_prompts: true,
+          show_builtin_workflows: true,
           claude_chrome_enabled: false,
           auto_reading_mode: false,
           notify_on_completion: true,
@@ -544,7 +547,8 @@ describe("SettingsView", () => {
           editor_command: null,
           terminal_app: "Terminal",
           diff_style: "unified",
-          show_builtins: true,
+          show_builtin_prompts: true,
+          show_builtin_workflows: true,
           claude_chrome_enabled: false,
           auto_reading_mode: false,
           notify_on_completion: true,
@@ -567,7 +571,8 @@ describe("SettingsView", () => {
           editor_command: "code",
           terminal_app: "iTerm",
           diff_style: "unified",
-          show_builtins: true,
+          show_builtin_prompts: true,
+          show_builtin_workflows: true,
           claude_chrome_enabled: false,
           auto_reading_mode: false,
           notify_on_completion: true,
@@ -585,7 +590,8 @@ describe("SettingsView", () => {
           editor_command: "code",
           terminal_app: "Terminal",
           diff_style: "unified",
-          show_builtins: true,
+          show_builtin_prompts: true,
+          show_builtin_workflows: true,
           claude_chrome_enabled: false,
           auto_reading_mode: false,
           notify_on_completion: true,
@@ -596,33 +602,50 @@ describe("SettingsView", () => {
     );
   });
 
-  it("shares the built-in content preference between Prompts and Workflows", async () => {
+  it("saves independent built-in visibility choices on their own pages", async () => {
     const view = render(SettingsView, { props: { onClose: vi.fn(), initialSection: "prompts" } });
-    const toggle = screen.getByTestId("show-builtins-toggle");
-    // Defaults on.
-    expect(toggle).toHaveAttribute("aria-checked", "true");
+    const promptToggle = screen.getByRole("switch", { name: "Show built-in prompts" });
+    expect(
+      screen.queryByRole("switch", { name: "Show built-in workflows" }),
+    ).not.toBeInTheDocument();
+    expect(promptToggle).toHaveAttribute("aria-checked", "true");
 
-    await fireEvent.click(toggle);
+    await fireEvent.click(promptToggle);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
-        preferences: expect.objectContaining({ show_builtins: false }),
+        preferences: expect.objectContaining({
+          show_builtin_prompts: false,
+          show_builtin_workflows: true,
+        }),
       }),
     );
-    expect(toggle).toHaveAttribute("aria-checked", "false");
     await view.rerender({ initialSection: "workflows" });
-    const workflowToggle = screen.getByRole("switch", {
-      name: "Show built-in prompts and workflows",
-    });
-    expect(workflowToggle).toHaveAttribute("aria-checked", "false");
+    const workflowToggle = screen.getByRole("switch", { name: "Show built-in workflows" });
+    expect(screen.queryByRole("switch", { name: "Show built-in prompts" })).not.toBeInTheDocument();
+    expect(workflowToggle).toHaveAttribute("aria-checked", "true");
     await fireEvent.click(workflowToggle);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
-        preferences: expect.objectContaining({ show_builtins: true }),
+        preferences: expect.objectContaining({
+          show_builtin_prompts: false,
+          show_builtin_workflows: false,
+        }),
       }),
     );
     await view.rerender({ initialSection: "prompts" });
-    expect(toggle).toBeVisible();
-    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(promptToggle).toBeVisible();
+    expect(promptToggle).toHaveAttribute("aria-checked", "false");
+    await fireEvent.click(promptToggle);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          show_builtin_prompts: true,
+          show_builtin_workflows: false,
+        }),
+      }),
+    );
+    await view.rerender({ initialSection: "workflows" });
+    expect(workflowToggle).toHaveAttribute("aria-checked", "false");
   });
 
   it("toggles claude_chrome_enabled and persists the change", async () => {
@@ -650,7 +673,8 @@ describe("SettingsView", () => {
           editor_command: "code",
           terminal_app: "Terminal",
           diff_style: "unified",
-          show_builtins: true,
+          show_builtin_prompts: true,
+          show_builtin_workflows: true,
           claude_chrome_enabled: true,
           auto_reading_mode: false,
           notify_on_completion: true,

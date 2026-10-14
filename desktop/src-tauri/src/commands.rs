@@ -1683,13 +1683,13 @@ pub fn set_preferences_impl(state: &AppState, prefs: &Preferences) -> Result<(),
 /// rather than breaking the listing.
 ///
 /// The read-only built-in library is dropped from the listing when the user's
-/// `show_builtins` preference is off. This is the **only** place built-ins are
+/// `show_builtin_prompts` preference is off. This is the **only** place built-ins are
 /// hidden — `PromptService` always lists and renders them — so the toggle
 /// governs picker visibility without unwiring a workflow already pointed at a
 /// built-in (resolution by id still succeeds).
 pub fn list_prompts_impl(state: &AppState) -> Vec<switchboard_prompts::Prompt> {
     let prompts = state.prompts.list();
-    if lock(&state.preferences).show_builtins {
+    if lock(&state.preferences).show_builtin_prompts {
         return prompts;
     }
     prompts
@@ -25350,7 +25350,8 @@ mod tests {
             editor_command: Some("zed".to_owned()),
             terminal_app: "iTerm".to_owned(),
             diff_style: preferences::DiffStyle::Unified,
-            show_builtins: false,
+            show_builtin_prompts: false,
+            show_builtin_workflows: false,
             claude_chrome_enabled: true,
             auto_reading_mode: true,
             notify_on_completion: true,
@@ -25379,7 +25380,8 @@ mod tests {
                 editor_command: Some("  ".to_owned()),
                 terminal_app: String::new(),
                 diff_style: preferences::DiffStyle::SideBySide,
-                show_builtins: true,
+                show_builtin_prompts: true,
+                show_builtin_workflows: true,
                 claude_chrome_enabled: false,
                 auto_reading_mode: false,
                 notify_on_completion: true,
@@ -25405,7 +25407,8 @@ mod tests {
             editor_command: Some("code".to_owned()),
             terminal_app: "Terminal".to_owned(),
             diff_style: preferences::DiffStyle::SideBySide,
-            show_builtins: true,
+            show_builtin_prompts: true,
+            show_builtin_workflows: true,
             claude_chrome_enabled: false,
             auto_reading_mode: false,
             notify_on_completion: true,
@@ -25470,7 +25473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn show_builtins_off_hides_built_ins_but_keeps_resolution() {
+    async fn hide_builtin_prompts_keeps_workflows_and_prompt_resolution() {
         // The toggle is visibility-only: built-ins drop out of the listing, yet a
         // render-by-id still resolves (so a workflow wired to one never breaks).
         let (tmp, state) = state_with_prompts();
@@ -25480,7 +25483,7 @@ mod tests {
         set_preferences_impl(
             &state,
             &Preferences {
-                show_builtins: false,
+                show_builtin_prompts: false,
                 notify_on_completion: true,
                 notify_while_focused: false,
                 ..Preferences::default()
@@ -25488,6 +25491,7 @@ mod tests {
         )
         .unwrap();
 
+        assert!(list_workflows_impl(&state).iter().any(|w| w.is_builtin));
         let prompts = list_prompts_impl(&state);
         assert!(
             prompts
@@ -26640,13 +26644,19 @@ mod tests {
         set_preferences_impl(
             &state,
             &Preferences {
-                show_builtins: false,
+                show_builtin_workflows: false,
                 notify_on_completion: true,
                 notify_while_focused: false,
                 ..Preferences::default()
             },
         )
         .unwrap();
+        state.prompts.sync().await;
+        assert!(
+            list_prompts_impl(&state)
+                .iter()
+                .any(|p| p.provider == switchboard_prompts::BUILTIN_PROVIDER)
+        );
         let listed = list_workflows_impl(&state);
         assert!(
             listed.iter().all(|w| !w.is_builtin),

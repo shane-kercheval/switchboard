@@ -420,14 +420,14 @@ fn builtin_listing(workflow: &Workflow) -> WorkflowListing {
 
 // --- list --------------------------------------------------------------------
 
-/// All workflows: the read-only built-in library (governed by the `show_builtins`
+/// All workflows: the read-only built-in library (governed by the `show_builtin_workflows`
 /// preference) merged with the user-global workflows folder's own `*.{yaml,yml}`
 /// files. User-global — the same set is available from every project. A malformed
 /// file surfaces its parse error in place rather than failing the whole list;
 /// built-ins, being baked-in, never produce a parse error.
 pub fn list_workflows_impl(state: &AppState) -> Vec<WorkflowListing> {
     let mut out = Vec::new();
-    if lock(&state.preferences).show_builtins {
+    if lock(&state.preferences).show_builtin_workflows {
         out.extend(builtin_workflows().iter().map(builtin_listing));
     }
     if let Some(dir) = state.workflows_dir.as_deref() {

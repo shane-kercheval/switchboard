@@ -221,35 +221,6 @@
   }
 </script>
 
-{#snippet builtInContent(testid: string)}
-  <section class={sectionClass}>
-    <div>
-      <h2 class={sectionHeadingClass}>Built-in content</h2>
-      <p class="text-muted mt-1 text-sm leading-relaxed">
-        Switchboard ships read-only example prompts and workflows that live in the app, not your
-        folders. To customize one, use “Copy to my prompts” / “Copy to my workflows” in its picker,
-        then edit your copy.
-      </p>
-    </div>
-
-    <div class="flex items-start justify-between gap-4">
-      <div class="min-w-0">
-        <div class="text-fg text-sm">Show built-in prompts &amp; workflows</div>
-        <p class="text-muted mt-0.5 text-xs leading-relaxed">
-          Turn this off to see only your own content in the prompt and workflow pickers.
-        </p>
-      </div>
-      <Switch
-        checked={preferences.show_builtins}
-        disabled={!preferenceLoadState.ready}
-        ariaLabel="Show built-in prompts and workflows"
-        {testid}
-        onclick={() => void updatePreferences({ show_builtins: !preferences.show_builtins })}
-      />
-    </div>
-  </section>
-{/snippet}
-
 <div class="flex min-h-0 flex-1 flex-col" data-testid="settings-view">
   <div class="shrink-0 px-8">
     <div class="w-full max-w-2xl">
@@ -690,7 +661,31 @@
     data-testid="settings-panel-prompts"
   >
     <div class="w-full max-w-2xl">
-      {@render builtInContent("show-builtins-toggle")}
+      <section class={sectionClass}>
+        <div>
+          <h2 class={sectionHeadingClass}>Built-in prompts</h2>
+          <p class="text-muted mt-1 text-sm leading-relaxed">
+            Switchboard includes read-only example prompts. To customize one, choose “Copy to my
+            prompts” in the picker, then edit your copy.
+          </p>
+        </div>
+        <div class="flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            <div class="text-fg text-sm">Show built-in prompts</div>
+            <p class="text-muted mt-0.5 text-xs leading-relaxed">
+              Turn this off to hide examples from the prompt picker.
+            </p>
+          </div>
+          <Switch
+            checked={preferences.show_builtin_prompts}
+            disabled={!preferenceLoadState.ready}
+            ariaLabel="Show built-in prompts"
+            testid="show-builtins-toggle"
+            onclick={() =>
+              void updatePreferences({ show_builtin_prompts: !preferences.show_builtin_prompts })}
+          />
+        </div>
+      </section>
 
       <section class={cn(sectionClass, "mt-7")} data-testid="prompt-settings-section">
         <div>
@@ -766,7 +761,33 @@
     data-testid="settings-panel-workflows"
   >
     <div class="w-full max-w-2xl">
-      {@render builtInContent("workflows-show-builtins-toggle")}
+      <section class={sectionClass}>
+        <div>
+          <h2 class={sectionHeadingClass}>Built-in workflows</h2>
+          <p class="text-muted mt-1 text-sm leading-relaxed">
+            Switchboard includes read-only example workflows. To customize one, choose “Copy to my
+            workflows” in the picker, then edit your copy.
+          </p>
+        </div>
+        <div class="flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            <div class="text-fg text-sm">Show built-in workflows</div>
+            <p class="text-muted mt-0.5 text-xs leading-relaxed">
+              Turn this off to hide examples from the workflow picker.
+            </p>
+          </div>
+          <Switch
+            checked={preferences.show_builtin_workflows}
+            disabled={!preferenceLoadState.ready}
+            ariaLabel="Show built-in workflows"
+            testid="workflows-show-builtins-toggle"
+            onclick={() =>
+              void updatePreferences({
+                show_builtin_workflows: !preferences.show_builtin_workflows,
+              })}
+          />
+        </div>
+      </section>
       <section class={cn(sectionClass, "mt-7")}>
         <div>
           <h2 class={sectionHeadingClass}>Workflows</h2>

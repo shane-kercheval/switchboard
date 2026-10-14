@@ -1364,10 +1364,18 @@ impl PromptService {
     /// Build the local provider from current config, or `None` when this service
     /// has no resolved prompt store (disabled).
     fn local_provider(&self) -> Option<LocalProvider> {
-        let default_dir = self.default_prompt_dir.as_deref()?;
-        let config = self.load_local_config();
-        let dirs = resolve_local_dirs(&config, default_dir, self.home.as_deref());
-        Some(LocalProvider::new(dirs))
+        self.default_prompt_dir.as_ref()?;
+        Some(LocalProvider::new(self.local_prompt_dirs()))
+    }
+
+    /// Effective local prompt directories in lookup order. The first is the
+    /// creation destination so new prompts take precedence over later folders.
+    #[must_use]
+    pub fn local_prompt_dirs(&self) -> Vec<PathBuf> {
+        let Some(default_dir) = self.default_prompt_dir.as_deref() else {
+            return Vec::new();
+        };
+        resolve_local_dirs(&self.load_local_config(), default_dir, self.home.as_deref())
     }
 
     /// Read the user-global config's local section. A missing file is the common

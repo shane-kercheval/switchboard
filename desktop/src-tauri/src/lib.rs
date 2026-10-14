@@ -1639,13 +1639,13 @@ async fn reveal_in_finder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn local_prompts_dir() -> Result<String, String> {
-    local_prompts_dir_path().map(|path| path.to_string_lossy().into_owned())
+async fn local_prompts_dir(state: State<'_, AppState>) -> Result<String, String> {
+    local_prompts_dir_path(&state.prompts).map(|path| path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
-async fn open_local_prompts_dir() -> Result<(), String> {
-    let path = local_prompts_dir_path()?;
+async fn open_local_prompts_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let path = local_prompts_dir_path(&state.prompts)?;
     std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
     run_open_argv(vec!["open".to_owned(), path.to_string_lossy().into_owned()]).await
 }
@@ -1655,7 +1655,7 @@ async fn open_local_prompts_dir() -> Result<(), String> {
 /// path. Errors (already-exists, write failure) surface to the caller.
 #[tauri::command]
 async fn copy_builtin_prompt(state: State<'_, AppState>, name: String) -> Result<String, String> {
-    let prompts_dir = local_prompts_dir_path()?;
+    let prompts_dir = local_prompts_dir_path(&state.prompts)?;
     let written = copy_builtin_prompt_impl(&name, &prompts_dir).map_err(|e| e.to_string())?;
     let state = state.inner();
     sync_prompts_and_notify(state.prompts.clone(), Arc::clone(&state.emitter)).await;
@@ -2085,9 +2085,13 @@ fn preferences_config_path() -> Option<std::path::PathBuf> {
     config_dir().map(|dir| dir.join("config.yaml"))
 }
 
-fn local_prompts_dir_path() -> Result<std::path::PathBuf, String> {
-    config_dir()
-        .map(|dir| dir.join("prompts"))
+fn local_prompts_dir_path(
+    prompts: &switchboard_prompts::PromptService,
+) -> Result<std::path::PathBuf, String> {
+    prompts
+        .local_prompt_dirs()
+        .into_iter()
+        .next()
         .ok_or_else(|| "prompt providers are not configured (no config path)".to_owned())
 }
 
@@ -2859,11 +2863,58 @@ mod asset_scope_tests {
 mod tests {
     use super::{
         ActivationCommandError, build_debug_secret_store, build_release_secret_store,
-        debug_config_dir, run_open_argv, session_lock_root,
+        debug_config_dir, local_prompts_dir_path, run_open_argv, session_lock_root,
     };
     use crate::error::AppError;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use switchboard_prompts::{InMemorySecretStore, PromptService};
+    use tempfile::TempDir;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn prompt_creation_uses_the_first_scanned_folder() {
+        for custom in [false, true] {
+            let root = TempDir::new().unwrap();
+            let default = root.path().join("prompts");
+            let first = root.path().join("first");
+            let second = root.path().join("second");
+            let config = root.path().join("config.yaml");
+            if custom {
+                std::fs::write(
+                    &config,
+                    format!(
+                        "local_prompt_dirs:\n  - {}\n  - {}\n",
+                        first.display(),
+                        second.display()
+                    ),
+                )
+                .unwrap();
+            }
+            let service = PromptService::new(
+                config,
+                default.clone(),
+                None,
+                Arc::new(InMemorySecretStore::new()),
+            );
+            let advertised = local_prompts_dir_path(&service).unwrap();
+            assert_eq!(advertised, if custom { first } else { default.clone() });
+            let written =
+                crate::commands::copy_builtin_prompt_impl("code-review", &advertised).unwrap();
+            assert_eq!(written, advertised.join("code-review.md"));
+            service.sync().await;
+            assert!(
+                service
+                    .list()
+                    .iter()
+                    .any(|prompt| prompt.provider == "local" && prompt.name == "code-review")
+            );
+            assert!(!second.exists());
+            if custom {
+                assert!(!default.exists());
+            }
+        }
+    }
 
     #[test]
     fn the_session_lock_root_resolves_to_the_release_location_in_a_debug_build() {

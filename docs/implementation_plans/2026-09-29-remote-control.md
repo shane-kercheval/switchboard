@@ -53,7 +53,8 @@ shared Rust cryptography are in one tree.
   - **Queues are bounded by bytes, and a sender waits for room.** Each connection's queue
     holds at most 4 MiB of frames; a sender whose recipient is full waits rather than losing
     the frame, and a recipient is closed only when its socket accepts no bytes for 5 seconds
-    while a sender waits, or when even its own control messages no longer fit. Memory is
+    while a sender waits, when it frees no room for the waiting frame within 60 seconds, or
+    when even its own control messages no longer fit. Memory is
     bounded by the queue budget and one read buffer per admitted connection. The wait couples
     a Mac to its slowest phone, for as long as that phone's bandwidth makes it, minutes on a
     poor link, and the Mac does not pace around it: bounding it would take per-phone
@@ -1310,7 +1311,8 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
 - **Timings, in the order they must keep**: the relay's ping (25 s) is at most half the
   clients' silence limit (50 s), so one late ping does not end a working connection; the
   stall timeout (5 s) is below the phone's handshake deadline (10 s), so one phone's stall
-  cannot make another give up connecting; the ping is below the idle timeout (90 s). The
+  cannot make another give up connecting; the room timeout (60 s) and the ping are below the
+  idle timeout (90 s). The
   registration deadline and the request-head deadline are 10 s. A unit test holds the
   defaults to this order.
 - **Session table**: in memory, `device_id → (role, queue)`. A new registration for an id
@@ -1368,8 +1370,12 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   room; the recipient is closed only if its socket accepts no bytes for 5 seconds while a
   sender waits, measured from the later of the wait's start and the last bytes accepted, so a
   long message going out slowly is progress and a queue idle before a burst is not a stall;
-  or if even its own control messages no longer fit, which is a client not reading its own
-  errors. A send that fails closes its connection, so its peers are told.
+  if it frees no room for the waiting frame within 60 seconds however many bytes it accepts,
+  which is a phone below about 12 kbps or one trickling bytes to hold its Mac; or if even its
+  own control messages no longer fit, which is a client not reading its own errors. The 60
+  seconds bound how long one frame holds its sender, whose reader reads nothing else while
+  it waits: not its `paired_devices` unpairing that phone, and not its own socket's end, so for a
+  Mac whose connection dies during a wait, its idle timeout starts at most 60 seconds late. A send that fails closes its connection, so its peers are told.
 
   The wait couples a Mac to its slowest phone, and this is accepted: the Mac's traffic is one
   ordered stream, so while one phone's queue is full the Mac's frames to its other phones

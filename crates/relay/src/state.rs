@@ -94,13 +94,18 @@ impl Refusal {
         }
     }
 
-    fn mac_only() -> Self {
+    /// A protocol violation, which ends the connection.
+    pub fn bad_message(message: &'static str) -> Self {
         Self {
             code: ErrorCode::BadMessage,
-            message: "only a Mac may send this",
+            message,
             device_id: None,
             last_seen: None,
         }
+    }
+
+    fn mac_only() -> Self {
+        Self::bad_message("only a Mac may send this")
     }
 
     /// Whether the connection that caused this refusal is closed after it:
@@ -377,28 +382,28 @@ impl Relay {
         pairing_token: Option<&[u8; PAIRING_TOKEN_LEN]>,
         now: Instant,
     ) -> Result<Outbox, Refusal> {
-        let sender = self.registered.get(from);
-        match sender
+        let Some(sender) = self
+            .registered
+            .get(from)
             .filter(|peer| peer.generation == generation)
-            .map(|peer| peer.kind.clone())
-        {
-            Some(Kind::Phone { mac }) => self.route_from_phone(from, &mac, to, pairing_token, now),
-            Some(Kind::Mac) => self.route_from_mac(from, to, now),
-            None => Err(Refusal::not_paired(to)),
+        else {
+            return Err(Refusal::not_paired(to));
+        };
+        match &sender.kind {
+            Kind::Mac => self.route_from_mac(from, to, now),
+            Kind::Phone { mac } if mac == to => self.route_from_phone(from, to, pairing_token, now),
+            Kind::Phone { .. } => Err(Refusal::not_paired(to)),
         }
     }
 
+    /// From `phone` to `to`, the Mac it names.
     fn route_from_phone(
         &mut self,
         phone: &DeviceId,
-        named_mac: &DeviceId,
         to: &DeviceId,
         pairing_token: Option<&[u8; PAIRING_TOKEN_LEN]>,
         now: Instant,
     ) -> Result<Outbox, Refusal> {
-        if to != named_mac {
-            return Err(Refusal::not_paired(to));
-        }
         let Some(phones) = self.held_sets.get(to) else {
             // A Mac the relay holds no set for: one it does not know, or one
             // that has not registered since the relay restarted.

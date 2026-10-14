@@ -47,6 +47,14 @@ pub(crate) fn is_stalled(last_progress: Instant, now: Instant, stall: Duration) 
     now.saturating_duration_since(last_progress) >= stall
 }
 
+/// How long a sender waits for room at a recipient: `stall` without the
+/// recipient's socket accepting a byte, and `room` in all.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Wait {
+    pub stall: Duration,
+    pub room: Duration,
+}
+
 /// When a connection's socket last accepted bytes, stamped by the socket
 /// itself on every write that made headway.
 #[derive(Debug, Clone)]
@@ -127,13 +135,16 @@ impl Outbox {
 
     /// Queues a frame, waiting while the budget is full. Gives up, and
     /// returns false, if the recipient closes, if `sender_closed` is
-    /// cancelled, or if the recipient's socket accepts nothing for `stall`
-    /// while it waits — in which case it is closed as not reading.
+    /// cancelled, if the recipient's socket accepts nothing for `wait.stall`,
+    /// or if no room comes within `wait.room` however much it accepts — in
+    /// either of the last two cases the recipient is closed, as not reading
+    /// or as too slow to read. `wait.room` bounds how long one frame holds
+    /// its sender, which reads nothing else meanwhile.
     pub async fn send_frame(
         &self,
         message: ServerMessage,
         cost: usize,
-        stall: Duration,
+        wait: Wait,
         sender_closed: &CancellationToken,
     ) -> bool {
         let permits = u32::try_from(cost.min(self.capacity)).unwrap_or(u32::MAX);
@@ -141,7 +152,7 @@ impl Outbox {
             Ok(permit) => permit,
             Err(TryAcquireError::Closed) => return false,
             Err(TryAcquireError::NoPermits) => {
-                match self.wait_for_room(permits, stall, sender_closed).await {
+                match self.wait_for_room(permits, wait, sender_closed).await {
                     Some(permit) => permit,
                     None => return false,
                 }
@@ -156,7 +167,7 @@ impl Outbox {
     async fn wait_for_room(
         &self,
         permits: u32,
-        stall: Duration,
+        Wait { stall, room }: Wait,
         sender_closed: &CancellationToken,
     ) -> Option<OwnedSemaphorePermit> {
         let acquire = Arc::clone(&self.budget).acquire_many_owned(permits);
@@ -171,6 +182,11 @@ impl Outbox {
                 permit = &mut acquire => return permit.ok(),
                 () = self.closed.cancelled() => return None,
                 () = sender_closed.cancelled() => return None,
+                () = tokio::time::sleep_until(started + room) => {
+                    tracing::debug!("closing a connection too slow to take a frame");
+                    self.closed.cancel();
+                    return None;
+                }
                 () = tokio::time::sleep_until(since + stall) => {
                     if is_stalled(self.progress.last().max(started), Instant::now(), stall) {
                         tracing::debug!("closing a connection that stopped reading");
@@ -245,6 +261,11 @@ mod tests {
 
     const BUDGET: usize = 4 * MIN_FRAME_COST;
     const STALL: Duration = Duration::from_secs(5);
+    const ROOM: Duration = Duration::from_mins(1);
+    const WAIT: Wait = Wait {
+        stall: STALL,
+        room: ROOM,
+    };
 
     fn frame(n: u8) -> ServerMessage {
         let id = DeviceId::parse(&"a".repeat(26)).unwrap();
@@ -286,7 +307,7 @@ mod tests {
 
         async fn send(&self, n: u8, sender_closed: &CancellationToken) -> bool {
             self.outbox
-                .send_frame(frame(n), MIN_FRAME_COST, STALL, sender_closed)
+                .send_frame(frame(n), MIN_FRAME_COST, WAIT, sender_closed)
                 .await
         }
 
@@ -368,7 +389,7 @@ mod tests {
         for n in 0..4 {
             assert!(
                 outbox
-                    .send_frame(frame(n), MIN_FRAME_COST, STALL, &sender_closed)
+                    .send_frame(frame(n), MIN_FRAME_COST, WAIT, &sender_closed)
                     .await
             );
         }
@@ -377,7 +398,7 @@ mod tests {
             let sender_closed = sender_closed.clone();
             async move {
                 outbox
-                    .send_frame(frame(4), MIN_FRAME_COST, STALL, &sender_closed)
+                    .send_frame(frame(4), MIN_FRAME_COST, WAIT, &sender_closed)
                     .await
             }
         });
@@ -406,7 +427,7 @@ mod tests {
         for n in 0..12 {
             assert!(
                 outbox
-                    .send_frame(frame(n), MIN_FRAME_COST, STALL, &sender_closed)
+                    .send_frame(frame(n), MIN_FRAME_COST, WAIT, &sender_closed)
                     .await
             );
         }
@@ -434,7 +455,7 @@ mod tests {
             let sender_closed = sender_closed.clone();
             async move {
                 outbox
-                    .send_frame(frame(4), MIN_FRAME_COST, STALL, &sender_closed)
+                    .send_frame(frame(4), MIN_FRAME_COST, WAIT, &sender_closed)
                     .await
             }
         });
@@ -452,6 +473,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_recipient_that_keeps_accepting_bytes_but_frees_no_room_is_closed_in_time() {
+        let recipient = Recipient::new();
+        let sender_closed = CancellationToken::new();
+        recipient.fill(&sender_closed).await;
+        let started = Instant::now();
+        let waiting = tokio::spawn({
+            let outbox = recipient.outbox.clone();
+            let sender_closed = sender_closed.clone();
+            async move {
+                outbox
+                    .send_frame(frame(4), MIN_FRAME_COST, WAIT, &sender_closed)
+                    .await
+            }
+        });
+        // A byte every second: never stalled, and never through a frame.
+        let trickle = tokio::spawn({
+            let progress = recipient.progress.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    progress.stamp();
+                }
+            }
+        });
+        let gave_up = tokio::time::timeout(ROOM * 2, waiting)
+            .await
+            .expect("the sender waited on a recipient that never made room");
+        assert!(!gave_up.unwrap());
+        assert_eq!(Instant::now(), started + ROOM);
+        assert!(recipient.closed.is_cancelled());
+        trickle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_burst_after_a_long_idle_is_not_taken_for_a_stall() {
         let Recipient {
             outbox,
@@ -465,7 +520,7 @@ mod tests {
         for n in 0..8 {
             assert!(
                 outbox
-                    .send_frame(frame(n), MIN_FRAME_COST, STALL, &sender_closed)
+                    .send_frame(frame(n), MIN_FRAME_COST, WAIT, &sender_closed)
                     .await
             );
         }
@@ -488,7 +543,7 @@ mod tests {
             stalled.send(n, &sender_closed).await;
             assert!(
                 outbox
-                    .send_frame(frame(n), MIN_FRAME_COST, STALL, &sender_closed)
+                    .send_frame(frame(n), MIN_FRAME_COST, WAIT, &sender_closed)
                     .await
             );
         }
@@ -507,13 +562,13 @@ mod tests {
         for n in 0..12 {
             assert!(
                 slow.outbox
-                    .send_frame(frame(n), MIN_FRAME_COST, STALL, &sender_closed)
+                    .send_frame(frame(n), MIN_FRAME_COST, WAIT, &sender_closed)
                     .await
             );
             assert!(
                 quick
                     .outbox
-                    .send_frame(frame(n), MIN_FRAME_COST, STALL, &sender_closed)
+                    .send_frame(frame(n), MIN_FRAME_COST, WAIT, &sender_closed)
                     .await
             );
         }
@@ -561,7 +616,7 @@ mod tests {
             let sender_closed = sender_closed.clone();
             async move {
                 outbox
-                    .send_frame(frame(4), MIN_FRAME_COST, STALL, &sender_closed)
+                    .send_frame(frame(4), MIN_FRAME_COST, WAIT, &sender_closed)
                     .await
             }
         });

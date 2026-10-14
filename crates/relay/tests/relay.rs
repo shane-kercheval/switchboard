@@ -1048,6 +1048,24 @@ async fn healthz(relay: &RelayHandle) -> String {
     response
 }
 
+/// Asks for `/healthz` and leaves the connection open. `None` if the relay
+/// closed the socket instead of answering.
+async fn keep_alive_healthz(socket: &mut TcpStream) -> Option<String> {
+    let request = b"GET /healthz HTTP/1.1\r\nHost: relay\r\n\r\n";
+    if socket.write_all(request).await.is_err() {
+        return None;
+    }
+    let mut response = Vec::new();
+    let mut buffer = [0; 1024];
+    while !response.ends_with(b"}") {
+        match socket.read(&mut buffer).await {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => response.extend_from_slice(&buffer[..read]),
+        }
+    }
+    Some(String::from_utf8_lossy(&response).into_owned())
+}
+
 #[tokio::test]
 async fn healthz_answers_only_its_status() {
     let relay = start_default().await;
@@ -1089,27 +1107,28 @@ async fn a_relay_full_of_websockets_still_answers_http_until_its_headroom_is_tak
     let response = healthz(&relay).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
-    // Each socket that sends no request holds a place until its request
-    // head is overdue. Once they fill the headroom, the relay closes the
-    // next socket as soon as it accepts it, unanswered.
+    // Each socket answered on a kept-alive connection holds a place until its
+    // next request head is overdue. Once they fill the headroom, the relay
+    // closes the next socket as soon as it accepts it, unanswered. Telling
+    // the two apart takes no clock: one is answered, the other ends.
     let mut held = Vec::new();
-    let refused = loop {
+    loop {
         let mut socket = TcpStream::connect(relay.addr()).await.unwrap();
-        let mut response = Vec::new();
-        let read = tokio::time::timeout(
-            Duration::from_millis(200),
-            socket.read_to_end(&mut response),
-        );
-        if read.await.is_ok() {
-            break response;
+        match tokio::time::timeout(WAIT, keep_alive_healthz(&mut socket))
+            .await
+            .expect("a socket was neither answered nor closed")
+        {
+            Some(response) => {
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                held.push(socket);
+            }
+            None => break,
         }
-        held.push(socket);
         assert!(
             held.len() < 100,
             "sockets past the limit were never refused"
         );
-    };
-    assert!(refused.is_empty(), "{}", String::from_utf8_lossy(&refused));
+    }
     assert!(!held.is_empty());
 
     drop(held);

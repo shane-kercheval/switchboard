@@ -32,12 +32,12 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
-use crate::outbox::{Outbox, Progress, frame_cost};
+use crate::outbox::{Outbox, Progress, Wait, frame_cost};
 use crate::protocol::{
     ClientMessage, DeviceId, ErrorCode, NONCE_LEN, PAIRING_TOKEN_LEN, RELAY_PROTOCOL, Register,
     Role, ServerMessage,
 };
-use crate::state::Relay;
+use crate::state::{Refusal, Relay};
 
 /// How long a closing connection's queued messages may take to go out.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -473,22 +473,21 @@ impl Connection {
             self.refuse(ErrorCode::RegistrationRefused, "this device is denied");
             return false;
         }
-        let role = claim.role.clone();
+        let (phone_of, set) = match &claim.role {
+            Role::Mac { paired_devices } => (None, set_for_log(paired_devices)),
+            Role::Phone { mac } => (Some(mac.clone()), None),
+        };
         let registered =
             self.shared
                 .relay()
                 .register(id.clone(), claim.role, self.outbox.clone(), Utc::now());
         match registered {
             Ok(generation) => {
-                match role {
-                    Role::Mac { paired_devices } => {
-                        tracing::info!(device_id = %id, "registered a Mac");
-                        log_paired_devices(&id, &paired_devices);
-                    }
-                    Role::Phone { mac } => {
-                        tracing::info!(device_id = %id, %mac, "registered a phone");
-                    }
+                match phone_of {
+                    None => tracing::info!(device_id = %id, "registered a Mac"),
+                    Some(mac) => tracing::info!(device_id = %id, %mac, "registered a phone"),
                 }
+                log_set(&id, set);
                 self.registration = Some(Registration { id, generation });
                 true
             }
@@ -513,20 +512,20 @@ impl Connection {
                 pairing_token,
             } => {
                 if record.len() > MAX_FRAME_LEN {
-                    self.refuse(ErrorCode::BadMessage, "a record longer than any frame");
-                    return false;
+                    Err(Refusal::bad_message("a record longer than any frame"))
+                } else {
+                    self.forward(&id, generation, to, record, pairing_token)
+                        .await
                 }
-                self.forward(&id, generation, to, record, pairing_token)
-                    .await;
-                Ok(())
             }
             ClientMessage::PairedDevices { device_ids } => {
-                let changed =
-                    self.shared
-                        .relay()
-                        .set_paired_devices(&id, generation, device_ids.clone());
+                let set = set_for_log(&device_ids);
+                let changed = self
+                    .shared
+                    .relay()
+                    .set_paired_devices(&id, generation, device_ids);
                 if changed == Ok(true) {
-                    log_paired_devices(&id, &device_ids);
+                    log_set(&id, set);
                 }
                 changed.map(|_| ())
             }
@@ -541,10 +540,7 @@ impl Connection {
                 Instant::now(),
             ),
             ClientMessage::PairingClose => self.shared.relay().close_pairing(&id, generation),
-            ClientMessage::Register(_) => {
-                self.refuse(ErrorCode::BadMessage, "already registered");
-                return false;
-            }
+            ClientMessage::Register(_) => Err(Refusal::bad_message("already registered")),
             ClientMessage::Unknown => Ok(()),
         };
         match refusal {
@@ -558,7 +554,7 @@ impl Connection {
     }
 
     /// Routes a frame and queues it for its recipient, waiting while the
-    /// recipient's queue is full. A refusal goes back to the sender; a frame
+    /// recipient's queue is full, or returns why it may not pass. A frame
     /// that cannot be queued because its recipient closed is dropped, and the
     /// sender hears of that close through `peer_disconnected`.
     async fn forward(
@@ -568,21 +564,14 @@ impl Connection {
         to: DeviceId,
         record: Vec<u8>,
         pairing_token: Option<[u8; PAIRING_TOKEN_LEN]>,
-    ) {
-        let routed = self.shared.relay().route(
+    ) -> Result<(), Refusal> {
+        let recipient = self.shared.relay().route(
             from,
             generation,
             &to,
             pairing_token.as_ref(),
             Instant::now(),
-        );
-        let recipient = match routed {
-            Ok(recipient) => recipient,
-            Err(refusal) => {
-                self.send(refusal.into_message());
-                return;
-            }
-        };
+        )?;
         let cost = frame_cost(record.len());
         let frame = ServerMessage::Frame {
             to,
@@ -590,9 +579,12 @@ impl Connection {
             record,
             pairing_token,
         };
-        recipient
-            .send_frame(frame, cost, self.shared.config.stall_timeout, &self.closed)
-            .await;
+        let wait = Wait {
+            stall: self.shared.config.stall_timeout,
+            room: self.shared.config.room_timeout,
+        };
+        recipient.send_frame(frame, cost, wait, &self.closed).await;
+        Ok(())
     }
 
     /// The next client message, or `End` once the connection is over or
@@ -673,14 +665,20 @@ impl Connection {
     }
 }
 
-/// The set at debug only: a client may send its set as often as its rate
-/// allows.
-fn log_paired_devices(id: &DeviceId, paired_devices: &[DeviceId]) {
-    tracing::debug!(
-        device_id = %id,
-        paired_devices = ?paired_devices.iter().map(DeviceId::as_str).collect::<Vec<_>>(),
-        "paired devices"
-    );
+/// A Mac's set, written out only when debug logging is on: a client may
+/// send its set as often as its rate allows, so it is logged at debug, and
+/// costs nothing otherwise.
+fn set_for_log(paired_devices: &[DeviceId]) -> Option<String> {
+    tracing::enabled!(tracing::Level::DEBUG).then(|| {
+        let ids: Vec<&str> = paired_devices.iter().map(DeviceId::as_str).collect();
+        format!("{ids:?}")
+    })
+}
+
+fn log_set(id: &DeviceId, set: Option<String>) {
+    if let Some(set) = set {
+        tracing::debug!(device_id = %id, paired_devices = %set, "paired devices");
+    }
 }
 
 /// Two token buckets, messages and bytes, each refilling at its rate. A

@@ -57,6 +57,11 @@ pub struct Config {
     /// wait for its handshake reply, so another phone's stall cannot make a
     /// connecting phone give up.
     pub stall_timeout: Duration,
+    /// A recipient that frees no room for a waiting sender's frame within
+    /// this long, however many bytes its socket accepts, is closed as too
+    /// slow: about 12 kbps for the longest frame. It bounds how long one
+    /// frame holds its sender's reader, which reads nothing else meanwhile.
+    pub room_timeout: Duration,
 }
 
 impl Default for Config {
@@ -74,6 +79,7 @@ impl Default for Config {
             rate_limit_bytes: 16 * 1024 * 1024,
             queue_bytes: 4 * 1024 * 1024,
             stall_timeout: Duration::from_secs(5),
+            room_timeout: Duration::from_mins(1),
         }
     }
 }
@@ -144,6 +150,12 @@ impl Config {
             .is_none_or(|sockets| sockets > Semaphore::MAX_PERMITS)
         {
             return Err(ConfigError::Inconsistent("MAX_CONNECTIONS is too large"));
+        }
+        if self.queue_bytes > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::Inconsistent("queue_bytes is too large"));
+        }
+        if self.rate_limit == 0 {
+            return Err(ConfigError::Inconsistent("RATE_LIMIT must be positive"));
         }
         if self.ping_interval.is_zero() {
             return Err(ConfigError::Inconsistent("ping_interval must be positive"));
@@ -279,6 +291,37 @@ mod tests {
     }
 
     #[test]
+    fn settings_built_in_code_are_checked_too() {
+        // A `rate_limit_bytes` of zero falls under the message-limit floor.
+        for config in [
+            Config {
+                rate_limit: 0,
+                ..Config::default()
+            },
+            Config {
+                rate_limit_bytes: 0,
+                ..Config::default()
+            },
+            Config {
+                queue_bytes: usize::MAX,
+                ..Config::default()
+            },
+            Config {
+                ping_interval: Duration::ZERO,
+                ..Config::default()
+            },
+        ] {
+            assert!(
+                matches!(
+                    config.clone().validated(),
+                    Err(ConfigError::Inconsistent(_))
+                ),
+                "{config:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_byte_rate_below_the_message_limit_is_refused() {
         assert!(matches!(
             config(&[("RATE_LIMIT_BYTES", "131071")]),
@@ -296,6 +339,7 @@ mod tests {
         let config = Config::default();
         assert!(config.ping_interval * 2 <= CLIENT_SILENCE);
         assert!(config.stall_timeout < HANDSHAKE_WAIT);
+        assert!(config.room_timeout < config.idle_timeout);
         assert!(config.ping_interval < config.idle_timeout);
     }
 

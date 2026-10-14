@@ -699,13 +699,11 @@
         </div>
       </section>
 
-      <section class={cn(sectionClass, "mt-7")} data-testid="prompt-settings-section">
+      <section class={cn(sectionClass, "mt-7")}>
         <div>
-          <h2 class={sectionHeadingClass}>Prompt servers (MCP)</h2>
+          <h2 class={sectionHeadingClass}>Local prompts</h2>
           <p class="text-muted mt-1 text-sm leading-relaxed">
-            Add MCP servers that expose prompts (e.g. Tiddly). Their prompts become available to
-            every agent via the compose bar. Bearer tokens are stored in your OS keychain, never in
-            config.
+            Your prompt files are available in every project on this Mac.
           </p>
         </div>
 
@@ -762,6 +760,18 @@
             {/snippet}
           </Tooltip>
         </div>
+      </section>
+
+      <section class={cn(sectionClass, "mt-7")} data-testid="prompt-settings-section">
+        <div>
+          <h2 class={sectionHeadingClass}>Prompt servers (MCP)</h2>
+          <p class="text-muted mt-1 text-sm leading-relaxed">
+            Add MCP servers that expose prompts (e.g. Tiddly). Their prompts become available to
+            every agent via the compose bar. Bearer tokens are stored in your OS keychain, never in
+            config.
+          </p>
+        </div>
+
         <McpServersSettings />
       </section>
     </div>

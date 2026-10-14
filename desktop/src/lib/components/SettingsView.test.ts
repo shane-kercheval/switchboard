@@ -85,6 +85,7 @@ describe("SettingsView", () => {
 
   it("shows only the selected category and preserves unfinished prompt input", async (): Promise<void> => {
     const view = render(SettingsView, { props: { onClose: vi.fn(), initialSection: "prompts" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Add prompt server" }));
     const name = await screen.findByRole("textbox", { name: "Name" });
     await fireEvent.input(name, { target: { value: "My prompt server" } });
     await view.rerender({ initialSection: "general" });

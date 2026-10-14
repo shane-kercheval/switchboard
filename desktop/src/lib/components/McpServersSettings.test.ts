@@ -106,6 +106,36 @@ afterEach(() => {
 });
 
 describe("McpServersSettings", () => {
+  it("keeps the saved list visible, preserves closed drafts, and leaves failed adds open", async (): Promise<void> => {
+    providers = [oauthProvider()];
+    render(McpServersSettings);
+    expect(await screen.findByTestId("mcp-row-tiddly")).toBeVisible();
+    const form = screen.getByTestId("mcp-add-form");
+    const trigger = screen.getByRole("button", { name: "Add prompt server" });
+    expect(form).not.toBeVisible();
+    await fireEvent.click(trigger);
+    const name = screen.getByRole("textbox", { name: "Name" });
+    await waitFor(() => expect(name).toHaveFocus());
+    await fireEvent.input(name, { target: { value: "my-team" } });
+    await fireEvent.input(screen.getByRole("textbox", { name: "URL" }), {
+      target: { value: "https://example.test/mcp" },
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
+    expect(form).not.toBeVisible();
+    expect(screen.getByTestId("mcp-row-tiddly")).toBeVisible();
+    await waitFor(() => expect(trigger).toHaveFocus());
+    await fireEvent.click(trigger);
+    expect(name).toHaveValue("my-team");
+    expect(screen.getByRole("textbox", { name: "URL" })).toHaveValue("https://example.test/mcp");
+
+    invokeMock.mockRejectedValueOnce(new Error("Couldn't save the server"));
+    await fireEvent.click(screen.getByTestId("mcp-add"));
+    expect(await screen.findByTestId("mcp-add-error")).toBeVisible();
+    expect(form).toBeVisible();
+    expect(name).toHaveValue("my-team");
+  });
+
   it("lists configured providers with status on mount", async () => {
     providers = [
       {
@@ -169,6 +199,7 @@ describe("McpServersSettings", () => {
 
   it("rejects the reserved name `local` and blocks submit", async () => {
     render(McpServersSettings);
+    await fireEvent.click(screen.getByRole("button", { name: "Add prompt server" }));
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
     await fireEvent.input(screen.getByTestId("mcp-name"), { target: { value: "local" } });
     await fireEvent.input(screen.getByTestId("mcp-url"), { target: { value: "https://x" } });
@@ -178,6 +209,7 @@ describe("McpServersSettings", () => {
 
   it("adds a provider (bearer null when blank) and refreshes the list", async () => {
     render(McpServersSettings);
+    await fireEvent.click(screen.getByRole("button", { name: "Add prompt server" }));
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
     await chooseBearerAuth();
     await fireEvent.input(screen.getByTestId("mcp-name"), { target: { value: "team" } });
@@ -186,10 +218,15 @@ describe("McpServersSettings", () => {
     await waitFor(() => expect(screen.getByTestId("mcp-row-team")).toBeInTheDocument());
     const addCall = invokeMock.mock.calls.find(([c]) => c === "add_mcp_provider");
     expect(addCall?.[1]).toMatchObject({ name: "team", url: "https://x/mcp", bearer: null });
+    await waitFor(() => expect(screen.getByTestId("mcp-add-form")).not.toBeVisible());
+    await fireEvent.click(screen.getByRole("button", { name: "Add prompt server" }));
+    expect(screen.getByTestId("mcp-name")).toHaveValue("");
+    expect(screen.getByTestId("mcp-url")).toHaveValue("");
   });
 
   it("sends the bearer when provided", async () => {
     render(McpServersSettings);
+    await fireEvent.click(screen.getByRole("button", { name: "Add prompt server" }));
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
     await chooseBearerAuth();
     await fireEvent.input(screen.getByTestId("mcp-name"), { target: { value: "team" } });
@@ -252,6 +289,7 @@ describe("McpServersSettings", () => {
 
   it("test connection reports the prompt count", async () => {
     render(McpServersSettings);
+    await fireEvent.click(screen.getByRole("button", { name: "Add prompt server" }));
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
     await chooseBearerAuth();
     await fireEvent.input(screen.getByTestId("mcp-url"), { target: { value: "https://x/mcp" } });
@@ -265,6 +303,7 @@ describe("McpServersSettings", () => {
 describe("McpServersSettings — OAuth", () => {
   it("defaults to OAuth first and adds with the oauth mode", async () => {
     render(McpServersSettings);
+    await fireEvent.click(screen.getByRole("button", { name: "Add prompt server" }));
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
 
     const authOptions = screen.getAllByRole("radio");
@@ -573,6 +612,7 @@ describe("McpServersSettings — OAuth delta hardening", () => {
 
   it("a bearer test verdict disappears when the form switches to OAuth", async () => {
     render(McpServersSettings);
+    await fireEvent.click(screen.getByRole("button", { name: "Add prompt server" }));
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
     await chooseBearerAuth();
     await fireEvent.input(screen.getByTestId("mcp-url"), { target: { value: "https://x/mcp" } });
@@ -603,6 +643,7 @@ describe("McpServersSettings — OAuth delta hardening", () => {
       return null;
     });
     render(McpServersSettings);
+    await fireEvent.click(screen.getByRole("button", { name: "Add prompt server" }));
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
     await chooseBearerAuth();
     await fireEvent.input(screen.getByTestId("mcp-url"), { target: { value: "https://x/mcp" } });

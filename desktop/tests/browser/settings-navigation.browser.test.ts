@@ -54,6 +54,19 @@ for (const width of [760, 1100]) {
       }
     }
 
+    await navigation.getByRole("button", { name: "Prompts", exact: true }).click();
+    const addServer = page.getByRole("button", { name: "Add prompt server", exact: true });
+    const addForm = page.getByTestId("mcp-add-form");
+    expect(addForm.element().getBoundingClientRect().height).toBe(0);
+    (addServer.element() as HTMLButtonElement).focus();
+    await userEvent.keyboard("{Enter}");
+    await expect.element(page.getByRole("textbox", { name: "Name", exact: true })).toHaveFocus();
+    const prompts = page.getByTestId("settings-panel-prompts").element() as HTMLElement;
+    expect(prompts.scrollWidth - prompts.clientWidth).toBeLessThanOrEqual(1);
+    await page.getByRole("button", { name: "Close setup", exact: true }).click();
+    await expect.poll(() => addForm.element().getBoundingClientRect().height).toBe(0);
+    await expect.element(addServer).toHaveFocus();
+
     await navigation.getByRole("button", { name: "Notifications", exact: true }).click();
     const help = page.getByRole("button", { name: "How reading mode works", exact: true });
     const details = document.getElementById(help.element().getAttribute("aria-controls")!)!;

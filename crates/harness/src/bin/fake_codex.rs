@@ -40,6 +40,10 @@
 //!   `// read_stdin` — read stdin to EOF before streaming. The adapter must
 //!     spawn the child with `Stdio::null()` for stdin so this returns
 //!     immediately; without it, the test would deadlock waiting for input.
+//!   `// stdin_lines_to:<count>:<path>` — read `count` lines from stdin, write
+//!     them to `path`, then carry on. For `app-server` mode, whose client keeps
+//!     stdin open until it is done, so reading to EOF would never return. The
+//!     compaction tests use it to check the requests the adapter wrote.
 //!   `// pgid_to:<path>` — write the child's own process-group id (decimal
 //!     ASCII, single line) to the given path before streaming. Tests use
 //!     this to assert the adapter put us in our own process group.
@@ -127,6 +131,21 @@ fn main() {
         if line.trim() == "// read_stdin" {
             let mut sink = String::new();
             io::stdin().lock().read_to_string(&mut sink).ok();
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("// stdin_lines_to:") {
+            let (count, path) = rest.split_once(':').unwrap_or(("0", rest));
+            let count: usize = count.trim().parse().unwrap_or(0);
+            let mut received = String::new();
+            let stdin = io::stdin();
+            let mut stdin = stdin.lock();
+            for _ in 0..count {
+                if stdin.read_line(&mut received).unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+            std::fs::write(path.trim(), received).ok();
             continue;
         }
 

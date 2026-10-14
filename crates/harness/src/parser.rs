@@ -179,6 +179,11 @@ pub struct ParserState {
     /// success, which keeps "a boundary alone never invents a success" intact
     /// without the ordering dependency.
     compaction_occupancy: Option<CompactionOccupancy>,
+    /// The `compact_boundary` record's `uuid`, recorded with the occupancy. The
+    /// dispatcher persists the compaction's window under it, and the loader
+    /// reattaches the window to the marker the session file yields for the same
+    /// record (`ContextWindowSource::StreamOnlyCompaction`).
+    compaction_boundary_id: Option<String>,
     /// What this process's session cost counters started from. Subtracted from
     /// the `result` so the turn reports its own usage, not the session's; see
     /// [`UsageSeed`].
@@ -747,13 +752,25 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
     // Claude's context window is stream-only (`result.modelUsage`), absent from
     // the session file — so when this turn carries one, tag it `StreamOnly` for
     // the dispatcher to persist to the metadata sidecar. `None` when there's no
-    // window (nothing to persist).
-    let context_window_source =
-        context_window
-            .as_ref()
-            .map(|selected| crate::events::ContextWindowSource::StreamOnly {
+    // window (nothing to persist). A compaction has no message id to persist
+    // under, so its tag carries the boundary record's `uuid` instead; a
+    // compaction whose boundary carried none is tagged like a send, and the
+    // dispatcher then has no key and persists nothing.
+    let context_window_source = context_window.as_ref().map(|selected| {
+        match state
+            .compaction_boundary_id
+            .clone()
+            .filter(|_| state.compacting())
+        {
+            Some(boundary_id) => crate::events::ContextWindowSource::StreamOnlyCompaction {
                 model: selected.model.clone(),
-            });
+                boundary_id,
+            },
+            None => crate::events::ContextWindowSource::StreamOnly {
+                model: selected.model.clone(),
+            },
+        }
+    });
 
     // Stamp the turn's real-spend attribution from the overage state seen on
     // this turn's `rate_limit_event` (which precedes the `result` — verified).
@@ -1349,6 +1366,7 @@ fn record_compaction_verdict(obj: &Value, state: &mut ParserState) {
 /// turn succeed: [`parse_result`] reads this only when the verdict says success,
 /// so a boundary with no verdict still terminates as a failure with no usage.
 fn record_compaction_occupancy(obj: &Value, state: &mut ParserState) {
+    state.compaction_boundary_id = obj.get("uuid").and_then(Value::as_str).map(str::to_owned);
     let Some(metadata) = obj.get("compact_metadata") else {
         return;
     };
@@ -3788,6 +3806,30 @@ mod compaction_tests {
     }
 
     #[test]
+    fn a_boundary_without_a_uuid_tags_the_window_like_a_send() {
+        // Nothing to key the saved window on, so the dispatcher gets the plain
+        // tag and, with no message id either, persists no window for the turn.
+        let stripped = SUCCESS.replace(r#""uuid":"00000000-0000-7000-8000-000000000011","#, "");
+        assert_ne!(stripped, SUCCESS, "the fixture's boundary carries a uuid");
+        let events = compact(&stripped);
+        let AdapterEvent::TurnEnd {
+            outcome,
+            context_window_source,
+            ..
+        } = sole_terminal(&events)
+        else {
+            unreachable!("filtered to TurnEnd");
+        };
+        assert_eq!(*outcome, TurnOutcome::Completed);
+        assert_eq!(
+            *context_window_source,
+            Some(ContextWindowSource::StreamOnly {
+                model: "claude-fable-5-1".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn success_folds_and_completes_with_occupancy_from_compact_metadata() {
         let events = compact(SUCCESS);
         let AdapterEvent::TurnEnd {
@@ -3812,10 +3854,15 @@ mod compaction_tests {
         assert_eq!(usage.context_tokens_after_turn, Some(4_172));
         // Resolved from the post-compaction `system/init` model, exactly.
         assert_eq!(usage.context_window, Some(1_000_000));
-        assert!(matches!(
-            context_window_source,
-            Some(ContextWindowSource::StreamOnly { model }) if model == "claude-fable-5-1"
-        ));
+        // Keyed by the boundary record's `uuid`, not a message id: a compaction
+        // has none, and the session file carries the same record.
+        assert_eq!(
+            *context_window_source,
+            Some(ContextWindowSource::StreamOnlyCompaction {
+                model: "claude-fable-5-1".to_owned(),
+                boundary_id: "00000000-0000-7000-8000-000000000011".to_owned(),
+            })
+        );
         // Billing telemetry still comes from `result` as usual.
         assert_eq!(usage.total_cost_usd, Some(0.099_425));
         // A compaction names no model: there is no assistant envelope to carry

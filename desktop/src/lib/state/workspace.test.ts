@@ -3223,7 +3223,7 @@ describe("project read serialization", () => {
       id,
       agent_id: compactor.id,
       at: "2026-05-16T00:00:09Z",
-      marker: { marker_kind: "compaction", summary },
+      marker: { marker_kind: "compaction", summary, context_after: null },
     });
     const recapA = recap("marker-a", "first summary");
     const recapB = recap("marker-b", "second summary");

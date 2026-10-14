@@ -95,6 +95,24 @@ pub struct ContextWindowSnapshot {
     pub captured_at: DateTime<Utc>,
 }
 
+/// One persisted snapshot of the context window a compaction ran with. Stream-only
+/// for Claude like [`ContextWindowSnapshot`], but a compaction makes no
+/// assistant call, so it is keyed by the `compact_boundary` record's `uuid`,
+/// which the session file carries on the same record. The loader reattaches it
+/// to the compaction's marker, so the context bar divides the compacted size by
+/// the window the compaction actually ran with, not the previous reply's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactionWindowSnapshot {
+    pub context_window: u32,
+    /// The model the compaction ran on, as the post-compaction `system/init`
+    /// named it.
+    pub model: String,
+    /// The `compact_boundary` record's `uuid`.
+    pub boundary_id: String,
+    /// Wall-clock time this snapshot was captured (ISO-8601 UTC on disk).
+    pub captured_at: DateTime<Utc>,
+}
+
 /// One persisted snapshot of the harness's environment inventory — the
 /// registries, allowlists and run settings it reported having loaded.
 ///
@@ -125,6 +143,8 @@ pub struct MetaSidecar {
     pub context_window: Option<ContextWindowSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inventory: Option<InventorySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_window: Option<CompactionWindowSnapshot>,
 }
 
 impl Default for MetaSidecar {
@@ -134,6 +154,7 @@ impl Default for MetaSidecar {
             rate_limit: None,
             context_window: None,
             inventory: None,
+            compaction_window: None,
         }
     }
 }
@@ -241,6 +262,30 @@ pub fn write_context_window(
         context_window,
         model: Some(model),
         message_id: Some(message_id),
+        captured_at,
+    });
+    persist(path, &sidecar)
+}
+
+/// Persist the window the latest compaction ran with (last-write-wins for that
+/// field), keyed by its boundary record's `uuid`. Preserves the other snapshots.
+///
+/// # Errors
+///
+/// The sidecar could not be written.
+pub fn write_compaction_window(
+    path: &Path,
+    context_window: u32,
+    model: String,
+    boundary_id: String,
+    captured_at: DateTime<Utc>,
+) -> Result<(), MetaSidecarError> {
+    let mut sidecar = read(path).unwrap_or_default();
+    sidecar.schema_version = SCHEMA_VERSION;
+    sidecar.compaction_window = Some(CompactionWindowSnapshot {
+        context_window,
+        model,
+        boundary_id,
         captured_at,
     });
     persist(path, &sidecar)
@@ -504,6 +549,60 @@ mod tests {
         assert_eq!(cw.message_id.as_deref(), Some("msg-final"));
         assert_eq!(cw.captured_at, captured);
         assert_eq!(read_back.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn write_compaction_window_round_trips_and_preserves_the_replies_window() {
+        // The compaction's window lives beside the latest reply's, not in its
+        // place: the two are keyed differently and reattached to different
+        // records on load.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("agent.meta.json");
+        write_context_window(
+            &path,
+            1_000_000,
+            "claude-sonnet-5[1m]".to_owned(),
+            "msg-final".to_owned(),
+            ts("2026-05-31T12:00:00Z"),
+        )
+        .unwrap();
+        let captured = ts("2026-05-31T12:05:00Z");
+        write_compaction_window(
+            &path,
+            200_000,
+            "claude-sonnet-5".to_owned(),
+            "boundary-uuid".to_owned(),
+            captured,
+        )
+        .unwrap();
+
+        let read_back = read(&path).expect("sidecar present after write");
+        let compaction = read_back
+            .compaction_window
+            .expect("compaction_window populated");
+        assert_eq!(compaction.context_window, 200_000);
+        assert_eq!(compaction.model, "claude-sonnet-5");
+        assert_eq!(compaction.boundary_id, "boundary-uuid");
+        assert_eq!(compaction.captured_at, captured);
+        assert_eq!(
+            read_back.context_window.map(|cw| cw.context_window),
+            Some(1_000_000),
+            "the reply's window survives"
+        );
+    }
+
+    #[test]
+    fn a_sidecar_written_before_compaction_windows_reads_with_none() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("agent.meta.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"context_window":{"context_window":200000,"model":"m","message_id":"x","captured_at":"2026-05-31T12:00:00Z"}}"#,
+        )
+        .unwrap();
+        let read_back = read(&path).expect("an older sidecar still reads");
+        assert!(read_back.compaction_window.is_none());
+        assert!(read_back.context_window.is_some());
     }
 
     #[test]

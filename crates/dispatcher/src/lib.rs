@@ -791,6 +791,21 @@ pub trait MetadataCache: Send + Sync {
         captured_at: DateTime<Utc>,
     );
 
+    /// Persist the window the latest compaction ran with, keyed by its
+    /// `compact_boundary` record's `uuid` rather than a message id, which a
+    /// compaction has none of. Last-write-wins. Stream-only for Claude, like
+    /// the window above; the loader reattaches it to the compaction's marker
+    /// so the context bar reads the compacted size over the right window after
+    /// a reopen.
+    fn record_compaction_window(
+        &self,
+        agent_id: AgentId,
+        context_window: u32,
+        model: String,
+        boundary_id: String,
+        captured_at: DateTime<Utc>,
+    );
+
     /// Persist the latest environment-inventory snapshot for `agent_id`.
     /// Last-write-wins. Stream-only for Claude (`system/init` carries the
     /// registries, the session file records none of them), so it must be
@@ -835,6 +850,8 @@ impl MetadataCache for NoopMetadataCache {
     ) {
     }
     fn record_context_window(&self, _: AgentId, _: u32, _: String, _: String, _: DateTime<Utc>) {}
+    fn record_compaction_window(&self, _: AgentId, _: u32, _: String, _: String, _: DateTime<Utc>) {
+    }
     fn record_inventory(&self, _: AgentId, _: SessionInventory, _: DateTime<Utc>) {}
     fn record_turn_spend(
         &self,
@@ -2514,6 +2531,28 @@ async fn drain_turn(
                         context_window,
                         model.clone(),
                         message_id.clone(),
+                        Utc::now(),
+                    );
+                }
+                // A completed compaction's window, keyed by its boundary record
+                // rather than a message id. Same gate on a plausible occupancy;
+                // a failed compaction withholds usage, so it never gets here.
+                if let AdapterEvent::TurnEnd {
+                    usage: Some(usage),
+                    context_window_source:
+                        Some(ContextWindowSource::StreamOnlyCompaction { model, boundary_id }),
+                    ..
+                } = &event
+                    && let Some(context_window) = usage.context_window
+                    && usage.context_tokens_after_turn.is_some_and(|occupancy| {
+                        occupancy <= u64::from(context_window)
+                    })
+                {
+                    metadata.record_compaction_window(
+                        agent_id,
+                        context_window,
+                        model.clone(),
+                        boundary_id.clone(),
                         Utc::now(),
                     );
                 }

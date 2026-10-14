@@ -174,11 +174,11 @@ If you miss it, Settings → Notifications tells you macOS is blocking notificat
 
 ## Agent access
 
-**An agent connected over MCP has the same reach as the keyboard. Agents run without approval prompts, so any program holding the token can run commands on your Mac. It is off by default; regenerate the token in Settings → Agent access to revoke every client.**
+**An agent connected over MCP has the same reach as the keyboard. Agents run without approval prompts, so any program holding the token can run commands on your Mac. It is off by default; regenerate the token in Settings → Agent MCP Server to revoke every client.**
 
 Agent access is an MCP server inside Switchboard, so an agent you run elsewhere (Claude Code, Codex, or Claude Desktop) can work your projects as you do: create projects and agents, send messages and wait for replies, forward answers, run workflows, read conversations, compact and fork agents, and read the usage and context figures the window shows. Every message it sends appears in the window like your own, queued or running, and you can cancel it there.
 
-Turn it on in **Settings → Agent access**. Switchboard then listens on `127.0.0.1` only (port 47821 by default) and creates a token. Settings shows ready-to-paste setup for each client, with the token filled in:
+Turn it on in **Settings → Agent MCP Server**. Switchboard then listens on `127.0.0.1` only (port 47821 by default) and creates a token. Settings shows ready-to-paste setup for each client, with the token filled in:
 
 - **Claude Code**: a `claude mcp add` command. Run it in the folder you'll orchestrate from; it saves the token in your private `~/.claude.json`. Don't use `--scope project`, which writes the token into a committed file.
 - **Codex**: a `[mcp_servers.switchboard]` block for `.codex/config.toml` in a folder Codex trusts, plus an `export SWITCHBOARD_TOKEN=…` line. Keep that line in a file only you can read (for example `~/.switchboard-token` with `chmod 600`) and source it from your shell profile, since `~/.zshrc` itself can be read by other accounts. Add `tool_timeout_sec = 900` to the block, because Codex otherwise ends tool calls after 300 seconds.

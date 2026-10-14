@@ -77,7 +77,7 @@ describe("SettingsView", () => {
 
   it("opens the prompts page when requested", async (): Promise<void> => {
     render(SettingsView, { props: { onClose: vi.fn(), initialSection: "prompts" } });
-    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Prompts & workflows");
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Prompts");
     expect(screen.getByTestId("prompt-settings-section")).toBeVisible();
     expect(screen.getByTestId("settings-panel-general")).not.toBeVisible();
   });
@@ -89,10 +89,18 @@ describe("SettingsView", () => {
     await view.rerender({ initialSection: "general" });
     expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("General");
     expect(screen.queryByRole("textbox", { name: "Name" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("auto-reading-mode-toggle")).not.toBeVisible();
+    await view.rerender({ initialSection: "notifications" });
     expect(screen.getByTestId("auto-reading-mode-toggle")).toBeVisible();
+    expect(screen.getByTestId("notify-toggle")).toBeVisible();
+    await view.rerender({ initialSection: "workflows" });
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Workflows");
+    expect(screen.getByTestId("workflows-open")).toBeVisible();
+    expect(screen.getByTestId("prompt-settings-section")).not.toBeVisible();
     expect(screen.getByTestId("notify-toggle")).not.toBeVisible();
     await view.rerender({ initialSection: "prompts" });
     expect(screen.getByRole("textbox", { name: "Name" })).toHaveValue("My prompt server");
+    expect(screen.getByTestId("workflows-open")).not.toBeVisible();
   });
 
   it("renders a Supported CLIs section with the harness status list", async () => {
@@ -379,7 +387,6 @@ describe("SettingsView", () => {
     expect(screen.getByTestId("external-terminal-app")).toHaveAttribute("aria-disabled", "true");
     expect(screen.getByTestId("external-terminal-app-option-terminal")).toBeDisabled();
     expect(screen.getByTestId("external-terminal-app-option-iterm")).toBeDisabled();
-    expect(screen.getByTestId("auto-reading-mode-toggle")).toBeDisabled();
     await view.rerender({ initialSection: "notifications" });
     expect(screen.getByTestId("notify-toggle")).toBeDisabled();
     expect(screen.getByTestId("notify-while-focused-toggle")).toBeDisabled();
@@ -589,8 +596,8 @@ describe("SettingsView", () => {
     );
   });
 
-  it("toggles show_builtins and persists the change", async () => {
-    render(SettingsView, { props: { onClose: vi.fn(), initialSection: "prompts" } });
+  it("shares the built-in content preference between Prompts and Workflows", async () => {
+    const view = render(SettingsView, { props: { onClose: vi.fn(), initialSection: "prompts" } });
     const toggle = screen.getByTestId("show-builtins-toggle");
     // Defaults on.
     expect(toggle).toHaveAttribute("aria-checked", "true");
@@ -602,6 +609,20 @@ describe("SettingsView", () => {
       }),
     );
     expect(toggle).toHaveAttribute("aria-checked", "false");
+    await view.rerender({ initialSection: "workflows" });
+    const workflowToggle = screen.getByRole("switch", {
+      name: "Show built-in prompts and workflows",
+    });
+    expect(workflowToggle).toHaveAttribute("aria-checked", "false");
+    await fireEvent.click(workflowToggle);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
+        preferences: expect.objectContaining({ show_builtins: true }),
+      }),
+    );
+    await view.rerender({ initialSection: "prompts" });
+    expect(toggle).toBeVisible();
+    expect(toggle).toHaveAttribute("aria-checked", "true");
   });
 
   it("toggles claude_chrome_enabled and persists the change", async () => {
@@ -702,7 +723,7 @@ describe("SettingsView", () => {
   });
 
   it("shows the user-global workflows folder and opens it in Finder", async () => {
-    render(SettingsView, { props: { onClose: vi.fn(), initialSection: "prompts" } });
+    render(SettingsView, { props: { onClose: vi.fn(), initialSection: "workflows" } });
 
     await waitFor(() =>
       expect(screen.getByTestId("workflows-dir")).toHaveTextContent(
@@ -716,7 +737,7 @@ describe("SettingsView", () => {
   });
 
   it("previews and copies the workflow authoring prompt", async () => {
-    render(SettingsView, { props: { onClose: vi.fn(), initialSection: "prompts" } });
+    render(SettingsView, { props: { onClose: vi.fn(), initialSection: "workflows" } });
 
     const toggle = screen.getByTestId("workflow-authoring-toggle");
     expect(toggle).toHaveAttribute("aria-expanded", "false");
@@ -775,7 +796,7 @@ describe("SettingsView — notifications", () => {
   });
 
   it("the auto-reading-mode toggle is off by default and persists a flip", async () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), initialSection: "notifications" } });
     const toggle = await screen.findByTestId("auto-reading-mode-toggle");
     await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
 
@@ -795,7 +816,7 @@ describe("SettingsView — notifications", () => {
     // Unlike the background-projects toggle it is not a sub-clause of "notify
     // me": hiding the compose box after each send is meaningful on its own as a
     // focus mode, so turning notifications off must not lock the user out of it.
-    const view = render(SettingsView, {
+    render(SettingsView, {
       props: { onClose: vi.fn(), initialSection: "notifications" },
     });
     const master = await screen.findByTestId("notify-toggle");
@@ -804,7 +825,6 @@ describe("SettingsView — notifications", () => {
 
     await fireEvent.click(master);
     await waitFor(() => expect(screen.getByTestId("notify-while-focused-toggle")).toBeDisabled());
-    await view.rerender({ initialSection: "general" });
     expect(autoReading).toBeVisible();
     expect(autoReading).not.toBeDisabled();
   });
@@ -892,9 +912,9 @@ describe("SettingsView — preference save failures", () => {
     expect(await screen.findByTestId("notify-save-error")).toBeInTheDocument();
   });
 
-  it("reports a failed reading-mode save on General", async (): Promise<void> => {
+  it("reports a failed reading-mode save on Notifications", async (): Promise<void> => {
     failSaves();
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), initialSection: "notifications" } });
     await fireEvent.click(screen.getByTestId("auto-reading-mode-toggle"));
     expect(await screen.findByTestId("reading-mode-save-error")).toBeVisible();
     expect(screen.queryByTestId("notify-save-error")).not.toBeInTheDocument();

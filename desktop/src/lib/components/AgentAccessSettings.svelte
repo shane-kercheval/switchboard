@@ -91,7 +91,7 @@
 
 {#if loadError}
   <p class="text-status-failed text-xs" data-testid="agent-access-load-error">
-    Couldn't read the agent access setting ({loadError}).
+    Couldn't read the Agent MCP Server setting ({loadError}).
   </p>
 {:else if status === null}
   <p class="text-muted text-xs">Loading…</p>
@@ -284,7 +284,7 @@
     </div>
   {:else}
     <p class="text-muted text-xs leading-relaxed">
-      Turn agent access on to create the token and see each client's configuration.
+      Turn the Agent MCP Server on to create the token and see each client's configuration.
     </p>
   {/if}
 {/if}

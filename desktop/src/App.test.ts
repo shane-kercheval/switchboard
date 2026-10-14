@@ -4210,7 +4210,7 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
     expect(screen.getByTestId("prompt-settings-section")).toHaveTextContent("Prompt servers (MCP)");
     expect(screen.getByTestId("prompt-settings-section")).toBeVisible();
-    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Prompts & workflows");
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Prompts");
   });
 
   it("global shortcuts are suppressed inside non-composer editable elements", async () => {

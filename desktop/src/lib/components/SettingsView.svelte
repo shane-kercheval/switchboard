@@ -221,6 +221,35 @@
   }
 </script>
 
+{#snippet builtInContent(testid: string)}
+  <section class={sectionClass}>
+    <div>
+      <h2 class={sectionHeadingClass}>Built-in content</h2>
+      <p class="text-muted mt-1 text-sm leading-relaxed">
+        Switchboard ships read-only example prompts and workflows that live in the app, not your
+        folders. To customize one, use “Copy to my prompts” / “Copy to my workflows” in its picker,
+        then edit your copy.
+      </p>
+    </div>
+
+    <div class="flex items-start justify-between gap-4">
+      <div class="min-w-0">
+        <div class="text-fg text-sm">Show built-in prompts &amp; workflows</div>
+        <p class="text-muted mt-0.5 text-xs leading-relaxed">
+          Turn this off to see only your own content in the prompt and workflow pickers.
+        </p>
+      </div>
+      <Switch
+        checked={preferences.show_builtins}
+        disabled={!preferenceLoadState.ready}
+        ariaLabel="Show built-in prompts and workflows"
+        {testid}
+        onclick={() => void updatePreferences({ show_builtins: !preferences.show_builtins })}
+      />
+    </div>
+  </section>
+{/snippet}
+
 <div class="flex min-h-0 flex-1 flex-col" data-testid="settings-view">
   <div class="shrink-0 px-8">
     <div class="w-full max-w-2xl">
@@ -389,46 +418,6 @@
           >
             Couldn't save your external app preferences ({saveStatus.error}). The change applies for
             now but may not survive a restart.
-          </p>
-        {/if}
-      </section>
-
-      <section class={cn(sectionClass, "mt-7")} data-testid="reading-mode-prefs">
-        <h2 class={sectionHeadingClass}>Reading mode</h2>
-        <div class="flex items-start justify-between gap-4">
-          <div class="min-w-0">
-            <div class="text-fg text-sm">Turn on reading mode automatically when I send</div>
-            <p class="text-muted mt-0.5 text-xs leading-relaxed">
-              Every message you send — and every workflow you start — puts that project into
-              <span class="text-fg">reading mode</span>, exactly as if you'd pressed the
-              reading-mode button yourself: the compose box hides until the project finishes, and
-              the project's completion notifies you like any other project's. Reading mode turns
-              itself off when the project goes quiet.
-            </p>
-            <p class="text-muted mt-1 text-xs leading-relaxed">
-              To send a follow-up while agents are still working, leave reading mode first — click
-              the highlighted reading-mode button in the pane header, or press ⌘⇧R. And while you're
-              working in Switchboard, the completion alert only arrives if “Also notify me about
-              other projects while I'm using Switchboard” is on in Notifications.
-            </p>
-          </div>
-          <Switch
-            checked={preferences.auto_reading_mode}
-            disabled={!preferenceLoadState.ready}
-            ariaLabel="Turn on reading mode automatically when I send"
-            testid="auto-reading-mode-toggle"
-            onclick={() =>
-              void updatePreferences({ auto_reading_mode: !preferences.auto_reading_mode })}
-          />
-        </div>
-
-        {#if saveFailedFor("auto_reading_mode")}
-          <p
-            class="text-status-failed text-xs leading-relaxed"
-            data-testid="reading-mode-save-error"
-          >
-            Couldn't save your preferences ({saveStatus.error}). The change applies for now but may
-            not survive a restart.
           </p>
         {/if}
       </section>
@@ -653,6 +642,45 @@
           </p>
         {/if}
       </section>
+      <section class={cn(sectionClass, "mt-7")} data-testid="reading-mode-prefs">
+        <h2 class={sectionHeadingClass}>Reading mode</h2>
+        <div class="flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            <div class="text-fg text-sm">Turn on reading mode automatically when I send</div>
+            <p class="text-muted mt-0.5 text-xs leading-relaxed">
+              Every message you send — and every workflow you start — puts that project into
+              <span class="text-fg">reading mode</span>, exactly as if you'd pressed the
+              reading-mode button yourself: the compose box hides until the project finishes, and
+              the project's completion notifies you like any other project's. Reading mode turns
+              itself off when the project goes quiet.
+            </p>
+            <p class="text-muted mt-1 text-xs leading-relaxed">
+              To send a follow-up while agents are still working, leave reading mode first — click
+              the highlighted reading-mode button in the pane header, or press ⌘⇧R. And while you're
+              working in Switchboard, the completion alert only arrives if “Also notify me about
+              other projects while I'm using Switchboard” is on in Notifications.
+            </p>
+          </div>
+          <Switch
+            checked={preferences.auto_reading_mode}
+            disabled={!preferenceLoadState.ready}
+            ariaLabel="Turn on reading mode automatically when I send"
+            testid="auto-reading-mode-toggle"
+            onclick={() =>
+              void updatePreferences({ auto_reading_mode: !preferences.auto_reading_mode })}
+          />
+        </div>
+
+        {#if saveFailedFor("auto_reading_mode")}
+          <p
+            class="text-status-failed text-xs leading-relaxed"
+            data-testid="reading-mode-save-error"
+          >
+            Couldn't save your preferences ({saveStatus.error}). The change applies for now but may
+            not survive a restart.
+          </p>
+        {/if}
+      </section>
     </div>
   </div>
   <div
@@ -662,32 +690,7 @@
     data-testid="settings-panel-prompts"
   >
     <div class="w-full max-w-2xl">
-      <section class={sectionClass}>
-        <div>
-          <h2 class={sectionHeadingClass}>Built-in content</h2>
-          <p class="text-muted mt-1 text-sm leading-relaxed">
-            Switchboard ships read-only example prompts and workflows that live in the app, not your
-            folders. To customize one, use “Copy to my prompts” / “Copy to my workflows” in its
-            picker, then edit your copy.
-          </p>
-        </div>
-
-        <div class="flex items-start justify-between gap-4">
-          <div class="min-w-0">
-            <div class="text-fg text-sm">Show built-in prompts &amp; workflows</div>
-            <p class="text-muted mt-0.5 text-xs leading-relaxed">
-              Turn this off to see only your own content in the prompt and workflow pickers.
-            </p>
-          </div>
-          <Switch
-            checked={preferences.show_builtins}
-            disabled={!preferenceLoadState.ready}
-            ariaLabel="Show built-in prompts and workflows"
-            testid="show-builtins-toggle"
-            onclick={() => void updatePreferences({ show_builtins: !preferences.show_builtins })}
-          />
-        </div>
-      </section>
+      {@render builtInContent("show-builtins-toggle")}
 
       <section class={cn(sectionClass, "mt-7")} data-testid="prompt-settings-section">
         <div>
@@ -754,7 +757,16 @@
         </div>
         <McpServersSettings />
       </section>
-
+    </div>
+  </div>
+  <div
+    id="settings-panel-workflows"
+    hidden={activeSection !== "workflows"}
+    class="min-h-0 flex-1 overflow-y-auto px-8 pb-7"
+    data-testid="settings-panel-workflows"
+  >
+    <div class="w-full max-w-2xl">
+      {@render builtInContent("workflows-show-builtins-toggle")}
       <section class={cn(sectionClass, "mt-7")}>
         <div>
           <h2 class={sectionHeadingClass}>Workflows</h2>
@@ -879,7 +891,7 @@
     <div class="w-full max-w-2xl">
       <section class={sectionClass} data-testid="agent-access-settings">
         <div>
-          <h2 class={sectionHeadingClass}>Agent access</h2>
+          <h2 class={sectionHeadingClass}>Agent MCP Server</h2>
           <p class="text-muted mt-1 text-sm leading-relaxed">
             Let an AI agent you run elsewhere (Claude Code, Codex, or Claude Desktop) work
             Switchboard over MCP the way you do from the keyboard: create projects and agents, send

@@ -54,7 +54,7 @@ for (const width of [760, 1100]) {
       }
     }
 
-    const accessButton = navigation.getByRole("button", { name: "Agent access", exact: true });
+    const accessButton = navigation.getByRole("button", { name: "Agent MCP Server", exact: true });
     (accessButton.element() as HTMLButtonElement).focus();
     await expect.element(accessButton).toHaveFocus();
     await userEvent.keyboard("{Enter}");

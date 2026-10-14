@@ -852,6 +852,8 @@ async fn a_mac_waiting_on_a_phone_that_stopped_reading_still_hears_the_relays_pi
     let relay = start(Config {
         queue_bytes: 96 * 1024,
         stall_timeout: Duration::from_mins(1),
+        // High enough that only the wait at the phone holds the Mac up.
+        rate_limit: 1_000_000,
         rate_limit_bytes: 1 << 30,
         ping_interval: Duration::from_millis(100),
         ..Config::default()

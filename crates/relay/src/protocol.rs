@@ -238,9 +238,27 @@ pub enum ErrorCode {
     Unknown,
 }
 
+/// A byte field's type, with the most bytes it may hold. Text longer than
+/// that many bytes encode to is refused before it is decoded, so an
+/// oversized field costs no allocation beyond the text already read.
+trait Bytes: TryFrom<Vec<u8>> {
+    const MAX_LEN: usize;
+}
+
+impl<const N: usize> Bytes for [u8; N] {
+    const MAX_LEN: usize = N;
+}
+
+/// A frame's record.
+impl Bytes for Vec<u8> {
+    const MAX_LEN: usize = MAX_FRAME_LEN;
+}
+
 mod base64 {
     use data_encoding::BASE64;
     use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::Bytes;
 
     pub(super) fn serialize<S: Serializer, T: AsRef<[u8]>>(
         bytes: &T,
@@ -249,13 +267,16 @@ mod base64 {
         serializer.serialize_str(&BASE64.encode(bytes.as_ref()))
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>, T: TryFrom<Vec<u8>>>(
+    pub(super) fn deserialize<'de, D: Deserializer<'de>, T: Bytes>(
         deserializer: D,
     ) -> Result<T, D::Error> {
         decode(&String::deserialize(deserializer)?)
     }
 
-    pub(super) fn decode<E: serde::de::Error, T: TryFrom<Vec<u8>>>(text: &str) -> Result<T, E> {
+    pub(super) fn decode<E: serde::de::Error, T: Bytes>(text: &str) -> Result<T, E> {
+        if text.len() > BASE64.encode_len(T::MAX_LEN) {
+            return Err(E::custom(format!("longer than {} bytes", T::MAX_LEN)));
+        }
         let bytes = BASE64.decode(text.as_bytes()).map_err(E::custom)?;
         let len = bytes.len();
         T::try_from(bytes).map_err(|_| E::custom(format!("unexpected length {len}")))
@@ -279,7 +300,7 @@ mod base64_option {
         }
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>, T: TryFrom<Vec<u8>>>(
+    pub(super) fn deserialize<'de, D: Deserializer<'de>, T: super::Bytes>(
         deserializer: D,
     ) -> Result<Option<T>, D::Error> {
         Option::<String>::deserialize(deserializer)?
@@ -356,6 +377,22 @@ mod tests {
         assert!((87_000..131_072).contains(&frame), "{frame}");
         assert_eq!(longest_client_message(8), frame);
         assert!(longest_client_message(10_000) > frame);
+    }
+
+    #[test]
+    fn a_byte_field_longer_than_its_type_allows_is_refused_before_decoding() {
+        let frame = |len: usize| {
+            let record = data_encoding::BASE64.encode(&vec![0; len]);
+            serde_json::from_str::<ClientMessage>(&format!(
+                r#"{{"type":"frame","to":"{ID}","record":"{record}"}}"#
+            ))
+        };
+        assert!(frame(MAX_FRAME_LEN).is_ok());
+        assert!(frame(MAX_FRAME_LEN + 1).is_err());
+
+        let nonce = data_encoding::BASE64.encode(&[0; NONCE_LEN + 1]);
+        let json = format!(r#"{{"type":"challenge","nonce":"{nonce}","relay_protocol":1}}"#);
+        assert!(serde_json::from_str::<ServerMessage>(&json).is_err());
     }
 
     #[test]

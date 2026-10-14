@@ -12,7 +12,7 @@ use crate::server::HTTP_HEADROOM;
 const MAX_DEVICES_PER_MAC_CAP: usize = 1024;
 /// The longest message any setting may admit: well above the longest a
 /// client sends, and a bound on what one read may buffer.
-const MAX_FRAME_BYTES_CAP: usize = 16 * 1024 * 1024;
+const MAX_FRAME_BYTES_CAP: usize = 1024 * 1024;
 
 /// The relay's limits and settings. `from_env` reads the deployment's
 /// environment; the timeouts and the queue budget are fixed there and
@@ -141,7 +141,7 @@ impl Config {
         }
         if self.max_frame_bytes > MAX_FRAME_BYTES_CAP {
             return Err(ConfigError::Inconsistent(
-                "MAX_FRAME_BYTES may be at most 16 MiB",
+                "MAX_FRAME_BYTES may be at most 1 MiB",
             ));
         }
         if self
@@ -271,7 +271,7 @@ mod tests {
         for vars in [
             &[("MAX_DEVICES_PER_MAC", "1025")][..],
             &[("MAX_DEVICES_PER_MAC", huge.as_str())],
-            &[("MAX_FRAME_BYTES", "16777217")],
+            &[("MAX_FRAME_BYTES", "1048577")],
             &[("MAX_FRAME_BYTES", huge.as_str())],
             &[("MAX_CONNECTIONS", huge.as_str())],
         ] {
@@ -283,8 +283,8 @@ mod tests {
         assert!(config(&[("MAX_DEVICES_PER_MAC", "1024")]).is_ok());
         assert!(
             config(&[
-                ("MAX_FRAME_BYTES", "16777216"),
-                ("RATE_LIMIT_BYTES", "16777216")
+                ("MAX_FRAME_BYTES", "1048576"),
+                ("RATE_LIMIT_BYTES", "1048576")
             ])
             .is_ok()
         );

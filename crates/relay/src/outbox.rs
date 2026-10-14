@@ -133,34 +133,40 @@ impl Outbox {
         })
     }
 
-    /// Queues a frame, waiting while the budget is full. Gives up, and
-    /// returns false, if the recipient closes, if `sender_closed` is
-    /// cancelled, if the recipient's socket accepts nothing for `wait.stall`,
-    /// or if no room comes within `wait.room` however much it accepts — in
-    /// either of the last two cases the recipient is closed, as not reading
-    /// or as too slow to read. `wait.room` bounds how long one frame holds
-    /// its sender, which reads nothing else meanwhile.
-    pub async fn send_frame(
+    /// Reserves room for a frame of `cost`, waiting while the budget is
+    /// full. Gives up, returning `None`, if the recipient closes, if
+    /// `sender_closed` is cancelled, if the recipient's socket accepts
+    /// nothing for `wait.stall`, or if no room comes within `wait.room`
+    /// however much it accepts — in either of the last two cases the
+    /// recipient is closed, as not reading or as too slow to read.
+    /// `wait.room` bounds how long one frame holds its sender, which reads
+    /// nothing else meanwhile. The frame is queued separately, by
+    /// `enqueue_frame`, so the caller can check that it may still go.
+    pub async fn reserve(
         &self,
-        message: ServerMessage,
         cost: usize,
         wait: Wait,
         sender_closed: &CancellationToken,
-    ) -> bool {
+    ) -> Option<OwnedSemaphorePermit> {
+        if sender_closed.is_cancelled() {
+            return None;
+        }
         let permits = u32::try_from(cost.min(self.capacity)).unwrap_or(u32::MAX);
-        let permit = match Arc::clone(&self.budget).try_acquire_many_owned(permits) {
-            Ok(permit) => permit,
-            Err(TryAcquireError::Closed) => return false,
+        match Arc::clone(&self.budget).try_acquire_many_owned(permits) {
+            Ok(permit) => Some(permit),
+            Err(TryAcquireError::Closed) => None,
             Err(TryAcquireError::NoPermits) => {
-                match self.wait_for_room(permits, wait, sender_closed).await {
-                    Some(permit) => permit,
-                    None => return false,
-                }
+                self.wait_for_room(permits, wait, sender_closed).await
             }
-        };
+        }
+    }
+
+    /// Queues a frame into room `reserve` made for it, without waiting.
+    /// Returns whether it was queued.
+    pub fn enqueue_frame(&self, message: ServerMessage, room: OwnedSemaphorePermit) -> bool {
         self.enqueue(Outbound {
             message,
-            _permit: Some(permit),
+            _permit: Some(room),
         })
     }
 
@@ -179,9 +185,11 @@ impl Outbox {
         loop {
             let since = self.progress.last().max(started);
             tokio::select! {
-                permit = &mut acquire => return permit.ok(),
+                // A closed side wins over room that came at the same moment.
+                biased;
                 () = self.closed.cancelled() => return None,
                 () = sender_closed.cancelled() => return None,
+                permit = &mut acquire => return permit.ok(),
                 () = tokio::time::sleep_until(started + room) => {
                     tracing::debug!("closing a connection too slow to take a frame");
                     self.closed.cancel();
@@ -242,6 +250,24 @@ impl Writer {
         }
         let _ = sink.send(Message::Close(None)).await;
         let _ = sink.close().await;
+    }
+}
+
+#[cfg(test)]
+impl Outbox {
+    /// `reserve`, then `enqueue_frame`, as the server does with its check
+    /// between them.
+    pub async fn send_frame(
+        &self,
+        message: ServerMessage,
+        cost: usize,
+        wait: Wait,
+        sender_closed: &CancellationToken,
+    ) -> bool {
+        match self.reserve(cost, wait, sender_closed).await {
+            Some(room) => self.enqueue_frame(message, room),
+            None => false,
+        }
     }
 }
 

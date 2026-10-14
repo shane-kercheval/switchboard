@@ -37,7 +37,7 @@ use crate::protocol::{
     ClientMessage, DeviceId, ErrorCode, NONCE_LEN, PAIRING_TOKEN_LEN, RELAY_PROTOCOL, Register,
     Role, ServerMessage,
 };
-use crate::state::{Refusal, Relay};
+use crate::state::{Pending, Refusal, Relay};
 
 /// How long a closing connection's queued messages may take to go out.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -90,13 +90,19 @@ fn validate(config: Config) -> io::Result<Config> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
-/// The most memory connections' queues and read buffers can hold: each
-/// WebSocket's queue budget and one message being read, and every socket's
-/// request head, read and answered, before it upgrades.
+/// The most memory connections' queues and message buffers can hold: each
+/// WebSocket's queue budget and one message being read — its text, the copy
+/// decoding an internally tagged message makes, and one record decoded —
+/// and every socket's request head, read and answered, before it upgrades.
+/// A bound on what clients can make the relay hold, not on the process.
 fn memory_ceiling(config: &Config) -> usize {
+    let message = config
+        .max_frame_bytes
+        .saturating_mul(2)
+        .saturating_add(MAX_FRAME_LEN);
     let websockets = config
         .max_connections
-        .saturating_mul(config.queue_bytes.saturating_add(config.max_frame_bytes));
+        .saturating_mul(config.queue_bytes.saturating_add(message));
     let heads = config
         .max_connections
         .saturating_add(HTTP_HEADROOM)
@@ -110,7 +116,7 @@ fn memory_ceiling(config: &Config) -> usize {
 async fn serve_validated(listener: TcpListener, config: Config, shutdown: CancellationToken) {
     tracing::info!(
         memory_ceiling_bytes = memory_ceiling(&config),
-        "queues and read buffers are bounded"
+        "queues and message buffers are bounded"
     );
     // `validated` keeps this within the semaphore's limit.
     let sockets = Arc::new(Semaphore::new(config.max_connections + HTTP_HEADROOM));
@@ -343,9 +349,12 @@ async fn run_connection(
     };
     connection.run().await;
     if let Some(registration) = connection.registration.take() {
-        shared
-            .relay()
-            .unregister(&registration.id, registration.generation, Utc::now());
+        shared.relay().unregister(
+            &registration.id,
+            registration.generation,
+            Utc::now(),
+            Instant::now(),
+        );
         tracing::info!(device_id = %registration.id, "disconnected");
     }
     // Dropping the outbox, the queue's last sender, lets the writer flush
@@ -477,10 +486,13 @@ impl Connection {
             Role::Mac { paired_devices } => (None, set_for_log(paired_devices)),
             Role::Phone { mac } => (Some(mac.clone()), None),
         };
-        let registered =
-            self.shared
-                .relay()
-                .register(id.clone(), claim.role, self.outbox.clone(), Utc::now());
+        let registered = self.shared.relay().register(
+            id.clone(),
+            claim.role,
+            self.outbox.clone(),
+            Utc::now(),
+            Instant::now(),
+        );
         match registered {
             Ok(generation) => {
                 match phone_of {
@@ -511,12 +523,10 @@ impl Connection {
                 record,
                 pairing_token,
             } => {
-                if record.len() > MAX_FRAME_LEN {
-                    Err(Refusal::bad_message("a record longer than any frame"))
-                } else {
-                    self.forward(&id, generation, to, record, pairing_token)
-                        .await
-                }
+                // A record longer than any frame does not decode, so it
+                // never gets here: it is `bad_message` as not a relay message.
+                self.forward(&id, generation, to, record, pairing_token)
+                    .await
             }
             ClientMessage::PairedDevices { device_ids } => {
                 let set = set_for_log(&device_ids);
@@ -554,9 +564,10 @@ impl Connection {
     }
 
     /// Routes a frame and queues it for its recipient, waiting while the
-    /// recipient's queue is full, or returns why it may not pass. A frame
-    /// that cannot be queued because its recipient closed is dropped, and the
-    /// sender hears of that close through `peer_disconnected`.
+    /// recipient's queue is full, or returns why it may not pass. The route
+    /// is checked again once there is room, since the wait holds no lock: a
+    /// frame whose sender or recipient was replaced or closed meanwhile is
+    /// dropped, and the sender hears of that through `peer_disconnected`.
     async fn forward(
         &self,
         from: &DeviceId,
@@ -565,7 +576,7 @@ impl Connection {
         record: Vec<u8>,
         pairing_token: Option<[u8; PAIRING_TOKEN_LEN]>,
     ) -> Result<(), Refusal> {
-        let recipient = self.shared.relay().route(
+        let route = self.shared.relay().route(
             from,
             generation,
             &to,
@@ -573,18 +584,28 @@ impl Connection {
             Instant::now(),
         )?;
         let cost = frame_cost(record.len());
-        let frame = ServerMessage::Frame {
-            to,
-            from: from.clone(),
-            record,
-            pairing_token,
-        };
         let wait = Wait {
             stall: self.shared.config.stall_timeout,
             room: self.shared.config.room_timeout,
         };
-        recipient.send_frame(frame, cost, wait, &self.closed).await;
-        Ok(())
+        let Some(room) = route.outbox.reserve(cost, wait, &self.closed).await else {
+            return Ok(());
+        };
+        let pending = Pending {
+            frame: ServerMessage::Frame {
+                to: to.clone(),
+                from: from.clone(),
+                record,
+                pairing_token,
+            },
+            to,
+            pairing_token,
+            recipient: route.generation,
+            room,
+        };
+        self.shared
+            .relay()
+            .commit(from, generation, pending, Instant::now())
     }
 
     /// The next client message, or `End` once the connection is over or
@@ -772,10 +793,13 @@ mod tests {
     }
 
     #[test]
-    fn the_default_memory_ceiling_is_about_267_mib() {
-        // 64 queues of 4 MiB with a 128 KiB message each, and 80 request
-        // heads of 32 KiB.
-        assert_eq!(memory_ceiling(&Config::default()), 279_445_504);
+    fn the_default_memory_ceiling_is_about_279_mib() {
+        // 64 queues of 4 MiB, each with a 128 KiB message read twice and a
+        // decoded record, and 80 request heads of 32 KiB.
+        assert_eq!(
+            memory_ceiling(&Config::default()),
+            64 * (4 * 1024 * 1024 + 2 * 131_072 + MAX_FRAME_LEN) + 80 * 32 * 1024
+        );
     }
 
     #[test]

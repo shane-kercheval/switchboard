@@ -79,8 +79,11 @@ shared Rust cryptography are in one tree.
     and a `MAX_FRAME_BYTES` below the longest client message is refused at startup, as are
     a `RATE_LIMIT_BYTES` below `MAX_FRAME_BYTES` and settings past their caps. Only a Mac may
     change a set or a pairing window, checked in the routing table; a set's length counts
-    duplicates; a Mac and the phone bound to its pairing window are told when the other
-    leaves; registering as a phone forgets what the relay held for that id as a Mac.
+    duplicates; a Mac and the phone bound to its open pairing window are told when the other
+    leaves; registering as a phone forgets what the relay held for that id as a Mac. A frame
+    that waited for room is checked again before it is queued, so one from a replaced
+    connection never follows the notice of its end. A byte field longer than its type allows
+    is refused before it is decoded.
   - `make protocol-fixtures` lands with the relay's fixtures in PR 1; PR 2 adds the envelope
     fixtures to it. `make relay-image` builds the container with the Rust version from
     `rust-toolchain.toml`, and a CI job builds and smoke-tests it.
@@ -1258,7 +1261,7 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   `RATE_LIMIT_BYTES` (bytes a second per connection, at least `MAX_FRAME_BYTES`, so a burst
   may always reach one message of that size; default 16 MiB), `MAX_FRAME_BYTES` (the longest
   WebSocket message; default 131,072, above the 87,500-odd bytes of a frame carrying the
-  longest record as base64; at most 16 MiB; the relay refuses to start with a value below the
+  longest record as base64; at most 1 MiB; the relay refuses to start with a value below the
   longest message a client sends, that frame or a registration naming `MAX_DEVICES_PER_MAC`
   phones), `MAX_DEVICES_PER_MAC` (default 8, at most 1,024), `MAX_CONNECTIONS` (global,
   default 64, since registration is open to any key), `DENY_DEVICE_IDS` (comma-separated). A
@@ -1349,8 +1352,9 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
 - **Peer notices**: the relay sends `peer_disconnected { device_id }` **exactly once for each
   registration that ends**, to every connected device paired with it: to a phone's Mac if
   the phone is in its set or bound to its pairing window, and to each connected phone in a
-  Mac's set, or bound to its window, that names it — never to a device that merely lists
-  another. A pairing phone's end leaves the window bound to it. A registration ends when a newer registration for
+  Mac's set, or bound to its window while it is open, that names it — never to a device
+  that merely lists another, or whose window has expired. A pairing phone's end leaves the
+  window bound to it. A registration ends when a newer registration for
   the same id replaces it, or when its socket closes or times out while it is still the one
   registered. On a replacement the notice goes out before any frame from the new connection
   is forwarded, so the receiver ends the old session before the new handshake arrives. A
@@ -1359,7 +1363,10 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   session table still holds that generation for the id. The same check covers everything a
   connection asks of the session table, so a replaced connection acting on a message it read
   before the replacement can neither forward a frame nor change the newer registration's set
-  or pairing window.
+  or pairing window. A frame that waited for room at its recipient is checked again, under
+  the same lock registrations change under, before it is queued: if its sender or recipient
+  has been replaced or has gone meanwhile it is dropped, and if the pair may no longer reach
+  each other it is refused as at first.
 - **Last seen**: per Mac id, the time of its last disconnect, in memory; documented as
   observational and absent after a relay restart.
 - **Flow control**: a connection over `RATE_LIMIT` or `RATE_LIMIT_BYTES` is not refused; the
@@ -1369,13 +1376,17 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   the relay's own messages beyond that. A sender whose recipient's frames are full waits for
   room; the recipient is closed only if its socket accepts no bytes for 5 seconds while a
   sender waits, measured from the later of the wait's start and the last bytes accepted, so a
-  long message going out slowly is progress and a queue idle before a burst is not a stall;
+  long message going out slowly is progress and a queue idle before a burst is not a stall
+  (progress is seen when the kernel reports the socket writable, which with a large send
+  buffer comes only after much of it has drained);
   if it frees no room for the waiting frame within 60 seconds however many bytes it accepts,
   which is a phone below about 12 kbps or one trickling bytes to hold its Mac; or if even its
   own control messages no longer fit, which is a client not reading its own errors. The 60
   seconds bound how long one frame holds its sender, whose reader reads nothing else while
-  it waits: not its `paired_devices` unpairing that phone, and not its own socket's end, so for a
-  Mac whose connection dies during a wait, its idle timeout starts at most 60 seconds late. A send that fails closes its connection, so its peers are told.
+  it waits: not its `paired_devices` unpairing that phone, and not its own socket's end. So a
+  Mac whose connection dies is noticed only once the relay has worked through what it sent
+  before it died; a phone that is slow but within the limits can stretch that to minutes or
+  longer, and a reconnecting Mac replaces the stale registration at once. A send that fails closes its connection, so its peers are told.
 
   The wait couples a Mac to its slowest phone, and this is accepted: the Mac's traffic is one
   ordered stream, so while one phone's queue is full the Mac's frames to its other phones
@@ -1388,11 +1399,15 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   retries with backoff. Bounding it would need the Mac to know how much each phone has
   received — per-phone acknowledgements the protocol does not have — so the Mac does not
   pace. The relay's alternative, dropping the frame and answering the sender with an error
-  naming the recipient, loses replies as well as events, and is held in reserve. Keepalive
-  survives the wait on both sides: the relay's pings to the Mac come from its writer, and the
-  Mac's reader never waits on its sends (§5.1). A sender's own pings do wait behind its
-  frames, so its pong is late by up to the wait, which is why the clients judge the relay
-  by anything received, not by pongs alone. A phone has a floor: it must take in one
+  naming the recipient, loses replies as well as events, and is held in reserve. The Mac's
+  keepalive survives a wait: the relay's pings to it come from its writer, and its reader
+  never waits on its sends (§5.1). A sender's own pings do wait behind its frames, so its
+  pong is late by up to the wait, which is why the clients judge the relay by anything
+  received, not by pongs alone. A phone does not see the relay's pings, so one whose frame
+  waits at a Mac too slow to take it may reconnect before the relay closes that Mac; that is
+  harmless, since its new registration replaces the old and ends the wait. No room timeout
+  prevents it: the phone's silence may have begun up to a ping interval before the wait, so
+  that would take one under 25 seconds, which would cut off phones below about 28 kbps. A phone has a floor: it must take in one
   message of `MAX_FRAME_BYTES` within its 50-second silence limit, since the relay's pings
   to it go out between messages, so below about 15–20 kbps it reconnects in a loop and the
   relay is unusable from it.
@@ -1405,8 +1420,10 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   new socket as soon as it accepts it, unread and unanswered, since answering would take a
   task per socket, which is what the limit bounds. Each request head must arrive within 10 seconds,
   the first included, so a socket that sends nothing or idles between requests is closed,
-  and a head may be at most 16 KiB. Memory is bounded by `MAX_CONNECTIONS` times the queue
-  budget and one read buffer, plus every socket's request buffers, about 267 MiB at the
+  and a head may be at most 16 KiB. What clients can make the relay hold is bounded by
+  `MAX_CONNECTIONS` times the queue budget and one message being read — its text, the copy
+  decoding makes, and one decoded record, since a byte field longer than its type allows is
+  refused before it is decoded — plus every socket's request buffers, about 279 MiB at the
   defaults, logged at startup. At most 1,024 held sets of disconnected
   Macs are kept, the longest disconnected forgotten first, whenever a set is added or a Mac
   disconnects; its phones are then answered `mac_offline` as after a restart. A Mac's set is
@@ -1797,7 +1814,9 @@ denylist procedure written down; the App Store Connect export-compliance answer
 (`ITSAppUsesNonExemptEncryption`), decided and recorded; the relay's edge-abuse policy for the
 chosen host — a per-source connection limit at the trusted proxy, in place before the relay's
 address reaches any build beyond the two developers, which proxy headers are trusted, how shared
-carrier addresses and rotating IPv6 addresses are treated, and `Retry-After` on a 503. The app
+carrier addresses and rotating IPv6 addresses are treated, and `Retry-After` on a 503; and a
+support note that a phone on a very slow link, around 15 kbps and below, cannot take in a full
+message within the relay's limits, so it reconnects repeatedly and looks like a failing relay. The app
 implements its own
 end-to-end encryption, so the "exempt encryption only" answer cannot be assumed. TestFlight
 internal testing for both developers. A committed distribution identity: a dedicated

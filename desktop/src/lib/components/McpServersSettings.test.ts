@@ -116,7 +116,7 @@ describe("McpServersSettings", () => {
     await fireEvent.click(trigger);
     const name = screen.getByRole("textbox", { name: "Name" });
     await waitFor(() => expect(name).toHaveFocus());
-    await fireEvent.input(name, { target: { value: "my-team" } });
+    await fireEvent.input(name, { target: { value: "my-server" } });
     await fireEvent.input(screen.getByRole("textbox", { name: "URL" }), {
       target: { value: "https://example.test/mcp" },
     });
@@ -126,14 +126,14 @@ describe("McpServersSettings", () => {
     expect(screen.getByTestId("mcp-row-tiddly")).toBeVisible();
     await waitFor(() => expect(trigger).toHaveFocus());
     await fireEvent.click(trigger);
-    expect(name).toHaveValue("my-team");
+    expect(name).toHaveValue("my-server");
     expect(screen.getByRole("textbox", { name: "URL" })).toHaveValue("https://example.test/mcp");
 
     invokeMock.mockRejectedValueOnce(new Error("Couldn't save the server"));
     await fireEvent.click(screen.getByTestId("mcp-add"));
     expect(await screen.findByTestId("mcp-add-error")).toBeVisible();
     expect(form).toBeVisible();
-    expect(name).toHaveValue("my-team");
+    expect(name).toHaveValue("my-server");
   });
 
   it("lists configured providers with status on mount", async () => {

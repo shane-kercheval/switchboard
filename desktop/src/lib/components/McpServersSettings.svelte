@@ -536,7 +536,7 @@
       <span class="text-muted text-xs">Name</span>
       <Input
         bind:value={name}
-        placeholder="my-team"
+        placeholder="my-server"
         data-testid="mcp-name"
         class={cn("h-8 px-2", nameError && "border-status-failed")}
       />

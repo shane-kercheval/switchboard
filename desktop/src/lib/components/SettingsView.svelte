@@ -43,6 +43,7 @@
   import { HARNESS_LABEL, ALL_HARNESSES } from "$lib/harnessDisplay";
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
   import { promptAuthoringPrompt } from "$lib/promptAuthoring";
+  import { ORCHESTRATOR_PROMPT } from "$lib/orchestratorPrompt";
 
   let { onClose, section = null }: { onClose: () => void; section?: SettingsSection | null } =
     $props();
@@ -982,6 +983,44 @@
           </p>
         </div>
         <AgentAccessSettings />
+      </section>
+      <section class={cn(sectionClass, "mt-7")} data-testid="orchestrator-prompt-settings">
+        <div>
+          <h2 class={sectionHeadingClass}>Orchestrator prompt</h2>
+          <p class="text-muted mt-1 text-sm leading-relaxed">
+            The tools tell a connected agent how Switchboard works, not how to think. This prompt
+            makes it your stand-in: it decides and directs, questions the way an engineer or a
+            product, UX, security, or data expert would, and never writes code itself. Copy it into
+            the CLAUDE.md or AGENTS.md of the folder you orchestrate from so it loads every session,
+            or paste it when a session starts, and edit the rules to match yours.
+          </p>
+        </div>
+        <Disclosure id="orchestrator-prompt-help" label="Read and copy the orchestrator prompt">
+          <div class="overflow-hidden" data-testid="orchestrator-prompt-authoring">
+            <div class="flex items-start gap-2 py-2.5">
+              <div class="min-w-0 flex-1">
+                <h3 class="text-fg text-sm font-medium">Give the orchestrating agent its role</h3>
+                <p>Copy the whole prompt into the agent that connects over MCP.</p>
+              </div>
+              <Tooltip label="Copy Prompt" side="top">
+                {#snippet trigger(props)}
+                  <span {...props} class="shrink-0">
+                    <CopyButton
+                      text={ORCHESTRATOR_PROMPT}
+                      label="Copy orchestrator prompt"
+                      testid="orchestrator-prompt-copy"
+                    />
+                  </span>
+                {/snippet}
+              </Tooltip>
+            </div>
+
+            <pre
+              id="orchestrator-prompt"
+              data-testid="orchestrator-prompt"
+              class="bg-raised text-fg max-h-80 overflow-auto rounded-md px-3 py-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">{ORCHESTRATOR_PROMPT}</pre>
+          </div>
+        </Disclosure>
       </section>
     </div>
   </div>

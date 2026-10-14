@@ -8,6 +8,7 @@ import { agentCopy } from "$lib/agentCopy.svelte";
 import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
 import { _testing as prefsTesting, preferences } from "$lib/preferences.svelte";
 import { WORKFLOW_AUTHORING_GUIDE_URL } from "$lib/workflowAuthoring";
+import { ORCHESTRATOR_PROMPT } from "$lib/orchestratorPrompt";
 import { DEFAULT_AGENT_SELECTIONS } from "$lib/agentSelection";
 import type { Preferences } from "$lib/types";
 
@@ -795,6 +796,21 @@ describe("SettingsView", () => {
     await fireEvent.click(screen.getByTestId("workflows-open"));
 
     expect(invokeMock).toHaveBeenCalledWith("open_workflows_dir", undefined);
+  });
+
+  it("previews and copies the orchestrator prompt from the Agent MCP Server panel", async (): Promise<void> => {
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agent-access" } });
+
+    const help = screen.getByRole("button", { name: "Read and copy the orchestrator prompt" });
+    const preview = screen.getByTestId("orchestrator-prompt");
+    const copy = screen.getByTestId("orchestrator-prompt-copy");
+    expect(preview).not.toBeVisible();
+    await fireEvent.click(help);
+    expect(preview).toBeVisible();
+    expect(preview).toHaveTextContent("You are my stand-in");
+    await fireEvent.click(copy);
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledOnce());
+    expect(copyTextMock.mock.calls[0]![0]).toBe(ORCHESTRATOR_PROMPT);
   });
 
   it("previews and copies local prompt instructions with the folder once it loads", async (): Promise<void> => {

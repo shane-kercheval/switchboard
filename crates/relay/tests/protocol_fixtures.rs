@@ -12,7 +12,7 @@ use chrono::{TimeZone, Utc};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use switchboard_relay::protocol::{
-    ClientMessage, DeviceId, ErrorCode, RELAY_PROTOCOL, Role, ServerMessage, token_hash,
+    ClientMessage, DeviceId, ErrorCode, RELAY_PROTOCOL, Register, Role, ServerMessage, token_hash,
 };
 use switchboard_remote_crypto::DeviceKeys;
 
@@ -81,17 +81,17 @@ fn to_relay(sample: &Sample) -> Vec<(&'static str, Fixture)> {
     vec![
         (
             "to_relay/register.json",
-            ToRelay(ClientMessage::Register {
+            ToRelay(ClientMessage::Register(Register {
                 relay_protocol: RELAY_PROTOCOL,
                 device_id: id(phone),
                 identity_public_key: phone.identity_public_key().to_bytes(),
                 signature: phone.sign_relay_challenge(&sample.nonce).to_bytes(),
                 role: Role::Phone { mac: id(mac) },
-            }),
+            })),
         ),
         (
             "to_relay/register_mac.json",
-            ToRelay(ClientMessage::Register {
+            ToRelay(ClientMessage::Register(Register {
                 relay_protocol: RELAY_PROTOCOL,
                 device_id: id(mac),
                 identity_public_key: mac.identity_public_key().to_bytes(),
@@ -99,7 +99,7 @@ fn to_relay(sample: &Sample) -> Vec<(&'static str, Fixture)> {
                 role: Role::Mac {
                     paired_devices: vec![id(phone)],
                 },
-            }),
+            })),
         ),
         (
             "to_relay/frame.json",

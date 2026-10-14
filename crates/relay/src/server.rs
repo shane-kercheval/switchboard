@@ -1,8 +1,11 @@
 //! The WebSocket server over the routing table: one task per connection
 //! reading the socket, and one writer task draining that connection's queue.
 
+use std::io;
 use std::net::SocketAddr;
+use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -14,10 +17,13 @@ use axum::routing::get;
 use chrono::Utc;
 use futures::StreamExt;
 use futures::stream::SplitStream;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use serde_json::json;
 use switchboard_remote_crypto::frame::MAX_FRAME_LEN;
 use switchboard_remote_crypto::identity::{Signature, VerifyingKey, verify_relay_challenge};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -26,8 +32,8 @@ use tokio_util::task::TaskTracker;
 use crate::config::Config;
 use crate::outbox::{Outbox, frame_cost};
 use crate::protocol::{
-    ClientMessage, DeviceId, ErrorCode, NONCE_LEN, PAIRING_TOKEN_LEN, RELAY_PROTOCOL, Role,
-    ServerMessage,
+    ClientMessage, DeviceId, ErrorCode, NONCE_LEN, PAIRING_TOKEN_LEN, RELAY_PROTOCOL, Register,
+    Role, ServerMessage,
 };
 use crate::state::Relay;
 
@@ -36,16 +42,25 @@ const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// Messages read and discarded while a closing connection waits for the
 /// client to answer its close; past this the socket is simply dropped.
 const DRAIN_LIMIT: usize = 64;
+/// Sockets accepted beyond `MAX_CONNECTIONS`, for plain HTTP: health checks,
+/// and upgrades refused because the relay is full. Past this the relay
+/// answers 503 itself and closes the socket unread.
+pub(crate) const HTTP_HEADROOM: usize = 16;
+/// The longest request head read, and so the most a socket's HTTP buffers
+/// hold before it upgrades.
+pub(crate) const MAX_REQUEST_HEAD: usize = 16 * 1024;
+const FULL: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
 struct Shared {
     config: Config,
     relay: Mutex<Relay>,
-    /// One permit per open socket, taken before the upgrade and held until
-    /// the socket is dropped, so `MAX_CONNECTIONS` bounds sockets and tasks.
+    /// One permit per WebSocket, taken before the upgrade and held until the
+    /// socket is dropped, so `MAX_CONNECTIONS` bounds the upgraded sockets.
     admission: Arc<Semaphore>,
     shutdown: CancellationToken,
-    /// Every upgraded connection, so shutdown can wait for them: axum runs
-    /// them detached from the HTTP server's own graceful shutdown.
+    /// Every accepted socket and every upgraded connection, so shutdown can
+    /// wait for them.
     connections: TaskTracker,
 }
 
@@ -62,14 +77,26 @@ pub async fn serve(
     listener: TcpListener,
     config: Config,
     shutdown: CancellationToken,
-) -> std::io::Result<()> {
-    let config = config
+) -> io::Result<()> {
+    serve_validated(listener, validate(config)?, shutdown).await;
+    Ok(())
+}
+
+fn validate(config: Config) -> io::Result<Config> {
+    config
         .validated()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+/// Accepts sockets itself rather than through `axum::serve`, so that every
+/// socket counts against a limit, not only upgraded ones, and a socket that
+/// has not upgraded is closed once a request head is overdue.
+async fn serve_validated(listener: TcpListener, config: Config, shutdown: CancellationToken) {
     tracing::info!(
         memory_ceiling_bytes = config.memory_ceiling(),
         "queues and read buffers are bounded"
     );
+    let sockets = Arc::new(Semaphore::new(config.max_connections + HTTP_HEADROOM));
     let shared = Arc::new(Shared {
         relay: Mutex::new(Relay::new(config.max_devices_per_mac)),
         admission: Arc::new(Semaphore::new(config.max_connections)),
@@ -81,9 +108,33 @@ pub async fn serve(
         .route("/connect", get(connect))
         .route("/healthz", get(healthz))
         .with_state(Arc::clone(&shared));
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await?;
+    loop {
+        let accepted = tokio::select! {
+            () = shutdown.cancelled() => break,
+            accepted = listener.accept() => accepted,
+        };
+        let stream = match accepted {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                tracing::warn!(%error, "could not accept a connection");
+                // Out of file descriptors, most likely: let some close.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = Arc::clone(&sockets).try_acquire_owned() else {
+            shared.connections.spawn(refuse_socket(stream));
+            continue;
+        };
+        let socket = Admitted {
+            stream,
+            _permit: permit,
+        };
+        shared
+            .connections
+            .spawn(serve_http(socket, app.clone(), Arc::clone(&shared)));
+    }
+    drop(listener);
     shared.connections.close();
     let closing = FLUSH_TIMEOUT + Duration::from_secs(1);
     if tokio::time::timeout(closing, shared.connections.wait())
@@ -92,25 +143,103 @@ pub async fn serve(
     {
         tracing::warn!("connections still closing at shutdown were abandoned");
     }
-    Ok(())
+}
+
+/// Answers 503 on a socket past the limit without reading its request.
+/// Bounded by time, so a refused socket holds nothing for long.
+async fn refuse_socket(mut stream: TcpStream) {
+    let _ = tokio::time::timeout(FLUSH_TIMEOUT, async {
+        stream.write_all(FULL).await?;
+        stream.shutdown().await
+    })
+    .await;
+}
+
+/// HTTP on one socket until it upgrades or closes. Each request head, the
+/// first included, must arrive within the time a client has to register, so
+/// a socket that sends nothing, or idles between requests, is closed.
+async fn serve_http(socket: Admitted, app: Router, shared: Arc<Shared>) {
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(TokioTimer::new())
+        .header_read_timeout(shared.config.register_timeout)
+        .max_buf_size(MAX_REQUEST_HEAD);
+    let mut connection = pin!(
+        http.serve_connection(TokioIo::new(socket), TowerToHyperService::new(app))
+            .with_upgrades()
+    );
+    let served = tokio::select! {
+        served = connection.as_mut() => served,
+        () = shared.shutdown.cancelled() => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
+        }
+    };
+    if let Err(error) = served {
+        tracing::debug!(%error, "an HTTP connection failed");
+    }
+}
+
+/// An accepted socket holding its share of the socket limit until it is
+/// dropped: after an upgrade, with the WebSocket.
+struct Admitted {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsyncRead for Admitted {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Admitted {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
 }
 
 /// A relay running in this process, for tests and local use.
 pub struct RelayHandle {
     addr: SocketAddr,
     shutdown: CancellationToken,
-    task: JoinHandle<std::io::Result<()>>,
+    task: JoinHandle<()>,
 }
 
 impl RelayHandle {
-    pub async fn start(addr: SocketAddr, config: Config) -> std::io::Result<Self> {
-        let config = config
-            .validated()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    pub async fn start(addr: SocketAddr, config: Config) -> io::Result<Self> {
+        let config = validate(config)?;
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
         let shutdown = CancellationToken::new();
-        let task = tokio::spawn(serve(listener, config, shutdown.clone()));
+        let task = tokio::spawn(serve_validated(listener, config, shutdown.clone()));
         Ok(Self {
             addr,
             shutdown,
@@ -128,9 +257,9 @@ impl RelayHandle {
 
     /// Closes every connection, waits for them to finish closing, and stops
     /// listening. Everything the relay held is gone, as after a restart.
-    pub async fn shutdown(self) -> std::io::Result<()> {
+    pub async fn shutdown(self) -> io::Result<()> {
         self.shutdown.cancel();
-        self.task.await.map_err(std::io::Error::other)?
+        self.task.await.map_err(io::Error::other)
     }
 }
 
@@ -208,15 +337,6 @@ struct Registration {
     is_mac: bool,
 }
 
-/// What a `register` message claims, checked by `Connection::register`.
-struct Claim {
-    relay_protocol: u32,
-    device_id: DeviceId,
-    identity_public_key: [u8; 32],
-    signature: [u8; 64],
-    role: Role,
-}
-
 struct Connection {
     shared: Arc<Shared>,
     stream: SplitStream<WebSocket>,
@@ -261,20 +381,7 @@ impl Connection {
         });
         let register_by = tokio::time::Instant::now() + self.shared.config.register_timeout;
         match self.next(Deadline::At(register_by)).await {
-            Incoming::Message(ClientMessage::Register {
-                relay_protocol,
-                device_id,
-                identity_public_key,
-                signature,
-                role,
-            }) => {
-                let claim = Claim {
-                    relay_protocol,
-                    device_id,
-                    identity_public_key,
-                    signature,
-                    role,
-                };
+            Incoming::Message(ClientMessage::Register(claim)) => {
                 if !self.register(&nonce, claim) {
                     return;
                 }
@@ -294,7 +401,7 @@ impl Connection {
     }
 
     /// Registers the connection, or queues the refusal and returns false.
-    fn register(&mut self, nonce: &[u8; NONCE_LEN], claim: Claim) -> bool {
+    fn register(&mut self, nonce: &[u8; NONCE_LEN], claim: Register) -> bool {
         if claim.relay_protocol != RELAY_PROTOCOL {
             self.refuse(
                 ErrorCode::ProtocolMismatch,
@@ -361,7 +468,11 @@ impl Connection {
         let Some(registration) = &self.registration else {
             return false;
         };
-        let (id, is_mac) = (registration.id.clone(), registration.is_mac);
+        let (id, generation, is_mac) = (
+            registration.id.clone(),
+            registration.generation,
+            registration.is_mac,
+        );
         let refusal = match message {
             ClientMessage::Frame {
                 to,
@@ -372,7 +483,8 @@ impl Connection {
                     self.refuse(ErrorCode::BadMessage, "a record longer than any frame");
                     return false;
                 }
-                self.forward(&id, to, record, pairing_token).await;
+                self.forward(&id, generation, to, record, pairing_token)
+                    .await;
                 Ok(())
             }
             ClientMessage::PairedDevices { .. }
@@ -389,22 +501,28 @@ impl Connection {
                     paired_devices = ?device_ids.iter().map(DeviceId::as_str).collect::<Vec<_>>(),
                     "paired devices"
                 );
-                self.shared.relay().set_paired_devices(&id, device_ids)
+                self.shared
+                    .relay()
+                    .set_paired_devices(&id, generation, device_ids)
             }
             ClientMessage::PairingOpen {
                 token_hash,
                 expires_in,
             } => {
-                self.shared
-                    .relay()
-                    .open_pairing(&id, token_hash, expires_in, Instant::now());
+                self.shared.relay().open_pairing(
+                    &id,
+                    generation,
+                    token_hash,
+                    expires_in,
+                    Instant::now(),
+                );
                 Ok(())
             }
             ClientMessage::PairingClose => {
-                self.shared.relay().close_pairing(&id);
+                self.shared.relay().close_pairing(&id, generation);
                 Ok(())
             }
-            ClientMessage::Register { .. } => {
+            ClientMessage::Register(_) => {
                 self.refuse(ErrorCode::BadMessage, "already registered");
                 return false;
             }
@@ -423,14 +541,18 @@ impl Connection {
     async fn forward(
         &self,
         from: &DeviceId,
+        generation: u64,
         to: DeviceId,
         record: Vec<u8>,
         pairing_token: Option<[u8; PAIRING_TOKEN_LEN]>,
     ) {
-        let routed = self
-            .shared
-            .relay()
-            .route(from, &to, pairing_token.as_ref(), Instant::now());
+        let routed = self.shared.relay().route(
+            from,
+            generation,
+            &to,
+            pairing_token.as_ref(),
+            Instant::now(),
+        );
         let recipient = match routed {
             Ok(recipient) => recipient,
             Err(refusal) => {
@@ -456,9 +578,16 @@ impl Connection {
     /// out before its message is acted on, which slows it through TCP.
     async fn next(&mut self, deadline: Deadline) -> Incoming {
         loop {
+            let now = tokio::time::Instant::now();
             let until = match deadline {
+                // Checked before reading, not only by the read's timeout,
+                // which never fires while a message is always ready.
+                Deadline::At(at) if now >= at => {
+                    tracing::debug!("closing a connection past its deadline");
+                    return Incoming::End;
+                }
                 Deadline::At(at) => at,
-                Deadline::Idle(idle) => tokio::time::Instant::now() + idle,
+                Deadline::Idle(idle) => now + idle,
             };
             let received = tokio::select! {
                 () = self.closed.cancelled() => return Incoming::End,
@@ -472,10 +601,14 @@ impl Connection {
                 Ok(Some(Ok(message))) => message,
                 Ok(None | Some(Err(_))) => return Incoming::End,
             };
-            let len = match &message {
+            let (len, text) = match message {
                 Message::Close(_) => return Incoming::End,
-                Message::Text(text) => text.len(),
-                Message::Binary(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
+                Message::Binary(_) => {
+                    self.refuse(ErrorCode::BadMessage, "messages are JSON text");
+                    return Incoming::End;
+                }
+                Message::Text(text) => (text.len(), Some(text)),
+                Message::Ping(bytes) | Message::Pong(bytes) => (bytes.len(), None),
             };
             let wait = self.limiter.charge(Instant::now(), len);
             if !wait.is_zero() {
@@ -484,14 +617,7 @@ impl Connection {
                     () = tokio::time::sleep(wait) => {}
                 }
             }
-            let text = match message {
-                Message::Ping(_) | Message::Pong(_) | Message::Close(_) => continue,
-                Message::Text(text) => text,
-                Message::Binary(_) => {
-                    self.refuse(ErrorCode::BadMessage, "messages are JSON text");
-                    return Incoming::End;
-                }
-            };
+            let Some(text) = text else { continue };
             if let Ok(message) = serde_json::from_str(text.as_str()) {
                 return Incoming::Message(message);
             }

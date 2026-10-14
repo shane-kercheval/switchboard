@@ -17,6 +17,8 @@ chrono.workspace = true
 data-encoding.workspace = true
 futures.workspace = true
 getrandom.workspace = true
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "service"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -29,4 +31,4 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.29.0"

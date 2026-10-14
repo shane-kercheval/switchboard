@@ -57,12 +57,15 @@ shared Rust cryptography are in one tree.
     read buffer per admitted connection. The wait couples a Mac to its slowest phone (§5.6,
     §6).
   - **`MAX_CONNECTIONS` bounds sockets.** A connection's admission is taken before the upgrade
-    and held until its socket is gone; a full relay answers HTTP 503. One client with fresh
+    and held until its socket is gone; a full relay answers HTTP 503. Every accepted socket
+    counts, upgraded or not, with 16 more for plain HTTP, and a socket whose request head is
+    10 seconds overdue is closed. One client with fresh
     identities can still take every slot; a per-source limit waits for the deployment, which
     decides how client addresses reach the relay (§2, M5).
   - Shutdown waits, for a bounded time, for every connection to close; a failed send ends its
     connection; at most 1,024 held sets of disconnected Macs are kept, enforced on every path;
-    `/healthz` answers only its status.
+    `/healthz` answers only its status. A replaced connection's late messages change nothing,
+    and a `MAX_FRAME_BYTES` below the longest client message is refused at startup.
   - `make protocol-fixtures` lands with the relay's fixtures in PR 1; PR 2 adds the envelope
     fixtures to it. `make relay-image` builds the container with the Rust version from
     `rust-toolchain.toml`, and a CI job builds and smoke-tests it.
@@ -1236,7 +1239,8 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   `RATE_LIMIT_BYTES` (bytes a second per connection; a burst may always reach one message of
   `MAX_FRAME_BYTES`; default 16 MiB), `MAX_FRAME_BYTES` (the longest WebSocket message;
   default 131,072, above the 87,500-odd bytes of a frame carrying the longest record as
-  base64), `MAX_DEVICES_PER_MAC`, `MAX_CONNECTIONS` (global, default 64, since registration is
+  base64; the relay refuses to start with a value below the longest message a client sends,
+  that frame or a registration naming `MAX_DEVICES_PER_MAC` phones), `MAX_DEVICES_PER_MAC`, `MAX_CONNECTIONS` (global, default 64, since registration is
   open to any key), `DENY_DEVICE_IDS` (comma-separated). The queue budget (4 MiB) and the
   timeouts are fixed in code. `crates/relay/Dockerfile`; TLS terminated by the host so clients
   use `wss://`. Locally: `make relay`; the image: `make relay-image`, which passes the Rust
@@ -1312,7 +1316,10 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   is forwarded, so the receiver ends the old session before the new handshake arrives. A
   replaced socket that closes or times out later sends nothing: each connection keeps the
   generation number its registration was given, and its close handler acts only if the
-  session table still holds that generation for the id.
+  session table still holds that generation for the id. The same check covers everything a
+  connection asks of the session table, so a replaced connection acting on a message it read
+  before the replacement can neither forward a frame nor change the newer registration's set
+  or pairing window.
 - **Last seen**: per Mac id, the time of its last disconnect, in memory; documented as
   observational and absent after a relay restart.
 - **Flow control**: a connection over `RATE_LIMIT` or `RATE_LIMIT_BYTES` is not refused; the
@@ -1330,13 +1337,24 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   the others up for as long as that phone takes to drain the excess, about 30 seconds at
   1 Mbps. If that matters in practice, the Mac paces its sends per phone (§5.6); the relay's
   alternative, dropping the frame and answering the sender with an error naming the
-  recipient, loses replies as well as events, and is held in reserve. Pongs are delayed by
-  at most one throttle wait and one stall, far inside the clients' 50-second keepalive.
+  recipient, loses replies as well as events, and is held in reserve. A sender's pings wait
+  behind its own frames: the relay reads a ping, and answers it, only once every frame sent
+  before it is queued, so a pong is late by one throttle wait plus however long the slowest
+  recipient takes to drain what the sender sent ahead of the ping beyond that recipient's
+  queue budget. In the near-8 MiB case above that is the same 30 seconds, inside the
+  clients' 50-second keepalive; it grows without bound only for a sender that keeps
+  outrunning a slow recipient, which the Mac's pacing (§5.1) prevents.
 - **Limits from day one**: the message and byte rates, `MAX_FRAME_BYTES` (closed), the idle
   timeout, `MAX_DEVICES_PER_MAC` (`limit_exceeded`; on `paired_devices` the held set is kept,
   on `register` the connection is closed), `MAX_CONNECTIONS` (HTTP 503), and the queue
-  budget. Memory is bounded by `MAX_CONNECTIONS` times the queue budget and one read buffer,
-  about 264 MiB at the defaults, logged at startup. At most 1,024 held sets of disconnected
+  budget. The relay accepts sockets itself and counts every one, not only upgraded ones:
+  `MAX_CONNECTIONS` WebSockets and 16 sockets more for plain HTTP, so a relay full of
+  WebSockets still answers `/healthz` and refuses an upgrade with 503; past that it writes
+  503 itself and closes the socket unread. Each request head must arrive within 10 seconds,
+  the first included, so a socket that sends nothing or idles between requests is closed,
+  and a head may be at most 16 KiB. Memory is bounded by `MAX_CONNECTIONS` times the queue
+  budget and one read buffer, plus every socket's request buffers, about 267 MiB at the
+  defaults, logged at startup. At most 1,024 held sets of disconnected
   Macs are kept, the longest disconnected forgotten first, whenever a set is added or a Mac
   disconnects; its phones are then answered `mac_offline` as after a restart. One client with
   fresh identities can take every connection slot; a per-source limit belongs to the

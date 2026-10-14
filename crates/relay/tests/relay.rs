@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use switchboard_relay::protocol::{
-    ClientMessage, DeviceId, ErrorCode, PAIRING_TOKEN_LEN, RELAY_PROTOCOL, Role, ServerMessage,
-    token_hash,
+    ClientMessage, DeviceId, ErrorCode, PAIRING_TOKEN_LEN, RELAY_PROTOCOL, Register, Role,
+    ServerMessage, token_hash,
 };
 use switchboard_relay::{Config, RelayHandle};
 use switchboard_remote_crypto::DeviceKeys;
@@ -63,13 +63,13 @@ fn phone_role(mac: &DeviceId) -> Role {
 }
 
 fn register_message(keys: &DeviceKeys, nonce: &[u8], role: Role) -> ClientMessage {
-    ClientMessage::Register {
+    ClientMessage::Register(Register {
         relay_protocol: RELAY_PROTOCOL,
         device_id: id_of(keys),
         identity_public_key: keys.identity_public_key().to_bytes(),
         signature: keys.sign_relay_challenge(nonce).to_bytes(),
         role,
-    }
+    })
 }
 
 /// Opens a socket and reads the challenge, which names the relay's protocol.
@@ -290,28 +290,12 @@ async fn registration_refusal(
     until_closed(&mut socket).await
 }
 
-fn with_register(
-    message: ClientMessage,
-    edit: impl FnOnce(&mut u32, &mut DeviceId, &mut [u8; 64]),
-) -> ClientMessage {
-    let ClientMessage::Register {
-        mut relay_protocol,
-        mut device_id,
-        identity_public_key,
-        mut signature,
-        role,
-    } = message
-    else {
+fn with_register(message: ClientMessage, edit: impl FnOnce(&mut Register)) -> ClientMessage {
+    let ClientMessage::Register(mut register) = message else {
         unreachable!()
     };
-    edit(&mut relay_protocol, &mut device_id, &mut signature);
-    ClientMessage::Register {
-        relay_protocol,
-        device_id,
-        identity_public_key,
-        signature,
-        role,
-    }
+    edit(&mut register);
+    ClientMessage::Register(register)
 }
 
 #[tokio::test]
@@ -331,7 +315,7 @@ async fn registration_refuses_an_id_that_is_not_the_keys() {
     let said = registration_refusal(Config::default(), |nonce| {
         with_register(
             register_message(&keys, nonce, phone_role(&nobody())),
-            |_, id, _| *id = other,
+            |register| register.device_id = other,
         )
     })
     .await;
@@ -344,7 +328,7 @@ async fn registration_refuses_an_unsupported_relay_protocol() {
     let said = registration_refusal(Config::default(), |nonce| {
         with_register(
             register_message(&keys, nonce, phone_role(&nobody())),
-            |protocol, _, _| *protocol = RELAY_PROTOCOL + 1,
+            |register| register.relay_protocol = RELAY_PROTOCOL + 1,
         )
     })
     .await;
@@ -414,13 +398,13 @@ async fn an_impostor_is_refused_after_a_restart() {
     // The real device's id and public key, but the impostor's signature.
     send(
         &mut socket,
-        &ClientMessage::Register {
+        &ClientMessage::Register(Register {
             relay_protocol: RELAY_PROTOCOL,
             device_id: id_of(&real),
             identity_public_key: real.identity_public_key().to_bytes(),
             signature: impostor.sign_relay_challenge(&nonce).to_bytes(),
             role: phone_role(&nobody()),
-        },
+        }),
     )
     .await;
     assert_eq!(
@@ -731,6 +715,40 @@ async fn pings_do_not_extend_the_registration_deadline() {
 }
 
 #[tokio::test]
+async fn pings_sent_back_to_back_do_not_extend_the_registration_deadline() {
+    // At the default rate limit the relay takes about eight seconds to read
+    // these, and one is always ready; it must close the connection at the
+    // deadline with most of them unread, answering only those it read.
+    const PINGS: usize = 2_000;
+    let relay = start(Config {
+        register_timeout: Duration::from_millis(300),
+        ..Config::default()
+    })
+    .await;
+    let (mut socket, _) = open(&relay.url()).await;
+    for _ in 0..PINGS {
+        socket
+            .feed(Message::Ping(b"stalling".to_vec().into()))
+            .await
+            .unwrap();
+    }
+    socket.flush().await.unwrap();
+    let pongs = tokio::time::timeout(WAIT, async {
+        let mut pongs = 0;
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Pong(_))) => pongs += 1,
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return pongs,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a client flooding pings was never closed");
+    assert!(pongs < PINGS / 2, "{pongs} of {PINGS} pings were read");
+}
+
+#[tokio::test]
 async fn a_burst_over_the_rate_limit_is_slowed_and_delivered_whole() {
     let relay = start(Config {
         rate_limit: 20,
@@ -849,16 +867,13 @@ async fn a_client_that_never_reads_its_errors_is_closed() {
 
 #[tokio::test]
 async fn a_message_over_the_frame_limit_closes_the_connection() {
-    let relay = start(Config {
-        max_frame_bytes: 1024,
-        ..Config::default()
-    })
-    .await;
+    let relay = start_default().await;
     let mut client = Client::phone(&relay, new_keys(), &nobody()).await;
     client.frame(&nobody(), &[0; 256]).await;
     assert_eq!(error_code(&client.next().await), ErrorCode::MacOffline);
 
-    client.frame(&nobody(), &[0; 1024]).await;
+    // About 133,000 bytes as base64, over the default 131,072.
+    client.frame(&nobody(), &vec![0; 100_000]).await;
     assert_eq!(until_closed(&mut client.socket).await, vec![]);
 }
 
@@ -900,21 +915,93 @@ async fn malformed_and_binary_messages_close_the_connection_and_unknown_types_do
     );
 }
 
-#[tokio::test]
-async fn healthz_answers_only_its_status() {
-    let relay = start_default().await;
-    let (_mac, _phone) = paired(&relay).await;
+async fn healthz(relay: &RelayHandle) -> String {
     let mut stream = TcpStream::connect(relay.addr()).await.unwrap();
     stream
         .write_all(b"GET /healthz HTTP/1.1\r\nHost: relay\r\nConnection: close\r\n\r\n")
         .await
         .unwrap();
     let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
+    tokio::time::timeout(WAIT, stream.read_to_string(&mut response))
+        .await
+        .expect("the response did not end the connection")
+        .unwrap();
+    response
+}
+
+#[tokio::test]
+async fn healthz_answers_only_its_status() {
+    let relay = start_default().await;
+    let (_mac, _phone) = paired(&relay).await;
+    let response = healthz(&relay).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let body: serde_json::Value =
         serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(body, serde_json::json!({ "status": "ok" }));
+}
+
+#[tokio::test]
+async fn a_socket_that_sends_no_request_or_idles_after_one_is_closed() {
+    let relay = start(Config {
+        register_timeout: Duration::from_millis(300),
+        ..Config::default()
+    })
+    .await;
+    let silent = TcpStream::connect(relay.addr()).await.unwrap();
+    let mut idle = TcpStream::connect(relay.addr()).await.unwrap();
+    idle.write_all(b"GET /healthz HTTP/1.1\r\nHost: relay\r\n\r\n")
+        .await
+        .unwrap();
+    for (name, mut socket) in [("silent", silent), ("idle", idle)] {
+        let mut response = Vec::new();
+        let ended = tokio::time::timeout(WAIT, socket.read_to_end(&mut response)).await;
+        assert!(ended.is_ok(), "the {name} socket was kept open");
+    }
+}
+
+#[tokio::test]
+async fn a_relay_full_of_websockets_still_answers_http_until_its_headroom_is_taken() {
+    let relay = start(Config {
+        max_connections: 1,
+        ..Config::default()
+    })
+    .await;
+    let (_websocket, _) = open(&relay.url()).await;
+    let response = healthz(&relay).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    // Each socket that sends no request holds a place until its request
+    // head is overdue. Once they fill the headroom, the relay answers the
+    // next socket 503 itself and closes it.
+    let mut held = Vec::new();
+    let refused = loop {
+        let mut socket = TcpStream::connect(relay.addr()).await.unwrap();
+        let mut response = Vec::new();
+        let read = tokio::time::timeout(
+            Duration::from_millis(200),
+            socket.read_to_end(&mut response),
+        );
+        if read.await.is_ok() {
+            break String::from_utf8_lossy(&response).into_owned();
+        }
+        held.push(socket);
+        assert!(
+            held.len() < 100,
+            "sockets past the limit were never refused"
+        );
+    };
+    assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
+    assert!(!held.is_empty());
+
+    drop(held);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !healthz(&relay).await.starts_with("HTTP/1.1 200") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "closed sockets' places never came free"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]

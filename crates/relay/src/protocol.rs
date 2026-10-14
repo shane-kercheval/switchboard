@@ -11,6 +11,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
+use switchboard_remote_crypto::frame::MAX_FRAME_LEN;
 use switchboard_remote_crypto::identity::{self, VerifyingKey};
 
 /// The relay protocol this build speaks. A client names its own in
@@ -69,22 +70,39 @@ pub fn token_hash(token: &[u8; PAIRING_TOKEN_LEN]) -> [u8; TOKEN_HASH_LEN] {
     Sha256::digest(token).into()
 }
 
+/// The encoded length of the longest message a client following the
+/// protocol sends: a frame carrying the longest record and a pairing token,
+/// or a Mac's registration naming `max_devices_per_mac` phones.
+pub(crate) fn longest_client_message(max_devices_per_mac: usize) -> usize {
+    let id = DeviceId("a".repeat(identity::DEVICE_ID_LEN));
+    let frame = ClientMessage::Frame {
+        to: id.clone(),
+        record: vec![0; MAX_FRAME_LEN],
+        pairing_token: Some([0; PAIRING_TOKEN_LEN]),
+    };
+    let register = ClientMessage::Register(Register {
+        relay_protocol: RELAY_PROTOCOL,
+        device_id: id.clone(),
+        identity_public_key: [0; PUBLIC_KEY_LEN],
+        signature: [0; SIGNATURE_LEN],
+        role: Role::Mac {
+            paired_devices: vec![id; max_devices_per_mac],
+        },
+    });
+    [frame, register]
+        .iter()
+        .map(|message| serde_json::to_vec(message).map_or(usize::MAX, |json| json.len()))
+        .max()
+        .unwrap_or(usize::MAX)
+}
+
 /// A client's messages to the relay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ClientMessage {
     /// The answer to `challenge`, and the only message accepted before it.
-    Register {
-        relay_protocol: u32,
-        device_id: DeviceId,
-        #[serde(with = "base64")]
-        identity_public_key: [u8; PUBLIC_KEY_LEN],
-        /// `DeviceKeys::sign_relay_challenge` over the challenge's nonce.
-        #[serde(with = "base64")]
-        signature: [u8; SIGNATURE_LEN],
-        role: Role,
-    },
+    Register(Register),
     /// A frame for another device. Any `from` a client includes is ignored:
     /// the relay names the sender itself.
     Frame {
@@ -114,6 +132,19 @@ pub enum ClientMessage {
     /// A type this build does not know; ignored.
     #[serde(other)]
     Unknown,
+}
+
+/// What `register` claims: an identity, proof of holding its key, and a role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Register {
+    pub relay_protocol: u32,
+    pub device_id: DeviceId,
+    #[serde(with = "base64")]
+    pub identity_public_key: [u8; PUBLIC_KEY_LEN],
+    /// `DeviceKeys::sign_relay_challenge` over the challenge's nonce.
+    #[serde(with = "base64")]
+    pub signature: [u8; SIGNATURE_LEN],
+    pub role: Role,
 }
 
 /// What a device registers as. The relay routes by it, so a device's role is
@@ -317,6 +348,14 @@ mod tests {
                 pairing_token: None,
             }
         );
+    }
+
+    #[test]
+    fn the_longest_client_message_is_a_full_frame_until_a_set_outgrows_it() {
+        let frame = longest_client_message(1);
+        assert!((87_000..131_072).contains(&frame), "{frame}");
+        assert_eq!(longest_client_message(8), frame);
+        assert!(longest_client_message(10_000) > frame);
     }
 
     #[test]

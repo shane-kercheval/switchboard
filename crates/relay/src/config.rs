@@ -4,7 +4,8 @@ use std::time::Duration;
 use switchboard_remote_crypto::frame::MAX_FRAME_LEN;
 
 use crate::outbox::frame_cost;
-use crate::protocol::{DeviceId, InvalidDeviceId};
+use crate::protocol::{DeviceId, InvalidDeviceId, longest_client_message};
+use crate::server::{HTTP_HEADROOM, MAX_REQUEST_HEAD};
 
 /// The relay's limits and settings. `from_env` reads the deployment's
 /// environment; the timeouts and the queue budget are fixed there and
@@ -24,7 +25,9 @@ pub struct Config {
     /// carrying the longest record: 65,568 bytes, about 87,500 as base64.
     pub max_frame_bytes: usize,
     pub max_devices_per_mac: usize,
-    /// Open connections, registered or not.
+    /// WebSocket connections, registered or not. A full relay answers an
+    /// upgrade with HTTP 503. A few sockets more are accepted for plain HTTP,
+    /// each closed once it idles for `register_timeout`.
     pub max_connections: usize,
     pub deny_device_ids: HashSet<DeviceId>,
     /// A connection that sends nothing, pings included, for this long is
@@ -102,10 +105,18 @@ impl Config {
         .validated()
     }
 
-    /// Refuses settings the relay cannot work under: a queue budget smaller
-    /// than one frame of the longest record could never admit that frame,
-    /// and its recipient would be closed for a stall it did not cause.
+    /// Refuses settings the relay cannot work under. A message limit below
+    /// the longest message a client sends would close any connection that
+    /// sends it. A queue budget smaller than one frame of the longest record
+    /// could never admit that frame, and its recipient would be closed for a
+    /// stall it did not cause.
     pub fn validated(self) -> Result<Self, ConfigError> {
+        if self.max_frame_bytes < longest_client_message(self.max_devices_per_mac) {
+            return Err(ConfigError::Inconsistent(
+                "MAX_FRAME_BYTES is below the longest message a client sends: a frame of \
+                 the longest record, or a registration naming MAX_DEVICES_PER_MAC phones",
+            ));
+        }
         if self.queue_bytes < frame_cost(MAX_FRAME_LEN) {
             return Err(ConfigError::Inconsistent(
                 "queue_bytes is below the cost of one frame of the longest record",
@@ -115,10 +126,17 @@ impl Config {
     }
 
     /// The most memory connections' queues and read buffers can hold: each
-    /// connection's queue budget and one message being read.
+    /// WebSocket's queue budget and one message being read, and every
+    /// socket's request head, read and answered, before it upgrades.
     pub fn memory_ceiling(&self) -> usize {
-        self.max_connections
-            .saturating_mul(self.queue_bytes.saturating_add(self.max_frame_bytes))
+        let websockets = self
+            .max_connections
+            .saturating_mul(self.queue_bytes.saturating_add(self.max_frame_bytes));
+        let heads = self
+            .max_connections
+            .saturating_add(HTTP_HEADROOM)
+            .saturating_mul(2 * MAX_REQUEST_HEAD);
+        websockets.saturating_add(heads)
     }
 }
 
@@ -164,7 +182,7 @@ mod tests {
         let config = config(&[
             ("PORT", "9000"),
             ("RATE_LIMIT", "10"),
-            ("MAX_FRAME_BYTES", "2048"),
+            ("MAX_FRAME_BYTES", "200000"),
             ("MAX_DEVICES_PER_MAC", "2"),
             ("MAX_CONNECTIONS", "3"),
             (
@@ -181,7 +199,7 @@ mod tests {
                 config.max_devices_per_mac,
                 config.max_connections,
             ),
-            (9000, 10, 2048, 2, 3)
+            (9000, 10, 200_000, 2, 3)
         );
         assert_eq!(config.deny_device_ids.len(), 2);
     }
@@ -197,6 +215,19 @@ mod tests {
             Err(ConfigError::Inconsistent(_))
         ));
         assert!(Config::default().validated().is_ok());
+    }
+
+    #[test]
+    fn a_message_limit_below_the_longest_client_message_is_refused() {
+        for vars in [
+            &[("MAX_FRAME_BYTES", "65536")][..],
+            &[("MAX_DEVICES_PER_MAC", "10000")],
+        ] {
+            assert!(
+                matches!(config(vars), Err(ConfigError::Inconsistent(_))),
+                "{vars:?}"
+            );
+        }
     }
 
     #[test]

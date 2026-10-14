@@ -77,6 +77,14 @@ impl Refusal {
         )
     }
 
+    /// `last_seen` is when the Mac last disconnected, if the relay knows.
+    fn mac_offline(mac: &DeviceId, last_seen: Option<DateTime<Utc>>) -> Self {
+        Self {
+            last_seen,
+            ..Self::about(ErrorCode::MacOffline, "that Mac is not connected", mac)
+        }
+    }
+
     fn too_many_devices() -> Self {
         Self {
             code: ErrorCode::LimitExceeded,
@@ -164,14 +172,20 @@ impl Relay {
         Ok(generation)
     }
 
-    /// Ends `id`'s registration if `generation` is still the current one. A
-    /// replaced connection closing late finds a newer generation and changes
-    /// nothing, so each registration's end is announced exactly once.
-    pub fn unregister(&mut self, id: &DeviceId, generation: u64, now: DateTime<Utc>) {
-        if self
-            .registered
+    /// Whether `generation` is `id`'s current registration. Every call on
+    /// behalf of a connection names its generation, because a replaced
+    /// connection may still act on a message it read before it was
+    /// replaced; finding a newer generation, the call changes nothing.
+    fn is_current(&self, id: &DeviceId, generation: u64) -> bool {
+        self.registered
             .get(id)
             .is_some_and(|peer| peer.generation == generation)
+    }
+
+    /// Ends `id`'s registration if `generation` is still the current one, so
+    /// each registration's end is announced exactly once.
+    pub fn unregister(&mut self, id: &DeviceId, generation: u64, now: DateTime<Utc>) {
+        if self.is_current(id, generation)
             && let Some(peer) = self.registered.remove(id)
         {
             self.end_registration(id, &peer.kind, now);
@@ -219,8 +233,12 @@ impl Relay {
     pub fn set_paired_devices(
         &mut self,
         mac: &DeviceId,
+        generation: u64,
         device_ids: Vec<DeviceId>,
     ) -> Result<(), Refusal> {
+        if !self.is_current(mac, generation) {
+            return Ok(());
+        }
         let phones: HashSet<DeviceId> = device_ids.into_iter().collect();
         if phones.len() > self.max_devices_per_mac {
             return Err(Refusal {
@@ -244,10 +262,14 @@ impl Relay {
     pub fn open_pairing(
         &mut self,
         mac: &DeviceId,
+        generation: u64,
         token_hash: [u8; TOKEN_HASH_LEN],
         expires_in: u64,
         now: Instant,
     ) {
+        if !self.is_current(mac, generation) {
+            return;
+        }
         let window = Duration::from_secs(expires_in).min(MAX_PAIRING_WINDOW);
         self.pairings.insert(
             mac.clone(),
@@ -259,8 +281,10 @@ impl Relay {
         );
     }
 
-    pub fn close_pairing(&mut self, mac: &DeviceId) {
-        self.pairings.remove(mac);
+    pub fn close_pairing(&mut self, mac: &DeviceId, generation: u64) {
+        if self.is_current(mac, generation) {
+            self.pairings.remove(mac);
+        }
     }
 
     /// Forgets the longest disconnected Macs until at most `MAX_HELD_SETS`
@@ -295,11 +319,16 @@ impl Relay {
     pub fn route(
         &mut self,
         from: &DeviceId,
+        generation: u64,
         to: &DeviceId,
         pairing_token: Option<&[u8; PAIRING_TOKEN_LEN]>,
         now: Instant,
     ) -> Result<Outbox, Refusal> {
-        match self.registered.get(from).map(|peer| peer.kind.clone()) {
+        let sender = self.registered.get(from);
+        match sender
+            .filter(|peer| peer.generation == generation)
+            .map(|peer| peer.kind.clone())
+        {
             Some(Kind::Phone { mac }) => self.route_from_phone(from, &mac, to, pairing_token, now),
             Some(Kind::Mac) => self.route_from_mac(from, to, now),
             None => Err(Refusal::not_paired(to)),
@@ -320,11 +349,7 @@ impl Relay {
         let Some(phones) = self.held_sets.get(to) else {
             // A Mac the relay holds no set for: one it does not know, or one
             // that has not registered since the relay restarted.
-            return Err(Refusal::about(
-                ErrorCode::MacOffline,
-                "that Mac is not connected",
-                to,
-            ));
+            return Err(Refusal::mac_offline(to, None));
         };
         if !phones.contains(phone) {
             match pairing_token {
@@ -334,10 +359,7 @@ impl Relay {
         }
         match self.registered.get(to) {
             Some(peer) if peer.kind == Kind::Mac => Ok(peer.outbox.clone()),
-            _ => Err(Refusal {
-                last_seen: self.last_seen.get(to).copied(),
-                ..Refusal::about(ErrorCode::MacOffline, "that Mac is not connected", to)
-            }),
+            _ => Err(Refusal::mac_offline(to, self.last_seen.get(to).copied())),
         }
     }
 
@@ -467,16 +489,16 @@ mod tests {
     /// Routes and delivers a frame, as the server does without the wait.
     fn send(
         relay: &mut Relay,
-        from: &DeviceId,
+        from: &Device,
         to: &DeviceId,
         record: &[u8],
         token: Option<&[u8; PAIRING_TOKEN_LEN]>,
         now: Instant,
     ) -> Result<(), Refusal> {
-        let outbox = relay.route(from, to, token, now)?;
+        let outbox = relay.route(&from.id, from.generation, to, token, now)?;
         outbox.deliver(ServerMessage::Frame {
             to: to.clone(),
-            from: from.clone(),
+            from: from.id.clone(),
             record: record.to_vec(),
             pairing_token: token.copied(),
         });
@@ -502,8 +524,8 @@ mod tests {
     fn a_paired_mac_and_phone_reach_each_other() {
         let (mut relay, mut mac, mut phone) = paired();
         let now = Instant::now();
-        send(&mut relay, &phone.id, &mac.id, &[1], None, now).unwrap();
-        send(&mut relay, &mac.id, &phone.id, &[2], None, now).unwrap();
+        send(&mut relay, &phone, &mac.id, &[1], None, now).unwrap();
+        send(&mut relay, &mac, &phone.id, &[2], None, now).unwrap();
         assert_eq!(mac.frames(), vec![(phone.id.clone(), vec![1])]);
         assert_eq!(phone.frames(), vec![(mac.id.clone(), vec![2])]);
     }
@@ -522,7 +544,7 @@ mod tests {
         assert_eq!(
             code(send(
                 &mut relay,
-                &stranger.id,
+                &stranger,
                 &id(MAC),
                 &[],
                 None,
@@ -538,18 +560,18 @@ mod tests {
         let stranger = register(&mut relay, 2, phone_role(MAC));
         let now = Instant::now();
         assert_eq!(
-            code(send(&mut relay, &stranger.id, &mac.id, &[], None, now)),
+            code(send(&mut relay, &stranger, &mac.id, &[], None, now)),
             ErrorCode::NotPaired
         );
         relay.unregister(&mac.id, mac.generation, wall(5));
-        let refusal = send(&mut relay, &stranger.id, &mac.id, &[], None, now).unwrap_err();
+        let refusal = send(&mut relay, &stranger, &mac.id, &[], None, now).unwrap_err();
         assert_eq!(refusal.code, ErrorCode::NotPaired);
         assert_eq!(refusal.last_seen, None);
     }
 
     #[test]
     fn a_phone_reaches_only_the_mac_it_names() {
-        let (mut relay, _mac, _phone) = paired();
+        let (mut relay, _mac, phone) = paired();
         let other_mac = register(
             &mut relay,
             3,
@@ -560,7 +582,7 @@ mod tests {
         assert_eq!(
             code(send(
                 &mut relay,
-                &id(1),
+                &phone,
                 &other_mac.id,
                 &[],
                 None,
@@ -576,15 +598,15 @@ mod tests {
         let mut stranger = register(&mut relay, 2, phone_role(MAC));
         let mut elsewhere = register(&mut relay, 4, phone_role(3));
         relay
-            .set_paired_devices(&mac.id, vec![id(1), elsewhere.id.clone()])
+            .set_paired_devices(&mac.id, mac.generation, vec![id(1), elsewhere.id.clone()])
             .unwrap();
         let now = Instant::now();
         assert_eq!(
-            code(send(&mut relay, &mac.id, &stranger.id, &[], None, now)),
+            code(send(&mut relay, &mac, &stranger.id, &[], None, now)),
             ErrorCode::NotPaired
         );
         assert_eq!(
-            code(send(&mut relay, &mac.id, &elsewhere.id, &[], None, now)),
+            code(send(&mut relay, &mac, &elsewhere.id, &[], None, now)),
             ErrorCode::NotPaired
         );
         assert!(stranger.received().is_empty());
@@ -603,11 +625,11 @@ mod tests {
         );
         let now = Instant::now();
         assert_eq!(
-            code(send(&mut relay, &impostor.id, &mac.id, &[], None, now)),
+            code(send(&mut relay, &impostor, &mac.id, &[], None, now)),
             ErrorCode::NotPaired
         );
         assert_eq!(
-            code(send(&mut relay, &impostor.id, &phone.id, &[], None, now)),
+            code(send(&mut relay, &impostor, &phone.id, &[], None, now)),
             ErrorCode::NotPaired
         );
         assert!(mac.received().is_empty());
@@ -618,18 +640,15 @@ mod tests {
     fn a_mac_with_no_held_set_is_offline_without_last_seen() {
         let mut relay = Relay::new(8);
         let phone = register(&mut relay, 1, phone_role(MAC));
-        let refusal = send(&mut relay, &phone.id, &id(MAC), &[], None, Instant::now()).unwrap_err();
-        assert_eq!(
-            refusal,
-            Refusal::about(ErrorCode::MacOffline, "that Mac is not connected", &id(MAC))
-        );
+        let refusal = send(&mut relay, &phone, &id(MAC), &[], None, Instant::now()).unwrap_err();
+        assert_eq!(refusal, Refusal::mac_offline(&id(MAC), None));
     }
 
     #[test]
     fn a_disconnected_mac_is_offline_with_its_last_disconnect() {
         let (mut relay, mac, phone) = paired();
         relay.unregister(&mac.id, mac.generation, wall(42));
-        let refusal = send(&mut relay, &phone.id, &mac.id, &[], None, Instant::now()).unwrap_err();
+        let refusal = send(&mut relay, &phone, &mac.id, &[], None, Instant::now()).unwrap_err();
         assert_eq!(refusal.code, ErrorCode::MacOffline);
         assert_eq!(refusal.device_id, Some(mac.id.clone()));
         assert_eq!(refusal.last_seen, Some(wall(42)));
@@ -645,7 +664,7 @@ mod tests {
                 paired_devices: vec![id(1)],
             },
         );
-        let refusal = send(&mut relay, &mac.id, &id(1), &[], None, Instant::now()).unwrap_err();
+        let refusal = send(&mut relay, &mac, &id(1), &[], None, Instant::now()).unwrap_err();
         assert_eq!(refusal.code, ErrorCode::PhoneOffline);
         assert_eq!(refusal.device_id, Some(id(1)));
     }
@@ -655,14 +674,14 @@ mod tests {
         let (mut relay, mac, phone) = paired();
         let new = register(&mut relay, 2, phone_role(MAC));
         relay
-            .set_paired_devices(&mac.id, vec![new.id.clone()])
+            .set_paired_devices(&mac.id, mac.generation, vec![new.id.clone()])
             .unwrap();
         let now = Instant::now();
         assert_eq!(
-            code(send(&mut relay, &phone.id, &mac.id, &[], None, now)),
+            code(send(&mut relay, &phone, &mac.id, &[], None, now)),
             ErrorCode::NotPaired
         );
-        send(&mut relay, &new.id, &mac.id, &[], None, now).unwrap();
+        send(&mut relay, &new, &mac.id, &[], None, now).unwrap();
     }
 
     #[test]
@@ -694,10 +713,10 @@ mod tests {
             (relay, mac, phone)
         };
         assert_eq!(
-            code(relay.set_paired_devices(&mac.id, vec![id(2), id(3), id(4)])),
+            code(relay.set_paired_devices(&mac.id, mac.generation, vec![id(2), id(3), id(4)])),
             ErrorCode::LimitExceeded
         );
-        send(&mut relay, &phone.id, &mac.id, &[], None, Instant::now()).unwrap();
+        send(&mut relay, &phone, &mac.id, &[], None, Instant::now()).unwrap();
     }
 
     #[test]
@@ -740,7 +759,7 @@ mod tests {
         let mut new_phone = register(&mut relay, 1, phone_role(MAC));
         assert!(old_phone.closed.is_cancelled());
         let now = Instant::now();
-        send(&mut relay, &new_phone.id, &mac.id, &[9], None, now).unwrap();
+        send(&mut relay, &new_phone, &mac.id, &[9], None, now).unwrap();
         relay.unregister(&old_phone.id, old_phone.generation, wall(1));
 
         assert_eq!(
@@ -757,8 +776,44 @@ mod tests {
                 },
             ]
         );
-        send(&mut relay, &mac.id, &new_phone.id, &[1], None, now).unwrap();
+        send(&mut relay, &mac, &new_phone.id, &[1], None, now).unwrap();
         assert_eq!(new_phone.frames(), vec![(mac.id.clone(), vec![1])]);
+    }
+
+    #[test]
+    fn a_replaced_connection_acting_late_changes_nothing() {
+        let (mut relay, old_mac, mut phone) = paired();
+        let now = Instant::now();
+        let new_mac = register(&mut relay, MAC, mac_role(&[&phone]));
+        relay.open_pairing(
+            &new_mac.id,
+            new_mac.generation,
+            token_hash(&TOKEN),
+            300,
+            now,
+        );
+
+        relay
+            .set_paired_devices(&old_mac.id, old_mac.generation, vec![])
+            .unwrap();
+        relay.close_pairing(&old_mac.id, old_mac.generation);
+        relay.open_pairing(
+            &old_mac.id,
+            old_mac.generation,
+            token_hash(&[9; 32]),
+            300,
+            now,
+        );
+        assert_eq!(
+            code(send(&mut relay, &old_mac, &phone.id, &[1], None, now)),
+            ErrorCode::NotPaired
+        );
+
+        // The new registration's set and pairing window are as it left them.
+        send(&mut relay, &new_mac, &phone.id, &[2], None, now).unwrap();
+        assert_eq!(phone.frames(), vec![(new_mac.id.clone(), vec![2])]);
+        let candidate = register(&mut relay, 2, phone_role(MAC));
+        send(&mut relay, &candidate, &new_mac.id, &[3], Some(&TOKEN), now).unwrap();
     }
 
     fn pairing_mac() -> (Relay, Device, Device, Instant) {
@@ -772,7 +827,7 @@ mod tests {
         );
         let candidate = register(&mut relay, 1, phone_role(MAC));
         let now = Instant::now();
-        relay.open_pairing(&mac.id, token_hash(&TOKEN), 300, now);
+        relay.open_pairing(&mac.id, mac.generation, token_hash(&TOKEN), 300, now);
         (relay, mac, candidate, now)
     }
 
@@ -781,7 +836,7 @@ mod tests {
         let (mut relay, mut mac, mut candidate, now) = pairing_mac();
         let second = register(&mut relay, 2, phone_role(MAC));
 
-        send(&mut relay, &candidate.id, &mac.id, &[1], Some(&TOKEN), now).unwrap();
+        send(&mut relay, &candidate, &mac.id, &[1], Some(&TOKEN), now).unwrap();
         assert_eq!(
             mac.received(),
             vec![ServerMessage::Frame {
@@ -791,22 +846,15 @@ mod tests {
                 pairing_token: Some(TOKEN),
             }]
         );
-        send(&mut relay, &mac.id, &candidate.id, &[2], None, now).unwrap();
+        send(&mut relay, &mac, &candidate.id, &[2], None, now).unwrap();
         assert_eq!(candidate.frames(), vec![(mac.id.clone(), vec![2])]);
 
         assert_eq!(
-            code(send(
-                &mut relay,
-                &second.id,
-                &mac.id,
-                &[],
-                Some(&TOKEN),
-                now
-            )),
+            code(send(&mut relay, &second, &mac.id, &[], Some(&TOKEN), now)),
             ErrorCode::PairingExpired
         );
         assert_eq!(
-            code(send(&mut relay, &mac.id, &second.id, &[], None, now)),
+            code(send(&mut relay, &mac, &second.id, &[], None, now)),
             ErrorCode::NotPaired
         );
     }
@@ -817,7 +865,7 @@ mod tests {
         assert_eq!(
             code(send(
                 &mut relay,
-                &candidate.id,
+                &candidate,
                 &mac.id,
                 &[],
                 Some(&[8; 32]),
@@ -830,12 +878,12 @@ mod tests {
     #[test]
     fn a_pairing_window_expires_and_is_capped_at_five_minutes() {
         let (mut relay, mac, candidate, opened) = pairing_mac();
-        relay.open_pairing(&mac.id, token_hash(&TOKEN), 10_000, opened);
+        relay.open_pairing(&mac.id, mac.generation, token_hash(&TOKEN), 10_000, opened);
 
         let just_before = opened + MAX_PAIRING_WINDOW.saturating_sub(Duration::from_millis(1));
         send(
             &mut relay,
-            &candidate.id,
+            &candidate,
             &mac.id,
             &[],
             Some(&TOKEN),
@@ -846,7 +894,7 @@ mod tests {
         assert_eq!(
             code(send(
                 &mut relay,
-                &candidate.id,
+                &candidate,
                 &mac.id,
                 &[],
                 Some(&TOKEN),
@@ -857,14 +905,7 @@ mod tests {
         // A decline sent just after expiry does not reach the phone, which
         // has its own deadline.
         assert_eq!(
-            code(send(
-                &mut relay,
-                &mac.id,
-                &candidate.id,
-                &[],
-                None,
-                at_expiry
-            )),
+            code(send(&mut relay, &mac, &candidate.id, &[], None, at_expiry)),
             ErrorCode::NotPaired
         );
     }
@@ -873,33 +914,37 @@ mod tests {
     fn a_pairing_window_ends_on_confirmation_close_reopen_and_disconnect() {
         let (mut relay, mut mac, candidate, now) = pairing_mac();
         let open = |relay: &mut Relay, mac: &Device| {
-            relay.open_pairing(&mac.id, token_hash(&TOKEN), 300, now);
-            send(relay, &candidate.id, &mac.id, &[], Some(&TOKEN), now).unwrap();
+            relay.open_pairing(&mac.id, mac.generation, token_hash(&TOKEN), 300, now);
+            send(relay, &candidate, &mac.id, &[], Some(&TOKEN), now).unwrap();
         };
         let refused = |relay: &mut Relay, mac: &Device| {
-            send(relay, &candidate.id, &mac.id, &[], Some(&TOKEN), now)
+            send(relay, &candidate, &mac.id, &[], Some(&TOKEN), now)
                 .is_err_and(|refusal| refusal.code == ErrorCode::PairingExpired)
         };
 
         open(&mut relay, &mac);
-        relay.set_paired_devices(&mac.id, vec![id(5)]).unwrap();
+        relay
+            .set_paired_devices(&mac.id, mac.generation, vec![id(5)])
+            .unwrap();
         assert!(
             !refused(&mut relay, &mac),
             "a set without the candidate keeps the window"
         );
         relay
-            .set_paired_devices(&mac.id, vec![candidate.id.clone()])
+            .set_paired_devices(&mac.id, mac.generation, vec![candidate.id.clone()])
             .unwrap();
-        send(&mut relay, &candidate.id, &mac.id, &[], None, now).unwrap();
-        relay.set_paired_devices(&mac.id, vec![]).unwrap();
+        send(&mut relay, &candidate, &mac.id, &[], None, now).unwrap();
+        relay
+            .set_paired_devices(&mac.id, mac.generation, vec![])
+            .unwrap();
         assert!(refused(&mut relay, &mac), "confirmation ended the window");
 
         open(&mut relay, &mac);
-        relay.close_pairing(&mac.id);
+        relay.close_pairing(&mac.id, mac.generation);
         assert!(refused(&mut relay, &mac));
 
         open(&mut relay, &mac);
-        relay.open_pairing(&mac.id, token_hash(&[9; 32]), 300, now);
+        relay.open_pairing(&mac.id, mac.generation, token_hash(&[9; 32]), 300, now);
         assert!(
             refused(&mut relay, &mac),
             "a new window replaces the old one"
@@ -943,7 +988,7 @@ mod tests {
         }
         assert_eq!(relay.held_sets.len(), MAX_HELD_SETS);
         let now = Instant::now();
-        let first = send(&mut relay, &phone.id, &id(1), &[], None, now).unwrap_err();
+        let first = send(&mut relay, &phone, &id(1), &[], None, now).unwrap_err();
         assert_eq!(first.last_seen, None, "the first Mac to leave is forgotten");
         assert!(!relay.held_sets.contains_key(&id(6)));
         assert!(relay.held_sets.contains_key(&id(7)));

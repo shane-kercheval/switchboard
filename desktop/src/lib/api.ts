@@ -12,6 +12,7 @@ import type {
   AgentSelection,
   AgentSelectionChanges,
   DesktopSyncAck,
+  DesktopSyncRequest,
   ForwardSourceRef,
   Attachment,
   BranchComparison,
@@ -131,20 +132,17 @@ export async function listenHarnessPathResolved(handler: () => void): Promise<Un
 /// another client starts there; the window answers with
 /// [`desktopProjectSynced`].
 export async function listenDesktopSyncProject(
-  handler: (request: { request_id: string; project_id: ProjectId }) => void,
+  handler: (request: DesktopSyncRequest) => void,
 ): Promise<UnlistenFn> {
-  return await listen<{ request_id: string; project_id: ProjectId }>(
-    "desktop_sync_project",
-    (event) => handler(event.payload),
+  return await listen<DesktopSyncRequest>("desktop_sync_project", (event) =>
+    handler(event.payload),
   );
 }
 
 /// The sync requests still waiting for an answer, for a window that was not
 /// yet listening when they were emitted.
-export async function desktopPendingSyncs(): Promise<
-  { request_id: string; project_id: ProjectId }[]
-> {
-  return await invoke<{ request_id: string; project_id: ProjectId }[]>("desktop_pending_syncs");
+export async function desktopPendingSyncs(): Promise<DesktopSyncRequest[]> {
+  return await invoke<DesktopSyncRequest[]>("desktop_pending_syncs");
 }
 
 export async function desktopProjectSynced(

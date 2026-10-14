@@ -19,9 +19,9 @@
 //!   not fail a read.
 //! - *Change* (create, rename, model and effort, dismissing a run): open the
 //!   project in Rust, then notify the window without waiting.
-//! - *Turn* (send, forward, run workflow): open the project, then the blocking
-//!   window sync ([`desktop_sync`]), then the operation. Nothing is dispatched
-//!   if either step fails.
+//! - *Turn* (send, forward, run workflow, fork): open the project, then the
+//!   blocking window sync ([`desktop_sync`]), then the operation. Nothing is
+//!   dispatched if either step fails.
 //!
 //! **One error type.** Every operation returns [`crate::error::AppError`];
 //! [`error_code`] maps it to the closed set of codes a program acts on.
@@ -38,6 +38,7 @@ pub mod compact;
 pub mod context;
 pub mod desktop_sync;
 pub mod error_code;
+pub mod fork;
 pub mod handle;
 pub mod ledger;
 pub mod read;

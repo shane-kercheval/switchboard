@@ -1153,6 +1153,27 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     );
     let conversation = call("read_conversation", json!({ "project_id": project_id })).await;
     assert!(!conversation["items"].as_array().unwrap().is_empty());
+    let forked = call(
+        "fork_agent",
+        json!({ "project_id": project_id, "agent_id": coder, "text": "aside" }),
+    )
+    .await;
+    let fork_id = uuid(&forked["fork"]["id"]);
+    assert_eq!(forked["fork"]["name"], "coder-fork");
+    assert_eq!(forked["recipients"][0]["status"], "accepted");
+    let waited = call(
+        "wait_send",
+        json!({ "project_id": project_id, "send_id": forked["send_id"], "timeout_seconds": 10 }),
+    )
+    .await;
+    assert_eq!(waited["done"], true);
+    assert_eq!(waited["recipients"][0]["text"], "ack: aside");
+    let forks_output = call(
+        "read_agent_output",
+        json!({ "project_id": project_id, "agent_id": fork_id }),
+    )
+    .await;
+    assert_eq!(forks_output["text"], "ack: aside");
 
     let forwarded = call(
         "forward",
@@ -1788,6 +1809,116 @@ async fn live_compact_through_the_server(harness: switchboard_core::HarnessKind)
         json!(marker_figure),
         "list_agents reports the marker's figure: {listed}"
     );
+}
+
+/// A fork through the server with a real agent: a two-message source of
+/// one-word replies, a fork sent one more, and the fork's conversation holds
+/// the source's turns and the reply while the source's is unchanged.
+async fn live_fork_through_the_server(harness: switchboard_core::HarnessKind) {
+    let mut env = TestEnv::live();
+    let project_id = env.project("p");
+    let source = crate::commands::create_agent_in_project_impl(
+        &env.state,
+        project_id,
+        "worker",
+        harness,
+        switchboard_core::AgentSelection::default(),
+    )
+    .unwrap()
+    .id;
+    let (router, _shutdown) = in_process(&env);
+    let session = open_session(&router).await;
+    let mut id = 1;
+    let mut call = async |name: &str, args: Value| -> Value {
+        id += 1;
+        let (is_error, body) = call_in_process(&router, &session, id, name, &args).await;
+        assert!(!is_error, "{name} failed: {body}");
+        body["result"].clone()
+    };
+    for text in [
+        "Reply with only the word ack.",
+        "Reply with only the word ok.",
+    ] {
+        let receipt = call(
+            "send",
+            json!({ "project_id": project_id, "recipients": [source], "text": text }),
+        )
+        .await;
+        let waited = call(
+            "wait_send",
+            json!({ "project_id": project_id, "send_id": receipt["send_id"], "timeout_seconds": 180 }),
+        )
+        .await;
+        assert_eq!(waited["done"], true, "{waited}");
+        assert_eq!(waited["recipients"][0]["status"], "completed", "{waited}");
+    }
+    let turns_of = |conversation: &Value, agent: uuid::Uuid| -> Vec<String> {
+        conversation["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["kind"] == "agent_turn" && uuid(&item["agent_id"]) == agent)
+            .map(|item| item["text"].as_str().unwrap_or_default().trim().to_owned())
+            .collect()
+    };
+    let before = call("read_conversation", json!({ "project_id": project_id })).await;
+    let source_turns = turns_of(&before, source);
+    assert_eq!(source_turns.len(), 2, "{before}");
+    // A completed reply is not yet an idle source: the dispatcher holds the
+    // agent through its post-reply bookkeeping (Codex reads its rollout for
+    // usage), and a fork of a held source is refused. The tool description
+    // says to wait for idle first.
+    let idle = call(
+        "wait_agent",
+        json!({ "project_id": project_id, "agent_id": source, "timeout_seconds": 60 }),
+    )
+    .await;
+    assert_eq!(idle["status"], "idle", "{idle}");
+
+    let forked = call(
+        "fork_agent",
+        json!({ "project_id": project_id, "agent_id": source, "text": "Reply with only the word ack." }),
+    )
+    .await;
+    let fork_id = uuid(&forked["fork"]["id"]);
+    assert_eq!(forked["fork"]["name"], "worker-fork", "{forked}");
+    let waited = call(
+        "wait_send",
+        json!({ "project_id": project_id, "send_id": forked["send_id"], "timeout_seconds": 300 }),
+    )
+    .await;
+    assert_eq!(waited["done"], true, "{waited}");
+    assert_eq!(waited["recipients"][0]["status"], "completed", "{waited}");
+
+    let after = call("read_conversation", json!({ "project_id": project_id })).await;
+    let fork_turns = turns_of(&after, fork_id);
+    assert_eq!(
+        fork_turns.len(),
+        3,
+        "the fork holds the source's two turns and its reply: {after}"
+    );
+    assert_eq!(&fork_turns[..2], &source_turns[..], "{after}");
+    assert!(
+        fork_turns[2].to_lowercase().contains("ack"),
+        "the fork replied: {after}"
+    );
+    assert_eq!(
+        turns_of(&after, source),
+        source_turns,
+        "the source is unchanged"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_mcp_fork() {
+    live_fork_through_the_server(switchboard_core::HarnessKind::ClaudeCode).await;
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_mcp_fork() {
+    live_fork_through_the_server(switchboard_core::HarnessKind::Codex).await;
 }
 
 #[tokio::test]

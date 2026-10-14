@@ -23,7 +23,7 @@ use crate::commands::{create_project_impl, set_agent_session_locator_impl};
 use crate::error::AppError;
 use crate::state::{AppState, lock};
 
-use super::desktop_sync::{DesktopSync, Hearing, ReadyReport, WindowSync};
+use super::desktop_sync::{DesktopSync, Hearing, ReadyReport, SyncFork, WindowSync};
 
 /// One scripted turn.
 #[derive(Clone)]
@@ -147,9 +147,23 @@ impl HarnessAdapter for ScriptedAdapter {
             gate.notified().await;
         }
         let session_file = match &agent.session_locator {
-            Some(SessionLocator::Uuid(session)) => Some(
-                switchboard_harness::claude_session_file_path(&self.home, cwd, session),
-            ),
+            Some(SessionLocator::Uuid(session)) => {
+                let path = switchboard_harness::claude_session_file_path(&self.home, cwd, session);
+                // A branch's first turn starts from a copy of its parent's
+                // session, as `--fork-session` does, so the fork's
+                // conversation holds the parent's turns before its own.
+                if let Some(parent) = agent.forked_from_session
+                    && !path.exists()
+                {
+                    let parent_path =
+                        switchboard_harness::claude_session_file_path(&self.home, cwd, &parent);
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::copy(&parent_path, &path);
+                }
+                Some(path)
+            }
             _ => None,
         };
         let prompt = prompt.to_owned();
@@ -305,6 +319,8 @@ pub struct StubDesktopSync {
     pub hold: Mutex<Option<Arc<crate::state::MaintenanceBarrier>>>,
     pub times_out: Mutex<bool>,
     pub ready_calls: Mutex<Vec<ProjectId>>,
+    /// The forks readiness requests carried, in order.
+    pub forks_carried: Mutex<Vec<SyncFork>>,
     pub roster_changed: Mutex<Vec<ProjectId>>,
     pub projects_changed: Mutex<usize>,
     pub runs_changed: Mutex<Vec<ProjectId>>,
@@ -312,8 +328,15 @@ pub struct StubDesktopSync {
 
 #[async_trait]
 impl DesktopSync for StubDesktopSync {
-    async fn ensure_ready(&self, project_id: ProjectId) -> Result<ReadyReport, AppError> {
+    async fn ensure_ready(
+        &self,
+        project_id: ProjectId,
+        fork: Option<SyncFork>,
+    ) -> Result<ReadyReport, AppError> {
         lock(&self.ready_calls).push(project_id);
+        if let Some(fork) = fork {
+            lock(&self.forks_carried).push(fork);
+        }
         let hold = lock(&self.hold).clone();
         if let Some(hold) = hold {
             hold.entered.notify_one();
@@ -362,6 +385,7 @@ impl StubDesktopSync {
 pub struct SyncRequest {
     pub request_id: Uuid,
     pub project_id: ProjectId,
+    pub fork: Option<SyncFork>,
 }
 
 /// The window, as the production [`WindowSync`] reaches it: records every
@@ -389,6 +413,7 @@ impl EventEmitter for TestWindow {
             let _ = self.requests.send(SyncRequest {
                 request_id: field("request_id"),
                 project_id: field("project_id"),
+                fork: serde_json::from_value(payload["fork"].clone()).unwrap_or(None),
             });
         }
         lock(&self.events).push((name.to_owned(), payload));
@@ -414,6 +439,11 @@ pub struct TestEnv {
     /// Working directories created for projects, kept alive with the env.
     pub dirs: Vec<TempDir>,
     library_enabled: bool,
+    /// Whether the state may run harness programs: the Codex fork's `codex
+    /// exec fork` (pointed at `codex_binary`); turns still go to the scripted
+    /// adapter.
+    real_harnesses: bool,
+    codex_binary: Option<PathBuf>,
 }
 
 impl TestEnv {
@@ -426,7 +456,8 @@ impl TestEnv {
         let library = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         let adapter = Arc::new(ScriptedAdapter::new(scripts, home.path()));
-        let (state, emitter, sync) = build_state(store_root.path(), &adapter, None, None);
+        let (state, emitter, sync) =
+            build_state(store_root.path(), &adapter, None, None, false, None);
         Self {
             state,
             store_root,
@@ -438,7 +469,18 @@ impl TestEnv {
             sync,
             dirs: Vec::new(),
             library_enabled: false,
+            real_harnesses: false,
+            codex_binary: None,
         }
+    }
+
+    /// Rebuild the state so a Codex fork runs `codex_binary` as its `codex
+    /// exec fork` (a stand-in script), while turns still go to the scripted
+    /// adapter. Call before creating projects.
+    pub fn with_codex_fork_binary(mut self, codex_binary: PathBuf) -> Self {
+        self.real_harnesses = true;
+        self.codex_binary = Some(codex_binary);
+        self.restart()
     }
 
     /// An environment whose Claude and Codex agents are the real CLIs, for
@@ -460,6 +502,7 @@ impl TestEnv {
             None,
             None,
             true,
+            None,
         );
         Self {
             state,
@@ -472,6 +515,8 @@ impl TestEnv {
             sync,
             dirs: Vec::new(),
             library_enabled: false,
+            real_harnesses: true,
+            codex_binary: None,
         }
     }
 
@@ -537,8 +582,14 @@ impl TestEnv {
         let library = self
             .library_enabled
             .then(|| self.library.path().to_path_buf());
-        let (state, emitter, sync) =
-            build_state(self.store_root.path(), &adapter, library, desktop_sync);
+        let (state, emitter, sync) = build_state(
+            self.store_root.path(),
+            &adapter,
+            library,
+            desktop_sync,
+            self.real_harnesses,
+            self.codex_binary.clone(),
+        );
         self.state = state;
         self.emitter = emitter;
         self.sync = sync;
@@ -774,6 +825,8 @@ fn build_state(
     adapter: &Arc<ScriptedAdapter>,
     library: Option<PathBuf>,
     desktop_sync: Option<Arc<dyn DesktopSync>>,
+    real_harnesses: bool,
+    codex_binary: Option<PathBuf>,
 ) -> (Arc<AppState>, Arc<RecordingEmitter>, Arc<StubDesktopSync>) {
     build_state_with(
         store_root,
@@ -782,10 +835,12 @@ fn build_state(
         Arc::clone(adapter) as Arc<dyn HarnessAdapter>,
         library,
         desktop_sync,
-        false,
+        real_harnesses,
+        codex_binary,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_state_with(
     store_root: &Path,
     claude: Arc<dyn HarnessAdapter>,
@@ -794,6 +849,7 @@ fn build_state_with(
     library: Option<PathBuf>,
     desktop_sync: Option<Arc<dyn DesktopSync>>,
     real_harnesses: bool,
+    codex_binary: Option<PathBuf>,
 ) -> (Arc<AppState>, Arc<RecordingEmitter>, Arc<StubDesktopSync>) {
     let emitter = Arc::new(RecordingEmitter::new());
     let sync = Arc::new(StubDesktopSync::default());
@@ -806,6 +862,9 @@ fn build_state_with(
     )
     .with_real_harnesses(real_harnesses)
     .with_desktop_sync(desktop_sync.unwrap_or_else(|| Arc::clone(&sync) as Arc<dyn DesktopSync>));
+    if let Some(codex_binary) = codex_binary {
+        state = state.with_codex_binary(codex_binary);
+    }
     if let Some(library) = library {
         let prompts_dir = library.join("prompts");
         let workflows_dir = library.join("workflows");

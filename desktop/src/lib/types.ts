@@ -617,6 +617,20 @@ export type DesktopSyncAck =
   | { status: "ready"; listening_agents: AgentId[] }
   | { status: "failed"; message: string };
 
+/// A fork the backend's readiness request carries: another client branched
+/// `source_agent_id` into `fork_id` and is about to send the fork its first
+/// message, so the window places the fork and reads its earlier conversation
+/// before it answers.
+export type DesktopSyncFork = { fork_id: AgentId; source_agent_id: AgentId };
+
+/// The backend's request to get a project ready for a turn another client is
+/// about to start, as the event and the waiting-requests fetch carry it.
+export type DesktopSyncRequest = {
+  request_id: string;
+  project_id: ProjectId;
+  fork?: DesktopSyncFork;
+};
+
 // Mirror of `crates/core::AgentRecord`. `session_locator` is `null` for
 // harnesses that assign their own session id at runtime (Codex and Antigravity)
 // until the first dispatch captures it; for Claude Code it's

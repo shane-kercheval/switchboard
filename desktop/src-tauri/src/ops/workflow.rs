@@ -114,7 +114,7 @@ pub async fn run_workflow(
     // After the forwards are read, as a send checks just before dispatch, and
     // reported the way a send reports it.
     let report = match budget
-        .run_with_grace(state.desktop_sync.ensure_ready(project_id))
+        .run_with_grace(state.desktop_sync.ensure_ready(project_id, None))
         .await
     {
         Outcome::Done(report) => report?,

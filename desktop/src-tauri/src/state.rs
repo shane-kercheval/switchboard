@@ -556,6 +556,10 @@ pub struct AppState {
     /// second copy of that decision is one that can silently disagree with the
     /// first.
     pub spawns_real_harnesses: bool,
+    /// The Codex program a fork runs (`codex exec fork`), resolved on the
+    /// login-shell PATH as every harness call is. A path so a test can point
+    /// it at a stand-in; production keeps the default.
+    pub codex_binary: PathBuf,
     /// The *kind* of the last account-usage failure, so a persistent one is
     /// logged on change rather than on repeat.
     ///
@@ -659,6 +663,7 @@ impl AppState {
             // Tests construct state directly and never spawn a real CLI
             // through this seam; production overrides it in `run`.
             spawns_real_harnesses: false,
+            codex_binary: PathBuf::from("codex"),
             last_account_usage_failure: Mutex::new(None),
             context,
             codex_usage_reader: Arc::new(CodexUsageReader::new(Arc::new(production_codex_read))),
@@ -752,6 +757,14 @@ impl AppState {
     #[must_use]
     pub fn with_real_harnesses(mut self, spawns_real_harnesses: bool) -> Self {
         self.spawns_real_harnesses = spawns_real_harnesses;
+        self
+    }
+
+    /// Builder step pointing forks at a Codex stand-in. Tests only: production
+    /// resolves `codex` on PATH.
+    #[must_use]
+    pub fn with_codex_binary(mut self, binary: PathBuf) -> Self {
+        self.codex_binary = binary;
         self
     }
 

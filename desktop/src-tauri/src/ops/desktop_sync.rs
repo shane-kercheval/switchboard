@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use switchboard_core::{AgentId, ProjectId};
 use switchboard_dispatcher::EventEmitter;
 use tokio::sync::oneshot;
@@ -66,6 +66,20 @@ impl Hearing {
     }
 }
 
+/// A fork the readiness request carries: another client branched
+/// `source_agent_id` into `fork_id` and is about to send to the fork. The
+/// window places the fork in its own pane and starts reading its earlier
+/// conversation before it answers, so the fork shows where the user's own
+/// forks show and its turn starts after that read. Carried by the request the
+/// turn makes anyway, from the roster the window refreshes for it, rather
+/// than by a notification of its own: the request has the deadline, the
+/// replay for a window not yet listening, and the duplicate-answer guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncFork {
+    pub fork_id: AgentId,
+    pub source_agent_id: AgentId,
+}
+
 /// What the window reports once a project is ready for a turn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadyReport {
@@ -80,8 +94,13 @@ pub struct ReadyReport {
 pub trait DesktopSync: Send + Sync {
     /// Ask the window to load or refresh `project_id` and wait until it is
     /// ready for a turn. The turn tier calls this after opening the project in
-    /// Rust and before dispatching; an error means nothing is dispatched.
-    async fn ensure_ready(&self, project_id: ProjectId) -> Result<ReadyReport, AppError>;
+    /// Rust and before dispatching; an error means nothing is dispatched. A
+    /// turn that is a fork's first carries the fork ([`SyncFork`]).
+    async fn ensure_ready(
+        &self,
+        project_id: ProjectId,
+        fork: Option<SyncFork>,
+    ) -> Result<ReadyReport, AppError>;
 
     /// Tell the window a project's roster changed. Not awaited: correctness
     /// does not depend on it, because the blocking sync before the next turn
@@ -104,7 +123,11 @@ pub struct NoopDesktopSync;
 
 #[async_trait]
 impl DesktopSync for NoopDesktopSync {
-    async fn ensure_ready(&self, _project_id: ProjectId) -> Result<ReadyReport, AppError> {
+    async fn ensure_ready(
+        &self,
+        _project_id: ProjectId,
+        _fork: Option<SyncFork>,
+    ) -> Result<ReadyReport, AppError> {
         Ok(ReadyReport::default())
     }
 
@@ -134,16 +157,20 @@ pub const SYNC_DEADLINE: Duration = Duration::from_secs(10);
 /// One request waiting for the window.
 struct Waiting {
     project_id: ProjectId,
+    fork: Option<SyncFork>,
     answer: oneshot::Sender<SyncAck>,
 }
 
 type Pending = Mutex<HashMap<Uuid, Waiting>>;
 
-/// A request still waiting for the window's answer, as the window fetches it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// A request still waiting for the window's answer, as the window fetches it;
+/// also the shape of the `desktop_sync_project` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PendingSync {
     pub request_id: Uuid,
     pub project_id: ProjectId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork: Option<SyncFork>,
 }
 
 /// The production round trip: emits `desktop_sync_project { request_id,
@@ -207,6 +234,7 @@ impl WindowSync {
             .map(|(request_id, waiting)| PendingSync {
                 request_id: *request_id,
                 project_id: waiting.project_id,
+                fork: waiting.fork,
             })
             .collect()
     }
@@ -232,18 +260,34 @@ impl Drop for PendingGuard<'_> {
 
 #[async_trait]
 impl DesktopSync for WindowSync {
-    async fn ensure_ready(&self, project_id: ProjectId) -> Result<ReadyReport, AppError> {
+    async fn ensure_ready(
+        &self,
+        project_id: ProjectId,
+        fork: Option<SyncFork>,
+    ) -> Result<ReadyReport, AppError> {
         let request_id = Uuid::now_v7();
         let (answer, rx) = oneshot::channel();
-        lock(&self.pending).insert(request_id, Waiting { project_id, answer });
+        lock(&self.pending).insert(
+            request_id,
+            Waiting {
+                project_id,
+                fork,
+                answer,
+            },
+        );
         let _guard = PendingGuard {
             pending: &self.pending,
             request_id,
         };
         let started = Instant::now();
+        let request = PendingSync {
+            request_id,
+            project_id,
+            fork,
+        };
         self.window.emit(
             "desktop_sync_project",
-            serde_json::json!({ "request_id": request_id, "project_id": project_id }),
+            serde_json::to_value(&request).unwrap_or_default(),
         );
         let answer = tokio::time::timeout(self.deadline, rx).await;
         let elapsed_ms = started.elapsed().as_millis();

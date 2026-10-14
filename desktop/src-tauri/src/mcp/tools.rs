@@ -40,6 +40,7 @@ use crate::ops::RESULT_BUDGET_CHARS;
 use crate::ops::budget::{BudgetSpec, Budgeted, fit};
 use crate::ops::change::{self, SelectionChange};
 use crate::ops::compact::{self, CompactRequest};
+use crate::ops::fork::{self, ForkRequest};
 use crate::ops::handle::AppStateHandle;
 use crate::ops::read::{self, ReadFrom};
 use crate::ops::send::{
@@ -236,6 +237,22 @@ tools! {
          compaction is queued or running for the agent, another request returns its send_id \
          instead of queuing a second. The user sees it in Switchboard's window as a compaction \
          row and can cancel it there.";
+    ForkAgent = "fork_agent" (ForkArgs) [Acts]
+        "Branch an agent's conversation into a new agent that starts with the source's \
+         conversation so far, and send it a message: for a side question or a rabbit hole that \
+         must not disturb the source. The fork is named <source>-fork and is an agent like any \
+         other from then on (its id is the agent_id for every later call); the source is \
+         untouched. Returns the fork's record and a send_id: call wait_send until done, then \
+         read_agent_output or read_conversation. Claude Code and Codex agents only \
+         (fork_unsupported otherwise); the source must have replied at least once (no_session) \
+         and must be idle (source_busy: wait_agent on it first). The message is text, or a saved \
+         prompt with text appended, as in send. idempotency_key as in send, with one more rule: \
+         once the fork exists it is kept under the key, so if the message was refused before it \
+         started (recipients[0] is rejected, with a code) a retry with the same key sends it \
+         again to the same fork rather than making a second, and a different key makes another \
+         fork. The user sees the fork in its own pane in Switchboard's window, with its earlier \
+         conversation. Nothing over MCP removes an agent, so forks stay until the user removes \
+         them: fork for a reason, not per message.";
     Send = "send" (SendArgs) [Acts]
         "Send one message to one or more agents of a project. Returns at once with a send_id and \
          each recipient's status at dispatch: accepted, rejected (with a code), or \
@@ -560,6 +577,43 @@ pub struct CompactArgs {
     agent_id: AgentId,
     #[serde(default)]
     idempotency_key: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub struct ForkArgs {
+    #[schemars(with = "String")]
+    project_id: ProjectId,
+    /// The agent whose conversation is branched.
+    #[schemars(with = "String")]
+    agent_id: AgentId,
+    /// The fork's first message; with a prompt, the text appended after it.
+    #[serde(default)]
+    text: Option<String>,
+    /// A saved prompt to send, rendered with its args.
+    #[serde(default)]
+    prompt: Option<PromptArg>,
+    /// Any string unique to this request; a retry passes the same one.
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+/// A message from its two optional parts: a saved prompt with text appended,
+/// or text alone.
+fn body_of(prompt: Option<PromptArg>, text: Option<String>) -> Result<Body, AppError> {
+    match (prompt, text) {
+        (Some(prompt), appended_text) => Ok(Body::Prompt {
+            provider: prompt.provider,
+            name: prompt.name,
+            args: prompt.args,
+            appended_text,
+        }),
+        (None, Some(text)) => Ok(Body::Text { text }),
+        (None, None) => Err(AppError::InvalidArgument(
+            "a send needs text, a prompt, or both".to_owned(),
+        )),
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -919,24 +973,10 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
         }
         ToolName::Send => {
             let a: SendArgs = parse(args)?;
-            let body = match (a.prompt, a.text) {
-                (Some(prompt), appended_text) => Body::Prompt {
-                    provider: prompt.provider,
-                    name: prompt.name,
-                    args: prompt.args,
-                    appended_text,
-                },
-                (None, Some(text)) => Body::Text { text },
-                (None, None) => {
-                    return Err(AppError::InvalidArgument(
-                        "a send needs text, a prompt, or both".to_owned(),
-                    ));
-                }
-            };
             let request = SendRequest {
                 project_id: a.project_id,
                 recipients: a.recipients,
-                body,
+                body: body_of(a.prompt, a.text)?,
                 on_busy: a.on_busy.into(),
                 idempotency_key: a.idempotency_key,
             };
@@ -957,6 +997,22 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 CompactRequest {
                     project_id: a.project_id,
                     agent_id: a.agent_id,
+                    idempotency_key: a.idempotency_key,
+                },
+                cx.budget(None),
+            )
+            .await?;
+            Reply::plain(&receipt)
+        }
+        ToolName::ForkAgent => {
+            let a: ForkArgs = parse(args)?;
+            let receipt = fork::fork(
+                Arc::clone(&cx.handle),
+                cx.home.clone(),
+                ForkRequest {
+                    project_id: a.project_id,
+                    agent_id: a.agent_id,
+                    body: body_of(a.prompt, a.text)?,
                     idempotency_key: a.idempotency_key,
                 },
                 cx.budget(None),

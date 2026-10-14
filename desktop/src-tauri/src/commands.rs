@@ -2536,15 +2536,29 @@ pub async fn fork_agent_impl(
         source_agent_id,
         home_dir,
         codex_binary,
-        switchboard_harness::subprocess::ensure_path_settled(CODEX_FORK_PATH_WAIT),
+        fork_path_ready(),
     )
     .await
+}
+
+/// The PATH readiness a fork waits on. In tests the PATH counts as settled:
+/// the capture runs the machine's login shell, which no test may depend on,
+/// and the wait's own tests inject their readiness into `fork_agent_with`.
+#[cfg(not(test))]
+fn fork_path_ready() -> impl std::future::Future<Output = PathSource> {
+    switchboard_harness::subprocess::ensure_path_settled(CODEX_FORK_PATH_WAIT)
+}
+
+#[cfg(test)]
+fn fork_path_ready() -> impl std::future::Future<Output = PathSource> {
+    std::future::ready(PathSource::LoginShell)
 }
 
 /// How long a Codex fork waits for the login-shell PATH capture at launch.
 /// The same budget, and the same reason, as [`ACCOUNT_USAGE_PATH_WAIT`]:
 /// resolving `codex` against the provisional GUI PATH misses installs outside
 /// the fallback's well-known folders. Paid only while a capture is in flight.
+#[cfg_attr(test, allow(dead_code))]
 pub const CODEX_FORK_PATH_WAIT: std::time::Duration =
     switchboard_harness::subprocess::capture_attempt_budget();
 

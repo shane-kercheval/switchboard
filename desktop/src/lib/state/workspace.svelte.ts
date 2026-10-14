@@ -35,6 +35,8 @@ import type {
   AgentSelectionChanges,
   AgentSessionFingerprint,
   DesktopSyncAck,
+  DesktopSyncFork,
+  DesktopSyncRequest,
   ConversationItem,
   HarnessKind,
   LoadedTurn,
@@ -88,6 +90,7 @@ import {
   assignAgentToFirstVisibleEmptyPane,
   createEmptyPane,
   moveAgentToPane,
+  paneOfAgent,
   revealPane,
 } from "$lib/state/transcriptPanes.svelte";
 
@@ -1542,7 +1545,16 @@ async function settleProjectLoads(projectId: ProjectId): Promise<void> {
 /// load that failed still counts as settled — nothing is in flight, so the
 /// turn is safe — and the window shows that error as it would anyway. An
 /// open or roster read that fails is reported, and the backend sends nothing.
-export async function syncProjectForTurn(projectId: ProjectId): Promise<DesktopSyncAck> {
+///
+/// A turn that is a fork's first carries the fork: once the roster is
+/// current, so the fork is in it and the pane layout was reconciled against
+/// the whole roster, the fork is placed as the window's own forks are and its
+/// earlier conversation is queued for reading, which the settle below waits
+/// for ([`placeCarriedFork`]).
+export async function syncProjectForTurn(
+  projectId: ProjectId,
+  fork?: DesktopSyncFork,
+): Promise<DesktopSyncAck> {
   try {
     await ensureProjectLoaded(projectId);
     // After the request arrived, never from before it: every agent the
@@ -1559,6 +1571,7 @@ export async function syncProjectForTurn(projectId: ProjectId): Promise<DesktopS
   // failed, which gives an unreachable agent another chance on every sync.
   await Promise.all((agentsByProject[projectId] ?? []).map((agent) => registerAgent(agent)));
   if (!loadStarted.has(projectId)) return removed;
+  if (fork !== undefined) placeCarriedFork(projectId, fork);
   try {
     await subscribeProjectWorkflows(projectId);
   } catch (err) {
@@ -1577,6 +1590,50 @@ export async function syncProjectForTurn(projectId: ProjectId): Promise<DesktopS
       .filter((agent) => isListening(agent.id))
       .map((agent) => agent.id),
   };
+}
+
+/// Place a fork another client created, carried by the readiness request for
+/// its first turn, as the window's own Fork places one
+/// ([`registerForkInOwnPane`] without the create): its own visible pane, or
+/// a new one, never its source's, and no other agent moves. Not revealed:
+/// revealing is the user's own fork's justification (an explicit action with
+/// an immediate result), and background work never changes what the user is
+/// looking at, so a new pane may start minimized. Then its earlier
+/// conversation: a Codex fork's is read now, through the project's read
+/// chain the sync settles before answering, unless the fork has work running
+/// or queued, in which case the idle hook reads it, because a reread must
+/// not overlap a reply being written to its file; a Claude fork's arrives
+/// with its first reply, so its cue is armed.
+///
+/// Idempotent by fork identity, because a retry carries the fork again and a
+/// timed-out request's handler keeps running: placement is skipped only when
+/// the fork already sits in a pane without its source. A plain roster refresh
+/// can have dropped it beside its source, showing every inherited message
+/// twice, and "already in a pane" would wrongly skip that case. The check
+/// runs right before the move, with no await between them, since two
+/// handlers can be here at once. Works on the fork's current record from the
+/// roster just refreshed, never a creation-time one, so a retry cannot revert
+/// a rename, and a fork removed between attempts is not restored.
+function placeCarriedFork(projectId: ProjectId, carried: DesktopSyncFork): void {
+  const roster = agentsByProject[projectId] ?? [];
+  const fork = roster.find((a) => a.id === carried.fork_id);
+  if (fork === undefined) return;
+  const rosterIds = roster.map((a) => a.id);
+  const pane = paneOfAgent(projectId, rosterIds, fork.id);
+  if (pane === null || pane.members.includes(carried.source_agent_id)) {
+    const placed =
+      pane === null && assignAgentToFirstVisibleEmptyPane(projectId, rosterIds, fork.id) !== null;
+    if (!placed) {
+      const paneId = createEmptyPane(projectId, rosterIds);
+      moveAgentToPane(projectId, rosterIds, fork.id, paneId);
+    }
+  }
+  if (supportsForkWithoutTurn(fork.harness)) {
+    eagerForks.add(fork.id);
+    if (!agentIsWorking(runtimes[fork.id])) void loadForkInheritedHistory(fork.id);
+  } else if (!forkHistoryLoaded.has(fork.id)) {
+    forkHistoryPending.add(fork.id);
+  }
 }
 
 /// Another client changed a project's roster. A loaded project re-reads it so
@@ -1626,10 +1683,10 @@ export async function installDesktopSync(): Promise<() => void> {
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const syncsInFlight = new Set<string>();
 
-function answerSyncRequest(request: { request_id: string; project_id: ProjectId }): void {
+function answerSyncRequest(request: DesktopSyncRequest): void {
   if (syncsInFlight.has(request.request_id)) return;
   syncsInFlight.add(request.request_id);
-  void syncProjectForTurn(request.project_id)
+  void syncProjectForTurn(request.project_id, request.fork)
     .then((result) => api.desktopProjectSynced(request.request_id, result))
     .catch((err: unknown) => {
       console.warn("[switchboard] project sync acknowledgement failed", {

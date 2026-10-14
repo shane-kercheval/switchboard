@@ -75,13 +75,25 @@
 //! concurrent or later repeat with the same hash waits for and returns the
 //! original receipt; a different hash is refused; a request that failed before
 //! dispatching anything releases the key so the same request can be retried.
+//!
+//! **Forks.** A `fork_agent` request is a one-recipient message whose
+//! recipient, the fork, does not exist when the request is claimed, so its
+//! entry starts with no recipient and gains one when the fork is created
+//! ([`SendLedger::attach_fork`]). From then on the key is kept whatever
+//! happens to the message, because a released key would let a retry make a
+//! second fork: a message refused before it dispatched is recorded on the
+//! recipient as rejected and the entry settled, and a repeat under the key
+//! resumes with a fresh entry for the same fork ([`SendLedger::claim_fork`]);
+//! a message that dispatched or was cancelled is final, as a send's is. A key
+//! naming a fork outlives its entries, up to the age bound, since a rejected
+//! attempt's entry is finished and would be dropped first.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
-use switchboard_core::{AgentId, ProjectId, SendId};
+use switchboard_core::{AgentId, AgentRecord, ProjectId, SendId};
 use switchboard_dispatcher::EventEmitter;
 use switchboard_harness::{
     FailureKind, MessageFailureKind, MessageId, NormalizedEvent, TextCapture, TurnId, TurnOutcome,
@@ -233,6 +245,23 @@ pub enum SendKind {
     Compaction,
 }
 
+/// The outcome of a fork request's claim: see the module doc's retry rule.
+pub enum ForkClaim {
+    /// No fork yet: create one and send to it under this id.
+    Fresh { send_id: SendId },
+    /// An attempt is in flight, or the fork's message went out or was
+    /// cancelled: wait for, or take, its result.
+    Joined {
+        send_id: SendId,
+        result: watch::Receiver<Option<ClaimResult>>,
+    },
+    /// The fork exists and its message never dispatched: send it again under
+    /// this fresh id.
+    Resume { send_id: SendId, fork: AgentRecord },
+    /// The key was used for a different request.
+    Mismatch,
+}
+
 /// The outcome of a compaction's claim: see the module doc's merge rule.
 pub enum CompactionClaim {
     /// Queue a new compaction under this id.
@@ -312,6 +341,9 @@ struct SendEntry {
     /// shutdown fires it too; the flag tells the two apart.
     cancel: CancellationToken,
     recipients: Vec<RecipientEntry>,
+    /// The fork this send created, or was resumed for. An entry holding one
+    /// is settled, never released, however its task ends.
+    fork: Option<AgentRecord>,
     /// What a caller that joined this entry without a key of its own waits
     /// on: the receipt, or the error that released it.
     result: watch::Sender<Option<ClaimResult>>,
@@ -328,6 +360,10 @@ struct KeyClaim {
     send_id: SendId,
     request_hash: String,
     result: watch::Sender<Option<ClaimResult>>,
+    /// The fork a request under this key created. Once set, the key is never
+    /// released: a repeat must find this fork, not make another.
+    fork: Option<AgentRecord>,
+    claimed_at: DateTime<Utc>,
 }
 
 struct RunEntry {
@@ -397,13 +433,13 @@ impl SendLedger {
             return Claim::Mismatch;
         }
         let send_id = Uuid::now_v7();
-        inner.claims.insert(
-            (project_id, key.to_owned()),
-            KeyClaim {
-                send_id,
-                request_hash: request_hash.to_owned(),
-                result: watch::Sender::new(None),
-            },
+        claim_key(
+            &mut inner,
+            project_id,
+            Some(key),
+            request_hash,
+            send_id,
+            None,
         );
         Claim::Fresh { send_id }
     }
@@ -417,38 +453,138 @@ impl SendLedger {
         recipients: &[AgentId],
         cancel: CancellationToken,
     ) {
-        let now = Utc::now();
         let mut inner = lock(&self.inner);
-        inner.sends.insert(
+        insert_send(
+            &mut inner,
             send_id,
-            SendEntry {
-                project_id,
-                created_at: now,
-                kind: SendKind::Message,
-                settled: false,
-                cancel_requested: false,
-                cancel,
-                recipients: recipients
-                    .iter()
-                    .map(|&agent_id| RecipientEntry {
-                        agent_id,
-                        message_id: None,
-                        turn_id: None,
-                        admitted_at: None,
-                        dispatch: SendStatus::NotDispatched,
-                        status: SendStatus::NotDispatched,
-                        text: None,
-                        error: None,
-                        code: None,
-                        failure_kind: None,
-                        capture: TextCapture::default(),
-                    })
-                    .collect(),
-                result: watch::Sender::new(None),
-            },
+            project_id,
+            SendKind::Message,
+            recipients,
+            None,
+            cancel,
         );
-        inner.send_order.push_back(send_id);
-        prune(&mut inner, now);
+        drop(inner);
+        self.bump();
+    }
+
+    /// Claim a fork request: see [`ForkClaim`] and the module doc's retry
+    /// rule. A fresh claim's entry is created here, with no recipient, so
+    /// `cancel_send` and a joiner that gives up can name the send before the
+    /// fork exists.
+    pub fn claim_fork(
+        &self,
+        project_id: ProjectId,
+        key: Option<&str>,
+        request_hash: &str,
+        cancel: CancellationToken,
+    ) -> ForkClaim {
+        let mut inner = lock(&self.inner);
+        if let Some(key) = key
+            && let Some(existing) = inner.claims.get(&(project_id, key.to_owned()))
+        {
+            if existing.request_hash != request_hash {
+                return ForkClaim::Mismatch;
+            }
+            let joined = ForkClaim::Joined {
+                send_id: existing.send_id,
+                result: existing.result.subscribe(),
+            };
+            let fork = existing.fork.clone();
+            let outcome = (*existing.result.borrow()).clone();
+            if let Some(fork) = fork
+                && never_dispatched(outcome.as_ref())
+            {
+                let send_id = Uuid::now_v7();
+                insert_send(
+                    &mut inner,
+                    send_id,
+                    project_id,
+                    SendKind::Message,
+                    &[fork.id],
+                    Some(fork.clone()),
+                    cancel,
+                );
+                // The key moves to the new attempt and starts waiting again:
+                // a repeat that joined the failed attempt and is still parked
+                // gets this attempt's result.
+                if let Some(claim) = inner.claims.get_mut(&(project_id, key.to_owned())) {
+                    claim.send_id = send_id;
+                    claim.claimed_at = Utc::now();
+                    claim.result.send_replace(None);
+                }
+                drop(inner);
+                self.bump();
+                return ForkClaim::Resume { send_id, fork };
+            }
+            return joined;
+        }
+        let send_id = Uuid::now_v7();
+        claim_key(&mut inner, project_id, key, request_hash, send_id, None);
+        insert_send(
+            &mut inner,
+            send_id,
+            project_id,
+            SendKind::Message,
+            &[],
+            None,
+            cancel,
+        );
+        drop(inner);
+        self.bump();
+        ForkClaim::Fresh { send_id }
+    }
+
+    /// Record the fork a request created: as the send's recipient, and on
+    /// its key, which is kept from now on whatever happens to the message.
+    pub fn attach_fork(&self, send_id: SendId, fork: &AgentRecord) {
+        let mut inner = lock(&self.inner);
+        if let Some(entry) = inner.sends.get_mut(&send_id) {
+            if entry.recipients.is_empty() {
+                entry.recipients.push(recipient_entry(fork.id));
+            }
+            entry.fork = Some(fork.clone());
+        }
+        for claim in inner.claims.values_mut().filter(|c| c.send_id == send_id) {
+            claim.fork = Some(fork.clone());
+        }
+        drop(inner);
+        self.bump();
+    }
+
+    /// The fork a key names, if a request under it created one.
+    #[must_use]
+    pub fn fork_for_key(&self, project_id: ProjectId, key: &str) -> Option<AgentRecord> {
+        lock(&self.inner)
+            .claims
+            .get(&(project_id, key.to_owned()))?
+            .fork
+            .clone()
+    }
+
+    /// Whether the send created, or was resumed for, a fork.
+    #[must_use]
+    pub fn fork_attached(&self, send_id: SendId) -> bool {
+        lock(&self.inner)
+            .sends
+            .get(&send_id)
+            .is_some_and(|entry| entry.fork.is_some())
+    }
+
+    /// Mark every recipient not yet offered to the dispatcher `Rejected` with
+    /// the code and message of the refusal that ended the send's preparation,
+    /// for a send that is settled rather than released.
+    pub fn reject_undispatched(&self, send_id: SendId, code: &'static str, message: &str) {
+        let mut inner = lock(&self.inner);
+        if let Some(entry) = inner.sends.get_mut(&send_id) {
+            for recipient in &mut entry.recipients {
+                if recipient.dispatch == SendStatus::NotDispatched {
+                    recipient.dispatch = SendStatus::Rejected;
+                    recipient.status = SendStatus::Rejected;
+                    recipient.code = Some(code);
+                    recipient.error = Some(message.to_owned());
+                }
+            }
+        }
         drop(inner);
         self.bump();
     }
@@ -528,7 +664,15 @@ impl SendLedger {
         claim_key(&mut inner, project_id, key, request_hash, send_id, None);
         // The entry exists before the lock is released, so the next claim
         // finds it.
-        insert_compaction(&mut inner, send_id, project_id, agent_id, cancel);
+        insert_send(
+            &mut inner,
+            send_id,
+            project_id,
+            SendKind::Compaction,
+            &[agent_id],
+            None,
+            cancel,
+        );
         drop(inner);
         self.bump();
         CompactionClaim::Fresh { send_id }
@@ -1026,18 +1170,38 @@ fn claim_key(
                 send_id,
                 request_hash: request_hash.to_owned(),
                 result: watch::Sender::new(preset),
+                fork: None,
+                claimed_at: Utc::now(),
             },
         );
     }
 }
 
-/// The one-recipient entry of a fresh compaction, `NotDispatched` until it is
-/// admitted.
-fn insert_compaction(
+/// Whether a fork attempt sent nothing: its message was refused before it
+/// dispatched, or the attempt ended abnormally. An attempt still in flight
+/// has not, nor has one whose message went out or was cancelled.
+fn never_dispatched(outcome: Option<&ClaimResult>) -> bool {
+    match outcome {
+        None => false,
+        Some(Ok(receipt)) => !receipt
+            .recipients
+            .iter()
+            .any(|r| matches!(r.status, SendStatus::Accepted | SendStatus::Cancelled)),
+        Some(Err(_)) => true,
+    }
+}
+
+/// Insert a fresh entry with every recipient `NotDispatched`, under the
+/// caller's lock, so a claim and its entry appear together. A fork's entry
+/// starts with no recipient: the fork is the recipient, and it does not
+/// exist yet.
+fn insert_send(
     inner: &mut Inner,
     send_id: SendId,
     project_id: ProjectId,
-    agent_id: AgentId,
+    kind: SendKind,
+    recipients: &[AgentId],
+    fork: Option<AgentRecord>,
     cancel: CancellationToken,
 ) {
     let now = Utc::now();
@@ -1046,28 +1210,36 @@ fn insert_compaction(
         SendEntry {
             project_id,
             created_at: now,
-            kind: SendKind::Compaction,
+            kind,
             settled: false,
             cancel_requested: false,
             cancel,
-            recipients: vec![RecipientEntry {
-                agent_id,
-                message_id: None,
-                turn_id: None,
-                admitted_at: None,
-                dispatch: SendStatus::NotDispatched,
-                status: SendStatus::NotDispatched,
-                text: None,
-                error: None,
-                code: None,
-                failure_kind: None,
-                capture: TextCapture::default(),
-            }],
+            recipients: recipients
+                .iter()
+                .map(|&agent_id| recipient_entry(agent_id))
+                .collect(),
+            fork,
             result: watch::Sender::new(None),
         },
     );
     inner.send_order.push_back(send_id);
     prune(inner, now);
+}
+
+fn recipient_entry(agent_id: AgentId) -> RecipientEntry {
+    RecipientEntry {
+        agent_id,
+        message_id: None,
+        turn_id: None,
+        admitted_at: None,
+        dispatch: SendStatus::NotDispatched,
+        status: SendStatus::NotDispatched,
+        text: None,
+        error: None,
+        code: None,
+        failure_kind: None,
+        capture: TextCapture::default(),
+    }
 }
 
 /// The entry's receipt from its dispatch-time statuses.
@@ -1122,9 +1294,17 @@ fn prune(inner: &mut Inner, now: DateTime<Utc>) {
                     inner.by_turn.remove(&turn_id);
                 }
             }
-            inner.claims.retain(|_, claim| claim.send_id != send_id);
+            // A key naming a fork outlives its entry, up to the age bound
+            // below, so a repeat under it finds the fork rather than making
+            // another.
+            inner
+                .claims
+                .retain(|_, claim| claim.send_id != send_id || claim.fork.is_some());
         }
     }
+    inner
+        .claims
+        .retain(|_, claim| claim.fork.is_none() || claim.claimed_at >= cutoff);
     let terminal_runs = inner
         .run_order
         .iter()

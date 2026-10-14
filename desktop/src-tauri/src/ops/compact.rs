@@ -155,7 +155,7 @@ async fn run_inner(
     }
     compaction_gates(state, agent_id, home_dir)?;
     let report = match budget
-        .run_with_grace(state.desktop_sync.ensure_ready(project_id))
+        .run_with_grace(state.desktop_sync.ensure_ready(project_id, None))
         .await
     {
         Outcome::Done(report) => report?,

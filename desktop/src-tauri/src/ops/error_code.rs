@@ -35,6 +35,7 @@ pub const REQUEST_IN_PROGRESS: &str = "request_in_progress";
 pub const COMPACTION_UNSUPPORTED: &str = "compaction_unsupported";
 pub const NO_SESSION: &str = "no_session";
 pub const FORK_NOT_MATERIALIZED: &str = "fork_not_materialized";
+pub const FORK_UNSUPPORTED: &str = "fork_unsupported";
 pub const INVALID_ARGUMENT: &str = "invalid_argument";
 pub const INTERNAL: &str = "internal";
 
@@ -53,7 +54,10 @@ pub fn error_code(error: &AppError) -> &'static str {
         AppError::UnknownRecipient { .. } => UNKNOWN_RECIPIENT,
         AppError::AgentBusy | AppError::RecipientsBusy { .. } => AGENT_BUSY,
         AppError::SessionInUse => AGENT_BUSY_ELSEWHERE,
-        AppError::SourceBusy { .. } => SOURCE_BUSY,
+        // A fork's source mid-turn, including the Codex case where another
+        // program holds the parent's session: the advice is the same, wait for
+        // the source.
+        AppError::SourceBusy { .. } | AppError::ForkSourceBusy { .. } => SOURCE_BUSY,
         AppError::DirectoryMissing { .. } => DIRECTORY_MISSING,
         AppError::DesktopUnavailable { .. } | AppError::DesktopSyncFailed { .. } => {
             DESKTOP_UNAVAILABLE
@@ -78,8 +82,7 @@ pub fn error_code(error: &AppError) -> &'static str {
         | AppError::Workflow(_)
         | AppError::WorkflowNotFound { .. }
         | AppError::WorkflowStepUnsupported
-        | AppError::WorkflowRunActive { .. }
-        | AppError::ForkSourceBusy { .. } => INVALID_ARGUMENT,
+        | AppError::WorkflowRunActive { .. } => INVALID_ARGUMENT,
         // Includes `TimedOut`, `Interrupted`, and `Internal`: operational
         // failures, not the caller's input; their messages say to try again.
         _ => INTERNAL,
@@ -91,12 +94,12 @@ fn core_code(error: &CoreError) -> &'static str {
         CoreError::ProjectNotFound(_) => PROJECT_NOT_FOUND,
         CoreError::AgentNotFound(_) => AGENT_NOT_FOUND,
         CoreError::NotADirectory { .. } => DIRECTORY_MISSING,
+        CoreError::SessionForkUnsupported { .. } => FORK_UNSUPPORTED,
         CoreError::InvalidName { .. }
         | CoreError::DuplicateAgentName { .. }
         | CoreError::DuplicateProjectName { .. }
         | CoreError::SelectionUnsupported { .. }
-        | CoreError::EffortWithoutModel { .. }
-        | CoreError::SessionForkUnsupported { .. } => INVALID_ARGUMENT,
+        | CoreError::EffortWithoutModel { .. } => INVALID_ARGUMENT,
         _ => INTERNAL,
     }
 }
@@ -131,6 +134,27 @@ mod tests {
         ] {
             assert_eq!(error_code(&error), INTERNAL, "{error:?}");
         }
+    }
+
+    #[test]
+    fn the_fork_refusals_carry_their_own_codes() {
+        use switchboard_core::{CoreError, HarnessKind};
+        let name = || "alice".to_owned();
+        assert_eq!(
+            error_code(&AppError::ForkSourceHasNoSession { name: name() }),
+            NO_SESSION
+        );
+        assert_eq!(
+            error_code(&AppError::ForkSourceBusy { name: name() }),
+            SOURCE_BUSY
+        );
+        assert_eq!(
+            error_code(&AppError::Core(CoreError::SessionForkUnsupported {
+                harness: HarnessKind::Antigravity
+            })),
+            FORK_UNSUPPORTED
+        );
+        assert_eq!(error_code(&AppError::CodexForkNeedsRealHarness), INTERNAL);
     }
 
     #[test]

@@ -4,11 +4,12 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use switchboard_core::{AgentId, JournalRecord, ProjectId};
+use switchboard_core::{AgentId, JournalRecord, ProjectId, SessionLocator};
 use switchboard_harness::{CancelSource, TurnOutcome};
 use switchboard_workflow::{InputValue, RunRecord, TerminalStatus};
 use tokio::sync::Notify;
@@ -27,7 +28,7 @@ use super::change::{
     SelectionChange, SelectionChanges, create_agent, create_project, dismiss_workflow_run,
     rename_agent, set_agent_selection,
 };
-use super::desktop_sync::SyncAck;
+use super::desktop_sync::{Hearing, SyncAck, SyncFork};
 use super::error_code::{self, error_code};
 use super::ledger::SendStatus;
 use super::read::conversation_budget;
@@ -4349,4 +4350,525 @@ async fn an_agent_of_another_project_is_not_a_recipient() {
         .await
         .unwrap_err();
     assert_eq!(error_code(&err), error_code::UNKNOWN_RECIPIENT);
+}
+
+// --- forks --------------------------------------------------------------------
+
+use super::fork::{ForkReceipt, ForkRequest, fork};
+
+/// A project whose one Claude agent has a session (one seeded reply), so it
+/// can be forked. The scripted adapter starts a fork's first turn from a copy
+/// of that session, as `--fork-session` does.
+fn forkable_source() -> (TestEnv, ProjectId, AgentId) {
+    compactable_agent()
+}
+
+fn fork_request(
+    project_id: ProjectId,
+    agent_id: AgentId,
+    text: &str,
+    key: Option<&str>,
+) -> ForkRequest {
+    ForkRequest {
+        project_id,
+        agent_id,
+        body: Body::Text {
+            text: text.to_owned(),
+        },
+        idempotency_key: key.map(str::to_owned),
+    }
+}
+
+async fn fork_now(env: &TestEnv, request: ForkRequest) -> Result<ForkReceipt, AppError> {
+    fork(
+        env.handle(),
+        env.home(),
+        request,
+        WaitBudget::default_wait(),
+    )
+    .await
+}
+
+fn spawn_fork(
+    env: &TestEnv,
+    request: ForkRequest,
+) -> tokio::task::JoinHandle<Result<ForkReceipt, AppError>> {
+    let (handle, home) = (env.handle(), env.home());
+    tokio::spawn(async move { fork(handle, home, request, WaitBudget::default_wait()).await })
+}
+
+fn roster(env: &TestEnv, project_id: ProjectId) -> Vec<switchboard_core::AgentRecord> {
+    list_project_agents_readonly_impl(&env.state, project_id).unwrap()
+}
+
+fn fork_of(receipt: &ForkReceipt) -> switchboard_core::AgentRecord {
+    receipt.fork.clone().expect("the fork exists")
+}
+
+#[tokio::test]
+async fn a_fork_of_an_idle_source_sends_and_holds_the_sources_turns_and_the_reply() {
+    let (env, project_id, source) = forkable_source();
+    let receipt = fork_now(&env, fork_request(project_id, source, "branch", None))
+        .await
+        .unwrap();
+    let fork = fork_of(&receipt);
+    assert_eq!(fork.name, "a-fork");
+    assert_eq!(fork.project_id, project_id);
+    assert!(fork.forked_from_session.is_some());
+    assert_eq!(receipt.send.recipients.len(), 1);
+    assert_eq!(receipt.send.recipients[0].agent_id, fork.id);
+    assert_eq!(receipt.send.recipients[0].status, SendStatus::Accepted);
+    assert_eq!(
+        *lock(&env.sync.forks_carried),
+        vec![SyncFork {
+            fork_id: fork.id,
+            source_agent_id: source
+        }],
+        "the readiness request carried the fork"
+    );
+    let done = wait_done(&env, project_id, receipt.send.send_id).await;
+    assert_eq!(done.recipients[0].text.as_deref(), Some("ack: branch"));
+
+    let conversation = read_conversation(&env.state, project_id, None, &env.home())
+        .await
+        .unwrap();
+    let texts = |agent: AgentId| -> Vec<String> {
+        conversation
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DigestItem::AgentTurn { agent_id, text, .. } if *agent_id == agent => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(texts(fork.id), vec!["seeded", "ack: branch"]);
+    assert_eq!(texts(source), vec!["seeded"], "the source is untouched");
+}
+
+#[tokio::test]
+async fn a_busy_source_is_refused_and_nothing_is_created() {
+    let (env, project_id, source) = forkable_source();
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("busy", &gate));
+    let busy = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![source], "work"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, source).await;
+
+    let err = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), error_code::SOURCE_BUSY);
+    assert_eq!(roster(&env, project_id).len(), 1);
+
+    // The key was released: once the source finishes, the same request forks.
+    gate.notify_one();
+    wait_done(&env, project_id, busy.send_id).await;
+    let receipt = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    assert!(receipt.fork.is_some());
+    assert_eq!(roster(&env, project_id).len(), 2);
+}
+
+#[tokio::test]
+async fn a_source_without_a_session_gets_no_session() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("p");
+    let source = env.agent(project_id, "a");
+    let err = fork_now(&env, fork_request(project_id, source, "branch", None))
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), error_code::NO_SESSION);
+    assert_eq!(roster(&env, project_id).len(), 1);
+}
+
+#[tokio::test]
+async fn an_agent_of_a_harness_that_cannot_fork_gets_fork_unsupported() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("p");
+    let agy = crate::commands::create_agent_in_project_impl(
+        &env.state,
+        project_id,
+        "g",
+        switchboard_core::HarnessKind::Antigravity,
+        switchboard_core::AgentSelection::default(),
+    )
+    .unwrap()
+    .id;
+    let err = fork_now(&env, fork_request(project_id, agy, "branch", None))
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), error_code::FORK_UNSUPPORTED);
+    assert_eq!(roster(&env, project_id).len(), 1);
+}
+
+#[tokio::test]
+async fn an_agent_of_another_project_cannot_be_forked_into_this_one() {
+    let (mut env, p1, elsewhere) = forkable_source();
+    let p2 = env.project("other");
+    let err = fork_now(&env, fork_request(p2, elsewhere, "branch", None))
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), error_code::UNKNOWN_RECIPIENT);
+    assert_eq!(roster(&env, p1).len(), 1);
+}
+
+#[tokio::test]
+async fn a_repeat_with_the_same_key_returns_the_same_fork_and_concurrent_repeats_make_one() {
+    let (env, project_id, source) = forkable_source();
+    let hold = hold_window(&env);
+    let first = spawn_fork(&env, fork_request(project_id, source, "branch", Some("k")));
+    hold.entered.notified().await;
+    // Joined at its claim: the key is taken and no fork exists yet.
+    let second = spawn_fork(&env, fork_request(project_id, source, "branch", Some("k")));
+    hold.release.notify_one();
+    let (one, two) = (
+        first.await.unwrap().unwrap(),
+        second.await.unwrap().unwrap(),
+    );
+    assert_eq!(one, two);
+    assert_eq!(one.send.recipients[0].status, SendStatus::Accepted);
+    wait_done(&env, project_id, one.send.send_id).await;
+
+    let later = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    assert_eq!(later, one);
+    assert_eq!(roster(&env, project_id).len(), 2);
+    assert_eq!(lock(&env.adapter.prompts).len(), 1);
+
+    // A different key is a different request: a second fork.
+    hold.release.notify_one();
+    let other = fork_now(&env, fork_request(project_id, source, "branch", Some("k2")))
+        .await
+        .unwrap();
+    assert_ne!(fork_of(&other).id, fork_of(&one).id);
+    assert_eq!(fork_of(&other).name, "a-fork-2");
+    assert_eq!(roster(&env, project_id).len(), 3);
+}
+
+#[tokio::test]
+async fn a_message_refused_after_creation_and_repeated_with_the_same_key_sends_once_to_the_one_fork()
+ {
+    let (env, project_id, source) = forkable_source();
+    // The window does not hear the fork, so the message is refused at
+    // dispatch, after the fork exists.
+    *lock(&env.sync.hearing) = Hearing::Only(vec![source]);
+    let refused = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    let fork = fork_of(&refused);
+    assert_eq!(refused.send.recipients[0].status, SendStatus::Rejected);
+    assert_eq!(
+        refused.send.recipients[0].code,
+        Some(error_code::DESKTOP_UNAVAILABLE)
+    );
+    assert!(
+        wait_done(&env, project_id, refused.send.send_id).await.done,
+        "a wait on the refused attempt returns at once"
+    );
+    assert_eq!(roster(&env, project_id).len(), 2);
+
+    *lock(&env.sync.hearing) = Hearing::Everyone;
+    let resent = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    assert_eq!(fork_of(&resent).id, fork.id);
+    assert_ne!(resent.send.send_id, refused.send.send_id);
+    assert_eq!(resent.send.recipients[0].status, SendStatus::Accepted);
+    wait_done(&env, project_id, resent.send.send_id).await;
+    assert_eq!(roster(&env, project_id).len(), 2);
+    assert_eq!(lock(&env.adapter.prompts).len(), 1);
+
+    // The message went out: a further repeat returns its receipt.
+    let again = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    assert_eq!(again.send.send_id, resent.send.send_id);
+    assert_eq!(lock(&env.adapter.prompts).len(), 1);
+}
+
+#[tokio::test]
+async fn a_message_cancelled_while_preparing_is_not_resent_by_a_repeat() {
+    let (env, project_id, source) = forkable_source();
+    let hold = hold_window(&env);
+    let first = spawn_fork(&env, fork_request(project_id, source, "branch", Some("k")));
+    hold.entered.notified().await;
+    let send_id = env.state.ledger.send_id_for_key(project_id, "k").unwrap();
+    cancel_send(&env.state, project_id, send_id).unwrap();
+    hold.release.notify_one();
+    let cancelled = first.await.unwrap().unwrap();
+    assert!(
+        cancelled.fork.is_some(),
+        "the fork was created before the cancel"
+    );
+    assert_eq!(cancelled.send.recipients[0].status, SendStatus::Cancelled);
+
+    let repeat = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    assert_eq!(repeat, cancelled);
+    assert!(lock(&env.adapter.prompts).is_empty());
+    assert_eq!(roster(&env, project_id).len(), 2);
+}
+
+#[tokio::test]
+async fn a_window_that_never_answers_reports_the_fork_and_the_repeat_sends_once_it_does() {
+    let (env, project_id, source) = forkable_source();
+    *lock(&env.sync.times_out) = true;
+    let timed_out = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    let fork = fork_of(&timed_out);
+    assert_eq!(timed_out.send.recipients[0].status, SendStatus::Rejected);
+    assert_eq!(
+        timed_out.send.recipients[0].code,
+        Some(error_code::PROJECT_LOAD_TIMEOUT)
+    );
+    assert!(roster(&env, project_id).iter().any(|a| a.id == fork.id));
+
+    *lock(&env.sync.times_out) = false;
+    let resent = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    assert_eq!(fork_of(&resent).id, fork.id);
+    assert_eq!(resent.send.recipients[0].status, SendStatus::Accepted);
+    wait_done(&env, project_id, resent.send.send_id).await;
+    assert_eq!(roster(&env, project_id).len(), 2);
+}
+
+#[tokio::test]
+async fn a_repeat_after_the_refused_attempts_entry_was_dropped_still_returns_the_same_fork() {
+    let (env, project_id, source) = forkable_source();
+    *lock(&env.sync.times_out) = true;
+    let refused = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    let fork = fork_of(&refused);
+    // The refused attempt is finished, so the count bound drops it first.
+    for _ in 0..=super::ledger::MAX_ENTRIES {
+        let id = Uuid::now_v7();
+        env.state
+            .ledger
+            .register_send(id, project_id, &[], CancellationToken::new());
+        env.state.ledger.settle(id);
+    }
+    assert!(
+        env.state.ledger.send(refused.send.send_id).is_none(),
+        "the refused attempt's entry was dropped"
+    );
+
+    *lock(&env.sync.times_out) = false;
+    let resent = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    assert_eq!(fork_of(&resent).id, fork.id);
+    assert_eq!(resent.send.recipients[0].status, SendStatus::Accepted);
+    assert_eq!(roster(&env, project_id).len(), 2);
+}
+
+#[tokio::test]
+async fn a_repeat_that_joined_the_refused_attempt_gets_its_receipt_and_the_resumed_attempt_is_joinable()
+ {
+    let (env, project_id, source) = forkable_source();
+    *lock(&env.sync.times_out) = true;
+    let hold = hold_window(&env);
+    let first = spawn_fork(&env, fork_request(project_id, source, "branch", Some("k")));
+    hold.entered.notified().await;
+    let joiner = spawn_fork(&env, fork_request(project_id, source, "branch", Some("k")));
+    hold.release.notify_one();
+    let (first, joiner) = (
+        first.await.unwrap().unwrap(),
+        joiner.await.unwrap().unwrap(),
+    );
+    assert_eq!(joiner, first);
+    assert_eq!(first.send.recipients[0].status, SendStatus::Rejected);
+    let fork = fork_of(&first);
+
+    // The next repeat resumes; one arriving while it prepares joins it.
+    *lock(&env.sync.times_out) = false;
+    let resumed = spawn_fork(&env, fork_request(project_id, source, "branch", Some("k")));
+    hold.entered.notified().await;
+    let late = spawn_fork(&env, fork_request(project_id, source, "branch", Some("k")));
+    hold.release.notify_one();
+    let (resumed, late) = (
+        resumed.await.unwrap().unwrap(),
+        late.await.unwrap().unwrap(),
+    );
+    assert_eq!(late, resumed);
+    assert_eq!(fork_of(&resumed).id, fork.id);
+    assert_ne!(resumed.send.send_id, first.send.send_id);
+    assert_eq!(resumed.send.recipients[0].status, SendStatus::Accepted);
+    wait_done(&env, project_id, resumed.send.send_id).await;
+    assert_eq!(roster(&env, project_id).len(), 2);
+    assert_eq!(lock(&env.adapter.prompts).len(), 1);
+}
+
+#[tokio::test]
+async fn stopping_the_server_after_the_fork_exists_leaves_it_with_nothing_sent() {
+    let (env, project_id, source) = forkable_source();
+    let hold = hold_window(&env);
+    let stop = CancellationToken::new();
+    let (handle, home) = (env.handle(), env.home());
+    let budget = WaitBudget::default_wait().with_cancel(stop.clone());
+    let task = tokio::spawn(async move {
+        fork(
+            handle,
+            home,
+            fork_request(project_id, source, "branch", Some("k")),
+            budget,
+        )
+        .await
+    });
+    hold.entered.notified().await;
+    stop.cancel();
+    hold.release.notify_one();
+    let receipt = task.await.unwrap().unwrap();
+    let fork_record = fork_of(&receipt);
+    assert_eq!(receipt.send.recipients[0].status, SendStatus::Rejected);
+    assert!(lock(&env.adapter.prompts).is_empty(), "nothing was sent");
+    assert!(
+        roster(&env, project_id)
+            .iter()
+            .any(|a| a.id == fork_record.id)
+    );
+
+    // Access on again: the same request sends to the fork.
+    hold.release.notify_one();
+    let resent = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    assert_eq!(fork_of(&resent).id, fork_record.id);
+    assert_eq!(resent.send.recipients[0].status, SendStatus::Accepted);
+    wait_done(&env, project_id, resent.send.send_id).await;
+    assert_eq!(roster(&env, project_id).len(), 2);
+}
+
+#[tokio::test]
+async fn the_readiness_request_carries_the_fork() {
+    let (env, project_id, source) = forkable_source();
+    let (env, sync, _window, mut requests) = env.with_window(Duration::from_mins(1));
+    let task = spawn_fork(&env, fork_request(project_id, source, "branch", None));
+    let request = requests.recv().await.unwrap();
+    let carried = request.fork.expect("the request names the fork");
+    assert_eq!(carried.source_agent_id, source);
+    assert_eq!(sync.pending()[0].fork, Some(carried));
+    assert!(
+        roster(&env, project_id)
+            .iter()
+            .any(|a| a.id == carried.fork_id),
+        "the fork exists when the window is asked"
+    );
+    sync.acknowledge(
+        request.request_id,
+        SyncAck::Ready {
+            listening_agents: vec![source, carried.fork_id],
+        },
+    );
+    let receipt = task.await.unwrap().unwrap();
+    assert_eq!(fork_of(&receipt).id, carried.fork_id);
+    assert_eq!(receipt.send.recipients[0].status, SendStatus::Accepted);
+}
+
+/// The parent and fork ids of the Codex fork test, as the app's fork tests
+/// use them.
+const CODEX_FORK_PARENT: &str = "01a12c22-a3f8-71e2-b51e-ca72562cfabb";
+const CODEX_FORK_CHILD: &str = "01a12c22-df64-7103-9fc3-92f2e3595c02";
+
+fn codex_fork_date() -> chrono::NaiveDate {
+    chrono::NaiveDate::from_ymd_opt(2026, 10, 11).unwrap()
+}
+
+/// A stand-in for `codex exec fork`, as the app's fork tests use: it writes
+/// the fork's rollout under `home` and prints `thread.started` with its id.
+fn codex_fork_shim(home: &std::path::Path) -> PathBuf {
+    let folder = home.join(".codex/sessions/2026/10/11");
+    let script = format!(
+        "#!/bin/sh\nmkdir -p '{folder}'\n: > '{folder}/rollout-2026-10-11T00-00-01-{CODEX_FORK_CHILD}.jsonl'\necho '{{\"type\":\"thread.started\",\"thread_id\":\"{CODEX_FORK_CHILD}\"}}'\n",
+        folder = folder.display(),
+    );
+    let shim = home.join("codex");
+    std::fs::write(&shim, script).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    shim
+}
+
+/// A Codex agent whose rollout exists under the env's home, so it has a
+/// session to fork.
+fn codex_source(env: &TestEnv, project_id: ProjectId) -> AgentId {
+    let agent = crate::commands::create_agent_in_project_impl(
+        &env.state,
+        project_id,
+        "cx",
+        switchboard_core::HarnessKind::Codex,
+        switchboard_core::AgentSelection {
+            model: Some("gpt-6-luna".to_owned()),
+            effort: Some("low".to_owned()),
+            ..switchboard_core::AgentSelection::default()
+        },
+    )
+    .unwrap();
+    crate::commands::set_agent_session_locator_impl(
+        &env.state,
+        agent.id,
+        SessionLocator::Codex {
+            thread_id: CODEX_FORK_PARENT.to_owned(),
+            partition_date: codex_fork_date(),
+        },
+    )
+    .unwrap();
+    let folder = env.home().join(".codex/sessions/2026/10/11");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join(format!(
+            "rollout-2026-10-11T00-00-00-{CODEX_FORK_PARENT}.jsonl"
+        )),
+        "",
+    )
+    .unwrap();
+    agent.id
+}
+
+#[tokio::test]
+async fn a_codex_source_is_forked_through_codex_and_the_fork_is_an_ordinary_codex_agent() {
+    let env = TestEnv::new();
+    let shim = codex_fork_shim(&env.home());
+    let mut env = env.with_codex_fork_binary(shim);
+    let project_id = env.project("p");
+    let source = codex_source(&env, project_id);
+
+    let receipt = fork_now(&env, fork_request(project_id, source, "branch", None))
+        .await
+        .unwrap();
+    let fork = fork_of(&receipt);
+    assert_eq!(fork.name, "cx-fork");
+    assert_eq!(fork.harness, switchboard_core::HarnessKind::Codex);
+    assert_eq!(fork.model.as_deref(), Some("gpt-6-luna"));
+    assert_eq!(
+        fork.session_locator,
+        Some(SessionLocator::Codex {
+            thread_id: CODEX_FORK_CHILD.to_owned(),
+            partition_date: codex_fork_date(),
+        })
+    );
+    assert_eq!(
+        fork.forked_from_session, None,
+        "an eager fork has nothing to materialize"
+    );
+    assert_eq!(receipt.send.recipients[0].status, SendStatus::Accepted);
+    assert_eq!(lock(&env.sync.forks_carried).len(), 1);
+    let done = wait_done(&env, project_id, receipt.send.send_id).await;
+    assert_eq!(done.recipients[0].text.as_deref(), Some("ack: branch"));
+    assert_eq!(roster(&env, project_id).len(), 2);
 }

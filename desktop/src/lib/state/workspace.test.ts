@@ -3645,6 +3645,265 @@ describe("desktop sync for another client's turn", () => {
     });
   });
 
+  describe("a request carrying a fork another client created", () => {
+    const FORK = "00000000-0000-7000-8000-00000000000f";
+    const SESSION = "00000000-0000-7000-8000-0000000000aa";
+
+    // These cases assert on placement, and the file's shared `afterEach`
+    // doesn't reset pane layout.
+    beforeEach(async () => {
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      panes._testing.reset();
+    });
+
+    function claudeFork(): AgentRecord {
+      return { ...agent(FORK, PROJECT_2), name: "agent-a-fork", forked_from_session: SESSION };
+    }
+
+    function codexFork(): AgentRecord {
+      return { ...agent(FORK, PROJECT_2), name: "agent-a-fork", harness: "codex" };
+    }
+
+    function requestWithFork(requestId: string = REQUEST): void {
+      fireTo("desktop_sync_project", {
+        request_id: requestId,
+        project_id: PROJECT_2,
+        fork: { fork_id: FORK, source_agent_id: AGENT_1 },
+      });
+    }
+
+    /// A backend whose `load_project_conversation` is counted, and whose
+    /// `holdLoad`-th read waits for `hold`.
+    function installHistoryBackend(
+      roster: AgentRecord[],
+      holdLoad: number,
+      hold: Gate,
+    ): () => number {
+      let loads = 0;
+      invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+        switch (cmd) {
+          case "open_project":
+            return { id: PROJECT_2, name: "p", created_at: "2026-05-16T00:00:00Z" };
+          case "list_agents":
+            return roster;
+          case "load_project_conversation": {
+            loads += 1;
+            if (loads === holdLoad) await hold.promise;
+            return { items: [], agents: [] } satisfies ProjectConversation;
+          }
+          case "desktop_pending_syncs":
+          case "project_session_fingerprints":
+          case "list_workflow_runs":
+          case "list_projects":
+            return [];
+          case "workspace_status":
+            return { persistable: true };
+          default:
+            return undefined;
+        }
+      });
+      return () => loads;
+    }
+
+    it("places the fork in an empty visible pane of a stored layout, leaving every other assignment and the minimized panes as they were, and arms the Claude cue", async () => {
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const other = agent(AGENT_2, PROJECT_2);
+      const before = [source.id, other.id];
+      const empty = panes.createEmptyPane(PROJECT_2, before);
+      const minimized = panes.createEmptyPane(PROJECT_2, before);
+      panes.minimizePane(PROJECT_2, before, minimized);
+      installBackend({ roster: [source, other, claudeFork()] });
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      await settle();
+
+      const rosterIds = [source.id, other.id, FORK];
+      const layout = panes.layoutFor(PROJECT_2, rosterIds);
+      expect(panes.paneOfAgent(PROJECT_2, rosterIds, FORK)?.id).toBe(empty);
+      expect(panes.paneOfAgent(PROJECT_2, rosterIds, source.id)?.members).toEqual(before);
+      expect(layout.minimized).toEqual([minimized]);
+      expect(layout.maximized).toBeNull();
+      expect(acks()).toEqual([
+        { requestId: REQUEST, result: { status: "ready", listening_agents: rosterIds } },
+      ]);
+      expect(ws.isAwaitingForkHistory(FORK)).toBe(true);
+    });
+
+    it("makes a new pane when no visible pane is empty, without changing which pane is maximized", async () => {
+      // Background work never changes what the user is looking at: the
+      // user's own fork becomes the focused pane, an orchestrator's does not.
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const before = [source.id];
+      const focused = panes.layoutFor(PROJECT_2, before).panes[0]!.id;
+      panes.maximizePane(PROJECT_2, before, focused);
+      installBackend({ roster: [source, claudeFork()] });
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      await settle();
+
+      const rosterIds = [source.id, FORK];
+      const layout = panes.layoutFor(PROJECT_2, rosterIds);
+      const forkPane = panes.paneOfAgent(PROJECT_2, rosterIds, FORK);
+      expect(forkPane).not.toBeNull();
+      expect(forkPane?.id).not.toBe(focused);
+      expect(forkPane?.members).toEqual([FORK]);
+      expect(panes.paneOfAgent(PROJECT_2, rosterIds, source.id)?.members).toEqual([source.id]);
+      expect(layout.maximized).toBe(focused);
+      expect(layout.panes).toHaveLength(2);
+    });
+
+    it("carried twice, also by two overlapping handlers, places the fork once", async () => {
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const SECOND = "00000000-0000-7000-8000-0000000000e2";
+      installBackend({ roster: [source, claudeFork()] });
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      requestWithFork(SECOND);
+      await settle();
+      requestWithFork("00000000-0000-7000-8000-0000000000e3");
+      await settle();
+
+      const rosterIds = [source.id, FORK];
+      const layout = panes.layoutFor(PROJECT_2, rosterIds);
+      expect(layout.panes).toHaveLength(2);
+      expect(layout.panes.filter((p) => p.members.includes(FORK))).toHaveLength(1);
+      expect(panes.paneOfAgent(PROJECT_2, rosterIds, source.id)?.members).toEqual([source.id]);
+      expect(acks()).toHaveLength(3);
+    });
+
+    it("moves a fork a roster refresh had dropped beside its source into its own pane", async () => {
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const rosterIds = [source.id, FORK];
+      // The unified default puts every roster agent, the fork included, in
+      // the one pane: every inherited message shown twice.
+      expect(panes.layoutFor(PROJECT_2, rosterIds).panes[0]?.members).toEqual(rosterIds);
+      installBackend({ roster: [source, claudeFork()] });
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      await settle();
+
+      const forkPane = panes.paneOfAgent(PROJECT_2, rosterIds, FORK);
+      const sourcePane = panes.paneOfAgent(PROJECT_2, rosterIds, source.id);
+      expect(forkPane?.id).not.toBe(sourcePane?.id);
+      expect(sourcePane?.members).toEqual([source.id]);
+      expect(forkPane?.members).toEqual([FORK]);
+    });
+
+    it("works on the fork's current record: a rename between attempts keeps its name, and a removed fork is not restored", async () => {
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const renamed = { ...claudeFork(), name: "aside" };
+      const backend = installBackend({ roster: [source, renamed] });
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      await settle();
+      expect(ws.agentsByProject[PROJECT_2]?.find((a) => a.id === FORK)?.name).toBe("aside");
+      expect(panes.paneOfAgent(PROJECT_2, [source.id, FORK], FORK)).not.toBeNull();
+
+      // The user removes the fork in the window, as only the window can.
+      await ws.removeAgent(FORK);
+      backend.roster = [source];
+      requestWithFork("00000000-0000-7000-8000-0000000000e2");
+      await settle();
+      expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([source.id]);
+      expect(panes.paneOfAgent(PROJECT_2, [source.id], FORK)).toBeNull();
+      expect(acks().at(-1)).toEqual({
+        requestId: "00000000-0000-7000-8000-0000000000e2",
+        result: { status: "ready", listening_agents: [source.id] },
+      });
+    });
+
+    it("reads a Codex fork's earlier conversation before answering ready", async () => {
+      const ws = await loadWorkspaceState();
+      const source = agent(AGENT_1, PROJECT_2);
+      const hold = gate();
+      // The project's own load answers at once; the fork's read waits.
+      const loads = installHistoryBackend([source, codexFork()], 2, hold);
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      await settle();
+      expect(loads()).toBe(2);
+      expect(acks()).toEqual([]);
+
+      hold.open();
+      await settle();
+      expect(acks()).toEqual([
+        { requestId: REQUEST, result: { status: "ready", listening_agents: [source.id, FORK] } },
+      ]);
+      expect(loads()).toBe(2);
+    });
+
+    it("does not read a Codex fork's earlier conversation while the fork has a turn running", async () => {
+      const ws = await loadWorkspaceState();
+      const state = await loadAgentState();
+      const source = agent(AGENT_1, PROJECT_2);
+      const fork = codexFork();
+      const loads = installHistoryBackend([source, fork], 0, gate());
+      await ws.installDesktopSync();
+      // The fork is already registered and mid-reply when the request arrives.
+      await state.registerAgent(fork);
+      fireTo(`agent:${FORK}`, {
+        type: "turn_start",
+        turn_id: "turn-fork-1",
+        send_id: "send-fork-1",
+        started_at: "2026-05-16T00:00:03Z",
+      });
+      expect(state.runtimes[FORK]?.run_status).toBe("processing");
+
+      requestWithFork();
+      await settle();
+
+      expect(loads()).toBe(1);
+      expect(acks()).toEqual([
+        { requestId: REQUEST, result: { status: "ready", listening_agents: [source.id, FORK] } },
+      ]);
+    });
+
+    it("a retry whose request overlaps the first handler's read neither reads nor places again", async () => {
+      // The first request's handler keeps running past the backend's
+      // deadline; the retry carries the same fork while that read is in
+      // flight.
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const hold = gate();
+      const loads = installHistoryBackend([source, codexFork()], 2, hold);
+      await ws.installDesktopSync();
+      const SECOND = "00000000-0000-7000-8000-0000000000e2";
+
+      requestWithFork();
+      await settle();
+      expect(loads()).toBe(2);
+      requestWithFork(SECOND);
+      await settle();
+      expect(loads()).toBe(2);
+      expect(acks()).toEqual([]);
+
+      hold.open();
+      await settle();
+      expect(acks().map((a) => (a as { requestId: string }).requestId)).toEqual([REQUEST, SECOND]);
+      const rosterIds = [source.id, FORK];
+      expect(panes.layoutFor(PROJECT_2, rosterIds).panes).toHaveLength(2);
+      expect(panes.paneOfAgent(PROJECT_2, rosterIds, FORK)?.members).toEqual([FORK]);
+      expect(loads()).toBe(2);
+    });
+  });
+
   it("loads a project the window has not opened without selecting it, and answers once its history has loaded", async () => {
     const ws = await loadWorkspaceState();
     const conversation = gate();

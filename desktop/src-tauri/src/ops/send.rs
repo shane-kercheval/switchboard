@@ -167,20 +167,7 @@ pub async fn send(
         project_id: request.project_id,
         recipients: request.recipients,
         on_busy: request.on_busy,
-        body: match request.body {
-            Body::Text { text } => BodyPlan::Text(text),
-            Body::Prompt {
-                provider,
-                name,
-                args,
-                appended_text,
-            } => BodyPlan::Prompt {
-                provider,
-                name,
-                args,
-                appended_text: appended_text.unwrap_or_default(),
-            },
-        },
+        body: request.body.into(),
     };
     begin(handle, home_dir, plan, request.idempotency_key, budget).await
 }
@@ -227,7 +214,7 @@ struct Plan {
 }
 
 #[derive(Serialize)]
-enum BodyPlan {
+pub(super) enum BodyPlan {
     Text(String),
     Prompt {
         provider: String,
@@ -242,7 +229,28 @@ enum BodyPlan {
     },
 }
 
-fn request_hash(plan: &Plan) -> String {
+impl From<Body> for BodyPlan {
+    fn from(body: Body) -> Self {
+        match body {
+            Body::Text { text } => Self::Text(text),
+            Body::Prompt {
+                provider,
+                name,
+                args,
+                appended_text,
+            } => Self::Prompt {
+                provider,
+                name,
+                args,
+                appended_text: appended_text.unwrap_or_default(),
+            },
+        }
+    }
+}
+
+/// The retry key's view of a request: two requests are "the same" when their
+/// serialized forms are.
+pub(super) fn request_hash<T: Serialize>(plan: &T) -> String {
     use std::fmt::Write as _;
     let bytes = serde_json::to_vec(plan).unwrap_or_default();
     Sha256::digest(bytes)
@@ -362,9 +370,11 @@ impl Drop for SettleGuard<'_> {
 }
 
 /// What the guard does for a send whose task ended abnormally. Separate so
-/// the two outcomes are testable without provoking a panic inside a task.
+/// the two outcomes are testable without provoking a panic inside a task. A
+/// send that created a fork is settled, never released: its key must keep
+/// naming that fork.
 pub(crate) fn settle_abnormally(state: &AppState, send_id: SendId) {
-    if state.ledger.dispatched_any(send_id) {
+    if state.ledger.dispatched_any(send_id) || state.ledger.fork_attached(send_id) {
         state.ledger.settle(send_id);
     } else {
         state.ledger.release(
@@ -467,7 +477,52 @@ async fn run_inner(
         }
     }
 
-    let body = match plan.body {
+    let body = render_body(state, home_dir, project_id, plan.body, budget).await?;
+
+    // Last, right before dispatch: what has to hold is that the window was
+    // ready when the message went out, and a forward can wait a long time for
+    // its source above. Both checks are quick, so they share the call's
+    // finishing allowance; a source that finishes at the deadline must not
+    // fail an otherwise ready send.
+    let report = match budget
+        .run_with_grace(state.desktop_sync.ensure_ready(project_id, None))
+        .await
+    {
+        Outcome::Done(report) => report?,
+        Outcome::Timeout => return Err(AppError::ProjectLoadTimeout(project_id)),
+        Outcome::Cancelled => return Err(AppError::Interrupted),
+    };
+    let unheard = report.hearing.unheard(plan.recipients.iter().copied());
+    if plan.on_busy == OnBusyPolicy::Refuse {
+        refuse_if_busy(state, budget, &plan.recipients, &unheard, &roster).await?;
+    }
+    dispatch_recipients(
+        state,
+        home_dir,
+        send_id,
+        &plan.recipients,
+        plan.on_busy,
+        &unheard,
+        &roster,
+        &body,
+    )
+    .await
+}
+
+/// The message as it goes out: text as given, a saved prompt rendered under
+/// the budget with its appended text, or a forward composed through the
+/// existing resolvers. Checked against the prompt size on the final text, so
+/// the whole send is refused before any recipient is dispatched; the
+/// dispatcher's own check gives the same answer (these sends carry no
+/// attachments) and stays as the backstop.
+pub(super) async fn render_body(
+    state: &AppState,
+    home_dir: &Path,
+    project_id: ProjectId,
+    body: BodyPlan,
+    budget: &WaitBudget,
+) -> Result<String, AppError> {
+    let body = match body {
         BodyPlan::Text(text) => text,
         BodyPlan::Prompt {
             provider,
@@ -497,40 +552,8 @@ async fn run_inner(
             .await?
         }
     };
-    // On the final body, after rendering and forwarding: the dispatcher's own
-    // check gives the same answer (MCP sends carry no attachments) and stays
-    // as the backstop; checking here refuses the whole send before any
-    // recipient is dispatched.
     check_prompt_size(&body).map_err(AppError::PromptTooLarge)?;
-
-    // Last, right before dispatch: what has to hold is that the window was
-    // ready when the message went out, and a forward can wait a long time for
-    // its source above. Both checks are quick, so they share the call's
-    // finishing allowance; a source that finishes at the deadline must not
-    // fail an otherwise ready send.
-    let report = match budget
-        .run_with_grace(state.desktop_sync.ensure_ready(project_id))
-        .await
-    {
-        Outcome::Done(report) => report?,
-        Outcome::Timeout => return Err(AppError::ProjectLoadTimeout(project_id)),
-        Outcome::Cancelled => return Err(AppError::Interrupted),
-    };
-    let unheard = report.hearing.unheard(plan.recipients.iter().copied());
-    if plan.on_busy == OnBusyPolicy::Refuse {
-        refuse_if_busy(state, budget, &plan.recipients, &unheard, &roster).await?;
-    }
-    dispatch_recipients(
-        state,
-        home_dir,
-        send_id,
-        &plan.recipients,
-        plan.on_busy,
-        &unheard,
-        &roster,
-        &body,
-    )
-    .await
+    Ok(body)
 }
 
 fn agent_name(roster: &[AgentRecord], agent_id: AgentId) -> String {
@@ -591,7 +614,7 @@ pub(super) async fn refuse_if_busy(
 /// must not read as "busy", or a caller would wait for an idle agent and retry
 /// forever.
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_recipients(
+pub(super) async fn dispatch_recipients(
     state: &AppState,
     home_dir: &Path,
     send_id: SendId,

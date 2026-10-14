@@ -253,8 +253,11 @@ tools! {
          fork. The user sees the fork in its own pane in Switchboard's window, with its earlier \
          conversation. If the message started and then failed (wait_send says failed), the fork \
          exists: send to it by its agent_id rather than forking again; a Claude fork then branches \
-         from the source's conversation as it is at that send. Nothing over MCP removes an agent, \
-         so forks stay until the user removes them: fork for a reason, not per message.";
+         from the source's conversation as it is at that send. After request_in_progress, wait_send \
+         on its send_id: once it settles, its recipient is the fork (list_agents shows it); retry \
+         with the same key only if you gave one, since a retry without one makes a second fork. \
+         Nothing over MCP removes an agent, so forks stay until the user removes them: fork for a \
+         reason, not per message.";
     Send = "send" (SendArgs) [Acts]
         "Send one message to one or more agents of a project. Returns at once with a send_id and \
          each recipient's status at dispatch: accepted, rejected (with a code), or \

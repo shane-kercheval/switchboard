@@ -4731,33 +4731,16 @@ async fn stopping_the_server_after_the_fork_exists_leaves_it_with_nothing_sent()
     hold.entered.notified().await;
     stop.cancel();
     hold.release.notify_one();
-    // The stop is answered at once; the task settles the entry behind it,
-    // with the fork recorded and its message refused.
-    let err = task.await.unwrap().unwrap_err();
-    assert!(matches!(err, AppError::Interrupted), "{err:?}");
-    let send_id = env.state.ledger.send_id_for_key(project_id, "k").unwrap();
-    for _ in 0..500 {
-        if env
-            .state
-            .ledger
-            .send(send_id)
-            .is_some_and(|snapshot| snapshot.settled)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    let snapshot = env.state.ledger.send(send_id).unwrap();
-    assert!(snapshot.settled, "the task settled its entry");
-    assert_eq!(snapshot.recipients[0].status, SendStatus::Rejected);
+    // The window wait ends on the stop and the task settles at once: the
+    // caller gets the receipt naming the fork, its message refused.
+    let receipt = task.await.unwrap().unwrap();
+    let fork_record = fork_of(&receipt);
+    assert_eq!(receipt.send.recipients[0].status, SendStatus::Rejected);
     assert!(lock(&env.adapter.prompts).is_empty(), "nothing was sent");
-    let fork_record = roster(&env, project_id)
-        .into_iter()
-        .find(|a| a.id != source)
-        .expect("the fork exists");
-    assert_eq!(
-        env.state.ledger.fork_for_key(project_id, "k").map(|f| f.id),
-        Some(fork_record.id)
+    assert!(
+        roster(&env, project_id)
+            .iter()
+            .any(|a| a.id == fork_record.id)
     );
 
     // Access on again: the same request sends to the fork.
@@ -4895,7 +4878,7 @@ async fn a_codex_source_is_forked_through_codex_and_the_fork_is_an_ordinary_code
 #[tokio::test]
 async fn a_repeat_that_joined_the_refused_attempt_keeps_its_receipt_when_another_repeat_resumes() {
     // Ledger only, no tasks: the joiner's slot is inspected unpolled.
-    let (env, project_id, source) = forkable_source();
+    let (env, project_id, _source) = forkable_source();
     let fork = roster(&env, project_id).remove(0);
     let ledger = &env.state.ledger;
     let ForkClaim::Fresh { send_id } =
@@ -4928,7 +4911,6 @@ async fn a_repeat_that_joined_the_refused_attempt_keeps_its_receipt_when_another
             && receipt.recipients[0].status == SendStatus::Rejected),
         "the joiner keeps the refused attempt's receipt: {held:?}"
     );
-    assert_eq!(source, source);
 }
 
 /// A source whose reply is complete but whose stream stays open, as Codex's
@@ -5004,8 +4986,18 @@ async fn a_source_holding_its_session_past_the_budget_refuses_the_fork_and_the_s
     assert_eq!(roster(&env, project_id).len(), 2);
 }
 
-#[tokio::test]
-async fn a_stop_while_the_sources_agent_is_preparing_a_turn_interrupts_the_fork_at_once() {
+/// Whether an error is the server's interruption, however it was wrapped on
+/// the way out of a task.
+fn is_interrupted(error: &AppError) -> bool {
+    match error {
+        AppError::Interrupted => true,
+        AppError::Shared(inner) => is_interrupted(inner),
+        _ => false,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_while_the_sources_agent_is_preparing_a_turn_ends_the_forks_task_at_once() {
     let (env, project_id, source) = forkable_source();
     let held = Arc::new(Notify::new());
     env.adapter
@@ -5040,11 +5032,28 @@ async fn a_stop_while_the_sources_agent_is_preparing_a_turn_interrupts_the_fork_
         )
         .await
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!task.is_finished(), "blocked on the actor's answer");
+    // Under the paused clock a sleep returns only once every task is parked:
+    // the fork's task is waiting on the actor's answer.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!task.is_finished(), "parked on the actor's answer");
+    assert!(env.state.ledger.send_id_for_key(project_id, "k").is_some());
+
     stop.cancel();
+    // The task's own interruption, not the call's fallback: its question to
+    // the actor was cut short, and it released the key, while the actor is
+    // still held.
     let err = task.await.unwrap().unwrap_err();
-    assert!(matches!(err, AppError::Interrupted), "{err:?}");
+    assert!(is_interrupted(&err), "{err:?}");
+    for _ in 0..500 {
+        if env.state.ledger.send_id_for_key(project_id, "k").is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        env.state.ledger.send_id_for_key(project_id, "k").is_none(),
+        "the task released the key"
+    );
     assert_eq!(roster(&env, project_id).len(), 1, "nothing was created");
 
     held.notify_one();
@@ -5052,8 +5061,79 @@ async fn a_stop_while_the_sources_agent_is_preparing_a_turn_interrupts_the_fork_
     wait_done(&env, project_id, receipt.send_id).await;
 }
 
-#[tokio::test]
-async fn a_stop_during_the_forks_creation_is_answered_at_once_and_the_fork_is_recorded_with_nothing_sent()
+/// Wait for the send's dispatch phase to settle, by the ledger.
+async fn settled(env: &TestEnv, send_id: Uuid) -> super::ledger::SendSnapshot {
+    for _ in 0..500 {
+        if env
+            .state
+            .ledger
+            .send(send_id)
+            .is_some_and(|snapshot| snapshot.settled)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let snapshot = env.state.ledger.send(send_id).unwrap();
+    assert!(snapshot.settled, "the task settled its entry");
+    snapshot
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_creation_that_outlasts_the_calls_budget_answers_request_in_progress_and_the_same_key_finds_the_fork()
+ {
+    let (env, project_id, source) = forkable_source();
+    let seam = env.seam(TestSeam::ForkRegistration);
+    let (handle, home) = (env.handle(), env.home());
+    let task = tokio::spawn(async move {
+        fork(
+            handle,
+            home,
+            fork_request(project_id, source, "branch", Some("k")),
+            WaitBudget::new(Some(2), false),
+        )
+        .await
+    });
+    seam.entered.notified().await;
+    // Creation is still held when the budget runs out: the caller gets the
+    // send id, the task keeps going.
+    let err = task.await.unwrap().unwrap_err();
+    let AppError::RequestInProgress { send_id } = err else {
+        panic!("request in progress, got {err:?}");
+    };
+    assert_eq!(
+        env.state.ledger.send_id_for_key(project_id, "k"),
+        Some(send_id)
+    );
+    assert_eq!(roster(&env, project_id).len(), 1, "creation is still held");
+
+    // The task's later phases are past the deadline too: the fork is
+    // recorded and its message refused, which a wait on the id reports.
+    seam.release.notify_one();
+    let snapshot = settled(&env, send_id).await;
+    assert_eq!(snapshot.recipients[0].status, SendStatus::Rejected);
+    assert!(wait_done(&env, project_id, send_id).await.done);
+    assert!(lock(&env.adapter.prompts).is_empty(), "nothing was sent");
+    assert_eq!(roster(&env, project_id).len(), 2);
+
+    // The same key resumes: the message goes to that fork, not a second.
+    env.clear_seam(TestSeam::ForkRegistration);
+    let resent = fork_now(&env, fork_request(project_id, source, "branch", Some("k")))
+        .await
+        .unwrap();
+    assert_ne!(resent.send.send_id, send_id);
+    assert_eq!(resent.send.recipients[0].status, SendStatus::Accepted);
+    assert_eq!(
+        fork_of(&resent).id,
+        snapshot.recipients[0].agent_id,
+        "the same fork"
+    );
+    wait_done(&env, project_id, resent.send.send_id).await;
+    assert_eq!(roster(&env, project_id).len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_during_the_forks_creation_answers_request_in_progress_and_the_fork_is_recorded_with_nothing_sent()
  {
     let (env, project_id, source) = forkable_source();
     let seam = env.seam(TestSeam::ForkRegistration);
@@ -5071,13 +5151,20 @@ async fn a_stop_during_the_forks_creation_is_answered_at_once_and_the_fork_is_re
     });
     seam.entered.notified().await;
     stop.cancel();
+    // The allowance passes with creation still held: the send id, not a
+    // bare interruption, since the fork is about to exist.
     let err = task.await.unwrap().unwrap_err();
-    assert!(matches!(err, AppError::Interrupted), "{err:?}");
+    let AppError::RequestInProgress { send_id } = err else {
+        panic!("request in progress, got {err:?}");
+    };
+    assert_eq!(
+        env.state.ledger.send_id_for_key(project_id, "k"),
+        Some(send_id)
+    );
     assert_eq!(roster(&env, project_id).len(), 1, "creation is still held");
 
     // The task runs on: the fork is registered, its message refused, not sent.
     seam.release.notify_one();
-    let send_id = env.state.ledger.send_id_for_key(project_id, "k").unwrap();
     for _ in 0..500 {
         if env
             .state

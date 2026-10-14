@@ -1811,6 +1811,14 @@ async fn live_compact_through_the_server(harness: switchboard_core::HarnessKind)
     );
 }
 
+#[test]
+fn a_forks_answer_after_a_stop_fits_inside_the_servers_grace() {
+    // The fork call waits this long for its task after a stop; the server
+    // waits CALLS_GRACE for the call. The answer reaches the client only
+    // while the first is shorter.
+    assert!(crate::ops::fork::STOP_ANSWER_ALLOWANCE < server::CALLS_GRACE);
+}
+
 /// A fork through the server with a real agent: a two-message source of
 /// one-word replies, a fork sent one more, and the fork's conversation holds
 /// the source's turns and the reply while the source's is unchanged.

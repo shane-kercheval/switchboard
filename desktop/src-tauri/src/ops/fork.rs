@@ -32,22 +32,27 @@
 //! observed through `wait_send`, never rerun here. The rule is the ledger's
 //! ([`SendLedger::claim_fork`]).
 //!
-//! **Stopping.** Everything before the fork's creation runs under the call's
-//! budget and ends at once on a server stop: the login-shell PATH wait a
-//! Codex fork needs at launch, the questions to the source's agent, the wait
-//! for its session. The creation itself cannot be cut short: a Codex fork
-//! holds the parent's session lock while `codex exec fork` runs, and dropping
-//! it mid-way would release that lock while the process is still being
-//! killed. So on a stop the call answers `interrupted` at once while its task
-//! finishes the creation, records the fork, and sends nothing; a repeat under
-//! the key then resumes.
+//! **Stopping, and the call's own deadline.** Everything before the fork's
+//! creation runs under the call's budget and ends at once on a server stop:
+//! the login-shell PATH wait a Codex fork needs at launch, the questions to
+//! the source's agent, the wait for its session. The creation itself cannot
+//! be cut short: a Codex fork holds the parent's session lock while `codex
+//! exec fork` runs, and dropping it mid-way would release that lock while the
+//! process is still being killed. So the call waits for its task: on a stop,
+//! up to [`STOP_ANSWER_ALLOWANCE`], within the server's grace for in-flight
+//! calls, which is enough for every phase but a creation under way to settle
+//! and answer with the receipt that names the fork; and otherwise to the
+//! call's finishing deadline, which a creation begun late can outrun. When
+//! the task is still at work at either point the call answers
+//! `request_in_progress` with the send id: the task keeps its lock, finishes,
+//! and settles the entry, and the caller reads the outcome with `wait_send`,
+//! or resumes it with the same key.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
 use switchboard_core::{AgentId, AgentRecord, ProjectId, SendId};
-use tokio_util::sync::CancellationToken;
 
 use crate::commands::{fork_agent_impl, list_project_agents_readonly_impl, open_project_impl};
 use crate::error::AppError;
@@ -62,6 +67,12 @@ use super::send::{
     render_body, request_hash, settle_cancelled,
 };
 use super::wait::{Outcome, WaitBudget};
+
+/// How long the call keeps waiting for its task after a server stop before
+/// answering `request_in_progress`. Kept under the server's grace for calls
+/// in flight (`CALLS_GRACE`, 2 seconds; a server test holds the two apart),
+/// so the answer still reaches the client.
+pub const STOP_ANSWER_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub struct ForkRequest {
     pub project_id: ProjectId,
@@ -138,20 +149,26 @@ pub async fn fork(
         existing,
     };
     // Own task, as a send: the caller's future may be dropped at any point
-    // from here on without affecting the fork or its message.
-    let stop = budget.cancel_token().clone();
-    let task = tokio::spawn(run(handle, home_dir, plan, budget, cancel));
-    tokio::select! {
-        biased;
-        // A server stop is answered at once; the task runs on to settle the
-        // entry (see the module doc).
-        () = stop.cancelled() => Err(AppError::Interrupted),
-        joined = task => joined.unwrap_or_else(|join_error| {
-            Err(AppError::Internal(format!(
-                "the fork task did not finish: {join_error}"
-            )))
-        }),
-    }
+    // from here on without affecting the fork or its message. Its budget
+    // stops on either the call's cancellation (server shutdown) or the
+    // send's own (`cancel_send`).
+    let prep = budget.clone().with_cancel(cancel);
+    let mut task = tokio::spawn(run(handle, home_dir, plan, prep));
+    let joined = match budget.run_with_grace(&mut task).await {
+        Outcome::Done(joined) => joined,
+        Outcome::Timeout => return Err(AppError::RequestInProgress { send_id }),
+        // See the module doc: every phase but a creation under way settles
+        // within the allowance and answers for itself.
+        Outcome::Cancelled => match tokio::time::timeout(STOP_ANSWER_ALLOWANCE, &mut task).await {
+            Ok(joined) => joined,
+            Err(_) => return Err(AppError::RequestInProgress { send_id }),
+        },
+    };
+    joined.unwrap_or_else(|join_error| {
+        Err(AppError::Internal(format!(
+            "the fork task did not finish: {join_error}"
+        )))
+    })
 }
 
 struct Plan {
@@ -167,8 +184,7 @@ async fn run(
     handle: Arc<dyn AppStateHandle>,
     home_dir: PathBuf,
     plan: Plan,
-    budget: WaitBudget,
-    cancel: CancellationToken,
+    prep: WaitBudget,
 ) -> Result<ForkReceipt, AppError> {
     let state = handle.app_state();
     let (send_id, project_id) = (plan.send_id, plan.project_id);
@@ -177,7 +193,6 @@ async fn run(
         send_id,
         armed: true,
     };
-    let prep = budget.with_cancel(cancel);
     let mut fork = plan.existing.clone();
     let result = Box::pin(run_inner(state, &home_dir, plan, &prep, &mut fork)).await;
     guard.armed = false;

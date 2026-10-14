@@ -63,7 +63,7 @@ use super::token;
 use super::tools::{self, CallContext, ToolName};
 
 /// How long a stop waits for the tool calls it told to finish.
-const CALLS_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const CALLS_GRACE: Duration = Duration::from_secs(2);
 /// How long a finished call's reply gets to reach its stream before the
 /// sessions end. The reply crosses in-process channels, so this is generous.
 const REPLY_FLUSH: Duration = Duration::from_millis(200);

@@ -744,12 +744,12 @@ mod tests {
     }
 
     #[test]
-    fn the_default_memory_ceiling_is_about_279_mib() {
-        // 64 queues of 4 MiB, each with a 128 KiB message read twice and a
+    fn the_default_memory_ceiling_is_about_791_mib() {
+        // 64 queues of 12 MiB, each with a 128 KiB message read twice and a
         // decoded record, and 80 request heads of 32 KiB.
         assert_eq!(
             memory_ceiling(&Config::default()),
-            64 * (4 * 1024 * 1024 + 2 * 131_072 + MAX_FRAME_LEN) + 80 * 32 * 1024
+            64 * (12 * 1024 * 1024 + 2 * 131_072 + MAX_FRAME_LEN) + 80 * 32 * 1024
         );
     }
 

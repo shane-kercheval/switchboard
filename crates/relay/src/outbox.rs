@@ -18,6 +18,8 @@ use axum::body::Bytes;
 use axum::extract::ws::Message;
 use data_encoding::BASE64;
 use futures::{Sink, SinkExt};
+#[cfg(test)]
+use switchboard_remote_crypto::frame::{MAX_FRAME_LEN, MAX_MESSAGE_FRAMES};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, MissedTickBehavior};
@@ -32,7 +34,7 @@ pub(crate) const MIN_FRAME_COST: usize = 4096;
 /// messages hold no budget, so they may take the room frames leave too: a
 /// connection with no frames queued is closed once it leaves
 /// `queue_bytes / MIN_FRAME_COST + CONTROL_HEADROOM` of them unread, about
-/// 1,100 at the default budget. One that does is not reading its own errors.
+/// 3,200 at the default budget. One that does is not reading its own errors.
 pub(crate) const CONTROL_HEADROOM: usize = 64;
 /// A frame's JSON around its base64 record: type, ids, an optional token.
 const FRAME_OVERHEAD: usize = 256;
@@ -42,6 +44,15 @@ const FRAME_OVERHEAD: usize = 256;
 /// `MIN_FRAME_COST`.
 pub(crate) fn frame_cost(record_len: usize) -> usize {
     (BASE64.encode_len(record_len) + FRAME_OVERHEAD).max(MIN_FRAME_COST)
+}
+
+/// The most the longest message a session sends can be charged: every one of
+/// its frames at the longest. A budget at least this large takes a whole
+/// message however slowly its recipient reads, so a phone that asks for one
+/// is never closed for its size alone.
+#[cfg(test)]
+pub(crate) fn longest_message_cost() -> usize {
+    MAX_MESSAGE_FRAMES * frame_cost(MAX_FRAME_LEN)
 }
 
 /// Why a frame was not queued.

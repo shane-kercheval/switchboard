@@ -51,7 +51,7 @@ pub struct Config {
     pub register_timeout: Duration,
     /// Bytes of frames queued for one connection at most. A frame for a
     /// connection with no room left is refused as `recipient_full`, and the
-    /// connection closed.
+    /// connection closed. The default holds the longest message whole.
     pub queue_bytes: usize,
 }
 
@@ -68,7 +68,7 @@ impl Default for Config {
             ping_interval: Duration::from_secs(25),
             register_timeout: Duration::from_secs(10),
             rate_limit_bytes: 16 * 1024 * 1024,
-            queue_bytes: 4 * 1024 * 1024,
+            queue_bytes: 12 * 1024 * 1024,
         }
     }
 }
@@ -188,6 +188,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::outbox::longest_message_cost;
 
     fn config(vars: &[(&str, &str)]) -> Result<Config, ConfigError> {
         let vars: HashMap<String, String> = vars
@@ -244,6 +245,11 @@ mod tests {
             Err(ConfigError::Inconsistent(_))
         ));
         assert!(Config::default().validated().is_ok());
+    }
+
+    #[test]
+    fn the_default_budget_holds_the_longest_message_whole() {
+        assert!(Config::default().queue_bytes >= longest_message_cost());
     }
 
     #[test]

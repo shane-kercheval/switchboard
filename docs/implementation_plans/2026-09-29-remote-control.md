@@ -21,8 +21,8 @@ shared Rust cryptography are in one tree.
   §5.6, §6, §9).
   - **A frame for a recipient with no room is refused, not waited on.** The relay closes the
     recipient and answers the sender `error { recipient_full, device_id }` naming it; the
-    frame is dropped and the sender's connection stays open. The byte budget, each frame's
-    cost, and the relay's own messages are unchanged. **Replaces** revision 24's wait for room,
+    frame is dropped and the sender's connection stays open. Each frame's cost and the
+    relay's own messages are unchanged. **Replaces** revision 24's wait for room,
     and with it the stall timeout, the room timeout, the per-socket limit on unsent bytes, and
     the check of a waited frame before it is queued.
   - Why: the wait held the sender's reader, and through TCP the Mac's whole connection, so
@@ -33,6 +33,11 @@ shared Rust cryptography are in one tree.
     and idempotent sends (§5.5) catch it up. Closing it at once also tells the Mac which phone
     is gone. The wait needed stall detection, a room timeout, a Linux socket option, a
     two-phase commit under the routing lock, and most of §6's flow-control caveats.
+  - **The queue budget is 12 MiB, up from 4 MiB**, so the longest message, 8 MiB and about
+    10.8 MiB as frames, fits whole. With 4 MiB, a phone reading slower than its Mac sends
+    would be closed by any reply over the budget, and again each time it reconnected and asked
+    for the same window. What clients can make the relay hold rises from about 279 MiB to
+    about 791 MiB at the defaults.
   - A recipient that stops reading and is sent nothing stops answering the relay's pings and
     is closed at the idle timeout. The relay still pings every 25 seconds from the writer, now
     as a keepalive for the client rather than to reach a reader held by a wait. On
@@ -1295,7 +1300,7 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   phones), `MAX_DEVICES_PER_MAC` (default 8, at most 1,024), `MAX_CONNECTIONS` (global,
   default 64, since registration is open to any key), `DENY_DEVICE_IDS` (comma-separated). A
   setting past its cap is refused at startup, before anything is sized by it. The queue
-  budget (4 MiB) and the timeouts are fixed in code. `crates/relay/Dockerfile`; TLS terminated by the host so clients
+  budget (12 MiB) and the timeouts are fixed in code. `crates/relay/Dockerfile`; TLS terminated by the host so clients
   use `wss://`. Locally: `make relay`; the image: `make relay-image`, which passes the Rust
   version from `rust-toolchain.toml` as the required `RUST_VERSION` build argument. The
   WebSocket is at `/connect`.
@@ -1398,7 +1403,7 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   relay waits out its overdraft before acting on its next message, which slows it through
   TCP; a throttle wait never outlasts the registration deadline. That is the only wait
   between reading a frame and queueing or refusing it. Each connection's queue holds at most
-  4 MiB of frames, each charged its encoded size (its record as base64 and 256 bytes of JSON)
+  12 MiB of frames, each charged its encoded size (its record as base64 and 256 bytes of JSON)
   and at least 4 KiB, returned once the frame is sent. A frame for a recipient with no room
   for it is not waited on: the relay closes the recipient, sending what is already queued to
   it for up to 2 seconds, and answers the sender `error { recipient_full, device_id }` naming
@@ -1408,7 +1413,7 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   under one lock, so two senders racing to one full recipient each get their own error and
   the recipient is closed once. The relay's own messages (`registered`, notices, errors)
   never wait and hold no byte budget; they are bounded only by the queue's count of
-  messages, about 1,100 at the default budget, and a client that leaves that many unread,
+  messages, about 3,200 at the default budget, and a client that leaves that many unread,
   which is one not reading its own errors, is closed. Frames a recipient receives arrive in
   the order their sender sent them. A refused frame leaves a gap, which is why the recipient
   is closed rather than kept: its session would close at the gap anyway (§3), and on
@@ -1418,11 +1423,10 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   connection, so its peers are told.
 
   A slow phone costs only itself: the Mac's frames to its other phones are never held behind
-  it. A normal reply (§5.7's 1 MiB window) plus live events fits the budget whatever the
-  phone's link. A reply near the 8 MiB reassembly limit is about 11.2 MB as encoded frames,
-  more than the budget, so a phone that cannot take it in at about the pace the Mac sends it
-  is closed with `recipient_full`, and will be again if it asks for the same window after it
-  reconnects. That takes one huge text block and a slow link, and is accepted.
+  it. The budget holds the longest message whole, 8 MiB and about 10.8 MiB as encoded frames,
+  so no single reply closes a phone however slow its link; a unit test holds the default to
+  that. A phone is closed only when the Mac sends it more than the budget ahead of what it
+  has taken in, which takes several large replies or a long run of events back to back.
 - **Limits from day one**: the message and byte rates, `MAX_FRAME_BYTES` (closed), the idle
   timeout, `MAX_DEVICES_PER_MAC` (`limit_exceeded`; on `paired_devices` the held set is kept,
   on `register` the connection is closed), `MAX_CONNECTIONS` (HTTP 503), and the queue
@@ -1435,7 +1439,7 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   and a head may be at most 16 KiB. What clients can make the relay hold is bounded by
   `MAX_CONNECTIONS` times the queue budget and one message being read — its text, the copy
   decoding makes, and one decoded record, since a byte field longer than its type allows is
-  refused before it is decoded — plus every socket's request buffers, about 279 MiB at the
+  refused before it is decoded — plus every socket's request buffers, about 791 MiB at the
   defaults, logged at startup. At most 1,024 held sets of disconnected
   Macs are kept, the longest disconnected forgotten first, whenever a set is added or a Mac
   disconnects; its phones are then answered `mac_offline` as after a restart. A Mac's set is

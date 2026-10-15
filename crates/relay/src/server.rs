@@ -8,17 +8,15 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Extension, Router};
 use chrono::Utc;
 use futures::StreamExt;
 use futures::stream::SplitStream;
-use hyper::Request;
-use hyper::service::{Service as _, service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde_json::json;
@@ -33,12 +31,11 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
-use crate::outbox::{Outbox, Progress, Wait, frame_cost};
+use crate::outbox::Outbox;
 use crate::protocol::{
-    ClientMessage, DeviceId, ErrorCode, NONCE_LEN, PAIRING_TOKEN_LEN, RELAY_PROTOCOL, Register,
-    Role, ServerMessage,
+    ClientMessage, DeviceId, ErrorCode, NONCE_LEN, RELAY_PROTOCOL, Register, Role, ServerMessage,
 };
-use crate::state::{Pending, Refusal, Relay};
+use crate::state::{Refusal, Relay};
 
 /// How long a closing connection's queued messages may take to go out.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -153,10 +150,8 @@ async fn serve_validated(listener: TcpListener, config: Config, shutdown: Cancel
             drop(stream);
             continue;
         };
-        limit_unsent(&stream);
         let socket = Admitted {
             stream,
-            progress: Progress::new(),
             _permit: permit,
         };
         shared
@@ -174,12 +169,6 @@ async fn serve_validated(listener: TcpListener, config: Config, shutdown: Cancel
     }
 }
 
-/// Unsent bytes the kernel holds for a socket before it reports the socket
-/// full. Without a limit it reports a socket writable again only once much
-/// of a large send buffer has drained, so a phone reading steadily would
-/// show no progress for seconds at a time and be closed as stalled. At this
-/// size progress shows at least every 5 s down to about 13 kbps, below the
-/// slowest link a phone can use. Linux only, where the relay is deployed.
 /// Whether an `accept` error is one connection's, gone before it was
 /// accepted, rather than the listener's.
 fn is_connection_error(error: &io::Error) -> bool {
@@ -191,36 +180,16 @@ fn is_connection_error(error: &io::Error) -> bool {
     )
 }
 
-#[cfg(target_os = "linux")]
-const UNSENT_LIMIT: u32 = 8 * 1024;
-
-#[cfg(target_os = "linux")]
-fn limit_unsent(stream: &TcpStream) {
-    if let Err(error) = socket2::SockRef::from(stream).set_tcp_notsent_lowat(UNSENT_LIMIT) {
-        tracing::warn!(%error, "could not limit a socket's unsent bytes");
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn limit_unsent(_: &TcpStream) {}
-
 /// HTTP on one socket until it upgrades or closes. Each request head, the
 /// first included, must arrive within the time a client has to register, so
-/// a socket that sends nothing, or idles between requests, is closed. Each
-/// request carries the socket's `Progress`, for its WebSocket's outbox.
+/// a socket that sends nothing, or idles between requests, is closed.
 async fn serve_http(socket: Admitted, app: Router, shared: Arc<Shared>) {
     let mut http = hyper::server::conn::http1::Builder::new();
     http.timer(TokioTimer::new())
         .header_read_timeout(shared.config.register_timeout)
         .max_buf_size(MAX_REQUEST_HEAD);
-    let progress = socket.progress.clone();
-    let app = TowerToHyperService::new(app);
-    let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
-        request.extensions_mut().insert(progress.clone());
-        app.call(request)
-    });
     let mut connection = pin!(
-        http.serve_connection(TokioIo::new(socket), service)
+        http.serve_connection(TokioIo::new(socket), TowerToHyperService::new(app))
             .with_upgrades()
     );
     let served = tokio::select! {
@@ -236,21 +205,10 @@ async fn serve_http(socket: Admitted, app: Router, shared: Arc<Shared>) {
 }
 
 /// An accepted socket holding its share of the socket limit until it is
-/// dropped: after an upgrade, with the WebSocket. Every write that the
-/// socket accepts bytes of stamps its progress.
+/// dropped: after an upgrade, with the WebSocket.
 struct Admitted {
     stream: TcpStream,
-    progress: Progress,
     _permit: OwnedSemaphorePermit,
-}
-
-impl Admitted {
-    fn written(&self, written: Poll<io::Result<usize>>) -> Poll<io::Result<usize>> {
-        if let Poll::Ready(Ok(1..)) = written {
-            self.progress.stamp();
-        }
-        written
-    }
 }
 
 impl AsyncRead for Admitted {
@@ -269,9 +227,7 @@ impl AsyncWrite for Admitted {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let written = Pin::new(&mut this.stream).poll_write(cx, buf);
-        this.written(written)
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
     }
 
     fn poll_write_vectored(
@@ -279,9 +235,7 @@ impl AsyncWrite for Admitted {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let written = Pin::new(&mut this.stream).poll_write_vectored(cx, bufs);
-        this.written(written)
+        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -340,11 +294,7 @@ async fn healthz() -> Response {
     axum::Json(json!({ "status": "ok" })).into_response()
 }
 
-async fn connect(
-    State(shared): State<Arc<Shared>>,
-    Extension(progress): Extension<Progress>,
-    upgrade: WebSocketUpgrade,
-) -> Response {
+async fn connect(State(shared): State<Arc<Shared>>, upgrade: WebSocketUpgrade) -> Response {
     let Ok(permit) = Arc::clone(&shared.admission).try_acquire_owned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -359,20 +309,13 @@ async fn connect(
     upgrade
         .max_message_size(max)
         .max_frame_size(max)
-        .on_upgrade(move |socket| {
-            tracker.track_future(run_connection(socket, shared, progress, permit))
-        })
+        .on_upgrade(move |socket| tracker.track_future(run_connection(socket, shared, permit)))
 }
 
-async fn run_connection(
-    socket: WebSocket,
-    shared: Arc<Shared>,
-    progress: Progress,
-    permit: OwnedSemaphorePermit,
-) {
+async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSemaphorePermit) {
     let (sink, stream) = socket.split();
     let closed = shared.shutdown.child_token();
-    let (outbox, writer) = Outbox::new(shared.config.queue_bytes, closed.clone(), progress);
+    let (outbox, writer) = Outbox::new(shared.config.queue_bytes, closed.clone());
     let mut writer = tokio::spawn(writer.run(sink, shared.config.ping_interval));
     let mut connection = Connection {
         limiter: RateLimiter::new(&shared.config, Instant::now()),
@@ -384,8 +327,9 @@ async fn run_connection(
         heard: Instant::now(),
     };
     connection.run().await;
-    // Releases senders waiting for room here. The writer does not watch it,
-    // so what is queued still goes out.
+    // Frames routed here before the registration ends below are dropped,
+    // not queued. The writer does not watch it, so what is queued still
+    // goes out.
     connection.closed.cancel();
     if let Some(registration) = connection.registration.take()
         && shared.relay().unregister(
@@ -431,8 +375,8 @@ struct Connection {
     stream: SplitStream<WebSocket>,
     outbox: Outbox,
     /// Cancelled when the relay shuts down, when a newer registration
-    /// replaces this one, when this connection stops reading, or when it
-    /// ends.
+    /// replaces this one, when a frame for this connection finds no room in
+    /// its queue, or when it ends.
     closed: CancellationToken,
     limiter: RateLimiter,
     registration: Option<Registration>,
@@ -488,7 +432,7 @@ impl Connection {
         }
         let idle_timeout = self.shared.config.idle_timeout;
         while let Incoming::Message(message) = self.next(Deadline::Idle(idle_timeout)).await {
-            if !self.handle(message).await {
+            if !self.handle(message) {
                 return;
             }
         }
@@ -557,7 +501,7 @@ impl Connection {
 
     /// Acts on one message from a registered client; false ends the
     /// connection.
-    async fn handle(&self, message: ClientMessage) -> bool {
+    fn handle(&self, message: ClientMessage) -> bool {
         let Some(Registration { id, generation }) = &self.registration else {
             return false;
         };
@@ -570,8 +514,9 @@ impl Connection {
             } => {
                 // A record longer than any frame does not decode, so it
                 // never gets here: it is `bad_message` as not a relay message.
-                self.forward(id, generation, to, record, pairing_token)
-                    .await
+                self.shared
+                    .relay()
+                    .forward(id, generation, &to, record, pairing_token, table_now())
             }
             ClientMessage::PairedDevices { device_ids } => {
                 let set = set_for_log(&device_ids);
@@ -606,51 +551,6 @@ impl Connection {
                 !ends
             }
         }
-    }
-
-    /// Routes a frame and queues it for its recipient, waiting while the
-    /// recipient's queue is full, or returns why it may not pass. The route
-    /// is checked again once there is room, since the wait holds no lock: a
-    /// frame whose sender or recipient was replaced or closed meanwhile is
-    /// dropped, and the sender hears of that through `peer_disconnected`.
-    async fn forward(
-        &self,
-        from: &DeviceId,
-        generation: u64,
-        to: DeviceId,
-        record: Vec<u8>,
-        pairing_token: Option<[u8; PAIRING_TOKEN_LEN]>,
-    ) -> Result<(), Refusal> {
-        let route = self.shared.relay().route(
-            from,
-            generation,
-            &to,
-            pairing_token.as_ref(),
-            table_now(),
-        )?;
-        let cost = frame_cost(record.len());
-        let wait = Wait {
-            stall: self.shared.config.stall_timeout,
-            room: self.shared.config.room_timeout,
-        };
-        let Some(room) = route.outbox.reserve(cost, wait, &self.closed).await else {
-            return Ok(());
-        };
-        let pending = Pending {
-            frame: ServerMessage::Frame {
-                to: to.clone(),
-                from: from.clone(),
-                record,
-                pairing_token,
-            },
-            to,
-            pairing_token,
-            recipient: route.generation,
-            room,
-        };
-        self.shared
-            .relay()
-            .commit(from, generation, pending, table_now())
     }
 
     /// The next client message, or `End` once the connection is over or

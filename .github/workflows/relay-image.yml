@@ -4,9 +4,8 @@ name: relay-image
 # and smoke-tests it: no other gate builds the image, and its dockerignore is
 # a hand-kept list of what the Cargo workspace needs, so a new member or a
 # manifest change can break it silently. It also runs the relay's tests on
-# Linux, the only platform where the relay limits each socket's unsent bytes,
-# so the only place its slow-reader socket test runs. Runs only when
-# something the image is built from changes.
+# Linux, the platform the relay is deployed on. Runs only when something the
+# image is built from changes.
 on:
   push:
     branches: [main]

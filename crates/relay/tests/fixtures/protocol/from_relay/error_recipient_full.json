@@ -1,0 +1,6 @@
+{
+  "type": "error",
+  "code": "recipient_full",
+  "message": "that device had no room for the frame and has been disconnected",
+  "device_id": "cms3qugcq4mrn2xcapyo7q6itb"
+}

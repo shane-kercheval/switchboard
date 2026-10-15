@@ -49,19 +49,10 @@ pub struct Config {
     pub ping_interval: Duration,
     /// How long a new connection has to answer the challenge.
     pub register_timeout: Duration,
-    /// Bytes of frames queued for one connection at most. A sender whose
-    /// recipient is full waits for room rather than losing the frame.
+    /// Bytes of frames queued for one connection at most. A frame for a
+    /// connection with no room left is refused as `recipient_full`, and the
+    /// connection closed.
     pub queue_bytes: usize,
-    /// A recipient whose socket accepts no bytes for this long while a
-    /// sender waits for room is closed as not reading. Below the phone's 10-second
-    /// wait for its handshake reply, so another phone's stall cannot make a
-    /// connecting phone give up.
-    pub stall_timeout: Duration,
-    /// A recipient that frees no room for a waiting sender's frame within
-    /// this long, however many bytes its socket accepts, is closed as too
-    /// slow: about 12 kbps for the longest frame. It bounds how long one
-    /// frame holds its sender's reader, which reads nothing else meanwhile.
-    pub room_timeout: Duration,
 }
 
 impl Default for Config {
@@ -78,8 +69,6 @@ impl Default for Config {
             register_timeout: Duration::from_secs(10),
             rate_limit_bytes: 16 * 1024 * 1024,
             queue_bytes: 4 * 1024 * 1024,
-            stall_timeout: Duration::from_secs(5),
-            room_timeout: Duration::from_mins(1),
         }
     }
 }
@@ -132,7 +121,7 @@ impl Config {
     /// any connection that sends it, and a byte rate below it would hold
     /// such a message for longer than a second. A queue budget smaller than
     /// one frame of the longest record could never admit that frame, and
-    /// its recipient would be closed for a stall it did not cause.
+    /// its recipient would be closed by the first one it was sent.
     pub fn validated(self) -> Result<Self, ConfigError> {
         if self.max_devices_per_mac > MAX_DEVICES_PER_MAC_CAP {
             return Err(ConfigError::Inconsistent(
@@ -332,14 +321,10 @@ mod tests {
 
     #[test]
     fn the_default_timings_keep_their_order() {
-        // The Mac reconnects after this long with nothing from the relay,
-        // and a phone gives up on a handshake reply after this long.
+        // A client reconnects after this long with nothing from the relay.
         const CLIENT_SILENCE: Duration = Duration::from_secs(50);
-        const HANDSHAKE_WAIT: Duration = Duration::from_secs(10);
         let config = Config::default();
         assert!(config.ping_interval * 2 <= CLIENT_SILENCE);
-        assert!(config.stall_timeout < HANDSHAKE_WAIT);
-        assert!(config.room_timeout < config.idle_timeout);
         assert!(config.ping_interval < config.idle_timeout);
     }
 

@@ -192,6 +192,16 @@ fn from_relay(sample: &Sample) -> Vec<(&'static str, Fixture)> {
             }),
         ),
         (
+            "from_relay/error_recipient_full.json",
+            FromRelay(ServerMessage::Error {
+                code: ErrorCode::RecipientFull,
+                message: "that device had no room for the frame and has been disconnected"
+                    .to_owned(),
+                device_id: Some(id(phone)),
+                last_seen: None,
+            }),
+        ),
+        (
             "from_relay/error_registration_refused.json",
             FromRelay(ServerMessage::Error {
                 code: ErrorCode::RegistrationRefused,

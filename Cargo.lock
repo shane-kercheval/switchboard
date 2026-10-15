@@ -4753,7 +4753,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "socket2",
  "switchboard-remote-crypto",
  "thiserror 2.0.18",
  "tokio",

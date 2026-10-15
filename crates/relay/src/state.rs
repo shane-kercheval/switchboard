@@ -13,9 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use tokio::sync::OwnedSemaphorePermit;
 
-use crate::outbox::Outbox;
+use crate::outbox::{NotQueued, Outbox, frame_cost};
 use crate::protocol::{
     DeviceId, ErrorCode, PAIRING_TOKEN_LEN, Role, ServerMessage, TOKEN_HASH_LEN, token_hash,
 };
@@ -57,34 +56,6 @@ impl Pairing {
     fn candidate(&self, now: Instant) -> Option<&DeviceId> {
         self.bound.as_ref().filter(|_| now < self.expires_at)
     }
-}
-
-/// Where `route` sends a frame: the recipient's queue, and the generation of
-/// the registration it belongs to.
-#[derive(Debug)]
-pub(crate) struct Route {
-    pub outbox: Outbox,
-    pub generation: u64,
-}
-
-impl Route {
-    fn to(peer: &Peer) -> Self {
-        Self {
-            outbox: peer.outbox.clone(),
-            generation: peer.generation,
-        }
-    }
-}
-
-/// A frame `route` let through, with room reserved for it at the recipient
-/// `route` named, waiting for `commit` to queue it.
-pub(crate) struct Pending {
-    pub to: DeviceId,
-    pub pairing_token: Option<[u8; PAIRING_TOKEN_LEN]>,
-    /// The recipient's generation when it was routed.
-    pub recipient: u64,
-    pub frame: ServerMessage,
-    pub room: OwnedSemaphorePermit,
 }
 
 /// Why a registration, a frame, or a set was refused, sent back as `error`.
@@ -139,6 +110,15 @@ impl Refusal {
             device_id: None,
             last_seen: None,
         }
+    }
+
+    /// The recipient had no room for a frame and has been closed.
+    fn recipient_full(recipient: &DeviceId) -> Self {
+        Self::about(
+            ErrorCode::RecipientFull,
+            "that device had no room for the frame and has been disconnected",
+            recipient,
+        )
     }
 
     fn mac_only() -> Self {
@@ -420,20 +400,48 @@ impl Relay {
         }
     }
 
+    /// Queues a frame from `from` for `to`, without waiting, or returns why
+    /// it may not pass. A recipient with no room for it is closed, and this
+    /// frame and any that reach it while it closes are refused as
+    /// `recipient_full`. A frame for a recipient closing for another reason
+    /// is dropped: its sender hears of that through `peer_disconnected`.
+    pub fn forward(
+        &mut self,
+        from: &DeviceId,
+        generation: u64,
+        to: &DeviceId,
+        record: Vec<u8>,
+        pairing_token: Option<[u8; PAIRING_TOKEN_LEN]>,
+        now: Instant,
+    ) -> Result<(), Refusal> {
+        let outbox = self.route(from, generation, to, pairing_token.as_ref(), now)?;
+        let cost = frame_cost(record.len());
+        let frame = ServerMessage::Frame {
+            to: to.clone(),
+            from: from.clone(),
+            record,
+            pairing_token,
+        };
+        match outbox.queue_frame(frame, cost) {
+            Ok(()) | Err(NotQueued::Closed) => Ok(()),
+            Err(NotQueued::Full) => Err(Refusal::recipient_full(to)),
+        }
+    }
+
     /// Where a frame from `from` to `to` goes, or why it may not. A phone
     /// reaches only the Mac it names, and only if that Mac's set holds it
     /// or it presents that Mac's open pairing token. A Mac reaches only a
     /// phone in its set or bound to its token, and only if that phone names
     /// it. Pairing is checked before connectivity, so a refused device never
     /// learns whether the other is connected.
-    pub fn route(
+    fn route(
         &mut self,
         from: &DeviceId,
         generation: u64,
         to: &DeviceId,
         pairing_token: Option<&[u8; PAIRING_TOKEN_LEN]>,
         now: Instant,
-    ) -> Result<Route, Refusal> {
+    ) -> Result<&Outbox, Refusal> {
         let Some(sender) = self
             .registered
             .get(from)
@@ -448,36 +456,6 @@ impl Relay {
         }
     }
 
-    /// Queues `pending`, a frame from `from` routed and then given room
-    /// while no lock was held, if it may still go. Checked under the same
-    /// lock registrations change under, so a frame from a replaced
-    /// connection never follows the notice of its end. If the sender or the
-    /// recipient has been replaced or has gone, the frame is dropped: the
-    /// sender has been, or will be, told so. If the pair may no longer
-    /// reach each other — unpaired, or a pairing window expired — the
-    /// refusal is returned, as from `route`. A pairing token presented again
-    /// binds nothing new: it is bound to this phone already.
-    pub fn commit(
-        &mut self,
-        from: &DeviceId,
-        generation: u64,
-        pending: Pending,
-        now: Instant,
-    ) -> Result<(), Refusal> {
-        if !self.is_current(from, generation) || !self.is_current(&pending.to, pending.recipient) {
-            return Ok(());
-        }
-        let route = self.route(
-            from,
-            generation,
-            &pending.to,
-            pending.pairing_token.as_ref(),
-            now,
-        )?;
-        route.outbox.enqueue_frame(pending.frame, pending.room);
-        Ok(())
-    }
-
     /// From `phone` to `to`, the Mac it names.
     fn route_from_phone(
         &mut self,
@@ -485,7 +463,7 @@ impl Relay {
         to: &DeviceId,
         pairing_token: Option<&[u8; PAIRING_TOKEN_LEN]>,
         now: Instant,
-    ) -> Result<Route, Refusal> {
+    ) -> Result<&Outbox, Refusal> {
         let Some(phones) = self.held_sets.get(to) else {
             // A Mac the relay holds no set for: one it does not know, or one
             // that has not registered since the relay restarted.
@@ -498,7 +476,7 @@ impl Relay {
             }
         }
         match self.registered.get(to) {
-            Some(peer) if peer.kind == Kind::Mac => Ok(Route::to(peer)),
+            Some(peer) if peer.kind == Kind::Mac => Ok(&peer.outbox),
             _ => Err(Refusal::mac_offline(to, self.last_seen.get(to).copied())),
         }
     }
@@ -536,7 +514,7 @@ impl Relay {
         mac: &DeviceId,
         to: &DeviceId,
         now: Instant,
-    ) -> Result<Route, Refusal> {
+    ) -> Result<&Outbox, Refusal> {
         let in_set = self
             .held_sets
             .get(mac)
@@ -551,7 +529,7 @@ impl Relay {
         }
         match self.registered.get(to) {
             Some(peer) if matches!(&peer.kind, Kind::Phone { mac: of } if of == mac) => {
-                Ok(Route::to(peer))
+                Ok(&peer.outbox)
             }
             Some(_) => Err(Refusal::not_paired(to)),
             None => Err(Refusal::about(
@@ -569,7 +547,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::outbox::{MIN_FRAME_COST, Progress, Wait, Writer};
+    use crate::outbox::{MIN_FRAME_COST, Writer};
 
     struct Device {
         id: DeviceId,
@@ -614,8 +592,12 @@ mod tests {
     }
 
     fn register(relay: &mut Relay, n: u16, role: Role) -> Device {
+        register_with_budget(relay, n, role, 64 * MIN_FRAME_COST)
+    }
+
+    fn register_with_budget(relay: &mut Relay, n: u16, role: Role, queue_bytes: usize) -> Device {
         let closed = CancellationToken::new();
-        let (outbox, writer) = Outbox::new(64 * MIN_FRAME_COST, closed.clone(), Progress::new());
+        let (outbox, writer) = Outbox::new(queue_bytes, closed.clone());
         let generation = relay
             .register(id(n), role, outbox, wall(0), Instant::now())
             .unwrap();
@@ -629,7 +611,6 @@ mod tests {
         device
     }
 
-    /// Routes and delivers a frame, as the server does without the wait.
     fn send(
         relay: &mut Relay,
         from: &Device,
@@ -638,14 +619,14 @@ mod tests {
         token: Option<&[u8; PAIRING_TOKEN_LEN]>,
         now: Instant,
     ) -> Result<(), Refusal> {
-        let route = relay.route(&from.id, from.generation, to, token, now)?;
-        route.outbox.deliver(ServerMessage::Frame {
-            to: to.clone(),
-            from: from.id.clone(),
-            record: record.to_vec(),
-            pairing_token: token.copied(),
-        });
-        Ok(())
+        relay.forward(
+            &from.id,
+            from.generation,
+            to,
+            record.to_vec(),
+            token.copied(),
+            now,
+        )
     }
 
     fn code(result: Result<(), Refusal>) -> ErrorCode {
@@ -833,7 +814,7 @@ mod tests {
         for too_many in [vec![id(1), id(2), id(3)], vec![id(1); 3]] {
             let mut relay = Relay::new(2);
             let closed = CancellationToken::new();
-            let (outbox, _writer) = Outbox::new(64 * MIN_FRAME_COST, closed, Progress::new());
+            let (outbox, _writer) = Outbox::new(64 * MIN_FRAME_COST, closed);
             let refusal = relay
                 .register(
                     id(MAC),
@@ -1099,105 +1080,60 @@ mod tests {
         assert!(candidate.received().is_empty());
     }
 
-    /// Routes a frame from `from` to `to` and reserves its room, as the
-    /// server does before it waits; `commit` then queues it.
-    async fn routed(
-        relay: &mut Relay,
-        from: &Device,
-        to: &DeviceId,
-        token: Option<&[u8; PAIRING_TOKEN_LEN]>,
-        now: Instant,
-    ) -> Pending {
-        let route = relay
-            .route(&from.id, from.generation, to, token, now)
-            .unwrap();
-        let wait = Wait {
-            stall: Duration::from_secs(5),
-            room: Duration::from_mins(1),
-        };
-        let room = route
-            .outbox
-            .reserve(MIN_FRAME_COST, wait, &CancellationToken::new())
-            .await
-            .unwrap();
-        Pending {
-            to: to.clone(),
-            pairing_token: token.copied(),
-            recipient: route.generation,
-            frame: ServerMessage::Frame {
-                to: to.clone(),
-                from: from.id.clone(),
-                record: vec![7],
-                pairing_token: token.copied(),
-            },
-            room,
+    #[test]
+    fn frames_racing_to_a_full_recipient_are_each_refused_and_it_is_closed_once() {
+        let mut relay = Relay::new(8);
+        let mut first = register(&mut relay, 1, phone_role(MAC));
+        let mut second = register(&mut relay, 2, phone_role(MAC));
+        let mut mac = register_with_budget(
+            &mut relay,
+            MAC,
+            mac_role(&[&first, &second]),
+            2 * MIN_FRAME_COST,
+        );
+        let now = Instant::now();
+        send(&mut relay, &first, &mac.id, &[1], None, now).unwrap();
+        send(&mut relay, &second, &mac.id, &[2], None, now).unwrap();
+
+        for phone in [&first, &second] {
+            let refusal = send(&mut relay, phone, &mac.id, &[3], None, now).unwrap_err();
+            assert_eq!(refusal, Refusal::recipient_full(&mac.id));
+            assert!(!refusal.ends_connection());
         }
-    }
-
-    #[tokio::test]
-    async fn a_frame_whose_sender_was_replaced_while_it_waited_is_dropped_after_the_notice() {
-        let (mut relay, mut mac, old_phone) = paired();
-        let now = Instant::now();
-        let pending = routed(&mut relay, &old_phone, &mac.id, None, now).await;
-        let _new_phone = register(&mut relay, 1, phone_role(MAC));
-        relay
-            .commit(&old_phone.id, old_phone.generation, pending, now)
-            .unwrap();
+        assert!(mac.closed.is_cancelled());
         assert_eq!(
-            mac.received(),
-            vec![ServerMessage::PeerDisconnected {
-                device_id: old_phone.id.clone()
-            }]
+            mac.frames(),
+            vec![(first.id.clone(), vec![1]), (second.id.clone(), vec![2])]
+        );
+        // Room has come back, but the Mac has lost frames: it is still full.
+        assert_eq!(
+            code(send(&mut relay, &first, &mac.id, &[4], None, now)),
+            ErrorCode::RecipientFull
+        );
+
+        // Its connection ends once, however many senders found it full.
+        assert!(relay.unregister(&mac.id, mac.generation, wall(1), now));
+        assert!(!relay.unregister(&mac.id, mac.generation, wall(2), now));
+        for phone in [&mut first, &mut second] {
+            assert_eq!(
+                phone.received(),
+                vec![ServerMessage::PeerDisconnected {
+                    device_id: mac.id.clone()
+                }]
+            );
+        }
+        assert_eq!(
+            code(send(&mut relay, &first, &mac.id, &[5], None, now)),
+            ErrorCode::MacOffline
         );
     }
 
-    #[tokio::test]
-    async fn a_frame_whose_recipient_was_replaced_while_it_waited_is_dropped() {
-        let (mut relay, mac, phone) = paired();
-        let now = Instant::now();
-        let pending = routed(&mut relay, &mac, &phone.id, None, now).await;
-        let mut new_phone = register(&mut relay, 1, phone_role(MAC));
-        relay.commit(&mac.id, mac.generation, pending, now).unwrap();
-        assert!(new_phone.received().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_frame_that_may_no_longer_pass_once_it_has_room_is_refused() {
-        // Unpaired while it waited.
+    #[test]
+    fn a_frame_for_a_recipient_closing_for_another_reason_is_dropped_unrefused() {
         let (mut relay, mac, mut phone) = paired();
-        let now = Instant::now();
-        let pending = routed(&mut relay, &mac, &phone.id, None, now).await;
-        relay
-            .set_paired_devices(&mac.id, mac.generation, vec![])
-            .unwrap();
-        assert_eq!(
-            code(relay.commit(&mac.id, mac.generation, pending, now)),
-            ErrorCode::NotPaired
-        );
+        phone.closed.cancel();
+        send(&mut relay, &mac, &phone.id, &[1], None, Instant::now()).unwrap();
         assert!(phone.received().is_empty());
-
-        // Its pairing window expired while it waited.
-        let (mut relay, mut mac, candidate, opened) = pairing_mac();
-        let pending = routed(&mut relay, &candidate, &mac.id, Some(&TOKEN), opened).await;
-        assert_eq!(
-            code(relay.commit(
-                &candidate.id,
-                candidate.generation,
-                pending,
-                opened + MAX_PAIRING_WINDOW
-            )),
-            ErrorCode::PairingExpired
-        );
-        assert!(mac.received().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_frame_still_allowed_once_it_has_room_is_queued() {
-        let (mut relay, mac, mut phone) = paired();
-        let now = Instant::now();
-        let pending = routed(&mut relay, &mac, &phone.id, None, now).await;
-        relay.commit(&mac.id, mac.generation, pending, now).unwrap();
-        assert_eq!(phone.frames(), vec![(mac.id.clone(), vec![7])]);
     }
 
     #[test]

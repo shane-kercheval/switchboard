@@ -5,8 +5,6 @@
 //! happens, never how long it took.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::{Sink, SinkExt, Stream, StreamExt};
@@ -777,194 +775,170 @@ async fn a_burst_over_the_rate_limit_is_slowed_and_delivered_whole() {
     assert_eq!(phone.sync().await, vec![]);
 }
 
-#[tokio::test]
-async fn a_slow_reader_behind_a_burst_is_slowed_not_closed() {
-    // A budget of about twenty such frames, far below the burst.
-    let relay = start(Config {
+/// A budget of about one large frame, and no rate limit to speak of: a
+/// recipient that stops reading runs out of room once the socket buffers
+/// between it and the relay are full.
+fn small_budget() -> Config {
+    Config {
         queue_bytes: 96 * 1024,
+        rate_limit: 1_000_000,
+        rate_limit_bytes: 1 << 30,
+        ..Config::default()
+    }
+}
+
+fn large_record() -> Vec<u8> {
+    vec![0; 60_000]
+}
+
+fn is_recipient_full(message: &ServerMessage, recipient: &DeviceId) -> bool {
+    matches!(
+        message,
+        ServerMessage::Error { code: ErrorCode::RecipientFull, device_id: Some(id), .. }
+            if id == recipient
+    )
+}
+
+/// Sends `sender` large frames for `to`, which reads nothing, until the
+/// relay refuses one. Returns what the relay said, the refusal and the
+/// recipient's end announced once.
+async fn send_until_full(sender: &mut Client, to: &DeviceId) -> Vec<ServerMessage> {
+    let record = large_record();
+    for _ in 0..2_000 {
+        sender.frame(to, &record).await;
+        let mut said = sender.sync().await;
+        if said.is_empty() {
+            continue;
+        }
+        if said.len() == 1 {
+            said.push(sender.next().await);
+        }
+        return said;
+    }
+    panic!("a recipient that read nothing never ran out of room");
+}
+
+/// Reads the frames left for a closed client; whether the relay ended the
+/// socket with a close frame.
+async fn closes_with_a_close_frame(socket: &mut Socket) -> bool {
+    loop {
+        match tokio::time::timeout(WAIT, socket.next())
+            .await
+            .expect("the relay never closed the socket")
+        {
+            Some(Ok(Message::Close(_))) => return true,
+            Some(Ok(Message::Text(text))) => assert!(matches!(
+                serde_json::from_str(&text).unwrap(),
+                ServerMessage::Frame { .. }
+            )),
+            Some(Ok(_)) => {}
+            Some(Err(_)) | None => return false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_phone_with_no_room_is_closed_and_its_mac_told_and_kept() {
+    let relay = start(small_budget()).await;
+    let (mut mac, mut phone) = paired(&relay).await;
+    let phone_id = phone.id.clone();
+
+    let said = send_until_full(&mut mac, &phone_id).await;
+    assert!(is_recipient_full(&said[0], &phone_id), "{said:?}");
+    assert_eq!(said[1], notice(&phone_id));
+    assert_eq!(mac.sync().await, vec![]);
+    assert!(closes_with_a_close_frame(&mut phone.socket).await);
+}
+
+#[tokio::test]
+async fn a_phone_with_no_room_is_closed_and_the_macs_other_phone_gets_every_frame_in_order() {
+    let relay = start(small_budget()).await;
+    let mac_keys = new_keys();
+    let mac_id = id_of(&mac_keys);
+    let stopped = Client::phone(&relay, new_keys(), &mac_id).await;
+    let mut reading = Client::phone(&relay, new_keys(), &mac_id).await;
+    let mut mac = Client::mac(&relay, mac_keys, &[&stopped.id, &reading.id]).await;
+    let (stopped_id, reading_id) = (stopped.id.clone(), reading.id.clone());
+    let record = large_record();
+
+    let mut n = 0u32;
+    let mut said = loop {
+        assert!(n < 2_000, "a phone that read nothing never ran out of room");
+        mac.frame(&stopped_id, &record).await;
+        mac.frame(&reading_id, &n.to_be_bytes()).await;
+        assert_eq!(
+            reading.next().await,
+            frame_from(&mac_id, &reading_id, &n.to_be_bytes())
+        );
+        n += 1;
+        let said = mac.sync().await;
+        if !said.is_empty() {
+            break said;
+        }
+    };
+    assert!(is_recipient_full(&said[0], &stopped_id), "{said:?}");
+    if said.len() == 1 {
+        said.push(mac.next().await);
+    }
+    assert_eq!(said[1], notice(&stopped_id));
+
+    // The Mac was never held: what it sends next reaches the other phone.
+    for n in n..n + 10 {
+        mac.frame(&reading_id, &n.to_be_bytes()).await;
+        assert_eq!(
+            reading.next().await,
+            frame_from(&mac_id, &reading_id, &n.to_be_bytes())
+        );
+    }
+    assert_eq!(reading.sync().await, vec![]);
+    drop(stopped);
+}
+
+#[tokio::test]
+async fn a_mac_with_no_room_is_closed_and_its_phone_told_and_kept() {
+    let relay = start(small_budget()).await;
+    let (mut mac, mut phone) = paired(&relay).await;
+    let mac_id = mac.id.clone();
+
+    let said = send_until_full(&mut phone, &mac_id).await;
+    assert!(is_recipient_full(&said[0], &mac_id), "{said:?}");
+    assert_eq!(said[1], notice(&mac_id));
+    phone.frame(&mac_id, b"after").await;
+    assert_eq!(error_code(&phone.next().await), ErrorCode::MacOffline);
+    assert!(closes_with_a_close_frame(&mut mac.socket).await);
+}
+
+#[tokio::test]
+async fn a_burst_within_the_budget_to_a_slow_reader_is_delivered_whole() {
+    // Twenty frames at the least a frame is charged fit a budget of 96 KiB
+    // with none of them sent.
+    let relay = start(small_budget()).await;
+    let (mut mac, mut phone) = paired(&relay).await;
+    for n in 0..20u8 {
+        mac.frame(&phone.id, &[n]).await;
+    }
+    for n in 0..20u8 {
+        assert_eq!(phone.next().await, frame_from(&mac.id, &phone.id, &[n]));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(mac.sync().await, vec![]);
+    assert_eq!(phone.sync().await, vec![]);
+}
+
+#[tokio::test]
+async fn a_phone_that_stops_reading_and_is_sent_nothing_is_closed_when_idle() {
+    // The relay pings both. The Mac reads, so answers; the phone reads
+    // nothing, so answers nothing, and its idle timeout runs out.
+    let relay = start(Config {
+        idle_timeout: Duration::from_secs(2),
+        ping_interval: Duration::from_millis(200),
         ..Config::default()
     })
     .await;
     let (mut mac, mut phone) = paired(&relay).await;
-    let phone_id = phone.id.clone();
-    let reader = tokio::spawn(async move {
-        for n in 0..300u16 {
-            match phone.next().await {
-                ServerMessage::Frame { record, .. } => {
-                    assert_eq!(record[..2], n.to_be_bytes());
-                }
-                other => panic!("expected frame {n}, got {other:?}"),
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        phone
-    });
-    for n in 0..300u16 {
-        let mut record = n.to_be_bytes().to_vec();
-        record.resize(4096, 0);
-        mac.frame(&phone_id, &record).await;
-    }
-    let mut phone = reader.await.unwrap();
-    assert_eq!(phone.sync().await, vec![]);
+    assert_eq!(mac.next().await, notice(&phone.id));
     assert_eq!(mac.sync().await, vec![]);
-}
-
-#[tokio::test]
-async fn a_phone_that_stops_reading_is_closed_and_its_mac_told() {
-    let relay = start(Config {
-        queue_bytes: 96 * 1024,
-        stall_timeout: Duration::from_millis(300),
-        rate_limit_bytes: 1 << 30,
-        ..Config::default()
-    })
-    .await;
-    let (mac, phone) = paired(&relay).await;
-    let phone_id = phone.id.clone();
-    let (mut to_relay, mut from_relay) = mac.socket.split();
-    // Large frames, until the socket buffers between the relay and the
-    // phone are full and the relay's queue with them; the phone reads none.
-    let sending = tokio::spawn({
-        let phone_id = phone_id.clone();
-        async move {
-            let record = vec![0; 60_000];
-            for _ in 0..2_000 {
-                let text = serde_json::to_string(&frame_message(&phone_id, &record)).unwrap();
-                if to_relay.send(Message::Text(text.into())).await.is_err() {
-                    return;
-                }
-            }
-        }
-    });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let message = tokio::time::timeout_at(deadline, from_relay.next())
-            .await
-            .expect("the stalled phone was never closed");
-        if let Some(Ok(Message::Text(text))) = message
-            && serde_json::from_str::<ServerMessage>(&text).unwrap() == notice(&phone_id)
-        {
-            break;
-        }
-    }
-    sending.abort();
-    drop(phone);
-}
-
-fn large_frame(to: &DeviceId) -> Message {
-    let text = serde_json::to_string(&frame_message(to, &vec![0; 60_000])).unwrap();
-    Message::Text(text.into())
-}
-
-#[tokio::test]
-async fn a_mac_waiting_on_a_phone_that_stopped_reading_still_hears_the_relays_pings() {
-    let relay = start(Config {
-        queue_bytes: 96 * 1024,
-        stall_timeout: Duration::from_mins(1),
-        // High enough that only the wait at the phone holds the Mac up.
-        rate_limit: 1_000_000,
-        rate_limit_bytes: 1 << 30,
-        ping_interval: Duration::from_millis(100),
-        ..Config::default()
-    })
-    .await;
-    let (mac, phone) = paired(&relay).await;
-    let (mut to_relay, mut from_relay) = mac.socket.split();
-    // More than every buffer between the Mac and the phone holds: the
-    // relay stops reading the Mac while it waits for room at the phone.
-    let frame = large_frame(&phone.id);
-    let sending = tokio::spawn(async move {
-        for _ in 0..2_000 {
-            to_relay.send(frame.clone()).await.unwrap();
-        }
-    });
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let mut pings = 0;
-    while pings < 5 {
-        match tokio::time::timeout(WAIT, from_relay.next()).await {
-            Ok(Some(Ok(Message::Ping(_)))) => pings += 1,
-            Ok(Some(Ok(_))) => {}
-            other => panic!("the relay stopped pinging the Mac: {other:?}"),
-        }
-    }
-    assert!(
-        !sending.is_finished(),
-        "the relay never stopped reading the Mac"
-    );
-    sending.abort();
-    drop(phone);
-}
-
-#[tokio::test]
-async fn a_phone_that_stops_reading_is_closed_and_its_macs_other_phone_gets_every_frame() {
-    let relay = start(Config {
-        queue_bytes: 96 * 1024,
-        stall_timeout: Duration::from_millis(300),
-        rate_limit_bytes: 1 << 30,
-        ..Config::default()
-    })
-    .await;
-    let mac_keys = new_keys();
-    let mac_id = id_of(&mac_keys);
-    let stalled = Client::phone(&relay, new_keys(), &mac_id).await;
-    let mut reading = Client::phone(&relay, new_keys(), &mac_id).await;
-    let mac = Client::mac(&relay, mac_keys, &[&stalled.id, &reading.id]).await;
-    let (stalled_id, reading_id) = (stalled.id.clone(), reading.id.clone());
-    let (mut to_relay, mut from_relay) = mac.socket.split();
-
-    let told = Arc::new(AtomicBool::new(false));
-    let listening = tokio::spawn({
-        let told = Arc::clone(&told);
-        let notice = notice(&stalled_id);
-        async move {
-            while let Some(Ok(message)) = from_relay.next().await {
-                if let Message::Text(text) = message
-                    && serde_json::from_str::<ServerMessage>(&text).unwrap() == notice
-                {
-                    told.store(true, Ordering::SeqCst);
-                }
-            }
-        }
-    });
-    // Each large frame for the stalled phone is followed by a numbered one
-    // for the reading phone, until a few rounds after the relay reports the
-    // stalled phone gone. Returns how many numbered frames went out.
-    let mut sending = tokio::spawn({
-        let reading_id = reading_id.clone();
-        async move {
-            let large = large_frame(&stalled_id);
-            let mut after_told = 0;
-            for n in 0..5_000u32 {
-                to_relay.send(large.clone()).await.unwrap();
-                let small = serde_json::to_string(&frame_message(&reading_id, &n.to_be_bytes()));
-                to_relay
-                    .send(Message::Text(small.unwrap().into()))
-                    .await
-                    .unwrap();
-                if told.load(Ordering::SeqCst) {
-                    after_told += 1;
-                    if after_told == 10 {
-                        return n + 1;
-                    }
-                }
-            }
-            panic!("the stalled phone was never closed");
-        }
-    });
-
-    let mut sent = None;
-    let mut received = 0u32;
-    while sent != Some(received) {
-        assert_eq!(
-            reading.next().await,
-            frame_from(&mac_id, &reading_id, &received.to_be_bytes())
-        );
-        received += 1;
-        if sent.is_none() && sending.is_finished() {
-            sent = Some((&mut sending).await.unwrap());
-        }
-    }
-    listening.abort();
-    drop(stalled);
+    assert_eq!(until_closed(&mut phone.socket).await, vec![]);
 }
 
 #[tokio::test]
@@ -1177,225 +1151,4 @@ async fn shutdown_closes_every_connection_with_a_close_frame_before_returning() 
         .expect("shutdown did not return")
         .unwrap()
         .unwrap();
-}
-
-/// Waiting for room through real sockets. Linux only: elsewhere the relay
-/// leaves the kernel's unsent bytes unlimited, so the kernel reports
-/// progress too coarsely for a slow phone to be told from a stalled one, and
-/// a test cannot know which frame is the one left waiting.
-#[cfg(target_os = "linux")]
-mod slow_reader {
-    use std::future::Future;
-    use std::io;
-    use std::pin::Pin;
-    use std::sync::atomic::AtomicU16;
-    use std::task::{Context, Poll, ready};
-
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-    use tokio::net::TcpSocket;
-    use tokio_tungstenite::client_async;
-
-    use super::*;
-
-    /// A socket that hands over at most `CHUNK` bytes a read, with a pause
-    /// after each: a phone on a slow link.
-    struct Slow {
-        stream: TcpStream,
-        pause: Option<Pin<Box<tokio::time::Sleep>>>,
-    }
-
-    const CHUNK: usize = 2048;
-    /// Frames the Mac sends: far more than the phone's budget and the
-    /// kernel's few unsent bytes hold, so while the phone reads, the relay's
-    /// reader waits for room.
-    const SENT: u16 = 30;
-
-    impl AsyncRead for Slow {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            let this = self.get_mut();
-            if let Some(pause) = &mut this.pause {
-                ready!(pause.as_mut().poll(cx));
-                this.pause = None;
-            }
-            let mut chunk = [0; CHUNK];
-            let len = CHUNK.min(buf.remaining());
-            let mut limited = ReadBuf::new(&mut chunk[..len]);
-            ready!(Pin::new(&mut this.stream).poll_read(cx, &mut limited))?;
-            buf.put_slice(limited.filled());
-            if !limited.filled().is_empty() {
-                this.pause = Some(Box::pin(tokio::time::sleep(Duration::from_millis(20))));
-            }
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl AsyncWrite for Slow {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.get_mut().stream).poll_flush(cx)
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
-        }
-    }
-
-    /// A registered phone on a slow link, with a small receive buffer so the
-    /// relay's writes wait on its reads rather than filling kernel buffers.
-    async fn slow_phone(
-        relay: &RelayHandle,
-        keys: &DeviceKeys,
-        mac: &DeviceId,
-    ) -> WebSocketStream<Slow> {
-        let tcp = TcpSocket::new_v4().unwrap();
-        tcp.set_recv_buffer_size(4096).unwrap();
-        let stream = tcp.connect(relay.addr()).await.unwrap();
-        let (mut phone, _) = client_async(
-            relay.url(),
-            Slow {
-                stream,
-                pause: None,
-            },
-        )
-        .await
-        .unwrap();
-        let Some(ServerMessage::Challenge { nonce, .. }) = next(&mut phone).await else {
-            panic!("expected a challenge");
-        };
-        send(&mut phone, &register_message(keys, &nonce, phone_role(mac))).await;
-        assert_eq!(next(&mut phone).await, Some(ServerMessage::Registered));
-        phone
-    }
-
-    #[tokio::test]
-    async fn a_phone_reading_slowly_but_steadily_is_waited_for_not_closed() {
-        // Each frame takes the phone several stall periods to take in, while
-        // its socket keeps accepting bytes: progress, not a stall.
-        let relay = start(Config {
-            queue_bytes: 96 * 1024,
-            stall_timeout: Duration::from_millis(300),
-            rate_limit: 1_000_000,
-            rate_limit_bytes: 1 << 30,
-            ..Config::default()
-        })
-        .await;
-        let mac_keys = new_keys();
-        let mac_id = id_of(&mac_keys);
-        let phone_keys = new_keys();
-        let phone_id = id_of(&phone_keys);
-        let mut phone = slow_phone(&relay, &phone_keys, &mac_id).await;
-
-        let mac = Client::mac(&relay, mac_keys, &[&phone_id]).await;
-        let (mut to_relay, mut from_relay) = mac.socket.split();
-        let told = Arc::new(AtomicBool::new(false));
-        let listening = tokio::spawn({
-            let told = Arc::clone(&told);
-            let notice = notice(&phone_id);
-            async move {
-                while let Some(Ok(message)) = from_relay.next().await {
-                    if let Message::Text(text) = message
-                        && serde_json::from_str::<ServerMessage>(&text).unwrap() == notice
-                    {
-                        told.store(true, Ordering::SeqCst);
-                    }
-                }
-            }
-        });
-        let sending = tokio::spawn({
-            let phone_id = phone_id.clone();
-            async move {
-                for n in 0..SENT {
-                    let mut record = n.to_be_bytes().to_vec();
-                    record.resize(60_000, 0);
-                    let text = serde_json::to_string(&frame_message(&phone_id, &record)).unwrap();
-                    to_relay.send(Message::Text(text.into())).await.unwrap();
-                }
-            }
-        });
-        let received = Arc::new(AtomicU16::new(0));
-        let reading = tokio::spawn({
-            let received = Arc::clone(&received);
-            async move {
-                while let Some(message) = next(&mut phone).await {
-                    match message {
-                        ServerMessage::Frame { record, .. } => {
-                            let n = received.load(Ordering::SeqCst);
-                            assert_eq!(record[..2], n.to_be_bytes());
-                            received.store(n + 1, Ordering::SeqCst);
-                        }
-                        other => panic!("expected a frame, got {other:?}"),
-                    }
-                }
-                panic!("the slow phone was closed");
-            }
-        });
-
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(
-            !told.load(Ordering::SeqCst),
-            "the Mac was told the phone left"
-        );
-        assert!(!reading.is_finished(), "{:?}", reading.await);
-        // The phone has taken a few frames, and the rest are still behind the
-        // one its queue holds: the relay waited for room all along.
-        let received = received.load(Ordering::SeqCst);
-        assert!(
-            (1..SENT - 3).contains(&received),
-            "{received} of {SENT} frames arrived, so the relay never waited on the phone"
-        );
-        reading.abort();
-        sending.abort();
-        listening.abort();
-    }
-
-    #[tokio::test]
-    async fn the_idle_timeout_runs_from_a_message_not_from_the_wait_it_caused() {
-        // The phone never reads. The first frame fills its socket's few
-        // unsent bytes and holds most of its budget, so the second, the
-        // Mac's last message, waits for room until the room timeout closes
-        // the phone. The Mac is then closed an idle timeout after that frame
-        // arrived, a second after the wait, not an idle timeout after it.
-        let relay = start(Config {
-            queue_bytes: 96 * 1024,
-            idle_timeout: Duration::from_secs(5),
-            room_timeout: Duration::from_secs(4),
-            stall_timeout: Duration::from_mins(1),
-            rate_limit_bytes: 1 << 30,
-            ..Config::default()
-        })
-        .await;
-        let mac_keys = new_keys();
-        let mac_id = id_of(&mac_keys);
-        let phone_keys = new_keys();
-        let phone = slow_phone(&relay, &phone_keys, &mac_id).await;
-        let mut mac = Client::mac(&relay, mac_keys, &[&id_of(&phone_keys)]).await;
-        for _ in 0..2 {
-            mac.socket
-                .send(large_frame(&id_of(&phone_keys)))
-                .await
-                .unwrap();
-        }
-        // Midway between the fixed close, five seconds from now, and nine.
-        tokio::time::sleep(Duration::from_secs(7)).await;
-        let probe = serde_json::to_string(&frame_message(&nobody(), b"probe")).unwrap();
-        let _ = mac.socket.send(Message::Text(probe.into())).await;
-        while let Some(message) = next(&mut mac.socket).await {
-            assert!(
-                !matches!(&message, ServerMessage::Error { device_id: Some(id), .. } if *id == nobody()),
-                "the Mac was kept past its idle timeout"
-            );
-        }
-        drop(phone);
-    }
 }

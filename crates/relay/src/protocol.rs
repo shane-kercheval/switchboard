@@ -234,6 +234,10 @@ pub enum ErrorCode {
     /// The pairing token is unknown, expired, closed, or bound to another
     /// device.
     PairingExpired,
+    /// The recipient, named by `device_id`, had no room for this frame and
+    /// has been closed. The frame was not delivered; the sender's connection
+    /// stays open.
+    RecipientFull,
     #[serde(other)]
     Unknown,
 }

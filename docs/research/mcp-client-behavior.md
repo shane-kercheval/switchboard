@@ -190,3 +190,34 @@ Each with the measurement that settles it.
   A `wait_send` lost that way loses nothing; the send keeps running in the app.
 - `rmcp` 1.7 answers Claude Code's `server/discover` with 422, and Claude Code falls back to
   `initialize`. Harmless today; worth rechecking when `rmcp` is upgraded.
+
+## Later observations
+
+Measurements made after the milestones, each with how it was made.
+
+- **2026-10-14, the result size declaration in Claude Desktop's Code tab.** An orchestration
+  session in Desktop's Code tab (Local environment; the session ran Claude Code 2.1.295 inside
+  Desktop) called `read_conversation` on a server whose every tool declared
+  `_meta["anthropic/maxResultSizeChars"]` of 100,000. A 54.7 KB result was saved to a JSON file
+  and the model shown a 2 KB preview and the path; a 98,132-character result came back as an
+  error, "exceeds maximum allowed tokens", saved to a text file with no preview. Both are the
+  session's own messages, quoted by the orchestrating agent. The same day, `claude -p` 2.1.296
+  from the terminal delivered a 99,163-character `read_conversation` result inline in three
+  configurations: the server passed with `--mcp-config` with tool search off, the same with it
+  on, and the server registered with `claude mcp add` in the orchestration folder (Sonnet; the
+  raw `stream-json` tool result inspected). The versions differed, so these runs alone do not
+  separate "Desktop drops the declaration" from "2.1.296 started honoring it"; a third-party
+  report from July 2026 of Desktop's Code agent dropping per-tool `_meta` while the CLI honors
+  it points at Desktop
+  (<https://claudeissues.com/issue/78478-bug-claude-desktop-code-agent-drops-mcp-per-tool-meta-anthropic-maxresultsizecha>).
+  The error on the 98 KB result shows a token limit in play alongside the 50,000-character
+  one; at the 2.5 characters per token assumed above, 45,000 characters of dense JSON stays
+  under 25,000 tokens. What followed: a per-call `max_chars` on the five result-bearing tools
+  (the MCP plan's revision 34).
+- **2026-10-14, Claude Code's text caps, from its documentation** (<https://code.claude.com/docs/en/mcp>,
+  "Tool search for MCP server authors"): server instructions, and the description of a tool
+  that loads upfront, are cut at 4,096 characters; a description loaded through tool search at
+  16,384; the model sees only the text before the cut. Our instructions are about 2,900
+  characters and the longest tool description 1,650. A test pins the instructions under 4,096.
+- The Codex figure in E6 (about 10,000 tokens kept, head and tail, with a warning and a marker
+  where it cut) was measured on Codex 0.161.0 and has not been rechecked since.

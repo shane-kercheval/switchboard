@@ -69,7 +69,6 @@ use crate::commands::{
 use crate::error::AppError;
 use crate::state::{AppState, lock};
 
-use super::RESULT_BUDGET_CHARS;
 use super::budget::{BudgetSpec, CutSite};
 use super::error_code::error_code;
 use super::handle::AppStateHandle;
@@ -1225,20 +1224,23 @@ pub async fn wait_agent(
 /// evenly across recipients; recipients are never dropped; a cut reply reads
 /// on through `read_send_output` from where the cut ended.
 #[must_use]
-pub fn wait_send_budget(project_id: ProjectId, send_id: SendId) -> BudgetSpec {
+pub fn wait_send_budget(project_id: ProjectId, send_id: SendId, budget_chars: usize) -> BudgetSpec {
     BudgetSpec {
-        budget_chars: RESULT_BUDGET_CHARS,
+        budget_chars,
         droppable_list: None,
         read_with: Some("read_send_output"),
         pointer: Box::new(move |site: &CutSite<'_>| {
             let agent_id = site.ancestors.last()?.get("agent_id")?.clone();
-            Some(serde_json::json!({
-                "tool": "read_send_output",
-                "project_id": project_id,
-                "send_id": send_id,
-                "agent_id": agent_id,
-                "offset": site.kept_chars,
-            }))
+            Some(super::with_cap(
+                serde_json::json!({
+                    "tool": "read_send_output",
+                    "project_id": project_id,
+                    "send_id": send_id,
+                    "agent_id": agent_id,
+                    "offset": site.kept_chars,
+                }),
+                budget_chars,
+            ))
         }),
     }
 }

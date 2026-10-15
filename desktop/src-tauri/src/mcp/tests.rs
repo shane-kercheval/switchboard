@@ -188,6 +188,15 @@ async fn the_tool_list_is_the_catalog_and_declares_the_result_size() {
             .is_some_and(|i| i.contains("wait_send")),
         "the instructions describe the loop"
     );
+    // Claude Code cuts server instructions at 4,096 characters and shows the
+    // model only the text before the cut (its MCP documentation, "Tool search
+    // for MCP server authors"; recorded in docs/research/mcp-client-behavior.md).
+    assert!(
+        info.instructions
+            .as_deref()
+            .is_some_and(|i| i.chars().count() < 4_096),
+        "the instructions fit under Claude Code's cut"
+    );
     let tools = client.list_all_tools().await.unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     let expected: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
@@ -1253,6 +1262,194 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
         .collect();
     every.sort();
     assert_eq!(called, every, "every tool was called");
+}
+
+/// One client session against a fresh project, calling tools through the
+/// in-process router and returning each whole result envelope.
+struct Capped {
+    env: TestEnv,
+    project_id: ProjectId,
+    coder: AgentId,
+    router: axum::Router,
+    _shutdown: server::Shutdown,
+    session: String,
+    id: u64,
+}
+
+impl Capped {
+    async fn start() -> Self {
+        let (env, project_id, agents) = workflow_env().await;
+        let (router, shutdown) = in_process(&env);
+        let session = open_session(&router).await;
+        Self {
+            env,
+            project_id,
+            coder: agents[0],
+            router,
+            _shutdown: shutdown,
+            session,
+            id: 1,
+        }
+    }
+
+    async fn call(&mut self, name: &str, args: Value) -> Value {
+        self.id += 1;
+        let (is_error, body) =
+            call_in_process(&self.router, &self.session, self.id, name, &args).await;
+        assert!(!is_error, "{name} failed: {body}");
+        body
+    }
+
+    /// One send to the coder, scripted to reply with `reply`, waited to done.
+    async fn exchange(&mut self, reply: &str) -> Value {
+        self.env.adapter.push(Script::reply(reply));
+        let (project_id, coder) = (self.project_id, self.coder);
+        let sent = self
+            .call(
+                "send",
+                json!({ "project_id": project_id, "recipients": [coder], "text": "go" }),
+            )
+            .await;
+        let send_id = sent["result"]["send_id"].clone();
+        let waited = self
+            .call(
+                "wait_send",
+                json!({ "project_id": project_id, "send_id": send_id, "timeout_seconds": 10 }),
+            )
+            .await;
+        assert_eq!(waited["result"]["done"], true);
+        send_id
+    }
+}
+
+fn serialized_len(body: &Value) -> usize {
+    serde_json::to_string(body).unwrap().len()
+}
+
+/// The one cut's follow-up call, as a capped result lists it.
+fn hint_of(body: &Value) -> Value {
+    let cuts = body["truncated"].as_array().unwrap();
+    assert_eq!(cuts.len(), 1, "one reply was cut: {body}");
+    cuts[0]["read_with"].clone()
+}
+
+/// A hint's arguments, without the tool name it carries.
+fn args_of(hint: &Value) -> Value {
+    let mut args = hint.clone();
+    args.as_object_mut().unwrap().remove("tool");
+    args
+}
+
+/// `max_chars` keeps a conversation under the size a client can show: older
+/// items go first, the newest stays whole while it fits, a value below the
+/// floor is raised to it rather than refused, and a single item cut on its
+/// own lists a follow-up call that keeps the cap.
+#[tokio::test]
+async fn max_chars_keeps_a_conversation_under_the_size_asked_for() {
+    let mut t = Capped::start().await;
+    for i in 0..4 {
+        t.exchange(&format!("{i}-{}", "r".repeat(12_000))).await;
+    }
+    let project_id = t.project_id;
+
+    let whole = t
+        .call("read_conversation", json!({ "project_id": project_id }))
+        .await;
+    assert_eq!(
+        whole["items_omitted"], 0,
+        "four exchanges fit the full budget"
+    );
+
+    let capped = t
+        .call(
+            "read_conversation",
+            json!({ "project_id": project_id, "max_chars": 20_000 }),
+        )
+        .await;
+    assert!(serialized_len(&capped) <= 20_000);
+    assert!(capped["items_omitted"].as_u64().unwrap() > 0);
+    let items = capped["result"]["items"].as_array().unwrap();
+    assert!(
+        items.last().unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("3-"),
+        "the newest reply is kept whole"
+    );
+
+    let floored = t
+        .call(
+            "read_conversation",
+            json!({ "project_id": project_id, "max_chars": 5 }),
+        )
+        .await;
+    assert!(serialized_len(&floored) <= 10_000);
+
+    let newest_only = t
+        .call(
+            "read_conversation",
+            json!({ "project_id": project_id, "last_n_items": 1, "max_chars": 10_000 }),
+        )
+        .await;
+    assert!(serialized_len(&newest_only) <= 10_000);
+    assert_eq!(hint_of(&newest_only)["max_chars"], 10_000);
+}
+
+/// A reply cut to a caller's cap lists a follow-up call that keeps the cap,
+/// so following it stays under the size asked for; a page shrinks under the
+/// cap too; and the agent's latest answer, read or waited for, is cut the
+/// same way.
+#[tokio::test]
+async fn a_capped_reply_lists_a_follow_up_call_that_keeps_the_cap() {
+    let mut t = Capped::start().await;
+    // Long enough that following the capped result's hint still leaves text.
+    let send_id = t.exchange(&format!("4-{}", "r".repeat(30_000))).await;
+    let (project_id, coder) = (t.project_id, t.coder);
+
+    let waited = t
+        .call(
+            "wait_send",
+            json!({ "project_id": project_id, "send_id": send_id, "max_chars": 10_000 }),
+        )
+        .await;
+    assert!(serialized_len(&waited) <= 10_000);
+    let hint = hint_of(&waited);
+    assert_eq!(hint["max_chars"], 10_000, "the follow-up keeps the cap");
+    let rest = t.call("read_send_output", args_of(&hint)).await;
+    assert!(serialized_len(&rest) <= 10_000);
+    assert_eq!(rest["result"]["offset"], hint["offset"]);
+    assert!(
+        rest["result"]["next_offset"].is_number(),
+        "more remains after one capped page"
+    );
+
+    let page = t
+        .call(
+            "read_send_output",
+            json!({ "project_id": project_id, "send_id": send_id, "agent_id": coder, "max_chars": 12_000 }),
+        )
+        .await;
+    assert_eq!(page["result"]["text"].as_str().unwrap().len(), 7_000);
+    assert_eq!(page["result"]["next_offset"], 7_000);
+
+    let output = t
+        .call(
+            "read_agent_output",
+            json!({ "project_id": project_id, "agent_id": coder, "max_chars": 10_000 }),
+        )
+        .await;
+    assert!(serialized_len(&output) <= 10_000);
+    assert_eq!(hint_of(&output)["max_chars"], 10_000);
+
+    let idle = t
+        .call(
+            "wait_agent",
+            json!({ "project_id": project_id, "agent_id": coder, "max_chars": 10_000 }),
+        )
+        .await;
+    assert_eq!(idle["result"]["status"], "idle");
+    assert!(serialized_len(&idle) <= 10_000);
+    assert_eq!(hint_of(&idle)["max_chars"], 10_000);
 }
 
 // --- several orchestrators at once ---------------------------------------------------

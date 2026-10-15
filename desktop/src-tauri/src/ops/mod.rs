@@ -63,3 +63,39 @@ pub const RESULT_BUDGET_CHARS: usize = 100_000;
 /// Characters per page of [`read::read_send_output`]: the result budget less
 /// room for the envelope around the text.
 pub const OUTPUT_PAGE_CHARS: usize = 95_000;
+
+/// The smallest result budget a caller may ask for with `max_chars`: room
+/// for the envelope and one useful page of text.
+pub const MIN_RESULT_CHARS: usize = 10_000;
+
+/// The result budget for one call: the caller's `max_chars` clamped to
+/// [`MIN_RESULT_CHARS`]..=[`RESULT_BUDGET_CHARS`], or the full budget. A
+/// caller lowers it to fit its client: Claude Desktop's Code tab shows a
+/// result inline only under 50,000 characters.
+#[must_use]
+pub fn result_budget_chars(max_chars: Option<usize>) -> usize {
+    max_chars.map_or(RESULT_BUDGET_CHARS, |n| {
+        n.clamp(MIN_RESULT_CHARS, RESULT_BUDGET_CHARS)
+    })
+}
+
+/// A cut's follow-up call with the caller's cap kept: `max_chars` is added
+/// when the budget is below the full one, so following the hint stays under
+/// the size the caller asked for.
+#[must_use]
+pub fn with_cap(mut call: serde_json::Value, budget_chars: usize) -> serde_json::Value {
+    if budget_chars < RESULT_BUDGET_CHARS {
+        call["max_chars"] = serde_json::json!(budget_chars);
+    }
+    call
+}
+
+/// Characters of text a `read_send_output` page may hold within
+/// `budget_chars`: the budget less the envelope room the full budget leaves
+/// for [`OUTPUT_PAGE_CHARS`].
+#[must_use]
+pub fn output_page_chars(budget_chars: usize) -> usize {
+    budget_chars
+        .saturating_sub(RESULT_BUDGET_CHARS - OUTPUT_PAGE_CHARS)
+        .max(1)
+}

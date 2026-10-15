@@ -3,9 +3,12 @@
 //! (see `send::wait_send_budget`, `read::conversation_budget`,
 //! `read::agent_output_budget`), so M1's tests exercise what the tools ship.
 //!
-//! **What may be cut.** Only fields that hold free text, named by key:
-//! reply and message text, tool input and output, prompt bodies. Ids, names,
-//! paths, statuses, error codes, and error messages are never shortened —
+//! **What may be cut.** Only fields named `text`, the one name that holds
+//! free text in a result: replies, messages, an agent's latest answer. Every
+//! other value is kept whole, objects and arrays searched for `text` fields
+//! inside them. Ids, names (a workflow issue's `prompt`, a recipient's
+//! `input`), paths, statuses, error codes, and error messages are never
+//! shortened —
 //! "shrink the longest string" would otherwise pick a long error message or a
 //! path the caller needs whole, and a result that is valid JSON but names a
 //! truncated id is useless for the next call.
@@ -65,7 +68,7 @@ use serde_json::{Map, Value};
 use crate::error::AppError;
 
 /// Keys whose string values may be shortened.
-const CUTTABLE_KEYS: &[&str] = &["text", "output", "input", "prompt", "body"];
+const CUTTABLE_KEYS: &[&str] = &["text"];
 
 /// Where a cut field sits, for the caller to decide how its remainder is read.
 pub struct CutSite<'a> {
@@ -285,9 +288,8 @@ fn cut_evenly(budgeted: &mut Budgeted, spec: &BudgetSpec) -> Result<(), AppError
 }
 
 /// The envelope's size at any cap, computed without serializing it. Sizes
-/// are summed from the parts, never adjusted by subtraction: a cut structured
-/// field (a tool input object) can serialize *longer* than the object it
-/// replaced, because its quotes escape.
+/// are summed from the parts, never adjusted by subtraction: a cut field's
+/// record can make the envelope *longer* than the text it replaced.
 struct SizeModel<'a> {
     /// The envelope with every candidate field's value and every record
     /// removed.
@@ -384,13 +386,8 @@ impl<'a> SizeModel<'a> {
                         escapes.push((pos, extra));
                     }
                 }
-                // A string field costs its escaped text plus quotes; a
-                // structured field (a tool input object) costs its JSON text.
-                let full_cost = if candidate.structured {
-                    candidate.chars
-                } else {
-                    candidate.chars + extra + 2
-                };
+                // A field costs its escaped text plus quotes.
+                let full_cost = candidate.chars + extra + 2;
                 FieldModel {
                     candidate,
                     ancestors,
@@ -520,12 +517,8 @@ struct Candidate {
     /// JSON pointer.
     path: String,
     key: String,
-    /// The field's text: the string itself, or a structured field's JSON.
     text: String,
     chars: usize,
-    /// The field holds a non-string value (a tool input object), which is cut
-    /// as its JSON text.
-    structured: bool,
 }
 
 fn escape_pointer_token(key: &str) -> String {
@@ -537,29 +530,16 @@ fn collect_candidates(value: &Value, path: &str, out: &mut Vec<Candidate>) {
         Value::Object(map) => {
             for (key, child) in map {
                 let child_path = format!("{path}/{}", escape_pointer_token(key));
-                if CUTTABLE_KEYS.contains(&key.as_str()) {
-                    match child {
-                        Value::String(text) => out.push(Candidate {
+                match child {
+                    Value::String(text) if CUTTABLE_KEYS.contains(&key.as_str()) => {
+                        out.push(Candidate {
                             path: child_path,
                             key: key.clone(),
                             chars: text.chars().count(),
                             text: text.clone(),
-                            structured: false,
-                        }),
-                        Value::Null => {}
-                        other => {
-                            let text = serde_json::to_string(other).unwrap_or_default();
-                            out.push(Candidate {
-                                path: child_path,
-                                key: key.clone(),
-                                chars: text.chars().count(),
-                                text,
-                                structured: true,
-                            });
-                        }
+                        });
                     }
-                } else {
-                    collect_candidates(child, &child_path, out);
+                    other => collect_candidates(other, &child_path, out),
                 }
             }
         }
@@ -707,7 +687,7 @@ mod tests {
 
     #[test]
     fn a_field_with_no_paging_tool_says_so() {
-        let value = json!({ "items": [{ "kind": "tool", "output": "o".repeat(2_000) }] });
+        let value = json!({ "items": [{ "kind": "tool", "text": "o".repeat(2_000) }] });
         let fitted = fit(value, &spec(500, None)).unwrap();
         assert_eq!(fitted.truncated[0].read_with, None);
     }
@@ -749,13 +729,27 @@ mod tests {
     }
 
     #[test]
-    fn a_structured_tool_input_is_cut_as_its_json_text() {
-        let value =
-            json!({ "items": [{ "input": { "content": "c".repeat(2_000) }, "name": "Write" }] });
+    fn names_beside_long_text_stay_whole() {
+        let value = json!({
+            "issues": [{ "prompt": "code-review", "input": "worker", "text": "x".repeat(2_000) }]
+        });
         let fitted = fit(value, &spec(500, None)).unwrap();
-        assert!(fitted.result["items"][0]["input"].is_string());
-        assert_eq!(fitted.result["items"][0]["name"], "Write");
-        assert_eq!(fitted.truncated[0].path, "/items/0/input");
+        assert!(fitted.serialized_chars() <= 500);
+        assert_eq!(fitted.result["issues"][0]["prompt"], "code-review");
+        assert_eq!(fitted.result["issues"][0]["input"], "worker");
+        assert_eq!(fitted.truncated[0].path, "/issues/0/text");
+    }
+
+    #[test]
+    fn a_nested_answer_object_keeps_its_shape_and_has_its_text_cut() {
+        let value =
+            json!({ "output": { "text": "c".repeat(2_000), "send_id": "s" }, "status": "idle" });
+        let fitted = fit(value, &spec(500, None)).unwrap();
+        assert!(fitted.serialized_chars() <= 500);
+        assert!(fitted.result["output"].is_object());
+        assert_eq!(fitted.result["output"]["send_id"], "s");
+        assert_eq!(fitted.result["status"], "idle");
+        assert_eq!(fitted.truncated[0].path, "/output/text");
     }
 
     #[test]
@@ -797,13 +791,13 @@ mod round_three {
         // Cutting the short field too adds a second record, which costs more
         // than the characters it removes: the fitting caps form a window, and
         // the search must find it.
-        let value = json!({ "body": "b".repeat(20), "text": "t".repeat(1_000) });
+        let value = json!({ "a": { "text": "b".repeat(20) }, "b": { "text": "t".repeat(1_000) } });
         let fitted = fit(
             value,
-            &BudgetSpec::unpageable(180, None, "read_send_output"),
+            &BudgetSpec::unpageable(194, None, "read_send_output"),
         )
         .expect("caps 20 through 27 fit");
-        assert!(fitted.serialized_chars() <= 180);
+        assert!(fitted.serialized_chars() <= 194);
         assert_eq!(fitted.truncated.len(), 1, "only the long field is cut");
         assert_eq!(
             fitted.truncated[0].kept_chars, 27,
@@ -824,7 +818,7 @@ mod size_model {
         // (Hundreds more would not fit at all — each cut field's own record
         // costs about 80 characters — which is the single-item error.)
         let items: Vec<Value> = (0..100)
-            .map(|i| json!({ "item_kind": "tool", "output": "o".repeat(1_000 + i * 7) }))
+            .map(|i| json!({ "item_kind": "tool", "text": "o".repeat(1_000 + i * 7) }))
             .collect();
         let value = json!({ "items": [{ "kind": "agent_turn", "items": items }] });
         let before = serializations();

@@ -24,7 +24,7 @@ use crate::workflow_commands::{WorkflowListing, list_workflows_impl};
 use super::budget::{BudgetSpec, CutSite, json_escaped_len};
 use super::context::{CONTEXT_READ_WAIT, ContextFigures, ContextState, ContextStore};
 use super::ledger::SendStatus;
-use super::{OUTPUT_PAGE_CHARS, RESULT_BUDGET_CHARS};
+use super::with_cap;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -507,7 +507,9 @@ pub enum ReadFrom {
 /// running, failed, or was cancelled, or the app restarted since — the session
 /// file's is read, so the answer does not change across a restart. The stable
 /// way to read a long reply: a new turn on the same agent does not move this
-/// one.
+/// one. The page holds up to `page_chars` of text; the full budget's page is
+/// [`super::OUTPUT_PAGE_CHARS`].
+#[allow(clippy::too_many_arguments)] // One reader: the ids, the position, the copy, and the size.
 pub async fn read_send_output(
     state: &AppState,
     project_id: ProjectId,
@@ -515,6 +517,7 @@ pub async fn read_send_output(
     agent_id: AgentId,
     offset: usize,
     read_from: ReadFrom,
+    page_chars: usize,
     home_dir: &Path,
 ) -> Result<OutputPage, AppError> {
     let live_status = match state.ledger.send(send_id) {
@@ -536,6 +539,7 @@ pub async fn read_send_output(
                     recipient.status,
                     text,
                     offset,
+                    page_chars,
                     OutputSource::Live,
                 ));
             }
@@ -573,7 +577,9 @@ pub async fn read_send_output(
         _ => OutputSource::Journal,
     };
     let text = turn.map_or("", |t| t.text.as_str());
-    Ok(page(send_id, agent_id, status, text, offset, source))
+    Ok(page(
+        send_id, agent_id, status, text, offset, page_chars, source,
+    ))
 }
 
 /// One of an agent's transcript turns, correlated to its send exactly as the
@@ -666,10 +672,11 @@ fn page(
     status: SendStatus,
     text: &str,
     offset: usize,
+    page_chars: usize,
     source: OutputSource,
 ) -> OutputPage {
     let total_chars = text.chars().count();
-    let mut budget = OUTPUT_PAGE_CHARS;
+    let mut budget = page_chars;
     let page: String = text
         .chars()
         .skip(offset)
@@ -810,9 +817,9 @@ pub async fn read_agent_output(
 /// file's copy, from where it was cut, when the turn has a send; a user
 /// message's cannot be read on.
 #[must_use]
-pub fn conversation_budget(project_id: ProjectId) -> BudgetSpec {
+pub fn conversation_budget(project_id: ProjectId, budget_chars: usize) -> BudgetSpec {
     BudgetSpec {
-        budget_chars: RESULT_BUDGET_CHARS,
+        budget_chars,
         droppable_list: Some("items"),
         read_with: Some("read_conversation with a smaller last_n_items"),
         pointer: Box::new(move |site: &CutSite<'_>| {
@@ -825,14 +832,17 @@ pub fn conversation_budget(project_id: ProjectId) -> BudgetSpec {
             let send_id = item.get("send_id")?.as_str()?;
             // The conversation's text is the session file's, so reading on
             // keeps to that copy (see `ReadFrom`).
-            Some(serde_json::json!({
-                "tool": "read_send_output",
-                "project_id": project_id,
-                "send_id": send_id,
-                "agent_id": item.get("agent_id")?.clone(),
-                "offset": site.kept_chars,
-                "read_from": ReadFrom::Transcript,
-            }))
+            Some(with_cap(
+                serde_json::json!({
+                    "tool": "read_send_output",
+                    "project_id": project_id,
+                    "send_id": send_id,
+                    "agent_id": item.get("agent_id")?.clone(),
+                    "offset": site.kept_chars,
+                    "read_from": ReadFrom::Transcript,
+                }),
+                budget_chars,
+            ))
         }),
     }
 }
@@ -841,9 +851,9 @@ pub fn conversation_budget(project_id: ProjectId) -> BudgetSpec {
 /// through `read_send_output`, from the copy its text came from, when the
 /// output has a send. A journal note is not a reply and has no read-on.
 #[must_use]
-pub fn agent_output_budget(project_id: ProjectId) -> BudgetSpec {
+pub fn agent_output_budget(project_id: ProjectId, budget_chars: usize) -> BudgetSpec {
     BudgetSpec {
-        budget_chars: RESULT_BUDGET_CHARS,
+        budget_chars,
         droppable_list: None,
         read_with: Some("read_send_output"),
         pointer: Box::new(move |site: &CutSite<'_>| {
@@ -855,14 +865,17 @@ pub fn agent_output_budget(project_id: ProjectId) -> BudgetSpec {
                 Some("journal") => return None,
                 _ => ReadFrom::Transcript,
             };
-            Some(serde_json::json!({
-                "tool": "read_send_output",
-                "project_id": project_id,
-                "send_id": send_id,
-                "agent_id": output.get("agent_id")?.clone(),
-                "offset": site.kept_chars,
-                "read_from": read_from,
-            }))
+            Some(with_cap(
+                serde_json::json!({
+                    "tool": "read_send_output",
+                    "project_id": project_id,
+                    "send_id": send_id,
+                    "agent_id": output.get("agent_id")?.clone(),
+                    "offset": site.kept_chars,
+                    "read_from": read_from,
+                }),
+                budget_chars,
+            ))
         }),
     }
 }

@@ -36,7 +36,6 @@ use uuid::Uuid;
 
 use crate::commands::ForwardSourceRef;
 use crate::error::AppError;
-use crate::ops::RESULT_BUDGET_CHARS;
 use crate::ops::budget::{BudgetSpec, Budgeted, fit};
 use crate::ops::change::{self, SelectionChange};
 use crate::ops::compact::{self, CompactRequest};
@@ -49,6 +48,7 @@ use crate::ops::send::{
 use crate::ops::usage;
 use crate::ops::wait::{ProgressHook, WaitBudget};
 use crate::ops::workflow::{self, RunWorkflowRequest};
+use crate::ops::{RESULT_BUDGET_CHARS, output_page_chars, result_budget_chars};
 use crate::state::AppState;
 
 /// The orchestration loop, sent once when a client connects.
@@ -79,8 +79,12 @@ and reconcile), check list_workflows for one the user saved.
 
 Results are JSON: {\"result\": …, \"truncated\": […], \"items_omitted\": n}. A result is kept \
 under 100,000 characters: long text may be cut, and each cut is listed in truncated with the \
-call that reads the rest (read_with), when there is one. An error is {\"code\": …, \
-\"message\": …}; the message says what to do.
+call that reads the rest (read_with), when there is one. max_chars on read_conversation, \
+read_send_output, read_agent_output, wait_send, and wait_agent lowers the limit for one call, and \
+the call a cut lists keeps it. Claude Desktop's Code tab shows a result inline only under 50,000 \
+characters and saves a larger one to a file: pass 45000 there. Codex keeps about 10,000 tokens \
+of a result and cuts the middle: pass 25000 there. An error is {\"code\": …, \"message\": …}; \
+the message says what to do.
 
 Some conditions need the user at the Mac, not a retry: a turn that failed with failure_kind \
 usage_limit or auth_failure; prompt_needs_sign_in (a prompt server's sign-in lapsed); \
@@ -194,16 +198,18 @@ tools! {
          cancelled), failures with their reason, and a compacted marker where an agent's context \
          was compacted (it may have lost earlier instructions there). Tool calls and thinking are \
          left out; the answer says what the agent did. last_n_items keeps only the newest items. \
-         When the whole would pass 100,000 characters, older items are left out whole \
+         When the whole would pass the budget (100,000 characters, or max_chars), older items \
+         are left out whole \
          (items_omitted says how many); a single answer too long on its own is cut, and \
          truncated names the read_send_output call that reads on.";
     ReadSendOutput = "read_send_output" (ReadSendOutputArgs) [Read]
         "One recipient's reply to one send, a page at a time, starting at offset (in \
-         characters). The way to read a reply that another result cut: pass the arguments its \
+         characters); a page holds up to 95,000 characters, less under max_chars. The way to \
+         read a reply that another result cut: pass the arguments its \
          truncated entry's read_with gives, read_from included. next_offset is where the next \
          page starts and is absent on the last page. Also reads a reply still running (the text \
          so far), failed, or cancelled.";
-    ReadAgentOutput = "read_agent_output" (AgentArgs) [Read]
+    ReadAgentOutput = "read_agent_output" (ReadAgentOutputArgs) [Read]
         "An agent's latest completed answer, including turns you did not send (the user's, a \
          workflow's), or the reason its latest turn failed or was cancelled. Carries the send_id \
          when known, so a long answer can be paged with read_send_output. To wait for a running \
@@ -401,12 +407,30 @@ pub struct AgentArgs {
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
+pub struct ReadAgentOutputArgs {
+    #[schemars(with = "String")]
+    project_id: ProjectId,
+    #[schemars(with = "String")]
+    agent_id: AgentId,
+    /// Keep the result under this many characters: 10,000 to 100,000, the
+    /// full 100,000 by default.
+    #[serde(default)]
+    max_chars: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
 pub struct ReadConversationArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
     /// Keep only this many of the newest items.
     #[serde(default)]
     last_n_items: Option<usize>,
+    /// Keep the result under this many characters: 10,000 to 100,000, the
+    /// full 100,000 by default.
+    #[serde(default)]
+    max_chars: Option<usize>,
 }
 
 /// Which copy of a reply to page.
@@ -448,6 +472,10 @@ pub struct ReadSendOutputArgs {
     /// an offset only holds in the copy it came from.
     #[serde(default)]
     read_from: ReadFromArg,
+    /// Keep the result under this many characters: 10,000 to 100,000, the
+    /// full 100,000 by default.
+    #[serde(default)]
+    max_chars: Option<usize>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -571,7 +599,7 @@ pub struct RunArgs {
 pub struct SendIdArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
-    /// The send_id that `send`, `forward`, `compact_agent`, or `fork_agent`
+    /// The `send_id` that `send`, `forward`, `compact_agent`, or `fork_agent`
     /// returned.
     #[schemars(with = "String")]
     send_id: SendId,
@@ -747,7 +775,7 @@ pub struct ForwardArgs {
     /// Text placed before the forwarded answers.
     #[serde(default)]
     text: Option<String>,
-    /// A saved prompt to send, rendered with its args; its forward_args fill
+    /// A saved prompt to send, rendered with its args; its `forward_args` fill
     /// arguments from sources.
     #[serde(default)]
     prompt: Option<ForwardPromptArg>,
@@ -806,13 +834,17 @@ pub struct RunWorkflowArgs {
 pub struct WaitSendArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
-    /// The send_id that `send`, `forward`, `compact_agent`, or `fork_agent`
+    /// The `send_id` that `send`, `forward`, `compact_agent`, or `fork_agent`
     /// returned.
     #[schemars(with = "String")]
     send_id: SendId,
     /// Seconds to wait before returning the current state. 50 by default.
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    /// Keep the result under this many characters: 10,000 to 100,000, the
+    /// full 100,000 by default.
+    #[serde(default)]
+    max_chars: Option<usize>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -826,6 +858,10 @@ pub struct WaitAgentArgs {
     /// Seconds to wait before returning the current state. 50 by default.
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    /// Keep the result under this many characters: 10,000 to 100,000, the
+    /// full 100,000 by default.
+    #[serde(default)]
+    max_chars: Option<usize>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -942,7 +978,10 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
             let a: ReadConversationArgs = parse(args)?;
             let digest =
                 read::read_conversation(state, a.project_id, a.last_n_items, cx.home()).await?;
-            Reply::fitted(&digest, read::conversation_budget(a.project_id))
+            Reply::fitted(
+                &digest,
+                read::conversation_budget(a.project_id, result_budget_chars(a.max_chars)),
+            )
         }
         ToolName::ReadSendOutput => {
             let a: ReadSendOutputArgs = parse(args)?;
@@ -954,16 +993,20 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                     a.agent_id,
                     a.offset,
                     a.read_from.into(),
+                    output_page_chars(result_budget_chars(a.max_chars)),
                     cx.home(),
                 )
                 .await?,
             )
         }
         ToolName::ReadAgentOutput => {
-            let a: AgentArgs = parse(args)?;
+            let a: ReadAgentOutputArgs = parse(args)?;
             let output =
                 read::read_agent_output(state, a.project_id, a.agent_id, cx.home()).await?;
-            Reply::fitted(&output, read::agent_output_budget(a.project_id))
+            Reply::fitted(
+                &output,
+                read::agent_output_budget(a.project_id, result_budget_chars(a.max_chars)),
+            )
         }
         ToolName::ListPrompts => {
             parse::<NoArgs>(args)?;
@@ -1137,14 +1180,20 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
             let a: WaitSendArgs = parse(args)?;
             let budget = cx.budget(a.timeout_seconds);
             let reply = send::wait_send(state, a.project_id, a.send_id, &budget, cx.home()).await?;
-            Reply::fitted(&reply, wait_send_budget(a.project_id, a.send_id))
+            Reply::fitted(
+                &reply,
+                wait_send_budget(a.project_id, a.send_id, result_budget_chars(a.max_chars)),
+            )
         }
         ToolName::WaitAgent => {
             let a: WaitAgentArgs = parse(args)?;
             let budget = cx.budget(a.timeout_seconds);
             let reply =
                 send::wait_agent(state, a.project_id, a.agent_id, &budget, cx.home()).await?;
-            Reply::fitted(&reply, read::agent_output_budget(a.project_id))
+            Reply::fitted(
+                &reply,
+                read::agent_output_budget(a.project_id, result_budget_chars(a.max_chars)),
+            )
         }
         ToolName::WaitWorkflow => {
             let a: WaitWorkflowArgs = parse(args)?;

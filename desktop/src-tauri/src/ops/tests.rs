@@ -989,6 +989,7 @@ async fn read_send_output_pages_one_reply_stably_while_the_agent_starts_a_new_tu
         agents[0],
         0,
         ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
         &env.home(),
     )
     .await
@@ -1016,6 +1017,7 @@ async fn read_send_output_pages_one_reply_stably_while_the_agent_starts_a_new_tu
         agents[0],
         OUTPUT_PAGE_CHARS * 2,
         ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
         &env.home(),
     )
     .await
@@ -1041,7 +1043,7 @@ async fn a_three_recipient_fan_out_with_long_replies_stays_under_the_budget() {
     let reply = wait_done(&env, project_id, receipt.send_id).await;
     let fitted = fit(
         serde_json::to_value(&reply).unwrap(),
-        &wait_send_budget(project_id, receipt.send_id),
+        &wait_send_budget(project_id, receipt.send_id, RESULT_BUDGET_CHARS),
     )
     .unwrap();
     assert!(fitted.serialized_chars() <= RESULT_BUDGET_CHARS);
@@ -1161,6 +1163,7 @@ async fn the_restart_fallback_answers_from_the_journal() {
         a,
         0,
         ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
         &env.home(),
     )
     .await
@@ -1539,6 +1542,7 @@ async fn create_send_forward_and_read_leave_the_expected_files() {
         reviewer.id,
         0,
         ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
         &env.home(),
     )
     .await
@@ -2023,6 +2027,7 @@ async fn a_page_is_sized_by_its_serialized_length() {
         agents[0],
         0,
         ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
         &env.home(),
     )
     .await
@@ -2056,11 +2061,21 @@ async fn a_long_conversation_fits_the_budget_with_its_newest_items_intact() {
         .unwrap();
     let fitted = fit(
         serde_json::to_value(&conversation).unwrap(),
-        &conversation_budget(project_id),
+        &conversation_budget(project_id, RESULT_BUDGET_CHARS),
     )
     .unwrap();
     assert!(fitted.serialized_chars() <= RESULT_BUDGET_CHARS);
     assert!(fitted.items_omitted > 0);
+    let smaller = fit(
+        serde_json::to_value(&conversation).unwrap(),
+        &conversation_budget(project_id, 30_000),
+    )
+    .unwrap();
+    assert!(smaller.serialized_chars() <= 30_000);
+    assert!(
+        smaller.items_omitted > fitted.items_omitted,
+        "a smaller budget drops more of the oldest items"
+    );
     let items = fitted.result["items"].as_array().unwrap();
     let newest = items.last().unwrap();
     assert_eq!(newest["kind"], "agent_turn");
@@ -2266,6 +2281,7 @@ async fn paging_after_a_restart_agrees_with_wait_send_on_a_failed_send() {
         a,
         0,
         ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
         &env.home(),
     )
     .await
@@ -2454,6 +2470,7 @@ async fn the_merged_conversation_and_reply_paging_agree_on_every_turn() {
             *agent_id,
             0,
             ReadFrom::Auto,
+            OUTPUT_PAGE_CHARS,
             &env.home(),
         )
         .await
@@ -2485,6 +2502,7 @@ async fn the_merged_conversation_and_reply_paging_agree_on_every_turn() {
         a,
         0,
         ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
         &env.home(),
     )
     .await
@@ -2670,7 +2688,7 @@ async fn a_turn_with_three_hundred_edits_comes_back_whole_in_the_conversation() 
         .unwrap();
     let fitted = fit(
         serde_json::to_value(&conversation).unwrap(),
-        &conversation_budget(project_id),
+        &conversation_budget(project_id, RESULT_BUDGET_CHARS),
     )
     .unwrap();
     assert!(fitted.truncated.is_empty(), "nothing needed cutting");
@@ -2732,7 +2750,7 @@ async fn cut_answer(
         .unwrap();
     let fitted = fit(
         serde_json::to_value(&conversation).unwrap(),
-        &conversation_budget(project_id),
+        &conversation_budget(project_id, RESULT_BUDGET_CHARS),
     )
     .unwrap();
     assert!(fitted.serialized_chars() <= RESULT_BUDGET_CHARS);
@@ -2777,6 +2795,7 @@ async fn read_on(env: &TestEnv, project_id: ProjectId, read_with: &serde_json::V
             agent_id,
             offset,
             read_from,
+            OUTPUT_PAGE_CHARS,
             &env.home(),
         )
         .await
@@ -2839,6 +2858,7 @@ async fn a_cancelled_partial_reply_reads_on_in_the_same_session() {
         agents[0],
         0,
         ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
         &env.home(),
     )
     .await
@@ -2975,6 +2995,7 @@ async fn a_reply_split_by_compaction_pages_the_piece_the_conversation_shows() {
         agents[0],
         0,
         ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
         &env.home(),
     )
     .await

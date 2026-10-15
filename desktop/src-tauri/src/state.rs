@@ -60,6 +60,28 @@ pub struct ActiveRun {
     pub done: Arc<tokio::sync::Notify>,
 }
 
+/// Agent removals as workflow starts see them, per project.
+#[derive(Debug, Default)]
+pub struct AgentRemovals {
+    /// Removals over agent access under way, counted because two can
+    /// overlap. Taken and checked while `workflow_runs` is held, so a
+    /// removal's "no run here" check and a run's registration cannot
+    /// interleave.
+    pub in_progress: HashMap<ProjectId, usize>,
+    /// Agents deleted so far, by either removal path. Advanced under
+    /// `registry_write` when a record is confirmed gone, and read under it with
+    /// the roster a run binds to, so a run whose roster predates a deletion is
+    /// refused at registration.
+    pub deletions: HashMap<ProjectId, u64>,
+}
+
+impl AgentRemovals {
+    #[must_use]
+    pub fn deletions(&self, project_id: ProjectId) -> u64 {
+        self.deletions.get(&project_id).copied().unwrap_or(0)
+    }
+}
+
 /// A live run's step progress. A run is only in the registry while running, so
 /// there is no terminal status here — terminal removes the entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,6 +552,13 @@ pub struct AppState {
     /// updates a run's step snapshot, the task removes the entry on terminal.
     pub workflow_runs: Arc<Mutex<HashMap<Uuid, ActiveRun>>>,
 
+    /// What a workflow start checks about agent removals, so a run cannot
+    /// start with an agent that is being or has just been removed: it could
+    /// run its first steps and then fail at that agent's. See
+    /// [`AgentRemovals`]. A leaf in the lock order: nothing is acquired while
+    /// holding it.
+    pub agent_removals: Mutex<AgentRemovals>,
+
     /// Fires OS notifications on a workflow run's completion/failure (suppressed
     /// when the window is focused). Defaults to a no-op; production injects the
     /// gated notifier via [`AppState::with_notifier`].
@@ -657,6 +686,7 @@ impl AppState {
             prompts: PromptService::disabled(),
             forwards: Mutex::new(HashMap::new()),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
+            agent_removals: Mutex::new(AgentRemovals::default()),
             notifier: Arc::new(NullNotifier),
             wake_lock: WakeLock::inert(),
             notification_gate: Arc::new(crate::notification::AuthorizationGate::new(Arc::new(

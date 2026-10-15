@@ -3575,6 +3575,11 @@ describe("desktop sync for another client's turn", () => {
     /// when the read was issued, as a read the backend already served would.
     rosterReads?: Gate;
     failOpen?: string;
+    /// `remove_agent` deletes the agent, then reports this error, as a save
+    /// that failed after the record went does.
+    failRemoveAfterDeleting?: string;
+    /// `remove_agent` rejects with this and deletes nothing.
+    failRemove?: string;
     failConversation?: boolean;
     projects?: ProjectListing[];
     pending?: { request_id: string; project_id: string }[];
@@ -3593,7 +3598,11 @@ describe("desktop sync for another client's turn", () => {
             return snapshot;
           }
           case "remove_agent":
+            if (backend.failRemove !== undefined) throw new Error(backend.failRemove);
             backend.roster = backend.roster.filter((a) => a.id !== args?.agentId);
+            if (backend.failRemoveAfterDeleting !== undefined) {
+              throw new Error(backend.failRemoveAfterDeleting);
+            }
             return undefined;
           case "rename_agent": {
             backend.roster = backend.roster.map((a) =>
@@ -4195,6 +4204,50 @@ describe("desktop sync for another client's turn", () => {
     expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([AGENT_1]);
     expect(state._testing.hasListener(AGENT_2)).toBe(false);
     expect(state._testing.hasListener(AGENT_1)).toBe(true);
+  });
+
+  it("drops an agent whose removal failed after its record was deleted", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend({
+      roster: [agent(AGENT_1, PROJECT_2), agent(AGENT_2, PROJECT_2)],
+      failRemoveAfterDeleting: "the agent was removed, but saving the change failed",
+    });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+
+    // The agent is gone, so the removal resolves; the error becomes a warning.
+    await ws.removeAgent(AGENT_2);
+
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([AGENT_1]);
+    expect(state._testing.hasListener(AGENT_2)).toBe(false);
+    expect(ws.agentRemovalWarnings).toEqual([
+      {
+        agentId: AGENT_2,
+        name: "agent-b",
+        message: "the agent was removed, but saving the change failed",
+      },
+    ]);
+    ws.dismissAgentRemovalWarning(AGENT_2);
+    expect(ws.agentRemovalWarnings).toEqual([]);
+  });
+
+  it("a removal that failed with the agent still listed rejects and warns of nothing", async () => {
+    const ws = await loadWorkspaceState();
+    const backend = installBackend({
+      roster: [agent(AGENT_1, PROJECT_2), agent(AGENT_2, PROJECT_2)],
+    });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+    backend.failRemove = "registry locked";
+
+    await expect(ws.removeAgent(AGENT_2)).rejects.toThrow("registry locked");
+
+    expect(backend.roster.map((a) => a.id)).toEqual([AGENT_1, AGENT_2]);
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([AGENT_1, AGENT_2]);
+    expect(ws.agentRemovalWarnings).toEqual([]);
   });
 
   it("ignores a roster notice for a project the window has not loaded", async () => {

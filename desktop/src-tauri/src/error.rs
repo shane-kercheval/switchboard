@@ -505,6 +505,33 @@ pub enum AppError {
     #[error("a failed or interrupted workflow run must be dismissed before starting another")]
     WorkflowRunRequiresDismissal { project_id: ProjectId },
 
+    /// A workflow start in a project where an agent is being removed, or was
+    /// removed while the start read the roster. Momentary: starting again reads
+    /// the roster as it is now.
+    #[error("an agent is being removed from this project; start the workflow again in a moment")]
+    WorkflowBlockedByAgentRemoval { project_id: ProjectId },
+
+    /// The agent's record is gone, but saving the change failed afterwards
+    /// (the folder could not be synced), so a crash could bring it back.
+    #[error(
+        "the agent was removed, but saving the change failed, so it may reappear after a crash: {source}"
+    )]
+    AgentRemovalNotDurable {
+        #[source]
+        source: switchboard_core::CoreError,
+    },
+
+    /// Saving the removal failed and the registry could not be read back, so
+    /// whether the record is gone is unknown. The agent refuses messages until
+    /// the app restarts, when the registry decides.
+    #[error(
+        "could not confirm the agent was removed ({source}); it refuses messages until Switchboard restarts"
+    )]
+    AgentRemovalUnconfirmed {
+        #[source]
+        source: switchboard_core::CoreError,
+    },
+
     /// Abandon was asked to clear a run that is still live. The interpreter would
     /// just recreate the file on its next record; cancel it first.
     #[error("workflow run {run_id} is still active; cancel it before abandoning")]

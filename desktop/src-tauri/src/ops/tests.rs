@@ -5288,3 +5288,234 @@ async fn a_stop_during_the_forks_creation_answers_request_in_progress_and_the_fo
     assert_eq!(resent.send.recipients[0].status, SendStatus::Accepted);
     assert_eq!(roster(&env, project_id).len(), 2, "the same fork, resumed");
 }
+
+/// A removal over agent access, held at its agent's drain: the agent's turn
+/// has finished but its stream stays open until `drain` fires, as Codex's does
+/// while it reads its rollout, so the removal waits there. Returns once the
+/// removal has closed the agent, which a send can no longer reach: that is
+/// the signal it is under way, not a guess at scheduling.
+async fn removal_held_at_drain(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent: AgentId,
+    drain: &Arc<Notify>,
+) -> tokio::task::JoinHandle<Result<super::change::RemovedAgent, AppError>> {
+    env.adapter.push(Script::reply("done").draining(drain));
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agent], "go"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        wait_done(env, project_id, receipt.send_id).await.recipients[0].status,
+        SendStatus::Completed
+    );
+    assert!(
+        env.state.dispatcher.accepts_now(agent).await,
+        "idle in its drain"
+    );
+    let removal = tokio::spawn(super::change::remove_agent(env.handle(), project_id, agent));
+    let started = tokio::time::Instant::now();
+    while env.state.dispatcher.accepts_now(agent).await {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the removal never closed the agent"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    removal
+}
+
+fn listed(env: &TestEnv, project_id: ProjectId, agent: AgentId) -> bool {
+    list_project_agents_readonly_impl(&env.state, project_id)
+        .unwrap()
+        .iter()
+        .any(|a| a.id == agent)
+}
+
+#[tokio::test]
+async fn a_removal_finishes_when_its_caller_is_cancelled() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let drain = Arc::new(Notify::new());
+    let caller = removal_held_at_drain(&env, project_id, agents[0], &drain).await;
+    // The tool call is cancelled mid-removal: its future is dropped.
+    caller.abort();
+    drain.notify_one();
+
+    let started = tokio::time::Instant::now();
+    while listed(&env, project_id, agents[0]) {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the removal stopped with its caller"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !env.state.dispatcher.accepts_now(agents[0]).await,
+        "nothing can start the removed agent"
+    );
+    let refused = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agents[0]], "again"),
+    )
+    .await;
+    assert!(refused.is_err(), "a send to it is refused: {refused:?}");
+    assert!(
+        lock(&env.state.agent_removals).in_progress.is_empty(),
+        "the project is free for workflows again"
+    );
+}
+
+#[tokio::test]
+async fn no_workflow_starts_while_an_agent_is_being_removed() {
+    let (env, project_id, agents) = workflow_env().await;
+    let drain = Arc::new(Notify::new());
+    let removal = removal_held_at_drain(&env, project_id, agents[2], &drain).await;
+
+    let refused = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(refused, AppError::WorkflowBlockedByAgentRemoval { .. }),
+        "{refused:?}"
+    );
+
+    drain.notify_one();
+    let removed = removal.await.unwrap().unwrap();
+    assert_eq!(removed.agent_id, agents[2]);
+    assert!(lock(&env.state.agent_removals).in_progress.is_empty());
+}
+
+#[tokio::test]
+async fn no_agent_is_removed_while_a_workflow_runs_and_the_run_is_untouched() {
+    let (env, project_id, agents) = workflow_env().await;
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("greeting", &gate));
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+
+    let refused = super::change::remove_agent(env.handle(), project_id, agents[2])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, AppError::RemoveAgentWorkflowRunning { .. }),
+        "{refused:?}"
+    );
+    assert!(listed(&env, project_id, agents[2]));
+    assert!(
+        lock(&env.state.agent_removals).in_progress.is_empty(),
+        "a refused removal holds nothing"
+    );
+    gate.notify_one();
+    let reply = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply.status, WorkflowRunStatus::Completed);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_record_deletion_leaves_the_agent_usable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let registry_dir = lock(&env.state.projects)
+        .get(&project_id)
+        .unwrap()
+        .registry_path
+        .parent()
+        .unwrap()
+        .to_owned();
+    let writable = std::fs::metadata(&registry_dir).unwrap().permissions();
+    std::fs::set_permissions(&registry_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = super::change::remove_agent(env.handle(), project_id, agents[0]).await;
+    std::fs::set_permissions(&registry_dir, writable).unwrap();
+
+    assert!(
+        failed.is_err(),
+        "the registry could not be written: {failed:?}"
+    );
+    assert!(
+        listed(&env, project_id, agents[0]),
+        "the agent is still there"
+    );
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agents[0]], "still here?"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        wait_done(&env, project_id, receipt.send_id)
+            .await
+            .recipients[0]
+            .status,
+        SendStatus::Completed,
+        "and it still works"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_registry_leaves_the_agent_blocked_and_nothing_else_deleted() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let registry = lock(&env.state.projects)
+        .get(&project_id)
+        .unwrap()
+        .registry_path
+        .clone();
+    let readable = std::fs::metadata(&registry).unwrap().permissions();
+    std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // The window's removal: it finds the agent in memory, so the registry is
+    // first read by the deletion itself. (Agent access reads the roster from
+    // the file first, and stops there with the read error.)
+    let failed = crate::commands::remove_agent_impl(&env.state, agents[0]).await;
+    std::fs::set_permissions(&registry, readable).unwrap();
+
+    assert!(
+        matches!(failed, Err(AppError::AgentRemovalUnconfirmed { .. })),
+        "whether the record went could not be told: {failed:?}"
+    );
+    assert!(
+        !env.state.dispatcher.accepts_now(agents[0]).await,
+        "the agent is blocked rather than reopened on a guess"
+    );
+    assert!(
+        listed(&env, project_id, agents[0]),
+        "its record was never touched"
+    );
+    assert!(
+        lock(&env.state.agents_by_id).contains_key(&agents[0]),
+        "nothing else was deleted"
+    );
+    assert_eq!(
+        lock(&env.state.agent_removals).deletions(project_id),
+        0,
+        "an unconfirmed deletion does not count as one"
+    );
+}

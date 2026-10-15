@@ -273,7 +273,10 @@ tools! {
          session file stays on disk, outside Switchboard. Remove an agent only when you are \
          confident it is no longer needed. Refused with agent_busy while the agent has a turn \
          running or queued (wait_agent for it, or cancel_agent to stop it) or a workflow runs in \
-         its project. Returns the removed agent's agent_id and name.";
+         its project. A message that reaches the agent while it is being removed is cancelled or \
+         refused, and no workflow can start in the project until the removal ends. Once begun, \
+         it finishes even if this call is cancelled. Returns the removed agent's agent_id and \
+         name.";
     DismissWorkflowRun = "dismiss_workflow_run" (RunArgs) [Acts]
         "Delete a failed or interrupted workflow run's record, which otherwise blocks every new \
          workflow in the project. Returns the step that failed and why, which this removes from \
@@ -1148,7 +1151,9 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
         }
         ToolName::RemoveAgent => {
             let a: AgentArgs = parse(args)?;
-            Reply::plain(&change::remove_agent(state, a.project_id, a.agent_id).await?)
+            Reply::plain(
+                &change::remove_agent(Arc::clone(&cx.handle), a.project_id, a.agent_id).await?,
+            )
         }
         ToolName::DismissWorkflowRun => {
             let a: RunArgs = parse(args)?;

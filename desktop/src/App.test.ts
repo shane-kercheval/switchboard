@@ -104,6 +104,9 @@ type Backend = {
   failOpenFor: Map<string, unknown>;
   failRelocateFor: Map<string, { message: string; applied: boolean }>;
   failDeleteFor: Map<string, string>;
+  // When set, `remove_agent` deletes the agent from its roster and then
+  // rejects with this message, as a save that failed after the record went.
+  failRemoveAfterDeleting: string | null;
   failConvoFor: Set<string>;
   failPickFor: Set<string>;
   // Git-view tracked repos returned by `list_tracked_repos` / `read_tracked_repo`.
@@ -144,6 +147,7 @@ function freshBackend(): Backend {
     failOpenFor: new Map(),
     failRelocateFor: new Map(),
     failDeleteFor: new Map(),
+    failRemoveAfterDeleting: null,
     failConvoFor: new Set(),
     failPickFor: new Set(),
     trackedRepos: [],
@@ -402,6 +406,16 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     // reading-mode tests) but otherwise inert — the suppression policy they feed
     // lives in Rust and is tested there.
     case "remove_agent":
+      if (backend.failRemoveAfterDeleting !== null) {
+        for (const [pid, roster] of backend.rosters) {
+          backend.rosters.set(
+            pid,
+            roster.filter((a) => a.id !== args?.agentId),
+          );
+        }
+        throw new Error(backend.failRemoveAfterDeleting);
+      }
+      return null;
     case "set_visible_project":
       return null;
     case "notify":
@@ -4789,6 +4803,54 @@ describe("App", () => {
     await waitFor(() => expect(screen.queryByTestId("command-palette")).toBeNull());
 
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
+  });
+
+  it("keeps the warning of a removal that deleted the agent but failed to save", async () => {
+    // The sidebar shows a removal error inside the agent's card, and the
+    // re-read that follows a failed removal drops the card when the agent is
+    // gone. The warning must outlive the card.
+    //
+    // jsdom has no Web Animations API, and the agent's actions menu asks for
+    // its running animations as the card it belongs to unmounts. Supplied for
+    // this test only: across the suite it changes how menus close in tests
+    // that depend on today's jsdom behavior.
+    const prototype = Element.prototype as { getAnimations?: () => Animation[] };
+    const hadGetAnimations = prototype.getAnimations !== undefined;
+    if (!hadGetAnimations) prototype.getAnimations = () => [];
+    try {
+      seedProject({
+        projectId: "p-a",
+        directory: DIR_A,
+        name: "alpha",
+        agents: [
+          agent({ id: "ag-1", project_id: "p-a", name: "assistant" }),
+          agent({ id: "ag-2", project_id: "p-a", name: "reviewer" }),
+        ],
+      });
+      await mountApp();
+      await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+      await fireEvent.click(screen.getByText("alpha"));
+      await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(2));
+      backend.failRemoveAfterDeleting =
+        "the agent was removed, but saving the change failed, so it may reappear after a crash";
+
+      const triggers = await screen.findAllByTestId("agent-actions-trigger");
+      await fireEvent.click(triggers[1]!);
+      await fireEvent.click(await screen.findByTestId("agent-action-remove"));
+      await fireEvent.click(screen.getByTestId("agent-remove-confirm"));
+
+      const banner = await screen.findByTestId("banner-agent-remove-warning-ag-2");
+      expect(banner).toHaveTextContent(
+        "reviewer: the agent was removed, but saving the change failed",
+      );
+      await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(1));
+      expect(screen.queryByTestId("agent-remove-error")).not.toBeInTheDocument();
+
+      await fireEvent.click(screen.getByTestId("banner-agent-remove-warning-ag-2-dismiss"));
+      expect(screen.queryByTestId("banner-agent-remove-warning-ag-2")).not.toBeInTheDocument();
+    } finally {
+      if (!hadGetAnimations) delete prototype.getAnimations;
+    }
   });
 
   it("keeps the way out of reading mode when the project's last agent is removed", async () => {

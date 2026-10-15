@@ -573,15 +573,26 @@ fn roster_for_project(state: &AppState, project_id: ProjectId) -> Vec<AgentRecor
 fn capture_run_snapshot(
     state: &AppState,
     project_id: ProjectId,
-) -> Result<(Project, u64, Vec<AgentRecord>), AppError> {
+) -> Result<RunSnapshotCapture, AppError> {
     let _write = lock(&state.registry_write);
     let project = lock(&state.projects)
         .get(&project_id)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(project_id))?;
     let generation = crate::commands::project_generation(state, project_id);
-    Ok((project, generation, roster_for_project(state, project_id)))
+    let deletions = lock(&state.agent_removals).deletions(project_id);
+    Ok((
+        project,
+        generation,
+        roster_for_project(state, project_id),
+        deletions,
+    ))
 }
+
+/// A run's view of its project from one instant under `registry_write`: the
+/// project, its generation, its roster, and the count of agents deleted from
+/// it as of that roster (registration refuses the run if the count has moved).
+type RunSnapshotCapture = (Project, u64, Vec<AgentRecord>, u64);
 
 /// The user-global workflows directory, or a clear error if no config dir was
 /// resolved (an exotic host with no home).
@@ -1286,16 +1297,29 @@ pub fn validate_workflow_invocation_impl(
 ///
 /// Enforces one run per project **atomically** under the registry lock: the
 /// existing-run check and the insert happen under one acquisition, so two
-/// concurrent invokes cannot both pass.
+/// concurrent invokes cannot both pass. Refuses, under the same acquisition, a
+/// project where an agent is being removed over agent access, or where an
+/// agent was deleted since the run read its roster (`deletions_seen`), so a
+/// run never starts bound to an agent that is going or gone (see
+/// [`AppState::agent_removals`]).
 fn register_live_run(
     state: &AppState,
     project_id: ProjectId,
+    deletions_seen: u64,
     run_id: uuid::Uuid,
     run: ActiveRun,
 ) -> Result<(), AppError> {
     let mut runs = lock(&state.workflow_runs);
     if runs.values().any(|r| r.project_id == project_id) {
         return Err(AppError::WorkflowAlreadyRunning { project_id });
+    }
+    {
+        let removals = lock(&state.agent_removals);
+        if removals.in_progress.contains_key(&project_id)
+            || removals.deletions(project_id) != deletions_seen
+        {
+            return Err(AppError::WorkflowBlockedByAgentRemoval { project_id });
+        }
     }
     runs.insert(run_id, run);
     Ok(())
@@ -1354,7 +1378,7 @@ pub fn invoke_workflow_with(
         return Err(AppError::WorkflowStepUnsupported);
     }
 
-    let (project, generation, roster) = capture_run_snapshot(state, project_id)?;
+    let (project, generation, roster, deletions) = capture_run_snapshot(state, project_id)?;
     let names: Vec<String> = roster.iter().map(|r| r.name.clone()).collect();
     let converted;
     let inputs = if options.agent_inputs_are_ids {
@@ -1432,6 +1456,7 @@ pub fn invoke_workflow_with(
     register_live_run(
         state,
         project_id,
+        deletions,
         run_id,
         ActiveRun {
             cancel: cancel.clone(),
@@ -1892,6 +1917,61 @@ mod tests {
                 done: Arc::new(tokio::sync::Notify::new()),
             },
         );
+    }
+
+    fn idle_run(project_id: ProjectId) -> ActiveRun {
+        ActiveRun {
+            cancel: CancellationToken::new(),
+            project_id,
+            workflow: "w".to_owned(),
+            snapshot: RunSnapshot {
+                total_steps: 1,
+                current_step: 0,
+            },
+            steps: Vec::new(),
+            resolved: BTreeMap::new(),
+            done: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_roster_predates_an_agent_deletion_is_refused_at_registration() {
+        let mut env = crate::ops::test_support::TestEnv::new();
+        let project_id = env.project("p");
+        let removed = env.agent(project_id, "removed");
+        env.agent(project_id, "kept");
+        crate::commands::open_project_impl(&env.state, project_id).unwrap();
+
+        // The run reads its roster, then the agent is deleted before it
+        // registers.
+        let (_, _, roster, deletions) = capture_run_snapshot(&env.state, project_id).unwrap();
+        assert!(roster.iter().any(|agent| agent.id == removed));
+        crate::commands::remove_agent_impl(&env.state, removed)
+            .await
+            .unwrap();
+        let refused = register_live_run(
+            &env.state,
+            project_id,
+            deletions,
+            Uuid::now_v7(),
+            idle_run(project_id),
+        );
+        assert!(
+            matches!(refused, Err(AppError::WorkflowBlockedByAgentRemoval { .. })),
+            "{refused:?}"
+        );
+
+        // Read again, the roster no longer holds the agent, and the run starts.
+        let (_, _, roster, deletions) = capture_run_snapshot(&env.state, project_id).unwrap();
+        assert!(roster.iter().all(|agent| agent.id != removed));
+        register_live_run(
+            &env.state,
+            project_id,
+            deletions,
+            Uuid::now_v7(),
+            idle_run(project_id),
+        )
+        .unwrap();
     }
 
     #[test]

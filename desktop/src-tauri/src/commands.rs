@@ -2921,48 +2921,107 @@ fn check_selection_supported(
 /// Switchboard sidecars. Resolves the agent's *own* project from its id (never
 /// the active project), so it's free of the active-project coupling.
 ///
-/// **Two phases by necessity.** `shutdown_agent` is async and the registry
-/// mutation runs under the synchronous `registry_write` guard, which can't be
-/// held across an `.await` (the guard isn't `Send`).
+/// **One dispatcher step.** [`Dispatcher::remove_agent`] holds the agent's slot
+/// closed from before its actor shuts down until the record is deleted, then
+/// marks the agent removed for good. A send that found the record a moment
+/// earlier, from the window, a workflow, or an orchestrator, is refused rather
+/// than starting a fresh actor whose turn nothing could see or stop once the
+/// record is gone. The registry deletion runs inside that step, synchronously
+/// under `registry_write` (the guard can't be held across an `.await`).
 ///
-/// **Active agents are torn down, not rejected.** If a turn is in flight,
-/// `shutdown_agent` cancels it (surfaced as a `Cancelled` terminal, same as
-/// "Stop"), drains the harness subprocess, and drops the slot — the UI gates
-/// Remove on the active state; the backend just makes teardown robust whatever
-/// the state. This inherits `shutdown_agent`'s drain latency: a slow subprocess
-/// wind-down blocks the command for that duration (same path as remove-directory
-/// and quit).
+/// **Active agents are torn down, not rejected.** If a turn is in flight, it is
+/// cancelled (surfaced as a `Cancelled` terminal, same as "Stop") and the
+/// harness subprocess drained. Callers that must not cancel work check first:
+/// the agent-access removal refuses a busy agent before calling this. This
+/// inherits the shutdown's drain latency: a slow subprocess wind-down blocks
+/// the command for that duration (same path as remove-directory and quit).
 ///
-/// **Not atomic across the two phases.** Phase (a) is irreversible (it cancels
-/// any in-flight turn), but phase (b)'s registry write can fail (disk I/O). On
-/// that path the turn was already cancelled yet the record remains — so a failed
-/// remove can still have cancelled work; "remove errored" does not mean "nothing
-/// happened." It self-heals functionally (the next send re-spawns the actor),
-/// and registry-write failure is rare, so this is accepted rather than made
-/// transactional across an async cancel + a sync write.
+/// **Not atomic across the two phases.** The shutdown is irreversible (it
+/// cancels any in-flight turn), but the registry write can fail (disk I/O). On
+/// that path the turn was already cancelled — so a failed remove can still have
+/// cancelled work; "remove errored" does not mean "nothing happened." What the
+/// failure did to the record is read back from the registry ([`settle_deletion`]):
+/// still there, the agent is left usable (its slot is cleared, so the next
+/// send starts a fresh actor); gone, it stays removed and the error says the
+/// change may not survive a crash; unreadable, it stays blocked until restart
+/// and nothing else is deleted. Registry-write failure is rare, so this is
+/// accepted rather than made transactional across an async cancel + a sync
+/// write.
+///
+/// [`Dispatcher::remove_agent`]: switchboard_dispatcher::Dispatcher::remove_agent
 pub async fn remove_agent_impl(state: &AppState, agent_id: AgentId) -> Result<(), AppError> {
     // Resolve the agent's *own* project from its id (never the active project),
-    // before the irreversible phase (a) so a non-existent agent fails fast —
+    // before the irreversible shutdown so a non-existent agent fails fast —
     // nothing is torn down before we know the agent exists.
     let (project, _agent) = lookup_agent(state, agent_id)?;
-
-    // Phase (a) — no lock held.
     state
         .dispatcher
-        .shutdown_agent(agent_id, CancelSource::Shutdown)
-        .await;
+        .remove_agent(agent_id, CancelSource::Shutdown, || {
+            let _write = lock(&state.registry_write);
+            // Absent already counts as deleted: an overlapping removal deleted
+            // it first.
+            let deletion = settle_deletion(project.remove_agent(agent_id), || {
+                project
+                    .list_agents()
+                    .map(|agents| agents.iter().any(|a| a.id == agent_id))
+            });
+            let forget = || {
+                delete_agent_sidecars(&project, agent_id);
+                lock(&state.agents_by_id).remove(&agent_id);
+                *lock(&state.agent_removals)
+                    .deletions
+                    .entry(project.id)
+                    .or_insert(0) += 1;
+            };
+            match deletion {
+                Deletion::Deleted => {
+                    forget();
+                    (true, Ok(()))
+                }
+                Deletion::DeletedNotDurable(source) => {
+                    forget();
+                    (true, Err(AppError::AgentRemovalNotDurable { source }))
+                }
+                Deletion::Kept(source) => (false, Err(source.into())),
+                // Blocked, but nothing deleted: whether the record went is
+                // unknown, and the registry decides at the next start.
+                Deletion::Unconfirmed(source) => {
+                    (true, Err(AppError::AgentRemovalUnconfirmed { source }))
+                }
+            }
+        })
+        .await
+}
 
-    // No lock spans (a)→(b), so a concurrent `send_message` to this id can
-    // re-spawn an `Active` actor via `ensure_actor` between the teardown and the
-    // registry removal — leaving an idle orphan actor after phase (b) deletes the
-    // record. Tolerated: it's UI-gated (you can't send to an agent you're
-    // removing), self-limiting (the orphan is idle), and reaped on restart.
-    // Phase (b) — fully synchronous under `registry_write`, no `.await`.
-    let _write = lock(&state.registry_write);
-    project.remove_agent(agent_id)?;
-    delete_agent_sidecars(&project, agent_id);
-    lock(&state.agents_by_id).remove(&agent_id);
-    Ok(())
+/// What a removal's registry deletion did.
+#[derive(Debug)]
+enum Deletion {
+    /// The record is gone.
+    Deleted,
+    /// The record is gone, but saving failed afterwards.
+    DeletedNotDurable(switchboard_core::CoreError),
+    /// The record is still there: the save failed before it took effect.
+    Kept(switchboard_core::CoreError),
+    /// The save failed and the registry could not be read back.
+    Unconfirmed(switchboard_core::CoreError),
+}
+
+/// Decide what a registry deletion did from its result and, after an error,
+/// the registry read back. An error alone does not say: the writer replaces
+/// the file before syncing its folder, so the sync can fail after the record
+/// is already gone.
+fn settle_deletion(
+    deleted: Result<bool, switchboard_core::CoreError>,
+    still_listed: impl FnOnce() -> Result<bool, switchboard_core::CoreError>,
+) -> Deletion {
+    match deleted {
+        Ok(_) => Deletion::Deleted,
+        Err(error) => match still_listed() {
+            Ok(true) => Deletion::Kept(error),
+            Ok(false) => Deletion::DeletedNotDurable(error),
+            Err(_) => Deletion::Unconfirmed(error),
+        },
+    }
 }
 
 /// Best-effort deletion of an agent's Switchboard sidecar. A missing file is
@@ -16439,6 +16498,49 @@ mod tests {
     }
 
     // --- remove_agent / rename_agent ---
+
+    fn disk_error() -> switchboard_core::CoreError {
+        switchboard_core::CoreError::Io {
+            path: PathBuf::from("/store/registry.jsonl"),
+            source: std::io::Error::other("disk failed"),
+        }
+    }
+
+    #[test]
+    fn a_deletion_is_settled_by_what_the_registry_holds_after_an_error() {
+        assert!(matches!(
+            settle_deletion(Ok(true), || panic!("no read-back without an error")),
+            Deletion::Deleted
+        ));
+        assert!(
+            matches!(
+                settle_deletion(Ok(false), || panic!("no read-back")),
+                Deletion::Deleted
+            ),
+            "already absent: an overlapping removal deleted it"
+        );
+        assert!(
+            matches!(
+                settle_deletion(Err(disk_error()), || Ok(false)),
+                Deletion::DeletedNotDurable(_)
+            ),
+            "the file was replaced, then its folder failed to sync"
+        );
+        assert!(
+            matches!(
+                settle_deletion(Err(disk_error()), || Ok(true)),
+                Deletion::Kept(_)
+            ),
+            "the save failed before the record went"
+        );
+        assert!(
+            matches!(
+                settle_deletion(Err(disk_error()), || Err(disk_error())),
+                Deletion::Unconfirmed(_)
+            ),
+            "the registry could not be read back"
+        );
+    }
     // Fixture-level only — no live test: these commands don't change how we talk
     // to a real CLI, just registry/sidecar/in-memory state.
 

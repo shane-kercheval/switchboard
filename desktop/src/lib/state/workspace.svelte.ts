@@ -652,6 +652,20 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
   }
 }
 
+/// Removals the backend reported as failed although the agent is gone: the
+/// record went, then saving failed, so the agent may come back after a crash.
+/// The agent's card is gone with it, so the warning is shown app-wide until
+/// dismissed.
+export const agentRemovalWarnings = $state<{ agentId: AgentId; name: string; message: string }[]>(
+  [],
+);
+
+/// Dismiss one removal warning.
+export function dismissAgentRemovalWarning(agentId: AgentId): void {
+  const index = agentRemovalWarnings.findIndex((warning) => warning.agentId === agentId);
+  if (index !== -1) agentRemovalWarnings.splice(index, 1);
+}
+
 /// Remove an agent everywhere. The backend tears down its actor (cancelling any
 /// in-flight turn), drops its registry record, and deletes Switchboard's
 /// per-agent sidecars; on success we drop it from whichever project roster holds
@@ -659,10 +673,42 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
 /// runtime). The agent is located across all rosters rather than assumed to be
 /// in the active project, mirroring the backend's agent-id → own-project
 /// resolution. A dangling recipient preselect needs no cleanup — `ComposeBar`
-/// filters its selection against the live roster. Errors propagate to the caller
-/// (the menu surfaces them and keeps the agent).
+/// filters its selection against the live roster.
+///
+/// A failure re-reads the agent's roster before deciding what it meant: saving
+/// can fail after the record is already gone. Still listed, the error
+/// propagates to the caller (the menu surfaces it and keeps the agent). Gone,
+/// the re-read has already dropped it, the error becomes an app-wide warning in
+/// [`agentRemovalWarnings`], and the removal resolves, because the agent was
+/// removed. A re-read that fails propagates the original error.
 export async function removeAgent(agentId: AgentId): Promise<void> {
-  await api.removeAgent(agentId);
+  // Taken before any await: the roster can change meanwhile.
+  const owner = Object.entries(agentsByProject).find(([, agents]) =>
+    agents.some((a) => a.id === agentId),
+  );
+  const name = owner?.[1].find((a) => a.id === agentId)?.name;
+  try {
+    await api.removeAgent(agentId);
+  } catch (err) {
+    if (owner === undefined || name === undefined) throw err;
+    const [projectId] = owner;
+    try {
+      await refreshProjectRoster(projectId);
+    } catch (refreshErr) {
+      console.warn("[switchboard] roster refresh after a failed removal failed", {
+        project_id: projectId,
+        error: refreshErr,
+      });
+      throw err;
+    }
+    if ((agentsByProject[projectId] ?? []).some((a) => a.id === agentId)) throw err;
+    agentRemovalWarnings.push({
+      agentId,
+      name,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
   for (const [projectId, agents] of Object.entries(agentsByProject)) {
     if (agents.some((a) => a.id === agentId)) {
       markRosterChanged(projectId);

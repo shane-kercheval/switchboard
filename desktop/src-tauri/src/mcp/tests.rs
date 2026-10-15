@@ -1067,6 +1067,7 @@ async fn a_kept_alive_forward_waits_for_a_busy_source_with_progress_every_minute
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One scenario followed through: two parallel sends, then removing the agent that was busy; linear.
 async fn wait_any_send_returns_when_the_first_send_finishes_and_a_busy_agent_is_not_removed() {
     let (env, project_id, agents) = workflow_env().await;
     let (coder, r1) = (agents[0], agents[1]);
@@ -1164,6 +1165,22 @@ async fn wait_any_send_returns_when_the_first_send_finishes_and_a_busy_agent_is_
     .await;
     assert!(!is_error, "{body}");
     assert_eq!(body["result"]["name"], "coder");
+    let (_, body) = call("list_agents", json!({ "project_id": project_id })).await;
+    assert!(
+        body["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|agent| uuid(&agent["id"]) != coder),
+        "the removed agent is gone from the roster: {body}"
+    );
+    let (is_error, body) = call(
+        "send",
+        json!({ "project_id": project_id, "recipients": [coder], "text": "still there?" }),
+    )
+    .await;
+    assert!(is_error, "a send to the removed agent is refused: {body}");
+    assert_eq!(body["code"], "unknown_recipient");
 }
 
 #[tokio::test]

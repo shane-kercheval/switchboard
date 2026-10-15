@@ -72,11 +72,13 @@
     activateProject,
     addAgentToProjectRoster,
     agentCreationFailures,
+    agentRemovalWarnings,
     agentsByProject,
     conversations,
     deleteProject,
     dismissProjectDeletionError,
     dismissAgentCreationFailure,
+    dismissAgentRemovalWarning,
     dismissSeedPathUnresolved,
     loadAttachedAgentHistory,
     loadWorkspace,
@@ -1680,6 +1682,13 @@
           message={`Couldn't create the ${HARNESS_LABEL[failure.harness]} agent: ${failure.error}`}
           testid={`banner-agent-create-failed-${failure.harness}`}
           onDismiss={() => dismissAgentCreationFailure(failure.harness)}
+        />
+      {/each}
+      {#each agentRemovalWarnings as warning (warning.agentId)}
+        <Banner
+          message={`${warning.name}: ${warning.message}`}
+          testid={`banner-agent-remove-warning-${warning.agentId}`}
+          onDismiss={() => dismissAgentRemovalWarning(warning.agentId)}
         />
       {/each}
       {#if editorShortcutError !== null}

@@ -7219,3 +7219,431 @@ async fn an_item_refused_at_enqueue_is_announced_before_it_fails_when_it_asked_t
     release.notify_one();
     shutdown.await;
 }
+
+/// Removing an agent for good: its slot is held closed through the record's
+/// deletion and then marked removed, so nothing can start it again; a failed
+/// deletion or an abandoned removal leaves it usable.
+mod removal {
+    use super::*;
+
+    fn setup(
+        scenario: MockScenario,
+    ) -> (
+        Arc<Dispatcher>,
+        Arc<RecordingEmitter>,
+        AgentRecord,
+        Arc<dyn DispatchContextFactory>,
+    ) {
+        let dispatcher = Arc::new(Dispatcher::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let agent = agent_record();
+        let factory: Arc<dyn DispatchContextFactory> = TestFactory::new(
+            scenario,
+            agent.clone(),
+            Arc::clone(&emitter),
+            noop_journal(),
+        );
+        (dispatcher, emitter, agent, factory)
+    }
+
+    async fn send(
+        dispatcher: &Dispatcher,
+        agent: &AgentRecord,
+        factory: &Arc<dyn DispatchContextFactory>,
+        on_busy: OnBusy,
+    ) -> SendOutcome {
+        dispatcher
+            .send_message(
+                agent.id,
+                "go",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(factory),
+                on_busy,
+            )
+            .await
+    }
+
+    /// An agent whose turn has ended but whose stream stays open until `hold`
+    /// fires, as Codex's does while it reads its rollout: a shutdown waits for
+    /// it, though the agent would accept a send.
+    async fn draining(
+        dispatcher: &Dispatcher,
+        emitter: &RecordingEmitter,
+        agent: &AgentRecord,
+        factory: &Arc<dyn DispatchContextFactory>,
+    ) {
+        accepted(send(dispatcher, agent, factory, OnBusy::Enqueue).await);
+        within(emitter, "turn_end", emitter.wait_for_type("turn_end", 1)).await;
+        assert!(dispatcher.accepts_now(agent.id).await, "idle in its drain");
+    }
+
+    #[tokio::test]
+    async fn a_removed_agent_is_never_started_again() {
+        let (dispatcher, emitter, agent, factory) = setup(MockScenario::Streaming);
+        accepted(send(&dispatcher, &agent, &factory, OnBusy::Enqueue).await);
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+
+        let answer = dispatcher
+            .remove_agent(agent.id, CancelSource::Shutdown, || (true, "deleted"))
+            .await;
+        assert_eq!(answer, "deleted", "the deletion's own result comes back");
+
+        assert!(matches!(
+            send(&dispatcher, &agent, &factory, OnBusy::FailFast).await,
+            SendOutcome::Busy
+        ));
+        send(&dispatcher, &agent, &factory, OnBusy::Enqueue).await;
+        within(
+            &emitter,
+            "the queued send's refusal",
+            emitter.wait_for(|events| {
+                events.iter().any(|(_, e)| {
+                    event_type(e) == "message_failed" && e["error"] == "agent was removed"
+                })
+            }),
+        )
+        .await;
+        assert_eq!(
+            count_type(&emitter.snapshot(), "turn_start"),
+            1,
+            "no send started the agent again"
+        );
+        assert!(!dispatcher.accepts_now(agent.id).await);
+        assert_eq!(dispatcher.agent_slot_count(), 0, "no actor is kept alive");
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_actor_is_marked_removed_too() {
+        let (dispatcher, emitter, agent, factory) = setup(MockScenario::Streaming);
+        dispatcher
+            .remove_agent(agent.id, CancelSource::Shutdown, || (true, ()))
+            .await;
+        assert!(matches!(
+            send(&dispatcher, &agent, &factory, OnBusy::FailFast).await,
+            SendOutcome::Busy
+        ));
+        assert_eq!(count_type(&emitter.snapshot(), "turn_start"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_deletion_leaves_the_agent_usable() {
+        let (dispatcher, emitter, agent, factory) = setup(MockScenario::Streaming);
+        accepted(send(&dispatcher, &agent, &factory, OnBusy::Enqueue).await);
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+
+        dispatcher
+            .remove_agent(agent.id, CancelSource::Shutdown, || (false, ()))
+            .await;
+
+        accepted(send(&dispatcher, &agent, &factory, OnBusy::FailFast).await);
+        within(
+            &emitter,
+            "a second turn",
+            emitter.wait_for_type("turn_start", 2),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_removal_abandoned_mid_shutdown_deletes_nothing_and_frees_the_agent() {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, emitter, agent, factory) =
+            setup(MockScenario::CompletesThenHolds(Arc::clone(&hold)));
+        draining(&dispatcher, &emitter, &agent, &factory).await;
+
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let deleted = Arc::clone(&deleted);
+            let mut removal =
+                Box::pin(
+                    dispatcher.remove_agent(agent.id, CancelSource::Shutdown, move || {
+                        deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        (true, ())
+                    }),
+                );
+            assert!(
+                futures::poll!(removal.as_mut()).is_pending(),
+                "the removal waits for the drain"
+            );
+            assert!(
+                !dispatcher.accepts_now(agent.id).await,
+                "the agent is closing"
+            );
+            // The caller goes away here.
+        }
+        hold.notify_waiters();
+
+        let started = tokio::time::Instant::now();
+        while !dispatcher.accepts_now(agent.id).await {
+            assert!(started.elapsed() < WAIT, "the slot was never cleared");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !deleted.load(std::sync::atomic::Ordering::SeqCst),
+            "an abandoned removal deletes nothing"
+        );
+        accepted(send(&dispatcher, &agent, &factory, OnBusy::FailFast).await);
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_abandoned_mid_drain_still_clears_its_slot() {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, emitter, agent, factory) =
+            setup(MockScenario::CompletesThenHolds(Arc::clone(&hold)));
+        draining(&dispatcher, &emitter, &agent, &factory).await;
+
+        {
+            let mut shutdown =
+                Box::pin(dispatcher.shutdown_agent(agent.id, CancelSource::Shutdown));
+            assert!(futures::poll!(shutdown.as_mut()).is_pending());
+        }
+        hold.notify_waiters();
+
+        let started = tokio::time::Instant::now();
+        while !dispatcher.accepts_now(agent.id).await {
+            assert!(started.elapsed() < WAIT, "the slot stayed closing");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(dispatcher.agent_slot_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_removal_overlapping_a_shutdown_stays_removed_after_it() {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, emitter, agent, factory) =
+            setup(MockScenario::CompletesThenHolds(Arc::clone(&hold)));
+        draining(&dispatcher, &emitter, &agent, &factory).await;
+
+        let mut shutdown = Box::pin(dispatcher.shutdown_agent(agent.id, CancelSource::Shutdown));
+        assert!(futures::poll!(shutdown.as_mut()).is_pending());
+        // Another caller removes the agent while the shutdown drains: the
+        // record goes at once, and the agent is marked removed.
+        dispatcher
+            .remove_agent(agent.id, CancelSource::Shutdown, || (true, ()))
+            .await;
+        hold.notify_waiters();
+        tokio::time::timeout(WAIT, shutdown)
+            .await
+            .expect("the shutdown finishes");
+
+        assert!(
+            matches!(
+                send(&dispatcher, &agent, &factory, OnBusy::FailFast).await,
+                SendOutcome::Busy
+            ),
+            "the shutdown's own clearing did not undo the removal"
+        );
+        assert_eq!(count_type(&emitter.snapshot(), "turn_start"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_removal_overlapping_a_shutdown_leaves_the_agent_blocked() {
+        // Deliberate: a removal that joined another shutdown cannot know
+        // whether a further removal still counts on its flag, so a failure
+        // never takes it back. The agent refuses sends until the app restarts.
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, emitter, agent, factory) =
+            setup(MockScenario::CompletesThenHolds(Arc::clone(&hold)));
+        draining(&dispatcher, &emitter, &agent, &factory).await;
+
+        let mut shutdown = Box::pin(dispatcher.shutdown_agent(agent.id, CancelSource::Shutdown));
+        assert!(futures::poll!(shutdown.as_mut()).is_pending());
+        dispatcher
+            .remove_agent(agent.id, CancelSource::Shutdown, || (false, ()))
+            .await;
+        assert!(
+            !dispatcher.accepts_now(agent.id).await,
+            "still closing: the drain has not finished"
+        );
+        hold.notify_waiters();
+        tokio::time::timeout(WAIT, shutdown)
+            .await
+            .expect("the shutdown finishes");
+        assert!(matches!(
+            send(&dispatcher, &agent, &factory, OnBusy::FailFast).await,
+            SendOutcome::Busy
+        ));
+        assert_eq!(count_type(&emitter.snapshot(), "turn_start"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_removal_failing_while_another_still_deletes_does_not_reopen_the_agent() {
+        use futures::FutureExt as _;
+
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, emitter, agent, factory) =
+            setup(MockScenario::CompletesThenHolds(Arc::clone(&hold)));
+        draining(&dispatcher, &emitter, &agent, &factory).await;
+        let mut shutdown = Box::pin(dispatcher.shutdown_agent(agent.id, CancelSource::Shutdown));
+        assert!(futures::poll!(shutdown.as_mut()).is_pending());
+
+        // A removal joins the shutdown and is still deleting, on another
+        // thread, when everything below happens.
+        let (claimed, on_claim) = std::sync::mpsc::channel::<()>();
+        let (finish, finishing) = std::sync::mpsc::channel::<()>();
+        let slow = {
+            let dispatcher = Arc::clone(&dispatcher);
+            let agent_id = agent.id;
+            std::thread::spawn(move || {
+                dispatcher
+                    .remove_agent(agent_id, CancelSource::Shutdown, move || {
+                        claimed.send(()).unwrap();
+                        finishing.recv().unwrap();
+                        (true, ())
+                    })
+                    .now_or_never()
+                    .expect("a joined removal does not wait");
+            })
+        };
+        on_claim.recv().unwrap();
+
+        // The shutdown's actor stops, so the flagged slot turns removed; then
+        // a second removal fails.
+        hold.notify_waiters();
+        tokio::time::timeout(WAIT, shutdown)
+            .await
+            .expect("the shutdown finishes");
+        dispatcher
+            .remove_agent(agent.id, CancelSource::Shutdown, || (false, ()))
+            .await;
+        assert!(
+            matches!(
+                send(&dispatcher, &agent, &factory, OnBusy::FailFast).await,
+                SendOutcome::Busy
+            ),
+            "the failure did not reopen the agent under the deletion still running"
+        );
+
+        finish.send(()).unwrap();
+        slow.join().unwrap();
+        assert!(matches!(
+            send(&dispatcher, &agent, &factory, OnBusy::FailFast).await,
+            SendOutcome::Busy
+        ));
+        assert_eq!(count_type(&emitter.snapshot(), "turn_start"), 1);
+    }
+
+    /// One removal closes an agent whose actor has stopped; inside its
+    /// deletion, a second removal joins and settles first. A send between the
+    /// two outcomes must be refused, and the agent ends removed when either
+    /// deletion succeeded.
+    async fn two_removals(first_deletes: bool, second_deletes: bool) {
+        use futures::FutureExt as _;
+
+        let (dispatcher, emitter, agent, factory) = setup(MockScenario::Streaming);
+        accepted(send(&dispatcher, &agent, &factory, OnBusy::Enqueue).await);
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+
+        dispatcher
+            .remove_agent(agent.id, CancelSource::Shutdown, || {
+                // A joined removal never waits, so it settles here and now.
+                dispatcher
+                    .remove_agent(agent.id, CancelSource::Shutdown, || (second_deletes, ()))
+                    .now_or_never()
+                    .expect("a joined removal does not wait");
+                let refused = dispatcher
+                    .send_message(
+                        agent.id,
+                        "between",
+                        vec![],
+                        Uuid::now_v7(),
+                        Arc::clone(&factory),
+                        OnBusy::FailFast,
+                    )
+                    .now_or_never();
+                assert!(
+                    matches!(refused, Some(SendOutcome::Busy)),
+                    "a send between the two outcomes is refused, not admitted"
+                );
+                (first_deletes, ())
+            })
+            .await;
+
+        assert!(matches!(
+            send(&dispatcher, &agent, &factory, OnBusy::FailFast).await,
+            SendOutcome::Busy
+        ));
+        assert_eq!(
+            count_type(&emitter.snapshot(), "turn_start"),
+            1,
+            "nothing started the agent again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_joined_removal_failing_inside_the_closing_ones_deletion_keeps_the_agent_closed() {
+        two_removals(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn a_closing_removal_failing_after_a_joined_one_deleted_leaves_the_agent_removed() {
+        two_removals(false, true).await;
+    }
+}
+
+/// An actor whose command channel closes mid-turn (the dispatcher dropped)
+/// stops polling it rather than spinning on its `None`. Under a paused clock a
+/// spinning task keeps the runtime busy, so time never advances and the sleep
+/// below never ends; the real-time limit on the thread turns that hang into a
+/// failure.
+#[test]
+fn an_actor_whose_channel_closes_mid_turn_does_not_spin() {
+    let (finished, finish) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let hold = Arc::new(tokio::sync::Notify::new());
+            let dispatcher = Arc::new(Dispatcher::new());
+            let emitter = Arc::new(RecordingEmitter::new());
+            let agent = agent_record();
+            let factory: Arc<dyn DispatchContextFactory> = TestFactory::new(
+                MockScenario::CompletesThenHolds(Arc::clone(&hold)),
+                agent.clone(),
+                Arc::clone(&emitter),
+                noop_journal(),
+            );
+            accepted(
+                dispatcher
+                    .send_message(
+                        agent.id,
+                        "go",
+                        vec![],
+                        Uuid::now_v7(),
+                        factory,
+                        OnBusy::Enqueue,
+                    )
+                    .await,
+            );
+            within(&emitter, "turn_end", emitter.wait_for_type("turn_end", 1)).await;
+            // The stream is still open (post-terminal drain); dropping the
+            // dispatcher drops the actor's only sender.
+            drop(dispatcher);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            hold.notify_waiters();
+        });
+        let _ = finished.send(());
+    });
+    finish
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the actor spun on its closed command channel");
+}

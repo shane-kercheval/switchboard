@@ -2,6 +2,8 @@
 //! dismissing a failed workflow run. Each opens the project in Rust first (a
 //! no-op when loaded), then notifies the window without waiting on it.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
     AgentId, AgentRecord, AgentSelection, HarnessKind, ProjectId, ProjectSummary,
@@ -16,6 +18,7 @@ use crate::error::AppError;
 use crate::state::{AppState, lock};
 use crate::workflow_commands::{abandon_workflow_run_impl, classify_run_file, read_run_files};
 
+use super::handle::AppStateHandle;
 use super::read::agent_in_project;
 
 /// Create a project for `directory`. Seeds no agents: the desktop seeds one
@@ -103,31 +106,90 @@ pub struct RemovedAgent {
 /// step may send to the agent: a caller that cannot see the agent's pane
 /// stops that work on purpose, not as a side effect.
 ///
-/// The busy check and the removal are not one step: a send that lands
-/// between them is cancelled by the removal, as the window's remove would.
+/// Runs as its own task, as a send does, so cancelling the tool call cannot
+/// leave a removal half-done; the caller only stops waiting for its answer.
+///
+/// While it runs, no workflow can start in the project (see
+/// [`AppState::agent_removals`]). The busy check is an observation: a message
+/// that reaches the agent between it and the shutdown is cancelled by the
+/// removal, and its sender sees it cancelled. Nothing can start the agent
+/// again once it is removed.
 pub async fn remove_agent(
-    state: &AppState,
+    handle: Arc<dyn AppStateHandle>,
     project_id: ProjectId,
     agent_id: AgentId,
 ) -> Result<RemovedAgent, AppError> {
+    tokio::spawn(run_removal(handle, project_id, agent_id))
+        .await
+        .unwrap_or_else(|join_error| {
+            Err(AppError::Internal(format!(
+                "the removal task did not finish: {join_error}"
+            )))
+        })
+}
+
+async fn run_removal(
+    handle: Arc<dyn AppStateHandle>,
+    project_id: ProjectId,
+    agent_id: AgentId,
+) -> Result<RemovedAgent, AppError> {
+    let state = handle.app_state();
     open_project_impl(state, project_id)?;
     let agent = agent_in_project(state, project_id, agent_id)?;
-    let workflow_running = lock(&state.workflow_runs)
-        .values()
-        .any(|run| run.project_id == project_id);
-    if workflow_running {
-        return Err(AppError::RemoveAgentWorkflowRunning { name: agent.name });
-    }
+    let _reserved = RemovalReservation::take(state, project_id, &agent.name)?;
     if !state.dispatcher.accepts_now(agent_id).await {
         return Err(AppError::RemoveAgentBusy { name: agent.name });
     }
-    remove_agent_impl(state, agent_id).await?;
-    tracing::info!(%project_id, %agent_id, name = %agent.name, "agent removed");
+    let removed = remove_agent_impl(state, agent_id).await;
+    // Whatever the outcome: a removal can fail after the record is gone, and
+    // the window should show what the registry holds either way.
     state.desktop_sync.roster_changed(project_id);
+    removed?;
+    tracing::info!(%project_id, %agent_id, name = %agent.name, "agent removed");
     Ok(RemovedAgent {
         agent_id,
         name: agent.name,
     })
+}
+
+/// A project held against workflow starts while one of its agents is removed,
+/// released when dropped, however the removal ends.
+struct RemovalReservation<'a> {
+    state: &'a AppState,
+    project_id: ProjectId,
+}
+
+impl<'a> RemovalReservation<'a> {
+    /// Refuses when a workflow already runs in the project. The check and the
+    /// reservation happen under the lock a workflow takes to register, so a
+    /// run either registered first (and this refuses) or will find the
+    /// reservation.
+    fn take(state: &'a AppState, project_id: ProjectId, name: &str) -> Result<Self, AppError> {
+        let runs = lock(&state.workflow_runs);
+        if runs.values().any(|run| run.project_id == project_id) {
+            return Err(AppError::RemoveAgentWorkflowRunning {
+                name: name.to_owned(),
+            });
+        }
+        *lock(&state.agent_removals)
+            .in_progress
+            .entry(project_id)
+            .or_insert(0) += 1;
+        drop(runs);
+        Ok(Self { state, project_id })
+    }
+}
+
+impl Drop for RemovalReservation<'_> {
+    fn drop(&mut self) {
+        let mut removals = lock(&self.state.agent_removals);
+        if let Some(count) = removals.in_progress.get_mut(&self.project_id) {
+            *count -= 1;
+            if *count == 0 {
+                removals.in_progress.remove(&self.project_id);
+            }
+        }
+    }
 }
 
 /// One axis of an agent's selection as a caller states it. Absent means

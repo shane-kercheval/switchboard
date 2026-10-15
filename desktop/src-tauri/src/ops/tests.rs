@@ -959,11 +959,11 @@ async fn cancel_send_stops_running_recipients() {
     .await
     .unwrap();
     await_turn_running(&env.state, agents[0]).await;
-    let cancelled = cancel_send(&env.state, project_id, receipt.send_id).unwrap();
+    let cancelled = cancel_send(&env.state, project_id, receipt.send_id, None).unwrap();
     assert_eq!(cancelled.recipients, agents);
     let reply = wait_done(&env, project_id, receipt.send_id).await;
     assert_eq!(reply.recipients[0].status, SendStatus::Cancelled);
-    let err = cancel_send(&env.state, project_id, Uuid::now_v7()).unwrap_err();
+    let err = cancel_send(&env.state, project_id, Uuid::now_v7(), None).unwrap_err();
     assert_eq!(error_code(&err), error_code::SEND_UNKNOWN);
 }
 
@@ -2071,7 +2071,7 @@ fn a_workflow_wait_with_more_sends_than_fit_keeps_the_newest() {
     };
     let fitted = fit(
         serde_json::to_value(&reply).unwrap(),
-        &crate::ops::workflow::wait_workflow_budget(),
+        &crate::ops::workflow::wait_workflow_budget(RESULT_BUDGET_CHARS),
     )
     .unwrap();
     assert!(fitted.serialized_chars() <= RESULT_BUDGET_CHARS);
@@ -2230,7 +2230,7 @@ async fn cancelling_a_send_between_its_check_and_its_admission_stops_it() {
         .ledger
         .send_id_for_key(project_id, "cancel-gap")
         .expect("the send is registered");
-    cancel_send(&env.state, project_id, send_id).unwrap();
+    cancel_send(&env.state, project_id, send_id, None).unwrap();
     env.clear_seam(TestSeam::OpsDispatch);
     barrier.release.notify_one();
     let receipt = caller
@@ -2292,7 +2292,7 @@ async fn cancelling_a_forward_while_it_waits_on_a_source_dispatches_nothing() {
         }
         tokio::task::yield_now().await;
     };
-    cancel_send(&env.state, project_id, send_id).unwrap();
+    cancel_send(&env.state, project_id, send_id, None).unwrap();
     let receipt = tokio::time::timeout(Duration::from_secs(5), caller)
         .await
         .expect("the cancel stops the compose at once")
@@ -2925,7 +2925,7 @@ async fn a_cancelled_partial_reply_reads_on_in_the_same_session() {
     .await
     .unwrap();
     await_turn_running(&env.state, agents[0]).await;
-    cancel_send(&env.state, project_id, receipt.send_id).unwrap();
+    cancel_send(&env.state, project_id, receipt.send_id, None).unwrap();
     let reply = wait_done(&env, project_id, receipt.send_id).await;
     assert_eq!(reply.recipients[0].status, SendStatus::Cancelled);
 
@@ -3233,7 +3233,7 @@ async fn a_send_cancelled_during_the_round_trip_leaves_nothing_pending() {
     let sync_request = requests.recv().await.unwrap();
     assert_eq!(sync.pending_requests(), 1);
     let send_id = env.state.ledger.send_id_for_key(project_id, "k").unwrap();
-    cancel_send(&env.state, project_id, send_id).unwrap();
+    cancel_send(&env.state, project_id, send_id, None).unwrap();
     let receipt = pending.await.unwrap().unwrap();
     assert_eq!(receipt.recipients[0].status, SendStatus::Cancelled);
     assert_eq!(sync.pending_requests(), 0, "the request went with the send");
@@ -4060,7 +4060,7 @@ async fn cancel_send_cancels_a_queued_compaction() {
         .await
         .unwrap();
 
-    cancel_send(&env.state, project_id, receipt.send_id).unwrap();
+    cancel_send(&env.state, project_id, receipt.send_id, None).unwrap();
     gate.notify_one();
     wait_done(&env, project_id, busy.send_id).await;
     let reply = wait_done(&env, project_id, receipt.send_id).await;
@@ -4702,7 +4702,7 @@ async fn a_message_cancelled_while_preparing_is_not_resent_by_a_repeat() {
     let first = spawn_fork(&env, fork_request(project_id, source, "branch", Some("k")));
     hold.entered.notified().await;
     let send_id = env.state.ledger.send_id_for_key(project_id, "k").unwrap();
-    cancel_send(&env.state, project_id, send_id).unwrap();
+    cancel_send(&env.state, project_id, send_id, None).unwrap();
     hold.release.notify_one();
     let cancelled = first.await.unwrap().unwrap();
     assert!(
@@ -5518,4 +5518,159 @@ async fn an_unreadable_registry_leaves_the_agent_blocked_and_nothing_else_delete
         0,
         "an unconfirmed deletion does not count as one"
     );
+}
+
+#[tokio::test]
+async fn cancelling_one_recipient_leaves_the_others_running() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b"]);
+    // One gate for both: which agent's turn takes which script depends on
+    // which actor dispatches first.
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("reply", &gate));
+    env.adapter.push(Script::parked("reply", &gate));
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "go"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    await_turn_running(&env.state, agents[1]).await;
+
+    let cancelled = cancel_send(&env.state, project_id, receipt.send_id, Some(agents[0])).unwrap();
+    assert_eq!(cancelled.outcome, super::send::CancelOutcome::Cancelled);
+    assert_eq!(cancelled.recipients, vec![agents[0]]);
+    // Release the gate only once the cancelled reply has ended, so it cannot
+    // take the release and finish instead.
+    let started = tokio::time::Instant::now();
+    loop {
+        let snapshot = env.state.ledger.send(receipt.send_id).unwrap();
+        if snapshot.recipients[0].status == SendStatus::Cancelled {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the reply never stopped"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    gate.notify_one();
+    let done = wait_done(&env, project_id, receipt.send_id).await;
+    let status_of = |agent: AgentId| {
+        done.recipients
+            .iter()
+            .find(|r| r.agent_id == agent)
+            .unwrap()
+            .status
+    };
+    assert_eq!(status_of(agents[0]), SendStatus::Cancelled);
+    assert_eq!(
+        status_of(agents[1]),
+        SendStatus::Completed,
+        "the other recipient carried on"
+    );
+
+    let again = cancel_send(&env.state, project_id, receipt.send_id, Some(agents[0])).unwrap();
+    assert_eq!(
+        again.outcome,
+        super::send::CancelOutcome::AlreadyFinished,
+        "nothing left to cancel"
+    );
+    assert!(again.recipients.is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_one_agents_reply_to_a_workflow_send_ends_the_run() {
+    let (env, project_id, agents) = workflow_env().await;
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("greeting", &gate));
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    // The run's first send, as an orchestrator reads it from wait_workflow.
+    let mut send_id = None;
+    for _ in 0..100 {
+        let reply = wait_workflow(
+            &env.state,
+            project_id,
+            run_id,
+            &WaitBudget::new(Some(0), false),
+        )
+        .await
+        .unwrap();
+        if let Some(first) = reply.sends.first() {
+            send_id = Some(first.send_id);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let send_id = send_id.expect("the run reported its first send");
+
+    let cancelled = cancel_send(&env.state, project_id, send_id, Some(agents[0])).unwrap();
+    assert_eq!(
+        cancelled.outcome,
+        super::send::CancelOutcome::Requested,
+        "Switchboard holds no record of a workflow's send to check against"
+    );
+    let reply = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reply.status,
+        WorkflowRunStatus::Cancelled,
+        "the agent stopped that reply, and a cancelled reply ends the run"
+    );
+}
+
+#[tokio::test]
+async fn the_latest_answer_says_when_a_newer_turn_is_running() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let first = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "one"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, first.send_id).await;
+    let settled = read_agent_output(&env.state, project_id, agents[0], &env.home())
+        .await
+        .unwrap();
+    assert!(!settled.newer_turn_running);
+
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("two's answer", &gate));
+    send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "two"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    let mid_turn = read_agent_output(&env.state, project_id, agents[0], &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        mid_turn.text.as_deref(),
+        Some("ack: one"),
+        "still the previous answer"
+    );
+    assert!(
+        mid_turn.newer_turn_running,
+        "and it says a newer turn is running"
+    );
+    gate.notify_one();
 }

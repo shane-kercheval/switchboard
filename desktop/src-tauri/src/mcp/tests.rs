@@ -1523,6 +1523,24 @@ impl Capped {
         body
     }
 
+    /// [`Self::call`] with a progress token, as Claude Code and Codex send one.
+    async fn call_with_progress(&mut self, name: &str, args: Value) -> Value {
+        self.id += 1;
+        let request = tool_call(
+            self.id,
+            name,
+            &args,
+            Some(json!({ "progressToken": format!("call-{}", self.id) })),
+        );
+        let response = post_in_process(&self.router, Some(&self.session), &request).await;
+        let (message, _) = read_sse(response, self.id).await;
+        assert!(
+            !message["result"]["isError"].as_bool().unwrap_or(false),
+            "{name} failed: {message}"
+        );
+        tool_reply(&message)
+    }
+
     /// One send to the coder, scripted to reply with `reply`, waited to done.
     async fn exchange(&mut self, reply: &str) -> Value {
         self.env.adapter.push(Script::reply(reply));
@@ -1576,12 +1594,20 @@ async fn max_chars_keeps_a_conversation_under_the_size_asked_for() {
     let project_id = t.project_id;
 
     let whole = t
-        .call("read_conversation", json!({ "project_id": project_id }))
+        .call_with_progress("read_conversation", json!({ "project_id": project_id }))
         .await;
     assert_eq!(
         whole["items_omitted"], 0,
-        "four exchanges fit the full budget"
+        "four exchanges fit the full budget, a client with a progress token's default"
     );
+    let no_token = t
+        .call("read_conversation", json!({ "project_id": project_id }))
+        .await;
+    assert!(
+        serialized_len(&no_token) <= 45_000,
+        "a client that sends no progress token (Claude Desktop) gets results it shows inline"
+    );
+    assert!(no_token["items_omitted"].as_u64().unwrap() > 0);
 
     let capped = t
         .call(
@@ -2579,4 +2605,54 @@ async fn live_claude_mcp_compact() {
 #[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_mcp_compact() {
     live_compact_through_the_server(switchboard_core::HarnessKind::Codex).await;
+}
+
+/// The orchestrator prompt in Settings names tools by name. A rename or a
+/// removal here would leave a pasted prompt pointing at a tool that is gone,
+/// so every tool-like name in it must be a tool, and its version must be the
+/// one the server's instructions announce.
+#[test]
+fn the_orchestrator_prompt_names_only_real_tools_and_the_announced_version() {
+    const VERBS: &[&str] = &[
+        "list_",
+        "read_",
+        "wait_",
+        "send_",
+        "cancel_",
+        "create_",
+        "rename_",
+        "remove_",
+        "fork_",
+        "compact_",
+        "run_",
+        "describe_",
+        "dismiss_",
+        "get_",
+        "set_",
+    ];
+    // Field names that share a tool's prefix.
+    const FIELDS: &[&str] = &["send_id", "send_ids", "run_id"];
+    let source = include_str!("../../../src/lib/orchestratorPrompt.ts");
+    let tools: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
+    let named: Vec<&str> = source
+        .split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+        .filter(|word| VERBS.iter().any(|verb| word.starts_with(verb)))
+        .filter(|word| !FIELDS.contains(word))
+        .collect();
+    assert!(!named.is_empty(), "the scan found the prompt's tool names");
+    for word in named {
+        assert!(
+            tools.contains(&word),
+            "the prompt names {word}, which is not a tool"
+        );
+    }
+
+    let version: u32 = source
+        .split("ORCHESTRATOR_PROMPT_VERSION = ")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .and_then(|n| n.trim().parse().ok())
+        .expect("the prompt declares its version");
+    assert_eq!(version, super::tools::ORCHESTRATOR_PROMPT_VERSION);
+    assert!(super::tools::instructions().contains(&format!("version {version}")));
 }

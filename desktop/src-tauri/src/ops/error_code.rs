@@ -50,7 +50,9 @@ pub fn error_code(error: &AppError) -> &'static str {
         | AppError::ProjectUnderMaintenance(_)
         | AppError::ProjectViewStale(_) => PROJECT_NOT_LOADED,
         AppError::ProjectLocked(_) => PROJECT_LOCKED,
-        AppError::AgentNotFound(_) | AppError::ForwardSourceMoved { .. } => AGENT_NOT_FOUND,
+        AppError::AgentNotFound(_)
+        | AppError::AgentNotInProject { .. }
+        | AppError::ForwardSourceMoved { .. } => AGENT_NOT_FOUND,
         AppError::UnknownRecipient { .. } => UNKNOWN_RECIPIENT,
         AppError::AgentBusy
         | AppError::RecipientsBusy { .. }

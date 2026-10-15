@@ -150,6 +150,14 @@ pub enum AppError {
     #[error("agent {0} not found in any loaded project")]
     AgentNotFound(AgentId),
 
+    /// An agent-access call named an agent the project does not hold: a typo,
+    /// an id from another project, or an agent since removed.
+    #[error("no agent {agent_id} in project {project_id}: list_agents shows the project's agents")]
+    AgentNotInProject {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
+
     /// A forward source resolved to a project the journal read pass never
     /// covered — the read set and the resolve set diverged. Distinct from
     /// `ProjectNotLoaded` on purpose: the project *is* loaded, so "open it"
@@ -586,13 +594,17 @@ pub enum AppError {
 
     /// The desktop window reported that it cannot listen to this agent's
     /// events, so a send to it would run invisibly. Refused per recipient.
-    #[error("the desktop window is not listening to agent {agent_id}; nothing was sent to it")]
+    #[error(
+        "the desktop window is not listening to agent {agent_id}; nothing was sent to it: try again, and if it repeats, ask the user to reopen the project in Switchboard"
+    )]
     DesktopUnavailable { agent_id: AgentId },
 
     /// The desktop window did not acknowledge loading the project within the
     /// sync deadline. Nothing was dispatched; the load keeps running, so a
     /// retry usually succeeds.
-    #[error("the desktop window did not finish loading project {0} in time")]
+    #[error(
+        "the desktop window did not finish loading project {0} in time; nothing was sent: try again"
+    )]
     ProjectLoadTimeout(ProjectId),
 
     /// The desktop window could not load the project (its open or roster read
@@ -668,7 +680,10 @@ pub enum AppError {
     /// whole send was refused and nothing was dispatched. Names rather than
     /// ids because the message is what the caller reads; the ids are in the
     /// request it just made.
-    #[error("busy: {}", names.join(", "))]
+    #[error(
+        "busy: {}; nothing was sent: wait for them with wait_agent, or send again with on_busy queue to line it up behind their turns",
+        names.join(", ")
+    )]
     RecipientsBusy { names: Vec<String> },
 
     /// A caller other than the window asked to remove an agent with a turn

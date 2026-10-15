@@ -19,7 +19,6 @@ use crate::workflow_commands::{
     classify_run_file, describe_workflow_form_fresh_impl, invoke_workflow_with, read_run_files,
 };
 
-use super::RESULT_BUDGET_CHARS;
 use super::budget::BudgetSpec;
 use super::ledger::{RunSend, RunState};
 use super::read::project_readonly;
@@ -195,9 +194,9 @@ pub struct WaitWorkflowReply {
 /// steps in one fixed workflow file; revisit with real paging when loops
 /// (`for_each`) can run.
 #[must_use]
-pub fn wait_workflow_budget() -> BudgetSpec {
+pub fn wait_workflow_budget(budget_chars: usize) -> BudgetSpec {
     BudgetSpec::unpageable(
-        RESULT_BUDGET_CHARS,
+        budget_chars,
         Some("sends"),
         "list_workflow_runs, for the run's step and status",
     )

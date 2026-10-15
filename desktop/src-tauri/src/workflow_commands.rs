@@ -610,9 +610,28 @@ pub(crate) fn snapshot_workflow(
     name: &str,
     is_builtin: bool,
 ) -> Result<Workflow, AppError> {
+    // A name, never a path: joined to the workflows folder below, "../x" or
+    // an absolute path would read any YAML file on the Mac as a workflow.
+    let mut parts = Path::new(name).components();
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) {
+        return Err(AppError::InvalidArgument(format!(
+            "{name:?} is not a workflow name: list_workflows shows the names"
+        )));
+    }
     if is_builtin {
-        return builtin_workflow(name).ok_or_else(|| AppError::WorkflowNotFound {
-            name: name.to_owned(),
+        return builtin_workflow(name).ok_or_else(|| {
+            if user_workflow_exists(state, name) {
+                AppError::InvalidArgument(format!(
+                    "{name:?} is not a built-in workflow but one of the user's: pass is_builtin false"
+                ))
+            } else {
+                AppError::WorkflowNotFound {
+                    name: name.to_owned(),
+                }
+            }
         });
     }
     let dir = workflows_dir(state)?;
@@ -627,8 +646,22 @@ pub(crate) fn snapshot_workflow(
             return Ok(parse_workflow(name, &content)?);
         }
     }
+    if builtin_workflow(name).is_some() {
+        return Err(AppError::InvalidArgument(format!(
+            "{name:?} is a built-in workflow: pass is_builtin true"
+        )));
+    }
     Err(AppError::WorkflowNotFound {
         name: name.to_owned(),
+    })
+}
+
+/// Whether the user's workflows folder holds `name`.
+fn user_workflow_exists(state: &AppState, name: &str) -> bool {
+    workflows_dir(state).is_ok_and(|dir| {
+        ["yaml", "yml"]
+            .iter()
+            .any(|ext| dir.join(format!("{name}.{ext}")).exists())
     })
 }
 
@@ -1932,6 +1965,31 @@ mod tests {
             resolved: BTreeMap::new(),
             done: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    #[test]
+    fn a_workflow_name_is_a_name_never_a_path() {
+        let env = crate::ops::test_support::TestEnv::new().with_prompts_and_workflows();
+        let outside = env.workflows_dir().parent().unwrap().join("outside.yaml");
+        std::fs::write(&outside, "name: outside\nsteps: []\n").unwrap();
+        for name in ["../outside", "/etc/hosts", "a/b", ".."] {
+            let refused = snapshot_workflow(&env.state, name, false);
+            assert!(
+                matches!(&refused, Err(AppError::InvalidArgument(m)) if m.contains("not a workflow name")),
+                "{name}: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_built_in_named_without_is_builtin_says_so() {
+        let env = crate::ops::test_support::TestEnv::new().with_prompts_and_workflows();
+        let refused = snapshot_workflow(&env.state, "review-and-reconcile", false);
+        assert!(
+            matches!(&refused, Err(AppError::InvalidArgument(m)) if m.contains("is_builtin true")),
+            "{refused:?}"
+        );
+        assert!(snapshot_workflow(&env.state, "review-and-reconcile", true).is_ok());
     }
 
     #[tokio::test]

@@ -55,42 +55,47 @@ use crate::state::AppState;
 pub const INSTRUCTIONS: &str = "\
 Switchboard runs AI coding agents (Claude Code, Codex, Antigravity) on this Mac, grouped into \
 projects; each project has a working folder and any number of agents. These tools direct them \
-the way the user does from Switchboard's window. Every tool takes ids: call list_projects, then \
-list_agents, and use the ids they return (names are for display and can change).
+the way the user does from Switchboard's window. Every tool takes ids: call list_projects, \
+then list_agents, and use the ids they return (names are for display and can change).
 
 An agent is a persistent session of its harness, run in the project's folder with the user's \
-own configuration for that harness (including the folder's instructions file, such as CLAUDE.md \
-or AGENTS.md) and the harness's full tools: it reads and edits files, runs commands, and uses \
-git. It receives your message as if the user had typed it and cannot tell you from the user. \
-Each send continues its conversation: it keeps earlier sends and its own replies until its \
-context is compacted, so a follow-up need not repeat what it already knows. Its reply is the \
-text it writes; tool calls and thinking are not returned. These tools read no files: to learn \
-how the code works, ask an agent.
+own configuration for that harness (including the folder's instructions file, such as \
+CLAUDE.md or AGENTS.md) and the harness's full tools: it reads and edits files, runs commands, \
+and uses git. A project's agents share its folder, so each sees the others' uncommitted \
+changes. An agent receives your message as if the user had typed it and cannot tell you from \
+the user. Each send continues its conversation: it keeps earlier sends and its own replies \
+until its context is compacted, so a follow-up need not repeat what it already knows. Its \
+reply is the text it writes; tool calls and thinking are not returned. These tools read no \
+files: to learn how the code works, ask an agent.
 
 The loop: send a message to one or more agents with send (or pass agents' latest answers to \
 others with forward). It returns a send_id at once. Call wait_send with that id until done is \
 true; each call waits up to its timeout and returns the current state either way, so call it \
 again. The replies come back in wait_send's final answer. With several agents working at once, \
 wait_any_send waits on all their sends and returns when the first finishes. read_conversation \
-shows a project's whole history; read_agent_output shows an agent's latest answer, including \
-turns you did not send. The user's saved prompts (list_prompts) and workflows (list_workflows) are their standing \
-instructions and procedures, such as a code review: use one when it fits rather than writing \
-your own. Before running a multi-step exchange across agents by hand (review rounds, a fan-out \
-and reconcile), check list_workflows for one the user saved.
+shows a project's whole history; read_agent_output shows an agent's latest finished answer, \
+including turns you did not send. The user's saved prompts (list_prompts) and workflows \
+(list_workflows) are their standing instructions and procedures, such as a code review: use \
+one when it fits rather than writing your own. Before running a multi-step exchange across \
+agents by hand (review rounds, a fan-out and reconcile), check list_workflows for one the user \
+saved.
 
 Results are JSON: {\"result\": …, \"truncated\": […], \"items_omitted\": n}. A result is kept \
-under 100,000 characters: long text may be cut, and each cut is listed in truncated with the \
-call that reads the rest (read_with), when there is one. max_chars on read_conversation, \
-read_send_output, read_agent_output, wait_send, wait_any_send, and wait_agent lowers the limit \
-for one call, and the call a cut lists keeps it. Claude Desktop's Code tab shows a result inline only under 50,000 \
-characters and saves a larger one to a file: pass 45000 there. Codex keeps about 10,000 tokens \
-of a result and cuts the middle: pass 25000 there. An error is {\"code\": …, \"message\": …}; \
-the message says what to do.
+under 100,000 characters, or 45,000 when your client sends no progress token (Claude Desktop): \
+long text may be cut, and each cut is listed in truncated with the call that reads the rest \
+(read_with), when there is one. max_chars on read_conversation, read_send_output, \
+read_agent_output, wait_send, wait_any_send, and wait_agent sets the limit for one call, and \
+the call a cut lists keeps it. Codex keeps about 10,000 tokens of a result and cuts the \
+middle: pass 25000 there. An error is {\"code\": …, \"message\": …}; the message says what to \
+do.
 
 Some conditions need the user at the Mac, not a retry: a turn that failed with failure_kind \
-usage_limit or auth_failure; prompt_needs_sign_in (a prompt server's sign-in lapsed); \
-directory_missing (the project's folder is gone); agent_busy_elsewhere (another program holds \
-the agent's session); a workflow whose invocable is false. Report them and stop.
+usage_limit or auth_failure, or whose error says a usage limit was reached (Claude and \
+Antigravity report one as harness_error); prompt_needs_sign_in; directory_missing; \
+project_locked (another Switchboard holds the project). Report them and pause the work that \
+needs them. agent_busy_elsewhere means another process holds the agent's session: after \
+fork_agent it is the fork's first reply, so wait and resend; if it persists, report it. A \
+workflow whose invocable is false cannot run here: skip it.
 
 The agents run without approval prompts and act on the user's files. The user sees every \
 message you send, queued or running, in Switchboard's window and can cancel it there.";
@@ -101,8 +106,19 @@ message you send, queued or running, in Switchboard's window and can cancel it t
 #[must_use]
 pub fn instructions() -> String {
     let names: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
-    format!("{INSTRUCTIONS}\n\nThe tools: {}.", names.join(", "))
+    format!(
+        "{INSTRUCTIONS} The orchestrator prompt in Switchboard's Settings is version \
+         {ORCHESTRATOR_PROMPT_VERSION}: if yours is older or has none, tell the user to copy \
+         the current one.\n\nThe tools: {}.",
+        names.join(", ")
+    )
 }
+
+/// The version of the orchestrator prompt in Settings
+/// (`desktop/src/lib/orchestratorPrompt.ts`), named in the instructions so an
+/// orchestrator running an older pasted copy can tell the user to recopy it.
+/// Bump both together whenever the prompt changes; a test checks they match.
+pub const ORCHESTRATOR_PROMPT_VERSION: u32 = 1;
 
 /// How Claude Code is told to show a result directly rather than save one
 /// over 50,000 characters to a file: every result is under this.
@@ -226,11 +242,12 @@ tools! {
          page starts and is absent on the last page. Also reads a reply still running (the text \
          so far), failed, or cancelled.";
     ReadAgentOutput = "read_agent_output" (ReadAgentOutputArgs) [Read]
-        "An agent's latest completed answer, including turns you did not send (the user's, a \
+        "An agent's latest finished answer, including turns you did not send (the user's, a \
          workflow's), or the reason its latest turn failed or was cancelled. Carries the send_id \
          when known, so a long answer can be paged with read_send_output, and the agent's context \
-         after its newest finished turn (as list_agents reports it). To wait for a running agent \
-         first, use wait_agent.";
+         after its newest finished turn (as list_agents reports it). newer_turn_running is true \
+         when the agent has a turn running or waiting: this answer is then not its newest. To \
+         follow a message you sent, use wait_send; to wait for a running agent, wait_agent.";
     ListPrompts = "list_prompts" (NoArgs) [Read]
         "The user's saved prompts, local and from prompt servers: provider, name, description, \
          and arguments. They are the user's standing instructions (a code review, a security \
@@ -239,8 +256,9 @@ tools! {
     ListWorkflows = "list_workflows" (NoArgs) [Read]
         "The user's workflows, saved multi-agent procedures (send to several reviewers and gather \
          their findings, for example): name, is_builtin, description, declared inputs, and \
-         invocable (false when a step needs the user at the Mac). Prefer one to running its steps \
-         by hand. Call describe_workflow before run_workflow: it also lists the arguments the \
+         invocable: false when this server cannot run it (a pause_for_user or for_each step, or a \
+         file that failed to parse, with its parse_error). Skip one that is not invocable and say \
+         so. Prefer one to running its steps by hand. Call describe_workflow before run_workflow: it also lists the arguments the \
          workflow's saved prompts need.";
     DescribeWorkflow = "describe_workflow" (DescribeWorkflowArgs) [Read]
         "Everything run_workflow needs for one workflow: its declared inputs (an agent input \
@@ -270,8 +288,9 @@ tools! {
     RemoveAgent = "remove_agent" (AgentArgs) [Acts]
         "Remove an agent from its project for good: Switchboard's record of it goes, and its \
          card and conversation leave the window. Nothing brings it back; only the harness's own \
-         session file stays on disk, outside Switchboard. Remove an agent only when you are \
-         confident it is no longer needed. Refused with agent_busy while the agent has a turn \
+         session file stays on disk, outside Switchboard. Remove only an agent you created whose \
+         work is committed or passed on, and that will not be needed again; ask the user before \
+         removing any other. Refused with agent_busy while the agent has a turn \
          running or queued (wait_agent for it, or cancel_agent to stop it) or a workflow runs in \
          its project. A message that reaches the agent while it is being removed is cancelled or \
          refused, and no workflow can start in the project until the removal ends. Once begun, \
@@ -313,8 +332,9 @@ tools! {
          from the source's conversation as it is at that send. After request_in_progress, wait_send \
          on its send_id: once it settles, its recipient is the fork (list_agents shows it); retry \
          with the same key only if you gave one, since a retry without one makes a second fork. \
-         A fork stays until someone removes it (remove_agent): fork for a reason, not per \
-         message.";
+         Until a Claude fork's first reply ends, sends to its source fail with \
+         agent_busy_elsewhere: wait for that reply, then resend. A fork stays until someone \
+         removes it (remove_agent): fork for a reason, not per message.";
     Send = "send" (SendArgs) [Acts]
         "Send one message to one or more agents of a project, as the user's next message in each \
          one's conversation. Returns at once with a send_id and each recipient's status at \
@@ -339,39 +359,55 @@ tools! {
              Sources may be in other projects. Prefer this to copying a reply into send. A \
              source still mid-turn is waited for, up to timeout_seconds; if it is still running \
              then, the forward fails with source_busy and nothing is sent: call wait_agent on the \
-             source, then retry. With a saved prompt, forward_args fills a prompt argument from \
-             sources instead. on_busy, idempotency_key, and the receipt work as in send.\n\
+             source, then retry. A source whose latest turn failed or was cancelled is still \
+             forwarded, as a note saying so in place of an answer: check a source's status \
+             first. A source with no answer text refuses the forward (invalid_argument). With a \
+             saved prompt, forward_args fills a prompt argument from sources instead. on_busy, idempotency_key, and the receipt work as in send.\n\
              {WAIT_HINTS}"
         );
     RunWorkflow = "run_workflow" (RunWorkflowArgs) [Acts]
         "Start a workflow in a project and return its run_id; then call wait_workflow until \
          done. Pass inputs as describe_workflow lists them: an agent input takes an agent id, a \
-         list input a list. forward_sources fills an input with agents' latest answers. The run \
-         reports only its status: read outputs afterwards with read_agent_output. Refused with \
-         workflow_run_requires_dismissal while a failed run is held in the project.";
-    CancelSend = "cancel_send" (SendIdArgs) [Stops]
-        "Cancel a send: every recipient still queued or running is cancelled, and a send still \
-         being prepared stops before reaching anyone else. outcome is cancelled, or \
-         already_finished when every recipient had already ended (nothing to cancel). Works for \
-         sends made since the app last started.";
+         list input a list. forward_sources fills an input with agents' latest answers. \
+         wait_workflow lists every send the run made with its send_id: read each reply with \
+         read_send_output, since an agent's latest answer holds only its last step. Refused with \
+         workflow_already_running while another run is in progress in the project, with \
+         workflow_run_requires_dismissal while a failed run is held there, and while an agent \
+         is being removed from it (start again in a moment).";
+    CancelSend = "cancel_send" (CancelSendArgs) [Stops]
+        "Cancel a send. Without agent_id, every recipient still queued or running is cancelled, \
+         and a send still being prepared stops before reaching anyone else; this works for sends \
+         you made since the app last started. With agent_id, only that agent's reply to the \
+         send is cancelled, queued or running, and the other recipients carry on; this also \
+         works for a workflow's sends (wait_workflow lists their send_ids), where a cancelled \
+         reply cancels the whole run. To unstick one agent, pass its agent_id. outcome is \
+         cancelled; already_finished when there was nothing left to cancel; or requested when \
+         Switchboard holds no record of the send (a workflow's, or one from before a restart): \
+         the agent stops that reply if it is still queued or running.";
     CancelAgent = "cancel_agent" (AgentArgs) [Stops]
-        "Stop an agent: cancel its running turn and drop every message queued for it, including \
-         ones the user or a workflow queued.";
+        "Stop an agent entirely: cancel its running turn and drop every message queued for it, \
+         including ones the user or a workflow queued. To unstick one reply without dropping \
+         anything else, use cancel_send with agent_id.";
     CancelWorkflowRun = "cancel_workflow_run" (RunArgs) [Stops]
         "Cancel a running workflow run.";
     WaitSend = "wait_send" (WaitSendArgs) [Read]
         format!(
             "Wait for a send's replies. Returns when every recipient has finished or \
              timeout_seconds passes, with the current state either way: call again until done \
-             is true. While not done, recipients carry statuses, and each unfinished one its \
+             is true. While not done, recipients carry statuses, and each running one its \
              activity (as list_agents describes it) and recent_text: the last 500 characters \
              it has written in this turn so far (its answer text, not tool output; absent until \
-             it writes some). When done, each completed recipient \
-             carries its reply text and its agent's context after the turn (as list_agents \
-             reports it), for deciding whether to compact before the next step. Statuses: accepted (queued), running, completed, failed, cancelled, \
-             rejected, not_dispatched; after an app restart, started or unknown, read from \
-             the journal. Long replies share the result evenly, each cut one listed in \
-             truncated with the read_send_output call that reads on.\n{WAIT_HINTS}"
+             it writes some). An accepted recipient is waiting in line behind another turn and \
+             carries no activity: list_agents shows that other turn's. When done, each \
+             completed recipient carries its reply text and its agent's context after the turn \
+             (as list_agents reports it), for deciding whether to compact before the next step. \
+             Statuses: accepted (waiting in line), running, completed, failed, cancelled, \
+             rejected, not_dispatched; after an app restart, started, which means the restart \
+             cut the reply off: ask the agent where it got to. source is live, journal (read \
+             after a restart), or unknown: this project has no record of the send, so check \
+             project_id and send_id; a message still waiting in line when the app restarted was \
+             never sent and reads this way too. Long replies share the result evenly, each cut \
+             one listed in truncated with the read_send_output call that reads on.\n{WAIT_HINTS}"
         );
     WaitAnySend = "wait_any_send" (WaitAnySendArgs) [Read]
         format!(
@@ -423,7 +459,9 @@ pub fn catalog() -> Vec<Tool> {
             let annotations = match tool.kind() {
                 ToolKind::Read => ToolAnnotations::new().read_only(true),
                 ToolKind::Additive => ToolAnnotations::new().read_only(false).destructive(false),
-                ToolKind::Acts | ToolKind::Stops => ToolAnnotations::new().read_only(false),
+                ToolKind::Acts | ToolKind::Stops => {
+                    ToolAnnotations::new().read_only(false).destructive(true)
+                }
             };
             Tool::new(tool.as_str(), tool.description(), tool.schema())
                 .with_annotations(annotations)
@@ -644,18 +682,6 @@ pub struct RunArgs {
     /// The run id `run_workflow` or `list_workflow_runs` returned.
     #[schemars(with = "String")]
     run_id: Uuid,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-#[serde(deny_unknown_fields)]
-pub struct SendIdArgs {
-    #[schemars(with = "String")]
-    project_id: ProjectId,
-    /// The `send_id` that `send`, `forward`, `compact_agent`, or `fork_agent`
-    /// returned.
-    #[schemars(with = "String")]
-    send_id: SendId,
 }
 
 /// What to do with a recipient that is busy.
@@ -916,11 +942,29 @@ pub struct WaitSendArgs {
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)] // The three ids a single-recipient cancel names.
+pub struct CancelSendArgs {
+    #[schemars(with = "String")]
+    project_id: ProjectId,
+    /// The send to cancel, as `send`, `forward`, `compact_agent`, `fork_agent`,
+    /// or `wait_workflow` reported it.
+    #[schemars(with = "String")]
+    send_id: SendId,
+    /// Cancel only this agent's reply to the send; the other recipients carry
+    /// on. Omit to cancel every recipient.
+    #[serde(default)]
+    #[schemars(with = "Option<String>")]
+    agent_id: Option<AgentId>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
 pub struct WaitAnySendArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
     /// The `send_id`s to wait on, each as `send`, `forward`, `compact_agent`,
-    /// or `fork_agent` returned it. At least one.
+    /// or `fork_agent` returned it, all made in `project_id`. At least one.
     #[schemars(with = "Vec<String>")]
     send_ids: Vec<SendId>,
     /// Seconds to wait before returning the current state. 50 by default.
@@ -964,11 +1008,23 @@ pub struct WaitWorkflowArgs {
 }
 
 fn parse<P: DeserializeOwned>(args: JsonObject) -> Result<P, AppError> {
-    serde_json::from_value(Value::Object(args))
-        .map_err(|e| AppError::InvalidArgument(format!("invalid arguments: {e}")))
+    serde_json::from_value(Value::Object(args)).map_err(|e| {
+        let hint = if e.to_string().contains("UUID") {
+            " (ids come from list_projects, list_agents, and the send and run results; names are \
+             not accepted)"
+        } else {
+            ""
+        };
+        AppError::InvalidArgument(format!("invalid arguments: {e}{hint}"))
+    })
 }
 
 // --- calling ---------------------------------------------------------------------
+
+/// The result budget for a client that sends no progress token. Claude
+/// Desktop is the one measured client without one, and its Code tab shows a
+/// result inline only under 50,000 characters, saving a larger one to a file.
+const NO_PROGRESS_RESULT_CHARS: usize = 45_000;
 
 /// What one tool call runs with.
 pub struct CallContext {
@@ -999,6 +1055,16 @@ impl CallContext {
             Some(hook) => budget.with_progress(Arc::clone(hook)),
             None => budget,
         }
+    }
+
+    /// The result budget for this call: the caller's `max_chars`, or the
+    /// full budget, or [`NO_PROGRESS_RESULT_CHARS`] for a client that sends no
+    /// progress token, so Claude Desktop gets results it shows inline without
+    /// the model having to know which client it runs in.
+    fn result_chars(&self, max_chars: Option<usize>) -> usize {
+        result_budget_chars(
+            max_chars.or((!self.can_keep_alive).then_some(NO_PROGRESS_RESULT_CHARS)),
+        )
     }
 }
 
@@ -1065,7 +1131,7 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 read::read_conversation(state, a.project_id, a.last_n_items, cx.home()).await?;
             Reply::fitted(
                 &digest,
-                read::conversation_budget(a.project_id, result_budget_chars(a.max_chars)),
+                read::conversation_budget(a.project_id, cx.result_chars(a.max_chars)),
             )
         }
         ToolName::ReadSendOutput => {
@@ -1078,7 +1144,7 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                     a.agent_id,
                     a.offset,
                     a.read_from.into(),
-                    output_page_chars(result_budget_chars(a.max_chars)),
+                    output_page_chars(cx.result_chars(a.max_chars)),
                     cx.home(),
                 )
                 .await?,
@@ -1090,7 +1156,7 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 read::read_agent_output(state, a.project_id, a.agent_id, cx.home()).await?;
             Reply::fitted(
                 &output,
-                read::agent_output_budget(a.project_id, result_budget_chars(a.max_chars)),
+                read::agent_output_budget(a.project_id, cx.result_chars(a.max_chars)),
             )
         }
         ToolName::ListPrompts => {
@@ -1255,8 +1321,13 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
             Reply::plain(&serde_json::json!({ "run_id": run_id }))
         }
         ToolName::CancelSend => {
-            let a: SendIdArgs = parse(args)?;
-            Reply::plain(&send::cancel_send(state, a.project_id, a.send_id)?)
+            let a: CancelSendArgs = parse(args)?;
+            Reply::plain(&send::cancel_send(
+                state,
+                a.project_id,
+                a.send_id,
+                a.agent_id,
+            )?)
         }
         ToolName::CancelAgent => {
             let a: AgentArgs = parse(args)?;
@@ -1273,7 +1344,7 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
             let reply = send::wait_send(state, a.project_id, a.send_id, &budget, cx.home()).await?;
             Reply::fitted(
                 &reply,
-                wait_send_budget(a.project_id, a.send_id, result_budget_chars(a.max_chars)),
+                wait_send_budget(a.project_id, a.send_id, cx.result_chars(a.max_chars)),
             )
         }
         ToolName::WaitAnySend => {
@@ -1283,7 +1354,7 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 send::wait_any_send(state, a.project_id, a.send_ids, &budget, cx.home()).await?;
             Reply::fitted(
                 &reply,
-                send::wait_any_send_budget(a.project_id, result_budget_chars(a.max_chars)),
+                send::wait_any_send_budget(a.project_id, cx.result_chars(a.max_chars)),
             )
         }
         ToolName::WaitAgent => {
@@ -1293,14 +1364,17 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 send::wait_agent(state, a.project_id, a.agent_id, &budget, cx.home()).await?;
             Reply::fitted(
                 &reply,
-                read::agent_output_budget(a.project_id, result_budget_chars(a.max_chars)),
+                read::agent_output_budget(a.project_id, cx.result_chars(a.max_chars)),
             )
         }
         ToolName::WaitWorkflow => {
             let a: WaitWorkflowArgs = parse(args)?;
             let budget = cx.budget(a.timeout_seconds);
             let reply = workflow::wait_workflow(state, a.project_id, a.run_id, &budget).await?;
-            Reply::fitted(&reply, workflow::wait_workflow_budget())
+            Reply::fitted(
+                &reply,
+                workflow::wait_workflow_budget(cx.result_chars(None)),
+            )
         }
     }
 }

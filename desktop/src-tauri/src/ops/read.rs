@@ -738,6 +738,10 @@ pub struct AgentOutput {
     /// `list_agents` reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextFigures>,
+    /// The agent has a turn running or waiting, so this answer is not its
+    /// newest: a caller that just sent to it should wait on that send instead.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub newer_turn_running: bool,
 }
 
 /// The agent's context fullness after its newest finished turn, when known.
@@ -765,6 +769,7 @@ pub async fn read_agent_output(
 ) -> Result<AgentOutput, AppError> {
     let mut output = latest_agent_output(state, project_id, agent_id, home_dir).await?;
     output.context = known_context(state, agent_id);
+    output.newer_turn_running = !state.dispatcher.accepts_now(agent_id).await;
     Ok(output)
 }
 
@@ -785,6 +790,7 @@ async fn latest_agent_output(
             send_id: Some(send_id),
             source: OutputSource::Live,
             context: None,
+            newer_turn_running: false,
         });
     }
     let project = project_readonly(state, project_id)?;
@@ -814,6 +820,7 @@ async fn latest_agent_output(
             send_id: latest_send,
             source: OutputSource::Journal,
             context: None,
+            newer_turn_running: false,
         });
     }
     let view = AgentJournalView::from_records(&records, agent_id);
@@ -834,6 +841,7 @@ async fn latest_agent_output(
                 _ => OutputSource::Uncorrelated,
             },
             context: None,
+            newer_turn_running: false,
         },
         None => AgentOutput {
             agent_id,
@@ -842,6 +850,7 @@ async fn latest_agent_output(
             send_id: None,
             source: OutputSource::Uncorrelated,
             context: None,
+            newer_turn_running: false,
         },
     })
 }
@@ -947,5 +956,8 @@ pub(crate) fn agent_in_project(
     list_project_agents_readonly_impl(state, project_id)?
         .into_iter()
         .find(|a| a.id == agent_id)
-        .ok_or(AppError::AgentNotFound(agent_id))
+        .ok_or(AppError::AgentNotInProject {
+            project_id,
+            agent_id,
+        })
 }

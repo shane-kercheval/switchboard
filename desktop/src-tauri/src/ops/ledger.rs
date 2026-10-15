@@ -168,8 +168,9 @@ pub struct RecipientSnapshot {
     /// tell a quota wall or an auth failure from a crash and not retry into it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<FailureKind>,
-    /// What the agent is doing while this recipient is not finished: how long
-    /// since it last produced output, and the tool calls it has open.
+    /// What the agent is doing while this recipient's own turn runs: how long
+    /// since it last produced output, and the tool calls it has open. Absent
+    /// while the recipient waits in line behind another turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<AgentActivity>,
     /// The end of what the agent has written in this turn so far, up to
@@ -972,7 +973,10 @@ impl SendLedger {
                 .iter()
                 .map(|recipient| {
                     let mut snapshot = recipient.snapshot();
-                    if !snapshot.status.is_terminal() {
+                    // Only a running recipient's own turn: one still waiting in
+                    // line would otherwise show the turn ahead of it, which may
+                    // be the user's, as if it were this send's.
+                    if snapshot.status == SendStatus::Running {
                         snapshot.activity = inner
                             .activity
                             .get(&recipient.agent_id)
@@ -1801,6 +1805,38 @@ mod tests {
         assert_eq!(
             done.recipients[0].activity, None,
             "a finished recipient carries its reply instead"
+        );
+    }
+
+    #[test]
+    fn a_recipient_waiting_in_line_carries_no_activity_of_the_turn_ahead() {
+        let ledger = SendLedger::new();
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        // Another turn holds the agent, one this ledger did not send (the
+        // user's, say): its silence is not this send's.
+        let other_turn = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(Uuid::now_v7(), other_turn, Uuid::now_v7()),
+        );
+        assert!(ledger.activity(agent_id).is_some(), "the agent is busy");
+        let waiting = ledger.send(send_id).unwrap();
+        assert_eq!(waiting.recipients[0].status, SendStatus::Accepted);
+        assert_eq!(waiting.recipients[0].activity, None);
+
+        ledger.observe(
+            &channel(agent_id),
+            &turn_end(other_turn, &json!({ "status": "completed" })),
+        );
+        let own_turn = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(message_id, own_turn, send_id),
+        );
+        let running = ledger.send(send_id).unwrap();
+        assert!(
+            running.recipients[0].activity.is_some(),
+            "its own turn's activity, once it runs"
         );
     }
 

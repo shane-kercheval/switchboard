@@ -562,13 +562,17 @@ steps:
 
         {{ aggregated_responses(reviewers) }}
 
-        Weigh their responses and give your final recommendation.
+        Weigh their responses and settle every finding — where a reviewer changed your mind, say so plainly and name what changed it; where you stand firm, keep the refuting evidence.
+
+        Then write ONE final response, addressed to the human who decides what happens next. They have read nothing else — not the reviews, not your analysis, not the responses — and this workflow does not send your reply back to the reviewers. Write for the human only, and do not reuse the per-finding template from your earlier analysis message. Do not change any files in this reply: the fixes come after this run.
+
+        - Open with the bottom line, one or two sentences: …
   - label: Recommendation ready
     wait_for:
       agent: "{{ worker }}"
 ```
 
-Both prompts are hardcoded. The invocation form shows `reviewers`, `worker`, and `code-review`'s auto-derived optional `context`. `analyze-ai-reviews`'s `review` argument is a computed binding, so it is hidden; if that prompt ever renamed `review`, invocation would be blocked with an error naming the prompt and argument rather than failing mid-run.
+The final step's rules for that response are shortened above; `crates/workflow/resources/workflows/review-and-reconcile.yaml` holds them in full. Both prompts are hardcoded. The invocation form shows `reviewers`, `worker`, and `code-review`'s auto-derived optional `context`. `analyze-ai-reviews`'s `review` argument is a computed binding, so it is hidden; if that prompt ever renamed `review`, invocation would be blocked with an error naming the prompt and argument rather than failing mid-run.
 
 ## Conventions
 

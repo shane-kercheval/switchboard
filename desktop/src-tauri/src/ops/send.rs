@@ -877,17 +877,33 @@ pub enum CancelOutcome {
     Cancelled,
     /// Every recipient had already ended: nothing to cancel.
     AlreadyFinished,
+    /// One recipient's cancel was sent to its agent without a record of the
+    /// send to check against (a workflow's send, or one from before a restart,
+    /// or a recipient not yet offered its message): the agent stops the reply
+    /// if it still has it.
+    Requested,
 }
 
 /// Cancel a send: every recipient still accepted or running is cancelled
 /// through the dispatcher, and a send still preparing or dispatching is told to
 /// stop, so its remaining recipients are never sent. Needs the ledger's record
 /// of the send: a queued send does not survive a restart.
+///
+/// With `agent_id`, only that recipient's reply is cancelled, queued or
+/// running: its actor drops the send's item, and the other recipients carry
+/// on. That needs no ledger record, so it also reaches a workflow's sends (the
+/// ledger does not hold them) and one from before a restart; the outcome is
+/// then `requested`, because nothing here can see whether the agent still had
+/// the reply.
 pub fn cancel_send(
     state: &AppState,
     project_id: ProjectId,
     send_id: SendId,
+    agent_id: Option<AgentId>,
 ) -> Result<CancelledSend, AppError> {
+    if let Some(agent_id) = agent_id {
+        return cancel_one_recipient(state, project_id, send_id, agent_id);
+    }
     let snapshot = state
         .ledger
         .send(send_id)
@@ -909,6 +925,53 @@ pub fn cancel_send(
         CancelOutcome::Cancelled
     };
     tracing::info!(%project_id, %send_id, recipients = recipients.len(), ?outcome, "send cancelled");
+    Ok(CancelledSend {
+        send_id,
+        outcome,
+        recipients,
+    })
+}
+
+/// [`cancel_send`] for one recipient.
+fn cancel_one_recipient(
+    state: &AppState,
+    project_id: ProjectId,
+    send_id: SendId,
+    agent_id: AgentId,
+) -> Result<CancelledSend, AppError> {
+    agent_in_project(state, project_id, agent_id)?;
+    let held = state
+        .ledger
+        .send(send_id)
+        .filter(|s| s.project_id == project_id);
+    let outcome = match &held {
+        Some(snapshot) => {
+            let recipient = snapshot
+                .recipients
+                .iter()
+                .find(|r| r.agent_id == agent_id)
+                .ok_or(AppError::UnknownRecipient {
+                    project_id,
+                    agent_id,
+                })?;
+            match recipient.status {
+                // Not offered to the agent yet while the send still dispatches:
+                // the dispatch may yet reach it, and only cancelling the whole
+                // send stops that.
+                SendStatus::NotDispatched if !snapshot.settled => CancelOutcome::Requested,
+                status if status.is_terminal() => CancelOutcome::AlreadyFinished,
+                _ => CancelOutcome::Cancelled,
+            }
+        }
+        None => CancelOutcome::Requested,
+    };
+    let recipients = if outcome == CancelOutcome::AlreadyFinished {
+        Vec::new()
+    } else {
+        cancel_send_impl(state, send_id, &[agent_id]);
+        vec![agent_id]
+    };
+    tracing::info!(%project_id, %send_id, %agent_id, ?outcome, "one recipient of a send cancelled");
     Ok(CancelledSend {
         send_id,
         outcome,

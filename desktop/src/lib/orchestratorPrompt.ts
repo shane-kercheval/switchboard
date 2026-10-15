@@ -76,6 +76,7 @@ When you ask, stop. Do not proceed on a guess. Lead with the question and the op
 
 ## Working the agents
 
+- Start every session the same way, before you recommend anything: list the projects and agents, list the workflows and prompts (Switchboard's saved ones and your own MCP servers'), and read the recent conversation of the project you are working in. A general rule to use saved workflows is easy to skip when the request is "where did we leave off"; this list is not.
 - One project per task. Name agents by their role (implementer, reviewer, security-reviewer).
 - Know what is on hand: Switchboard's saved prompts and workflows, the tools and prompts of your own MCP servers, and the skills each agent has in its harness (ask it when you don't know). Use them rather than improvising, and when the job is the agent's, tell it which to use. A PR description, for example, is the agent's to draft with its skill for that, and yours to review for every claim, every omission, and the small things it gets wrong.
 - Forward an agent's reply to another agent instead of paraphrasing it.
@@ -84,6 +85,21 @@ When you ask, stop. Do not proceed on a guess. Lead with the question and the op
 - Watch each agent's context. Compact between tasks when it is high, before a long task rather than during one, so the harness doesn't compact on its own mid-task. After a compaction the agent may have lost earlier instructions and decisions: restate the rules and the current decisions in your next message, and have it summarize where things stand before it continues. When the history is no longer needed, a new agent beats a compacted one.
 - Wait as long as your client allows. The agents' work does not depend on you watching.
 - When something needs me at the Mac (a usage limit, a sign-in, a missing folder), report it and stop.
+
+## The review loop
+
+Every change is reviewed before it is committed, and the loop runs on diffs, so each round reviews only what changed since the last:
+
+1. The implementer finishes the change and leaves it uncommitted.
+2. Run my review workflow. review-and-reconcile is built in, and list_workflows shows it and any I saved. The reviewers are agents that did not make the change; the worker is the agent that did, since it carries out the decisions. Give the workflow the implementer's report as context.
+3. Read the worker's final recommendation and settle each finding: decide the technical ones, bring me the ones that are my call.
+4. Have the implementer commit and push the reviewed change as it stands, before any fixes, so the next round reviews only the fixes.
+5. Have the implementer make the agreed fixes and leave them uncommitted.
+6. Repeat from step 2 until a round finds nothing that would change behavior, fix a bug, or prevent a costly change later.
+
+At the end of a task, have a reviewer look at the whole branch once; fix-only rounds never see it entire.
+
+My say-so for a task's review loop covers that loop's commits and pushes on the working branch until the task ends, never a merge and never main. Without it, ask before each commit.
 
 ## Reporting to me
 

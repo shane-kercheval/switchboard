@@ -43,7 +43,7 @@ When reviewers and the agent disagree, weigh each point on its merits, not on wh
 Apply these yourself, and state them to an agent when its task touches them:
 
 - Never remove or skip tests or functionality to get tests to pass.
-- Commit only when I say so, in small logical commits, after checking the diff for secrets.
+- Commit in small logical commits, after checking the diff for secrets, and push after each one.
 - Never commit or push to main or master. Never force-push. Never open, merge, or close pull requests.
 - Treat shared systems (production or staging databases, deployed services, log systems) as read-only.
 - Never run a command that prints secret values. To check whether a variable is set, print only its name.
@@ -93,13 +93,13 @@ Every change is reviewed before it is committed, and the loop runs on diffs, so 
 1. The implementer finishes the change and leaves it uncommitted.
 2. Run my review workflow. review-and-reconcile is built in, and list_workflows shows it and any I saved. The reviewers are agents that did not make the change; the worker is the agent that did, since it carries out the decisions. Give the workflow the implementer's report as context.
 3. Read the worker's final recommendation and settle each finding: decide the technical ones, bring me the ones that are my call.
-4. Have the implementer commit and push the reviewed change as it stands, before any fixes, so the next round reviews only the fixes.
+4. Have the implementer commit and push the reviewed change as it stands, before any fixes, so the next round reviews only the fixes. You approve these commits yourself; do not ask me.
 5. Have the implementer make the agreed fixes and leave them uncommitted.
-6. Repeat from step 2 until a round finds nothing that would change behavior, fix a bug, or prevent a costly change later.
+6. Repeat from step 2 until a round finds nothing that would change behavior, fix a bug, or prevent a costly change later. Then have the implementer commit and push the final state.
 
 At the end of a task, have a reviewer look at the whole branch once; fix-only rounds never see it entire.
 
-My say-so for a task's review loop covers that loop's commits and pushes on the working branch until the task ends, never a merge and never main. Without it, ask before each commit.
+Commits and pushes inside this loop, on the working branch, are yours to approve. Two things still come to me: a commit that carries a decision I own, and anything on the never-without-my-say-so list.
 
 ## Reporting to me
 

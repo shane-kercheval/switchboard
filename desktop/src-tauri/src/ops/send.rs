@@ -863,9 +863,20 @@ fn forward_args_for(state: &AppState, prompt: &ForwardPrompt) -> Result<Vec<Forw
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CancelledSend {
     pub send_id: SendId,
+    pub outcome: CancelOutcome,
     /// The recipients the cancel reached: those still accepted or running, and,
     /// for a send still dispatching, those not yet sent.
     pub recipients: Vec<AgentId>,
+}
+
+/// What a cancel found.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelOutcome {
+    /// At least one recipient was still queued, running, or unsent.
+    Cancelled,
+    /// Every recipient had already ended: nothing to cancel.
+    AlreadyFinished,
 }
 
 /// Cancel a send: every recipient still accepted or running is cancelled
@@ -892,9 +903,15 @@ pub fn cancel_send(
         })
         .map(|r| r.agent_id)
         .collect();
-    tracing::info!(%project_id, %send_id, recipients = recipients.len(), "send cancelled");
+    let outcome = if recipients.is_empty() && snapshot.is_done() {
+        CancelOutcome::AlreadyFinished
+    } else {
+        CancelOutcome::Cancelled
+    };
+    tracing::info!(%project_id, %send_id, recipients = recipients.len(), ?outcome, "send cancelled");
     Ok(CancelledSend {
         send_id,
+        outcome,
         recipients,
     })
 }
@@ -939,6 +956,10 @@ pub enum WaitSource {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WaitSendReply {
     pub send_id: SendId,
+    /// The wait was shortened to this many seconds: the client sent no
+    /// progress token to keep a longer one alive (or asked for over an hour).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capped_to_seconds: Option<u64>,
     /// Every recipient reached a terminal status. While `false`, recipients
     /// carry statuses only, never reply text, so a caller that must call
     /// again every 50 seconds pays a few lines per call.
@@ -947,9 +968,23 @@ pub struct WaitSendReply {
     pub recipients: Vec<RecipientSnapshot>,
 }
 
+/// [`wait_send_unreported`], with the reply saying when the wait was
+/// shortened.
+pub async fn wait_send(
+    state: &AppState,
+    project_id: ProjectId,
+    send_id: SendId,
+    budget: &WaitBudget,
+    home_dir: &Path,
+) -> Result<WaitSendReply, AppError> {
+    let mut reply = wait_send_unreported(state, project_id, send_id, budget, home_dir).await?;
+    reply.capped_to_seconds = budget.capped_to_seconds();
+    Ok(reply)
+}
+
 /// Block until every recipient of the send is terminal or the budget ends,
 /// and return the current state either way.
-pub async fn wait_send(
+async fn wait_send_unreported(
     state: &AppState,
     project_id: ProjectId,
     send_id: SendId,
@@ -990,6 +1025,7 @@ pub async fn wait_send(
                 .collect();
             Ok(WaitSendReply {
                 send_id,
+                capped_to_seconds: None,
                 done,
                 source: WaitSource::Live,
                 recipients,
@@ -1006,6 +1042,7 @@ pub async fn wait_send(
             Outcome::Done(reply) => reply,
             Outcome::Timeout | Outcome::Cancelled => Ok(WaitSendReply {
                 send_id,
+                capped_to_seconds: None,
                 done: false,
                 source: WaitSource::Journal,
                 recipients: Vec::new(),
@@ -1064,6 +1101,7 @@ async fn journal_fallback(
     if order.is_empty() {
         return Ok(WaitSendReply {
             send_id,
+            capped_to_seconds: None,
             done: true,
             source: WaitSource::Unknown,
             recipients: Vec::new(),
@@ -1086,6 +1124,7 @@ async fn journal_fallback(
     .await;
     Ok(WaitSendReply {
         send_id,
+        capped_to_seconds: None,
         // Nothing more can arrive from a restart's journal; the caller decides
         // what a lingering `started` means.
         done: true,
@@ -1107,6 +1146,7 @@ async fn fallback_recipient(
 ) -> RecipientSnapshot {
     let mut recipient = RecipientSnapshot {
         agent_id,
+        activity: None,
         message_id: None,
         status: SendStatus::Started,
         text: None,
@@ -1157,6 +1197,14 @@ pub enum AgentWaitStatus {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WaitAgentReply {
     pub agent_id: AgentId,
+    /// Whether the agent is producing anything: seconds since its last output
+    /// and its open tool calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<super::ledger::AgentActivity>,
+    /// The wait was shortened to this many seconds: the client sent no
+    /// progress token to keep a longer one alive (or asked for over an hour).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capped_to_seconds: Option<u64>,
     pub status: AgentWaitStatus,
     /// The agent's latest output, once idle.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1168,6 +1216,20 @@ pub struct WaitAgentReply {
     pub output_unavailable: bool,
 }
 
+/// [`wait_agent_unreported`], with the reply saying when the wait was
+/// shortened.
+pub async fn wait_agent(
+    state: &AppState,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    budget: &WaitBudget,
+    home_dir: &Path,
+) -> Result<WaitAgentReply, AppError> {
+    let mut reply = wait_agent_unreported(state, project_id, agent_id, budget, home_dir).await?;
+    reply.capped_to_seconds = budget.capped_to_seconds();
+    Ok(reply)
+}
+
 /// Block until the dispatcher would accept a send to the agent, or the budget
 /// ends. Between checks it parks on the ledger's per-agent signal (an event on
 /// the agent's channel that can change admission: a turn's start or end, a
@@ -1175,7 +1237,7 @@ pub struct WaitAgentReply {
 /// an agent shuts down both dispatcher queries answer instantly, so a polling
 /// loop would never yield. The output is read within the call's finishing
 /// allowance.
-pub async fn wait_agent(
+async fn wait_agent_unreported(
     state: &AppState,
     project_id: ProjectId,
     agent_id: AgentId,
@@ -1200,6 +1262,8 @@ pub async fn wait_agent(
     if !idle {
         return Ok(WaitAgentReply {
             agent_id,
+            activity: state.ledger.activity(agent_id),
+            capped_to_seconds: None,
             status: AgentWaitStatus::Running,
             output: None,
             output_unavailable: false,
@@ -1214,6 +1278,8 @@ pub async fn wait_agent(
     };
     Ok(WaitAgentReply {
         agent_id,
+        activity: state.ledger.activity(agent_id),
+        capped_to_seconds: None,
         status: AgentWaitStatus::Idle,
         output_unavailable: output.is_none(),
         output,

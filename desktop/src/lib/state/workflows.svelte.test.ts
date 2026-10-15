@@ -126,6 +126,23 @@ describe("workflows store", () => {
     expect(row?.step).toBe(2);
     expect(row?.steps).toHaveLength(1);
     expect(row?.steps[0]?.label).toBe("Send the review");
+
+    // A second event for the same step, naming the agents the engine resolved
+    // and its send, changes nothing the window shows.
+    emit(
+      "p1",
+      running({
+        step: 2,
+        label: "Send the review",
+        recipients: [{ agent_id: "a1", name: "reviewer-1", dispatched: true }],
+        send_id: "s1",
+      }),
+    );
+    const again = workflowRuns["p1"]?.filter((r) => r.run_id === "r1");
+    expect(again).toHaveLength(1);
+    expect(again?.[0]?.step).toBe(2);
+    expect(again?.[0]?.status).toBe("running");
+    expect(again?.[0]?.steps).toHaveLength(1);
   });
 
   it("refreshes to fetch steps when a run is first seen via an event", async () => {

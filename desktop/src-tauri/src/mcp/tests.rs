@@ -201,6 +201,20 @@ async fn the_tool_list_is_the_catalog_and_declares_the_result_size() {
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     let expected: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
     assert_eq!(names, expected);
+    let instructions = info.instructions.as_deref().unwrap();
+    for name in &expected {
+        assert!(
+            instructions.contains(name),
+            "the instructions name every tool, so a client that loads tools on demand can find {name}"
+        );
+    }
+    let forward = tools.iter().find(|t| t.name == "forward").unwrap();
+    let source = &forward.input_schema["properties"]["sources"]["items"];
+    assert!(
+        source["properties"]["agent_id"].is_object()
+            && source["properties"]["project_id"].is_object(),
+        "a forward source's shape is spelled out in place, not behind a definition a client may drop: {source}"
+    );
     for tool in &tools {
         let meta = tool.meta.as_ref().unwrap();
         assert_eq!(
@@ -564,6 +578,11 @@ async fn a_wait_without_a_progress_token_returns_by_fifty_seconds_whatever_it_as
     let elapsed = started.elapsed();
 
     assert_eq!(tool_reply(&message)["result"]["done"], false);
+    assert_eq!(
+        tool_reply(&message)["result"]["capped_to_seconds"],
+        50,
+        "the reply says the wait was shortened"
+    );
     assert!(progress.is_empty(), "nothing to keep alive");
     assert!(
         elapsed >= Duration::from_secs(50) && elapsed <= Duration::from_secs(55),
@@ -602,6 +621,10 @@ async fn a_kept_alive_wait_outlives_the_session_keep_alive_with_progress_every_m
 
     let reply = tool_reply(&message);
     assert_eq!(reply["result"]["done"], true, "{reply}");
+    assert!(
+        reply["result"]["capped_to_seconds"].is_null(),
+        "a kept-alive wait ran as asked: {reply}"
+    );
     assert_eq!(reply["result"]["recipients"][0]["status"], "completed");
     assert_eq!(reply["result"]["recipients"][0]["text"], "done at last");
     assert!(
@@ -1224,6 +1247,19 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     )
     .await;
     assert_eq!(ended["status"], "failed");
+    // The send went out; the turn failed while the next step waited for it.
+    assert_eq!(ended["label"], "Greeted", "the failed step's label");
+    assert_eq!(
+        ended["recipients"],
+        json!([{ "agent_id": coder, "name": "coder" }]),
+        "and the agent it waited on, as the engine resolved it"
+    );
+    assert_eq!(ended["sends"][0]["label"], "Greet");
+    assert_eq!(
+        ended["sends"][0]["recipients"],
+        json!([{ "agent_id": coder, "name": "coder", "dispatched": true }]),
+        "the send the run made, with whom it reached"
+    );
     let runs = call("list_workflow_runs", json!({ "project_id": project_id })).await;
     assert_eq!(runs.as_array().unwrap().len(), 1);
     let dismissed = call(
@@ -1450,6 +1486,183 @@ async fn a_capped_reply_lists_a_follow_up_call_that_keeps_the_cap() {
     assert_eq!(idle["result"]["status"], "idle");
     assert!(serialized_len(&idle) <= 10_000);
     assert_eq!(hint_of(&idle)["max_chars"], 10_000);
+    assert!(
+        idle["result"]["activity"].is_null(),
+        "an idle agent has no running turn to report: {}",
+        idle["result"]
+    );
+
+    let agents = t
+        .call("list_agents", json!({ "project_id": project_id }))
+        .await;
+    let listed = agents["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == json!(coder))
+        .unwrap();
+    assert!(listed["activity"].is_null(), "{listed}");
+
+    let cancelled = t
+        .call(
+            "cancel_send",
+            json!({ "project_id": project_id, "send_id": send_id }),
+        )
+        .await;
+    assert_eq!(cancelled["result"]["outcome"], "already_finished");
+    assert_eq!(cancelled["result"]["recipients"], json!([]));
+}
+
+/// A running turn reports its activity in the agent list and in its send's
+/// wait; once it ends, the agent reports none.
+#[tokio::test]
+async fn a_running_turn_reports_its_activity_and_an_idle_agent_none() {
+    let mut t = Capped::start().await;
+    let gate = Arc::new(Notify::new());
+    t.env.adapter.push(Script::parked("partial", &gate));
+    let (project_id, coder) = (t.project_id, t.coder);
+    let sent = t
+        .call(
+            "send",
+            json!({ "project_id": project_id, "recipients": [coder], "text": "go" }),
+        )
+        .await;
+    let send_id: SendId = serde_json::from_value(sent["result"]["send_id"].clone()).unwrap();
+    // Wait on the ledger's own record of the turn's start, which is what
+    // activity reads, rather than on the dispatcher, which can see it first.
+    let mut started = false;
+    for _ in 0..500 {
+        if t.env
+            .state
+            .ledger
+            .send(send_id)
+            .is_some_and(|s| s.recipients[0].status == SendStatus::Running)
+        {
+            started = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(started, "the turn never started");
+
+    let running_agent = |agents: &Value| {
+        agents["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == json!(coder))
+            .unwrap()
+            .clone()
+    };
+    let agents = t
+        .call("list_agents", json!({ "project_id": project_id }))
+        .await;
+    let listed = running_agent(&agents);
+    assert!(
+        listed["activity"]["seconds_since_output"].is_u64(),
+        "{listed}"
+    );
+    let waiting = t
+        .call(
+            "wait_send",
+            json!({ "project_id": project_id, "send_id": send_id, "timeout_seconds": 1 }),
+        )
+        .await;
+    assert_eq!(waiting["result"]["done"], false);
+    assert!(
+        waiting["result"]["recipients"][0]["activity"].is_object(),
+        "{waiting}"
+    );
+
+    gate.notify_one();
+    let done = t
+        .call(
+            "wait_send",
+            json!({ "project_id": project_id, "send_id": send_id, "timeout_seconds": 10 }),
+        )
+        .await;
+    assert_eq!(done["result"]["done"], true);
+    assert!(done["result"]["recipients"][0]["activity"].is_null());
+    let agents = t
+        .call("list_agents", json!({ "project_id": project_id }))
+        .await;
+    assert!(running_agent(&agents)["activity"].is_null());
+}
+
+const TWICE_WORKFLOW: &str = "name: twice
+description: test
+inputs:
+  coder:
+    type: agent
+steps:
+  - label: First
+    send:
+      to: \"{{- coder -}}\"
+      text: one
+  - label: First answer
+    wait_for:
+      agent: \"{{ coder }}\"
+  - label: Second
+    send:
+      to: \"{{ coder }}\"
+      text: two
+  - label: Second answer
+    wait_for:
+      agent: \"{{ coder }}\"
+";
+
+/// A run lists every send it made, with the agents the engine resolved (a
+/// whitespace-trimmed target included), so an agent's first answer stays
+/// readable by its send id after the agent has answered a later step.
+#[tokio::test]
+async fn a_workflow_lists_each_send_so_an_earlier_reply_stays_readable() {
+    let mut t = Capped::start().await;
+    std::fs::write(t.env.workflows_dir().join("twice.yaml"), TWICE_WORKFLOW).unwrap();
+    t.env.adapter.push(Script::reply("first answer"));
+    t.env.adapter.push(Script::reply("second answer"));
+    let (project_id, coder) = (t.project_id, t.coder);
+
+    let started = t
+        .call(
+            "run_workflow",
+            json!({ "project_id": project_id, "name": "twice", "inputs": { "coder": coder } }),
+        )
+        .await;
+    let run_id = started["result"]["run_id"].clone();
+    let ended = t
+        .call(
+            "wait_workflow",
+            json!({ "project_id": project_id, "run_id": run_id, "timeout_seconds": 10 }),
+        )
+        .await;
+    assert_eq!(ended["result"]["status"], "completed", "{ended}");
+    let sends = ended["result"]["sends"].as_array().unwrap();
+    assert_eq!(sends.len(), 2, "{ended}");
+    assert_eq!(sends[0]["step"], 0);
+    assert_eq!(
+        sends[0]["recipients"],
+        json!([{ "agent_id": coder, "name": "coder", "dispatched": true }]),
+        "a trimmed target resolves to the agent, not to its template text"
+    );
+    assert_eq!(sends[1]["step"], 2);
+
+    let first = t
+        .call(
+            "read_send_output",
+            json!({ "project_id": project_id, "send_id": sends[0]["send_id"], "agent_id": coder }),
+        )
+        .await;
+    assert_eq!(first["result"]["text"], "first answer");
+    let latest = t
+        .call(
+            "read_agent_output",
+            json!({ "project_id": project_id, "agent_id": coder }),
+        )
+        .await;
+    assert_eq!(
+        latest["result"]["text"], "second answer",
+        "the latest answer alone cannot reach the first"
+    );
 }
 
 // --- several orchestrators at once ---------------------------------------------------

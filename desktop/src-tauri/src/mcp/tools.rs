@@ -94,6 +94,15 @@ the agent's session); a workflow whose invocable is false. Report them and stop.
 The agents run without approval prompts and act on the user's files. The user sees every \
 message you send, queued or running, in Switchboard's window and can cancel it there.";
 
+/// The instructions a client receives: the loop, then every tool's name, so
+/// a client that loads tool definitions on demand (Claude Code's tool search)
+/// knows what exists from the start.
+#[must_use]
+pub fn instructions() -> String {
+    let names: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
+    format!("{INSTRUCTIONS}\n\nThe tools: {}.", names.join(", "))
+}
+
 /// How Claude Code is told to show a result directly rather than save one
 /// over 50,000 characters to a file: every result is under this.
 const MAX_RESULT_SIZE_META: &str = "anthropic/maxResultSizeChars";
@@ -102,9 +111,10 @@ const MAX_RESULT_SIZE_META: &str = "anthropic/maxResultSizeChars";
 const WAIT_HINTS: &str = "\
 Timeouts: timeout_seconds defaults to 50. If your client sends a progress token with the call, \
 you may ask for up to 3600 and get a progress notification every 60 seconds; without one, waits \
-are capped at 50. In Claude Code, ask for a long timeout (e.g. 1800): the call moves to the \
-background and its result arrives on its own when it settles. In Codex, stay under 300 seconds \
-unless the user raised tool_timeout_sec. Otherwise use the default and call again.";
+are capped at 50, and the reply says so (capped_to_seconds). In the Claude Code CLI, ask for a \
+long timeout (e.g. 1800): the call moves to the background and its result arrives on its own \
+when it settles. Claude Desktop, its Code tab included, sends no token: use the default and call \
+again. In Codex, stay under 300 seconds unless the user raised tool_timeout_sec.";
 
 // --- the catalog ---------------------------------------------------------------
 
@@ -177,7 +187,12 @@ tools! {
          it or the harness reports no window (Antigravity). It is the latest Switchboard observed: \
          a turn the agent ran outside Switchboard (continued in a terminal) shows after \
          Switchboard's next turn for it or the window's next reread. context_pending is true \
-         while the agent's session file is still being read for it: call again.";
+         while the agent's session file is still being read for it: call again. activity \
+         describes the agent's running turn: seconds_since_output, since the turn started or \
+         the agent last wrote text or started or finished a tool call (what the window's \
+         \"No response\" counter measures), and open_tool_calls, each with its name and \
+         running_seconds. A tool call open is work in progress: a test suite produces \
+         nothing until it ends. Absent while the agent has no turn running.";
     GetUsage = "get_usage" (NoArgs) [Read]
         "How much of each harness account's limits is used, for choosing a model and effort for \
          the work at hand. One entry per account the app has a reading for: {harness, \
@@ -324,8 +339,9 @@ tools! {
          workflow_run_requires_dismissal while a failed run is held in the project.";
     CancelSend = "cancel_send" (SendIdArgs) [Stops]
         "Cancel a send: every recipient still queued or running is cancelled, and a send still \
-         being prepared stops before reaching anyone else. Works for sends made since the app \
-         last started.";
+         being prepared stops before reaching anyone else. outcome is cancelled, or \
+         already_finished when every recipient had already ended (nothing to cancel). Works for \
+         sends made since the app last started.";
     CancelAgent = "cancel_agent" (AgentArgs) [Stops]
         "Stop an agent: cancel its running turn and drop every message queued for it, including \
          ones the user or a workflow queued.";
@@ -335,8 +351,8 @@ tools! {
         format!(
             "Wait for a send's replies. Returns when every recipient has finished or \
              timeout_seconds passes, with the current state either way: call again until done \
-             is true. While not done, recipients carry statuses only; reply text comes with \
-             done. Statuses: accepted (queued), running, completed, failed, cancelled, \
+             is true. While not done, recipients carry statuses and each unfinished one's \
+             activity (as list_agents describes it) only; reply text comes with done. Statuses: accepted (queued), running, completed, failed, cancelled, \
              rejected, not_dispatched; after an app restart, started or unknown, read from \
              the journal. Long replies share the result evenly, each cut one listed in \
              truncated with the read_send_output call that reads on.\n{WAIT_HINTS}"
@@ -344,15 +360,25 @@ tools! {
     WaitAgent = "wait_agent" (WaitAgentArgs) [Read]
         format!(
             "Wait until an agent would accept a new send, then return idle with its latest \
-             output; or running once timeout_seconds passes (call again). idle is an \
+             output; or running once timeout_seconds passes (call again), with the agent's \
+             activity (as list_agents describes it). idle is an \
              observation: the user or a workflow can occupy the agent before your next send, \
              which then returns agent_busy.\n{WAIT_HINTS}"
         );
     WaitWorkflow = "wait_workflow" (WaitWorkflowArgs) [Read]
         format!(
-            "Wait for a workflow run to finish. Returns running with the current step once \
-             timeout_seconds passes (call again), or the final status (completed, failed, \
-             cancelled, interrupted) with the step that failed and why.\n{WAIT_HINTS}"
+            "Wait for a workflow run to finish. Returns running once timeout_seconds passes \
+             (call again), or the final status (completed, failed, cancelled, interrupted) with \
+             the step that failed and why. Either way it gives the current step (counted from \
+             0, its label, and its agents as {{agent_id, name}}) and sends: every send the run's \
+             send steps made so far, each with its step, label, send_id, and recipients \
+             (dispatched false for one a failed step never reached). Read any of those replies \
+             with read_send_output and its send_id, even after the agent answered a later step: \
+             an agent's latest answer holds only its last one. A run with more sends than one \
+             reply holds lists only the newest: items_omitted says how many of the earliest were \
+             left out, and their replies cannot be read through this tool. sends_unavailable is \
+             true once Switchboard no longer holds the run's record (after a restart, or once it \
+             pruned the run): its sends are no longer known.\n{WAIT_HINTS}"
         );
 }
 
@@ -714,7 +740,7 @@ pub struct SendArgs {
 
 /// An agent whose latest answer is forwarded. It may be in another project.
 #[derive(Deserialize, JsonSchema, Clone, Copy)]
-#[schemars(crate = "rmcp::schemars")]
+#[schemars(crate = "rmcp::schemars", inline)]
 #[serde(deny_unknown_fields)]
 struct SourceArg {
     #[schemars(with = "String")]
@@ -754,8 +780,9 @@ struct ForwardPromptArg {
     /// Argument values by name, as `list_prompts` declares them.
     #[serde(default)]
     args: BTreeMap<String, String>,
-    /// Prompt arguments filled from sources: each named argument becomes its
-    /// typed text (from args) followed by the sources' answers.
+    /// Prompt arguments filled from sources, each source `{project_id,
+    /// agent_id}`: each named argument becomes its typed text (from args)
+    /// followed by the sources' answers.
     #[serde(default)]
     forward_args: BTreeMap<String, Vec<SourceArg>>,
 }
@@ -766,7 +793,8 @@ struct ForwardPromptArg {
 pub struct ForwardArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
-    /// Agents whose latest answers are appended after the text.
+    /// Agents whose latest answers are appended after the text, each as
+    /// `{project_id, agent_id}`; a source may be in another project.
     #[serde(default)]
     sources: Vec<SourceArg>,
     /// Agent ids in this project. At least one; none repeated.
@@ -823,7 +851,8 @@ pub struct RunWorkflowArgs {
     /// agent ids.
     #[serde(default)]
     inputs: BTreeMap<String, InputArg>,
-    /// Inputs filled with agents' latest answers, by input name.
+    /// Inputs filled with agents' latest answers, by input name; each source
+    /// is `{project_id, agent_id}`.
     #[serde(default)]
     forward_sources: BTreeMap<String, Vec<SourceArg>>,
 }
@@ -1198,7 +1227,8 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
         ToolName::WaitWorkflow => {
             let a: WaitWorkflowArgs = parse(args)?;
             let budget = cx.budget(a.timeout_seconds);
-            Reply::plain(&workflow::wait_workflow(state, a.project_id, a.run_id, &budget).await?)
+            let reply = workflow::wait_workflow(state, a.project_id, a.run_id, &budget).await?;
+            Reply::fitted(&reply, workflow::wait_workflow_budget())
         }
     }
 }

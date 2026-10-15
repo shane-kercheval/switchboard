@@ -12,12 +12,16 @@ use uuid::Uuid;
 use crate::commands::{ForwardSourceRef, open_project_impl, resolve_workflow_forwards};
 use crate::error::AppError;
 use crate::state::{AppState, lock};
+use crate::workflow::ResolvedRecipient;
+use crate::workflow_commands::step_label;
 use crate::workflow_commands::{
     InvokeOptions, WorkflowFormDescriptor, WorkflowRunInfo, cancel_workflow_run_impl,
     classify_run_file, describe_workflow_form_fresh_impl, invoke_workflow_with, read_run_files,
 };
 
-use super::ledger::RunState;
+use super::RESULT_BUDGET_CHARS;
+use super::budget::BudgetSpec;
+use super::ledger::{RunSend, RunState};
 use super::read::project_readonly;
 use super::wait::{Observed, Outcome, WaitBudget, wait_until};
 
@@ -155,20 +159,65 @@ pub enum WorkflowRunStatus {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WaitWorkflowReply {
     pub run_id: Uuid,
+    /// The wait was shortened to this many seconds: the client sent no
+    /// progress token to keep a longer one alive (or asked for over an hour).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capped_to_seconds: Option<u64>,
     pub status: WorkflowRunStatus,
     pub done: bool,
     pub workflow: String,
     /// The step in progress, or the one that failed.
     pub step: usize,
     pub total: usize,
+    /// That step's label, and its agents as the engine resolved them once it
+    /// has (each with `agent_id` and `name`; for a send step, `dispatched`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recipients: Vec<ResolvedRecipient>,
+    /// Every send the run's send steps made so far, in step order: read any
+    /// recipient's reply with `read_send_output` and its `send_id`, even
+    /// after a later step.
+    pub sends: Vec<RunSend>,
+    /// Switchboard no longer holds the run's live record (after a restart, or
+    /// once it pruned the run), so its sends are not known, which is not the
+    /// same as a run that made none.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sends_unavailable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// The workflow wait's result fits the budget by dropping its oldest sends
+/// first, so a run with more sends than one reply holds still reports its
+/// status; `items_omitted` says how many were left out, and their replies
+/// cannot be read through this tool. Reaching that takes hundreds of send
+/// steps in one fixed workflow file; revisit with real paging when loops
+/// (`for_each`) can run.
+#[must_use]
+pub fn wait_workflow_budget() -> BudgetSpec {
+    BudgetSpec::unpageable(
+        RESULT_BUDGET_CHARS,
+        Some("sends"),
+        "list_workflow_runs, for the run's step and status",
+    )
 }
 
 /// Block until the run is terminal or the budget ends. From the ledger's run
 /// entries while the ledger holds the run; for one it does not, from the
 /// live registry or a retained run file.
 pub async fn wait_workflow(
+    state: &AppState,
+    project_id: ProjectId,
+    run_id: Uuid,
+    budget: &WaitBudget,
+) -> Result<WaitWorkflowReply, AppError> {
+    let mut reply = wait_workflow_unreported(state, project_id, run_id, budget).await?;
+    reply.capped_to_seconds = budget.capped_to_seconds();
+    Ok(reply)
+}
+
+async fn wait_workflow_unreported(
     state: &AppState,
     project_id: ProjectId,
     run_id: Uuid,
@@ -183,6 +232,7 @@ pub async fn wait_workflow(
                 Some(run) if run.project_id == project_id => {
                     let reply = WaitWorkflowReply {
                         run_id,
+                        capped_to_seconds: None,
                         status: match run.status {
                             RunState::Running => WorkflowRunStatus::Running,
                             RunState::Completed => WorkflowRunStatus::Completed,
@@ -193,6 +243,10 @@ pub async fn wait_workflow(
                         workflow: run.workflow,
                         step: run.step,
                         total: run.total,
+                        label: run.label,
+                        recipients: run.recipients,
+                        sends: run.sends,
+                        sends_unavailable: false,
                         reason: run.reason,
                     };
                     if reply.done {
@@ -225,13 +279,20 @@ pub async fn wait_workflow(
         "interrupted" => WorkflowRunStatus::Interrupted,
         _ => WorkflowRunStatus::Failed,
     };
+    // A run read from its file after a restart: its step is known, which
+    // agents the engine resolved and which sends it made are not.
     Ok(WaitWorkflowReply {
         run_id,
+        capped_to_seconds: None,
         status,
         done: status != WorkflowRunStatus::Running,
+        label: step_label(&info.steps, info.step),
         workflow: info.workflow,
         step: info.step,
         total: info.total,
+        recipients: Vec::new(),
+        sends: Vec::new(),
+        sends_unavailable: true,
         reason: info.reason,
     })
 }
@@ -241,13 +302,35 @@ fn live_run(state: &AppState, project_id: ProjectId, run_id: Uuid) -> Option<Wai
     let run = runs
         .get(&run_id)
         .filter(|run| run.project_id == project_id)?;
+    let step = run.snapshot.current_step;
+    let sends = run
+        .resolved
+        .iter()
+        .filter_map(|(&index, resolution)| {
+            Some(RunSend {
+                step: index,
+                label: step_label(&run.steps, index),
+                send_id: resolution.send_id?,
+                recipients: resolution.recipients.clone(),
+            })
+        })
+        .collect();
     Some(WaitWorkflowReply {
         run_id,
+        capped_to_seconds: None,
         status: WorkflowRunStatus::Running,
         done: false,
         workflow: run.workflow.clone(),
-        step: run.snapshot.current_step,
+        step,
         total: run.snapshot.total_steps,
+        label: step_label(&run.steps, step),
+        recipients: run
+            .resolved
+            .get(&step)
+            .map(|resolution| resolution.recipients.clone())
+            .unwrap_or_default(),
+        sends,
+        sends_unavailable: false,
         reason: None,
     })
 }

@@ -49,6 +49,9 @@ pub struct ActiveRun {
     /// agents. Disk-sourced runs instead reconstruct *declared* steps from the run
     /// file; this resolved copy exists only for the in-flight run.
     pub steps: Vec<WorkflowStepInfo>,
+    /// Each step's agents and send as the engine resolved them, by step
+    /// index, filled as steps run.
+    pub resolved: std::collections::BTreeMap<usize, crate::workflow::StepResolution>,
     /// Notified once when the run reaches a terminal status. Teardown collects a
     /// clone **before** firing cancel, then awaits it — so the wait can't be
     /// stranded by the owning task removing its own registry entry. `notify_one`

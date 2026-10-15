@@ -23,6 +23,7 @@ use crate::workflow_commands::{WorkflowListing, list_workflows_impl};
 
 use super::budget::{BudgetSpec, CutSite, json_escaped_len};
 use super::context::{CONTEXT_READ_WAIT, ContextFigures, ContextState, ContextStore};
+use super::ledger::AgentActivity;
 use super::ledger::SendStatus;
 use super::with_cap;
 
@@ -105,6 +106,11 @@ pub struct AgentListing {
     pub context: Option<ContextFigures>,
     /// The agent's session file is still being read for `context`; call again.
     pub context_pending: bool,
+    /// Whether the agent is producing anything: seconds since its last output
+    /// and its open tool calls. `None` before any output since the app
+    /// started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<AgentActivity>,
 }
 
 /// The project's roster with each agent's model, effort, quick choices,
@@ -159,6 +165,7 @@ pub async fn list_agents(
             ContextState::Unknown => (None, true),
         };
         out.push(AgentListing {
+            activity: state.ledger.activity(record.id),
             record,
             busy,
             context,

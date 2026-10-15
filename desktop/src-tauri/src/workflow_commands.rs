@@ -32,7 +32,10 @@ use crate::commands::adapter_for;
 use crate::dispatch_context::ProjectDispatchContextFactory;
 use crate::error::AppError;
 use crate::state::{ActiveRun, AppState, RunSnapshot, lock};
-use crate::workflow::{DispatchFactoryProvider, ProgressSink, WorkflowProgress, WorkflowRun};
+use crate::workflow::{
+    DispatchFactoryProvider, ProgressSink, ResolvedRecipient, StepResolution, WorkflowProgress,
+    WorkflowRun,
+};
 
 /// The project-scoped progress channel name. The frontend subscribes once per
 /// loaded project (not per run); the payload's `run_id` disambiguates a project's
@@ -198,6 +201,22 @@ pub struct WorkflowProgressPayload {
     pub status: WorkflowProgressStatus,
     /// The failure reason on a failed terminal, else `None`.
     pub reason: Option<String>,
+    /// The step's label, from the run's step info.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The step's agents as the engine resolved them, once it has, so a
+    /// reader knows whose reply to read without the workflow's definition.
+    #[serde(default)]
+    pub recipients: Vec<ResolvedRecipient>,
+    /// The send a send step made, once it has dispatched.
+    #[serde(default)]
+    pub send_id: Option<uuid::Uuid>,
+}
+
+/// A step's label from the run's step info; `None` for an unknown step.
+#[must_use]
+pub fn step_label(steps: &[WorkflowStepInfo], step: usize) -> Option<String> {
+    steps.get(step).map(|info| info.label.clone())
 }
 
 /// The run's state as the progress channel carries it.
@@ -257,6 +276,22 @@ impl ProgressSink for ChannelProgressSink {
                 }
                 (step_index, WorkflowProgressStatus::Running, None)
             }
+            WorkflowProgress::StepResolved {
+                step_index,
+                recipients,
+                send_id,
+            } => {
+                if let Some(run) = lock(&self.workflow_runs).get_mut(&self.run_id) {
+                    run.resolved.insert(
+                        step_index,
+                        StepResolution {
+                            recipients,
+                            send_id,
+                        },
+                    );
+                }
+                (step_index, WorkflowProgressStatus::Running, None)
+            }
             // Report the actual terminal step so the live indicator matches what
             // `list_workflow_runs` reports after a refresh: the failing step on a
             // failure, else the latest step the run reached (from the snapshot,
@@ -275,6 +310,16 @@ impl ProgressSink for ChannelProgressSink {
                 (step, terminal_status_str(status), reason)
             }
         };
+        let (label, resolution) = {
+            let runs = lock(&self.workflow_runs);
+            runs.get(&self.run_id).map_or((None, None), |run| {
+                (
+                    step_label(&run.steps, step),
+                    run.resolved.get(&step).cloned(),
+                )
+            })
+        };
+        let resolution = resolution.unwrap_or_default();
         let payload = WorkflowProgressPayload {
             run_id: self.run_id.to_string(),
             workflow: self.workflow.clone(),
@@ -282,6 +327,9 @@ impl ProgressSink for ChannelProgressSink {
             total: self.total_steps,
             status,
             reason,
+            label,
+            recipients: resolution.recipients,
+            send_id: resolution.send_id,
         };
         self.emitter.emit(
             &progress_channel(self.project_id),
@@ -1394,6 +1442,7 @@ pub fn invoke_workflow_with(
                 current_step: 0,
             },
             steps: resolved_steps,
+            resolved: BTreeMap::new(),
             done: Arc::clone(&done),
         },
     )?;
@@ -1839,6 +1888,7 @@ mod tests {
                     current_step,
                 },
                 steps: Vec::new(),
+                resolved: BTreeMap::new(),
                 done: Arc::new(tokio::sync::Notify::new()),
             },
         );

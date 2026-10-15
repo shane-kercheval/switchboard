@@ -2041,6 +2041,84 @@ async fn a_page_is_sized_by_its_serialized_length() {
     assert_eq!(page.next_offset, Some(OUTPUT_PAGE_CHARS / 2));
 }
 
+/// A run with more sends than one reply holds still reports its status: the
+/// oldest sends are left out, the newest kept, and the count left out said.
+#[test]
+fn a_workflow_wait_with_more_sends_than_fit_keeps_the_newest() {
+    let send = |step: usize| crate::ops::ledger::RunSend {
+        step,
+        label: Some(format!("Review round {step}")),
+        send_id: Uuid::now_v7(),
+        recipients: vec![crate::workflow::ResolvedRecipient {
+            agent_id: Uuid::now_v7(),
+            name: "reviewer-1".to_owned(),
+            dispatched: Some(true),
+        }],
+    };
+    let reply = crate::ops::workflow::WaitWorkflowReply {
+        run_id: Uuid::now_v7(),
+        capped_to_seconds: None,
+        status: WorkflowRunStatus::Completed,
+        done: true,
+        workflow: "long".to_owned(),
+        step: 1_199,
+        total: 1_200,
+        label: Some("last".to_owned()),
+        recipients: Vec::new(),
+        sends: (0..600).map(|i| send(i * 2)).collect(),
+        sends_unavailable: false,
+        reason: None,
+    };
+    let fitted = fit(
+        serde_json::to_value(&reply).unwrap(),
+        &crate::ops::workflow::wait_workflow_budget(),
+    )
+    .unwrap();
+    assert!(fitted.serialized_chars() <= RESULT_BUDGET_CHARS);
+    assert!(fitted.items_omitted > 0);
+    let kept = fitted.result["sends"].as_array().unwrap();
+    assert_eq!(
+        kept.last().unwrap()["step"],
+        1_198,
+        "the newest send is kept"
+    );
+    assert_eq!(kept.len() + fitted.items_omitted, 600);
+    assert_eq!(fitted.result["status"], "completed", "and the run's status");
+}
+
+#[tokio::test]
+async fn a_wait_asked_for_longer_than_the_call_can_last_says_it_was_shortened() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "go"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+    let shortened = wait_send(
+        &env.state,
+        project_id,
+        receipt.send_id,
+        &WaitBudget::new(Some(3_600), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(shortened.capped_to_seconds, Some(50));
+    let as_asked = wait_send(
+        &env.state,
+        project_id,
+        receipt.send_id,
+        &WaitBudget::new(Some(10), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(as_asked.capped_to_seconds, None);
+}
+
 #[tokio::test]
 async fn a_long_conversation_fits_the_budget_with_its_newest_items_intact() {
     let (env, project_id, agents) = project_with_agents(&["a"]);

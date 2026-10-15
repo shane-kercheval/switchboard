@@ -61,6 +61,7 @@ pub type ProgressHook = Arc<dyn Fn() + Send + Sync>;
 #[derive(Clone)]
 pub struct WaitBudget {
     deadline: tokio::time::Instant,
+    requested: Duration,
     effective: Duration,
     cancel: CancellationToken,
     on_progress: Option<ProgressHook>,
@@ -88,6 +89,7 @@ impl WaitBudget {
         let effective = requested.min(cap);
         Self {
             deadline: tokio::time::Instant::now() + effective,
+            requested,
             effective,
             cancel: CancellationToken::new(),
             on_progress: None,
@@ -117,6 +119,14 @@ impl WaitBudget {
     #[must_use]
     pub fn effective_timeout(&self) -> Duration {
         self.effective
+    }
+
+    /// The wait the caller asked for, shortened: `Some(seconds)` when the
+    /// request ran past what the call can survive (50 seconds without a
+    /// progress token to keep it alive, an hour with one).
+    #[must_use]
+    pub fn capped_to_seconds(&self) -> Option<u64> {
+        (self.requested > self.effective).then_some(self.effective.as_secs())
     }
 
     #[must_use]

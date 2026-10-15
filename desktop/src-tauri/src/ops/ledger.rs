@@ -90,6 +90,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -104,6 +105,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::state::lock;
+use crate::workflow::ResolvedRecipient;
 use crate::workflow_commands::{WorkflowProgressPayload, WorkflowProgressStatus};
 
 use super::error_code;
@@ -166,7 +168,76 @@ pub struct RecipientSnapshot {
     /// tell a quota wall or an auth failure from a crash and not retry into it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<FailureKind>,
+    /// What the agent is doing while this recipient is not finished: how long
+    /// since it last produced output, and the tool calls it has open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<AgentActivity>,
 }
+
+/// What an agent's running turn is doing, for telling a stuck turn from a
+/// long one. Silence is measured as the window measures it for its "No
+/// response" label: the time since the turn started or the agent last wrote
+/// text, sent a heartbeat, or started or finished a tool call. A tool call
+/// left open (a test suite running) is reported with how long it has run,
+/// since it produces nothing until it ends. Reported only while a turn runs:
+/// an idle agent has nothing to be stuck on.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentActivity {
+    pub seconds_since_output: u64,
+    /// Oldest first.
+    pub open_tool_calls: Vec<OpenToolCall>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OpenToolCall {
+    pub name: String,
+    pub running_seconds: u64,
+}
+
+/// An agent's last output and its open tool calls, as the ledger tracks them.
+struct ActivityState {
+    last_output: Instant,
+    open_tools: Vec<OpenTool>,
+    /// A turn has started and not ended.
+    turn_open: bool,
+}
+
+struct OpenTool {
+    tool_use_id: String,
+    name: String,
+    started: Instant,
+}
+
+impl ActivityState {
+    fn report(&self, now: Instant) -> AgentActivity {
+        AgentActivity {
+            seconds_since_output: now.saturating_duration_since(self.last_output).as_secs(),
+            open_tool_calls: self
+                .open_tools
+                .iter()
+                .map(|tool| OpenToolCall {
+                    name: tool.name.clone(),
+                    running_seconds: now.saturating_duration_since(tool.started).as_secs(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The events that restart an agent's silence: a turn starting, which arms
+/// the window's "No response" timer, and the ones that clear that label.
+const OUTPUT_EVENTS: &[&str] = &[
+    "turn_start",
+    "content_chunk",
+    "liveness",
+    "turn_identity",
+    "tool_started",
+    "tool_completed",
+];
+
+/// The ledger's clock for activity durations: monotonic, so a change to the
+/// system time cannot make an agent look silent or active.
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// A ledgered send, as a caller sees it.
 #[derive(Debug, Clone, PartialEq)]
@@ -216,6 +287,27 @@ pub struct RunSnapshot {
     pub total: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The step's label and its agents as the engine resolved them, once it
+    /// has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recipients: Vec<ResolvedRecipient>,
+    /// Every send the run's send steps made so far, in step order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sends: Vec<RunSend>,
+}
+
+/// One send a workflow step made: read any recipient's reply with
+/// `read_send_output` and this `send_id`, even after the agent answered a
+/// later step.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RunSend {
+    pub step: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub send_id: Uuid,
+    pub recipients: Vec<ResolvedRecipient>,
 }
 
 /// The outcome of a claim on an idempotency key.
@@ -301,6 +393,7 @@ impl RecipientEntry {
     fn snapshot(&self) -> RecipientSnapshot {
         RecipientSnapshot {
             agent_id: self.agent_id,
+            activity: None,
             message_id: self.message_id,
             status: self.status,
             text: self.text.clone(),
@@ -315,6 +408,7 @@ impl RecipientEntry {
     fn receipt(&self) -> RecipientSnapshot {
         RecipientSnapshot {
             agent_id: self.agent_id,
+            activity: None,
             message_id: self.message_id,
             status: self.dispatch,
             text: None,
@@ -385,6 +479,8 @@ struct Inner {
     runs: HashMap<Uuid, RunEntry>,
     run_order: VecDeque<Uuid>,
     latest_turn: HashMap<AgentId, LatestTurn>,
+    /// Each agent's last output and open tool calls.
+    activity: HashMap<AgentId, ActivityState>,
 }
 
 pub struct SendLedger {
@@ -393,6 +489,7 @@ pub struct SendLedger {
     changed: watch::Sender<u64>,
     /// Bumped on any event on an agent's channel; `wait_agent` parks here.
     agent_signals: Mutex<HashMap<AgentId, watch::Sender<u64>>>,
+    clock: Clock,
 }
 
 impl Default for SendLedger {
@@ -404,10 +501,17 @@ impl Default for SendLedger {
 impl SendLedger {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(Instant::now))
+    }
+
+    /// A ledger whose activity durations read `clock`; tests set the time.
+    #[must_use]
+    pub fn with_clock(clock: Clock) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
             changed: watch::Sender::new(0),
             agent_signals: Mutex::new(HashMap::new()),
+            clock,
         }
     }
 
@@ -839,6 +943,7 @@ impl SendLedger {
 
     #[must_use]
     pub fn send(&self, send_id: SendId) -> Option<SendSnapshot> {
+        let now = (self.clock)();
         let inner = lock(&self.inner);
         let entry = inner.sends.get(&send_id)?;
         Some(SendSnapshot {
@@ -847,9 +952,78 @@ impl SendLedger {
             recipients: entry
                 .recipients
                 .iter()
-                .map(RecipientEntry::snapshot)
+                .map(|recipient| {
+                    let mut snapshot = recipient.snapshot();
+                    if !snapshot.status.is_terminal() {
+                        snapshot.activity = inner
+                            .activity
+                            .get(&recipient.agent_id)
+                            .filter(|state| state.turn_open)
+                            .map(|state| state.report(now));
+                    }
+                    snapshot
+                })
                 .collect(),
         })
+    }
+
+    /// What the agent's running turn is doing; `None` while no turn runs.
+    #[must_use]
+    pub fn activity(&self, agent_id: AgentId) -> Option<AgentActivity> {
+        let now = (self.clock)();
+        lock(&self.inner)
+            .activity
+            .get(&agent_id)
+            .filter(|state| state.turn_open)
+            .map(|state| state.report(now))
+    }
+
+    /// Note an agent-channel event against the agent's activity: a turn's
+    /// start or the agent's output restarts the silence, a tool call opens or
+    /// closes, and a turn's end closes the turn and whatever it left open.
+    fn note_activity(&self, agent_id: AgentId, kind: &str, payload: &serde_json::Value) {
+        let output = OUTPUT_EVENTS.contains(&kind);
+        if !output && kind != "turn_end" {
+            return;
+        }
+        let now = (self.clock)();
+        let mut inner = lock(&self.inner);
+        if !output {
+            if let Some(state) = inner.activity.get_mut(&agent_id) {
+                state.open_tools.clear();
+                state.turn_open = false;
+            }
+            return;
+        }
+        let state = inner
+            .activity
+            .entry(agent_id)
+            .or_insert_with(|| ActivityState {
+                last_output: now,
+                open_tools: Vec::new(),
+                turn_open: false,
+            });
+        state.last_output = now;
+        if kind == "turn_start" {
+            state.turn_open = true;
+            state.open_tools.clear();
+        }
+        let tool_use_id = payload
+            .get("tool_use_id")
+            .and_then(serde_json::Value::as_str);
+        match (kind, tool_use_id) {
+            ("tool_started", Some(id)) => state.open_tools.push(OpenTool {
+                tool_use_id: id.to_owned(),
+                name: payload
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool")
+                    .to_owned(),
+                started: now,
+            }),
+            ("tool_completed", Some(id)) => state.open_tools.retain(|tool| tool.tool_use_id != id),
+            _ => {}
+        }
     }
 
     /// The agent's newest turn when the ledger holds it, with its send.
@@ -921,6 +1095,7 @@ impl SendLedger {
         let Some(kind) = payload.get("type").and_then(serde_json::Value::as_str) else {
             return;
         };
+        self.note_activity(agent_id, kind, payload);
         match kind {
             // Content can only change text, never admission or completion:
             // feed the capture and wake nobody.
@@ -1097,9 +1272,32 @@ impl SendLedger {
             step: progress.step,
             total: progress.total,
             reason: progress.reason,
+            label: progress.label,
+            recipients: progress.recipients,
+            sends: Vec::new(),
         };
         let now = Utc::now();
         let mut inner = lock(&self.inner);
+        let mut snapshot = snapshot;
+        snapshot.sends = inner
+            .runs
+            .get(&run_id)
+            .map(|entry| entry.snapshot.sends.clone())
+            .unwrap_or_default();
+        if let Some(send_id) = progress.send_id {
+            let send = RunSend {
+                step: snapshot.step,
+                label: snapshot.label.clone(),
+                send_id,
+                recipients: snapshot.recipients.clone(),
+            };
+            if let Some(existing) = snapshot.sends.iter_mut().find(|s| s.step == send.step) {
+                *existing = send;
+            } else {
+                snapshot.sends.push(send);
+                snapshot.sends.sort_by_key(|s| s.step);
+            }
+        }
         if !inner.runs.contains_key(&run_id) {
             inner.run_order.push_back(run_id);
         }
@@ -1422,6 +1620,166 @@ mod tests {
         let message_id = ledger.mark_accepted(send_id, agent_id).unwrap();
         ledger.settle(send_id);
         (project_id, send_id, agent_id, message_id)
+    }
+
+    /// A clock the test moves by hand, and the handle that moves it.
+    fn hand_clock() -> (Clock, Arc<Mutex<Instant>>) {
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let reader = Arc::clone(&now);
+        (Arc::new(move || *reader.lock().unwrap()), now)
+    }
+
+    fn advance(now: &Arc<Mutex<Instant>>, seconds: u64) {
+        *now.lock().unwrap() += std::time::Duration::from_secs(seconds);
+    }
+
+    fn tool_started(turn_id: TurnId, id: &str, name: &str) -> serde_json::Value {
+        json!({ "type": "tool_started", "turn_id": turn_id, "tool_use_id": id, "kind": "other", "name": name, "input": {} })
+    }
+
+    fn tool_completed(turn_id: TurnId, id: &str) -> serde_json::Value {
+        json!({ "type": "tool_completed", "turn_id": turn_id, "tool_use_id": id, "output": "", "is_error": false })
+    }
+
+    #[test]
+    fn silence_counts_only_the_turns_start_and_the_agents_own_output() {
+        let (clock, now) = hand_clock();
+        let ledger = SendLedger::with_clock(clock);
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        let turn_id = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(message_id, turn_id, send_id),
+        );
+        assert_eq!(
+            ledger.activity(agent_id).unwrap().seconds_since_output,
+            0,
+            "a turn starting restarts the silence"
+        );
+        advance(&now, 30);
+        ledger.observe(&channel(agent_id), &chunk(turn_id, "working"));
+        advance(&now, 90);
+        assert_eq!(ledger.activity(agent_id).unwrap().seconds_since_output, 90);
+        // Queue traffic for the agent is not the agent producing anything.
+        ledger.observe(
+            &channel(agent_id),
+            &json!({ "type": "send_accepted", "message_id": Uuid::now_v7(), "send_id": Uuid::now_v7() }),
+        );
+        ledger.observe(
+            &channel(agent_id),
+            &json!({ "type": "message_cancelled", "message_id": Uuid::now_v7() }),
+        );
+        assert_eq!(ledger.activity(agent_id).unwrap().seconds_since_output, 90);
+        ledger.observe(
+            &channel(agent_id),
+            &json!({ "type": "liveness", "turn_id": turn_id }),
+        );
+        assert_eq!(ledger.activity(agent_id).unwrap().seconds_since_output, 0);
+    }
+
+    #[test]
+    fn a_turn_counts_from_its_own_start_and_an_idle_agent_reports_nothing() {
+        let (clock, now) = hand_clock();
+        let ledger = SendLedger::with_clock(clock);
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        // A first turn that never produces anything still counts its silence.
+        let first = Uuid::now_v7();
+        ledger.observe(&channel(agent_id), &turn_start(message_id, first, send_id));
+        advance(&now, 1_500);
+        assert_eq!(
+            ledger.activity(agent_id).unwrap().seconds_since_output,
+            1_500
+        );
+        ledger.observe(
+            &channel(agent_id),
+            &turn_end(first, &json!({ "status": "completed" })),
+        );
+        // Between turns there is nothing to be stuck on.
+        advance(&now, 3_600);
+        assert_eq!(ledger.activity(agent_id), None);
+        // A new turn after an hour idle starts from zero, not from the idle time.
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()),
+        );
+        assert_eq!(ledger.activity(agent_id).unwrap().seconds_since_output, 0);
+        advance(&now, 60);
+        assert_eq!(ledger.activity(agent_id).unwrap().seconds_since_output, 60);
+    }
+
+    #[test]
+    fn an_open_tool_call_is_reported_until_it_or_its_turn_ends() {
+        let (clock, now) = hand_clock();
+        let ledger = SendLedger::with_clock(clock);
+        let agent_id = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(Uuid::now_v7(), turn_id, Uuid::now_v7()),
+        );
+        ledger.observe(&channel(agent_id), &tool_started(turn_id, "t1", "Bash"));
+        advance(&now, 600);
+        assert_eq!(
+            ledger.activity(agent_id).unwrap(),
+            AgentActivity {
+                seconds_since_output: 600,
+                open_tool_calls: vec![OpenToolCall {
+                    name: "Bash".to_owned(),
+                    running_seconds: 600
+                }],
+            },
+            "a test suite running is silence with a tool call open"
+        );
+        ledger.observe(&channel(agent_id), &tool_completed(turn_id, "t1"));
+        assert_eq!(
+            ledger.activity(agent_id).unwrap(),
+            AgentActivity {
+                seconds_since_output: 0,
+                open_tool_calls: Vec::new()
+            }
+        );
+        ledger.observe(&channel(agent_id), &tool_started(turn_id, "t2", "Read"));
+        ledger.observe(
+            &channel(agent_id),
+            &turn_end(turn_id, &json!({ "status": "cancelled" })),
+        );
+        assert_eq!(
+            ledger.activity(agent_id),
+            None,
+            "a turn's end closes the turn and what it left open"
+        );
+    }
+
+    #[test]
+    fn an_unfinished_recipient_carries_its_agents_activity() {
+        let (clock, _now) = hand_clock();
+        let ledger = SendLedger::with_clock(clock);
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        let turn_id = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(message_id, turn_id, send_id),
+        );
+        ledger.observe(&channel(agent_id), &tool_started(turn_id, "t1", "Bash"));
+        let running = ledger.send(send_id).unwrap();
+        assert_eq!(
+            running.recipients[0]
+                .activity
+                .as_ref()
+                .unwrap()
+                .open_tool_calls[0]
+                .name,
+            "Bash"
+        );
+        ledger.observe(
+            &channel(agent_id),
+            &turn_end(turn_id, &json!({ "status": "completed" })),
+        );
+        let done = ledger.send(send_id).unwrap();
+        assert_eq!(
+            done.recipients[0].activity, None,
+            "a finished recipient carries its reply instead"
+        );
     }
 
     #[test]

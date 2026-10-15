@@ -127,7 +127,7 @@ impl ServerHandler for SwitchboardServer {
                 "switchboard",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(tools::INSTRUCTIONS)
+            .with_instructions(tools::instructions())
     }
 
     async fn list_tools(

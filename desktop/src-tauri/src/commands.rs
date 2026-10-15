@@ -26839,6 +26839,7 @@ mod tests {
                     current_step: 0,
                 },
                 steps: Vec::new(),
+                resolved: std::collections::BTreeMap::new(),
                 done: std::sync::Arc::new(tokio::sync::Notify::new()),
             },
         );

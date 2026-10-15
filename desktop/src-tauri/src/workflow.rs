@@ -108,6 +108,15 @@ pub enum WorkflowProgress {
     /// A top-level step has *begun* (zero-based index) — so the indicator advances
     /// when a step starts, not only when the prior one completes.
     StepStarted { step_index: usize },
+    /// The step's agents as the engine resolved them from its template, and,
+    /// for a send step, the send it made. A send step reports once its
+    /// dispatch ends (each recipient marked dispatched or not); a wait step
+    /// reports as soon as it knows whom it waits for.
+    StepResolved {
+        step_index: usize,
+        recipients: Vec<ResolvedRecipient>,
+        send_id: Option<Uuid>,
+    },
     /// The run reached a controlled terminal, with the failing step and reason on
     /// a failed run.
     Terminal {
@@ -115,6 +124,26 @@ pub enum WorkflowProgress {
         failed_step: Option<usize>,
         reason: Option<String>,
     },
+}
+
+/// An agent a step addressed, as the engine resolved it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedRecipient {
+    pub agent_id: AgentId,
+    pub name: String,
+    /// For a send step, whether the message reached the agent's queue: a
+    /// step that fails part-way through a fan-out leaves the rest undispatched.
+    /// `None` for a wait step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched: Option<bool>,
+}
+
+/// A step's agents and send as the engine resolved them, kept per step on the
+/// live run so its waits and progress events can name them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepResolution {
+    pub recipients: Vec<ResolvedRecipient>,
+    pub send_id: Option<Uuid>,
 }
 
 /// Receives the interpreter's live [`WorkflowProgress`] events. The production
@@ -225,15 +254,15 @@ impl WorkflowRun {
                 .emit(WorkflowProgress::StepStarted { step_index: index });
             let result = match &labeled.step {
                 Step::Send(s) => {
-                    self.execute_send(s, &outputs, &mut pending, &mut in_flight)
+                    self.execute_send(index, s, &outputs, &mut pending, &mut in_flight)
                         .await
                 }
                 Step::WaitFor(w) => {
-                    self.execute_wait_for(w, &mut outputs, &mut pending, &mut in_flight)
+                    self.execute_wait_for(index, w, &mut outputs, &mut pending, &mut in_flight)
                         .await
                 }
                 Step::WaitForAll(w) => {
-                    self.execute_wait_for_all(w, &mut outputs, &mut pending, &mut in_flight)
+                    self.execute_wait_for_all(index, w, &mut outputs, &mut pending, &mut in_flight)
                         .await
                 }
                 // These parse and invocation-validate as syntactically valid but
@@ -265,17 +294,49 @@ impl WorkflowRun {
 
     async fn execute_send(
         &self,
+        index: usize,
         step: &SendStep,
         outputs: &OutputScope,
         pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
         in_flight: &mut BTreeMap<AgentId, usize>,
     ) -> Result<(), StepError> {
-        let recipients = self.resolve_agent_ids(&step.to, outputs)?;
-        let body = self.build_body(step, outputs).await?;
+        let resolved = self.resolve_named_agent_ids(&step.to, outputs)?;
         // One send_id for the whole step; a fan-out's recipients share it so the
         // user-facing send renders once, exactly like a manual multi-recipient send.
         let send_id = Uuid::now_v7();
-        for agent_id in recipients {
+        let mut report: Vec<ResolvedRecipient> = resolved
+            .iter()
+            .map(|(name, agent_id)| ResolvedRecipient {
+                agent_id: *agent_id,
+                name: name.clone(),
+                dispatched: Some(false),
+            })
+            .collect();
+        let result = self
+            .dispatch_send(step, outputs, &mut report, send_id, pending, in_flight)
+            .await;
+        self.progress.emit(WorkflowProgress::StepResolved {
+            step_index: index,
+            recipients: report,
+            send_id: Some(send_id),
+        });
+        result
+    }
+
+    /// Render the step's message and queue it for each recipient in order,
+    /// marking each one dispatched as it is accepted.
+    async fn dispatch_send(
+        &self,
+        step: &SendStep,
+        outputs: &OutputScope,
+        report: &mut [ResolvedRecipient],
+        send_id: Uuid,
+        pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
+        in_flight: &mut BTreeMap<AgentId, usize>,
+    ) -> Result<(), StepError> {
+        let body = self.build_body(step, outputs).await?;
+        for recipient in report.iter_mut() {
+            let agent_id = recipient.agent_id;
             let factory = self.factories.factory_for(agent_id).ok_or_else(|| {
                 StepError::Failed(
                     "a participating agent is unavailable for dispatch (removed mid-run, or its harness is unsupported)".to_owned(),
@@ -313,6 +374,7 @@ impl WorkflowRun {
                 AwaitableSendOutcome::Accepted { completion, .. } => {
                     pending.entry(agent_id).or_default().push_back(completion);
                     *in_flight.entry(agent_id).or_insert(0) += 1;
+                    recipient.dispatched = Some(true);
                     // The dispatcher emits this send's live user message once it is
                     // durable (after `record_send`, before `TurnStart`) — see
                     // `send_workflow_message_awaiting_completion`. A fan-out's
@@ -336,12 +398,14 @@ impl WorkflowRun {
 
     async fn execute_wait_for(
         &self,
+        index: usize,
         step: &WaitForStep,
         outputs: &mut OutputScope,
         pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
         in_flight: &mut BTreeMap<AgentId, usize>,
     ) -> Result<(), StepError> {
         let (name, agent_id) = self.resolve_single_agent(&step.agent, outputs)?;
+        self.report_waited(index, &[(name.clone(), agent_id)]);
         let rx = pending
             .get_mut(&agent_id)
             .and_then(VecDeque::pop_front)
@@ -355,12 +419,14 @@ impl WorkflowRun {
 
     async fn execute_wait_for_all(
         &self,
+        index: usize,
         step: &WaitForAllStep,
         outputs: &mut OutputScope,
         pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
         in_flight: &mut BTreeMap<AgentId, usize>,
     ) -> Result<(), StepError> {
         let agents = self.resolve_named_agent_ids(&step.agents, outputs)?;
+        self.report_waited(index, &agents);
         // Take every awaited turn's handle up front so a later missing one fails
         // before we block on the first.
         let mut waits = Vec::with_capacity(agents.len());
@@ -595,23 +661,26 @@ impl WorkflowRun {
         Ok(compose_forwarded_message(&base, &block_refs))
     }
 
-    /// Resolve a `to` / `agents` field to recipient ids — validating the resolved
-    /// list (non-empty, unique, all in the roster) per the spec, then mapping to
-    /// `AgentId`s in declared order.
-    fn resolve_agent_ids(
-        &self,
-        field: &Templated,
-        outputs: &OutputScope,
-    ) -> Result<Vec<AgentId>, StepError> {
-        Ok(self
-            .resolve_named_agent_ids(field, outputs)?
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect())
+    /// Report a wait step's agents, as resolved, before it blocks on them.
+    fn report_waited(&self, index: usize, agents: &[(String, AgentId)]) {
+        self.progress.emit(WorkflowProgress::StepResolved {
+            step_index: index,
+            recipients: agents
+                .iter()
+                .map(|(name, agent_id)| ResolvedRecipient {
+                    agent_id: *agent_id,
+                    name: name.clone(),
+                    dispatched: None,
+                })
+                .collect(),
+            send_id: None,
+        });
     }
 
-    /// As [`Self::resolve_agent_ids`] but keeps each agent's canonical name (needed
-    /// to key the output scope when its turn is awaited).
+    /// Resolve a `to` / `agents` field to `(canonical name, id)` pairs in
+    /// declared order, validating the resolved list (non-empty, unique, all in
+    /// the roster) per the spec. The name keys the output scope when the
+    /// agent's turn is awaited.
     fn resolve_named_agent_ids(
         &self,
         field: &Templated,
@@ -2159,15 +2228,42 @@ mod tests {
 
         // Fan-out to [a, busy] in order: `a` is accepted, `busy` fails fast.
         let yaml = "name: p\ndescription: d\ninputs:\n  rs: [agent]\nsteps:\n  - label: s\n    send:\n      to: \"{{ rs }}\"\n      text: hi\n";
-        let (run, _dir, _path) = build_run(
+        let sink = Arc::new(RecordingProgressSink::default());
+        let (run, _dir, _path) = build_run_with_sink(
             &rig,
             PromptService::disabled(),
             yaml,
             "p",
             supplied(vec![("rs", list(&["a", "busy"]))]),
             CancellationToken::new(),
+            Arc::clone(&sink) as Arc<dyn ProgressSink>,
         );
         assert_eq!(run.execute().await, RunStatus::Failed);
+        // The step reports whom it reached: `a` dispatched, `busy` not, under
+        // the step's one send id.
+        let resolved: Vec<(usize, Vec<ResolvedRecipient>, Option<Uuid>)> = sink
+            .snapshot()
+            .into_iter()
+            .filter_map(|e| match e {
+                WorkflowProgress::StepResolved {
+                    step_index,
+                    recipients,
+                    send_id,
+                } => Some((step_index, recipients, send_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved.len(), 1);
+        let (step_index, recipients, send_id) = &resolved[0];
+        assert_eq!(*step_index, 0);
+        assert!(send_id.is_some());
+        assert_eq!(
+            recipients
+                .iter()
+                .map(|r| (r.name.as_str(), r.agent_id, r.dispatched))
+                .collect::<Vec<_>>(),
+            vec![("a", rig.ids["a"], Some(true)), ("busy", busy, Some(false)),]
+        );
         // `a`'s accepted turn runs to a completed terminal — the failure did not
         // cancel it. (Would time out here if it had been cancelled instead.)
         let a_channel = format!("agent:{}", rig.ids["a"]);

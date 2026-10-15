@@ -1409,6 +1409,11 @@ export type WorkflowProgressPayload = {
   total: number;
   status: WorkflowProgressStatus;
   reason: string | null;
+  // The step's label, its agents as the engine resolved them, and the send a
+  // send step made, for readers outside the window.
+  label?: string | null;
+  recipients?: { agent_id: string; name: string; dispatched?: boolean }[];
+  send_id?: string | null;
 };
 
 // An input value supplied at invocation. A scalar (agent/prompt_id/text) is a

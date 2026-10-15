@@ -1,7 +1,7 @@
 //! A connection's outbound queue. Frames from other devices are bounded by
 //! bytes, and a sender whose recipient is full waits for room instead of
 //! losing the frame; the relay's own messages — `registered`, notices,
-//! errors — never wait, and bound the queue by count. A recipient is closed
+//! errors — never wait, and are bounded only by the queue's count of messages. A recipient is closed
 //! only when it stops making progress, or when even its control messages no
 //! longer fit, so a phone that reads slowly is slowed, not cut off. Progress
 //! is any byte its socket accepts, so a long message going out slowly is
@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::Message;
+use data_encoding::BASE64;
 use futures::{Sink, SinkExt};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
@@ -28,8 +29,11 @@ use crate::protocol::ServerMessage;
 /// The least a queued frame is charged, so the byte budget also bounds how
 /// many frames a queue holds.
 pub(crate) const MIN_FRAME_COST: usize = 4096;
-/// Room for control messages beyond the most frames the budget admits. A
-/// connection that lets this many pile up is not reading its own errors.
+/// Room for messages beyond the most frames the budget admits. Control
+/// messages hold no budget, so they may take the room frames leave too: a
+/// connection with no frames queued is closed once it leaves
+/// `queue_bytes / MIN_FRAME_COST + CONTROL_HEADROOM` of them unread, about
+/// 1,100 at the default budget. One that does is not reading its own errors.
 pub(crate) const CONTROL_HEADROOM: usize = 64;
 /// A frame's JSON around its base64 record: type, ids, an optional token.
 const FRAME_OVERHEAD: usize = 256;
@@ -38,7 +42,7 @@ const FRAME_OVERHEAD: usize = 256;
 /// recipient's budget: about its encoded size, and at least
 /// `MIN_FRAME_COST`.
 pub(crate) fn frame_cost(record_len: usize) -> usize {
-    (record_len.div_ceil(3) * 4 + FRAME_OVERHEAD).max(MIN_FRAME_COST)
+    (BASE64.encode_len(record_len) + FRAME_OVERHEAD).max(MIN_FRAME_COST)
 }
 
 /// Whether a recipient whose socket last accepted bytes at `last_progress`

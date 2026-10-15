@@ -83,7 +83,9 @@ shared Rust cryptography are in one tree.
     leaves; registering as a phone forgets what the relay held for that id as a Mac. A frame
     that waited for room is checked again before it is queued, so one from a replaced
     connection never follows the notice of its end. A byte field longer than its type allows
-    is refused before it is decoded.
+    is refused before it is decoded. A connection that ends releases the senders waiting for
+    room at it, and the idle timeout runs from a message's arrival, not from when the relay
+    finished acting on it.
   - `make protocol-fixtures` lands with the relay's fixtures in PR 1; PR 2 adds the envelope
     fixtures to it. `make relay-image` builds the container with the Rust version from
     `rust-toolchain.toml`, and a CI job builds and smoke-tests it.
@@ -1308,7 +1310,8 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   its pings go out while that connection's reader waits for room at a recipient. The Mac
   reconnects after 50 seconds with nothing from the relay; the phone, whose WebSocket answers
   the relay's pings without showing them, after 50 seconds with neither a pong nor a message.
-  The relay's idle timeout is 90 seconds without any message, ping, or pong; a pong counts,
+  The relay's idle timeout is 90 seconds without any message, ping, or pong, counted from
+  the message's arrival however long the relay took to act on it; a pong counts,
   so a client that only answers the relay's pings stays connected, which holds a slot no
   longer than pinging would.
 - **Timings, in the order they must keep**: the relay's ping (25 s) is at most half the
@@ -1384,7 +1387,9 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   is deployed);
   if it frees no room for the waiting frame within 60 seconds however many bytes it accepts,
   which is a phone below about 12 kbps or one trickling bytes to hold its Mac; or if even its
-  own control messages no longer fit, which is a client not reading its own errors. The 60
+  own control messages no longer fit, which is a client not reading its own errors (they hold
+  no byte budget, so they are bounded only by the queue's count of messages, about 1,100 at
+  the default budget). The 60
   seconds bound how long one frame holds its sender, whose reader reads nothing else while
   it waits: not its `paired_devices` unpairing that phone, and not its own socket's end. So a
   Mac whose connection dies is noticed only once the relay has worked through what it sent
@@ -1462,7 +1467,8 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   token forwarding, expiry, and second-device refusal, and a Mac's reply after expiry
   refused; a burst over the rate delivered whole; a slow reader behind a burst slowed and not
   closed; a phone reading slowly but steadily waited for and not closed (Linux, the only
-  place the relay limits unsent bytes); a stalled reader closed and its Mac told, while the Mac's other phone receives
+  place the relay limits unsent bytes); the idle timeout counted from a Mac's last frame, not
+  from the end of the wait it caused (Linux too); a stalled reader closed and its Mac told, while the Mac's other phone receives
   every frame in order; the relay's pings reaching a Mac whose reader waits on a stalled
   phone; a client that never reads its errors closed; frame and record limits; settings
   past their caps refused; held sets pruned after mass disconnects; a socket past the
@@ -1470,7 +1476,8 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   other's end; shutdown closing
   every connection with a close frame; the fixtures match the encoding. The timing decisions
   (rate buckets, stall detection, waiting for room) are tested on virtual time; the socket
-  tests assert outcomes, not durations. CI runs the relay's tests on Linux, builds the image
+  tests assert outcomes, not durations, except the idle timeout's, whose test probes midway
+  between the two answers, two seconds from each. CI runs the relay's tests on Linux, builds the image
   with `make relay-image`, checks `/healthz`, and checks that `docker stop` closes a live
   connection with a close frame.
 

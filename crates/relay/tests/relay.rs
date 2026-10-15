@@ -1179,9 +1179,10 @@ async fn shutdown_closes_every_connection_with_a_close_frame_before_returning() 
         .unwrap();
 }
 
-/// Byte-level progress through real sockets. Linux only: elsewhere the
-/// relay leaves the kernel's unsent bytes unlimited, and the kernel reports
-/// progress too coarsely for a slow phone to be told from a stalled one.
+/// Waiting for room through real sockets. Linux only: elsewhere the relay
+/// leaves the kernel's unsent bytes unlimited, so the kernel reports
+/// progress too coarsely for a slow phone to be told from a stalled one, and
+/// a test cannot know which frame is the one left waiting.
 #[cfg(target_os = "linux")]
 mod slow_reader {
     use std::future::Future;
@@ -1250,6 +1251,33 @@ mod slow_reader {
         }
     }
 
+    /// A registered phone on a slow link, with a small receive buffer so the
+    /// relay's writes wait on its reads rather than filling kernel buffers.
+    async fn slow_phone(
+        relay: &RelayHandle,
+        keys: &DeviceKeys,
+        mac: &DeviceId,
+    ) -> WebSocketStream<Slow> {
+        let tcp = TcpSocket::new_v4().unwrap();
+        tcp.set_recv_buffer_size(4096).unwrap();
+        let stream = tcp.connect(relay.addr()).await.unwrap();
+        let (mut phone, _) = client_async(
+            relay.url(),
+            Slow {
+                stream,
+                pause: None,
+            },
+        )
+        .await
+        .unwrap();
+        let Some(ServerMessage::Challenge { nonce, .. }) = next(&mut phone).await else {
+            panic!("expected a challenge");
+        };
+        send(&mut phone, &register_message(keys, &nonce, phone_role(mac))).await;
+        assert_eq!(next(&mut phone).await, Some(ServerMessage::Registered));
+        phone
+    }
+
     #[tokio::test]
     async fn a_phone_reading_slowly_but_steadily_is_waited_for_not_closed() {
         // Each frame takes the phone several stall periods to take in, while
@@ -1266,30 +1294,7 @@ mod slow_reader {
         let mac_id = id_of(&mac_keys);
         let phone_keys = new_keys();
         let phone_id = id_of(&phone_keys);
-
-        // A small receive buffer, so the relay's writes wait on the phone's
-        // reads rather than filling kernel buffers.
-        let tcp = TcpSocket::new_v4().unwrap();
-        tcp.set_recv_buffer_size(4096).unwrap();
-        let stream = tcp.connect(relay.addr()).await.unwrap();
-        let (mut phone, _) = client_async(
-            relay.url(),
-            Slow {
-                stream,
-                pause: None,
-            },
-        )
-        .await
-        .unwrap();
-        let Some(ServerMessage::Challenge { nonce, .. }) = next(&mut phone).await else {
-            panic!("expected a challenge");
-        };
-        send(
-            &mut phone,
-            &register_message(&phone_keys, &nonce, phone_role(&mac_id)),
-        )
-        .await;
-        assert_eq!(next(&mut phone).await, Some(ServerMessage::Registered));
+        let mut phone = slow_phone(&relay, &phone_keys, &mac_id).await;
 
         let mac = Client::mac(&relay, mac_keys, &[&phone_id]).await;
         let (mut to_relay, mut from_relay) = mac.socket.split();
@@ -1352,5 +1357,45 @@ mod slow_reader {
         reading.abort();
         sending.abort();
         listening.abort();
+    }
+
+    #[tokio::test]
+    async fn the_idle_timeout_runs_from_a_message_not_from_the_wait_it_caused() {
+        // The phone never reads. The first frame fills its socket's few
+        // unsent bytes and holds most of its budget, so the second, the
+        // Mac's last message, waits for room until the room timeout closes
+        // the phone. The Mac is then closed an idle timeout after that frame
+        // arrived, a second after the wait, not an idle timeout after it.
+        let relay = start(Config {
+            queue_bytes: 96 * 1024,
+            idle_timeout: Duration::from_secs(5),
+            room_timeout: Duration::from_secs(4),
+            stall_timeout: Duration::from_mins(1),
+            rate_limit_bytes: 1 << 30,
+            ..Config::default()
+        })
+        .await;
+        let mac_keys = new_keys();
+        let mac_id = id_of(&mac_keys);
+        let phone_keys = new_keys();
+        let phone = slow_phone(&relay, &phone_keys, &mac_id).await;
+        let mut mac = Client::mac(&relay, mac_keys, &[&id_of(&phone_keys)]).await;
+        for _ in 0..2 {
+            mac.socket
+                .send(large_frame(&id_of(&phone_keys)))
+                .await
+                .unwrap();
+        }
+        // Midway between the fixed close, five seconds from now, and nine.
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        let probe = serde_json::to_string(&frame_message(&nobody(), b"probe")).unwrap();
+        let _ = mac.socket.send(Message::Text(probe.into())).await;
+        while let Some(message) = next(&mut mac.socket).await {
+            assert!(
+                !matches!(&message, ServerMessage::Error { device_id: Some(id), .. } if *id == nobody()),
+                "the Mac was kept past its idle timeout"
+            );
+        }
+        drop(phone);
     }
 }

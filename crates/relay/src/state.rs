@@ -249,20 +249,23 @@ impl Relay {
     }
 
     /// Ends `id`'s registration if `generation` is still the current one, so
-    /// each registration's end is announced exactly once.
+    /// each registration's end is announced exactly once. Returns whether it
+    /// ended one.
     pub fn unregister(
         &mut self,
         id: &DeviceId,
         generation: u64,
         wall: DateTime<Utc>,
         now: Instant,
-    ) {
+    ) -> bool {
         if self.is_current(id, generation)
             && let Some(peer) = self.registered.remove(id)
         {
             self.end_registration(id, &peer.kind, wall, now);
             self.prune_held_sets();
+            return true;
         }
+        false
     }
 
     /// Announces the end to the devices paired with `id`, once each: a Mac's
@@ -290,7 +293,7 @@ impl Relay {
                     .collect();
                 for phone in phones {
                     if let Some(peer) = self.registered.get(phone)
-                        && peer.kind == (Kind::Phone { mac: id.clone() })
+                        && matches!(&peer.kind, Kind::Phone { mac } if mac == id)
                     {
                         peer.outbox.deliver(notice.clone());
                     }
@@ -547,7 +550,9 @@ impl Relay {
             return Err(Refusal::not_paired(to));
         }
         match self.registered.get(to) {
-            Some(peer) if peer.kind == (Kind::Phone { mac: mac.clone() }) => Ok(Route::to(peer)),
+            Some(peer) if matches!(&peer.kind, Kind::Phone { mac: of } if of == mac) => {
+                Ok(Route::to(peer))
+            }
             Some(_) => Err(Refusal::not_paired(to)),
             None => Err(Refusal::about(
                 ErrorCode::PhoneOffline,
@@ -956,7 +961,7 @@ mod tests {
         assert!(old_phone.closed.is_cancelled());
         let now = Instant::now();
         send(&mut relay, &new_phone, &mac.id, &[9], None, now).unwrap();
-        relay.unregister(&old_phone.id, old_phone.generation, wall(1), Instant::now());
+        assert!(!relay.unregister(&old_phone.id, old_phone.generation, wall(1), Instant::now()));
 
         assert_eq!(
             mac.received(),

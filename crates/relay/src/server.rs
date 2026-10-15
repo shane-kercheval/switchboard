@@ -139,11 +139,14 @@ async fn serve_validated(listener: TcpListener, config: Config, shutdown: Cancel
         };
         let stream = match accepted {
             Ok((stream, _)) => stream,
+            Err(error) if is_connection_error(&error) => continue,
             Err(error) => {
                 tracing::warn!(%error, "could not accept a connection");
                 // Out of file descriptors, most likely: let some close.
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                }
             }
         };
         let Ok(permit) = Arc::clone(&sockets).try_acquire_owned() else {
@@ -177,6 +180,17 @@ async fn serve_validated(listener: TcpListener, config: Config, shutdown: Cancel
 /// show no progress for seconds at a time and be closed as stalled. At this
 /// size progress shows at least every 5 s down to about 13 kbps, below the
 /// slowest link a phone can use. Linux only, where the relay is deployed.
+/// Whether an `accept` error is one connection's, gone before it was
+/// accepted, rather than the listener's.
+fn is_connection_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+    )
+}
+
 #[cfg(target_os = "linux")]
 const UNSENT_LIMIT: u32 = 8 * 1024;
 
@@ -367,15 +381,20 @@ async fn run_connection(
         outbox,
         closed,
         registration: None,
+        heard: Instant::now(),
     };
     connection.run().await;
-    if let Some(registration) = connection.registration.take() {
-        shared.relay().unregister(
+    // Releases senders waiting for room here. The writer does not watch it,
+    // so what is queued still goes out.
+    connection.closed.cancel();
+    if let Some(registration) = connection.registration.take()
+        && shared.relay().unregister(
             &registration.id,
             registration.generation,
             Utc::now(),
             table_now(),
-        );
+        )
+    {
         tracing::info!(device_id = %registration.id, "disconnected");
     }
     // Dropping the outbox, the queue's last sender, lets the writer flush
@@ -412,10 +431,14 @@ struct Connection {
     stream: SplitStream<WebSocket>,
     outbox: Outbox,
     /// Cancelled when the relay shuts down, when a newer registration
-    /// replaces this one, or when this connection stops reading.
+    /// replaces this one, when this connection stops reading, or when it
+    /// ends.
     closed: CancellationToken,
     limiter: RateLimiter,
     registration: Option<Registration>,
+    /// When the client's last message of any kind arrived, or the
+    /// connection opened.
+    heard: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -423,7 +446,8 @@ enum Deadline {
     /// A fixed moment, unmoved by anything the client sends: the window to
     /// register, which pings must not stretch.
     At(Instant),
-    /// This long after the client's last message of any kind.
+    /// This long after the client's last message of any kind, however long
+    /// the relay took to act on it.
     Idle(Duration),
 }
 
@@ -475,7 +499,7 @@ impl Connection {
         if claim.relay_protocol != RELAY_PROTOCOL {
             self.refuse(
                 ErrorCode::ProtocolMismatch,
-                "this relay speaks relay protocol 1",
+                &format!("this relay speaks relay protocol {RELAY_PROTOCOL}"),
             );
             return false;
         }
@@ -533,11 +557,11 @@ impl Connection {
 
     /// Acts on one message from a registered client; false ends the
     /// connection.
-    async fn handle(&mut self, message: ClientMessage) -> bool {
-        let Some(registration) = &self.registration else {
+    async fn handle(&self, message: ClientMessage) -> bool {
+        let Some(Registration { id, generation }) = &self.registration else {
             return false;
         };
-        let (id, generation) = (registration.id.clone(), registration.generation);
+        let (id, generation) = (id, *generation);
         let refusal = match message {
             ClientMessage::Frame {
                 to,
@@ -546,7 +570,7 @@ impl Connection {
             } => {
                 // A record longer than any frame does not decode, so it
                 // never gets here: it is `bad_message` as not a relay message.
-                self.forward(&id, generation, to, record, pairing_token)
+                self.forward(id, generation, to, record, pairing_token)
                     .await
             }
             ClientMessage::PairedDevices { device_ids } => {
@@ -554,9 +578,9 @@ impl Connection {
                 let changed = self
                     .shared
                     .relay()
-                    .set_paired_devices(&id, generation, device_ids);
+                    .set_paired_devices(id, generation, device_ids);
                 if changed == Ok(true) {
-                    log_set(&id, set);
+                    log_set(id, set);
                 }
                 changed.map(|_| ())
             }
@@ -564,13 +588,13 @@ impl Connection {
                 token_hash,
                 expires_in,
             } => self.shared.relay().open_pairing(
-                &id,
+                id,
                 generation,
                 token_hash,
                 expires_in,
                 table_now(),
             ),
-            ClientMessage::PairingClose => self.shared.relay().close_pairing(&id, generation),
+            ClientMessage::PairingClose => self.shared.relay().close_pairing(id, generation),
             ClientMessage::Register(_) => Err(Refusal::bad_message("already registered")),
             ClientMessage::Unknown => Ok(()),
         };
@@ -635,17 +659,16 @@ impl Connection {
     /// out before its message is acted on, which slows it through TCP.
     async fn next(&mut self, deadline: Deadline) -> Incoming {
         loop {
-            let now = Instant::now();
             let until = match deadline {
-                // Checked before reading, not only by the read's timeout,
-                // which never fires while a message is always ready.
-                Deadline::At(at) if now >= at => {
-                    tracing::debug!("closing a connection past its deadline");
-                    return Incoming::End;
-                }
                 Deadline::At(at) => at,
-                Deadline::Idle(idle) => now + idle,
+                Deadline::Idle(idle) => self.heard + idle,
             };
+            // Checked before reading, not only by the read's timeout, which
+            // never fires while a message is always ready.
+            if Instant::now() >= until {
+                tracing::debug!("closing a connection past its deadline");
+                return Incoming::End;
+            }
             let received = tokio::select! {
                 () = self.closed.cancelled() => return Incoming::End,
                 received = tokio::time::timeout_at(until, self.stream.next()) => received,
@@ -658,6 +681,7 @@ impl Connection {
                 Ok(Some(Ok(message))) => message,
                 Ok(None | Some(Err(_))) => return Incoming::End,
             };
+            self.heard = Instant::now();
             let (len, text) = match message {
                 Message::Close(_) => return Incoming::End,
                 Message::Binary(_) => {

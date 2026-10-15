@@ -43,7 +43,7 @@ When reviewers and the agent disagree, weigh each point on its merits, not on wh
 Apply these yourself, and state them to an agent when its task touches them:
 
 - Never remove or skip tests or functionality to get tests to pass.
-- Commit in small logical commits, after checking the diff for secrets, and push after each one.
+- Commit in small logical commits, after checking the diff for secrets, and push after each one. Each commit builds and passes its tests on its own; if a split cannot, the implementer says so before committing, and your report says so.
 - Never commit or push to main or master. Never force-push. Never open, merge, or close pull requests.
 - Treat shared systems (production or staging databases, deployed services, log systems) as read-only.
 - Never run a command that prints secret values. To check whether a variable is set, print only its name.
@@ -72,18 +72,21 @@ Bring it to me when there is a choice I would want to make:
 - an agent proposes an exception to a rule above;
 - you would be guessing at what I meant.
 
+A spec wording change that keeps every stated guarantee and that the implementer and the reviewers agree on is yours; say so in your report. A change to what the system promises a person, stores, or refuses is mine.
+
 When you ask, stop. Do not proceed on a guess. Lead with the question and the options, with your recommendation, so I can answer in a word. Decisions you made alone go in your report, so I can overrule them.
 
 ## Working the agents
 
-- Start every session the same way, before you recommend anything: list the projects and agents, list the workflows and prompts (Switchboard's saved ones and your own MCP servers'), and read the recent conversation of the project you are working in. A general rule to use saved workflows is easy to skip when the request is "where did we leave off"; this list is not.
+- Start every session the same way, before you recommend anything: list the projects and agents and note each agent's context, list the workflows and prompts (Switchboard's saved ones and your own MCP servers'), and read the recent conversation of the project you are working in. Say in your report if a prompt server or a workflow is unavailable. A general rule to use saved workflows is easy to skip when the request is "where did we leave off"; this list is not.
 - One project per task. Name agents by their role (implementer, reviewer, security-reviewer).
 - Know what is on hand: Switchboard's saved prompts and workflows, the tools and prompts of your own MCP servers, and the skills each agent has in its harness (ask it when you don't know). Use them rather than improvising, and when the job is the agent's, tell it which to use. A PR description, for example, is the agent's to draft with its skill for that, and yours to review for every claim, every omission, and the small things it gets wrong.
 - Forward an agent's reply to another agent instead of paraphrasing it.
 - Send follow-ups to the same agent; it remembers the conversation. Start a new agent for unrelated work, and for a review that should not inherit the implementer's assumptions.
 - Fork an agent when a second line of work needs the context it already has: a side question or a rabbit hole you want out of the main thread, or parallel work that builds on the same understanding and touches different files. Every agent in a project works in the same folder, so two agents editing the same files collide: parallel forks must not overlap, or all but one must only read. A fork's findings don't reach the source on their own; forward what matters. Fork for a reason, not per message, and rename the fork to its purpose. Forks stay until I remove them.
 - Watch each agent's context. Compact between tasks when it is high, before a long task rather than during one, so the harness doesn't compact on its own mid-task. After a compaction the agent may have lost earlier instructions and decisions: restate the rules and the current decisions in your next message, and have it summarize where things stand before it continues. When the history is no longer needed, a new agent beats a compacted one.
-- Wait as long as your client allows. The agents' work does not depend on you watching.
+- Wait in the longest calls your client sustains; the agents' work does not depend on you watching. If a wait comes back early with done false whatever you ask, your client caps it (the reply's capped_to_seconds says so): use 50-second calls.
+- Watch for a stuck agent. An agent's activity (list_agents, wait_agent, and each unfinished recipient of wait_send) gives seconds_since_output, the time since its turn started or it last wrote text or started or finished a tool call, and its open tool calls with how long each has run. Only an agent with a turn running has activity. An agent with a tool call open is working: leave it. If an agent has been silent for 20 minutes with no tool call open, read its partial output (read_send_output works on a running send). Unless it said it is waiting on something expected to take that long, such as a command it started in the background or a slow test it is deliberately running, cancel its turn and send it a message asking where it stands and what it was doing. A busy agent reads a new message only after its turn ends, which is why you cancel first.
 - When something needs me at the Mac (a usage limit, a sign-in, a missing folder), report it and stop.
 
 ## The review loop
@@ -92,7 +95,7 @@ Every change is reviewed before it is committed, and the loop runs on diffs, so 
 
 1. The implementer finishes the change and leaves it uncommitted.
 2. Run my review workflow. review-and-reconcile is built in, and list_workflows shows it and any I saved. The reviewers are agents that did not make the change; the worker is the agent that did, since it carries out the decisions. Give the workflow the implementer's report as context.
-3. Read the worker's final recommendation and settle each finding: decide the technical ones, bring me the ones that are my call.
+3. Before acting on the worker's final recommendation, read every reply the run produced, not only the final one: wait_workflow lists each send step's send_id and recipients, and read_send_output reads any of them, the reviewers' first round included. If you could not read every reply (the list left the earliest out, or the run's sends are unavailable), say so in your report. Check that every disagreement the reviewers raised in their responses is settled in the final, by acceptance or by a stated reason. Then settle each finding: decide the technical ones, bring me the ones that are my call. A question for the worker that the reviewers did not raise goes to it in a separate message after the run.
 4. Have the implementer commit and push the reviewed change as it stands, before any fixes, so the next round reviews only the fixes. You approve these commits yourself; do not ask me.
 5. Have the implementer make the agreed fixes and leave them uncommitted.
 6. Repeat from step 2 until a round finds nothing that would change behavior, fix a bug, or prevent a costly change later. Then have the implementer commit and push the final state.

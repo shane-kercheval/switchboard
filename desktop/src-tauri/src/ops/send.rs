@@ -979,6 +979,13 @@ pub async fn wait_send(
 ) -> Result<WaitSendReply, AppError> {
     let mut reply = wait_send_unreported(state, project_id, send_id, budget, home_dir).await?;
     reply.capped_to_seconds = budget.capped_to_seconds();
+    if reply.done {
+        for recipient in &mut reply.recipients {
+            if recipient.status == SendStatus::Completed {
+                recipient.context = super::read::known_context(state, recipient.agent_id);
+            }
+        }
+    }
     Ok(reply)
 }
 
@@ -1147,6 +1154,7 @@ async fn fallback_recipient(
     let mut recipient = RecipientSnapshot {
         agent_id,
         activity: None,
+        context: None,
         message_id: None,
         status: SendStatus::Started,
         text: None,
@@ -1194,7 +1202,7 @@ pub enum AgentWaitStatus {
     Running,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WaitAgentReply {
     pub agent_id: AgentId,
     /// Whether the agent is producing anything: seconds since its last output

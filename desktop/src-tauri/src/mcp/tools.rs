@@ -227,8 +227,9 @@ tools! {
     ReadAgentOutput = "read_agent_output" (ReadAgentOutputArgs) [Read]
         "An agent's latest completed answer, including turns you did not send (the user's, a \
          workflow's), or the reason its latest turn failed or was cancelled. Carries the send_id \
-         when known, so a long answer can be paged with read_send_output. To wait for a running \
-         agent first, use wait_agent.";
+         when known, so a long answer can be paged with read_send_output, and the agent's context \
+         after its newest finished turn (as list_agents reports it). To wait for a running agent \
+         first, use wait_agent.";
     ListPrompts = "list_prompts" (NoArgs) [Read]
         "The user's saved prompts, local and from prompt servers: provider, name, description, \
          and arguments. They are the user's standing instructions (a code review, a security \
@@ -352,7 +353,9 @@ tools! {
             "Wait for a send's replies. Returns when every recipient has finished or \
              timeout_seconds passes, with the current state either way: call again until done \
              is true. While not done, recipients carry statuses and each unfinished one's \
-             activity (as list_agents describes it) only; reply text comes with done. Statuses: accepted (queued), running, completed, failed, cancelled, \
+             activity (as list_agents describes it) only. When done, each completed recipient \
+             carries its reply text and its agent's context after the turn (as list_agents \
+             reports it), for deciding whether to compact before the next step. Statuses: accepted (queued), running, completed, failed, cancelled, \
              rejected, not_dispatched; after an app restart, started or unknown, read from \
              the journal. Long replies share the result evenly, each cut one listed in \
              truncated with the read_send_output call that reads on.\n{WAIT_HINTS}"

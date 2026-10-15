@@ -172,6 +172,11 @@ pub struct RecipientSnapshot {
     /// since it last produced output, and the tool calls it has open.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<AgentActivity>,
+    /// The agent's context fullness after its newest finished turn, on a
+    /// completed recipient in a finished wait: what decides whether to compact
+    /// before the next step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<super::context::ContextFigures>,
 }
 
 /// What an agent's running turn is doing, for telling a stuck turn from a
@@ -394,6 +399,7 @@ impl RecipientEntry {
         RecipientSnapshot {
             agent_id: self.agent_id,
             activity: None,
+            context: None,
             message_id: self.message_id,
             status: self.status,
             text: self.text.clone(),
@@ -409,6 +415,7 @@ impl RecipientEntry {
         RecipientSnapshot {
             agent_id: self.agent_id,
             activity: None,
+            context: None,
             message_id: self.message_id,
             status: self.dispatch,
             text: None,
@@ -1569,8 +1576,10 @@ impl OpsLedgerEmitter {
 
 impl EventEmitter for OpsLedgerEmitter {
     fn emit(&self, name: &str, payload: serde_json::Value) {
-        self.ledger.observe(name, &payload);
+        // Context first: the ledger wakes a send's waiters on its turn's end,
+        // and the reply they read carries the agent's context after that turn.
         self.context.observe(name, &payload);
+        self.ledger.observe(name, &payload);
         self.inner.emit(name, payload);
     }
 }

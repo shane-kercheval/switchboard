@@ -1589,6 +1589,49 @@ async fn a_running_turn_reports_its_activity_and_an_idle_agent_none() {
     assert!(running_agent(&agents)["activity"].is_null());
 }
 
+/// A finished reply carries the agent's context after the turn, wherever the
+/// orchestrator reads it: the send's wait, the agent's latest answer, and
+/// the wait for the agent.
+#[tokio::test]
+async fn a_finished_reply_carries_the_agents_context() {
+    let mut t = Capped::start().await;
+    t.env
+        .adapter
+        .push(Script::reply("done").with_context(150_000, 200_000));
+    let (project_id, coder) = (t.project_id, t.coder);
+    let sent = t
+        .call(
+            "send",
+            json!({ "project_id": project_id, "recipients": [coder], "text": "go" }),
+        )
+        .await;
+    let done = t
+        .call(
+            "wait_send",
+            json!({ "project_id": project_id, "send_id": sent["result"]["send_id"], "timeout_seconds": 10 }),
+        )
+        .await;
+    assert_eq!(done["result"]["done"], true);
+    let context = &done["result"]["recipients"][0]["context"];
+    assert_eq!(context["used_tokens"], 150_000, "{done}");
+    assert_eq!(context["window_tokens"], 200_000);
+
+    let latest = t
+        .call(
+            "read_agent_output",
+            json!({ "project_id": project_id, "agent_id": coder }),
+        )
+        .await;
+    assert_eq!(latest["result"]["context"]["used_tokens"], 150_000);
+    let idle = t
+        .call(
+            "wait_agent",
+            json!({ "project_id": project_id, "agent_id": coder }),
+        )
+        .await;
+    assert_eq!(idle["result"]["output"]["context"]["used_tokens"], 150_000);
+}
+
 const TWICE_WORKFLOW: &str = "name: twice
 description: test
 inputs:

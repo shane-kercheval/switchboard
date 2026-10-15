@@ -723,7 +723,7 @@ pub enum AgentOutputStatus {
 }
 
 /// An agent's latest output, for turns the caller did not send.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AgentOutput {
     pub agent_id: AgentId,
     pub status: AgentOutputStatus,
@@ -734,6 +734,18 @@ pub struct AgentOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub send_id: Option<SendId>,
     pub source: OutputSource,
+    /// The agent's context fullness after its newest finished turn, as
+    /// `list_agents` reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextFigures>,
+}
+
+/// The agent's context fullness after its newest finished turn, when known.
+pub(crate) fn known_context(state: &AppState, agent_id: AgentId) -> Option<ContextFigures> {
+    match state.context.lookup(agent_id) {
+        ContextState::Known(figures) => figures,
+        ContextState::Unknown => None,
+    }
 }
 
 /// The agent's latest completed answer: the ledger's text when the agent's
@@ -743,8 +755,20 @@ pub struct AgentOutput {
 /// the newest completed turn in the agent's own transcript, correlated to its
 /// send with the merge's per-agent classifier. A `send_id` is reported only
 /// when that classifier assigns one: guessing from the last journaled send
-/// would name a newer turn that is still running.
+/// would name a newer turn that is still running. Carries the agent's context
+/// after its newest finished turn.
 pub async fn read_agent_output(
+    state: &AppState,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    home_dir: &Path,
+) -> Result<AgentOutput, AppError> {
+    let mut output = latest_agent_output(state, project_id, agent_id, home_dir).await?;
+    output.context = known_context(state, agent_id);
+    Ok(output)
+}
+
+async fn latest_agent_output(
     state: &AppState,
     project_id: ProjectId,
     agent_id: AgentId,
@@ -760,6 +784,7 @@ pub async fn read_agent_output(
             text: latest.text,
             send_id: Some(send_id),
             source: OutputSource::Live,
+            context: None,
         });
     }
     let project = project_readonly(state, project_id)?;
@@ -788,6 +813,7 @@ pub async fn read_agent_output(
             text: Some(note),
             send_id: latest_send,
             source: OutputSource::Journal,
+            context: None,
         });
     }
     let view = AgentJournalView::from_records(&records, agent_id);
@@ -807,6 +833,7 @@ pub async fn read_agent_output(
                 Some(SendCorrelation::Positional) => OutputSource::Positional,
                 _ => OutputSource::Uncorrelated,
             },
+            context: None,
         },
         None => AgentOutput {
             agent_id,
@@ -814,6 +841,7 @@ pub async fn read_agent_output(
             text: None,
             send_id: None,
             source: OutputSource::Uncorrelated,
+            context: None,
         },
     })
 }

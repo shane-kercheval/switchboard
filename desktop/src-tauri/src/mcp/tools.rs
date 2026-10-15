@@ -74,7 +74,8 @@ again. The replies come back in wait_send's final answer. read_conversation show
 whole history; read_agent_output shows an agent's latest answer, including turns you did not \
 send. The user's saved prompts (list_prompts) and workflows (list_workflows) are their standing \
 instructions and procedures, such as a code review: use one when it fits rather than writing \
-your own.
+your own. Before running a multi-step exchange across agents by hand (review rounds, a fan-out \
+and reconcile), check list_workflows for one the user saved.
 
 Results are JSON: {\"result\": …, \"truncated\": […], \"items_omitted\": n}. A result is kept \
 under 100,000 characters: long text may be cut, and each cut is listed in truncated with the \

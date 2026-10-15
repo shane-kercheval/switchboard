@@ -520,7 +520,7 @@ inputs:
     description: The agents that review in parallel, then respond to the worker's analysis.
   worker:
     type: agent
-    description: The agent that distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
+    description: Usually the agent that made the change, since it carries out the decisions. It distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
 steps:
   - label: Code review
     description: Each reviewer independently reviews the current changes in parallel.

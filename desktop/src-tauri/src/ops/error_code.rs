@@ -52,7 +52,10 @@ pub fn error_code(error: &AppError) -> &'static str {
         AppError::ProjectLocked(_) => PROJECT_LOCKED,
         AppError::AgentNotFound(_) | AppError::ForwardSourceMoved { .. } => AGENT_NOT_FOUND,
         AppError::UnknownRecipient { .. } => UNKNOWN_RECIPIENT,
-        AppError::AgentBusy | AppError::RecipientsBusy { .. } => AGENT_BUSY,
+        AppError::AgentBusy
+        | AppError::RecipientsBusy { .. }
+        | AppError::RemoveAgentBusy { .. }
+        | AppError::RemoveAgentWorkflowRunning { .. } => AGENT_BUSY,
         AppError::SessionInUse => AGENT_BUSY_ELSEWHERE,
         // A fork's source mid-turn, including the Codex case where another
         // program holds the parent's session: the advice is the same, wait for

@@ -70,9 +70,10 @@ how the code works, ask an agent.
 The loop: send a message to one or more agents with send (or pass agents' latest answers to \
 others with forward). It returns a send_id at once. Call wait_send with that id until done is \
 true; each call waits up to its timeout and returns the current state either way, so call it \
-again. The replies come back in wait_send's final answer. read_conversation shows a project's \
-whole history; read_agent_output shows an agent's latest answer, including turns you did not \
-send. The user's saved prompts (list_prompts) and workflows (list_workflows) are their standing \
+again. The replies come back in wait_send's final answer. With several agents working at once, \
+wait_any_send waits on all their sends and returns when the first finishes. read_conversation \
+shows a project's whole history; read_agent_output shows an agent's latest answer, including \
+turns you did not send. The user's saved prompts (list_prompts) and workflows (list_workflows) are their standing \
 instructions and procedures, such as a code review: use one when it fits rather than writing \
 your own. Before running a multi-step exchange across agents by hand (review rounds, a fan-out \
 and reconcile), check list_workflows for one the user saved.
@@ -80,8 +81,8 @@ and reconcile), check list_workflows for one the user saved.
 Results are JSON: {\"result\": …, \"truncated\": […], \"items_omitted\": n}. A result is kept \
 under 100,000 characters: long text may be cut, and each cut is listed in truncated with the \
 call that reads the rest (read_with), when there is one. max_chars on read_conversation, \
-read_send_output, read_agent_output, wait_send, and wait_agent lowers the limit for one call, and \
-the call a cut lists keeps it. Claude Desktop's Code tab shows a result inline only under 50,000 \
+read_send_output, read_agent_output, wait_send, wait_any_send, and wait_agent lowers the limit \
+for one call, and the call a cut lists keeps it. Claude Desktop's Code tab shows a result inline only under 50,000 \
 characters and saves a larger one to a file: pass 45000 there. Codex keeps about 10,000 tokens \
 of a result and cuts the middle: pass 25000 there. An error is {\"code\": …, \"message\": …}; \
 the message says what to do.
@@ -167,7 +168,7 @@ enum ToolKind {
     Read,
     /// Creates or renames; nothing is lost.
     Additive,
-    /// Starts agents or deletes a run's record.
+    /// Starts agents, removes one, or deletes a run's record.
     Acts,
     /// Stops work and starts none: the cancels.
     Stops,
@@ -266,6 +267,13 @@ tools! {
     SetAgentSelection = "set_agent_selection" (SetAgentSelectionArgs) [Additive]
         "Change an agent's model or effort; it applies from the agent's next turn. Omit a field \
          to leave it as it is; pass null to reset it to the harness's default.";
+    RemoveAgent = "remove_agent" (AgentArgs) [Acts]
+        "Remove an agent from its project for good: Switchboard's record of it goes, and its \
+         card and conversation leave the window. Nothing brings it back; only the harness's own \
+         session file stays on disk, outside Switchboard. Remove an agent only when you are \
+         confident it is no longer needed. Refused with agent_busy while the agent has a turn \
+         running or queued (wait_agent for it, or cancel_agent to stop it) or a workflow runs in \
+         its project. Returns the removed agent's agent_id and name.";
     DismissWorkflowRun = "dismiss_workflow_run" (RunArgs) [Acts]
         "Delete a failed or interrupted workflow run's record, which otherwise blocks every new \
          workflow in the project. Returns the step that failed and why, which this removes from \
@@ -302,8 +310,8 @@ tools! {
          from the source's conversation as it is at that send. After request_in_progress, wait_send \
          on its send_id: once it settles, its recipient is the fork (list_agents shows it); retry \
          with the same key only if you gave one, since a retry without one makes a second fork. \
-         Nothing over MCP removes an agent, so forks stay until the user removes them: fork for a \
-         reason, not per message.";
+         A fork stays until someone removes it (remove_agent): fork for a reason, not per \
+         message.";
     Send = "send" (SendArgs) [Acts]
         "Send one message to one or more agents of a project, as the user's next message in each \
          one's conversation. Returns at once with a send_id and each recipient's status at \
@@ -352,13 +360,26 @@ tools! {
         format!(
             "Wait for a send's replies. Returns when every recipient has finished or \
              timeout_seconds passes, with the current state either way: call again until done \
-             is true. While not done, recipients carry statuses and each unfinished one's \
-             activity (as list_agents describes it) only. When done, each completed recipient \
+             is true. While not done, recipients carry statuses, and each unfinished one its \
+             activity (as list_agents describes it) and recent_text: the last 500 characters \
+             it has written in this turn so far (its answer text, not tool output; absent until \
+             it writes some). When done, each completed recipient \
              carries its reply text and its agent's context after the turn (as list_agents \
              reports it), for deciding whether to compact before the next step. Statuses: accepted (queued), running, completed, failed, cancelled, \
              rejected, not_dispatched; after an app restart, started or unknown, read from \
              the journal. Long replies share the result evenly, each cut one listed in \
              truncated with the read_send_output call that reads on.\n{WAIT_HINTS}"
+        );
+    WaitAnySend = "wait_any_send" (WaitAnySendArgs) [Read]
+        format!(
+            "Wait on several sends at once, for agents working in parallel: returns as soon as \
+             any one is done, or when timeout_seconds passes, with every send's current state \
+             either way. sends lists each send once, in the order given, shaped as wait_send \
+             returns it: a done one carries its replies, the others their recipients' statuses, \
+             activity, and recent_text. any_done says whether one finished. Call again with the \
+             sends still running; a send already done returns at once. Long replies share the \
+             result evenly, each cut one listed in truncated with the read_send_output call \
+             that reads on.\n{WAIT_HINTS}"
         );
     WaitAgent = "wait_agent" (WaitAgentArgs) [Read]
         format!(
@@ -746,28 +767,38 @@ pub struct SendArgs {
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(deny_unknown_fields)]
 struct SourceArg {
-    #[schemars(with = "String")]
-    project_id: ProjectId,
+    /// The source's project; leave it out for an agent in the call's own
+    /// project.
+    #[serde(default)]
+    #[schemars(with = "Option<String>")]
+    project_id: Option<ProjectId>,
     #[schemars(with = "String")]
     agent_id: AgentId,
 }
 
-impl From<SourceArg> for ForwardSourceRef {
-    fn from(arg: SourceArg) -> Self {
-        Self {
-            project_id: arg.project_id,
-            agent_id: arg.agent_id,
+impl SourceArg {
+    fn in_project(self, project_id: ProjectId) -> ForwardSourceRef {
+        ForwardSourceRef {
+            project_id: self.project_id.unwrap_or(project_id),
+            agent_id: self.agent_id,
         }
     }
 }
 
-fn sources(args: Vec<SourceArg>) -> Vec<ForwardSourceRef> {
-    args.into_iter().map(ForwardSourceRef::from).collect()
+/// The sources as the call names them, a source without a project taken to
+/// be in the call's own `project_id`.
+fn sources(args: Vec<SourceArg>, project_id: ProjectId) -> Vec<ForwardSourceRef> {
+    args.into_iter()
+        .map(|arg| arg.in_project(project_id))
+        .collect()
 }
 
-fn source_map(args: BTreeMap<String, Vec<SourceArg>>) -> BTreeMap<String, Vec<ForwardSourceRef>> {
+fn source_map(
+    args: BTreeMap<String, Vec<SourceArg>>,
+    project_id: ProjectId,
+) -> BTreeMap<String, Vec<ForwardSourceRef>> {
     args.into_iter()
-        .map(|(name, list)| (name, sources(list)))
+        .map(|(name, list)| (name, sources(list, project_id)))
         .collect()
 }
 
@@ -783,9 +814,9 @@ struct ForwardPromptArg {
     /// Argument values by name, as `list_prompts` declares them.
     #[serde(default)]
     args: BTreeMap<String, String>,
-    /// Prompt arguments filled from sources, each source `{project_id,
-    /// agent_id}`: each named argument becomes its typed text (from args)
-    /// followed by the sources' answers.
+    /// Prompt arguments filled from sources, each source `{agent_id}`, with
+    /// `project_id` for an agent in another project: each named argument
+    /// becomes its typed text (from args) followed by the sources' answers.
     #[serde(default)]
     forward_args: BTreeMap<String, Vec<SourceArg>>,
 }
@@ -797,7 +828,7 @@ pub struct ForwardArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
     /// Agents whose latest answers are appended after the text, each as
-    /// `{project_id, agent_id}`; a source may be in another project.
+    /// `{agent_id}`, with `project_id` for an agent in another project.
     #[serde(default)]
     sources: Vec<SourceArg>,
     /// Agent ids in this project. At least one; none repeated.
@@ -855,7 +886,7 @@ pub struct RunWorkflowArgs {
     #[serde(default)]
     inputs: BTreeMap<String, InputArg>,
     /// Inputs filled with agents' latest answers, by input name; each source
-    /// is `{project_id, agent_id}`.
+    /// is `{agent_id}`, with `project_id` for an agent in another project.
     #[serde(default)]
     forward_sources: BTreeMap<String, Vec<SourceArg>>,
 }
@@ -870,6 +901,25 @@ pub struct WaitSendArgs {
     /// returned.
     #[schemars(with = "String")]
     send_id: SendId,
+    /// Seconds to wait before returning the current state. 50 by default.
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+    /// Keep the result under this many characters: 10,000 to 100,000, the
+    /// full 100,000 by default.
+    #[serde(default)]
+    max_chars: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub struct WaitAnySendArgs {
+    #[schemars(with = "String")]
+    project_id: ProjectId,
+    /// The `send_id`s to wait on, each as `send`, `forward`, `compact_agent`,
+    /// or `fork_agent` returned it. At least one.
+    #[schemars(with = "Vec<String>")]
+    send_ids: Vec<SendId>,
     /// Seconds to wait before returning the current state. 50 by default.
     #[serde(default)]
     timeout_seconds: Option<u64>,
@@ -1096,6 +1146,10 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 &a.effort,
             )?)
         }
+        ToolName::RemoveAgent => {
+            let a: AgentArgs = parse(args)?;
+            Reply::plain(&change::remove_agent(state, a.project_id, a.agent_id).await?)
+        }
         ToolName::DismissWorkflowRun => {
             let a: RunArgs = parse(args)?;
             Reply::plain(&change::dismiss_workflow_run(
@@ -1157,14 +1211,14 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
             let a: ForwardArgs = parse(args)?;
             let request = ForwardRequest {
                 project_id: a.project_id,
-                sources: sources(a.sources),
+                sources: sources(a.sources, a.project_id),
                 recipients: a.recipients,
                 text: a.text,
                 prompt: a.prompt.map(|p| ForwardPrompt {
                     provider: p.provider,
                     name: p.name,
                     args: p.args,
-                    forward_args: source_map(p.forward_args),
+                    forward_args: source_map(p.forward_args, a.project_id),
                 }),
                 on_busy: a.on_busy.into(),
                 idempotency_key: a.idempotency_key,
@@ -1189,7 +1243,7 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                     .into_iter()
                     .map(|(name, value)| (name, value.into()))
                     .collect(),
-                forward_sources: source_map(a.forward_sources),
+                forward_sources: source_map(a.forward_sources, a.project_id),
             };
             let run_id =
                 workflow::run_workflow(state, cx.home(), request, &cx.budget(None)).await?;
@@ -1215,6 +1269,16 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
             Reply::fitted(
                 &reply,
                 wait_send_budget(a.project_id, a.send_id, result_budget_chars(a.max_chars)),
+            )
+        }
+        ToolName::WaitAnySend => {
+            let a: WaitAnySendArgs = parse(args)?;
+            let budget = cx.budget(a.timeout_seconds);
+            let reply =
+                send::wait_any_send(state, a.project_id, a.send_ids, &budget, cx.home()).await?;
+            Reply::fitted(
+                &reply,
+                send::wait_any_send_budget(a.project_id, result_budget_chars(a.max_chars)),
             )
         }
         ToolName::WaitAgent => {

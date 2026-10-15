@@ -1445,7 +1445,8 @@ const ROSTER_READ_ATTEMPTS = 3;
 
 /// Re-read a loaded project's roster and fold in what another client changed:
 /// a new agent is registered and added (its card and compose chip appear), a
-/// renamed or reconfigured one is replaced in place.
+/// renamed or reconfigured one is replaced in place, and a removed one is
+/// dropped with its live state.
 ///
 /// **A read older than the user's own change is never applied.** It would
 /// put the old state back: a removed agent's card, a reverted name, a model
@@ -1504,6 +1505,10 @@ function refreshProjectRoster(projectId: ProjectId): Promise<void> {
           }
           continue;
         }
+        const removed = (agentsByProject[projectId] ?? [])
+          .filter((shown) => !fetched.some((agent) => agent.id === shown.id))
+          .map((agent) => agent.id);
+        if (removed.length > 0) dropRemovedAgents(projectId, removed);
         for (const agent of fetched) {
           const known = (agentsByProject[projectId] ?? []).find((a) => a.id === agent.id);
           if (known === undefined) {
@@ -1520,6 +1525,19 @@ function refreshProjectRoster(projectId: ProjectId): Promise<void> {
   })();
   rosterReads.set(projectId, read);
   return read.done;
+}
+
+/// Drop agents another client removed: out of the roster, their live state
+/// torn down, and their card state forgotten, as the window's own remove does.
+function dropRemovedAgents(projectId: ProjectId, agentIds: AgentId[]): void {
+  agentsByProject[projectId] = (agentsByProject[projectId] ?? []).filter(
+    (agent) => !agentIds.includes(agent.id),
+  );
+  unregisterAgents(agentIds);
+  for (const agentId of agentIds) {
+    forksLoadedWithProject.delete(agentId);
+    layout.removeAgentCardState(projectId, agentId);
+  }
 }
 
 /// Resolve once no read of the project is running or queued, including reads

@@ -215,6 +215,11 @@ async fn the_tool_list_is_the_catalog_and_declares_the_result_size() {
             && source["properties"]["project_id"].is_object(),
         "a forward source's shape is spelled out in place, not behind a definition a client may drop: {source}"
     );
+    assert_eq!(
+        source["required"],
+        json!(["agent_id"]),
+        "a source in the call's own project needs no project_id"
+    );
     for tool in &tools {
         let meta = tool.meta.as_ref().unwrap();
         assert_eq!(
@@ -1062,6 +1067,144 @@ async fn a_kept_alive_forward_waits_for_a_busy_source_with_progress_every_minute
 }
 
 #[tokio::test]
+async fn wait_any_send_returns_when_the_first_send_finishes_and_a_busy_agent_is_not_removed() {
+    let (env, project_id, agents) = workflow_env().await;
+    let (coder, r1) = (agents[0], agents[1]);
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("partial", &gate));
+    let (router, _shutdown) = in_process(&env);
+    let session = open_session(&router).await;
+    let mut id = 1;
+    let mut call = async |name: &str, args: Value| -> (bool, Value) {
+        id += 1;
+        call_in_process(&router, &session, id, name, &args).await
+    };
+
+    let (_, slow) = call(
+        "send",
+        json!({ "project_id": project_id, "recipients": [coder], "text": "work" }),
+    )
+    .await;
+    await_turn_running(&env.state, coder).await;
+    let (_, quick) = call(
+        "send",
+        json!({ "project_id": project_id, "recipients": [r1], "text": "go" }),
+    )
+    .await;
+    let slow_id = slow["result"]["send_id"].clone();
+    let quick_id = quick["result"]["send_id"].clone();
+
+    let (is_error, body) = call(
+        "wait_any_send",
+        json!({
+            "project_id": project_id,
+            "send_ids": [slow_id, quick_id, slow_id],
+            "timeout_seconds": 10
+        }),
+    )
+    .await;
+    assert!(!is_error, "{body}");
+    let reply = &body["result"];
+    assert_eq!(reply["any_done"], true, "{reply}");
+    let sends = reply["sends"].as_array().unwrap();
+    assert_eq!(sends.len(), 2, "each send once, in the order given");
+    assert_eq!(sends[0]["send_id"], slow_id);
+    assert_eq!(sends[0]["done"], false);
+    assert_eq!(sends[0]["recipients"][0]["status"], "running");
+    assert_eq!(sends[1]["done"], true);
+    assert_eq!(sends[1]["recipients"][0]["text"], "ack: go");
+
+    // The running agent's text so far, without a separate read. Content wakes
+    // no waiter, so look until the chunk has landed.
+    let mut recent = Value::Null;
+    for _ in 0..50 {
+        let (_, body) = call(
+            "wait_send",
+            json!({ "project_id": project_id, "send_id": slow_id, "timeout_seconds": 0 }),
+        )
+        .await;
+        recent = body["result"]["recipients"][0]["recent_text"].clone();
+        if !recent.is_null() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(recent, "partial");
+
+    let (is_error, body) = call(
+        "remove_agent",
+        json!({ "project_id": project_id, "agent_id": coder }),
+    )
+    .await;
+    assert!(is_error, "an agent mid-turn is not removed: {body}");
+    assert_eq!(body["code"], "agent_busy");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("cancel_agent")),
+        "{body}"
+    );
+    assert_eq!(
+        env.state.ledger.send(uuid(&slow_id)).unwrap().recipients[0].status,
+        SendStatus::Running,
+        "and its turn is untouched"
+    );
+
+    gate.notify_one();
+    let (_, body) = call(
+        "wait_send",
+        json!({ "project_id": project_id, "send_id": slow_id, "timeout_seconds": 10 }),
+    )
+    .await;
+    assert_eq!(body["result"]["done"], true);
+    let (is_error, body) = call(
+        "remove_agent",
+        json!({ "project_id": project_id, "agent_id": coder }),
+    )
+    .await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["result"]["name"], "coder");
+}
+
+#[tokio::test]
+async fn no_agent_is_removed_while_a_workflow_runs_in_its_project() {
+    let (env, project_id, agents) = workflow_env().await;
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("greeting", &gate));
+    let (router, _shutdown) = in_process(&env);
+    let session = open_session(&router).await;
+
+    let (is_error, body) = call_in_process(
+        &router,
+        &session,
+        2,
+        "run_workflow",
+        &json!({ "project_id": project_id, "name": "pair", "inputs": pair_inputs(&agents) }),
+    )
+    .await;
+    assert!(!is_error, "{body}");
+    await_turn_running(&env.state, agents[0]).await;
+    // r2 is idle, but a later step of the run may send to it.
+    let (is_error, body) = call_in_process(
+        &router,
+        &session,
+        3,
+        "remove_agent",
+        &json!({ "project_id": project_id, "agent_id": agents[2] }),
+    )
+    .await;
+    assert!(is_error, "{body}");
+    assert_eq!(body["code"], "agent_busy");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("workflow")),
+        "{body}"
+    );
+    gate.notify_one();
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)] // One call per tool, in the order an orchestrator would use them; linear.
 async fn every_tool_answers_a_valid_call_through_the_server() {
     let (env, project_id, agents) = workflow_env().await;
@@ -1206,12 +1349,39 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     )
     .await;
     assert_eq!(forks_output["text"], "ack: aside");
+    let both = call(
+        "wait_any_send",
+        json!({
+            "project_id": project_id,
+            "send_ids": [send_id, forked["send_id"]],
+            "timeout_seconds": 10
+        }),
+    )
+    .await;
+    assert_eq!(both["any_done"], true);
+    assert_eq!(both["sends"][1]["recipients"][0]["text"], "ack: aside");
+    let removed = call(
+        "remove_agent",
+        json!({ "project_id": project_id, "agent_id": fork_id }),
+    )
+    .await;
+    assert_eq!(removed["name"], "coder-fork");
+    let listed = call("list_agents", json!({ "project_id": project_id })).await;
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|agent| uuid(&agent["id"]) != fork_id),
+        "the removed fork is gone from the roster: {listed}"
+    );
 
+    // A source in the call's own project needs no project_id.
     let forwarded = call(
         "forward",
         json!({
             "project_id": project_id,
-            "sources": [{ "project_id": project_id, "agent_id": coder }],
+            "sources": [{ "agent_id": coder }],
             "recipients": [r1],
             "text": "see this"
         }),

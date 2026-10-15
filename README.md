@@ -190,7 +190,7 @@ What else to know:
 
 - **Stop stops an orchestrator's messages too**, from the compose bar, the project list, or an agent's "Stop agent", and the orchestrator is told. While a workflow runs, the project list's button stops the workflow instead.
 - **An orchestrator's messages notify like yours**, so an orchestrator that sends and waits step by step notifies after each step while you're in another app. A workflow run notifies once, at its end.
-- **Forks an orchestrator creates stay in the sidebar**, and each one that finds no empty pane adds a pane, because nothing over agent access removes an agent.
+- **An orchestrator can remove agents, which deletes them and their conversations from Switchboard.** It can't remove one that's working or while a workflow runs in the project. Each fork it creates that finds no empty pane adds a pane.
 - **Turning agent access off disconnects every client but doesn't stop their work.** Use Stop for that.
 - **Regenerating the token or changing the port disconnects every client**, and each needs the new setup from Settings: for Claude Code, `claude mcp remove switchboard --scope local` in the orchestration folder, then the new command; for Codex, update the token file and open a new shell; for Claude Desktop, update the config entry and restart it.
 - **Settings → Agent MCP Server also holds an orchestrator prompt**: a role for the connected agent (decide and direct, question the way an engineer or a product, UX, security, or data expert would, never code). Copy it into the CLAUDE.md or AGENTS.md of the folder you orchestrate from.

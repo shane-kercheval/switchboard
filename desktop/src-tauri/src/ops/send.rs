@@ -72,7 +72,7 @@ use crate::state::{AppState, lock};
 use super::budget::{BudgetSpec, CutSite};
 use super::error_code::error_code;
 use super::handle::AppStateHandle;
-use super::ledger::{Claim, ClaimResult, RecipientSnapshot, SendReceipt, SendStatus};
+use super::ledger::{Claim, ClaimResult, RecipientSnapshot, SendReceipt, SendSnapshot, SendStatus};
 use super::read::{
     AgentOutput, agent_in_project, correlate_turns, project_readonly, read_agent_output,
     read_journal,
@@ -961,8 +961,9 @@ pub struct WaitSendReply {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capped_to_seconds: Option<u64>,
     /// Every recipient reached a terminal status. While `false`, recipients
-    /// carry statuses only, never reply text, so a caller that must call
-    /// again every 50 seconds pays a few lines per call.
+    /// carry statuses, activity, and the end of their text so far, never the
+    /// whole reply, so a caller that must call again every 50 seconds pays a
+    /// few lines per call.
     pub done: bool,
     pub source: WaitSource,
     pub recipients: Vec<RecipientSnapshot>,
@@ -979,13 +980,7 @@ pub async fn wait_send(
 ) -> Result<WaitSendReply, AppError> {
     let mut reply = wait_send_unreported(state, project_id, send_id, budget, home_dir).await?;
     reply.capped_to_seconds = budget.capped_to_seconds();
-    if reply.done {
-        for recipient in &mut reply.recipients {
-            if recipient.status == SendStatus::Completed {
-                recipient.context = super::read::known_context(state, recipient.agent_id);
-            }
-        }
-    }
+    add_context(state, &mut reply);
     Ok(reply)
 }
 
@@ -1003,58 +998,167 @@ async fn wait_send_unreported(
         budget,
         signal,
         || async move {
-            match state.ledger.send(send_id) {
-                Some(snapshot) if snapshot.project_id == project_id => {
-                    if snapshot.is_done() {
-                        Observed::Done(Some(snapshot))
-                    } else {
-                        Observed::NotYet(Some(snapshot))
-                    }
-                }
-                _ => Observed::Done(None),
+            match held_send(state, project_id, send_id) {
+                Some(snapshot) if !snapshot.is_done() => Observed::NotYet(Some(snapshot)),
+                held => Observed::Done(held),
             }
         },
         || None,
     )
     .await;
     match observed {
-        Some(snapshot) => {
-            let done = snapshot.is_done();
-            let recipients = snapshot
-                .recipients
-                .into_iter()
-                .map(|mut r| {
-                    if !done {
-                        r.text = None;
-                    }
-                    r
-                })
-                .collect();
-            Ok(WaitSendReply {
-                send_id,
-                capped_to_seconds: None,
-                done,
-                source: WaitSource::Live,
-                recipients,
-            })
+        Some(snapshot) => Ok(live_reply(send_id, snapshot)),
+        None => unheld_reply(state, project_id, send_id, budget, home_dir).await,
+    }
+}
+
+/// Several sends waited on together, as [`wait_any_send`] reports them.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct WaitAnySendReply {
+    /// The wait was shortened to this many seconds: the client sent no
+    /// progress token to keep a longer one alive (or asked for over an hour).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capped_to_seconds: Option<u64>,
+    /// At least one of the sends is done.
+    pub any_done: bool,
+    /// Each send asked about, once, in the order asked, as `wait_send`
+    /// reports it: a done one with its replies, the others with their
+    /// recipients' statuses and activity.
+    pub sends: Vec<WaitSendReply>,
+}
+
+/// Block until any one of `send_ids` is done or the budget ends, and return
+/// every one's current state either way. For work running on several agents
+/// at once: a wait on one send would not notice another finishing first.
+pub async fn wait_any_send(
+    state: &AppState,
+    project_id: ProjectId,
+    send_ids: Vec<SendId>,
+    budget: &WaitBudget,
+    home_dir: &Path,
+) -> Result<WaitAnySendReply, AppError> {
+    let mut ids: Vec<SendId> = Vec::with_capacity(send_ids.len());
+    for send_id in send_ids {
+        if !ids.contains(&send_id) {
+            ids.push(send_id);
         }
-        // Within the call's finishing allowance: the fallback reads the
-        // journal and transcripts, and a caller that cannot be kept alive must
-        // still get an answer before its client gives up. Unfinished, the
-        // reply is "not done" with no recipients, and the caller calls again.
-        None => match budget
-            .run_with_grace(journal_fallback(state, project_id, send_id, home_dir))
-            .await
-        {
-            Outcome::Done(reply) => reply,
-            Outcome::Timeout | Outcome::Cancelled => Ok(WaitSendReply {
-                send_id,
-                capped_to_seconds: None,
-                done: false,
-                source: WaitSource::Journal,
-                recipients: Vec::new(),
-            }),
+    }
+    if ids.is_empty() {
+        return Err(AppError::InvalidArgument(
+            "send_ids must name at least one send".to_owned(),
+        ));
+    }
+    let signal = state.ledger.subscribe();
+    let observed = wait_until(
+        budget,
+        signal,
+        || {
+            let ids = ids.clone();
+            async move {
+                let held: Vec<Option<SendSnapshot>> = ids
+                    .iter()
+                    .map(|send_id| held_send(state, project_id, *send_id))
+                    .collect();
+                if held
+                    .iter()
+                    .any(|snapshot| snapshot.as_ref().is_none_or(SendSnapshot::is_done))
+                {
+                    Observed::Done(held)
+                } else {
+                    Observed::NotYet(held)
+                }
+            }
         },
+        || ids.iter().map(|_| None).collect(),
+    )
+    .await;
+    let sends =
+        futures::future::join_all(ids.iter().zip(observed).map(|(&send_id, held)| async move {
+            let mut reply = match held {
+                Some(snapshot) => live_reply(send_id, snapshot),
+                None => unheld_reply(state, project_id, send_id, budget, home_dir).await?,
+            };
+            add_context(state, &mut reply);
+            Ok::<_, AppError>(reply)
+        }))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(WaitAnySendReply {
+        capped_to_seconds: budget.capped_to_seconds(),
+        any_done: sends.iter().any(|send| send.done),
+        sends,
+    })
+}
+
+/// The send as the ledger holds it, when it is this project's.
+fn held_send(state: &AppState, project_id: ProjectId, send_id: SendId) -> Option<SendSnapshot> {
+    state
+        .ledger
+        .send(send_id)
+        .filter(|snapshot| snapshot.project_id == project_id)
+}
+
+/// A send the ledger holds, as a wait reports it: reply text only once every
+/// recipient is done.
+fn live_reply(send_id: SendId, snapshot: SendSnapshot) -> WaitSendReply {
+    let done = snapshot.is_done();
+    let recipients = snapshot
+        .recipients
+        .into_iter()
+        .map(|mut r| {
+            if !done {
+                r.text = None;
+            }
+            r
+        })
+        .collect();
+    WaitSendReply {
+        send_id,
+        capped_to_seconds: None,
+        done,
+        source: WaitSource::Live,
+        recipients,
+    }
+}
+
+/// A send the ledger does not hold, answered from the journal within the
+/// call's finishing allowance: the fallback reads the journal and
+/// transcripts, and a caller that cannot be kept alive must still get an
+/// answer before its client gives up. Unfinished, the reply is "not done"
+/// with no recipients, and the caller calls again.
+async fn unheld_reply(
+    state: &AppState,
+    project_id: ProjectId,
+    send_id: SendId,
+    budget: &WaitBudget,
+    home_dir: &Path,
+) -> Result<WaitSendReply, AppError> {
+    match budget
+        .run_with_grace(journal_fallback(state, project_id, send_id, home_dir))
+        .await
+    {
+        Outcome::Done(reply) => reply,
+        Outcome::Timeout | Outcome::Cancelled => Ok(WaitSendReply {
+            send_id,
+            capped_to_seconds: None,
+            done: false,
+            source: WaitSource::Journal,
+            recipients: Vec::new(),
+        }),
+    }
+}
+
+/// A done send's completed recipients carry their agent's context after the
+/// turn, for deciding whether to compact before the next step.
+fn add_context(state: &AppState, reply: &mut WaitSendReply) {
+    if !reply.done {
+        return;
+    }
+    for recipient in &mut reply.recipients {
+        if recipient.status == SendStatus::Completed {
+            recipient.context = super::read::known_context(state, recipient.agent_id);
+        }
     }
 }
 
@@ -1154,6 +1258,7 @@ async fn fallback_recipient(
     let mut recipient = RecipientSnapshot {
         agent_id,
         activity: None,
+        recent_text: None,
         context: None,
         message_id: None,
         status: SendStatus::Started,
@@ -1292,6 +1397,36 @@ async fn wait_agent_unreported(
         output_unavailable: output.is_none(),
         output,
     })
+}
+
+/// The budget rules for a [`WaitAnySendReply`]: those of [`wait_send_budget`],
+/// across every send's recipients, each cut reading on through its own send.
+#[must_use]
+pub fn wait_any_send_budget(project_id: ProjectId, budget_chars: usize) -> BudgetSpec {
+    BudgetSpec {
+        budget_chars,
+        droppable_list: None,
+        read_with: Some("read_send_output"),
+        pointer: Box::new(move |site: &CutSite<'_>| {
+            let agent_id = site.ancestors.last()?.get("agent_id")?.clone();
+            let send_id = site
+                .ancestors
+                .iter()
+                .rev()
+                .find_map(|object| object.get("send_id"))?
+                .clone();
+            Some(super::with_cap(
+                serde_json::json!({
+                    "tool": "read_send_output",
+                    "project_id": project_id,
+                    "send_id": send_id,
+                    "agent_id": agent_id,
+                    "offset": site.kept_chars,
+                }),
+                budget_chars,
+            ))
+        }),
+    }
 }
 
 /// The budget rules for a [`WaitSendReply`]: reply text may be cut, shared

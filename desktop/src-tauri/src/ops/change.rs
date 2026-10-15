@@ -1,6 +1,6 @@
-//! The change tier: create, rename, model and effort, and dismissing a failed
-//! workflow run. Each opens the project in Rust first (a no-op when loaded),
-//! then notifies the window without waiting on it.
+//! The change tier: create, rename, model and effort, removing an agent, and
+//! dismissing a failed workflow run. Each opens the project in Rust first (a
+//! no-op when loaded), then notifies the window without waiting on it.
 
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::commands::{
     ProjectListing, create_agent_in_project_impl, create_project_impl, open_project_impl,
-    rename_agent_impl, rename_project_impl, update_agent_selection_impl,
+    remove_agent_impl, rename_agent_impl, rename_project_impl, update_agent_selection_impl,
 };
 use crate::error::AppError;
 use crate::state::{AppState, lock};
@@ -86,6 +86,48 @@ pub fn rename_agent(
     let record = rename_agent_impl(state, agent_id, name)?;
     state.desktop_sync.roster_changed(project_id);
     Ok(record)
+}
+
+/// What a removal took away, so the caller's report can name it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RemovedAgent {
+    pub agent_id: AgentId,
+    pub name: String,
+}
+
+/// Remove an agent from its project: Switchboard's record of it and its
+/// sidecar go, and the window drops its card and conversation. The harness's
+/// own session file stays on disk. Unlike the window's remove, which cancels
+/// whatever the agent is doing, this refuses an agent with work running or
+/// queued, and refuses while a workflow runs in the project, since a later
+/// step may send to the agent: a caller that cannot see the agent's pane
+/// stops that work on purpose, not as a side effect.
+///
+/// The busy check and the removal are not one step: a send that lands
+/// between them is cancelled by the removal, as the window's remove would.
+pub async fn remove_agent(
+    state: &AppState,
+    project_id: ProjectId,
+    agent_id: AgentId,
+) -> Result<RemovedAgent, AppError> {
+    open_project_impl(state, project_id)?;
+    let agent = agent_in_project(state, project_id, agent_id)?;
+    let workflow_running = lock(&state.workflow_runs)
+        .values()
+        .any(|run| run.project_id == project_id);
+    if workflow_running {
+        return Err(AppError::RemoveAgentWorkflowRunning { name: agent.name });
+    }
+    if !state.dispatcher.accepts_now(agent_id).await {
+        return Err(AppError::RemoveAgentBusy { name: agent.name });
+    }
+    remove_agent_impl(state, agent_id).await?;
+    tracing::info!(%project_id, %agent_id, name = %agent.name, "agent removed");
+    state.desktop_sync.roster_changed(project_id);
+    Ok(RemovedAgent {
+        agent_id,
+        name: agent.name,
+    })
 }
 
 /// One axis of an agent's selection as a caller states it. Absent means

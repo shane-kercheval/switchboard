@@ -215,15 +215,28 @@ impl TextCapture {
     /// never got a result, so it is left out.
     #[must_use]
     pub fn finish(self) -> String {
+        self.text_so_far()
+    }
+
+    /// The last `max_chars` characters of the answer so far, by the same rule
+    /// as [`Self::finish`]: where a running turn has got to.
+    #[must_use]
+    pub fn tail(&self, max_chars: usize) -> String {
+        let text = self.text_so_far();
+        let skip = text.chars().count().saturating_sub(max_chars);
+        text.chars().skip(skip).collect()
+    }
+
+    fn text_so_far(&self) -> String {
         let mut out = String::new();
-        for piece in self.pieces {
+        for piece in &self.pieces {
             match piece {
-                CapturedPiece::Text(text) => out.push_str(&text),
+                CapturedPiece::Text(text) => out.push_str(text),
                 CapturedPiece::Review {
                     text,
                     status: ReviewStatus::Accepted,
                     ..
-                } => push_piece(&mut out, &text),
+                } => push_piece(&mut out, text),
                 CapturedPiece::Review { .. } => {}
             }
         }
@@ -611,6 +624,28 @@ mod tests {
             chunk("\n\nOutro."),
         ]);
         assert_eq!(text, "Intro.\n\nREVIEW\n\nOutro.");
+    }
+
+    #[test]
+    fn tail_is_the_end_of_the_answer_so_far_without_a_pending_review() {
+        let mut capture = TextCapture::default();
+        for event in [
+            chunk("Intro é."),
+            started("f1", findings_facet("REVIEW")),
+            completed("f1", false),
+            chunk("\n\nRunning the tests."),
+            started("f2", findings_facet("PENDING")),
+        ] {
+            capture.observe(&event);
+        }
+        assert_eq!(capture.tail(18), "Running the tests.");
+        assert_eq!(
+            capture.tail(1000),
+            "Intro é.\n\nREVIEW\n\nRunning the tests."
+        );
+        // Counted in characters, not bytes, so a cut never splits one.
+        assert_eq!(capture.tail(30), "é.\n\nREVIEW\n\nRunning the tests.");
+        assert_eq!(TextCapture::default().tail(10), "");
     }
 
     #[test]

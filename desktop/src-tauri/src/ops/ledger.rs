@@ -172,12 +172,21 @@ pub struct RecipientSnapshot {
     /// since it last produced output, and the tool calls it has open.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<AgentActivity>,
+    /// The end of what the agent has written in this turn so far, up to
+    /// [`RECENT_TEXT_CHARS`] characters, while it runs: where it has got to,
+    /// without a separate read. Answer text only, as the reply will hold it;
+    /// tool output and thinking are left out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_text: Option<String>,
     /// The agent's context fullness after its newest finished turn, on a
     /// completed recipient in a finished wait: what decides whether to compact
     /// before the next step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<super::context::ContextFigures>,
 }
+
+/// How much of a running turn's text a send's snapshot carries.
+pub const RECENT_TEXT_CHARS: usize = 500;
 
 /// What an agent's running turn is doing, for telling a stuck turn from a
 /// long one. Silence is measured as the window measures it for its "No
@@ -399,6 +408,7 @@ impl RecipientEntry {
         RecipientSnapshot {
             agent_id: self.agent_id,
             activity: None,
+            recent_text: None,
             context: None,
             message_id: self.message_id,
             status: self.status,
@@ -415,6 +425,7 @@ impl RecipientEntry {
         RecipientSnapshot {
             agent_id: self.agent_id,
             activity: None,
+            recent_text: None,
             context: None,
             message_id: self.message_id,
             status: self.dispatch,
@@ -967,6 +978,8 @@ impl SendLedger {
                             .get(&recipient.agent_id)
                             .filter(|state| state.turn_open)
                             .map(|state| state.report(now));
+                        snapshot.recent_text = Some(recipient.capture.tail(RECENT_TEXT_CHARS))
+                            .filter(|text| !text.is_empty());
                     }
                     snapshot
                 })
@@ -1788,6 +1801,45 @@ mod tests {
         assert_eq!(
             done.recipients[0].activity, None,
             "a finished recipient carries its reply instead"
+        );
+    }
+
+    #[test]
+    fn a_running_recipient_carries_the_end_of_its_text_so_far() {
+        let ledger = SendLedger::new();
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        let queued = ledger.send(send_id).unwrap();
+        assert_eq!(
+            queued.recipients[0].recent_text, None,
+            "nothing written yet is nothing to show"
+        );
+        let turn_id = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(message_id, turn_id, send_id),
+        );
+        let long = "x".repeat(RECENT_TEXT_CHARS);
+        ledger.observe(&channel(agent_id), &chunk(turn_id, &long));
+        ledger.observe(&channel(agent_id), &chunk(turn_id, "Running the tests."));
+        let running = ledger.send(send_id).unwrap();
+        let recent = running.recipients[0].recent_text.as_deref().unwrap();
+        assert_eq!(recent.chars().count(), RECENT_TEXT_CHARS);
+        assert!(recent.ends_with("Running the tests."));
+        ledger.observe(
+            &channel(agent_id),
+            &turn_end(turn_id, &json!({ "status": "completed" })),
+        );
+        let done = ledger.send(send_id).unwrap();
+        assert_eq!(
+            done.recipients[0].recent_text, None,
+            "a finished recipient carries its whole reply instead"
+        );
+        assert!(
+            done.recipients[0]
+                .text
+                .as_deref()
+                .unwrap()
+                .ends_with("Running the tests.")
         );
     }
 

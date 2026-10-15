@@ -152,7 +152,8 @@ export async function desktopProjectSynced(
   await invoke("desktop_project_synced", { requestId, result });
 }
 
-/// Another client created, renamed, or reconfigured an agent in the project.
+/// Another client created, renamed, reconfigured, or removed an agent in the
+/// project.
 export async function listenDesktopRosterChanged(
   handler: (projectId: ProjectId) => void,
 ): Promise<UnlistenFn> {

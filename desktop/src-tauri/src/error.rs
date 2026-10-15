@@ -644,6 +644,22 @@ pub enum AppError {
     #[error("busy: {}", names.join(", "))]
     RecipientsBusy { names: Vec<String> },
 
+    /// A caller other than the window asked to remove an agent with a turn
+    /// running or queued. The window's own remove cancels that work; a caller
+    /// that cannot see the agent's pane must stop it on purpose first.
+    #[error(
+        "{name} has a turn running or queued: wait for it with wait_agent, or stop it with cancel_agent, then remove it"
+    )]
+    RemoveAgentBusy { name: String },
+
+    /// A caller other than the window asked to remove an agent while a
+    /// workflow runs in its project, which may send to the agent in a later
+    /// step.
+    #[error(
+        "a workflow is running in this project and may send to {name}: wait for it with wait_workflow, or cancel it, then remove the agent"
+    )]
+    RemoveAgentWorkflowRunning { name: String },
+
     /// Writing the copied built-in prompt into the user's folder failed.
     #[error("failed to copy prompt to {path}: {source}")]
     PromptCopyIo {

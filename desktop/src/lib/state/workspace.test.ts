@@ -4177,6 +4177,26 @@ describe("desktop sync for another client's turn", () => {
     expect(acks()).toEqual([]);
   });
 
+  it("drops an agent another client removed, through a roster notice", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const backend = installBackend({
+      roster: [agent(AGENT_1, PROJECT_2), agent(AGENT_2, PROJECT_2)],
+    });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+    expect(state._testing.hasListener(AGENT_2)).toBe(true);
+
+    backend.roster = [agent(AGENT_1, PROJECT_2)];
+    fireTo("desktop_roster_changed", { project_id: PROJECT_2 });
+    await settle();
+
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([AGENT_1]);
+    expect(state._testing.hasListener(AGENT_2)).toBe(false);
+    expect(state._testing.hasListener(AGENT_1)).toBe(true);
+  });
+
   it("ignores a roster notice for a project the window has not loaded", async () => {
     const ws = await loadWorkspaceState();
     installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });

@@ -157,6 +157,11 @@ pub struct ForwardRequest {
     pub on_busy: OnBusyPolicy,
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Files on this Mac to attach, as absolute paths. Each is copied into the
+    /// project and every recipient gets the copies' paths after the message,
+    /// as with a file attached in the window.
+    #[serde(default)]
+    pub attachments: Vec<PathBuf>,
 }
 
 /// Send one message to the recipients and return each one's dispatch-time
@@ -170,7 +175,6 @@ pub async fn send(
     request: SendRequest,
     budget: WaitBudget,
 ) -> Result<SendReceipt, AppError> {
-    attach::check_sources(&request.attachments)?;
     let plan = Plan {
         project_id: request.project_id,
         recipients: request.recipients,
@@ -208,7 +212,7 @@ pub async fn forward(
             text: request.text.unwrap_or_default(),
             prompt: request.prompt,
         },
-        attachments: Vec::new(),
+        attachments: request.attachments,
     };
     begin(handle, home_dir, plan, request.idempotency_key, budget).await
 }
@@ -468,6 +472,7 @@ async fn run_inner(
     budget: &WaitBudget,
 ) -> Result<SendReceipt, AppError> {
     let project_id = plan.project_id;
+    attach::check_sources(&plan.attachments).await?;
     open_project_impl(state, project_id)?;
     let project = lock(&state.projects)
         .get(&project_id)

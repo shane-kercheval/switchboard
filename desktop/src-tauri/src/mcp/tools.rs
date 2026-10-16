@@ -758,6 +758,11 @@ pub struct ForkArgs {
     /// Any string unique to this request; a retry passes the same one.
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// Files on this Mac to attach, as absolute paths: a screenshot, a log.
+    /// Each is copied into the project, and every recipient gets the copies'
+    /// paths after the message, as with a file attached in the window.
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 /// A message from its two optional parts: a saved prompt with text appended,
@@ -891,6 +896,11 @@ pub struct ForwardArgs {
     /// Seconds to wait for a source still mid-turn. 50 by default.
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    /// Files on this Mac to attach, as absolute paths: a screenshot, a log.
+    /// Each is copied into the project, and every recipient gets the copies'
+    /// paths after the message, as with a file attached in the window.
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 /// A workflow input: a string, or a list of strings for a list input.
@@ -1286,6 +1296,7 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                     agent_id: a.agent_id,
                     body: body_of(a.prompt, a.text)?,
                     idempotency_key: a.idempotency_key,
+                    attachments: a.attachments.into_iter().map(PathBuf::from).collect(),
                 },
                 cx.budget(None),
             )
@@ -1307,6 +1318,7 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 }),
                 on_busy: a.on_busy.into(),
                 idempotency_key: a.idempotency_key,
+                attachments: a.attachments.into_iter().map(PathBuf::from).collect(),
             };
             let receipt = send::forward(
                 Arc::clone(&cx.handle),

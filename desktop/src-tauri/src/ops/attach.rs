@@ -39,22 +39,45 @@ const TEXT_EXTENSIONS: &[&str] = &[
 ];
 
 /// Refuse a send whose attachments cannot be read, before anything is
-/// claimed or dispatched: each must be an absolute path to a file on this Mac.
-pub(super) fn check_sources(sources: &[PathBuf]) -> Result<(), AppError> {
-    for source in sources {
-        if !source.is_absolute() {
-            return Err(AppError::InvalidArgument(format!(
-                "attachment {} is not an absolute path",
-                source.display()
-            )));
-        }
-        if !source.is_file() {
-            return Err(AppError::InvalidArgument(format!(
-                "attachment {} is not a file on this Mac",
-                source.display()
-            )));
-        }
+/// created or dispatched: each must be an absolute path to a file on this Mac
+/// that opens for reading. Runs at the start of every attempt, after the
+/// retry key is claimed, so a retry of a send that already went out returns
+/// its receipt even when the file has since been deleted. On the blocking
+/// pool, as the copy is: opening a file is blocking I/O.
+pub(super) async fn check_sources(sources: &[PathBuf]) -> Result<(), AppError> {
+    if sources.is_empty() {
+        return Ok(());
     }
+    let sources = sources.to_vec();
+    tokio::task::spawn_blocking(move || sources.iter().try_for_each(|s| check_source(s)))
+        .await
+        .map_err(|join_err| {
+            AppError::Internal(format!(
+                "checking the attachments did not finish: {join_err}"
+            ))
+        })?
+}
+
+fn check_source(source: &Path) -> Result<(), AppError> {
+    if !source.is_absolute() {
+        return Err(AppError::InvalidArgument(format!(
+            "attachment {} is not an absolute path",
+            source.display()
+        )));
+    }
+    let unreadable = |error: std::io::Error| {
+        AppError::InvalidArgument(format!(
+            "attachment {} cannot be read: {error}",
+            source.display()
+        ))
+    };
+    if !std::fs::metadata(source).map_err(unreadable)?.is_file() {
+        return Err(AppError::InvalidArgument(format!(
+            "attachment {} is not a file",
+            source.display()
+        )));
+    }
+    std::fs::File::open(source).map_err(unreadable)?;
     Ok(())
 }
 

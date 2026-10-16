@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 /// How a staged attachment is classified, by the dropped file's extension.
 /// Drives the user-facing label prefix (`image-1`, `text-1`, `file-1`).
 ///
-/// The classification is assigned **frontend-side** (it owns the extension→kind
-/// mapping and has the dropped filename); core only persists what it's told.
+/// The classification is assigned by whoever stages the file: the frontend for
+/// a file dropped into the window, the server for one an orchestrator attaches
+/// (each holds the same extension lists, kept equal by a test); core only
+/// persists what it's told.
 ///
 /// `#[non_exhaustive]` keeps adding a variant non-breaking for Rust `match`
 /// callers, but that alone does **not** make older builds tolerate a newer kind

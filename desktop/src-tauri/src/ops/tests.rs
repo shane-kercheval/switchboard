@@ -639,6 +639,7 @@ async fn forward_from_a_source_in_a_second_unopened_project() {
         prompt: None,
         on_busy: OnBusyPolicy::Refuse,
         idempotency_key: None,
+        attachments: Vec::new(),
     };
     let receipt = forward(
         env.handle(),
@@ -684,6 +685,7 @@ async fn forward_with_a_mid_turn_source_past_the_budget_is_source_busy() {
         prompt: None,
         on_busy: OnBusyPolicy::Refuse,
         idempotency_key: Some("fwd".to_owned()),
+        attachments: Vec::new(),
     };
     let err = forward(
         env.handle(),
@@ -749,6 +751,7 @@ async fn forward_into_a_named_prompt_argument() {
         }),
         on_busy: OnBusyPolicy::Refuse,
         idempotency_key: None,
+        attachments: Vec::new(),
     };
     let receipt = forward(
         env.handle(),
@@ -773,6 +776,7 @@ async fn forward_into_a_named_prompt_argument() {
         prompt: None,
         on_busy: OnBusyPolicy::Refuse,
         idempotency_key: None,
+        attachments: Vec::new(),
     };
     let err = forward(
         env.handle(),
@@ -1530,6 +1534,7 @@ async fn create_send_forward_and_read_leave_the_expected_files() {
             prompt: None,
             on_busy: OnBusyPolicy::Refuse,
             idempotency_key: None,
+            attachments: Vec::new(),
         },
         WaitBudget::default_wait(),
     )
@@ -1686,6 +1691,7 @@ async fn a_kept_alive_forward_fires_progress_past_five_minutes_and_completes() {
         prompt: None,
         on_busy: OnBusyPolicy::Refuse,
         idempotency_key: None,
+        attachments: Vec::new(),
     };
     let started = tokio::time::Instant::now();
     let receipt = forward(env.handle(), env.home(), request, budget)
@@ -1728,6 +1734,7 @@ async fn a_retry_that_joins_an_in_flight_send_and_runs_out_of_budget_reports_in_
         prompt: None,
         on_busy: OnBusyPolicy::Refuse,
         idempotency_key: Some("joined".to_owned()),
+        attachments: Vec::new(),
     };
     let original = tokio::spawn(forward(
         env.handle(),
@@ -2281,6 +2288,7 @@ async fn cancelling_a_forward_while_it_waits_on_a_source_dispatches_nothing() {
         prompt: None,
         on_busy: OnBusyPolicy::Refuse,
         idempotency_key: Some("held".to_owned()),
+        attachments: Vec::new(),
     };
     let caller = tokio::spawn(forward(
         env.handle(),
@@ -3513,6 +3521,7 @@ async fn a_forward_asks_the_window_only_once_its_source_has_finished() {
             prompt: None,
             on_busy: OnBusyPolicy::Refuse,
             idempotency_key: None,
+            attachments: Vec::new(),
         },
         WaitBudget::new(Some(30), false),
     ));
@@ -4291,6 +4300,7 @@ async fn a_message_registered_before_a_compaction_but_admitted_after_it_keeps_th
                     prompt: None,
                     on_busy: OnBusyPolicy::Queue,
                     idempotency_key: Some("held-forward".to_owned()),
+                    attachments: Vec::new(),
                 },
                 WaitBudget::default_wait(),
             )
@@ -4477,6 +4487,7 @@ fn fork_request(
             text: text.to_owned(),
         },
         idempotency_key: key.map(str::to_owned),
+        attachments: Vec::new(),
     }
 }
 
@@ -5779,6 +5790,7 @@ async fn cancelling_a_waiting_forwards_only_recipient_stops_the_forward_at_once(
         prompt: None,
         on_busy: OnBusyPolicy::Refuse,
         idempotency_key: Some("f".to_owned()),
+        attachments: Vec::new(),
     };
     let task = tokio::spawn(forward(
         env.handle(),
@@ -6215,6 +6227,7 @@ async fn cancelling_a_waiting_forward_sends_nothing_from_the_window_or_the_tools
                 prompt: None,
                 on_busy: OnBusyPolicy::Refuse,
                 idempotency_key: Some("f".to_owned()),
+                attachments: Vec::new(),
             };
             let task = tokio::spawn(forward(
                 env.handle(),
@@ -6314,6 +6327,7 @@ async fn forking_a_busy_agent_is_refused_from_the_window_and_the_tools() {
                 text: "aside".to_owned(),
             },
             idempotency_key: None,
+            attachments: Vec::new(),
         },
         WaitBudget::default_wait(),
     )
@@ -6508,14 +6522,18 @@ async fn attachments_copied_in_survive_the_cleanup_the_window_runs_when_it_opens
 }
 
 #[tokio::test]
-async fn an_attachment_that_is_not_an_absolute_path_to_a_file_sends_nothing() {
+async fn an_attachment_that_is_not_a_readable_file_sends_nothing() {
     let (env, project_id, agents) = project_with_agents(&["a"]);
     let (sources, image, _log) = attachment_sources();
-    for (bad, why) in [
+    let mut cases = vec![
         (PathBuf::from("shot.png"), "not an absolute path"),
-        (sources.path().join("missing.png"), "not a file on this Mac"),
-        (sources.path().to_path_buf(), "not a file on this Mac"),
-    ] {
+        (sources.path().join("missing.png"), "cannot be read"),
+        (sources.path().to_path_buf(), "is not a file"),
+    ];
+    if let Some(locked) = unreadable_file(sources.path()) {
+        cases.push((locked, "cannot be read"));
+    }
+    for (bad, why) in cases {
         let mut request = text_send(project_id, agents.clone(), "look");
         request.attachments = vec![image.clone(), bad];
         let err = send_now(env.handle(), env.home(), request)
@@ -6529,5 +6547,244 @@ async fn an_attachment_that_is_not_an_absolute_path_to_a_file_sends_nothing() {
     assert!(
         std::fs::read_dir(&attachments_dir).map_or(true, |mut dir| dir.next().is_none()),
         "nothing was copied in"
+    );
+}
+
+/// A file this process cannot open, or `None` where permissions do not stop
+/// it (running as root), so the case is skipped rather than passing wrongly.
+fn unreadable_file(dir: &std::path::Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join("locked.png");
+    std::fs::write(&path, b"secret").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::File::open(&path).is_err().then_some(path)
+}
+
+/// A folder this process cannot write into, or `None` where permissions do
+/// not stop it (running as root).
+fn read_only_dir(dir: &std::path::Path) -> Option<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = dir.join("probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(probe);
+        return None;
+    }
+    Some(())
+}
+
+fn writable_dir(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[tokio::test]
+async fn a_retry_of_a_send_that_went_out_returns_its_receipt_after_the_file_is_deleted() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let (_sources, image, _log) = attachment_sources();
+    let mut request = text_send(project_id, agents, "look");
+    request.attachments = vec![image.clone()];
+    request.idempotency_key = Some("k".to_owned());
+    let first = send_now(env.handle(), env.home(), request.clone())
+        .await
+        .unwrap();
+    wait_done(&env, project_id, first.send_id).await;
+
+    std::fs::remove_file(&image).unwrap();
+    let retry = send_now(env.handle(), env.home(), request)
+        .await
+        .expect("the retry returns the original receipt");
+    assert_eq!(retry.send_id, first.send_id);
+    assert_eq!(lock(&env.adapter.prompts).len(), 1, "nothing sent twice");
+    let attachments_dir = env.journal_path(project_id).with_file_name("attachments");
+    assert_eq!(
+        std::fs::read_dir(attachments_dir).unwrap().count(),
+        1,
+        "nothing copied twice"
+    );
+}
+
+#[tokio::test]
+async fn a_forward_with_an_attachment_gives_the_recipient_the_forwarded_text_and_the_file() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("proj");
+    let recipient = env.agent(project_id, "r");
+    let source = env.agent(project_id, "src");
+    env.seed_claude_turn(project_id, source, "SOURCE OUTPUT", "m1");
+    let env = env.restart();
+    let (_sources, image, _log) = attachment_sources();
+    let request = ForwardRequest {
+        project_id,
+        sources: vec![ForwardSourceRef {
+            agent_id: source,
+            project_id,
+        }],
+        recipients: vec![recipient],
+        text: Some("Please review:".to_owned()),
+        prompt: None,
+        on_busy: OnBusyPolicy::Refuse,
+        idempotency_key: None,
+        attachments: vec![image],
+    };
+    let receipt = forward(
+        env.handle(),
+        env.home(),
+        request,
+        WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+
+    let journaled = journaled_attachments(&env, project_id, receipt.send_id);
+    assert_eq!(journaled.len(), 1);
+    assert_eq!(journaled[0][0].label, "image-1");
+    let forwarded = "Please review:\n\n=== START forwarded from src ===\nSOURCE OUTPUT\n=== END forwarded from src ===";
+    assert_eq!(
+        lock(&env.adapter.prompts)[0],
+        switchboard_core::render_prompt_with_attachments(forwarded, &journaled[0])
+    );
+}
+
+fn fork_with_attachments(
+    project_id: ProjectId,
+    source: AgentId,
+    key: Option<&str>,
+    attachments: Vec<PathBuf>,
+) -> ForkRequest {
+    ForkRequest {
+        attachments,
+        ..fork_request(project_id, source, "branch", key)
+    }
+}
+
+#[tokio::test]
+async fn a_forks_first_message_carries_its_attachments() {
+    let (env, project_id, source) = forkable_source();
+    let (_sources, image, _log) = attachment_sources();
+    let receipt = fork_now(
+        &env,
+        fork_with_attachments(project_id, source, None, vec![image]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt.send.recipients[0].status, SendStatus::Accepted);
+    wait_done(&env, project_id, receipt.send.send_id).await;
+
+    let journaled = journaled_attachments(&env, project_id, receipt.send.send_id);
+    assert_eq!(journaled.len(), 1);
+    assert_eq!(journaled[0][0].label, "image-1");
+    assert_eq!(
+        *lock(&env.adapter.prompts),
+        vec![switchboard_core::render_prompt_with_attachments(
+            "branch",
+            &journaled[0]
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_fork_with_an_unreadable_attachment_is_refused_and_no_fork_is_created() {
+    let (env, project_id, source) = forkable_source();
+    let (sources, _image, _log) = attachment_sources();
+    let Some(locked) = unreadable_file(sources.path()) else {
+        return;
+    };
+    let before = roster(&env, project_id).len();
+    let err = fork_now(
+        &env,
+        fork_with_attachments(project_id, source, Some("k"), vec![locked]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error_code(&err), error_code::INVALID_ARGUMENT);
+    assert!(err.to_string().contains("cannot be read"), "{err}");
+    assert_eq!(roster(&env, project_id).len(), before, "no fork was made");
+    assert!(lock(&env.adapter.prompts).is_empty());
+}
+
+#[tokio::test]
+async fn a_fork_retried_with_the_same_key_and_different_files_is_refused() {
+    let (env, project_id, source) = forkable_source();
+    let (_sources, image, log) = attachment_sources();
+    let first = fork_now(
+        &env,
+        fork_with_attachments(project_id, source, Some("k"), vec![image]),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, first.send.send_id).await;
+
+    let err = fork_now(
+        &env,
+        fork_with_attachments(project_id, source, Some("k"), vec![log]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error_code(&err), error_code::INVALID_ARGUMENT);
+    assert!(err.to_string().contains("idempotency_key"), "{err}");
+    assert_eq!(lock(&env.adapter.prompts).len(), 1);
+}
+
+#[tokio::test]
+async fn a_fork_whose_copy_fails_keeps_the_fork_and_the_same_key_sends_it_the_message() {
+    let (env, project_id, source) = forkable_source();
+    let (_sources, image, _log) = attachment_sources();
+    let attachments_dir = env.journal_path(project_id).with_file_name("attachments");
+    if read_only_dir(&attachments_dir).is_none() {
+        return;
+    }
+    let request = || fork_with_attachments(project_id, source, Some("k"), vec![image.clone()]);
+
+    let refused = fork_now(&env, request()).await.unwrap();
+    writable_dir(&attachments_dir);
+    let fork = fork_of(&refused);
+    assert_eq!(refused.send.recipients[0].status, SendStatus::Rejected);
+    assert!(lock(&env.adapter.prompts).is_empty(), "nothing was sent");
+    assert_eq!(roster(&env, project_id).len(), 2, "the fork exists");
+
+    let resent = fork_now(&env, request()).await.unwrap();
+    assert_eq!(fork_of(&resent).id, fork.id, "the same fork, not a second");
+    assert_eq!(resent.send.recipients[0].status, SendStatus::Accepted);
+    wait_done(&env, project_id, resent.send.send_id).await;
+    assert_eq!(roster(&env, project_id).len(), 2);
+    let journaled = journaled_attachments(&env, project_id, resent.send.send_id);
+    assert_eq!(
+        *lock(&env.adapter.prompts),
+        vec![switchboard_core::render_prompt_with_attachments(
+            "branch",
+            &journaled[0]
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_forks_attachments_survive_the_cleanup_the_window_runs_when_it_opens_the_project() {
+    let (env, project_id, source) = forkable_source();
+    let (env, sync, _window, mut requests) = env.with_window(Duration::from_mins(1));
+    let (_sources, image, _log) = attachment_sources();
+    let task = spawn_fork(
+        &env,
+        fork_with_attachments(project_id, source, None, vec![image]),
+    );
+    let request = requests.recv().await.unwrap();
+    let carried = request.fork.expect("the request names the fork");
+    crate::commands::reclaim_project_attachments_impl(&env.state, project_id, &[])
+        .await
+        .unwrap();
+    sync.acknowledge(
+        request.request_id,
+        SyncAck::Ready {
+            listening_agents: vec![source, carried.fork_id],
+        },
+    );
+    let receipt = task.await.unwrap().unwrap();
+    assert_eq!(receipt.send.recipients[0].status, SendStatus::Accepted);
+    wait_done(&env, project_id, receipt.send.send_id).await;
+    let journaled = journaled_attachments(&env, project_id, receipt.send.send_id);
+    assert!(
+        PathBuf::from(&journaled[0][0].path).is_file(),
+        "the copy the fork was given still exists"
     );
 }

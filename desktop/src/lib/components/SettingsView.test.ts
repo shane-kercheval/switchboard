@@ -8,7 +8,7 @@ import { agentCopy } from "$lib/agentCopy.svelte";
 import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
 import { _testing as prefsTesting, preferences } from "$lib/preferences.svelte";
 import { WORKFLOW_AUTHORING_GUIDE_URL } from "$lib/workflowAuthoring";
-import { ORCHESTRATOR_PROMPT } from "$lib/orchestratorPrompt";
+import { DATA_SCIENCE_ORCHESTRATOR_PROMPT, ORCHESTRATOR_PROMPT } from "$lib/orchestratorPrompt";
 import { DEFAULT_AGENT_SELECTIONS } from "$lib/agentSelection";
 import type { Preferences } from "$lib/types";
 
@@ -798,19 +798,43 @@ describe("SettingsView", () => {
     expect(invokeMock).toHaveBeenCalledWith("open_workflows_dir", undefined);
   });
 
-  it("previews and copies the orchestrator prompt from the Agent MCP Server panel", async (): Promise<void> => {
+  it("previews and copies the engineering orchestrator prompt from the Agent MCP Server panel", async (): Promise<void> => {
     render(SettingsView, { props: { onClose: vi.fn(), section: "agent-access" } });
 
-    const help = screen.getByRole("button", { name: "Read and copy the orchestrator prompt" });
+    const help = screen.getByRole("button", {
+      name: "Read and copy the engineering orchestrator prompt",
+    });
     const preview = screen.getByTestId("orchestrator-prompt");
     const copy = screen.getByTestId("orchestrator-prompt-copy");
     expect(preview).not.toBeVisible();
     await fireEvent.click(help);
     expect(preview).toBeVisible();
     expect(preview).toHaveTextContent("You are my stand-in");
+    expect(preview).toHaveTextContent("principal engineer");
     await fireEvent.click(copy);
     await waitFor(() => expect(copyTextMock).toHaveBeenCalledOnce());
     expect(copyTextMock.mock.calls[0]![0]).toBe(ORCHESTRATOR_PROMPT);
+  });
+
+  it("opens the data science orchestrator prompt on its own and copies it", async (): Promise<void> => {
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agent-access" } });
+
+    const help = screen.getByRole("button", {
+      name: "Read and copy the data science orchestrator prompt",
+    });
+    const preview = screen.getByTestId("data-science-orchestrator-prompt");
+    const engineering = screen.getByTestId("orchestrator-prompt");
+    expect(preview).not.toBeVisible();
+    await fireEvent.click(help);
+    expect(preview).toBeVisible();
+    expect(engineering).not.toBeVisible();
+    expect(preview).toHaveTextContent("principal data scientist");
+    expect(preview).toHaveTextContent("A result is a claim");
+    await fireEvent.click(screen.getByTestId("data-science-orchestrator-prompt-copy"));
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledOnce());
+    expect(copyTextMock.mock.calls[0]![0]).toBe(DATA_SCIENCE_ORCHESTRATOR_PROMPT);
+    expect(DATA_SCIENCE_ORCHESTRATOR_PROMPT).not.toBe(ORCHESTRATOR_PROMPT);
+    expect(DATA_SCIENCE_ORCHESTRATOR_PROMPT).toContain("## The review loop");
   });
 
   it("previews and copies local prompt instructions with the folder once it loads", async (): Promise<void> => {

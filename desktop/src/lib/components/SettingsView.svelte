@@ -43,7 +43,7 @@
   import { HARNESS_LABEL, ALL_HARNESSES } from "$lib/harnessDisplay";
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
   import { promptAuthoringPrompt } from "$lib/promptAuthoring";
-  import { ORCHESTRATOR_PROMPT } from "$lib/orchestratorPrompt";
+  import { ORCHESTRATOR_PROMPTS } from "$lib/orchestratorPrompt";
 
   let { onClose, section = null }: { onClose: () => void; section?: SettingsSection | null } =
     $props();
@@ -986,41 +986,49 @@
       </section>
       <section class={cn(sectionClass, "mt-7")} data-testid="orchestrator-prompt-settings">
         <div>
-          <h2 class={sectionHeadingClass}>Orchestrator prompt</h2>
+          <h2 class={sectionHeadingClass}>Orchestrator prompts</h2>
           <p class="text-muted mt-1 text-sm leading-relaxed">
-            The tools tell a connected agent how Switchboard works, not how to think. This prompt
-            makes it your stand-in: it decides and directs, questions the way an engineer or a
-            product, UX, security, or data expert would, and never writes code itself. Copy it into
-            the CLAUDE.md or AGENTS.md of the folder you orchestrate from so it loads every session,
-            or paste it when a session starts, and edit the rules to match yours.
+            The tools tell a connected agent how Switchboard works, not how to think. These prompts
+            make it your stand-in: it decides and directs, questions the way you would, and never
+            writes code itself. They share every rule and differ in the lens: an engineering
+            manager's, or a data scientist's. Copy one into the CLAUDE.md or AGENTS.md of the folder
+            you orchestrate from so it loads every session, or paste it when a session starts, and
+            edit the rules to match yours.
           </p>
         </div>
-        <Disclosure id="orchestrator-prompt-help" label="Read and copy the orchestrator prompt">
-          <div class="overflow-hidden" data-testid="orchestrator-prompt-authoring">
-            <div class="flex items-start gap-2 py-2.5">
-              <div class="min-w-0 flex-1">
-                <h3 class="text-fg text-sm font-medium">Give the orchestrating agent its role</h3>
-                <p>Copy the whole prompt into the agent that connects over MCP.</p>
+        {#each ORCHESTRATOR_PROMPTS as prompt (prompt.id)}
+          <Disclosure
+            id={`${prompt.id}-help`}
+            label={`Read and copy the ${prompt.title} orchestrator prompt`}
+          >
+            <div class="overflow-hidden" data-testid={`${prompt.id}-authoring`}>
+              <div class="flex items-start gap-2 py-2.5">
+                <div class="min-w-0 flex-1">
+                  <h3 class="text-fg text-sm font-medium">Give the orchestrating agent its role</h3>
+                  <p>
+                    {prompt.description} Copy the whole prompt into the agent that connects over MCP.
+                  </p>
+                </div>
+                <Tooltip label="Copy Prompt" side="top">
+                  {#snippet trigger(props)}
+                    <span {...props} class="shrink-0">
+                      <CopyButton
+                        text={prompt.text}
+                        label={`Copy ${prompt.title} orchestrator prompt`}
+                        testid={`${prompt.id}-copy`}
+                      />
+                    </span>
+                  {/snippet}
+                </Tooltip>
               </div>
-              <Tooltip label="Copy Prompt" side="top">
-                {#snippet trigger(props)}
-                  <span {...props} class="shrink-0">
-                    <CopyButton
-                      text={ORCHESTRATOR_PROMPT}
-                      label="Copy orchestrator prompt"
-                      testid="orchestrator-prompt-copy"
-                    />
-                  </span>
-                {/snippet}
-              </Tooltip>
-            </div>
 
-            <pre
-              id="orchestrator-prompt"
-              data-testid="orchestrator-prompt"
-              class="bg-raised text-fg max-h-80 overflow-auto rounded-md px-3 py-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">{ORCHESTRATOR_PROMPT}</pre>
-          </div>
-        </Disclosure>
+              <pre
+                id={prompt.id}
+                data-testid={prompt.id}
+                class="bg-raised text-fg max-h-80 overflow-auto rounded-md px-3 py-2.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">{prompt.text}</pre>
+            </div>
+          </Disclosure>
+        {/each}
       </section>
     </div>
   </div>

@@ -2661,13 +2661,14 @@ fn the_orchestrator_prompt_names_only_real_tools_and_the_announced_version() {
         "the instructions announce the prompt's version"
     );
 
-    // A reminder, not enforcement: an edit to the prompt's text fails here
+    // A reminder, not enforcement: an edit to either prompt's text fails here
     // until the fingerprint is updated, and whoever updates it is told to bump
-    // the version, so a pasted copy can tell it is stale.
+    // the version, so a pasted copy can tell it is stale. Both prompts are
+    // built from this file, so it is the file from its first export that is
+    // fingerprinted; the doc comment above it is free to change.
     let text = source
-        .split("export const ORCHESTRATOR_PROMPT = `")
-        .nth(1)
-        .and_then(|rest| rest.split("`;").next())
+        .split_once("export const ORCHESTRATOR_PROMPT_VERSION")
+        .map(|(_, rest)| rest)
         .expect("the prompt's text");
     let fingerprint =
         sha2::Sha256::digest(text.as_bytes())
@@ -2685,9 +2686,9 @@ fn the_orchestrator_prompt_names_only_real_tools_and_the_announced_version() {
     );
 }
 
-/// The orchestrator prompt's version and the SHA-256 of its text at that
-/// version.
+/// The orchestrator prompts' version and the SHA-256 of their source, from
+/// the version line on, at that version.
 const PROMPT_FINGERPRINT: (u32, &str) = (
     5,
-    "680a7c1d44728a09fbef0bb8ce7121618963e195216475b46037aa242aecde9e",
+    "cbda86b8d1f04c40387e19ae090eb89ae915a4b54f002ed785a967dd8b0fc282",
 );

@@ -325,7 +325,15 @@ async fn run_inner(
     } = plan;
     // Every attempt, before the fork is created: a file that cannot be read
     // refuses the request with no fork made.
-    attach::check_sources(&attachments).await?;
+    match budget.run(attach::check_sources(state, &attachments)).await {
+        Outcome::Done(checked) => checked?,
+        Outcome::Timeout => {
+            return Err(AppError::TimedOut {
+                what: "checking the attachments",
+            });
+        }
+        Outcome::Cancelled => return Err(AppError::Interrupted),
+    }
     open_project_impl(state, project_id)?;
     let project = lock(&state.projects)
         .get(&project_id)
@@ -409,7 +417,7 @@ async fn run_inner(
     // After the window has the project open, as a send copies: see `attach`.
     // A copy that fails leaves the fork without its message, which the retry
     // rule above covers: the same key sends to this fork again.
-    let attachments = attach::stage(state, project_id, &attachments).await?;
+    let attachments = attach::stage(state, project_id, &attachments, budget.cancel_token()).await?;
     if !attachments.is_empty() {
         check_prompt_size(&render_prompt_with_attachments(&text, &attachments))
             .map_err(AppError::PromptTooLarge)?;

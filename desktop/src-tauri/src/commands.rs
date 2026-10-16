@@ -142,7 +142,7 @@ fn conflicting_claim(
 /// The barrier a test installed at `seam`, if any. `None` in release builds
 /// (the map does not exist) and when unset.
 #[cfg(test)]
-fn test_seam(
+pub(crate) fn test_seam(
     state: &AppState,
     seam: crate::state::TestSeam,
 ) -> Option<Arc<crate::state::MaintenanceBarrier>> {
@@ -173,7 +173,7 @@ async fn wait_at_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>) {
 /// compromise: the caller is already on the blocking pool, which is what that
 /// pool is for, and the capture seam uses the same form for the same reason.
 #[cfg(test)]
-fn wait_at_blocking_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>) {
+pub(crate) fn wait_at_blocking_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>) {
     if let Some(barrier) = barrier {
         // `notify_one` on both sides — see `wait_at_seam`.
         barrier.entered.notify_one();
@@ -182,7 +182,7 @@ fn wait_at_blocking_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>)
 }
 
 #[cfg(not(test))]
-fn wait_at_blocking_seam(_barrier: Option<()>) {}
+pub(crate) fn wait_at_blocking_seam(_barrier: Option<()>) {}
 
 #[cfg(test)]
 use crate::state::TestSeam::SelectionUpdate as SelectionSeam;
@@ -3826,12 +3826,19 @@ pub async fn stage_attachment_impl(
     let attachments_dir = project.attachments_dir();
     let source_path = source_path.to_path_buf();
     let source_display = source_path.to_string_lossy().into_owned();
-    tokio::task::spawn_blocking(move || stage_attachment_io(&attachments_dir, &source_path))
-        .await
-        .map_err(|join_err| AppError::AttachmentStage {
-            source_path: source_display,
-            source: std::io::Error::other(join_err.to_string()),
-        })?
+    #[cfg(test)]
+    let seam = test_seam(state, crate::state::TestSeam::AttachmentCopy);
+    #[cfg(not(test))]
+    let seam: Option<()> = None;
+    tokio::task::spawn_blocking(move || {
+        wait_at_blocking_seam(seam);
+        stage_attachment_io(&attachments_dir, &source_path)
+    })
+    .await
+    .map_err(|join_err| AppError::AttachmentStage {
+        source_path: source_display,
+        source: std::io::Error::other(join_err.to_string()),
+    })?
 }
 
 /// Narrow `paths` to the staged attachments that still exist on disk.

@@ -6788,3 +6788,126 @@ async fn a_forks_attachments_survive_the_cleanup_the_window_runs_when_it_opens_t
         "the copy the fork was given still exists"
     );
 }
+
+/// How long a test waits on a held attachment step before failing instead of
+/// hanging the suite.
+const HELD: Duration = Duration::from_secs(5);
+
+fn send_with_key_and_file(
+    project_id: ProjectId,
+    agents: Vec<AgentId>,
+    file: PathBuf,
+) -> SendRequest {
+    let mut request = text_send(project_id, agents, "look");
+    request.attachments = vec![file];
+    request.idempotency_key = Some("k".to_owned());
+    request
+}
+
+#[tokio::test]
+async fn a_send_whose_file_check_never_returns_times_out_at_its_deadline_with_nothing_sent() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let (_sources, image, _log) = attachment_sources();
+    let held = env.seam(TestSeam::AttachmentCheck);
+    let (handle, home) = (env.handle(), env.home());
+    let request = send_with_key_and_file(project_id, agents, image);
+    let task = tokio::spawn(async move { send(handle, home, request, short()).await });
+    tokio::time::timeout(HELD, held.entered.notified())
+        .await
+        .expect("the check reached its hold");
+
+    let outcome = tokio::time::timeout(HELD, task).await;
+    held.release.notify_one();
+    let err = outcome
+        .expect("the send answered while the check was still held")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("checking the attachments"),
+        "{err}"
+    );
+    assert!(lock(&env.adapter.prompts).is_empty());
+    assert!(
+        env.state.ledger.send_id_for_key(project_id, "k").is_none(),
+        "the key is free for a retry"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_send_while_its_file_check_is_stuck_ends_it_with_nothing_sent() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let (_sources, image, _log) = attachment_sources();
+    let held = env.seam(TestSeam::AttachmentCheck);
+    let task = tokio::spawn(send_now(
+        env.handle(),
+        env.home(),
+        send_with_key_and_file(project_id, agents, image),
+    ));
+    tokio::time::timeout(HELD, held.entered.notified())
+        .await
+        .expect("the check reached its hold");
+    let send_id = env.state.ledger.send_id_for_key(project_id, "k").unwrap();
+    cancel_send(&env.state, project_id, send_id, None).unwrap();
+
+    let outcome = tokio::time::timeout(HELD, task).await;
+    held.release.notify_one();
+    let receipt = outcome
+        .expect("the cancel ended the send while the check was still held")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.recipients[0].status, SendStatus::Cancelled);
+    assert!(lock(&env.adapter.prompts).is_empty());
+}
+
+#[tokio::test]
+async fn a_fork_whose_file_check_never_returns_times_out_and_creates_no_fork() {
+    let (env, project_id, source) = forkable_source();
+    let (_sources, image, _log) = attachment_sources();
+    let held = env.seam(TestSeam::AttachmentCheck);
+    let before = roster(&env, project_id).len();
+    let (handle, home) = (env.handle(), env.home());
+    let request = fork_with_attachments(project_id, source, Some("k"), vec![image]);
+    let task = tokio::spawn(async move { fork(handle, home, request, short()).await });
+    tokio::time::timeout(HELD, held.entered.notified())
+        .await
+        .expect("the check reached its hold");
+
+    let outcome = tokio::time::timeout(HELD, task).await;
+    held.release.notify_one();
+    let err = outcome
+        .expect("the fork answered while the check was still held")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("checking the attachments"),
+        "{err}"
+    );
+    assert_eq!(roster(&env, project_id).len(), before, "no fork was made");
+    assert!(lock(&env.adapter.prompts).is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_a_send_while_its_copy_is_stuck_ends_it_with_nothing_sent() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let (_sources, image, _log) = attachment_sources();
+    let held = env.seam(TestSeam::AttachmentCopy);
+    let task = tokio::spawn(send_now(
+        env.handle(),
+        env.home(),
+        send_with_key_and_file(project_id, agents, image),
+    ));
+    tokio::time::timeout(HELD, held.entered.notified())
+        .await
+        .expect("the copy reached its hold");
+    let send_id = env.state.ledger.send_id_for_key(project_id, "k").unwrap();
+    cancel_send(&env.state, project_id, send_id, None).unwrap();
+
+    let outcome = tokio::time::timeout(HELD, task).await;
+    held.release.notify_one();
+    let receipt = outcome
+        .expect("the cancel ended the send while the copy was still held")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.recipients[0].status, SendStatus::Cancelled);
+    assert!(lock(&env.adapter.prompts).is_empty());
+}

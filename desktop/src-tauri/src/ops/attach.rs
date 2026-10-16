@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 
 use switchboard_core::{Attachment, AttachmentKind, ProjectId};
 
-use crate::commands::stage_attachment_impl;
+use tokio_util::sync::CancellationToken;
+
+use crate::commands::{stage_attachment_impl, wait_at_blocking_seam};
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -43,19 +45,33 @@ const TEXT_EXTENSIONS: &[&str] = &[
 /// that opens for reading. Runs at the start of every attempt, after the
 /// retry key is claimed, so a retry of a send that already went out returns
 /// its receipt even when the file has since been deleted. On the blocking
-/// pool, as the copy is: opening a file is blocking I/O.
-pub(super) async fn check_sources(sources: &[PathBuf]) -> Result<(), AppError> {
+/// pool, as the copy is: opening a file is blocking I/O, and it can wait (a
+/// file stored only in iCloud, a network drive that stopped answering). The
+/// caller runs it under the call's deadline and cancel, as every other step
+/// before dispatch; an open that never returns then costs a blocking thread,
+/// not the send.
+pub(super) async fn check_sources(state: &AppState, sources: &[PathBuf]) -> Result<(), AppError> {
     if sources.is_empty() {
         return Ok(());
     }
     let sources = sources.to_vec();
-    tokio::task::spawn_blocking(move || sources.iter().try_for_each(|s| check_source(s)))
-        .await
-        .map_err(|join_err| {
-            AppError::Internal(format!(
-                "checking the attachments did not finish: {join_err}"
-            ))
-        })?
+    #[cfg(test)]
+    let seam = crate::commands::test_seam(state, crate::state::TestSeam::AttachmentCheck);
+    #[cfg(not(test))]
+    let seam: Option<()> = {
+        let _ = state;
+        None
+    };
+    tokio::task::spawn_blocking(move || {
+        wait_at_blocking_seam(seam);
+        sources.iter().try_for_each(|s| check_source(s))
+    })
+    .await
+    .map_err(|join_err| {
+        AppError::Internal(format!(
+            "checking the attachments did not finish: {join_err}"
+        ))
+    })?
 }
 
 fn check_source(source: &Path) -> Result<(), AppError> {
@@ -84,14 +100,28 @@ fn check_source(source: &Path) -> Result<(), AppError> {
 /// Copy each source into the project's `attachments/` dir and describe the
 /// copies, labelled in the order given. Call only after the window has the
 /// project open (see the module doc).
+///
+/// **No deadline, but `cancel` stops the wait.** The copy runs after the
+/// window's round trip, which may by design run up to the call's deadline (a
+/// forward waits there for its source to finish), so a deadline here would
+/// refuse an ordinary forward with nothing sent; and a large file takes as
+/// long as it takes, as it does when dropped into the window. A drive can
+/// still stall mid-copy, so a cancel or the server stopping ends the send
+/// without waiting for it: the copy finishes on its own thread and its file,
+/// unreferenced, goes with the next start's reclaim.
 pub(super) async fn stage(
     state: &AppState,
     project_id: ProjectId,
     sources: &[PathBuf],
+    cancel: &CancellationToken,
 ) -> Result<Vec<Attachment>, AppError> {
     let mut attachments: Vec<Attachment> = Vec::with_capacity(sources.len());
     for source in sources {
-        let staged = stage_attachment_impl(state, project_id, source).await?;
+        let staged = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(AppError::Interrupted),
+            staged = stage_attachment_impl(state, project_id, source) => staged?,
+        };
         let kind = kind_of(source);
         attachments.push(Attachment {
             label: next_label(kind, &attachments),

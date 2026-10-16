@@ -472,7 +472,18 @@ async fn run_inner(
     budget: &WaitBudget,
 ) -> Result<SendReceipt, AppError> {
     let project_id = plan.project_id;
-    attach::check_sources(&plan.attachments).await?;
+    match budget
+        .run(attach::check_sources(state, &plan.attachments))
+        .await
+    {
+        Outcome::Done(checked) => checked?,
+        Outcome::Timeout => {
+            return Err(AppError::TimedOut {
+                what: "checking the attachments",
+            });
+        }
+        Outcome::Cancelled => return Err(AppError::Interrupted),
+    }
     open_project_impl(state, project_id)?;
     let project = lock(&state.projects)
         .get(&project_id)
@@ -514,7 +525,8 @@ async fn run_inner(
         refuse_if_busy(state, budget, &plan.recipients, &unheard, &roster).await?;
     }
     // After the window has the project open, never before: see `attach`.
-    let attachments = attach::stage(state, project_id, &plan.attachments).await?;
+    let attachments =
+        attach::stage(state, project_id, &plan.attachments, budget.cancel_token()).await?;
     if !attachments.is_empty() {
         check_prompt_size(&render_prompt_with_attachments(&body, &attachments))
             .map_err(AppError::PromptTooLarge)?;

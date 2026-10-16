@@ -164,6 +164,13 @@ pub enum TestSeam {
     /// test start a project deletion at exactly the moment a slow fork
     /// creation would let one in.
     ForkRegistration,
+    /// Inside the blocking work that opens a send's attachments to check them.
+    /// Holds it as a file that never opens would, so a test can prove the send
+    /// stops waiting at its deadline or on a cancel while the work is stuck.
+    AttachmentCheck,
+    /// Inside the blocking copy of an attachment into the project. Holds it as
+    /// a stalled drive would, so a test can prove a cancel stops the send.
+    AttachmentCopy,
 }
 
 /// Two-way handshake for a [`TestSeam`].

@@ -5400,6 +5400,10 @@ fn load_agent_transcript_raw(
 pub struct AgentSessionInfo {
     /// Absolute path of the harness session file, present only if it exists.
     pub session_file: Option<String>,
+    /// Whether that file is one Codex has compressed. The text editor then
+    /// gets a decompressed copy rather than the file ([`session_file_for_editor`]),
+    /// so the sidebar says so.
+    pub session_file_compressed: bool,
     /// Full copy-ready resume command (`cd '<dir>' && <harness> …`), present
     /// only if the session can be resumed.
     pub resume_command: Option<String>,
@@ -5568,9 +5572,39 @@ pub fn agent_session_info_impl(
         });
 
     Ok(AgentSessionInfo {
+        session_file_compressed: session_file
+            .as_deref()
+            .is_some_and(switchboard_harness::codex::session_file::is_compressed_session_file),
         session_file: session_file.map(|p| p.to_string_lossy().into_owned()),
         resume_command,
     })
+}
+
+/// What "Open session file" hands the text editor.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionFileForEditor {
+    /// The session file itself.
+    File(PathBuf),
+    /// The text of a session file Codex has compressed. An editor would show
+    /// the compressed bytes, so it gets a decompressed copy instead.
+    Text(String),
+}
+
+/// Resolve what "Open session file" opens for the session file at `path`.
+/// Decompressing a long conversation takes a moment, so the command runs this
+/// on a blocking worker.
+///
+/// # Errors
+///
+/// [`AppError::SessionFileRead`] when a compressed file can't be read or
+/// doesn't decode.
+pub fn session_file_for_editor(path: PathBuf) -> Result<SessionFileForEditor, AppError> {
+    if !switchboard_harness::codex::session_file::is_compressed_session_file(&path) {
+        return Ok(SessionFileForEditor::File(path));
+    }
+    switchboard_harness::codex::session_file::read_session_file(&path)
+        .map(SessionFileForEditor::Text)
+        .map_err(|source| AppError::SessionFileRead { path, source })
 }
 
 /// Validate an interactive-session handoff and build the selected terminal's
@@ -16078,6 +16112,85 @@ mod tests {
             .resume_command
             .expect("resume offered from record locator");
         assert!(cmd.contains("codex resume sess-xyz"), "got: {cmd}");
+    }
+
+    #[tokio::test]
+    async fn agent_session_info_says_when_codex_has_compressed_the_session_file() {
+        // The sidebar labels "Open session file" as a copy only then.
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
+        let agent = create_agent_impl(
+            &state,
+            "codex_three",
+            HarnessKind::Codex,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        set_agent_session_locator_impl(
+            &state,
+            agent.id,
+            SessionLocator::Codex {
+                thread_id: "sess-zst".to_owned(),
+                partition_date: date,
+            },
+        )
+        .unwrap();
+        let plain = stage_codex_session_file(tmp_home.path(), date, "sess-zst");
+
+        let info = agent_session_info_impl(&state, agent.id, tmp_home.path()).unwrap();
+        assert!(!info.session_file_compressed);
+
+        let compressed = plain.with_extension("jsonl.zst");
+        std::fs::write(&compressed, zstd::encode_all(&b"{}\n"[..], 3).unwrap()).unwrap();
+        std::fs::remove_file(&plain).unwrap();
+        let info = agent_session_info_impl(&state, agent.id, tmp_home.path()).unwrap();
+        assert_eq!(
+            info.session_file.as_deref(),
+            Some(compressed.to_string_lossy().as_ref())
+        );
+        assert!(info.session_file_compressed);
+    }
+
+    #[test]
+    fn session_file_for_editor_opens_a_plain_file_itself() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x-sess.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+
+        assert_eq!(
+            session_file_for_editor(path.clone()).unwrap(),
+            SessionFileForEditor::File(path)
+        );
+    }
+
+    #[test]
+    fn session_file_for_editor_decompresses_a_file_codex_has_compressed() {
+        // A text editor would show the compressed bytes.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x-sess.jsonl.zst");
+        std::fs::write(&path, zstd::encode_all(&b"{\"a\":1}\n{}\n"[..], 3).unwrap()).unwrap();
+
+        assert_eq!(
+            session_file_for_editor(path).unwrap(),
+            SessionFileForEditor::Text("{\"a\":1}\n{}\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn session_file_for_editor_names_a_compressed_file_that_does_not_decode() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x-sess.jsonl.zst");
+        std::fs::write(&path, "not really zstd").unwrap();
+
+        let error = session_file_for_editor(path.clone()).unwrap_err();
+        assert!(
+            matches!(&error, AppError::SessionFileRead { path: failed, .. } if *failed == path),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("rollout-x-sess.jsonl.zst"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

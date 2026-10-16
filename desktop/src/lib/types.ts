@@ -1052,13 +1052,7 @@ export type SystemMarker =
 // Mirror of Rust `InheritedHistoryGap` (`crates/harness/src/transcript.rs`). A
 // reason this build doesn't know still renders, with general wording
 // (`inheritedHistoryNotice`).
-export type InheritedHistoryGap =
-  | "not_found"
-  | "compressed"
-  | "changed"
-  | "ambiguous"
-  | "cycle"
-  | "too_deep";
+export type InheritedHistoryGap = "not_found" | "changed" | "ambiguous" | "cycle" | "too_deep";
 
 // Mirror of Rust `ContextReport` (`crates/harness/src/context_report.rs`).
 //

@@ -61,7 +61,7 @@ const contextReportAgentMock = vi.fn<(agentId: string, sendId: string) => Promis
 vi.mock("$lib/api", () => ({
   agentSessionInfo: (id: string) => agentSessionInfoMock(id),
   openSessionFile: async (id: string) => {
-    openSessionFileMock(id);
+    await openSessionFileMock(id);
   },
   resumeAgentInTerminal: (id: string) => resumeAgentInTerminalMock(id),
   cancelAgent: vi.fn(),
@@ -458,7 +458,10 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await openAgentActions();
-    await fireEvent.click(await screen.findByTestId("agent-action-open-session"));
+    expect(await screen.findByTestId("agent-action-open-session")).toHaveTextContent(
+      "Open session file",
+    );
+    await fireEvent.click(screen.getByTestId("agent-action-open-session"));
     expect(openSessionFileMock).toHaveBeenCalledWith(CLAUDE_AGENT.id);
 
     await openAgentActions();
@@ -494,6 +497,48 @@ describe("Sidebar", () => {
       "Terminal automation was denied",
     );
     expect(screen.getByTestId("resume-panel")).toBeInTheDocument();
+  });
+
+  it("says a session file Codex has compressed opens as a copy", async () => {
+    // The editor gets a decompressed copy, which won't update as the agent
+    // keeps working, so the item mustn't promise the file itself.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    agentSessionInfoMock.mockResolvedValue({
+      session_file: "/sessions/rollout-x.jsonl.zst",
+      session_file_compressed: true,
+      resume_command: null,
+    });
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+    await openAgentActions();
+
+    expect(await screen.findByTestId("agent-action-open-session")).toHaveTextContent(
+      "Open copy of session file",
+    );
+  });
+
+  it("shows why a session file couldn't be opened", async () => {
+    // A compressed file that doesn't decode fails backend-side; without this
+    // the menu item would look like it did nothing.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    agentSessionInfoMock.mockResolvedValue({
+      session_file: "/sessions/rollout-x.jsonl.zst",
+      session_file_compressed: true,
+      resume_command: null,
+    });
+    openSessionFileMock.mockRejectedValue(
+      new Error("reading /sessions/rollout-x.jsonl.zst: Unknown frame descriptor"),
+    );
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-action-open-session"));
+
+    expect(await screen.findByTestId("agent-open-session-error")).toHaveTextContent(
+      "Couldn't open session file: reading /sessions/rollout-x.jsonl.zst: Unknown frame descriptor",
+    );
   });
 
   it("does not let a closed dialog's pending launch affect another agent", async () => {

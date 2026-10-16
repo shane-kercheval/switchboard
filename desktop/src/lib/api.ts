@@ -739,9 +739,11 @@ export async function cancelAgent(agentId: AgentId): Promise<void> {
 
 /// Per-agent session actions: the openable session-file path and a copy-ready
 /// terminal resume command. Each field is null until the agent has a resolvable
-/// session.
+/// session. `session_file_compressed` says the file is one Codex has
+/// compressed, which opens as a decompressed copy.
 export interface AgentSessionInfo {
   session_file: string | null;
+  session_file_compressed: boolean;
   resume_command: string | null;
 }
 
@@ -756,8 +758,10 @@ export async function resumeAgentInTerminal(agentId: AgentId): Promise<void> {
   await invoke("resume_agent_in_terminal", { agentId });
 }
 
-/// Open the agent's harness session file in the OS default app (backend-resolved
-/// path, opened Rust-side). Rejects if the agent has no session file yet.
+/// Open the agent's harness session file in the default text editor
+/// (backend-resolved path, opened Rust-side; a file Codex has compressed opens
+/// as a decompressed copy). Rejects if the agent has no session file yet or the
+/// file can't be read.
 export async function openSessionFile(agentId: AgentId): Promise<void> {
   await invoke("open_session_file", { agentId });
 }

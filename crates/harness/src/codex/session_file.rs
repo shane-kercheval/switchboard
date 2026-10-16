@@ -33,7 +33,9 @@
 //! ## Path resolution
 //!
 //! Codex session files live at
-//! `<home>/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<session-uuid>.jsonl`.
+//! `<home>/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<session-uuid>.jsonl`,
+//! with `.zst` appended once Codex compresses a file nobody has written to for
+//! a week (`codex/rollout_file.rs`).
 //! **Codex partitions by local date, not UTC** — the directory key is
 //! captured from `chrono::Local::now().date_naive()` at first dispatch and
 //! stored in the sidecar as `session_partition_date`. Codex appends to the
@@ -63,6 +65,7 @@ use switchboard_core::AgentId;
 use uuid::Uuid;
 
 use super::inherited_history::{InheritedHistory, load_inherited_history};
+use super::rollout_file;
 use crate::events::{
     ContentKind, McpServerStatus, SessionInventory, SettingPair, SkillEntry, ToolKind, TurnId,
     TurnUsage,
@@ -196,9 +199,11 @@ pub fn session_directory(home_dir: &Path, session_partition_date: NaiveDate) -> 
 
 /// Locate the session file for `session_id` under `home_dir` for the given
 /// original-start-date. Codex's filenames are
-/// `rollout-<timestamp>-<session-uuid>.jsonl`; the only unknown is the
-/// timestamp, so we match by suffix. Returns `None` if the directory or file
-/// is absent.
+/// `rollout-<timestamp>-<session-uuid>.jsonl`, or `.jsonl.zst` once Codex has
+/// compressed the file; the only unknown is the timestamp, so we match by
+/// suffix. While a plain file and its compressed copy both exist, the plain
+/// one is the file (see `codex/rollout_file.rs`). Returns `None` if the
+/// directory or file is absent.
 ///
 /// On multi-match (very rare — would require a backup/rename or Codex bug,
 /// since session UUIDs are unique by construction), picks the file with the
@@ -217,18 +222,16 @@ pub fn locate_session_file(
 ) -> Option<PathBuf> {
     let dir = session_directory(home_dir, session_partition_date);
     let entries = std::fs::read_dir(&dir).ok()?;
-    let suffix = format!("-{session_id}.jsonl");
     let mut matches: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && name.starts_with("rollout-")
-            && name.ends_with(&suffix)
+            && rollout_file::is_rollout_of(name, session_id)
         {
             matches.push(path);
         }
     }
-    pick_newest(matches)
+    pick_newest(rollout_file::current_copies(matches))
 }
 
 /// Choose the most-recent path by mtime. Falls back to the lexicographically
@@ -262,14 +265,15 @@ fn pick_newest(mut matches: Vec<PathBuf>) -> Option<PathBuf> {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AttachLookupError {
-    /// No `rollout-*-<session_id>.jsonl` file exists under
-    /// `~/.codex/sessions/*/*/*/`.
+    /// No `rollout-*-<session_id>.jsonl` file, plain or compressed, exists
+    /// under `~/.codex/sessions/*/*/*/`.
     #[error("no Codex session file found for session_id {session_id}")]
     NotFound { session_id: String },
     /// More than one `rollout-*-<session_id>.jsonl` file exists across the
-    /// date partitions. Impossible by Codex's design (UUIDs are unique by
-    /// construction); a real occurrence implies external anomaly (manual copy,
-    /// FS corruption). Surface to the user rather than picking arbitrarily.
+    /// date partitions (a plain file and its compressed copy count as one).
+    /// Impossible by Codex's design (UUIDs are unique by construction); a real
+    /// occurrence implies external anomaly (manual copy, FS corruption).
+    /// Surface to the user rather than picking arbitrarily.
     #[error("ambiguous Codex session file for session_id {session_id}: {} candidates", paths.len())]
     Ambiguous {
         session_id: String,
@@ -297,21 +301,27 @@ pub fn find_codex_session_file_for_attach(
     home_dir: &Path,
     session_id: &str,
 ) -> Result<(PathBuf, NaiveDate), AttachLookupError> {
-    let suffix = format!("-{session_id}.jsonl");
     let mut matches: Vec<(PathBuf, NaiveDate)> = Vec::new();
     for (folder, date) in session_day_folders(home_dir) {
         let Ok(file_entries) = std::fs::read_dir(&folder) else {
             continue;
         };
+        let mut found: Vec<PathBuf> = Vec::new();
         for file_entry in file_entries.flatten() {
             let path = file_entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && name.starts_with("rollout-")
-                && name.ends_with(&suffix)
+                && rollout_file::is_rollout_of(name, session_id)
             {
-                matches.push((path, date));
+                found.push(path);
             }
         }
+        // A plain file and its compressed copy share a folder, so resolving
+        // per folder counts them once.
+        matches.extend(
+            rollout_file::current_copies(found)
+                .into_iter()
+                .map(|path| (path, date)),
+        );
     }
 
     match matches.len() {
@@ -383,13 +393,31 @@ fn parse_numeric_dir(entry: &std::fs::DirEntry, expected_width: usize) -> Option
     name_str.parse().ok()
 }
 
-/// Read and parse the session file. Returns `Enrichment::default()` (all
-/// `None`) on any IO error or top-level corruption — per the harness-owned
-/// file skip-with-warning invariant in `AGENTS.md`. Individual malformed
-/// lines are warned-and-skipped, valid lines preserved.
+/// Whether `path` is a session file Codex has compressed (`.jsonl.zst`). A text
+/// editor shows such a file as binary, so it needs [`read_session_file`].
+#[must_use]
+pub fn is_compressed_session_file(path: &Path) -> bool {
+    rollout_file::is_compressed_path(path)
+}
+
+/// A session file's text, decompressing a `.jsonl.zst` one.
+///
+/// # Errors
+///
+/// Fails when neither the file nor its other copy can be read, or when a
+/// compressed file doesn't decode.
+pub fn read_session_file(path: &Path) -> std::io::Result<String> {
+    rollout_file::read_to_string(path)
+}
+
+/// Read and parse the session file, decompressing a `.jsonl.zst` one. Returns
+/// `Enrichment::default()` (all `None`) on any IO error or top-level
+/// corruption — per the harness-owned file skip-with-warning invariant in
+/// `AGENTS.md`. Individual malformed lines are warned-and-skipped, valid lines
+/// preserved.
 #[must_use]
 pub fn parse_session_file(path: &Path) -> Enrichment {
-    let content = match std::fs::read_to_string(path) {
+    let content = match rollout_file::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
@@ -1043,7 +1071,10 @@ impl Enrichment {
 ///
 /// **Stale-locator case**: if `session_partition_date` is present but no
 /// session file lives at the recorded path (user deleted it, external
-/// rotation), returns `Ok(LoadedTranscript { turns: vec![], warnings: vec![<stale warning>] })`.
+/// rotation), returns [`LoadTranscriptError::RecordedSessionUnavailable`].
+/// **Compressed case**: a rollout Codex has compressed (`.jsonl.zst`) loads
+/// exactly as its plain copy would; one that doesn't decode returns
+/// [`LoadTranscriptError::Io`] naming the file, never a shortened transcript.
 /// **Never-dispatched case** (agent created, no locator yet): caller passes
 /// `None` for the date — returns `Ok(LoadedTranscript::default())` with no
 /// warning.
@@ -1073,7 +1104,7 @@ pub fn load_codex_transcript(
         return Err(LoadTranscriptError::RecordedSessionUnavailable);
     };
 
-    let content = std::fs::read_to_string(&path).map_err(|e| LoadTranscriptError::Io {
+    let content = rollout_file::read_to_string(&path).map_err(|e| LoadTranscriptError::Io {
         path: path.clone(),
         source: e,
     })?;
@@ -4499,6 +4530,66 @@ not valid json
         assert!(locate_session_file(tmp.path(), today, session_id).is_none());
     }
 
+    /// A rollout as Codex compresses it: the same bytes, zstd-compressed at
+    /// the level its compression worker uses.
+    fn compressed(content: &str) -> Vec<u8> {
+        zstd::encode_all(content.as_bytes(), 3).unwrap()
+    }
+
+    #[test]
+    fn locate_session_file_finds_a_rollout_codex_has_compressed() {
+        // Codex rewrites a rollout nobody has written to for a week as
+        // `.jsonl.zst` and deletes the plain file. The temporary file it
+        // writes on the way ends in `.tmp` and is not a rollout.
+        let tmp = TempDir::new().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        let session_id = "01a10276-e1a3-7cc3-93e7-57102fc059f4";
+        let dir = session_directory(tmp.path(), date);
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = format!("rollout-2026-10-03T10-51-47-{session_id}.jsonl.zst");
+        let target = dir.join(&name);
+        std::fs::write(&target, compressed("{}\n")).unwrap();
+        std::fs::write(dir.join(format!("{name}.compress.4242.0.tmp")), b"partial").unwrap();
+
+        assert_eq!(
+            locate_session_file(tmp.path(), date, session_id).as_deref(),
+            Some(target.as_path())
+        );
+    }
+
+    #[test]
+    fn locate_session_file_reads_the_plain_copy_while_both_exist() {
+        // Codex writes the new copy before deleting the old one, whichever way
+        // it is converting, and reads the plain copy while both exist. The
+        // compressed copy is the newer file here, so this is precedence, not
+        // the newest-wins rule.
+        let tmp = TempDir::new().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        let session_id = "01a10276-e1a3-7cc3-93e7-57102fc059f4";
+        let dir = session_directory(tmp.path(), date);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join(format!("rollout-2026-10-03T10-51-47-{session_id}.jsonl"));
+        std::fs::write(&plain, "{}\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&plain)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_hours(1))
+            .unwrap();
+        std::fs::write(
+            dir.join(format!(
+                "rollout-2026-10-03T10-51-47-{session_id}.jsonl.zst"
+            )),
+            compressed("{}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            locate_session_file(tmp.path(), date, session_id).as_deref(),
+            Some(plain.as_path())
+        );
+    }
+
     fn write_rollout(tmp: &Path, date: NaiveDate, session_id: &str) -> PathBuf {
         let dir = session_directory(tmp, date);
         std::fs::create_dir_all(&dir).unwrap();
@@ -4599,6 +4690,38 @@ not valid json
         let (path, parsed_date) =
             find_codex_session_file_for_attach(tmp.path(), session_id).unwrap();
         assert_eq!(path, target);
+        assert_eq!(parsed_date, date);
+    }
+
+    #[test]
+    fn find_for_attach_finds_a_compressed_rollout() {
+        let tmp = TempDir::new().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        let session_id = "019e2c5f-eeee-7000-8000-000000000005";
+        let plain = write_rollout(tmp.path(), date, session_id);
+        let target = plain.with_extension("jsonl.zst");
+        std::fs::write(&target, compressed("{}\n")).unwrap();
+        std::fs::remove_file(plain).unwrap();
+
+        let (path, parsed_date) =
+            find_codex_session_file_for_attach(tmp.path(), session_id).unwrap();
+        assert_eq!(path, target);
+        assert_eq!(parsed_date, date);
+    }
+
+    #[test]
+    fn find_for_attach_counts_a_rollout_and_its_compressed_copy_as_one() {
+        // Both exist for a moment while Codex converts one into the other.
+        // That is one session, so attach must not refuse it as ambiguous.
+        let tmp = TempDir::new().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        let session_id = "019e2c5f-ffff-7000-8000-000000000006";
+        let plain = write_rollout(tmp.path(), date, session_id);
+        std::fs::write(plain.with_extension("jsonl.zst"), compressed("{}\n")).unwrap();
+
+        let (path, parsed_date) =
+            find_codex_session_file_for_attach(tmp.path(), session_id).unwrap();
+        assert_eq!(path, plain);
         assert_eq!(parsed_date, date);
     }
 
@@ -4828,6 +4951,126 @@ not valid json
             error,
             LoadTranscriptError::RecordedSessionUnavailable
         ));
+    }
+
+    /// `turns` as JSON with every `turn_id` blanked: the loader mints a fresh
+    /// one on each load, and nothing else in a turn may differ between two
+    /// loads of the same conversation.
+    fn turns_without_ids(transcript: &LoadedTranscript) -> Value {
+        fn blank(value: &mut Value) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(id) = map.get_mut("turn_id") {
+                        *id = Value::Null;
+                    }
+                    map.values_mut().for_each(blank);
+                }
+                Value::Array(items) => items.iter_mut().for_each(blank),
+                _ => {}
+            }
+        }
+        let mut turns = serde_json::to_value(&transcript.turns).unwrap();
+        blank(&mut turns);
+        turns
+    }
+
+    #[test]
+    fn load_codex_transcript_shows_a_compressed_rollout_exactly_as_the_plain_one() {
+        // The acceptance rule for compressed rollouts: never an empty or
+        // shortened transcript. Same agent, same conversation, one copy
+        // compressed: everything the pane shows must match.
+        let content = std::fs::read_to_string(fixture_path("fork-parent.session.jsonl")).unwrap();
+        let session_id = "01a10276-e1a3-7cc3-93e7-57102fc059f4";
+        let date = NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        let agent_id = Uuid::now_v7();
+        let cwd = TempDir::new().unwrap();
+        let plain_home = TempDir::new().unwrap();
+        write_session_at(plain_home.path(), date, session_id, &content);
+        let compressed_home = TempDir::new().unwrap();
+        let path = write_session_at(compressed_home.path(), date, session_id, "");
+        std::fs::write(path.with_extension("jsonl.zst"), compressed(&content)).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        let plain = load_codex_transcript(
+            plain_home.path(),
+            cwd.path(),
+            session_id,
+            Some(date),
+            agent_id,
+        )
+        .unwrap();
+        let from_compressed = load_codex_transcript(
+            compressed_home.path(),
+            cwd.path(),
+            session_id,
+            Some(date),
+            agent_id,
+        )
+        .unwrap();
+
+        assert!(!plain.turns.is_empty(), "the fixture must have turns");
+        assert!(plain.meta.is_some(), "the fixture must have session meta");
+        assert_eq!(
+            turns_without_ids(&from_compressed),
+            turns_without_ids(&plain)
+        );
+        assert_eq!(from_compressed.meta, plain.meta);
+        assert_eq!(from_compressed.warnings, plain.warnings);
+        assert_eq!(from_compressed.last_rate_limit, plain.last_rate_limit);
+    }
+
+    #[test]
+    fn load_codex_transcript_fails_loud_on_a_damaged_compressed_rollout() {
+        // A compressed file that doesn't decode, or ends partway, must be an
+        // error naming the file, never a transcript cut short where the
+        // damage starts.
+        let content = std::fs::read_to_string(fixture_path("world-state.session.jsonl")).unwrap();
+        let whole = compressed(&content);
+        let session_id = "01a10276-e1a3-7cc3-93e7-57102fc059f4";
+        let date = NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        for (damage, bytes) in [
+            ("not zstd", b"not really zstd".to_vec()),
+            ("cut short", whole[..whole.len() / 2].to_vec()),
+        ] {
+            let home = TempDir::new().unwrap();
+            let cwd = TempDir::new().unwrap();
+            let plain = write_session_at(home.path(), date, session_id, "");
+            let target = plain.with_extension("jsonl.zst");
+            std::fs::write(&target, bytes).unwrap();
+            std::fs::remove_file(plain).unwrap();
+
+            let error = load_codex_transcript(
+                home.path(),
+                cwd.path(),
+                session_id,
+                Some(date),
+                Uuid::now_v7(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, LoadTranscriptError::Io { path, .. } if *path == target),
+                "{damage}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_session_file_reads_a_compressed_rollout() {
+        // Post-turn enrichment reads the file the transcript loader found, so
+        // a compressed one must enrich exactly as its plain copy does.
+        let content = std::fs::read_to_string(fixture_path("world-state.session.jsonl")).unwrap();
+        let tmp = TempDir::new().unwrap();
+        let plain = tmp.path().join("rollout-plain.jsonl");
+        std::fs::write(&plain, &content).unwrap();
+        let zst = tmp.path().join("rollout-compressed.jsonl.zst");
+        std::fs::write(&zst, compressed(&content)).unwrap();
+
+        let expected = parse_session_file(&plain);
+        assert!(
+            expected.cli_version.is_some(),
+            "the fixture must enrich something"
+        );
+        assert_eq!(parse_session_file(&zst), expected);
     }
 
     fn write_session_at(home: &Path, date: NaiveDate, session_id: &str, content: &str) -> PathBuf {

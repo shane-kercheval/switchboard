@@ -32,6 +32,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use switchboard_core::AgentId;
 
+use super::rollout_file;
 use super::session_file::parse_codex_transcript_content;
 use crate::transcript::{InheritedHistoryGap, ParseWarning, Turn};
 
@@ -98,7 +99,7 @@ pub(crate) fn load_inherited_history(
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(rollout_file_id)
-        .map(|(id, _)| HashSet::from([id.to_owned()]))
+        .map(|id| HashSet::from([id.to_owned()]))
         .unwrap_or_default();
     let mut segments: Vec<(String, crate::transcript::LoadedTranscript)> = Vec::new();
     // Built on the first lookup, so only a fork pays for the walk, and only
@@ -216,8 +217,7 @@ fn pointer_of(meta: &Value) -> PointerField {
     }
 }
 
-/// The rollout id in a Codex rollout filename, and whether the file is
-/// compressed.
+/// The rollout id in a Codex rollout filename.
 ///
 /// Codex writes `rollout-<YYYY-MM-DDTHH-MM-SS>-<id>.jsonl`, where the one id is
 /// both thread id and rollout id. A thread rolled back with Codex's "revert"
@@ -226,21 +226,18 @@ fn pointer_of(meta: &Value) -> PointerField {
 /// `compression.rs` at `rust-v0.162.1`). A `history_base` names the rollout id,
 /// which in the two-id form is the part after `_`, so the `-<id>.jsonl` suffix
 /// match the rest of this crate uses would miss it.
-fn rollout_file_id(name: &str) -> Option<(&str, bool)> {
-    let (core, compressed) = match name.strip_suffix(".jsonl.zst") {
-        Some(core) => (core, true),
-        None => (name.strip_suffix(".jsonl")?, false),
-    };
+fn rollout_file_id(name: &str) -> Option<&str> {
+    let core = rollout_file::plain_name(name).strip_suffix(".jsonl")?;
     let core = core.strip_prefix("rollout-")?;
     // The timestamp is 19 characters, then a `-`, then the ids.
     if core.as_bytes().get(19) != Some(&b'-') {
         return None;
     }
     let ids = core.get(20..).filter(|ids| !ids.is_empty())?;
-    let rollout_id = ids
-        .split_once('_')
-        .map_or(ids, |(_, rollout_id)| rollout_id);
-    Some((rollout_id, compressed))
+    Some(
+        ids.split_once('_')
+            .map_or(ids, |(_, rollout_id)| rollout_id),
+    )
 }
 
 /// Where Codex keeps rollouts, in the order it searches them when following a
@@ -251,16 +248,11 @@ fn rollout_file_id(name: &str) -> Option<(&str, bool)> {
 /// folders, and a fork of it keeps working.
 const ROLLOUT_TIERS: [&str; 2] = ["sessions", "archived_sessions"];
 
-/// The copies of one rollout within one tier.
-#[derive(Default)]
-struct Copies {
-    plain: Vec<PathBuf>,
-    compressed: bool,
-}
-
 /// Every rollout file under Codex's session folders, by tier and rollout id.
+/// Each is recorded as the copy Codex would read now, so a plain file and its
+/// compressed copy count once.
 struct RolloutIndex {
-    tiers: Vec<HashMap<String, Copies>>,
+    tiers: Vec<HashMap<String, Vec<PathBuf>>>,
 }
 
 impl RolloutIndex {
@@ -272,7 +264,7 @@ impl RolloutIndex {
         let tiers = ROLLOUT_TIERS
             .iter()
             .map(|tier| {
-                let mut by_id: HashMap<String, Copies> = HashMap::new();
+                let mut by_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
                 let mut folders = vec![codex.join(tier)];
                 while let Some(folder) = folders.pop() {
                     let Ok(entries) = std::fs::read_dir(&folder) else {
@@ -293,18 +285,18 @@ impl RolloutIndex {
                         if !file_type.is_file() {
                             continue;
                         }
-                        let Some((id, compressed)) = path
+                        let Some(id) = path
                             .file_name()
                             .and_then(|name| name.to_str())
                             .and_then(rollout_file_id)
                         else {
                             continue;
                         };
-                        let copies = by_id.entry(id.to_owned()).or_default();
-                        if compressed {
-                            copies.compressed = true;
-                        } else {
-                            copies.plain.push(path);
+                        let id = id.to_owned();
+                        let path = rollout_file::current_copy(path);
+                        let copies = by_id.entry(id).or_default();
+                        if !copies.contains(&path) {
+                            copies.push(path);
                         }
                     }
                 }
@@ -316,19 +308,18 @@ impl RolloutIndex {
 
     /// The rollout carrying `rollout_id`, from the first tier that has one.
     ///
-    /// Within that tier, more than one plain copy is refused, as the attach
-    /// lookup refuses it, because two copies could hold different
-    /// conversations. A copy in an earlier tier simply wins over a later one:
-    /// that is Codex's own order, so it is not a duplicate. A tier holding
-    /// only a compressed copy decides the answer too, as it would for Codex.
+    /// Within that tier, more than one copy is refused, as the attach lookup
+    /// refuses it, because two copies could hold different conversations. A
+    /// copy in an earlier tier simply wins over a later one: that is Codex's
+    /// own order, so it is not a duplicate.
     fn find(&self, rollout_id: &str) -> Result<PathBuf, InheritedHistoryGap> {
         for tier in &self.tiers {
             let Some(copies) = tier.get(rollout_id) else {
                 continue;
             };
-            return match copies.plain.as_slice() {
+            return match copies.as_slice() {
                 [only] => Ok(only.clone()),
-                [] => Err(InheritedHistoryGap::Compressed),
+                [] => Err(InheritedHistoryGap::NotFound),
                 _ => Err(InheritedHistoryGap::Ambiguous),
             };
         }
@@ -337,12 +328,15 @@ impl RolloutIndex {
 }
 
 /// Exactly the first `end_byte_offset` bytes of `path`, as Codex recorded them.
+/// The offset counts uncompressed bytes, so a compressed file is measured
+/// after decompressing.
 ///
 /// Codex treats the prefix as immutable, so a file shorter than the offset, or
 /// an offset that no longer ends on a line break, means the file is not the one
-/// Codex forked. Nothing is rendered from it.
+/// Codex forked. Nothing is rendered from it. A compressed file that doesn't
+/// decode is treated the same way.
 fn read_prefix(path: &Path, end_byte_offset: u64) -> Result<String, InheritedHistoryGap> {
-    let file = std::fs::File::open(path).map_err(|_| InheritedHistoryGap::NotFound)?;
+    let file = rollout_file::open(path).map_err(|_| InheritedHistoryGap::NotFound)?;
     let mut bytes = Vec::new();
     file.take(end_byte_offset)
         .read_to_end(&mut bytes)
@@ -384,6 +378,12 @@ mod tests {
         std::fs::read_to_string(format!("{FIXTURES}/{name}.session.jsonl")).unwrap()
     }
 
+    /// A rollout as Codex compresses it: the same bytes, zstd-compressed at
+    /// the level its compression worker uses.
+    fn compressed(content: &str) -> Vec<u8> {
+        zstd::encode_all(content.as_bytes(), 3).unwrap()
+    }
+
     fn date(day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 10, day).unwrap()
     }
@@ -404,7 +404,13 @@ mod tests {
 
         /// Write `content` as `rollout-<time>-<ids><extension>` in the
         /// 2026-10-`day` folder. `ids` is one id, or `<thread>_<rollout>`.
-        fn stage(&self, day: u32, ids: &str, extension: &str, content: &str) -> PathBuf {
+        fn stage(
+            &self,
+            day: u32,
+            ids: &str,
+            extension: &str,
+            content: impl AsRef<[u8]>,
+        ) -> PathBuf {
             let folder = self
                 .dir
                 .path()
@@ -423,7 +429,7 @@ mod tests {
 
         /// Write `content` into `~/.codex/archived_sessions`, which Codex keeps
         /// flat rather than in date folders.
-        fn archive(&self, ids: &str, extension: &str, content: &str) {
+        fn archive(&self, ids: &str, extension: &str, content: impl AsRef<[u8]>) {
             let folder = self.dir.path().join(".codex/archived_sessions");
             std::fs::create_dir_all(&folder).unwrap();
             std::fs::write(
@@ -565,7 +571,32 @@ mod tests {
     }
 
     #[test]
-    fn a_compressed_parent_is_told_apart_from_a_missing_one() {
+    fn a_compressed_parent_still_hands_down_its_history() {
+        // Codex compresses a rollout nobody has written to for a week, and a
+        // fork's parent is often that cold. The cut-off counts the parent's
+        // uncompressed bytes, so the turns after it must still be left out.
+        let home = Home::new();
+        home.stage(
+            11,
+            PARENT,
+            ".jsonl.zst",
+            compressed(&fixture("fork-parent")),
+        );
+        home.rollout(11, CHILD, &fixture("fork-child"));
+
+        let transcript = home.load(CHILD, 11);
+
+        assert!(
+            markers(&transcript).is_empty(),
+            "{:?}",
+            markers(&transcript)
+        );
+        assert_eq!(user_texts(&transcript)[..2], [PELICAN, CHILD_FIRST]);
+        assert!(!user_texts(&transcript).contains(&OTTER));
+    }
+
+    #[test]
+    fn a_damaged_compressed_parent_is_not_guessed_at() {
         let home = Home::new();
         home.stage(11, PARENT, ".jsonl.zst", "not really zstd");
         home.rollout(11, CHILD, &fixture("fork-child"));
@@ -574,9 +605,29 @@ mod tests {
 
         assert_eq!(
             markers(&transcript),
-            [(InheritedHistoryGap::Compressed, PARENT)]
+            [(InheritedHistoryGap::Changed, PARENT)]
         );
         assert_eq!(user_texts(&transcript)[0], CHILD_FIRST);
+    }
+
+    #[test]
+    fn a_parent_and_its_compressed_copy_count_as_one_file() {
+        // Both exist for a moment while Codex converts one into the other, and
+        // Codex reads the plain one. The compressed copy here is junk, so
+        // reading it would show a "changed" line and counting it a duplicate.
+        let home = Home::new();
+        home.rollout(11, PARENT, &fixture("fork-parent"));
+        home.stage(11, PARENT, ".jsonl.zst", "not really zstd");
+        home.rollout(11, CHILD, &fixture("fork-child"));
+
+        let transcript = home.load(CHILD, 11);
+
+        assert!(
+            markers(&transcript).is_empty(),
+            "{:?}",
+            markers(&transcript)
+        );
+        assert_eq!(user_texts(&transcript)[0], PELICAN);
     }
 
     #[test]
@@ -626,7 +677,7 @@ mod tests {
             11,
             &format!("{PARENT}_{ROLLOUT}"),
             ".jsonl",
-            &fixture("fork-parent"),
+            fixture("fork-parent"),
         );
         home.rollout(11, CHILD, &fixture("fork-child").replace(PARENT, ROLLOUT));
 
@@ -801,7 +852,7 @@ mod tests {
         // Codex follows a fork's pointer into `archived_sessions` too, so the
         // fork keeps working; it must not be reported as missing.
         let home = Home::new();
-        home.archive(PARENT, ".jsonl", &fixture("fork-parent"));
+        home.archive(PARENT, ".jsonl", fixture("fork-parent"));
         home.rollout(11, CHILD, &fixture("fork-child"));
 
         let transcript = home.load(CHILD, 11);
@@ -817,7 +868,7 @@ mod tests {
     #[test]
     fn an_archived_grandparent_completes_the_chain() {
         let home = Home::new();
-        home.archive(PARENT, ".jsonl", &fixture("fork-parent"));
+        home.archive(PARENT, ".jsonl", fixture("fork-parent"));
         home.rollout(11, CHILD, &fixture("fork-child"));
         home.rollout(11, GRANDCHILD, &fixture("fork-grandchild"));
 
@@ -852,35 +903,43 @@ mod tests {
     }
 
     #[test]
-    fn a_compressed_copy_in_sessions_decides_even_when_the_archive_has_a_plain_one() {
-        // Codex would read the compressed copy it finds first, so the fork
-        // works; Switchboard can't read it, and must say so rather than show
-        // the archived copy as if it were the one Codex uses.
+    fn a_compressed_copy_in_sessions_wins_over_a_plain_archived_one() {
+        // Codex reads the copy it finds first, compressed or not. The archived
+        // copy here is damaged, so reading it would produce a "changed" line.
         let home = Home::new();
-        home.stage(10, PARENT, ".jsonl.zst", "not really zstd");
-        home.archive(PARENT, ".jsonl", &fixture("fork-parent"));
+        home.stage(
+            10,
+            PARENT,
+            ".jsonl.zst",
+            compressed(&fixture("fork-parent")),
+        );
+        home.archive(PARENT, ".jsonl", "not the parent\n");
         home.rollout(11, CHILD, &fixture("fork-child"));
 
         let transcript = home.load(CHILD, 11);
 
-        assert_eq!(
-            markers(&transcript),
-            [(InheritedHistoryGap::Compressed, PARENT)]
+        assert!(
+            markers(&transcript).is_empty(),
+            "{:?}",
+            markers(&transcript)
         );
+        assert_eq!(user_texts(&transcript)[0], PELICAN);
     }
 
     #[test]
-    fn a_compressed_archived_original_is_told_apart_from_a_missing_one() {
+    fn a_compressed_archived_original_still_shows_its_history() {
         let home = Home::new();
-        home.archive(PARENT, ".jsonl.zst", "not really zstd");
+        home.archive(PARENT, ".jsonl.zst", compressed(&fixture("fork-parent")));
         home.rollout(11, CHILD, &fixture("fork-child"));
 
         let transcript = home.load(CHILD, 11);
 
-        assert_eq!(
-            markers(&transcript),
-            [(InheritedHistoryGap::Compressed, PARENT)]
+        assert!(
+            markers(&transcript).is_empty(),
+            "{:?}",
+            markers(&transcript)
         );
+        assert_eq!(user_texts(&transcript)[..2], [PELICAN, CHILD_FIRST]);
     }
 
     #[cfg(unix)]
@@ -897,7 +956,7 @@ mod tests {
             folder.join(format!("rollout-2026-10-11T00-00-00-{PARENT}.jsonl")),
         )
         .unwrap();
-        home.archive(PARENT, ".jsonl", &fixture("fork-parent"));
+        home.archive(PARENT, ".jsonl", fixture("fork-parent"));
         home.rollout(11, CHILD, &fixture("fork-child"));
 
         let transcript = home.load(CHILD, 11);
@@ -999,7 +1058,7 @@ mod tests {
             rollout_file_id(
                 "rollout-2026-10-11T13-03-50-01a12c22-a3f8-71e2-b51e-ca72562cfabb.jsonl"
             ),
-            Some(("01a12c22-a3f8-71e2-b51e-ca72562cfabb", false))
+            Some("01a12c22-a3f8-71e2-b51e-ca72562cfabb")
         );
     }
 
@@ -1007,7 +1066,7 @@ mod tests {
     fn a_reverted_rollout_name_yields_the_id_after_the_underscore() {
         assert_eq!(
             rollout_file_id("rollout-2026-10-11T13-03-50-thread-1111_rollout-2222.jsonl"),
-            Some(("rollout-2222", false))
+            Some("rollout-2222")
         );
     }
 
@@ -1015,7 +1074,7 @@ mod tests {
     fn a_compressed_rollout_name_is_recognised() {
         assert_eq!(
             rollout_file_id("rollout-2026-10-11T13-03-50-0000-1111.jsonl.zst"),
-            Some(("0000-1111", true))
+            Some("0000-1111")
         );
     }
 

@@ -2628,6 +2628,128 @@ async fn live_codex_resume_reuses_session() {
     );
 }
 
+/// Compress a rollout as Codex does (zstd, same name plus `.zst`, plain file
+/// deleted). Does nothing when there is no plain file to compress.
+fn compress_rollout(plain: &Path, compressed: &Path) {
+    if let Ok(content) = std::fs::read(plain) {
+        std::fs::write(compressed, zstd::encode_all(content.as_slice(), 3).unwrap()).unwrap();
+        std::fs::remove_file(plain).unwrap();
+    }
+}
+
+/// The user prompts of a hydrated transcript, in order.
+fn user_texts(transcript: &switchboard_harness::LoadedTranscript) -> Vec<&str> {
+    transcript
+        .turns
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_compressed_rollout_loads_forks_and_resumes() {
+    // Codex compresses a rollout nobody has written to for a week and turns it
+    // back into plain `.jsonl` before appending to it. This compresses a
+    // throwaway session the same way, then checks: the loader reads the
+    // compressed file; Codex can fork it; a fork whose parent has since been
+    // compressed again (the parent going a week idle after the fork) shows the
+    // conversation it inherits; Codex still resumes the conversation from it;
+    // and after that turn the plain file is back and the compressed one gone,
+    // so the loader sees both turns. The fork is promptless, so it costs no
+    // model call.
+    const FIRST: &str = "Remember the word 'otter'. Reply with only 'ok'.";
+    const SECOND: &str = "What word did I ask you to remember? Reply with only that word.";
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = home_dir();
+    let adapter = CodexAdapter::new();
+    let mut agent = live_codex_agent();
+    agent.model = Some("gpt-6-luna".to_owned());
+    agent.effort = Some("low".to_owned());
+
+    let first = live_codex_turn(&adapter, &agent, tmp.path(), FIRST).await;
+    let (thread_id, partition_date) =
+        codex_capture(&first).expect("the first dispatch captures a locator");
+    agent.session_locator = Some(SessionLocator::Codex {
+        thread_id: thread_id.clone(),
+        partition_date,
+    });
+    let plain = switchboard_harness::codex::session_file::locate_session_file(
+        &home,
+        partition_date,
+        &thread_id,
+    )
+    .expect("the first turn's rollout must be on disk");
+    let mut compressed_name = plain.file_name().unwrap().to_os_string();
+    compressed_name.push(".zst");
+    let compressed = plain.with_file_name(compressed_name);
+    compress_rollout(&plain, &compressed);
+
+    let load = || {
+        load_codex_transcript(
+            &home,
+            tmp.path(),
+            &thread_id,
+            Some(partition_date),
+            agent.id,
+        )
+        .expect("the rollout must load")
+    };
+    assert_eq!(user_texts(&load()), [FIRST]);
+
+    let fork = fork_codex_session(
+        Path::new("codex"),
+        &home,
+        tmp.path(),
+        &thread_id,
+        &agent.selection(),
+        CODEX_FORK_TIMEOUT,
+    )
+    .await
+    .expect("forking a compressed session should succeed");
+    // Codex decompresses the parent to fork it (observed 2026-10-16 @ 0.162.1).
+    compress_rollout(&plain, &compressed);
+    assert!(compressed.exists() && !plain.exists());
+    let forked = load_codex_transcript(
+        &home,
+        tmp.path(),
+        &fork.thread_id,
+        Some(fork.partition_date),
+        Uuid::now_v7(),
+    )
+    .expect("the fork must load");
+    assert_eq!(
+        user_texts(&forked),
+        [FIRST],
+        "the fork must show the conversation it inherits from the compressed parent"
+    );
+
+    let second = live_codex_turn(&adapter, &agent, tmp.path(), SECOND).await;
+    let reply: String = second
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        reply.to_lowercase().contains("otter"),
+        "Codex must resume the conversation from the compressed rollout; reply was {reply:?}"
+    );
+    assert!(
+        plain.is_file(),
+        "Codex must write the plain rollout back before appending to it"
+    );
+    assert!(
+        !compressed.exists(),
+        "Codex must delete the compressed copy once the plain rollout is back"
+    );
+    assert_eq!(user_texts(&load()), [FIRST, SECOND]);
+}
+
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_fork_without_a_prompt_creates_an_idle_session_that_inherits_context() {

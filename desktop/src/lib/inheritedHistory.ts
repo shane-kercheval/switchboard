@@ -3,8 +3,8 @@ import type { InheritedHistoryGap } from "./types";
 /// What the transcript tells the user when a Codex fork's earlier conversation
 /// can't be shown. The reasons mean different things for the agent itself, so
 /// each says what still works: a missing file also stops Codex from running
-/// the fork (probed, `docs/harness-behavior.md` §3.5), while a compressed one
-/// doesn't. The wording names "a session this agent's earlier conversation
+/// the fork (probed, `docs/harness-behavior.md` §3.5), and no other reason is
+/// known to. The wording names "a session this agent's earlier conversation
 /// comes from" rather than the parent, because the chain can break at any
 /// ancestor.
 export function inheritedHistoryNotice(reason: InheritedHistoryGap | string): {
@@ -17,12 +17,6 @@ export function inheritedHistoryNotice(reason: InheritedHistoryGap | string): {
         title: "Earlier conversation unavailable",
         detail:
           "A Codex session this agent's earlier conversation comes from is no longer in Codex's session folders. Codex can't continue this agent until that file is restored, so its replies fail until then.",
-      };
-    case "compressed":
-      return {
-        title: "Earlier conversation not shown",
-        detail:
-          "A Codex session this agent's earlier conversation comes from has since been compressed. The agent still has the earlier conversation, but Switchboard can't read compressed session files yet.",
       };
     case "changed":
       return {

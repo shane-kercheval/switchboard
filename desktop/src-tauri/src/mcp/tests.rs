@@ -3,7 +3,6 @@
 //! HTTP where a test needs a request that client never sends (no progress
 //! token, a browser's `Origin`, a wrong `Host`).
 
-use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,7 +12,6 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ClientHandler, ServiceExt};
 use serde_json::{Value, json};
-use sha2::Digest as _;
 use switchboard_core::{AgentId, ProjectId, SendId};
 use switchboard_prompts::{InMemorySecretStore, SecretStore};
 use tokio::sync::Notify;
@@ -2609,12 +2607,11 @@ async fn live_codex_mcp_compact() {
     live_compact_through_the_server(switchboard_core::HarnessKind::Codex).await;
 }
 
-/// The orchestrator prompt in Settings names tools by name. A rename or a
+/// The orchestrator prompts in Settings name tools by name. A rename or a
 /// removal here would leave a pasted prompt pointing at a tool that is gone,
-/// so every tool-like name in it must be a tool, and its version must be the
-/// one the server's instructions announce.
+/// so every tool-like name in them must be a tool.
 #[test]
-fn the_orchestrator_prompt_names_only_real_tools_and_the_announced_version() {
+fn the_orchestrator_prompt_names_only_real_tools() {
     const VERBS: &[&str] = &[
         "list_",
         "read_",
@@ -2648,47 +2645,4 @@ fn the_orchestrator_prompt_names_only_real_tools_and_the_announced_version() {
             "the prompt names {word}, which is not a tool"
         );
     }
-
-    let version: u32 = source
-        .split("ORCHESTRATOR_PROMPT_VERSION = ")
-        .nth(1)
-        .and_then(|rest| rest.split(';').next())
-        .and_then(|n| n.trim().parse().ok())
-        .expect("the prompt declares its version");
-    assert_eq!(version, super::tools::ORCHESTRATOR_PROMPT_VERSION);
-    assert!(
-        super::tools::instructions().contains(&format!("version is below {version}")),
-        "the instructions announce the prompt's version"
-    );
-
-    // A reminder, not enforcement: an edit to either prompt's text fails here
-    // until the fingerprint is updated, and whoever updates it is told to bump
-    // the version, so a pasted copy can tell it is stale. Both prompts are
-    // built from this file, so it is the file from its first export that is
-    // fingerprinted; the doc comment above it is free to change.
-    let text = source
-        .split_once("export const ORCHESTRATOR_PROMPT_VERSION")
-        .map(|(_, rest)| rest)
-        .expect("the prompt's text");
-    let fingerprint =
-        sha2::Sha256::digest(text.as_bytes())
-            .iter()
-            .fold(String::new(), |mut hex, byte| {
-                let _ = write!(hex, "{byte:02x}");
-                hex
-            });
-    assert_eq!(
-        (version, fingerprint.as_str()),
-        PROMPT_FINGERPRINT,
-        "the orchestrator prompt's text changed: bump ORCHESTRATOR_PROMPT_VERSION in \
-         desktop/src/lib/orchestratorPrompt.ts and desktop/src-tauri/src/mcp/tools.rs, then set \
-         PROMPT_FINGERPRINT to the new version and {fingerprint}"
-    );
 }
-
-/// The orchestrator prompts' version and the SHA-256 of their source, from
-/// the version line on, at that version.
-const PROMPT_FINGERPRINT: (u32, &str) = (
-    5,
-    "cbda86b8d1f04c40387e19ae090eb89ae915a4b54f002ed785a967dd8b0fc282",
-);

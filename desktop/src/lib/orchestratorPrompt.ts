@@ -6,18 +6,9 @@
 /// are about the data, the method, and the evidence. Each is shown in Settings
 /// → Agent MCP Server with a copy button, for the CLAUDE.md or AGENTS.md of the
 /// folder the user orchestrates from.
-///
-/// The server's instructions name the current version, so an orchestrator
-/// running an older pasted copy tells the user to bring the new one into
-/// theirs. Bump it, and `ORCHESTRATOR_PROMPT_VERSION` in
-/// `desktop/src-tauri/src/mcp/tools.rs`, whenever either prompt's text
-/// changes: a test fails when this file changes without its stored
-/// fingerprint, as a reminder.
-export const ORCHESTRATOR_PROMPT_VERSION = 5;
 
 /// What differs between the two prompts. Every other sentence is shared.
 interface Lens {
-  header: string;
   role: string;
   /// What the orchestrator does not do itself, after "write code".
   notYours: string;
@@ -42,7 +33,6 @@ interface Lens {
 }
 
 const ENGINEERING: Lens = {
-  header: "",
   role: "You are a principal engineer who became an engineering manager, with a product manager's, a UX designer's, and a security reviewer's judgment on call. You know the system at the level of its design docs and plans, not its code, and you know what good looks like and what to ask. You talk through options with the agents the way you would with a senior engineer: at the level of approach, pattern, and practice, not lines of code. You are accountable for the result.",
   notYours: "run tests",
   results: "",
@@ -64,7 +54,6 @@ const ENGINEERING: Lens = {
 };
 
 const DATA_SCIENCE: Lens = {
-  header: " for data science",
   role: "You are a principal data scientist who became a manager, with an engineer's, a product manager's, and a statistics reviewer's judgment on call. You know the question, the data, and the analyses at the level of the design docs, plans, and write-ups, not the code or the notebooks, and you know what a sound analysis looks like and what to ask. You talk through options with the agents the way you would with a senior data scientist: at the level of question, method, and evidence, not lines of code. You are accountable for the result.",
   notYours: "run queries or notebooks",
   results:
@@ -95,9 +84,7 @@ const DATA_SCIENCE: Lens = {
 };
 
 function buildPrompt(lens: Lens): string {
-  return `Switchboard orchestrator prompt${lens.header}, version ${ORCHESTRATOR_PROMPT_VERSION}.
-
-You are directing AI coding agents through Switchboard's MCP tools on my behalf. You are my stand-in: you decide, question, and direct, and the agents do the work. The tools' descriptions cover the mechanics. This is about how to think and what you may do.
+  return `You are directing AI coding agents through Switchboard's MCP tools on my behalf. You are my stand-in: you decide, question, and direct, and the agents do the work. The tools' descriptions cover the mechanics. This is about how to think and what you may do.
 
 ## Your role
 

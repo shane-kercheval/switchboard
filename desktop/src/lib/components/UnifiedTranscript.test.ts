@@ -6814,3 +6814,82 @@ describe("UnifiedTranscript — code review cards", () => {
     expect(within(older).getByTestId("hidden-items-indicator")).toHaveTextContent("1 tool call");
   });
 });
+
+describe("a send another client made", () => {
+  const ORCHESTRATOR_SEND = "00000000-0000-7000-8000-0000000000c1";
+  const ORCHESTRATOR_MESSAGE = "00000000-0000-7000-8000-0000000000c2";
+  const channel = `agent:${CLAUDE_AGENT.id}`;
+
+  it("queued behind a running turn shows as queued, cancels like the user's own, and clears", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    fireTo(channel, {
+      type: "turn_start",
+      turn_id: "turn-running",
+      message_id: "msg-running",
+      send_id: SEND_1,
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(channel, {
+      type: "send_accepted",
+      message_id: ORCHESTRATOR_MESSAGE,
+      send_id: ORCHESTRATOR_SEND,
+      text: "from the orchestrator",
+      at: "2026-05-16T00:00:01Z",
+    });
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByText("from the orchestrator")).toBeInTheDocument();
+    const queued = screen.getByTestId("turn-queued");
+    expect(queued).toHaveTextContent("Queued");
+    await fireEvent.click(within(queued).getByTestId("turn-live-control"));
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_send",
+      expect.objectContaining({ sendId: ORCHESTRATOR_SEND, recipients: [CLAUDE_AGENT.id] }),
+    );
+
+    fireTo(channel, {
+      type: "message_cancelled",
+      message_id: ORCHESTRATOR_MESSAGE,
+      send_id: ORCHESTRATOR_SEND,
+      agent_id: CLAUDE_AGENT.id,
+      at: "2026-05-16T00:00:02Z",
+    });
+    await tick();
+    expect(screen.queryByTestId("turn-queued")).toBeNull();
+    expect(screen.getAllByText("from the orchestrator")).toHaveLength(1);
+  });
+
+  it("renders one user row when its user_message and turn_start follow", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    fireTo(channel, {
+      type: "send_accepted",
+      message_id: ORCHESTRATOR_MESSAGE,
+      send_id: ORCHESTRATOR_SEND,
+      text: "from the orchestrator",
+      at: "2026-05-16T00:00:01Z",
+    });
+    fireTo(channel, {
+      type: "user_message",
+      send_id: ORCHESTRATOR_SEND,
+      text: "from the orchestrator",
+      at: "2026-05-16T00:00:02Z",
+    });
+    fireTo(channel, {
+      type: "turn_start",
+      turn_id: "turn-orchestrated",
+      message_id: ORCHESTRATOR_MESSAGE,
+      send_id: ORCHESTRATOR_SEND,
+      started_at: "2026-05-16T00:00:02Z",
+    });
+    await tick();
+
+    expect(screen.getAllByText("from the orchestrator")).toHaveLength(1);
+    expect(screen.queryByTestId("turn-queued")).toBeNull();
+    expect(screen.getByTestId("turn-working")).toBeInTheDocument();
+  });
+});

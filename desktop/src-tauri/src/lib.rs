@@ -12,8 +12,10 @@ mod harness_usage;
 mod journal;
 mod lifecycle;
 mod locator_sink;
+pub mod mcp;
 mod metadata;
 mod notification;
+pub mod ops;
 mod preferences;
 mod secret_store;
 mod session_lock;
@@ -174,6 +176,12 @@ async fn finish_orderly_quit(app: tauri::AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
+    // Agent access first: no client can start work the drain below would
+    // cancel, and a client waiting on a reply gets an answer rather than a
+    // dropped connection.
+    if let Some(access) = app.try_state::<crate::mcp::AgentAccess>() {
+        access.shut_down().await;
+    }
     save_main_window_geometry(&app);
     let project_ids: Vec<_> = crate::state::lock(&state.projects)
         .keys()
@@ -334,13 +342,13 @@ use crate::commands::{
     ForwardOutcome, HarnessInstallStatus, ProjectListing, RepoListing, StagedAttachment,
     WorkspaceStatus, add_mcp_provider_impl, add_tracked_repo_impl, agent_session_info_impl,
     attach_agent_impl, branch_comparison_file_diff_impl, branch_comparison_impl, cancel_agent_impl,
-    cancel_forward_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
-    check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
-    check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
-    commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl, compact_agent_impl,
-    context_report_agent_impl, copy_builtin_prompt_impl, create_agent_impl, create_project_impl,
-    delete_project_impl, editor_open_argv, existing_attachment_paths_impl, fetch_repo_impl,
-    file_diff_impl, fork_agent_impl, forward_message_impl, forward_prompt_impl,
+    cancel_forward_impl, cancel_send_impl, cancel_turn_impl, change_agent_selection_impl,
+    changed_files_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
+    check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
+    check_codex_binary_impl, commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl,
+    compact_agent_impl, context_report_agent_impl, copy_builtin_prompt_impl, create_agent_impl,
+    create_project_impl, delete_project_impl, editor_open_argv, existing_attachment_paths_impl,
+    fetch_repo_impl, file_diff_impl, fork_agent_impl, forward_message_impl, forward_prompt_impl,
     get_harness_usage_impl, get_preferences_impl, get_prompt_source_impl, harness_adapter_for,
     install_status_for_adapter, list_agents_impl, list_mcp_providers_impl, list_message_pins_impl,
     list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
@@ -354,13 +362,13 @@ use crate::commands::{
     render_prompt_impl, reorder_agents_impl, resolve_saved_prompt_fresh_impl,
     resolve_saved_prompt_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
     search_project_files_in_root, search_project_files_root_impl, send_message_impl,
-    set_active_project_impl, set_agent_selection_impl, set_harness_usage_impl,
-    set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
-    set_project_directory_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
-    sign_out_mcp_provider_impl, spawn_prompt_resolution_change_notifications,
-    stage_attachment_impl, stage_pasted_text_impl, sync_prompts_and_notify, terminal_open_argv,
-    test_mcp_connection_impl, test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots,
-    validate_external_url, workspace_status_impl,
+    set_active_project_impl, set_harness_usage_impl, set_message_pin_impl, set_preferences_impl,
+    set_project_archived_impl, set_project_directory_impl, set_visible_project_impl,
+    sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
+    spawn_prompt_resolution_change_notifications, stage_attachment_impl, stage_pasted_text_impl,
+    sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
+    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
+    workspace_status_impl,
 };
 use crate::error::AppError;
 use crate::harness_usage::HarnessUsage;
@@ -1088,19 +1096,81 @@ async fn fork_agent(state: State<'_, AppState>, agent_id: String) -> Result<Agen
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    fork_agent_impl(state.inner(), id, &home, std::path::Path::new("codex"))
+    let state = state.inner();
+    fork_agent_impl(state, id, &home, &state.codex_binary)
         .await
         .map_err(|e| e.to_string())
 }
 
+/// Change the parts of an agent's selection the user changed. Every absent
+/// part is left as it is, so another client's change to a different setting
+/// survives (see `SelectionChanges`).
 #[tauri::command]
 async fn set_agent_selection(
     state: State<'_, AppState>,
     agent_id: String,
-    selection: switchboard_core::AgentSelection,
+    changes: crate::ops::change::SelectionChanges,
 ) -> Result<AgentRecord, String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
-    set_agent_selection_impl(state.inner(), id, selection).map_err(|e| e.to_string())
+    change_agent_selection_impl(state.inner(), id, &changes).map_err(|e| e.to_string())
+}
+
+/// Agent access as Settings shows it.
+#[tauri::command]
+async fn mcp_status(
+    access: State<'_, crate::mcp::AgentAccess>,
+) -> Result<crate::mcp::AgentAccessStatus, String> {
+    Ok(access.status().await)
+}
+
+/// Turn agent access on or off. Off stops the listener at once.
+#[tauri::command]
+async fn mcp_set_enabled(
+    access: State<'_, crate::mcp::AgentAccess>,
+    enabled: bool,
+) -> Result<crate::mcp::AgentAccessStatus, String> {
+    access.set_enabled(enabled).await.map_err(|e| e.to_string())
+}
+
+/// Move agent access to another port.
+#[tauri::command]
+async fn mcp_set_port(
+    access: State<'_, crate::mcp::AgentAccess>,
+    port: u16,
+) -> Result<crate::mcp::AgentAccessStatus, String> {
+    access.set_port(port).await.map_err(|e| e.to_string())
+}
+
+/// Replace the token, cutting every client off.
+#[tauri::command]
+async fn mcp_regenerate_token(
+    access: State<'_, crate::mcp::AgentAccess>,
+) -> Result<crate::mcp::AgentAccessStatus, String> {
+    access.regenerate_token().await.map_err(|e| e.to_string())
+}
+
+/// The sync requests still waiting for the window's answer. The window calls
+/// this once it is listening, to answer any request emitted before then:
+/// Tauri does not replay events (see `WindowSync`).
+#[tauri::command]
+async fn desktop_pending_syncs(
+    sync: State<'_, Arc<crate::ops::desktop_sync::WindowSync>>,
+) -> Result<Vec<crate::ops::desktop_sync::PendingSync>, String> {
+    Ok(sync.pending())
+}
+
+/// The window's answer to a `desktop_sync_project` request: the project is
+/// loaded and every subscription has settled, or loading failed. An answer
+/// for a request nobody waits for any more is ignored.
+#[tauri::command]
+async fn desktop_project_synced(
+    sync: State<'_, Arc<crate::ops::desktop_sync::WindowSync>>,
+    request_id: String,
+    result: crate::ops::desktop_sync::SyncAck,
+) -> Result<(), String> {
+    let request_id = parse_uuid(&request_id).map_err(|e| e.to_string())?;
+    sync.acknowledge(request_id, result);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1569,13 +1639,13 @@ async fn reveal_in_finder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn local_prompts_dir() -> Result<String, String> {
-    local_prompts_dir_path().map(|path| path.to_string_lossy().into_owned())
+async fn local_prompts_dir(state: State<'_, AppState>) -> Result<String, String> {
+    local_prompts_dir_path(&state.prompts).map(|path| path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
-async fn open_local_prompts_dir() -> Result<(), String> {
-    let path = local_prompts_dir_path()?;
+async fn open_local_prompts_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let path = local_prompts_dir_path(&state.prompts)?;
     std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
     run_open_argv(vec!["open".to_owned(), path.to_string_lossy().into_owned()]).await
 }
@@ -1585,14 +1655,14 @@ async fn open_local_prompts_dir() -> Result<(), String> {
 /// path. Errors (already-exists, write failure) surface to the caller.
 #[tauri::command]
 async fn copy_builtin_prompt(state: State<'_, AppState>, name: String) -> Result<String, String> {
-    let prompts_dir = local_prompts_dir_path()?;
+    let prompts_dir = local_prompts_dir_path(&state.prompts)?;
     let written = copy_builtin_prompt_impl(&name, &prompts_dir).map_err(|e| e.to_string())?;
     let state = state.inner();
     sync_prompts_and_notify(state.prompts.clone(), Arc::clone(&state.emitter)).await;
     Ok(written.to_string_lossy().into_owned())
 }
 
-/// All workflows: the read-only built-in library (when `show_builtins` is on)
+/// All workflows: the read-only built-in library (when `show_builtin_workflows` is on)
 /// merged with the user-global workflows folder. User-global — the same set is
 /// available from every project.
 #[tauri::command]
@@ -1627,36 +1697,26 @@ async fn refresh_workflow_form_from_cache(
         .map_err(|e| e.to_string())
 }
 
-/// Resolve any forward-fields (completed-only) and merge the composed text into
-/// the invocation inputs, so validation/launch see a forwarded field as a filled
-/// value. A still-streaming source rejects the whole invocation. The HOME read
-/// mirrors the manual-forward shims.
+/// The shim's half of the forward merge: the HOME read, mirroring the
+/// manual-forward shims, around `ops::workflow::merge_workflow_forwards`.
 async fn merge_workflow_forwards(
     state: &AppState,
     inputs: &std::collections::BTreeMap<String, InputValue>,
     forward_sources: &std::collections::BTreeMap<String, Vec<crate::commands::ForwardSourceRef>>,
     recipient_project: switchboard_core::ProjectId,
 ) -> Result<std::collections::BTreeMap<String, InputValue>, String> {
-    if forward_sources.values().all(Vec::is_empty) {
-        return Ok(inputs.clone());
-    }
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    let resolved = crate::commands::resolve_workflow_forwards(
+    crate::ops::workflow::merge_workflow_forwards(
         state,
-        forward_sources,
         inputs,
-        &home,
+        forward_sources,
         recipient_project,
+        &home,
     )
     .await
-    .map_err(|e| e.to_string())?;
-    let mut effective = inputs.clone();
-    for (field, text) in resolved {
-        effective.insert(field, InputValue::Text(text));
-    }
-    Ok(effective)
+    .map_err(|e| e.to_string())
 }
 
 /// Validate a workflow invocation (capability gate + input/roster/prompt rules)
@@ -1858,6 +1918,16 @@ struct AppHandleEmitter {
     app: tauri::AppHandle,
 }
 
+/// The production [`crate::ops::handle::AppStateHandle`]: a spawned send task
+/// holds an `AppHandle` clone and reaches the managed state through it.
+/// `State::inner` hands out a reference tied to the handle, so the borrow is
+/// valid for as long as the task holds the handle.
+impl crate::ops::handle::AppStateHandle for tauri::AppHandle {
+    fn app_state(&self) -> &AppState {
+        self.state::<AppState>().inner()
+    }
+}
+
 impl EventEmitter for AppHandleEmitter {
     fn emit(&self, name: &str, payload: serde_json::Value) {
         if let Err(e) = self.app.emit(name, payload) {
@@ -2015,9 +2085,13 @@ fn preferences_config_path() -> Option<std::path::PathBuf> {
     config_dir().map(|dir| dir.join("config.yaml"))
 }
 
-fn local_prompts_dir_path() -> Result<std::path::PathBuf, String> {
-    config_dir()
-        .map(|dir| dir.join("prompts"))
+fn local_prompts_dir_path(
+    prompts: &switchboard_prompts::PromptService,
+) -> Result<std::path::PathBuf, String> {
+    prompts
+        .local_prompt_dirs()
+        .into_iter()
+        .next()
         .ok_or_else(|| "prompt providers are not configured (no config path)".to_owned())
 }
 
@@ -2036,11 +2110,16 @@ fn workflows_dir_path() -> Option<std::path::PathBuf> {
 ///
 /// Release builds use one cached aggregate Keychain record; debug builds use a
 /// dev-only plaintext file so rebuilds never trigger Keychain authorization.
-fn build_prompt_service() -> switchboard_prompts::PromptService {
+///
+/// `secrets` is the one store the app uses, shared with agent access: the
+/// release store caches its Keychain record, so two instances would each
+/// write over the other's changes.
+fn build_prompt_service(
+    secrets: Arc<dyn switchboard_prompts::SecretStore>,
+) -> switchboard_prompts::PromptService {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if let Some(dir) = config_dir() {
         let prompts_dir = dir.join("prompts");
-        let secrets = build_secret_store(&dir);
         switchboard_prompts::PromptService::new(dir.join("config.yaml"), prompts_dir, home, secrets)
             .with_browser_opener(Arc::new(SystemBrowserOpener))
     } else {
@@ -2373,10 +2452,29 @@ pub fn run() {
             // Attach all user-global persistence locations (workspace.yaml,
             // git-view.yaml, config.yaml) — see `with_persistence_paths`.
             let state = with_persistence_paths(state);
+            // The window end of the sync a turn-starting operation runs, and of
+            // the change notifications. Its own emitter rather than the turn
+            // chain's: these are app-level events, and nothing in that chain
+            // (the wake lock, the send ledger) has a reason to see them.
+            let window_sync = Arc::new(crate::ops::desktop_sync::WindowSync::new(Arc::new(
+                AppHandleEmitter {
+                    app: app.handle().clone(),
+                },
+            )));
+            let state = state.with_desktop_sync(Arc::clone(&window_sync)
+                as Arc<dyn crate::ops::desktop_sync::DesktopSync>);
+            app.manage(window_sync);
+            // One secret store for the whole app (see `build_prompt_service`).
+            // With no config directory nothing persists, so a session-only
+            // store keeps agent access usable until quit.
+            let secrets: Arc<dyn switchboard_prompts::SecretStore> = match config_dir() {
+                Some(dir) => build_secret_store(&dir),
+                None => Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+            };
             // Resolve and inject the user-global prompt config + default prompts
             // store. Built-in example prompts are baked into the service as a
             // read-only library — nothing is written into the user's folder.
-            let prompts = build_prompt_service();
+            let prompts = build_prompt_service(Arc::clone(&secrets));
             spawn_prompt_resolution_change_notifications(&prompts, Arc::clone(&state.emitter));
             // Warm the prompt cache in the background so a slow/cold MCP server
             // never blocks startup. `PromptService` is cheaply cloneable and
@@ -2442,6 +2540,26 @@ pub fn run() {
             // directories (unmounted/moved) are skipped and stay unavailable.
             app.manage(crate::lifecycle::QuitCoordinator::new());
             app.manage(state);
+            // Agent access reaches the state through the handle per request,
+            // so it is built after the state is managed. It listens now only
+            // if the user left it on; a port in use shows in Settings rather
+            // than failing the start.
+            let access = crate::mcp::AgentAccess::new(
+                config_dir().map(|dir| dir.join("config.yaml")),
+                secrets,
+                Arc::new(app.handle().clone()),
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default(),
+            );
+            app.manage(access);
+            let resume_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                resume_handle
+                    .state::<crate::mcp::AgentAccess>()
+                    .resume()
+                    .await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2523,6 +2641,12 @@ pub fn run() {
             remove_agent,
             rename_agent,
             set_agent_selection,
+            desktop_project_synced,
+            desktop_pending_syncs,
+            mcp_status,
+            mcp_set_enabled,
+            mcp_set_port,
+            mcp_regenerate_token,
             reorder_agents,
             attach_agent,
             list_agents,
@@ -2739,11 +2863,58 @@ mod asset_scope_tests {
 mod tests {
     use super::{
         ActivationCommandError, build_debug_secret_store, build_release_secret_store,
-        debug_config_dir, run_open_argv, session_lock_root,
+        debug_config_dir, local_prompts_dir_path, run_open_argv, session_lock_root,
     };
     use crate::error::AppError;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use switchboard_prompts::{InMemorySecretStore, PromptService};
+    use tempfile::TempDir;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn prompt_creation_uses_the_first_scanned_folder() {
+        for custom in [false, true] {
+            let root = TempDir::new().unwrap();
+            let default = root.path().join("prompts");
+            let first = root.path().join("first");
+            let second = root.path().join("second");
+            let config = root.path().join("config.yaml");
+            if custom {
+                std::fs::write(
+                    &config,
+                    format!(
+                        "local_prompt_dirs:\n  - {}\n  - {}\n",
+                        first.display(),
+                        second.display()
+                    ),
+                )
+                .unwrap();
+            }
+            let service = PromptService::new(
+                config,
+                default.clone(),
+                None,
+                Arc::new(InMemorySecretStore::new()),
+            );
+            let advertised = local_prompts_dir_path(&service).unwrap();
+            assert_eq!(advertised, if custom { first } else { default.clone() });
+            let written =
+                crate::commands::copy_builtin_prompt_impl("code-review", &advertised).unwrap();
+            assert_eq!(written, advertised.join("code-review.md"));
+            service.sync().await;
+            assert!(
+                service
+                    .list()
+                    .iter()
+                    .any(|prompt| prompt.provider == "local" && prompt.name == "code-review")
+            );
+            assert!(!second.exists());
+            if custom {
+                assert!(!default.exists());
+            }
+        }
+    }
 
     #[test]
     fn the_session_lock_root_resolves_to_the_release_location_in_a_debug_build() {

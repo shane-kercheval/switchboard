@@ -291,6 +291,15 @@ pub enum ContextWindowSource {
     SessionFileBacked,
 }
 
+/// What an announced send is, when it is not a message. Additive on the wire:
+/// a window that does not know a kind treats the announcement as a message.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AnnouncedSendKind {
+    Compaction,
+}
+
 /// Per-turn usage and cost. Carried on `TurnEnd.usage`.
 ///
 /// `total_cost_usd` is Claude Code only (subscription auth has no dollar
@@ -559,6 +568,24 @@ pub enum AdapterEvent {
     SessionLocatorCaptured { locator: SessionLocator },
 }
 
+/// The typed cause carried by [`NormalizedEvent::MessageFailed`] when a send
+/// was refused for a reason the sender should act on, rather than retry.
+///
+/// Exists because `MessageFailed` otherwise carries only prose: an
+/// orchestrating program reading the event stream (the MCP send ledger) could
+/// not tell "the harness session is held by another process" from an adapter
+/// crash, and would retry a send that cannot succeed until a person closes the
+/// terminal holding the session. The frontend may ignore the field.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MessageFailureKind {
+    /// Another process holds the advisory lock on this agent's harness session
+    /// (a terminal resume, or another Switchboard build). Retrying is useless
+    /// until that process releases it.
+    SessionInUse,
+}
+
 /// Wire format across the IPC boundary to the frontend.
 ///
 /// **Variant sources.** `TurnStart` and `AgentIdle` are dispatcher-owned —
@@ -597,6 +624,26 @@ pub enum NormalizedEvent {
         send_id: SendId,
         text: String,
         at: DateTime<Utc>,
+    },
+    /// A send another client made was **accepted** into this agent's queue:
+    /// emitted as the actor admits it, so it precedes the send's `TurnStart`
+    /// whether the agent was idle or busy. The window has no optimistic row
+    /// for a send it did not make, and without this a send queued behind a
+    /// running turn would be invisible until it started, with nothing to
+    /// cancel it from. The window turns it into the same pending entry and
+    /// queued row it creates for its own sends. Only sends that ask for it
+    /// carry it; the window's own sends and workflow sends do not.
+    ///
+    /// `kind` says what was admitted when it is not a message: a compaction
+    /// another client asked for, which the window shows as the compaction row
+    /// its own Compact button makes, with no user row. Absent for a message.
+    SendAccepted {
+        message_id: MessageId,
+        send_id: SendId,
+        text: String,
+        at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<AnnouncedSendKind>,
     },
     ContentChunk {
         turn_id: TurnId,
@@ -709,6 +756,12 @@ pub enum NormalizedEvent {
         send_id: Option<SendId>,
         agent_id: AgentId,
         error: String,
+        /// Why the send was refused, when the cause is one a caller should act
+        /// on differently from a generic failure. `None` for every other
+        /// failure, so an older reader sees the event unchanged. See
+        /// [`MessageFailureKind`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<MessageFailureKind>,
         at: DateTime<Utc>,
     },
     /// A **queued** send was cancelled before it started (its backlog item was
@@ -1038,6 +1091,7 @@ mod tests {
             send_id: Some(send_id),
             agent_id,
             error: "journal write failed".to_owned(),
+            kind: None,
             at,
         };
         let value = serde_json::to_value(&event).unwrap();
@@ -1050,6 +1104,7 @@ mod tests {
             send_id: None,
             agent_id,
             error: "rejected".to_owned(),
+            kind: None,
             at,
         };
         assert!(serde_json::to_value(&no_send).unwrap()["send_id"].is_null());

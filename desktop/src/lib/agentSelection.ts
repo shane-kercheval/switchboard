@@ -14,7 +14,7 @@
 /// (`SUPPORTS_MODEL_SELECTION` / `SUPPORTS_EFFORT_SELECTION`); a harness with no
 /// capability has an empty list here and no default.
 
-import type { AgentSelection, HarnessKind, Preferences } from "./types";
+import type { AgentSelection, AgentSelectionChanges, HarnessKind, Preferences } from "./types";
 import { HARNESS_DEFAULT_AGENT_NAME } from "./harnessDisplay";
 
 /// One picker option: `value` is the alias/id submitted to the backend,
@@ -312,6 +312,30 @@ export function resolveModelChange(
     };
   }
   return { ok: true, selection: { ...selection, model, effort } };
+}
+
+function sameChoices(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((value, i) => value === b[i]);
+}
+
+/// The parts of `after` that differ from `before`, which is all a save sends.
+/// `before` is what the user started from — the record when they opened the
+/// editor or clicked the chip — so a setting another client changed since then
+/// is not sent back over that client's change.
+export function selectionChanges(
+  before: AgentSelection,
+  after: AgentSelection,
+): AgentSelectionChanges {
+  const changes: AgentSelectionChanges = {};
+  if (after.model !== before.model) changes.model = after.model;
+  if (after.effort !== before.effort) changes.effort = after.effort;
+  if (!sameChoices(after.model_choices, before.model_choices)) {
+    changes.model_choices = after.model_choices;
+  }
+  if (!sameChoices(after.effort_choices, before.effort_choices)) {
+    changes.effort_choices = after.effort_choices;
+  }
+  return changes;
 }
 
 export function selectionIsValid(selection: AgentSelection, harness: HarnessKind): boolean {

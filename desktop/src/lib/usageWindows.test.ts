@@ -920,3 +920,77 @@ describe("codexAccountUsageView against the recorded credits-covered response", 
     expect(codexAccountUsageView(captured, justBeforeReset).diagnostics).toEqual([]);
   });
 });
+
+/// The stored map agent access reads for `get_usage` (`ops/usage.rs`), with
+/// what it reports. The meter draws a subset of that: the same keys, fractions,
+/// resets, and instants, so the two readers cannot drift apart silently.
+describe("the shared usage fixture", () => {
+  type ExpectedWindow = {
+    key: string;
+    scope: "account" | "model";
+    used_fraction: number;
+    resets_at: string | null;
+    observed_at?: string;
+  };
+  type Case = {
+    name: string;
+    now: string;
+    harnesses: {
+      claude_code?: { payload: unknown; windows: Record<string, StoredUsageWindow> };
+      codex?: { payload: unknown };
+    };
+    expected: {
+      claude_code?: { windows: ExpectedWindow[] };
+      codex?: { windows: ExpectedWindow[] };
+    };
+  };
+  const fixture = JSON.parse(
+    readFileSync(resolve(__dirname, "../../tests/fixtures/usage-readings.json"), "utf8"),
+  ) as { cases: Case[] };
+  const iso = (ms: number): string => new Date(ms).toISOString().replace(".000Z", "Z");
+
+  it("holds cases", () => {
+    expect(fixture.cases.length).toBeGreaterThanOrEqual(2);
+  });
+
+  for (const c of fixture.cases) {
+    const nowMs = Date.parse(c.now);
+    if (c.harnesses.claude_code !== undefined) {
+      it(`${c.name}: draws the Claude windows agent access reports, in the same order`, () => {
+        const stored = c.harnesses.claude_code!;
+        const view = claudeRateLimitView(stored.payload, stored.windows, nowMs);
+        expect(
+          view?.windows.map((w) => ({
+            key: w.key,
+            used_fraction: w.usedFraction,
+            resets_at: w.resetsAtMs === null ? null : iso(w.resetsAtMs),
+            observed_at: w.measuredAt,
+          })),
+        ).toEqual(
+          c.expected.claude_code?.windows.map((w) => ({
+            key: w.key,
+            used_fraction: w.used_fraction,
+            resets_at: w.resets_at,
+            observed_at: w.observed_at,
+          })),
+        );
+      });
+    }
+    if (c.harnesses.codex !== undefined) {
+      it(`${c.name}: draws the account-scoped Codex windows agent access reports, and no reserve`, () => {
+        const view = codexAccountUsageView(c.harnesses.codex!.payload, nowMs);
+        expect(
+          view.windows.map((w) => ({
+            key: w.key.replace(":", "."),
+            used_fraction: w.usedFraction,
+            resets_at: w.resetsAtMs === null ? null : iso(w.resetsAtMs),
+          })),
+        ).toEqual(
+          c.expected.codex?.windows
+            .filter((w) => w.scope === "account")
+            .map((w) => ({ key: w.key, used_fraction: w.used_fraction, resets_at: w.resets_at })),
+        );
+      });
+    }
+  }
+});

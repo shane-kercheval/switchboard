@@ -1057,7 +1057,7 @@ describe("project staleness refresh", () => {
 });
 
 describe("agent selection", () => {
-  it("setAgentSelection replaces all four fields atomically and reconciles the roster", async () => {
+  it("setAgentSelection sends the changed parts and reconciles the roster", async () => {
     const ws = await loadWorkspaceState();
     const a = agent(AGENT_1, PROJECT_1);
     ws.agentsByProject[PROJECT_1] = [a, agent(AGENT_2, PROJECT_1)];
@@ -1072,21 +1072,11 @@ describe("agent selection", () => {
       cmd === "set_agent_selection" ? updated : undefined,
     );
 
-    await ws.setAgentSelection(AGENT_1, {
-      model: "opus",
-      effort: "high",
-      model_choices: ["opus", "sonnet"],
-      effort_choices: ["high", "medium"],
-    });
+    await ws.setAgentSelection(AGENT_1, { model: "opus" });
 
     expect(invokeMock).toHaveBeenCalledWith("set_agent_selection", {
       agentId: AGENT_1,
-      selection: {
-        model: "opus",
-        effort: "high",
-        model_choices: ["opus", "sonnet"],
-        effort_choices: ["high", "medium"],
-      },
+      changes: { model: "opus" },
     });
     expect(ws.agentsByProject[PROJECT_1]?.find((r) => r.id === AGENT_1)).toEqual(updated);
     expect(ws.agentsByProject[PROJECT_1]?.find((r) => r.id === AGENT_2)?.model).toBeNull();
@@ -3555,5 +3545,994 @@ describe("attachment reclaim boundary", () => {
     await ws.retryProjectHydration(PROJECT_1);
     await ws.activateProject(PROJECT_1);
     expect(reclaims).toBe(1);
+  });
+});
+
+describe("desktop sync for another client's turn", () => {
+  const REQUEST = "00000000-0000-7000-8000-0000000000e1";
+
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 40; i += 1) {
+      await tick();
+      await new Promise((r) => setTimeout(r, 1));
+    }
+  }
+
+  type Gate = { promise: Promise<void>; open: () => void };
+  function gate(): Gate {
+    let open = (): void => undefined;
+    const promise = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { promise, open };
+  }
+
+  type Backend = {
+    roster: AgentRecord[];
+    conversation?: Gate;
+    runs?: Gate;
+    /// Holds every `list_agents` read; each answers with the roster as it was
+    /// when the read was issued, as a read the backend already served would.
+    rosterReads?: Gate;
+    failOpen?: string;
+    /// `remove_agent` deletes the agent, then reports this error, as a save
+    /// that failed after the record went does.
+    failRemoveAfterDeleting?: string;
+    /// `remove_agent` rejects with this and deletes nothing.
+    failRemove?: string;
+    failConversation?: boolean;
+    projects?: ProjectListing[];
+    pending?: { request_id: string; project_id: string }[];
+  };
+
+  function installBackend(backend: Backend): Backend {
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+        switch (cmd) {
+          case "open_project":
+            if (backend.failOpen !== undefined) throw new Error(backend.failOpen);
+            return { id: PROJECT_2, name: "p", created_at: "2026-05-16T00:00:00Z" };
+          case "list_agents": {
+            const snapshot = backend.roster;
+            await backend.rosterReads?.promise;
+            return snapshot;
+          }
+          case "remove_agent":
+            if (backend.failRemove !== undefined) throw new Error(backend.failRemove);
+            backend.roster = backend.roster.filter((a) => a.id !== args?.agentId);
+            if (backend.failRemoveAfterDeleting !== undefined) {
+              throw new Error(backend.failRemoveAfterDeleting);
+            }
+            return undefined;
+          case "rename_agent": {
+            backend.roster = backend.roster.map((a) =>
+              a.id === args?.agentId ? { ...a, name: args?.newName as string } : a,
+            );
+            return backend.roster.find((a) => a.id === args?.agentId);
+          }
+          case "reorder_agents": {
+            const order = args?.agentIds as string[];
+            return order.map((id) => backend.roster.find((a) => a.id === id)!);
+          }
+          case "desktop_pending_syncs":
+            return backend.pending ?? [];
+          case "project_session_fingerprints":
+            return [];
+          case "load_project_conversation":
+            await backend.conversation?.promise;
+            if (backend.failConversation === true) throw new Error("the history could not be read");
+            return { items: [], agents: [] } satisfies ProjectConversation;
+          case "list_workflow_runs":
+            await backend.runs?.promise;
+            return [];
+          case "workspace_status":
+            return { persistable: true };
+          case "list_projects":
+            return backend.projects ?? [];
+          default:
+            return undefined;
+        }
+      },
+    );
+    return backend;
+  }
+
+  function acks(): unknown[] {
+    return invokeMock.mock.calls
+      .filter(([cmd]) => cmd === "desktop_project_synced")
+      .map(([, args]) => args);
+  }
+
+  function requestSync(projectId: string): void {
+    fireTo("desktop_sync_project", { request_id: REQUEST, project_id: projectId });
+  }
+
+  beforeEach(() => {
+    listenMock.mockImplementation(async (name: string, cb) => {
+      listeners.set(name, cb);
+      return vi.fn();
+    });
+  });
+
+  describe("a request carrying a fork another client created", () => {
+    const FORK = "00000000-0000-7000-8000-00000000000f";
+    const SESSION = "00000000-0000-7000-8000-0000000000aa";
+
+    // These cases assert on placement, and the file's shared `afterEach`
+    // doesn't reset pane layout.
+    beforeEach(async () => {
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      panes._testing.reset();
+    });
+
+    function claudeFork(): AgentRecord {
+      return { ...agent(FORK, PROJECT_2), name: "agent-a-fork", forked_from_session: SESSION };
+    }
+
+    function codexFork(): AgentRecord {
+      return { ...agent(FORK, PROJECT_2), name: "agent-a-fork", harness: "codex" };
+    }
+
+    function requestWithFork(requestId: string = REQUEST): void {
+      fireTo("desktop_sync_project", {
+        request_id: requestId,
+        project_id: PROJECT_2,
+        fork: { fork_id: FORK, source_agent_id: AGENT_1 },
+      });
+    }
+
+    /// A backend whose `load_project_conversation` is counted, and whose
+    /// `holdLoad`-th read waits for `hold`.
+    function installHistoryBackend(
+      roster: AgentRecord[],
+      holdLoad: number,
+      hold: Gate,
+    ): () => number {
+      let loads = 0;
+      invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+        switch (cmd) {
+          case "open_project":
+            return { id: PROJECT_2, name: "p", created_at: "2026-05-16T00:00:00Z" };
+          case "list_agents":
+            return roster;
+          case "load_project_conversation": {
+            loads += 1;
+            if (loads === holdLoad) await hold.promise;
+            return { items: [], agents: [] } satisfies ProjectConversation;
+          }
+          case "desktop_pending_syncs":
+          case "project_session_fingerprints":
+          case "list_workflow_runs":
+          case "list_projects":
+            return [];
+          case "workspace_status":
+            return { persistable: true };
+          default:
+            return undefined;
+        }
+      });
+      return () => loads;
+    }
+
+    it("places the fork in an empty visible pane of a stored layout, leaving every other assignment and the minimized panes as they were, and arms the Claude cue", async () => {
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const other = agent(AGENT_2, PROJECT_2);
+      const before = [source.id, other.id];
+      const empty = panes.createEmptyPane(PROJECT_2, before);
+      const minimized = panes.createEmptyPane(PROJECT_2, before);
+      panes.minimizePane(PROJECT_2, before, minimized);
+      installBackend({ roster: [source, other, claudeFork()] });
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      await settle();
+
+      const rosterIds = [source.id, other.id, FORK];
+      const layout = panes.layoutFor(PROJECT_2, rosterIds);
+      expect(panes.paneOfAgent(PROJECT_2, rosterIds, FORK)?.id).toBe(empty);
+      expect(panes.paneOfAgent(PROJECT_2, rosterIds, source.id)?.members).toEqual(before);
+      expect(layout.minimized).toEqual([minimized]);
+      expect(layout.maximized).toBeNull();
+      expect(acks()).toEqual([
+        { requestId: REQUEST, result: { status: "ready", listening_agents: rosterIds } },
+      ]);
+      expect(ws.isAwaitingForkHistory(FORK)).toBe(true);
+    });
+
+    it("makes a new pane when no visible pane is empty, without changing which pane is maximized", async () => {
+      // Background work never changes what the user is looking at: the
+      // user's own fork becomes the focused pane, an orchestrator's does not.
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const before = [source.id];
+      const focused = panes.layoutFor(PROJECT_2, before).panes[0]!.id;
+      panes.maximizePane(PROJECT_2, before, focused);
+      installBackend({ roster: [source, claudeFork()] });
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      await settle();
+
+      const rosterIds = [source.id, FORK];
+      const layout = panes.layoutFor(PROJECT_2, rosterIds);
+      const forkPane = panes.paneOfAgent(PROJECT_2, rosterIds, FORK);
+      expect(forkPane).not.toBeNull();
+      expect(forkPane?.id).not.toBe(focused);
+      expect(forkPane?.members).toEqual([FORK]);
+      expect(panes.paneOfAgent(PROJECT_2, rosterIds, source.id)?.members).toEqual([source.id]);
+      expect(layout.maximized).toBe(focused);
+      expect(layout.panes).toHaveLength(2);
+    });
+
+    it("carried twice, also by two overlapping handlers, places the fork once", async () => {
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const SECOND = "00000000-0000-7000-8000-0000000000e2";
+      installBackend({ roster: [source, claudeFork()] });
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      requestWithFork(SECOND);
+      await settle();
+      requestWithFork("00000000-0000-7000-8000-0000000000e3");
+      await settle();
+
+      const rosterIds = [source.id, FORK];
+      const layout = panes.layoutFor(PROJECT_2, rosterIds);
+      expect(layout.panes).toHaveLength(2);
+      expect(layout.panes.filter((p) => p.members.includes(FORK))).toHaveLength(1);
+      expect(panes.paneOfAgent(PROJECT_2, rosterIds, source.id)?.members).toEqual([source.id]);
+      expect(acks()).toHaveLength(3);
+    });
+
+    it("moves a fork a roster refresh had dropped beside its source into its own pane", async () => {
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const rosterIds = [source.id, FORK];
+      // The unified default puts every roster agent, the fork included, in
+      // the one pane: every inherited message shown twice.
+      expect(panes.layoutFor(PROJECT_2, rosterIds).panes[0]?.members).toEqual(rosterIds);
+      installBackend({ roster: [source, claudeFork()] });
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      await settle();
+
+      const forkPane = panes.paneOfAgent(PROJECT_2, rosterIds, FORK);
+      const sourcePane = panes.paneOfAgent(PROJECT_2, rosterIds, source.id);
+      expect(forkPane?.id).not.toBe(sourcePane?.id);
+      expect(sourcePane?.members).toEqual([source.id]);
+      expect(forkPane?.members).toEqual([FORK]);
+    });
+
+    it("works on the fork's current record: a rename between attempts keeps its name, and a removed fork is not restored", async () => {
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const renamed = { ...claudeFork(), name: "aside" };
+      const backend = installBackend({ roster: [source, renamed] });
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      await settle();
+      expect(ws.agentsByProject[PROJECT_2]?.find((a) => a.id === FORK)?.name).toBe("aside");
+      expect(panes.paneOfAgent(PROJECT_2, [source.id, FORK], FORK)).not.toBeNull();
+
+      // The user removes the fork in the window, as only the window can.
+      await ws.removeAgent(FORK);
+      backend.roster = [source];
+      requestWithFork("00000000-0000-7000-8000-0000000000e2");
+      await settle();
+      expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([source.id]);
+      expect(panes.paneOfAgent(PROJECT_2, [source.id], FORK)).toBeNull();
+      expect(acks().at(-1)).toEqual({
+        requestId: "00000000-0000-7000-8000-0000000000e2",
+        result: { status: "ready", listening_agents: [source.id] },
+      });
+    });
+
+    it("reads a Codex fork's earlier conversation before answering ready, when the project was loaded before the request", async () => {
+      // A load that was running or done before the request may predate the
+      // fork, so the fork's own read is still needed.
+      const ws = await loadWorkspaceState();
+      const source = agent(AGENT_1, PROJECT_2);
+      const hold = gate();
+      // The project's own load answers at once; the fork's read waits.
+      const loads = installHistoryBackend([source, codexFork()], 2, hold);
+      await ws.activateProject(PROJECT_2);
+      expect(loads()).toBe(1);
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      await settle();
+      expect(loads()).toBe(2);
+      expect(acks()).toEqual([]);
+
+      hold.open();
+      await settle();
+      expect(acks()).toEqual([
+        { requestId: REQUEST, result: { status: "ready", listening_agents: [source.id, FORK] } },
+      ]);
+      expect(loads()).toBe(2);
+    });
+
+    it("reads the project once when the request itself opens it: that load already holds the fork's earlier conversation", async () => {
+      const ws = await loadWorkspaceState();
+      const source = agent(AGENT_1, PROJECT_2);
+      const loads = installHistoryBackend([source, codexFork()], 0, gate());
+      await ws.installDesktopSync();
+
+      requestWithFork();
+      await settle();
+
+      expect(loads()).toBe(1);
+      expect(acks()).toEqual([
+        { requestId: REQUEST, result: { status: "ready", listening_agents: [source.id, FORK] } },
+      ]);
+      expect(ws.isAwaitingForkHistory(FORK)).toBe(false);
+    });
+
+    it("two requests overlapping the project's first load still read it once", async () => {
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const hold = gate();
+      const loads = installHistoryBackend([source, codexFork()], 1, hold);
+      await ws.installDesktopSync();
+      const SECOND = "00000000-0000-7000-8000-0000000000e2";
+
+      requestWithFork();
+      requestWithFork(SECOND);
+      await settle();
+      expect(loads()).toBe(1);
+      expect(acks()).toEqual([]);
+
+      hold.open();
+      await settle();
+      expect(loads()).toBe(1);
+      expect(acks().map((a) => (a as { requestId: string }).requestId)).toEqual([REQUEST, SECOND]);
+      const rosterIds = [source.id, FORK];
+      expect(panes.layoutFor(PROJECT_2, rosterIds).panes).toHaveLength(2);
+      expect(panes.paneOfAgent(PROJECT_2, rosterIds, FORK)?.members).toEqual([FORK]);
+    });
+
+    it("does not read a Codex fork's earlier conversation while the fork has a turn running", async () => {
+      const ws = await loadWorkspaceState();
+      const state = await loadAgentState();
+      const source = agent(AGENT_1, PROJECT_2);
+      const fork = codexFork();
+      const loads = installHistoryBackend([source, fork], 0, gate());
+      await ws.installDesktopSync();
+      // The fork is already registered and mid-reply when the request arrives.
+      await state.registerAgent(fork);
+      fireTo(`agent:${FORK}`, {
+        type: "turn_start",
+        turn_id: "turn-fork-1",
+        send_id: "send-fork-1",
+        started_at: "2026-05-16T00:00:03Z",
+      });
+      expect(state.runtimes[FORK]?.run_status).toBe("processing");
+
+      requestWithFork();
+      await settle();
+
+      expect(loads()).toBe(1);
+      expect(acks()).toEqual([
+        { requestId: REQUEST, result: { status: "ready", listening_agents: [source.id, FORK] } },
+      ]);
+    });
+
+    it("a retry whose request overlaps the first handler's read neither reads nor places again", async () => {
+      // The first request's handler keeps running past the backend's
+      // deadline; the retry carries the same fork while that read is in
+      // flight. The project was loaded before, so the fork's read is needed.
+      const ws = await loadWorkspaceState();
+      const panes = await import("$lib/state/transcriptPanes.svelte");
+      const source = agent(AGENT_1, PROJECT_2);
+      const hold = gate();
+      const loads = installHistoryBackend([source, codexFork()], 2, hold);
+      await ws.activateProject(PROJECT_2);
+      await ws.installDesktopSync();
+      const SECOND = "00000000-0000-7000-8000-0000000000e2";
+
+      requestWithFork();
+      await settle();
+      expect(loads()).toBe(2);
+      requestWithFork(SECOND);
+      await settle();
+      expect(loads()).toBe(2);
+      expect(acks()).toEqual([]);
+
+      hold.open();
+      await settle();
+      expect(acks().map((a) => (a as { requestId: string }).requestId)).toEqual([REQUEST, SECOND]);
+      const rosterIds = [source.id, FORK];
+      expect(panes.layoutFor(PROJECT_2, rosterIds).panes).toHaveLength(2);
+      expect(panes.paneOfAgent(PROJECT_2, rosterIds, FORK)?.members).toEqual([FORK]);
+      expect(loads()).toBe(2);
+    });
+  });
+
+  it("loads a project the window has not opened without selecting it, and answers once its history has loaded", async () => {
+    const ws = await loadWorkspaceState();
+    const conversation = gate();
+    installBackend({ roster: [agent(AGENT_1, PROJECT_2)], conversation });
+    await ws.installDesktopSync();
+    ws.selection.activeProjectId = PROJECT_1;
+
+    requestSync(PROJECT_2);
+    await settle();
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([AGENT_1]);
+    expect(acks()).toEqual([]);
+
+    conversation.open();
+    await settle();
+    expect(acks()).toEqual([
+      { requestId: REQUEST, result: { status: "ready", listening_agents: [AGENT_1] } },
+    ]);
+    expect(ws.selection.activeProjectId).toBe(PROJECT_1);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "set_active_project")).toBe(false);
+  });
+
+  it("prepares two projects for two orchestrators at once, each with its own agents, without changing the selection", async () => {
+    const ws = await loadWorkspaceState();
+    const PROJECT_3 = "00000000-0000-7000-8000-0000000000f3";
+    const FIRST = "00000000-0000-7000-8000-0000000000e2";
+    const SECOND = "00000000-0000-7000-8000-0000000000e3";
+    const histories: Record<string, Gate> = { [PROJECT_2]: gate(), [PROJECT_3]: gate() };
+    const rosters: Record<string, AgentRecord[]> = {
+      [PROJECT_2]: [agent(AGENT_1, PROJECT_2)],
+      [PROJECT_3]: [agent(AGENT_2, PROJECT_3)],
+    };
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+        const projectId = args?.projectId as string;
+        switch (cmd) {
+          case "open_project":
+            return { id: projectId, name: projectId, created_at: "2026-05-16T00:00:00Z" };
+          case "list_agents":
+            return rosters[projectId] ?? [];
+          case "desktop_pending_syncs":
+          case "project_session_fingerprints":
+          case "list_workflow_runs":
+          case "list_projects":
+            return [];
+          case "load_project_conversation":
+            await histories[projectId]?.promise;
+            return { items: [], agents: [] } satisfies ProjectConversation;
+          case "workspace_status":
+            return { persistable: true };
+          default:
+            return undefined;
+        }
+      },
+    );
+    await ws.installDesktopSync();
+    ws.selection.activeProjectId = PROJECT_1;
+
+    fireTo("desktop_sync_project", { request_id: FIRST, project_id: PROJECT_2 });
+    fireTo("desktop_sync_project", { request_id: SECOND, project_id: PROJECT_3 });
+    await settle();
+    // Both are being prepared at once: each project's own agents are
+    // registered while both histories are still loading.
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([AGENT_1]);
+    expect(ws.agentsByProject[PROJECT_3]?.map((a) => a.id)).toEqual([AGENT_2]);
+    expect(acks()).toEqual([]);
+
+    // The second project finishing first answers only its own request.
+    histories[PROJECT_3]!.open();
+    await settle();
+    expect(acks()).toEqual([
+      { requestId: SECOND, result: { status: "ready", listening_agents: [AGENT_2] } },
+    ]);
+
+    histories[PROJECT_2]!.open();
+    await settle();
+    expect(acks()).toEqual([
+      { requestId: SECOND, result: { status: "ready", listening_agents: [AGENT_2] } },
+      { requestId: FIRST, result: { status: "ready", listening_agents: [AGENT_1] } },
+    ]);
+    expect(ws.selection.activeProjectId).toBe(PROJECT_1);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "set_active_project")).toBe(false);
+  });
+
+  it("waits for a loaded project's history load that is still running", async () => {
+    const ws = await loadWorkspaceState();
+    const conversation = gate();
+    installBackend({ roster: [agent(AGENT_1, PROJECT_2)], conversation });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+
+    requestSync(PROJECT_2);
+    await settle();
+    expect(acks()).toEqual([]);
+
+    conversation.open();
+    await settle();
+    expect(acks()).toHaveLength(1);
+  });
+
+  it("waits for one agent's history reread, so the turn cannot start while its file is read", async () => {
+    // A Retry, an attach, or a new Codex fork rereads the agent's history. A
+    // reply that starts during that read can show twice, so the compose box
+    // waits for it; another client's turn has to wait too.
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const backend = installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await vi.waitFor(() => expect(ws.conversations[PROJECT_2]?.status).toBe("complete"));
+
+    const reread = gate();
+    backend.conversation = reread;
+    const attaching = ws.loadAttachedAgentHistory(AGENT_1);
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("loading");
+
+    requestSync(PROJECT_2);
+    await settle();
+    expect(acks()).toEqual([]);
+
+    reread.open();
+    await attaching;
+    await settle();
+    expect(state.runtimes[AGENT_1]?.hydration_status).toBe("complete");
+    expect(acks()).toEqual([
+      { requestId: REQUEST, result: { status: "ready", listening_agents: [AGENT_1] } },
+    ]);
+  });
+
+  it("waits for the project's workflow channel", async () => {
+    const ws = await loadWorkspaceState();
+    const runs = gate();
+    installBackend({ roster: [agent(AGENT_1, PROJECT_2)], runs });
+    await ws.installDesktopSync();
+
+    requestSync(PROJECT_2);
+    await settle();
+    expect(acks()).toEqual([]);
+
+    runs.open();
+    await settle();
+    expect(acks()).toHaveLength(1);
+  });
+
+  it("reports an agent the window could not subscribe to", async () => {
+    const ws = await loadWorkspaceState();
+    installBackend({ roster: [agent(AGENT_1, PROJECT_2), agent(AGENT_2, PROJECT_2)] });
+    listenMock.mockImplementation(async (name: string, cb) => {
+      if (name === `agent:${AGENT_2}`) throw new Error("channel unavailable");
+      listeners.set(name, cb);
+      return vi.fn();
+    });
+    await ws.installDesktopSync();
+
+    requestSync(PROJECT_2);
+    await settle();
+    expect(acks()).toEqual([
+      { requestId: REQUEST, result: { status: "ready", listening_agents: [AGENT_1] } },
+    ]);
+  });
+
+  it("answers ready after a history load that failed: nothing is left in flight", async () => {
+    const ws = await loadWorkspaceState();
+    installBackend({ roster: [agent(AGENT_1, PROJECT_2)], failConversation: true });
+    await ws.installDesktopSync();
+
+    requestSync(PROJECT_2);
+    await settle();
+    expect(ws.conversations[PROJECT_2]?.status).toBe("failed");
+    expect(acks()).toEqual([
+      { requestId: REQUEST, result: { status: "ready", listening_agents: [AGENT_1] } },
+    ]);
+  });
+
+  it("answers with the error when the project cannot be opened", async () => {
+    const ws = await loadWorkspaceState();
+    installBackend({ roster: [], failOpen: "locked by another Switchboard" });
+    await ws.installDesktopSync();
+
+    requestSync(PROJECT_2);
+    await settle();
+    expect(acks()).toEqual([
+      {
+        requestId: REQUEST,
+        result: { status: "failed", message: "locked by another Switchboard" },
+      },
+    ]);
+  });
+
+  it("picks up an agent created and one renamed by another client, through the sync", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const backend = installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+
+    backend.roster = [{ ...agent(AGENT_1, PROJECT_2), name: "renamed" }, agent(AGENT_2, PROJECT_2)];
+    requestSync(PROJECT_2);
+    await settle();
+
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => [a.id, a.name])).toEqual([
+      [AGENT_1, "renamed"],
+      [AGENT_2, "agent-b"],
+    ]);
+    expect(state._testing.hasListener(AGENT_2)).toBe(true);
+    expect(acks()).toHaveLength(1);
+  });
+
+  it("picks up an agent created and one renamed by another client, through a roster notice", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const backend = installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+
+    backend.roster = [{ ...agent(AGENT_1, PROJECT_2), name: "renamed" }, agent(AGENT_2, PROJECT_2)];
+    fireTo("desktop_roster_changed", { project_id: PROJECT_2 });
+    await settle();
+
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => [a.id, a.name])).toEqual([
+      [AGENT_1, "renamed"],
+      [AGENT_2, "agent-b"],
+    ]);
+    expect(state._testing.hasListener(AGENT_2)).toBe(true);
+    expect(acks()).toEqual([]);
+  });
+
+  it("drops an agent another client removed, through a roster notice", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const backend = installBackend({
+      roster: [agent(AGENT_1, PROJECT_2), agent(AGENT_2, PROJECT_2)],
+    });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+    expect(state._testing.hasListener(AGENT_2)).toBe(true);
+
+    backend.roster = [agent(AGENT_1, PROJECT_2)];
+    fireTo("desktop_roster_changed", { project_id: PROJECT_2 });
+    await settle();
+
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([AGENT_1]);
+    expect(state._testing.hasListener(AGENT_2)).toBe(false);
+    expect(state._testing.hasListener(AGENT_1)).toBe(true);
+  });
+
+  it("drops an agent whose removal failed after its record was deleted", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend({
+      roster: [agent(AGENT_1, PROJECT_2), agent(AGENT_2, PROJECT_2)],
+      failRemoveAfterDeleting: "the agent was removed, but saving the change failed",
+    });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+
+    // The agent is gone, so the removal resolves; the error becomes a warning.
+    await ws.removeAgent(AGENT_2);
+
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([AGENT_1]);
+    expect(state._testing.hasListener(AGENT_2)).toBe(false);
+    expect(ws.agentRemovalWarnings).toEqual([
+      {
+        agentId: AGENT_2,
+        name: "agent-b",
+        message: "the agent was removed, but saving the change failed",
+      },
+    ]);
+    ws.dismissAgentRemovalWarning(AGENT_2);
+    expect(ws.agentRemovalWarnings).toEqual([]);
+  });
+
+  it("a removal that failed with the agent still listed rejects and warns of nothing", async () => {
+    const ws = await loadWorkspaceState();
+    const backend = installBackend({
+      roster: [agent(AGENT_1, PROJECT_2), agent(AGENT_2, PROJECT_2)],
+    });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+    backend.failRemove = "registry locked";
+
+    await expect(ws.removeAgent(AGENT_2)).rejects.toThrow("registry locked");
+
+    expect(backend.roster.map((a) => a.id)).toEqual([AGENT_1, AGENT_2]);
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([AGENT_1, AGENT_2]);
+    expect(ws.agentRemovalWarnings).toEqual([]);
+  });
+
+  it("ignores a roster notice for a project the window has not loaded", async () => {
+    const ws = await loadWorkspaceState();
+    installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+
+    fireTo("desktop_roster_changed", { project_id: PROJECT_2 });
+    await settle();
+
+    expect(ws.agentsByProject[PROJECT_2]).toBeUndefined();
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_agents")).toBe(false);
+  });
+
+  it("re-reads the project list when another client creates a project", async () => {
+    const ws = await loadWorkspaceState();
+    installBackend({
+      roster: [],
+      projects: [project(PROJECT_3, "2026-05-16T00:00:00Z")],
+    });
+    await ws.installDesktopSync();
+
+    fireTo("projects_changed", null);
+    await settle();
+
+    expect(ws.projects.list.map((p) => p.id)).toEqual([PROJECT_3]);
+  });
+
+  it("re-reads a loaded project's runs when another client dismisses one", async () => {
+    const ws = await loadWorkspaceState();
+    installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+    const before = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_workflow_runs").length;
+
+    fireTo("desktop_runs_changed", { project_id: PROJECT_2 });
+    await settle();
+
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "list_workflow_runs")).toHaveLength(
+      before + 1,
+    );
+  });
+
+  function holdListen(channel: string): Gate & { unlisten: ReturnType<typeof vi.fn> } {
+    const held = gate();
+    const unlisten = vi.fn();
+    listenMock.mockImplementation(async (name: string, cb) => {
+      if (name === channel) {
+        await held.promise;
+        listeners.set(name, cb);
+        return unlisten;
+      }
+      listeners.set(name, cb);
+      return vi.fn();
+    });
+    return { ...held, unlisten };
+  }
+
+  it("waits for a slow agent subscription in a project's first load", async () => {
+    const ws = await loadWorkspaceState();
+    installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    const listening = holdListen(`agent:${AGENT_1}`);
+
+    requestSync(PROJECT_2);
+    await settle();
+    expect(acks()).toEqual([]);
+
+    listening.open();
+    await settle();
+    expect(acks()).toEqual([
+      { requestId: REQUEST, result: { status: "ready", listening_agents: [AGENT_1] } },
+    ]);
+  });
+
+  it("waits for a slow subscription to an agent another client created after the load", async () => {
+    const ws = await loadWorkspaceState();
+    const backend = installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+    backend.roster = [...backend.roster, agent(AGENT_2, PROJECT_2)];
+    const listening = holdListen(`agent:${AGENT_2}`);
+
+    requestSync(PROJECT_2);
+    await settle();
+    expect(acks()).toEqual([]);
+
+    listening.open();
+    await settle();
+    expect(acks()).toEqual([
+      { requestId: REQUEST, result: { status: "ready", listening_agents: [AGENT_1, AGENT_2] } },
+    ]);
+  });
+
+  it("an agent removed while a roster read is in flight does not come back", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const backend = installBackend({
+      roster: [agent(AGENT_1, PROJECT_2), agent(AGENT_2, PROJECT_2)],
+    });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+
+    backend.rosterReads = gate();
+    fireTo("desktop_roster_changed", { project_id: PROJECT_2 });
+    await settle();
+    await ws.removeAgent(AGENT_2);
+    const held = backend.rosterReads;
+    backend.rosterReads = undefined;
+    held.open();
+    await settle();
+
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([AGENT_1]);
+    expect(state._testing.hasListener(AGENT_2)).toBe(false);
+  });
+
+  it("a rename made while a roster read is in flight is not reverted", async () => {
+    const ws = await loadWorkspaceState();
+    const backend = installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+
+    backend.rosterReads = gate();
+    fireTo("desktop_roster_changed", { project_id: PROJECT_2 });
+    await settle();
+    await ws.renameAgent(AGENT_1, "critic");
+    const held = backend.rosterReads;
+    backend.rosterReads = undefined;
+    held.open();
+    await settle();
+
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.name)).toEqual(["critic"]);
+  });
+
+  it("a project deleted while a new agent subscribes gets neither its roster nor the listener back", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const backend = installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+    backend.roster = [...backend.roster, agent(AGENT_2, PROJECT_2)];
+    const listening = holdListen(`agent:${AGENT_2}`);
+
+    fireTo("desktop_roster_changed", { project_id: PROJECT_2 });
+    await settle();
+    await ws.deleteProject(PROJECT_2);
+    listening.open();
+    await settle();
+
+    expect(ws.agentsByProject[PROJECT_2]).toBeUndefined();
+    expect(state._testing.hasListener(AGENT_2)).toBe(false);
+    expect(listening.unlisten).toHaveBeenCalled();
+  });
+
+  it("a reorder that lands after another client added an agent keeps that agent", async () => {
+    const ws = await loadWorkspaceState();
+    const backend = installBackend({
+      roster: [agent(AGENT_1, PROJECT_2), agent(AGENT_2, PROJECT_2)],
+    });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+    const AGENT_3 = "00000000-0000-7000-8000-00000000000c";
+    backend.roster = [...backend.roster, agent(AGENT_3, PROJECT_2)];
+
+    await ws.reorderAgents(PROJECT_2, [AGENT_2, AGENT_1]);
+    await settle();
+
+    expect(ws.agentsByProject[PROJECT_2]?.map((a) => a.id)).toEqual([AGENT_2, AGENT_1, AGENT_3]);
+  });
+
+  it("answers a request emitted before the window was listening", async () => {
+    const ws = await loadWorkspaceState();
+    installBackend({
+      roster: [agent(AGENT_1, PROJECT_2)],
+      pending: [{ request_id: REQUEST, project_id: PROJECT_2 }],
+    });
+
+    await ws.installDesktopSync();
+    await settle();
+
+    expect(acks()).toEqual([
+      { requestId: REQUEST, result: { status: "ready", listening_agents: [AGENT_1] } },
+    ]);
+  });
+
+  it("answers a request once when it arrives both as the event and as waiting", async () => {
+    const ws = await loadWorkspaceState();
+    installBackend({
+      roster: [agent(AGENT_1, PROJECT_2)],
+      pending: [{ request_id: REQUEST, project_id: PROJECT_2 }],
+    });
+
+    await ws.installDesktopSync();
+    requestSync(PROJECT_2);
+    await settle();
+
+    expect(acks()).toHaveLength(1);
+  });
+
+  function listensTo(channel: string): number {
+    return listenMock.mock.calls.filter(([name]) => name === channel).length;
+  }
+
+  it("a project deleted while the window prepares it for a turn answers failed and sets nothing up", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const backend = installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    expect(await ws.activateProject(PROJECT_2)).toBe("activated");
+    await settle();
+    backend.roster = [...backend.roster, agent(AGENT_2, PROJECT_2)];
+    const listening = holdListen(`agent:${AGENT_2}`);
+    const workflowListens = listensTo(`workflow:${PROJECT_2}`);
+
+    requestSync(PROJECT_2);
+    await settle();
+    await ws.deleteProject(PROJECT_2);
+    listening.open();
+    await settle();
+
+    expect(acks()).toEqual([
+      {
+        requestId: REQUEST,
+        result: {
+          status: "failed",
+          message: "the project was removed while the window was loading it",
+        },
+      },
+    ]);
+    expect(ws.agentsByProject[PROJECT_2]).toBeUndefined();
+    expect(state._testing.hasListener(AGENT_2)).toBe(false);
+    expect(listensTo(`workflow:${PROJECT_2}`)).toBe(workflowListens);
+  });
+
+  it("a project deleted during its first background load is not brought back", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend({ roster: [agent(AGENT_1, PROJECT_2)] });
+    await ws.installDesktopSync();
+    const listening = holdListen(`agent:${AGENT_1}`);
+    const workflowListens = listensTo(`workflow:${PROJECT_2}`);
+
+    requestSync(PROJECT_2);
+    await settle();
+    await ws.deleteProject(PROJECT_2);
+    listening.open();
+    await settle();
+
+    expect(acks()).toEqual([
+      {
+        requestId: REQUEST,
+        result: {
+          status: "failed",
+          message: "the project was removed while the window was loading it",
+        },
+      },
+    ]);
+    expect(ws.agentsByProject[PROJECT_2]).toBeUndefined();
+    expect(ws.conversations[PROJECT_2]).toBeUndefined();
+    expect(state._testing.hasListener(AGENT_1)).toBe(false);
+    expect(listening.unlisten).toHaveBeenCalled();
+    expect(listensTo(`workflow:${PROJECT_2}`)).toBe(workflowListens);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "load_project_conversation")).toBe(false);
+  });
+
+  it("a history read queued when its project is deleted writes nothing", async () => {
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    const conversation = gate();
+    installBackend({ roster: [agent(AGENT_1, PROJECT_2)], conversation });
+    await ws.installDesktopSync();
+    requestSync(PROJECT_2);
+    await settle();
+
+    await ws.deleteProject(PROJECT_2);
+    conversation.open();
+    await settle();
+
+    expect(ws.conversations[PROJECT_2]).toBeUndefined();
+    expect(state.transcripts[AGENT_1]).toBeUndefined();
   });
 });

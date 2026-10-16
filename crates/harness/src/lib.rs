@@ -44,9 +44,10 @@ pub use codex::session_file::{
 pub use codex::{CodexAdapter, CodexLocator};
 pub use context_report::{ContextCategory, ContextItem, ContextReport};
 pub use events::{
-    AdapterEvent, CancelSource, ContentKind, ContextWindowSource, FailureKind, McpServerStatus,
-    MessageId, NormalizedEvent, PluginEntry, RateLimitSource, SessionInventory, SessionMetaSource,
-    SettingPair, SkillEntry, ToolKind, TurnId, TurnOutcome, TurnSpend, TurnUsage,
+    AdapterEvent, AnnouncedSendKind, CancelSource, ContentKind, ContextWindowSource, FailureKind,
+    McpServerStatus, MessageFailureKind, MessageId, NormalizedEvent, PluginEntry, RateLimitSource,
+    SessionInventory, SessionMetaSource, SettingPair, SkillEntry, ToolKind, TurnId, TurnOutcome,
+    TurnSpend, TurnUsage,
 };
 pub use facets::{
     EditChange, EditPair, EditedFile, Finding, FindingOutcome, FindingVerdict, FindingsReport,
@@ -54,7 +55,7 @@ pub use facets::{
 };
 pub use forward::{
     ForwardedBlock, TextCapture, compose_forwarded_message, empty_sources_reason,
-    is_forwardable_text, latest_completed_agent_text,
+    is_forwardable_text, latest_completed_agent_text, turn_answer_text,
 };
 pub use mock::{MockHarnessAdapter, MockScenario};
 pub use resume::interactive_resume_command;

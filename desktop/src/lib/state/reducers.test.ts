@@ -1746,6 +1746,77 @@ describe("runtimeReducer", () => {
     expect(r.last_error).toEqual({ message: "journal write failed", kind: "adapter_failure" });
   });
 
+  it("message_failed for the front entry while another is queued stays starting", () => {
+    // The remaining entry is next to start, so the agent is not idle.
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_sends: [
+        { send_id: "send-1", user_turn_id: "user-1", message_id: MESSAGE_1 },
+        { send_id: "send-2", user_turn_id: "user-2", message_id: MESSAGE_2 },
+      ],
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      send_id: "send-1",
+      agent_id: AGENT_A,
+      error: "journal write failed",
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("starting");
+    expect(r.pending_sends).toEqual([
+      { send_id: "send-2", user_turn_id: "user-2", message_id: MESSAGE_2 },
+    ]);
+    expect(r.last_error).toEqual({ message: "journal write failed", kind: "adapter_failure" });
+  });
+
+  it("message_failed for a queued entry behind the starting one stays starting", () => {
+    // The front entry has no receipt yet (its IPC is in flight); the one
+    // behind it, named by the event, fails.
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_sends: [
+        { send_id: "send-1", user_turn_id: "user-1" },
+        { send_id: "send-2", user_turn_id: "user-2", message_id: MESSAGE_2 },
+      ],
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_failed",
+      message_id: MESSAGE_2,
+      send_id: null,
+      agent_id: AGENT_A,
+      error: "agent is shutting down",
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("starting");
+    expect(r.pending_sends).toEqual([{ send_id: "send-1", user_turn_id: "user-1" }]);
+  });
+
+  it("message_cancelled for the front entry while another is queued stays starting", () => {
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_sends: [
+        { send_id: "send-1", user_turn_id: "user-1", message_id: MESSAGE_1 },
+        { send_id: "send-2", user_turn_id: "user-2", message_id: MESSAGE_2 },
+      ],
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_cancelled",
+      message_id: MESSAGE_1,
+      send_id: "send-1",
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("starting");
+    expect(r.pending_sends).toEqual([
+      { send_id: "send-2", user_turn_id: "user-2", message_id: MESSAGE_2 },
+    ]);
+    expect(r.last_error).toBeUndefined();
+  });
+
   it("message_failed for a different message_id is a no-op (correlation guard)", () => {
     // The pending send already recorded receipt MESSAGE_1, so a message_failed
     // for MESSAGE_2 correlates to nothing (not the front, since the front isn't

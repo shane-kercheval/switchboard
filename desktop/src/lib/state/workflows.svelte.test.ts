@@ -126,6 +126,23 @@ describe("workflows store", () => {
     expect(row?.step).toBe(2);
     expect(row?.steps).toHaveLength(1);
     expect(row?.steps[0]?.label).toBe("Send the review");
+
+    // A second event for the same step, naming the agents the engine resolved
+    // and its send, changes nothing the window shows.
+    emit(
+      "p1",
+      running({
+        step: 2,
+        label: "Send the review",
+        recipients: [{ agent_id: "a1", name: "reviewer-1", dispatched: true }],
+        send_id: "s1",
+      }),
+    );
+    const again = workflowRuns["p1"]?.filter((r) => r.run_id === "r1");
+    expect(again).toHaveLength(1);
+    expect(again?.[0]?.step).toBe(2);
+    expect(again?.[0]?.status).toBe("running");
+    expect(again?.[0]?.steps).toHaveLength(1);
   });
 
   it("refreshes to fetch steps when a run is first seen via an event", async () => {
@@ -234,5 +251,200 @@ describe("workflows store", () => {
     // The generation guard discards the stale seed and the listener is gone.
     expect(workflowRuns["p1"]).toBeUndefined();
     expect(channels.has("workflow:p1")).toBe(false);
+  });
+});
+
+describe("a run list fetched around a run's end", () => {
+  function runInfo(over: Partial<WorkflowRunInfo> = {}): WorkflowRunInfo {
+    return {
+      run_id: "r1",
+      workflow: "review-and-recommend",
+      step: 0,
+      total: 3,
+      status: "running",
+      reason: null,
+      steps: [
+        {
+          kind: "send",
+          label: "draft",
+          description: null,
+          prompt: null,
+          recipients: [],
+          feeds_from: [],
+        },
+      ],
+      ...over,
+    };
+  }
+
+  /// `list_workflow_runs` answers from a queue the test releases one by one.
+  function heldLists(): { release: (runs: WorkflowRunInfo[]) => void; held: () => number } {
+    const pending: ((runs: WorkflowRunInfo[]) => void)[] = [];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_workflow_runs") {
+        return await new Promise<WorkflowRunInfo[]>((resolve) => pending.push(resolve));
+      }
+      return undefined;
+    });
+    return {
+      release: (runs) => {
+        const next = pending.shift();
+        if (next === undefined) throw new Error("no list fetch in flight");
+        next(runs);
+      },
+      held: () => pending.length,
+    };
+  }
+
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 10; i += 1) await new Promise((r) => setTimeout(r, 0));
+  }
+
+  it("a run that completes while its first fetch is in flight stays gone", async () => {
+    const lists = heldLists();
+    const subscribed = subscribeProjectWorkflows("p1");
+    await settle();
+    lists.release([]);
+    await subscribed;
+
+    emit("p1", running());
+    await settle();
+    expect(lists.held()).toBe(1);
+    emit("p1", running({ status: "complete", step: 3 }));
+    lists.release([runInfo()]);
+    await settle();
+
+    expect(workflowRuns["p1"]).toEqual([]);
+  });
+
+  it("a failed run keeps its failure over a fetch that still says running", async () => {
+    const lists = heldLists();
+    const subscribed = subscribeProjectWorkflows("p1");
+    await settle();
+    lists.release([]);
+    await subscribed;
+
+    emit("p1", running());
+    await settle();
+    emit("p1", running({ status: "failed", step: 1, reason: "agent busy" }));
+    lists.release([runInfo()]);
+    await settle();
+
+    expect(workflowRuns["p1"]).toEqual([
+      expect.objectContaining({ run_id: "r1", status: "failed", reason: "agent busy" }),
+    ]);
+    expect(workflowRuns["p1"]?.[0]?.steps).toHaveLength(1);
+  });
+
+  it("a fetch that starts after a run completed cannot bring it back", async () => {
+    // The backend reports a run as running for a moment after announcing its
+    // end, so a fetch in that gap answers "running" with no event left to
+    // replay over it.
+    const lists = heldLists();
+    const subscribed = subscribeProjectWorkflows("p1");
+    await settle();
+    lists.release([]);
+    await subscribed;
+    emit("p1", running());
+    await settle();
+    lists.release([runInfo()]);
+    await settle();
+    emit("p1", running({ status: "complete", step: 3 }));
+
+    const { refreshRuns } = await import("./workflows.svelte");
+    const refreshed = refreshRuns("p1");
+    await settle();
+    lists.release([runInfo()]);
+    await refreshed;
+
+    expect(workflowRuns["p1"]).toEqual([]);
+  });
+
+  it("progress during the first fetch is kept over its answer", async () => {
+    const lists = heldLists();
+    const subscribed = subscribeProjectWorkflows("p1");
+    await settle();
+    emit("p1", running({ step: 2 }));
+    lists.release([]);
+    await settle();
+
+    expect(workflowRuns["p1"]).toEqual([expect.objectContaining({ run_id: "r1", step: 2 })]);
+    // The event asked for one more fetch, for the run's step names.
+    lists.release([runInfo({ step: 2 })]);
+    await subscribed;
+    expect(workflowRuns["p1"]?.[0]?.steps).toHaveLength(1);
+  });
+});
+
+describe("a run-list fetch around the project's first subscription", () => {
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 10; i += 1) await new Promise((r) => setTimeout(r, 0));
+  }
+
+  function heldLists(): { release: (runs: WorkflowRunInfo[]) => void; held: () => number } {
+    const pending: ((runs: WorkflowRunInfo[]) => void)[] = [];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_workflow_runs") {
+        return await new Promise<WorkflowRunInfo[]>((resolve) => pending.push(resolve));
+      }
+      return undefined;
+    });
+    return {
+      release: (runs) => {
+        const next = pending.shift();
+        if (next === undefined) throw new Error("no list fetch in flight");
+        next(runs);
+      },
+      held: () => pending.length,
+    };
+  }
+
+  const failedRun: WorkflowRunInfo = {
+    run_id: "r-old",
+    workflow: "review-and-recommend",
+    step: 1,
+    total: 3,
+    status: "failed",
+    reason: "agent busy",
+    steps: [],
+  };
+
+  it("a fetch started before the first subscription still delivers the list", async () => {
+    const { refreshRuns } = await import("./workflows.svelte");
+    const lists = heldLists();
+    const early = refreshRuns("p1");
+    await settle();
+    let subscribedDone = false;
+    const subscribed = subscribeProjectWorkflows("p1").then(() => {
+      subscribedDone = true;
+    });
+    await settle();
+
+    // The early read may predate the listener, so it is read again.
+    lists.release([]);
+    await settle();
+    expect(lists.held()).toBe(1);
+    expect(subscribedDone).toBe(false);
+    lists.release([failedRun]);
+    await Promise.all([early, subscribed]);
+
+    expect(workflowRuns["p1"]).toEqual([failedRun]);
+  });
+
+  it("a fetch whose project is torn down meanwhile commits nothing", async () => {
+    const { refreshRuns } = await import("./workflows.svelte");
+    const lists = heldLists();
+    const subscribed = subscribeProjectWorkflows("p1");
+    await settle();
+    lists.release([]);
+    await subscribed;
+
+    const refreshed = refreshRuns("p1");
+    await settle();
+    unsubscribeProjectWorkflows(["p1"]);
+    lists.release([failedRun]);
+    await refreshed;
+
+    expect(workflowRuns["p1"]).toBeUndefined();
   });
 });

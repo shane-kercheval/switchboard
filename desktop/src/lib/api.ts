@@ -10,6 +10,9 @@ import type {
   AgentId,
   AgentRecord,
   AgentSelection,
+  AgentSelectionChanges,
+  DesktopSyncAck,
+  DesktopSyncRequest,
   ForwardSourceRef,
   Attachment,
   BranchComparison,
@@ -25,6 +28,7 @@ import type {
   HarnessKind,
   McpAuth,
   McpProviderInfo,
+  AgentAccessStatus,
   MessageId,
   MessagePin,
   ProjectConversation,
@@ -122,6 +126,54 @@ export async function awaitHarnessPath(): Promise<PathSource> {
 /// results taken before then are provisional, so listeners re-probe on receipt.
 export async function listenHarnessPathResolved(handler: () => void): Promise<UnlistenFn> {
   return await listen("harness_path_resolved", () => handler());
+}
+
+/// The backend asks the window to load or refresh a project before a turn
+/// another client starts there; the window answers with
+/// [`desktopProjectSynced`].
+export async function listenDesktopSyncProject(
+  handler: (request: DesktopSyncRequest) => void,
+): Promise<UnlistenFn> {
+  return await listen<DesktopSyncRequest>("desktop_sync_project", (event) =>
+    handler(event.payload),
+  );
+}
+
+/// The sync requests still waiting for an answer, for a window that was not
+/// yet listening when they were emitted.
+export async function desktopPendingSyncs(): Promise<DesktopSyncRequest[]> {
+  return await invoke<DesktopSyncRequest[]>("desktop_pending_syncs");
+}
+
+export async function desktopProjectSynced(
+  requestId: string,
+  result: DesktopSyncAck,
+): Promise<void> {
+  await invoke("desktop_project_synced", { requestId, result });
+}
+
+/// Another client created, renamed, reconfigured, or removed an agent in the
+/// project.
+export async function listenDesktopRosterChanged(
+  handler: (projectId: ProjectId) => void,
+): Promise<UnlistenFn> {
+  return await listen<{ project_id: ProjectId }>("desktop_roster_changed", (event) =>
+    handler(event.payload.project_id),
+  );
+}
+
+/// Another client created or renamed a project.
+export async function listenProjectsChanged(handler: () => void): Promise<UnlistenFn> {
+  return await listen("projects_changed", () => handler());
+}
+
+/// Another client dismissed one of the project's workflow runs.
+export async function listenDesktopRunsChanged(
+  handler: (projectId: ProjectId) => void,
+): Promise<UnlistenFn> {
+  return await listen<{ project_id: ProjectId }>("desktop_runs_changed", (event) =>
+    handler(event.payload.project_id),
+  );
 }
 
 export async function pickDirectory(path: string): Promise<DirectoryInfo> {
@@ -469,11 +521,13 @@ export async function renameAgent(agentId: AgentId, newName: string): Promise<Ag
   return await invoke<AgentRecord>("rename_agent", { agentId, newName });
 }
 
+/// Save the parts of an agent's selection the user changed; absent parts are
+/// left as the backend has them.
 export async function setAgentSelection(
   agentId: AgentId,
-  selection: AgentSelection,
+  changes: AgentSelectionChanges,
 ): Promise<AgentRecord> {
-  return await invoke<AgentRecord>("set_agent_selection", { agentId, selection });
+  return await invoke<AgentRecord>("set_agent_selection", { agentId, changes });
 }
 
 export async function attachAgent(
@@ -715,6 +769,28 @@ export async function openExternalUrl(url: string): Promise<void> {
   await invoke("open_external_url", { url });
 }
 
+/// Agent access, the MCP server other agents (Claude Code, Codex, Claude
+/// Desktop) connect to, as Settings shows it.
+export async function agentAccessStatus(): Promise<AgentAccessStatus> {
+  return await invoke<AgentAccessStatus>("mcp_status");
+}
+
+/// Turn agent access on or off. Off stops the listener at once, even with
+/// clients connected; on creates the token the first time.
+export async function setAgentAccessEnabled(enabled: boolean): Promise<AgentAccessStatus> {
+  return await invoke<AgentAccessStatus>("mcp_set_enabled", { enabled });
+}
+
+/// Move agent access to another port, restarting it if it is on.
+export async function setAgentAccessPort(port: number): Promise<AgentAccessStatus> {
+  return await invoke<AgentAccessStatus>("mcp_set_port", { port });
+}
+
+/// Replace the token. Every client is cut off until given the new one.
+export async function regenerateAgentAccessToken(): Promise<AgentAccessStatus> {
+  return await invoke<AgentAccessStatus>("mcp_regenerate_token");
+}
+
 /// Configured MCP prompt-server providers with their status (Settings list).
 export async function listMcpProviders(): Promise<McpProviderInfo[]> {
   return await invoke<McpProviderInfo[]>("list_mcp_providers");
@@ -834,7 +910,7 @@ export async function getPromptSource(
 
 // ── Workflows ─────────────────────────────────────────────────────────────────
 
-/// All workflows: the read-only built-in library (when `show_builtins` is on)
+/// All workflows: the read-only built-in library (when `show_builtin_workflows` is on)
 /// merged with the user-global workflows folder. User-global — the same set is
 /// available from every project.
 export async function listWorkflows(): Promise<WorkflowListing[]> {

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
@@ -23,6 +23,11 @@
   let loadError = $state<string | null>(null);
 
   // Add form.
+  let addFormOpen = $state(false);
+  let addForm: HTMLDivElement | undefined;
+  let addTrigger: HTMLButtonElement | undefined;
+  let addFocusController: AbortController | undefined;
+  onDestroy(() => addFocusController?.abort());
   let name = $state("");
   let url = $state("");
   // Widened to string for SegmentedSelect's bindable value; only "bearer" and
@@ -129,8 +134,41 @@
     addError = null;
   }
 
+  async function closeAddForm(
+    restoreFocus: boolean = addForm?.contains(document.activeElement) ?? false,
+  ): Promise<void> {
+    addFormOpen = false;
+    await tick();
+    if (restoreFocus) addTrigger?.focus();
+  }
+
+  async function toggleAddForm(trigger: HTMLButtonElement): Promise<void> {
+    addTrigger = trigger;
+    if (addFormOpen) {
+      await closeAddForm(true);
+    } else {
+      addFormOpen = true;
+      await tick();
+      addForm?.querySelector("input")?.focus();
+    }
+  }
+
   async function handleAdd(): Promise<void> {
     if (!canSubmit) return;
+    let restoreFocus = addForm?.contains(document.activeElement) ?? false;
+    const focusController = new AbortController();
+    addFocusController = focusController;
+    const relinquishFocus = (event: Event): void => {
+      if (event.target instanceof Node && !addForm?.contains(event.target)) restoreFocus = false;
+    };
+    document.addEventListener("focusin", relinquishFocus, {
+      capture: true,
+      signal: focusController.signal,
+    });
+    document.addEventListener("pointerdown", relinquishFocus, {
+      capture: true,
+      signal: focusController.signal,
+    });
     adding = true;
     addError = null;
     try {
@@ -146,9 +184,13 @@
       await refresh();
     } catch (e) {
       addError = errorText(e);
+      return;
     } finally {
       adding = false;
+      focusController.abort();
+      addFocusController = undefined;
     }
+    await closeAddForm(restoreFocus && (addTrigger?.getClientRects().length ?? 0) > 0);
   }
 
   async function handleTest(): Promise<void> {
@@ -477,7 +519,18 @@
     <p class="text-muted text-sm" data-testid="mcp-empty">No MCP servers configured.</p>
   {/if}
 
-  <div>
+  <div class="flex flex-wrap items-center gap-2">
+    <Button
+      variant="secondary"
+      size="sm"
+      data-testid="mcp-add-toggle"
+      aria-expanded={addFormOpen}
+      aria-controls="mcp-add-form"
+      disabled={adding}
+      onclick={(event) => void toggleAddForm(event.currentTarget)}
+    >
+      {addFormOpen ? "Close setup" : "Add prompt server"}
+    </Button>
     <Button
       variant="secondary"
       size="sm"
@@ -489,13 +542,19 @@
     </Button>
   </div>
 
-  <div class="border-border space-y-2 rounded-md border p-3" data-testid="mcp-add-form">
-    <h3 class="text-fg text-sm font-medium">Add MCP server</h3>
+  <div
+    bind:this={addForm}
+    id="mcp-add-form"
+    hidden={!addFormOpen}
+    class="border-border space-y-2 rounded-md border p-3"
+    data-testid="mcp-add-form"
+  >
+    <h3 class="text-fg text-sm font-medium">Add prompt server</h3>
     <label class="block space-y-1">
       <span class="text-muted text-xs">Name</span>
       <Input
         bind:value={name}
-        placeholder="my-team"
+        placeholder="my-server"
         data-testid="mcp-name"
         class={cn("h-8 px-2", nameError && "border-status-failed")}
       />

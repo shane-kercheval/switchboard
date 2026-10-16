@@ -230,7 +230,7 @@ pub enum DiffStyle {
 /// Personal preferences, persisted to `config.yaml`. All fields default, so any
 /// subset may be present in the file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(from = "PreferencesWire")]
 // A bag of independent user toggles — the one shape where a run of bools is the
 // clearest representation, not a state enum waiting to be found.
 #[allow(clippy::struct_excessive_bools)]
@@ -271,11 +271,12 @@ pub struct Preferences {
     /// default, and the Settings copy tells anyone who wants it where to find it.
     pub notify_while_focused: bool,
 
-    /// Whether the app-owned read-only built-in prompts and workflows appear in
-    /// the pickers. Default `true` (show examples); a user who wants only their
-    /// own content turns it off. Visibility only — a workflow wired to a built-in
-    /// still resolves when this is off.
-    pub show_builtins: bool,
+    /// Whether built-in prompts appear in pickers. Defaults on. Hiding them
+    /// does not prevent workflows from resolving built-in prompts by id.
+    pub show_builtin_prompts: bool,
+
+    /// Whether built-in workflows appear in pickers. Defaults on.
+    pub show_builtin_workflows: bool,
 
     /// Whether Claude agents get browser tools, via the Claude in Chrome
     /// extension. Claude-only: the Codex equivalent is a plugin enabled in the
@@ -301,11 +302,66 @@ pub struct Preferences {
 
     /// Per-harness model/effort choices preselected by Add Agent and used when a new
     /// project auto-creates its roster.
+    pub agent_defaults: BTreeMap<HarnessKind, AgentDefaults>,
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+#[allow(clippy::struct_excessive_bools)]
+struct PreferencesWire {
+    editor_command: Option<String>,
+    terminal_app: String,
+    diff_style: DiffStyle,
+    show_builtins: Option<bool>,
+    show_builtin_prompts: Option<bool>,
+    show_builtin_workflows: Option<bool>,
+    claude_chrome_enabled: bool,
+    auto_reading_mode: bool,
+    notify_on_completion: bool,
+    notify_while_focused: bool,
     #[serde(
         default = "default_agent_defaults",
         deserialize_with = "deserialize_agent_defaults"
     )]
-    pub agent_defaults: BTreeMap<HarnessKind, AgentDefaults>,
+    agent_defaults: BTreeMap<HarnessKind, AgentDefaults>,
+}
+
+impl Default for PreferencesWire {
+    fn default() -> Self {
+        let defaults = Preferences::default();
+        Self {
+            editor_command: defaults.editor_command,
+            terminal_app: defaults.terminal_app,
+            diff_style: defaults.diff_style,
+            show_builtins: None,
+            show_builtin_prompts: None,
+            show_builtin_workflows: None,
+            claude_chrome_enabled: defaults.claude_chrome_enabled,
+            auto_reading_mode: defaults.auto_reading_mode,
+            notify_on_completion: defaults.notify_on_completion,
+            notify_while_focused: defaults.notify_while_focused,
+            agent_defaults: defaults.agent_defaults,
+        }
+    }
+}
+
+impl From<PreferencesWire> for Preferences {
+    fn from(wire: PreferencesWire) -> Self {
+        // Each explicit choice takes precedence over the retired shared toggle.
+        let legacy_visibility = wire.show_builtins.unwrap_or(true);
+        Self {
+            editor_command: wire.editor_command,
+            terminal_app: wire.terminal_app,
+            diff_style: wire.diff_style,
+            show_builtin_prompts: wire.show_builtin_prompts.unwrap_or(legacy_visibility),
+            show_builtin_workflows: wire.show_builtin_workflows.unwrap_or(legacy_visibility),
+            claude_chrome_enabled: wire.claude_chrome_enabled,
+            auto_reading_mode: wire.auto_reading_mode,
+            notify_on_completion: wire.notify_on_completion,
+            notify_while_focused: wire.notify_while_focused,
+            agent_defaults: wire.agent_defaults,
+        }
+    }
 }
 
 impl Default for Preferences {
@@ -314,7 +370,8 @@ impl Default for Preferences {
             editor_command: Some("code".to_owned()),
             terminal_app: default_terminal_app(),
             diff_style: DiffStyle::default(),
-            show_builtins: true,
+            show_builtin_prompts: true,
+            show_builtin_workflows: true,
             claude_chrome_enabled: false,
             auto_reading_mode: false,
             notify_on_completion: true,
@@ -382,7 +439,8 @@ impl Preferences {
             editor_command,
             terminal_app,
             diff_style: self.diff_style,
-            show_builtins: self.show_builtins,
+            show_builtin_prompts: self.show_builtin_prompts,
+            show_builtin_workflows: self.show_builtin_workflows,
             claude_chrome_enabled: self.claude_chrome_enabled,
             auto_reading_mode: self.auto_reading_mode,
             notify_on_completion: self.notify_on_completion,
@@ -447,6 +505,7 @@ pub fn save(path: &Path, prefs: &Preferences) -> Result<(), AppError> {
         _ => serde_norway::Mapping::new(),
     };
     switchboard_core::edit_yaml_mapping(path, move |root| {
+        root.remove(serde_norway::Value::String("show_builtins".to_owned()));
         let defaults_key = serde_norway::Value::String("agent_defaults".to_owned());
         if let Some(new_defaults) = fields.remove(&defaults_key) {
             match root.get_mut(&defaults_key) {
@@ -480,7 +539,7 @@ mod tests {
         assert_eq!(p.editor_command.as_deref(), Some("code"));
         assert_eq!(p.terminal_app, "Terminal");
         assert_eq!(p.diff_style, DiffStyle::Unified);
-        assert!(p.show_builtins, "built-ins are shown by default");
+        assert!(p.show_builtin_prompts, "built-ins are shown by default");
         assert!(p.notify_on_completion, "notifications are on by default");
     }
 
@@ -510,13 +569,77 @@ mod tests {
     }
 
     #[test]
-    fn missing_show_builtins_key_defaults_on() {
+    fn missing_builtin_visibility_keys_default_on() {
         // The forward/backward-compat contract: a config.yaml written before this
         // key existed loads with built-ins shown, not hidden.
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, "terminal_app: iTerm\n").unwrap();
-        assert!(load(&path).show_builtins);
+        assert!(load(&path).show_builtin_prompts);
+        assert!(load(&path).show_builtin_workflows);
+    }
+
+    #[test]
+    fn legacy_builtin_visibility_initializes_both_choices_without_rewriting() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        for shown in [false, true] {
+            let original = format!("show_builtins: {shown}\nterminal_app: iTerm\n");
+            std::fs::write(&path, &original).unwrap();
+            let prefs = load(&path);
+            assert_eq!(prefs.show_builtin_prompts, shown);
+            assert_eq!(prefs.show_builtin_workflows, shown);
+            assert_eq!(prefs.terminal_app, "iTerm");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn explicit_builtin_choices_override_legacy_value_independently() {
+        for legacy in [false, true] {
+            for key in ["show_builtin_prompts", "show_builtin_workflows"] {
+                let mut input = serde_json::json!({ "show_builtins": legacy });
+                input[key] = serde_json::json!(!legacy);
+                let prefs: Preferences = serde_json::from_value(input).unwrap();
+                assert_eq!(
+                    prefs.show_builtin_prompts,
+                    if key == "show_builtin_prompts" {
+                        !legacy
+                    } else {
+                        legacy
+                    }
+                );
+                assert_eq!(
+                    prefs.show_builtin_workflows,
+                    if key == "show_builtin_workflows" {
+                        !legacy
+                    } else {
+                        legacy
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn independent_builtin_choices_round_trip_and_retire_shared_key() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        for prompts in [false, true] {
+            for workflows in [false, true] {
+                std::fs::write(&path, "show_builtins: false\nfuture_setting: preserved\n").unwrap();
+                let prefs = Preferences {
+                    show_builtin_prompts: prompts,
+                    show_builtin_workflows: workflows,
+                    ..load(&path)
+                };
+                save(&path, &prefs).unwrap();
+                assert_eq!(load(&path), prefs);
+                let stored: serde_norway::Value = switchboard_core::read_yaml(&path).unwrap();
+                assert!(stored.get("show_builtins").is_none());
+                assert_eq!(stored["future_setting"].as_str(), Some("preserved"));
+            }
+        }
     }
 
     #[test]
@@ -722,7 +845,8 @@ mod tests {
             terminal_app: "iTerm".to_owned(),
             diff_style: DiffStyle::Unified,
             // Non-default so the round-trip exercises an explicitly-off toggle.
-            show_builtins: false,
+            show_builtin_prompts: false,
+            show_builtin_workflows: false,
             // Non-default in the other direction: an explicitly-on toggle.
             claude_chrome_enabled: true,
             auto_reading_mode: false,
@@ -752,7 +876,8 @@ mod tests {
                 editor_command: Some("zed".to_owned()),
                 terminal_app: "iTerm".to_owned(),
                 diff_style: DiffStyle::Unified,
-                show_builtins: true,
+                show_builtin_prompts: true,
+                show_builtin_workflows: true,
                 claude_chrome_enabled: false,
                 auto_reading_mode: false,
                 notify_on_completion: true,
@@ -803,7 +928,8 @@ mod tests {
                     editor_command: Some("zed".to_owned()),
                     terminal_app: "iTerm".to_owned(),
                     diff_style: DiffStyle::Unified,
-                    show_builtins: true,
+                    show_builtin_prompts: true,
+                    show_builtin_workflows: true,
                     claude_chrome_enabled: false,
                     auto_reading_mode: false,
                     notify_on_completion: true,
@@ -895,7 +1021,8 @@ mod tests {
             editor_command: Some("  cursor  ".to_owned()),
             terminal_app: "  iTerm  ".to_owned(),
             diff_style: DiffStyle::Unified,
-            show_builtins: true,
+            show_builtin_prompts: true,
+            show_builtin_workflows: true,
             claude_chrome_enabled: false,
             auto_reading_mode: false,
             notify_on_completion: true,
@@ -915,7 +1042,8 @@ mod tests {
             editor_command: Some("   ".to_owned()),
             terminal_app: "   ".to_owned(),
             diff_style: DiffStyle::default(),
-            show_builtins: true,
+            show_builtin_prompts: true,
+            show_builtin_workflows: true,
             claude_chrome_enabled: false,
             auto_reading_mode: false,
             notify_on_completion: true,

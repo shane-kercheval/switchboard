@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use switchboard_core::{AgentId, CoreError, HarnessKind, ProjectId};
+use switchboard_core::{AgentId, CoreError, HarnessKind, ProjectId, SendId};
 use switchboard_harness::{DispatchError, MessageId};
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +150,36 @@ pub enum AppError {
     #[error("agent {0} not found in any loaded project")]
     AgentNotFound(AgentId),
 
+    /// A single-recipient cancel named a send the agent tools did not make and
+    /// no workflow started through them made: a message the user typed, or a
+    /// wrong id.
+    #[error(
+        "send {send_id} was not made through these tools or by a workflow started through them (it may be one the user typed, or the id is wrong): to stop a reply the user started, tell the user"
+    )]
+    SendNotCancellable { send_id: SendId },
+
+    /// A single-recipient cancel named a send made by a workflow the user
+    /// started from the window.
+    #[error(
+        "send {send_id} belongs to a workflow the user started from Switchboard's window: tell the user rather than cancelling it"
+    )]
+    ReplyInUserWorkflow { send_id: SendId },
+
+    /// An agent-access cancel named a workflow run the user started from the
+    /// window.
+    #[error(
+        "workflow run {run_id} was started by the user from Switchboard's window: tell the user rather than cancelling it"
+    )]
+    RunStartedByUser { run_id: uuid::Uuid },
+
+    /// An agent-access call named an agent the project does not hold: a typo,
+    /// an id from another project, or an agent since removed.
+    #[error("no agent {agent_id} in project {project_id}: list_agents shows the project's agents")]
+    AgentNotInProject {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
+
     /// A forward source resolved to a project the journal read pass never
     /// covered — the read set and the resolve set diverged. Distinct from
     /// `ProjectNotLoaded` on purpose: the project *is* loaded, so "open it"
@@ -203,7 +233,7 @@ pub enum AppError {
     ResumeUnavailable,
 
     #[error(
-        "unsupported terminal app {terminal_app:?} — choose Terminal or iTerm in Settings → External apps"
+        "unsupported terminal app {terminal_app:?} — choose Terminal or iTerm in Settings → General → External Apps"
     )]
     UnsupportedTerminalApp { terminal_app: String },
 
@@ -505,6 +535,33 @@ pub enum AppError {
     #[error("a failed or interrupted workflow run must be dismissed before starting another")]
     WorkflowRunRequiresDismissal { project_id: ProjectId },
 
+    /// A workflow start in a project where an agent is being removed, or was
+    /// removed while the start read the roster. Momentary: starting again reads
+    /// the roster as it is now.
+    #[error("an agent is being removed from this project; start the workflow again in a moment")]
+    WorkflowBlockedByAgentRemoval { project_id: ProjectId },
+
+    /// The agent's record is gone, but saving the change failed afterwards
+    /// (the folder could not be synced), so a crash could bring it back.
+    #[error(
+        "the agent was removed, but saving the change failed, so it may reappear after a crash: {source}"
+    )]
+    AgentRemovalNotDurable {
+        #[source]
+        source: switchboard_core::CoreError,
+    },
+
+    /// Saving the removal failed and the registry could not be read back, so
+    /// whether the record is gone is unknown. The agent refuses messages until
+    /// the app restarts, when the registry decides.
+    #[error(
+        "could not confirm the agent was removed ({source}); it refuses messages until Switchboard restarts"
+    )]
+    AgentRemovalUnconfirmed {
+        #[source]
+        source: switchboard_core::CoreError,
+    },
+
     /// Abandon was asked to clear a run that is still live. The interpreter would
     /// just recreate the file on its next record; cancel it first.
     #[error("workflow run {run_id} is still active; cancel it before abandoning")]
@@ -539,6 +596,136 @@ pub enum AppError {
     #[error("a prompt file already exists at {path}")]
     PromptCopyExists { path: PathBuf },
 
+    /// A send or forward named a recipient that is not in the project's
+    /// roster. Spelled as the remote-control plan spells it (`unknown_recipient`
+    /// on the wire), because both clients validate recipients the same way.
+    #[error("agent {agent_id} is not in project {project_id}'s roster")]
+    UnknownRecipient {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
+
+    /// A turn cannot start because the project's working directory is gone:
+    /// the harness is spawned with it as cwd. Refused before anything is
+    /// journaled, so a caller sees the cause instead of a failed turn.
+    #[error("project {project_id}'s working directory does not exist: {}", path.display())]
+    DirectoryMissing {
+        project_id: ProjectId,
+        path: PathBuf,
+    },
+
+    /// The desktop window reported that it cannot listen to this agent's
+    /// events, so a send to it would run invisibly. Refused per recipient.
+    #[error(
+        "the desktop window is not listening to agent {agent_id}; nothing was sent to it: try again, and if it repeats, ask the user to reopen the project in Switchboard"
+    )]
+    DesktopUnavailable { agent_id: AgentId },
+
+    /// The desktop window did not acknowledge loading the project within the
+    /// sync deadline. Nothing was dispatched; the load keeps running, so a
+    /// retry usually succeeds.
+    #[error(
+        "the desktop window did not finish loading project {0} in time; nothing was sent: try again"
+    )]
+    ProjectLoadTimeout(ProjectId),
+
+    /// The desktop window could not load the project (its open or roster read
+    /// failed), so a turn started now would run where the window cannot show
+    /// it. Nothing was dispatched.
+    #[error("the desktop window could not load project {project_id}: {message}")]
+    DesktopSyncFailed {
+        project_id: ProjectId,
+        message: String,
+    },
+
+    /// A forward's source is still mid-turn past the caller's wait budget.
+    /// The compose was cancelled and nothing was dispatched.
+    #[error(
+        "{name} is still responding, so nothing was sent — wait for it with wait_agent, then forward again; the retry sends to every recipient it names, including any you cancelled"
+    )]
+    SourceBusy { name: String },
+
+    /// A caller-supplied argument is malformed or inconsistent, including a
+    /// retry key reused for a different request.
+    #[error("{0}")]
+    InvalidArgument(String),
+
+    /// The composed message is larger than a harness CLI can take. Checked up
+    /// front on the final body so the whole send is refused before any
+    /// recipient is dispatched; the dispatcher's own check stays as the
+    /// backstop for other callers.
+    #[error("{0}")]
+    PromptTooLarge(DispatchError),
+
+    /// No in-memory record of this send: it was never made, it was pruned, or
+    /// the app restarted since. Waits fall back to the journal; cancels cannot.
+    #[error("send {0} is not known to this Switchboard process")]
+    SendUnknown(SendId),
+
+    /// A single result item cannot fit the reply budget even with every text
+    /// field emptied. `read_with` names the call that reads it in pages, when
+    /// the result type has one; a result with none says only that it is too
+    /// large, because advice the caller cannot follow is worse than none.
+    #[error("{}", too_large_message(*read_with))]
+    ResultTooLarge { read_with: Option<&'static str> },
+
+    /// An error shared between the request that raised it and any retry that
+    /// joined it with the same key. Every `send` and `forward` error arrives in
+    /// this wrapper, always — whether a retry is holding a copy is a matter of
+    /// timing, and an error whose shape depended on timing would be a trap. Use
+    /// [`AppError::root`] to match on the underlying error.
+    #[error("{0}")]
+    Shared(std::sync::Arc<AppError>),
+
+    /// A retry joined an in-flight request with the same key, and its own wait
+    /// budget ran out before the original settled. The original keeps running
+    /// and its key stays claimed: call again with the same key.
+    #[error("request {send_id} is still in progress — call again with the same idempotency_key")]
+    RequestInProgress { send_id: SendId },
+
+    /// A blocking phase was ended by the server's own cancellation (shutdown)
+    /// before it produced a result. Nothing was dispatched.
+    #[error("the operation was interrupted by the server shutting down")]
+    Interrupted,
+
+    /// An invariant the code relies on did not hold. Never caused by the
+    /// caller's input.
+    #[error("internal error: {0}")]
+    Internal(String),
+
+    /// A step before dispatch did not finish within the call's wait budget —
+    /// a slow prompt provider, or opening a forward's source projects. Nothing
+    /// was dispatched; trying again is the right response, not changing the
+    /// request.
+    #[error("{what} did not finish within the wait budget; nothing was sent — try again")]
+    TimedOut { what: &'static str },
+
+    /// A fan-out under `refuse` found these recipients busy up front, so the
+    /// whole send was refused and nothing was dispatched. Names rather than
+    /// ids because the message is what the caller reads; the ids are in the
+    /// request it just made.
+    #[error(
+        "busy: {}; nothing was sent: wait for them with wait_agent, or send again with on_busy queue to line it up behind their turns",
+        names.join(", ")
+    )]
+    RecipientsBusy { names: Vec<String> },
+
+    /// A caller other than the window asked to remove an agent with a turn
+    /// running or queued. The window's own remove cancels that work; a caller
+    /// that cannot see the agent's pane must stop it on purpose first.
+    #[error(
+        "{name} has a turn running or queued: wait for it with wait_agent, or cancel a reply you sent with cancel_send and agent_id, then remove it; if a reply the user started keeps it busy, ask the user"
+    )]
+    RemoveAgentBusy { name: String },
+
+    /// A caller other than the window asked to remove an agent while a
+    /// workflow runs in its project, which may send to the agent in a later
+    /// step.
+    #[error(
+        "a workflow is running in this project and may send to {name}: wait for it with wait_workflow, or cancel it, then remove the agent"
+    )]
+    RemoveAgentWorkflowRunning { name: String },
+
     /// Writing the copied built-in prompt into the user's folder failed.
     #[error("failed to copy prompt to {path}: {source}")]
     PromptCopyIo {
@@ -548,7 +735,26 @@ pub enum AppError {
     },
 }
 
+fn too_large_message(read_with: Option<&'static str>) -> String {
+    match read_with {
+        Some(call) => {
+            format!("the result is too large to return whole; read it in pages with {call}")
+        }
+        None => "the result is too large to return".to_owned(),
+    }
+}
+
 impl AppError {
+    /// The underlying error, with any [`AppError::Shared`] wrappers removed.
+    /// The way to match on an `ops` error's kind.
+    #[must_use]
+    pub fn root(&self) -> &AppError {
+        match self {
+            AppError::Shared(inner) => inner.root(),
+            other => other,
+        }
+    }
+
     pub fn invalid_uuid(value: impl Into<String>, source: uuid::Error) -> Self {
         Self::InvalidUuid {
             value: value.into(),

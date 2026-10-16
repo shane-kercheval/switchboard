@@ -8,6 +8,7 @@ import { agentCopy } from "$lib/agentCopy.svelte";
 import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
 import { _testing as prefsTesting, preferences } from "$lib/preferences.svelte";
 import { WORKFLOW_AUTHORING_GUIDE_URL } from "$lib/workflowAuthoring";
+import { DATA_SCIENCE_ORCHESTRATOR_PROMPT, ORCHESTRATOR_PROMPT } from "$lib/orchestratorPrompt";
 import { DEFAULT_AGENT_SELECTIONS } from "$lib/agentSelection";
 import type { Preferences } from "$lib/types";
 
@@ -27,7 +28,8 @@ const defaultInvoke = async (cmd: string, _args?: Record<string, unknown>): Prom
       editor_command: "code",
       terminal_app: "Terminal",
       diff_style: "unified",
-      show_builtins: true,
+      show_builtin_prompts: true,
+      show_builtin_workflows: true,
       claude_chrome_enabled: false,
       auto_reading_mode: false,
       notify_on_completion: true,
@@ -75,23 +77,37 @@ describe("SettingsView", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it("opens at prompt settings when requested", async () => {
-    const scrollIntoView = vi.fn();
-    const original = HTMLElement.prototype.scrollIntoView;
-    HTMLElement.prototype.scrollIntoView = scrollIntoView;
-    try {
-      render(SettingsView, { props: { onClose: vi.fn(), initialSection: "prompts" } });
-      await waitFor(() => expect(scrollIntoView).toHaveBeenCalledWith({ block: "start" }));
-      expect(screen.getByTestId("prompt-settings-section")).toHaveTextContent(
-        "Prompt servers (MCP)",
-      );
-    } finally {
-      HTMLElement.prototype.scrollIntoView = original;
-    }
+  it("opens the prompts page when requested", async (): Promise<void> => {
+    render(SettingsView, { props: { onClose: vi.fn(), section: "prompts" } });
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Prompts");
+    expect(screen.getByTestId("prompt-settings-section")).toBeVisible();
+    expect(screen.getByTestId("settings-panel-general")).not.toBeVisible();
+  });
+
+  it("shows only the selected category and preserves unfinished prompt input", async (): Promise<void> => {
+    const view = render(SettingsView, { props: { onClose: vi.fn(), section: "prompts" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Add prompt server" }));
+    const name = await screen.findByRole("textbox", { name: "Name" });
+    await fireEvent.input(name, { target: { value: "My prompt server" } });
+    await view.rerender({ section: "general" });
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("General");
+    expect(screen.queryByRole("textbox", { name: "Name" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("auto-reading-mode-toggle")).not.toBeVisible();
+    await view.rerender({ section: "notifications" });
+    expect(screen.getByTestId("auto-reading-mode-toggle")).toBeVisible();
+    expect(screen.getByTestId("notify-toggle")).toBeVisible();
+    await view.rerender({ section: "workflows" });
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Workflows");
+    expect(screen.getByTestId("workflows-open")).toBeVisible();
+    expect(screen.getByTestId("prompt-settings-section")).not.toBeVisible();
+    expect(screen.getByTestId("notify-toggle")).not.toBeVisible();
+    await view.rerender({ section: "prompts" });
+    expect(screen.getByRole("textbox", { name: "Name" })).toHaveValue("My prompt server");
+    expect(screen.getByTestId("workflows-open")).not.toBeVisible();
   });
 
   it("renders a Supported CLIs section with the harness status list", async () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
     expect(screen.getByText("Supported CLIs")).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId("harness-status")).toBeInTheDocument());
     // The shared list probed install status for each harness.
@@ -103,8 +119,8 @@ describe("SettingsView", () => {
   });
 
   it("persists independent quick choices and explicit defaults atomically", async () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
-    await fireEvent.click(await screen.findByText("Codex", { selector: "summary" }));
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+    await fireEvent.click(await screen.findByTestId("agent-defaults-codex-summary"));
     await fireEvent.click(screen.getByTestId("settings-selection-codex-model-choice-gpt-6-astra"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
@@ -121,6 +137,7 @@ describe("SettingsView", () => {
       }),
     );
 
+    expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("GPT-6.1 Sol");
     await fireEvent.change(screen.getByTestId("settings-selection-codex-model-current"), {
       target: { value: "gpt-5.6-terra" },
     });
@@ -138,6 +155,23 @@ describe("SettingsView", () => {
         }),
       }),
     );
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("GPT-5.6 Terra"),
+    );
+  });
+
+  it("shows custom model and effort names and unset defaults in the headers", (): void => {
+    preferences.agent_defaults.codex.default_model = "custom-model";
+    preferences.agent_defaults.codex.default_effort = "custom-effort";
+    preferences.agent_defaults.claude_code.default_model = null;
+    preferences.agent_defaults.claude_code.default_effort = null;
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+    expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent(
+      "Default model: custom-model · Default effort: custom-effort",
+    );
+    expect(screen.getByTestId("agent-defaults-claude_code-summary")).toHaveTextContent(
+      "Default model: Not set · Default effort: Not set",
+    );
   });
 
   it("falls back to the first remaining default when the current choice is removed", async () => {
@@ -147,7 +181,7 @@ describe("SettingsView", () => {
       default_model: "fable",
       default_effort: "high",
     };
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
 
     await fireEvent.click(screen.getByTestId("settings-selection-claude_code-model-choice-fable"));
     await waitFor(() =>
@@ -165,6 +199,9 @@ describe("SettingsView", () => {
       }),
     );
 
+    expect(screen.getByTestId("agent-defaults-claude_code-summary")).toHaveTextContent(
+      "Default effort: High",
+    );
     await fireEvent.click(screen.getByTestId("settings-selection-claude_code-effort-choice-high"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
@@ -180,23 +217,32 @@ describe("SettingsView", () => {
         }),
       }),
     );
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-defaults-claude_code-summary")).toHaveTextContent(
+        "Default effort: Medium",
+      ),
+    );
   });
 
   it("lists every harness in Agent Defaults", () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
     const section = screen.getByTestId("agent-defaults-settings");
     expect(section).toHaveTextContent(
       "Choose which models and reasoning efforts are available for quick switching from the Agents sidebar, and which ones new agents start with. New projects use the same defaults for their initial agents.",
     );
     const labels = Array.from(section.querySelectorAll("summary")).map((el) =>
-      el.textContent?.trim(),
+      el.textContent?.replace(/\s+/g, " ").trim(),
     );
-    expect(labels).toEqual(["Claude", "Codex", "Antigravity"]);
+    expect(labels).toEqual([
+      "Claude Default model: Opus · Default effort: Medium",
+      "Codex Default model: GPT-6.1 Sol · Default effort: Medium",
+      "Antigravity Default model: Gemini 3.8 Flash · Default effort: Medium",
+    ]);
   });
 
   it("shows the Antigravity quick choices and defaults", async () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
-    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+    await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
 
     expect(
       screen.getByTestId("settings-selection-antigravity-model-choice-gemini-3.1-pro"),
@@ -215,8 +261,8 @@ describe("SettingsView", () => {
       default_model: "gemini-3.1-pro",
       default_effort: "high",
     };
-    render(SettingsView, { props: { onClose: vi.fn() } });
-    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    const view = render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+    await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
     const effortDefault = screen.getByTestId("settings-selection-antigravity-effort-current");
     expect(within(effortDefault).getByRole("option", { name: "Medium" })).toBeDisabled();
     await fireEvent.change(effortDefault, { target: { value: "medium" } });
@@ -224,6 +270,7 @@ describe("SettingsView", () => {
       0,
     );
 
+    await view.rerender({ section: "prompts" });
     await fireEvent.click(screen.getByTestId("show-builtins-toggle"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
@@ -248,8 +295,8 @@ describe("SettingsView", () => {
       default_effort: "medium",
     };
     preferences.agent_defaults.antigravity = structuredClone(storedDefaults);
-    render(SettingsView, { props: { onClose: vi.fn() } });
-    const antigravitySummary = screen.getByText("Antigravity", { selector: "summary" });
+    const view = render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+    const antigravitySummary = screen.getByTestId("agent-defaults-antigravity-summary");
     await fireEvent.click(antigravitySummary);
 
     expect(screen.getByTestId("settings-selection-antigravity-invalid")).toBeInTheDocument();
@@ -270,6 +317,7 @@ describe("SettingsView", () => {
       "true",
     );
 
+    await view.rerender({ section: "prompts" });
     await fireEvent.click(screen.getByTestId("show-builtins-toggle"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
@@ -279,6 +327,7 @@ describe("SettingsView", () => {
       }),
     );
 
+    await view.rerender({ section: "agents" });
     await fireEvent.change(screen.getByTestId("settings-selection-antigravity-effort-current"), {
       target: { value: "high" },
     });
@@ -304,8 +353,8 @@ describe("SettingsView", () => {
       default_model: "gemini-3.1-pro",
       default_effort: "medium",
     };
-    const view = render(SettingsView, { props: { onClose: vi.fn() } });
-    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    const view = render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+    await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
     await fireEvent.click(screen.getByTestId("settings-selection-antigravity-effort-choice-high"));
     await waitFor(() =>
       expect(
@@ -314,8 +363,8 @@ describe("SettingsView", () => {
     );
 
     view.unmount();
-    render(SettingsView, { props: { onClose: vi.fn() } });
-    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+    await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
     expect(screen.getByTestId("settings-selection-antigravity-effort-choice-high")).toHaveAttribute(
       "aria-pressed",
       "false",
@@ -329,8 +378,8 @@ describe("SettingsView", () => {
       default_model: "claude-sonnet-4-6",
       default_effort: "high",
     };
-    render(SettingsView, { props: { onClose: vi.fn() } });
-    await fireEvent.click(screen.getByText("Antigravity", { selector: "summary" }));
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+    await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
 
     const effortDefault = screen.getByTestId("settings-selection-antigravity-effort-current");
     expect(within(effortDefault).getByRole("option", { name: "Medium" })).toBeEnabled();
@@ -363,24 +412,29 @@ describe("SettingsView", () => {
       return defaultInvoke(cmd, args);
     });
 
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    const view = render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
     expect(screen.getByTestId("agent-defaults-loading")).toBeInTheDocument();
     expect(screen.queryByTestId("settings-selection-claude_code-model")).toBeNull();
+    await view.rerender({ section: "general" });
     expect(screen.getByTestId("external-editor-command")).toBeDisabled();
     expect(screen.getByTestId("external-terminal-app")).toHaveAttribute("aria-disabled", "true");
     expect(screen.getByTestId("external-terminal-app-option-terminal")).toBeDisabled();
     expect(screen.getByTestId("external-terminal-app-option-iterm")).toBeDisabled();
+    await view.rerender({ section: "notifications" });
     expect(screen.getByTestId("notify-toggle")).toBeDisabled();
     expect(screen.getByTestId("notify-while-focused-toggle")).toBeDisabled();
     expect(screen.getByTestId("auto-reading-mode-toggle")).toBeDisabled();
+    await view.rerender({ section: "prompts" });
     expect(screen.getByTestId("show-builtins-toggle")).toBeDisabled();
+    await view.rerender({ section: "agents" });
     expect(screen.getByTestId("claude-chrome-toggle")).toBeDisabled();
 
     resolvePreferences({
       editor_command: "zed",
       terminal_app: "iTerm",
       diff_style: "unified",
-      show_builtins: true,
+      show_builtin_prompts: true,
+      show_builtin_workflows: true,
       claude_chrome_enabled: false,
       auto_reading_mode: false,
       notify_on_completion: true,
@@ -401,6 +455,7 @@ describe("SettingsView", () => {
         screen.getByTestId("settings-selection-claude_code-model-choice-sonnet"),
       ).toHaveAttribute("aria-pressed", "true"),
     );
+    await view.rerender({ section: "general" });
     const editor = screen.getByTestId("external-editor-command") as HTMLInputElement;
     const terminal = screen.getByTestId("external-terminal-app");
     expect(editor).toBeEnabled();
@@ -421,6 +476,7 @@ describe("SettingsView", () => {
       }),
     );
 
+    await view.rerender({ section: "agents" });
     await fireEvent.click(
       screen.getByTestId("settings-selection-claude_code-effort-choice-medium"),
     );
@@ -502,7 +558,8 @@ describe("SettingsView", () => {
           editor_command: "cursor",
           terminal_app: "Terminal",
           diff_style: "unified",
-          show_builtins: true,
+          show_builtin_prompts: true,
+          show_builtin_workflows: true,
           claude_chrome_enabled: false,
           auto_reading_mode: false,
           notify_on_completion: true,
@@ -522,7 +579,8 @@ describe("SettingsView", () => {
           editor_command: null,
           terminal_app: "Terminal",
           diff_style: "unified",
-          show_builtins: true,
+          show_builtin_prompts: true,
+          show_builtin_workflows: true,
           claude_chrome_enabled: false,
           auto_reading_mode: false,
           notify_on_completion: true,
@@ -545,7 +603,8 @@ describe("SettingsView", () => {
           editor_command: "code",
           terminal_app: "iTerm",
           diff_style: "unified",
-          show_builtins: true,
+          show_builtin_prompts: true,
+          show_builtin_workflows: true,
           claude_chrome_enabled: false,
           auto_reading_mode: false,
           notify_on_completion: true,
@@ -563,7 +622,8 @@ describe("SettingsView", () => {
           editor_command: "code",
           terminal_app: "Terminal",
           diff_style: "unified",
-          show_builtins: true,
+          show_builtin_prompts: true,
+          show_builtin_workflows: true,
           claude_chrome_enabled: false,
           auto_reading_mode: false,
           notify_on_completion: true,
@@ -574,23 +634,54 @@ describe("SettingsView", () => {
     );
   });
 
-  it("toggles show_builtins and persists the change", async () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
-    const toggle = screen.getByTestId("show-builtins-toggle");
-    // Defaults on.
-    expect(toggle).toHaveAttribute("aria-checked", "true");
+  it("saves independent built-in visibility choices on their own pages", async () => {
+    const view = render(SettingsView, { props: { onClose: vi.fn(), section: "prompts" } });
+    const promptToggle = screen.getByRole("switch", { name: "Show built-in prompts" });
+    expect(
+      screen.queryByRole("switch", { name: "Show built-in workflows" }),
+    ).not.toBeInTheDocument();
+    expect(promptToggle).toHaveAttribute("aria-checked", "true");
 
-    await fireEvent.click(toggle);
+    await fireEvent.click(promptToggle);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
-        preferences: expect.objectContaining({ show_builtins: false }),
+        preferences: expect.objectContaining({
+          show_builtin_prompts: false,
+          show_builtin_workflows: true,
+        }),
       }),
     );
-    expect(toggle).toHaveAttribute("aria-checked", "false");
+    await view.rerender({ section: "workflows" });
+    const workflowToggle = screen.getByRole("switch", { name: "Show built-in workflows" });
+    expect(screen.queryByRole("switch", { name: "Show built-in prompts" })).not.toBeInTheDocument();
+    expect(workflowToggle).toHaveAttribute("aria-checked", "true");
+    await fireEvent.click(workflowToggle);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          show_builtin_prompts: false,
+          show_builtin_workflows: false,
+        }),
+      }),
+    );
+    await view.rerender({ section: "prompts" });
+    expect(promptToggle).toBeVisible();
+    expect(promptToggle).toHaveAttribute("aria-checked", "false");
+    await fireEvent.click(promptToggle);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          show_builtin_prompts: true,
+          show_builtin_workflows: false,
+        }),
+      }),
+    );
+    await view.rerender({ section: "workflows" });
+    expect(workflowToggle).toHaveAttribute("aria-checked", "false");
   });
 
   it("toggles claude_chrome_enabled and persists the change", async () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
     const toggle = screen.getByTestId("claude-chrome-toggle");
     // Browser access is opt-in: it must not be on until the user says so.
     expect(toggle).toHaveAttribute("aria-checked", "false");
@@ -614,7 +705,8 @@ describe("SettingsView", () => {
           editor_command: "code",
           terminal_app: "Terminal",
           diff_style: "unified",
-          show_builtins: true,
+          show_builtin_prompts: true,
+          show_builtin_workflows: true,
           claude_chrome_enabled: true,
           auto_reading_mode: false,
           notify_on_completion: true,
@@ -624,7 +716,7 @@ describe("SettingsView", () => {
       return defaultInvoke(cmd, args);
     });
 
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
 
     await waitFor(() =>
       expect(screen.getByTestId("claude-chrome-toggle")).toHaveAttribute("aria-checked", "true"),
@@ -653,7 +745,7 @@ describe("SettingsView", () => {
   });
 
   it("shortcuts section lists expected keyboard shortcuts", () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "shortcuts" } });
     // The command palette is listed first.
     const actions = screen.getAllByTestId("shortcut-action");
     expect(actions[0]).toHaveTextContent("Open command palette");
@@ -669,11 +761,17 @@ describe("SettingsView", () => {
     expect(screen.getByText("Toggle agents sidebar")).toBeInTheDocument();
     expect(screen.getByText("Toggle Agents / Pins sidebar")).toBeInTheDocument();
     expect(screen.getByText("Toggle settings")).toBeInTheDocument();
+    const notifications = screen.getByText("Toggle notifications").parentElement!;
+    expect(Array.from(notifications.querySelectorAll("kbd"), (key) => key.textContent)).toEqual([
+      "⌘",
+      "⇧",
+      "M",
+    ]);
     expect(screen.getByText("Cycle to previous / next pane")).toBeInTheDocument();
   });
 
   it("shows the local prompts folder and opens it in Finder", async () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "prompts" } });
 
     await waitFor(() =>
       expect(screen.getByTestId("local-prompts-dir")).toHaveTextContent(
@@ -687,7 +785,7 @@ describe("SettingsView", () => {
   });
 
   it("shows the user-global workflows folder and opens it in Finder", async () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "workflows" } });
 
     await waitFor(() =>
       expect(screen.getByTestId("workflows-dir")).toHaveTextContent(
@@ -700,12 +798,94 @@ describe("SettingsView", () => {
     expect(invokeMock).toHaveBeenCalledWith("open_workflows_dir", undefined);
   });
 
-  it("previews and copies the workflow authoring prompt", async () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
+  it("previews and copies the engineering orchestrator prompt from the Agent MCP Server panel", async (): Promise<void> => {
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agent-access" } });
 
-    const toggle = screen.getByTestId("workflow-authoring-toggle");
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByTestId("workflow-authoring-prompt")).not.toBeInTheDocument();
+    const help = screen.getByRole("button", {
+      name: "Read and copy the engineering orchestrator prompt",
+    });
+    const preview = screen.getByTestId("orchestrator-prompt");
+    const copy = screen.getByTestId("orchestrator-prompt-copy");
+    expect(preview).not.toBeVisible();
+    await fireEvent.click(help);
+    expect(preview).toBeVisible();
+    expect(preview).toHaveTextContent("You are my stand-in");
+    expect(preview).toHaveTextContent("principal engineer");
+    await fireEvent.click(copy);
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledOnce());
+    expect(copyTextMock.mock.calls[0]![0]).toBe(ORCHESTRATOR_PROMPT);
+  });
+
+  it("opens the data science orchestrator prompt on its own and copies it", async (): Promise<void> => {
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agent-access" } });
+
+    const help = screen.getByRole("button", {
+      name: "Read and copy the data science orchestrator prompt",
+    });
+    const preview = screen.getByTestId("data-science-orchestrator-prompt");
+    const engineering = screen.getByTestId("orchestrator-prompt");
+    expect(preview).not.toBeVisible();
+    await fireEvent.click(help);
+    expect(preview).toBeVisible();
+    expect(engineering).not.toBeVisible();
+    expect(preview).toHaveTextContent("principal data scientist");
+    expect(preview).toHaveTextContent("A result is a claim");
+    await fireEvent.click(screen.getByTestId("data-science-orchestrator-prompt-copy"));
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledOnce());
+    expect(copyTextMock.mock.calls[0]![0]).toBe(DATA_SCIENCE_ORCHESTRATOR_PROMPT);
+    expect(DATA_SCIENCE_ORCHESTRATOR_PROMPT).not.toBe(ORCHESTRATOR_PROMPT);
+    expect(DATA_SCIENCE_ORCHESTRATOR_PROMPT).toContain("## The review loop");
+  });
+
+  it("previews and copies local prompt instructions with the folder once it loads", async (): Promise<void> => {
+    let resolveFolder!: (path: string) => void;
+    const folder = new Promise<string>((resolve) => {
+      resolveFolder = resolve;
+    });
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "local_prompts_dir" ? folder : defaultInvoke(cmd, args),
+    );
+    render(SettingsView, { props: { onClose: vi.fn(), section: "prompts" } });
+
+    const help = screen.getByRole("button", { name: "How to create local prompts" });
+    const preview = screen.getByTestId("local-prompt-authoring-prompt");
+    const copy = screen.getByTestId("local-prompt-authoring-copy");
+    expect(preview).not.toBeVisible();
+    await fireEvent.click(help);
+    expect(preview).toBeVisible();
+    expect(copy).toBeVisible();
+    await fireEvent.click(copy);
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledOnce());
+    expect(copyTextMock.mock.calls[0]![0]).toContain("Before saving, ask me for the folder path");
+
+    const destination = "/Users/test/My prompt library";
+    resolveFolder(destination);
+    await waitFor(() => expect(preview).toHaveTextContent(destination));
+    await fireEvent.click(copy);
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledTimes(2));
+    const copied = copyTextMock.mock.calls[1]![0];
+    expect(copied).toBe(preview.textContent);
+    expect(copied).toContain(destination);
+    expect(copied).not.toContain("Before saving, ask me for the folder path");
+    expect(copied).toContain("---\nname: explain-code");
+    expect(copied).toContain("{{ target }}");
+    expect(copied).toContain("Sync prompts");
+    await fireEvent.click(help);
+    expect(preview).not.toBeVisible();
+  });
+
+  it("previews and copies the workflow authoring prompt", async () => {
+    render(SettingsView, { props: { onClose: vi.fn(), section: "workflows" } });
+
+    const help = screen.getByRole("button", { name: "How to create and run workflows" });
+    expect(help).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("workflow-authoring-copy")).not.toBeVisible();
+    expect(screen.getByTestId("workflow-authoring-prompt")).not.toBeVisible();
+    expect(screen.getByTestId("workflows-open")).toBeVisible();
+    await fireEvent.click(help);
+    expect(screen.getByTestId("workflow-authoring-copy")).toBeVisible();
+
+    expect(screen.getByTestId("workflow-authoring-prompt")).toBeVisible();
 
     await waitFor(() => expect(screen.getByTestId("workflows-dir")).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId("workflow-authoring-copy"));
@@ -715,9 +895,9 @@ describe("SettingsView", () => {
     expect(copied).toContain(WORKFLOW_AUTHORING_GUIDE_URL);
     expect(copied).toContain("/Users/test/Library/Application Support/switchboard/workflows");
 
-    await fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByTestId("workflow-authoring-prompt").textContent).toBe(copied);
+    await fireEvent.click(help);
+    expect(screen.getByTestId("workflow-authoring-prompt")).not.toBeVisible();
   });
 });
 
@@ -731,7 +911,7 @@ describe("SettingsView — notifications", () => {
   };
 
   it("the background-projects toggle is off by default and persists a flip", async () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "notifications" } });
     const toggle = await screen.findByTestId("notify-while-focused-toggle");
     await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
 
@@ -750,7 +930,7 @@ describe("SettingsView — notifications", () => {
   it("disables the background-projects toggle when notifications are off entirely", async () => {
     // It is meaningless on its own — without the master switch there is nothing
     // to route. Leaving it live would offer a choice that does nothing.
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "notifications" } });
     const master = await screen.findByTestId("notify-toggle");
     const nested = screen.getByTestId("notify-while-focused-toggle");
     expect(nested).not.toBeDisabled();
@@ -760,7 +940,7 @@ describe("SettingsView — notifications", () => {
   });
 
   it("the auto-reading-mode toggle is off by default and persists a flip", async () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "notifications" } });
     const toggle = await screen.findByTestId("auto-reading-mode-toggle");
     await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
 
@@ -780,13 +960,16 @@ describe("SettingsView — notifications", () => {
     // Unlike the background-projects toggle it is not a sub-clause of "notify
     // me": hiding the compose box after each send is meaningful on its own as a
     // focus mode, so turning notifications off must not lock the user out of it.
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, {
+      props: { onClose: vi.fn(), section: "notifications" },
+    });
     const master = await screen.findByTestId("notify-toggle");
     const autoReading = screen.getByTestId("auto-reading-mode-toggle");
     expect(autoReading).not.toBeDisabled();
 
     await fireEvent.click(master);
     await waitFor(() => expect(screen.getByTestId("notify-while-focused-toggle")).toBeDisabled());
+    expect(autoReading).toBeVisible();
     expect(autoReading).not.toBeDisabled();
   });
 
@@ -794,14 +977,19 @@ describe("SettingsView — notifications", () => {
     // Both are load-bearing: without the first, testing the toggle while looking
     // at the app reads as broken; without the second, "sound but no banner" looks
     // impossible when it is actually a macOS setting.
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "notifications" } });
     const section = screen.getByTestId("notification-prefs");
-    expect(within(section).getByText(/the project on screen never notifies/i)).toBeInTheDocument();
-    expect(within(section).getByText(/System Settings → Notifications/i)).toBeInTheDocument();
+    const help = within(section).getByRole("button", { name: "How notifications work" });
+    expect(within(section).getByText(/System Settings → Notifications/i)).not.toBeVisible();
+    await fireEvent.click(help);
+    expect(
+      within(section).getByText(/The project on screen only notifies when reading mode is on/i),
+    ).toBeVisible();
+    expect(within(section).getByText(/System Settings → Notifications/i)).toBeVisible();
   });
 
   it("toggle reflects the stored preference and persists a flip", async () => {
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "notifications" } });
     const toggle = await screen.findByTestId("notify-toggle");
     await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
 
@@ -819,7 +1007,7 @@ describe("SettingsView — notifications", () => {
 
   it("warns only when macOS is actually suppressing notifications", async () => {
     withCommand("notification_availability", "suppressed");
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "notifications" } });
     expect(await screen.findByTestId("notify-suppressed")).toBeInTheDocument();
   });
 
@@ -827,7 +1015,7 @@ describe("SettingsView — notifications", () => {
     // The sound-only configuration (alerts off, sound on) classifies as available
     // on the backend, so this is also the assertion that a working setup is not
     // reported as broken.
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "notifications" } });
     await screen.findByTestId("notify-toggle");
     expect(screen.queryByTestId("notify-suppressed")).not.toBeInTheDocument();
   });
@@ -837,7 +1025,7 @@ describe("SettingsView — notifications", () => {
     // isn't an installed app. Showing the blocking warning here would send a
     // developer to System Settings for no reason.
     withCommand("notification_availability", "unavailable");
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "notifications" } });
     await screen.findByTestId("notify-toggle");
     expect(screen.queryByTestId("notify-suppressed")).not.toBeInTheDocument();
   });
@@ -848,7 +1036,7 @@ describe("SettingsView — notifications", () => {
         ? Promise.reject(new Error("boom"))
         : defaultInvoke(c, args),
     );
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "notifications" } });
     await screen.findByTestId("notify-toggle");
     expect(screen.queryByTestId("notify-suppressed")).not.toBeInTheDocument();
   });
@@ -867,10 +1055,18 @@ describe("SettingsView — preference save failures", () => {
     // Previously this surfaced under Git View — plausibly scrolled off screen —
     // so a user would see the toggle flip with no error and assume it stuck.
     failSaves();
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    render(SettingsView, { props: { onClose: vi.fn(), section: "notifications" } });
     await fireEvent.click(await screen.findByTestId("notify-toggle"));
 
     expect(await screen.findByTestId("notify-save-error")).toBeInTheDocument();
+  });
+
+  it("reports a failed reading-mode save on Notifications", async (): Promise<void> => {
+    failSaves();
+    render(SettingsView, { props: { onClose: vi.fn(), section: "notifications" } });
+    await fireEvent.click(screen.getByTestId("auto-reading-mode-toggle"));
+    expect(await screen.findByTestId("reading-mode-save-error")).toBeVisible();
+    expect(screen.queryByTestId("notify-save-error")).not.toBeInTheDocument();
   });
 
   it("reports a failed external-app preference save beside those controls", async () => {
@@ -889,11 +1085,14 @@ describe("SettingsView — preference save failures", () => {
     // object and memory is updated optimistically first, so the Git save below
     // carries the failed notification value with it and does persist it.
     failSaves();
-    render(SettingsView, { props: { onClose: vi.fn() } });
+    const view = render(SettingsView, {
+      props: { onClose: vi.fn(), section: "notifications" },
+    });
     await fireEvent.click(await screen.findByTestId("notify-toggle"));
     expect(await screen.findByTestId("notify-save-error")).toBeInTheDocument();
 
     invokeMock.mockImplementation(defaultInvoke);
+    await view.rerender({ section: "general" });
     const editor = screen.getByTestId("external-editor-command") as HTMLInputElement;
     await fireEvent.input(editor, { target: { value: "cursor" } });
     await fireEvent.change(editor);

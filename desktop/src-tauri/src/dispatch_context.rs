@@ -21,8 +21,9 @@ use std::sync::{Arc, Mutex, Weak};
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId, SessionLocator};
 use switchboard_dispatcher::{
     ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter,
-    MetadataCache, SelectionSnapshot, SessionLocatorSink, TurnPermit,
+    MetadataCache, PreflightRefusal, SelectionSnapshot, SessionLocatorSink, TurnPermit,
 };
+use switchboard_harness::MessageFailureKind;
 use switchboard_harness::{DispatchOptions, HarnessAdapter};
 
 use crate::emitter::SessionMetaObservingEmitter;
@@ -111,6 +112,17 @@ pub struct DispatchDeps {
     pub generation_at_capture: u64,
     /// Read live per dispatch (browser-tools toggle), never frozen at enqueue.
     pub preferences: Arc<Mutex<Preferences>>,
+}
+
+/// The refusal a preflight error becomes on the wire: the error's own text, and
+/// a typed cause only for the one condition a caller must not retry into — the
+/// harness session held by another process.
+fn refusal(error: &crate::error::AppError) -> PreflightRefusal {
+    let refusal = PreflightRefusal::new(error.to_string());
+    match error {
+        crate::error::AppError::SessionInUse => refusal.with_kind(MessageFailureKind::SessionInUse),
+        _ => refusal,
+    }
 }
 
 impl ProjectDispatchContextFactory {
@@ -260,15 +272,18 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
     fn preflight<'a>(
         &'a self,
         agent: &'a AgentRecord,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnPermit, String>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<TurnPermit, PreflightRefusal>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let generation_now = lock(&self.project_generation)
                 .get(&self.project.id)
                 .copied()
                 .unwrap_or(0);
             if generation_now != self.generation_at_capture {
-                return Err(crate::error::AppError::ProjectViewStale(self.project.id).to_string());
+                return Err(refusal(&crate::error::AppError::ProjectViewStale(
+                    self.project.id,
+                )));
             }
             // Fail **closed** when the dispatcher is gone. Upgrade only fails
             // once teardown has begun, and actors can still be draining work
@@ -278,7 +293,7 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
             // which allows: no parent means nothing of ours is writing that
             // session, which is a fact rather than an unknown.)
             let Some(dispatcher) = self.dispatcher.upgrade() else {
-                return Err("Switchboard is shutting down".to_owned());
+                return Err(PreflightRefusal::new("Switchboard is shutting down"));
             };
             if let Some(parent) = crate::commands::busy_fork_source(
                 &self.agents_by_id,
@@ -289,11 +304,11 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
             )
             .await
             {
-                return Err(
-                    crate::error::AppError::ForkSourceBusy { name: parent.name }.to_string()
-                );
+                return Err(refusal(&crate::error::AppError::ForkSourceBusy {
+                    name: parent.name,
+                }));
             }
-            let keys = self.session_lock_keys(agent).map_err(|e| e.to_string())?;
+            let keys = self.session_lock_keys(agent).map_err(|e| refusal(&e))?;
             // **Off the async worker.** Acquisition opens files and, when
             // contended, sleeps through a backoff — and contention is no longer
             // exceptional: an unmaterialized branch deterministically holds its
@@ -307,8 +322,8 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
                 crate::session_lock::acquire_session_locks(&lock_root, &keys)
             })
             .await
-            .map_err(|e| format!("session lock task failed: {e}"))?
-            .map_err(|e| e.to_string())
+            .map_err(|e| PreflightRefusal::new(format!("session lock task failed: {e}")))?
+            .map_err(|e| refusal(&e))
         })
     }
 

@@ -54,9 +54,17 @@ import type {
   TurnId,
 } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
-import { _internal, freshRuntime, runtimeReducer, transcriptReducer } from "./reducers";
+import {
+  _internal,
+  backendUserTurnId,
+  freshRuntime,
+  runStatusAfterPendingRemoved,
+  runtimeReducer,
+  transcriptReducer,
+} from "./reducers";
 import {
   markRecipientStarted,
+  registerAnnouncedRecipient,
   settleAgentIdle,
   settleAgentsRemoved,
   settleRecipient,
@@ -249,6 +257,15 @@ const listenerRegistry = new Map<AgentId, UnlistenFn>();
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const agentHarness = new Map<AgentId, HarnessKind>();
 
+/// Each registered agent's project and display name, for registering a send
+/// another client made with the completion tracker as its announcement arrives.
+/// The compose bar passes both for its own sends; an announcement carries
+/// neither, and the roster that knows them imports this module. Written on
+/// every `registerAgent` call, including the no-op ones for an agent already
+/// registered, so a rename reaches it with the next roster pass.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const agentIdentity = new Map<AgentId, { projectId: ProjectId; name: string }>();
+
 /// In-flight `registerAgent` promises, keyed by `agent_id`. Without this
 /// map, two overlapping `registerAgent` calls for the same agent both
 /// pass the `listenerRegistry.has` check before either reaches the post-
@@ -270,6 +287,13 @@ const pendingRegistrations = new Map<AgentId, Promise<void>>();
 type Heartbeat = { turn_id: TurnId; handle: ReturnType<typeof setTimeout> | undefined };
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const heartbeats = new Map<AgentId, Heartbeat>();
+
+/// Whether the window is listening to this agent's events. A turn for an agent
+/// it is not listening to would run invisibly, and Tauri does not replay
+/// events, so the window reports exactly these agents as safe to send to.
+export function isListening(agentId: AgentId): boolean {
+  return listenerRegistry.has(agentId);
+}
 
 /// Re-attempt an agent's event subscription after [`registerAgent`] recorded a
 /// `listener_error`. Idempotent and safe to call repeatedly: `registerAgent`
@@ -389,11 +413,15 @@ function recordRestoredUsage(agentId: AgentId, hydrate: Required<Hydrate>): void
 /// and a freshly-created agent that's also in `list_agents()` would
 /// otherwise double-register.
 export async function registerAgent(agent: AgentRecord): Promise<void> {
+  agentIdentity.set(agent.id, { projectId: agent.project_id, name: agent.name });
   if (listenerRegistry.has(agent.id)) return;
   const pending = pendingRegistrations.get(agent.id);
   if (pending !== undefined) return pending;
 
-  const promise = (async () => {
+  // Held in an object the body can read: it compares against its own promise
+  // to tell whether it is still the registration in charge of this agent.
+  const own: { promise?: Promise<void> } = {};
+  own.promise = (async () => {
     try {
       // Initialize the runtime entry before subscribing — guarantees that
       // the first event arriving on the channel finds a runtime to
@@ -415,6 +443,13 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
         const unlisten = await listen<NormalizedEvent>(channel, (event) => {
           handleEvent(agent.id, event.payload);
         });
+        // Unregistered while subscribing (its project was deleted, or a
+        // roster refresh gave it up): drop the listener rather than leave one
+        // live for an agent nothing shows.
+        if (pendingRegistrations.get(agent.id) !== own.promise) {
+          unlisten();
+          return;
+        }
         listenerRegistry.set(agent.id, unlisten);
         const settled = runtimes[agent.id];
         if (settled?.listener_error !== undefined) {
@@ -440,11 +475,15 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
         }
       }
     } finally {
-      pendingRegistrations.delete(agent.id);
+      // Only its own entry: after an unregister, a newer registration of the
+      // same agent may own the slot.
+      if (pendingRegistrations.get(agent.id) === own.promise) {
+        pendingRegistrations.delete(agent.id);
+      }
     }
   })();
-  pendingRegistrations.set(agent.id, promise);
-  return promise;
+  pendingRegistrations.set(agent.id, own.promise);
+  return own.promise;
 }
 
 /// Synchronously append a user-role turn AND transition the agent's
@@ -487,6 +526,22 @@ export function dispatchUserTurn(
     });
     return;
   }
+  addPendingUserTurn(runtime, userTurnId, text, attachments, sendId, startedAt);
+}
+
+/// The user row and pending entry of a send not yet started: the window's own
+/// (`dispatchUserTurn`, receipt recorded later) or one another client made
+/// (`send_accepted`, receipt already known).
+function addPendingUserTurn(
+  runtime: AgentRuntime,
+  userTurnId: TurnId,
+  text: string,
+  attachments: Attachment[],
+  sendId: SendId,
+  startedAt: string,
+  messageId?: MessageId,
+): void {
+  const agentId = runtime.agent_id;
   const existing = transcripts[agentId] ?? [];
   setTranscript(
     agentId,
@@ -497,12 +552,87 @@ export function dispatchUserTurn(
   // just lines up behind the running turn. The entry (keyed by user_turn_id,
   // receipt filled later) is what stamps each response's `send_id` and lets a
   // failure prune the right send.
-  const pending = [...(runtime.pending_sends ?? []), { send_id: sendId, user_turn_id: userTurnId }];
+  const entry: PendingSend = { send_id: sendId, user_turn_id: userTurnId };
+  if (messageId !== undefined) entry.message_id = messageId;
+  const pending = [...(runtime.pending_sends ?? []), entry];
   // Only an idle agent transitions to "starting" (the run_status machine
   // governs the single running turn); a send to a busy agent leaves its
   // run_status alone — its turn waits in the backend queue and surfaces when
   // its `turn_start` arrives.
   runtimes[agentId] =
+    runtime.run_status === "idle"
+      ? { ...runtime, run_status: "starting", last_error: undefined, pending_sends: pending }
+      : { ...runtime, pending_sends: pending };
+}
+
+/// A send another client made was accepted into this agent's queue: show it
+/// exactly as the window shows its own — a queued row (or a starting one, for
+/// an idle agent) with the usual cancel button. The row takes the id the
+/// send's later `user_message` derives, so that event finds it rather than
+/// adding a second; the entry carries the receipt, so `turn_start`,
+/// `message_cancelled`, and `message_failed` resolve this send and never the
+/// window's own pending one. Registered with the completion tracker as the
+/// compose bar registers its own, one recipient per announcement, so the
+/// project's quiet-down notification covers it: whoever sent the message, the
+/// user is the one waiting for the project to go quiet. A compaction is not
+/// registered, as the Compact button's is not.
+function admitAnnouncedSend(
+  runtime: AgentRuntime,
+  event: Extract<NormalizedEvent, { type: "send_accepted" }>,
+): void {
+  if (event.kind === "compaction") {
+    admitAnnouncedCompaction(runtime, event);
+    return;
+  }
+  const userTurnId = backendUserTurnId(event.send_id, runtime.agent_id);
+  if ((transcripts[runtime.agent_id] ?? []).some((t) => t.turn_id === userTurnId)) return;
+  const identity = agentIdentity.get(runtime.agent_id);
+  if (identity === undefined) {
+    console.error("[switchboard] send announced to an agent with no identity", {
+      agent_id: runtime.agent_id,
+      send_id: event.send_id,
+    });
+  } else {
+    registerAnnouncedRecipient(event.send_id, identity.projectId, {
+      id: runtime.agent_id,
+      name: identity.name,
+    });
+  }
+  addPendingUserTurn(
+    runtime,
+    userTurnId,
+    event.text,
+    [],
+    event.send_id,
+    event.at,
+    event.message_id,
+  );
+}
+
+/// A compaction another client asked for was accepted into this agent's queue:
+/// register the pending entry the Compact button registers for its own
+/// (`dispatchCompaction`), carrying the receipt, and no user row, since a
+/// compaction is not something the user said. From here the existing paths
+/// apply: `turn_start` resolves the entry as a compaction, the terminal hook
+/// re-reads the project for the recap marker, and a queued one that is
+/// cancelled disappears. Idempotent on the send id, as the announcement can
+/// repeat.
+function admitAnnouncedCompaction(
+  runtime: AgentRuntime,
+  event: Extract<NormalizedEvent, { type: "send_accepted" }>,
+): void {
+  if ((runtime.pending_sends ?? []).some((p) => p.send_id === event.send_id)) return;
+  const pending = [
+    ...(runtime.pending_sends ?? []),
+    {
+      send_id: event.send_id,
+      user_turn_id: backendUserTurnId(event.send_id, runtime.agent_id),
+      kind: "compaction" as const,
+      queued_at: event.at,
+      message_id: event.message_id,
+    },
+  ];
+  runtimes[runtime.agent_id] =
     runtime.run_status === "idle"
       ? { ...runtime, run_status: "starting", last_error: undefined, pending_sends: pending }
       : { ...runtime, pending_sends: pending };
@@ -691,9 +821,10 @@ export function recordSendAccepted(
 /// invoked the `send_message` Tauri IPC which rejected before the backend's
 /// `TurnStart` arrived. Prunes this send's pending entry (by `user_turn_id`,
 /// wherever it sits — a queued send's entry is not at the front) and surfaces
-/// `last_error`. Flips `run_status` back to `"idle"` only if this was the
-/// *starting* send; a queued send failing while another turn is `processing`
-/// must not stomp the live turn. The optimistic user turn stays in the
+/// `last_error`. Flips `run_status` back to `"idle"` only when no queued entry
+/// is left (`runStatusAfterPendingRemoved`): a queued send failing while
+/// another turn is `processing`, or while another send is still queued, must
+/// not stomp what is still going. The optimistic user turn stays in the
 /// transcript (the user did submit it) and a failed agent turn is appended
 /// beneath it, so the failure surfaces in the transcript rather than only in
 /// runtime `last_error`.
@@ -731,16 +862,13 @@ export function failSendStart(
     error !== undefined
       ? { ...runtime.context_report_request, phase: "failed" as const, error: error.message }
       : runtime.context_report_request;
-  runtimes[agentId] =
-    runtime.run_status === "starting"
-      ? {
-          ...runtime,
-          run_status: "idle",
-          last_error: error,
-          pending_sends,
-          context_report_request,
-        }
-      : { ...runtime, last_error: error, pending_sends, context_report_request };
+  runtimes[agentId] = {
+    ...runtime,
+    run_status: runStatusAfterPendingRemoved(runtime, pending_sends),
+    last_error: error,
+    pending_sends,
+    context_report_request,
+  };
   // Surface the failure in the transcript (the same place post-start failures
   // and the post-reload journal marker render it) rather than only in runtime
   // state. The optimistic user turn already sits above it; this adds the failed
@@ -846,6 +974,7 @@ export function unregisterAgents(agentIds: AgentId[]): void {
     }
     pendingRegistrations.delete(agentId);
     agentHarness.delete(agentId);
+    agentIdentity.delete(agentId);
     clearHeartbeat(agentId);
     delete transcripts[agentId];
     delete runtimes[agentId];
@@ -992,6 +1121,11 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
       agent_id: agentId,
       event_type: event.type,
     });
+    return;
+  }
+
+  if (event.type === "send_accepted") {
+    admitAnnouncedSend(priorRuntime, event);
     return;
   }
 

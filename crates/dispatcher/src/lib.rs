@@ -7,8 +7,9 @@
 //! turn's cancellation handle, and an app-injected dispatch-context builder.
 //! The actor is reached only through an `mpsc` **command channel**; the
 //! `Dispatcher` itself holds nothing but a `Mutex<HashMap<AgentId, AgentSlot>>`
-//! of those senders (an `AgentSlot` is `Active(sender)` or `Closing` — the
-//! latter is the resurrection guard during teardown).
+//! of those senders (an `AgentSlot` is `Active(sender)`, `Closing` — the
+//! resurrection guard during teardown — or `Removed`, the same guard made
+//! permanent for a deleted agent).
 //!
 //! Because a single task is the sole consumer of an agent's work, **"one turn
 //! in flight per agent" is structural** — there is no status flag, no RAII
@@ -124,9 +125,10 @@ use switchboard_core::{
     AgentId, AgentRecord, Attachment, SendId, SessionLocator, render_prompt_with_attachments,
 };
 use switchboard_harness::{
-    AdapterEvent, CancelSource, ContextWindowSource, DispatchOptions, EventStream, FailureKind,
-    HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, SessionInventory,
-    SessionMetaSource, TextCapture, TurnId, TurnOutcome, TurnSpend, check_prompt_size,
+    AdapterEvent, AnnouncedSendKind, CancelSource, ContextWindowSource, DispatchOptions,
+    EventStream, FailureKind, HarnessAdapter, MessageFailureKind, MessageId, NormalizedEvent,
+    RateLimitSource, SessionInventory, SessionMetaSource, TextCapture, TurnId, TurnOutcome,
+    TurnSpend, check_prompt_size,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -259,11 +261,18 @@ enum WorkPayload {
         /// the live user message identical to the reloaded journal view by
         /// construction.
         emit_user_message: bool,
+        /// Emit [`NormalizedEvent::SendAccepted`] when the actor admits this
+        /// send, before its turn starts. Set for a send another client made,
+        /// so the window can show it queued and cancel it like its own.
+        announce_accepted: bool,
     },
     /// Ask the harness to compact the agent's **own existing conversation**.
     /// Carries no prompt and no attachments — it is not something the user said,
-    /// and nothing about it is journaled.
-    Compact,
+    /// and nothing about it is journaled. `announce_accepted` as for a send: a
+    /// compaction another client asked for is announced at admission, with
+    /// its kind, so the window shows the compaction row it would show for
+    /// its own.
+    Compact { announce_accepted: bool },
     /// Ask the harness what is occupying the agent's context window. Like
     /// `Compact` it carries no prompt and journals nothing; unlike it, it costs
     /// nothing and changes nothing — but it still writes to the session file, so
@@ -276,7 +285,7 @@ impl WorkPayload {
     fn kind(&self) -> TurnKind {
         match self {
             Self::Send { .. } => TurnKind::Send,
-            Self::Compact => TurnKind::Compaction,
+            Self::Compact { .. } => TurnKind::Compaction,
             Self::ContextReport => TurnKind::ContextReport,
         }
     }
@@ -438,6 +447,41 @@ pub enum OnBusy {
     FailFast,
 }
 
+/// What a caller of [`Dispatcher::send_message_with`] chooses that the compose
+/// path leaves to defaults.
+///
+/// `message_id`: the receipt id for this send. `None` mints one (the compose
+/// path). A caller that must correlate the send's events before the dispatch
+/// returns chooses it: the actor can emit the send's first event before the
+/// caller has the receipt back, so an observer of the event stream (the MCP
+/// send ledger) registers the id first and then dispatches, with no orphan
+/// map and no fallback matching.
+///
+/// `emit_user_message`: emit a live `user_message` for the send once it is
+/// durable. `false` for the compose path, which renders its user turn
+/// optimistically; `true` for a backend-originated send that has no frontend
+/// optimistic turn.
+///
+/// `announce_accepted`: emit `send_accepted` as the actor admits the send, so
+/// the window can show a send it did not make as queued, with its cancel
+/// button, before the turn starts. `false` for the compose path, whose row
+/// already exists, and for workflow sends, which stay as they were.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SendOptions {
+    pub message_id: Option<MessageId>,
+    pub emit_user_message: bool,
+    pub announce_accepted: bool,
+}
+
+/// How a compaction is queued: the receipt's `message_id`, when the caller
+/// registered it ahead of the actor's first event, and whether its admission
+/// is announced (`NormalizedEvent::SendAccepted` with `kind: compaction`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactOptions {
+    pub message_id: Option<MessageId>,
+    pub announce_accepted: bool,
+}
+
 /// Result of `send_message`. `Busy` is only possible under [`OnBusy::FailFast`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendOutcome {
@@ -535,6 +579,10 @@ enum Command {
     /// session handoff uses this to avoid starting a second process against a
     /// harness session Switchboard is still driving.
     PeekWorkPending { reply: oneshot::Sender<bool> },
+    /// Reply `true` iff an `Enqueue` under `FailFast` arriving now would be
+    /// accepted — see [`Dispatcher::accepts_now`]. Answered with the same
+    /// predicate the `FailFast` admission arm uses, so the two cannot drift.
+    PeekAcceptsNow { reply: oneshot::Sender<bool> },
     /// Cancel the running turn (out-of-band; no-op if none is live).
     Cancel(CancelSource),
     /// Cancel a whole *send* on this agent: fire the running turn's cancel
@@ -562,21 +610,6 @@ enum Command {
     },
 }
 
-/// The dispatcher's per-agent map slot.
-///
-/// `Active` holds the actor's command sender (no `busy` watch — contention is
-/// decided inside the actor for `FailFast`, and teardown completion comes from
-/// the `Shutdown` reply, so a watch would be dead state inviting a
-/// check-then-act race).
-///
-/// `Closing` is the **resurrection guard**: while an agent is being torn down
-/// (`shutdown_agent`), its slot is `Closing` so a racing `send_message` is
-/// rejected rather than spawning a *fresh* actor that would drive the same
-/// harness session concurrently with the draining turn (the double-drive the
-/// project lock exists to prevent). The dispatcher upholds its own
-/// one-driver-per-agent invariant here rather than relying on an app-layer
-/// guard. The entry is removed only after the actor's `Shutdown` reply, so a
-/// *later* send (e.g. project re-open) creates a new actor normally.
 /// Outcome of classifying a slot for [`Dispatcher::is_safe_to_fork_from`].
 /// Extracted so the `Closing` arm is testable: teardown completes too quickly to
 /// observe reliably through the public API, and an untested guard is one someone
@@ -592,16 +625,126 @@ fn fork_safety_from_slot(slot: Option<&AgentSlot>) -> SlotForkSafety {
         // Mid-teardown: the slot flips to `Closing` before cancellation and
         // subprocess drain finish, so the agent may still be writing its session
         // file. Unknowable means unsafe.
-        Some(AgentSlot::Closing) => SlotForkSafety::Decided(false),
-        // No actor ever existed, or it has fully exited — nothing of ours is
-        // writing that session.
-        None => SlotForkSafety::Decided(true),
+        Some(AgentSlot::Closing { .. }) => SlotForkSafety::Decided(false),
+        // No actor ever existed, or it has fully exited (a removed agent's
+        // has: its slot turns `Removed` only after its drain) — nothing of
+        // ours is writing that session.
+        None | Some(AgentSlot::Removed) => SlotForkSafety::Decided(true),
     }
 }
 
+/// The dispatcher's per-agent map slot.
+///
+/// `Active` holds the actor's command sender (no `busy` watch — contention is
+/// decided inside the actor for `FailFast`, and teardown completion comes from
+/// the `Shutdown` reply, so a watch would be dead state inviting a
+/// check-then-act race).
+///
+/// `Closing` is the **resurrection guard**: while an agent is being torn down
+/// (`shutdown_agent`), its slot is `Closing` so a racing `send_message` is
+/// rejected rather than spawning a *fresh* actor that would drive the same
+/// harness session concurrently with the draining turn (the double-drive the
+/// project lock exists to prevent). The dispatcher upholds its own
+/// one-driver-per-agent invariant here rather than relying on an app-layer
+/// guard. The entry is removed only after the actor's `Shutdown` reply, so a
+/// *later* send (e.g. project re-open) creates a new actor normally. Its
+/// `removed` flag is set by a removal that joins another shutdown: the slot
+/// then becomes `Removed` instead of clearing. The flag is never taken back,
+/// because the removal that set it cannot know whether another removal still
+/// counts on it; only a removal that closed the slot itself, and failed with
+/// no other removal involved, leaves the agent usable.
+///
+/// `Removed` is permanent: the agent was deleted ([`Dispatcher::remove_agent`]),
+/// so no send may start it again, whoever sent it and however late. Without
+/// it, a send that found the agent's record just before the deletion would
+/// start a fresh actor whose turn nothing could see or stop. Agent ids are
+/// never reused, so the mark costs one map entry until the app quits.
 enum AgentSlot {
     Active(mpsc::UnboundedSender<Command>),
-    Closing,
+    Closing {
+        /// A removal joined this shutdown: once the actor has stopped, the slot
+        /// becomes `Removed` instead of clearing, so nothing can start the
+        /// agent in between. Never cleared once set.
+        removed: bool,
+    },
+    Removed,
+}
+
+/// An actor told to shut down, its slot `Closing` until the caller settles it.
+/// Dropped before the actor has stopped (its caller was cancelled), it waits
+/// for the actor in the background and then clears the slot, so a `Closing`
+/// slot never outlives its actor with nobody left to clear it: that agent
+/// would refuse every send until the app restarted.
+struct Closing {
+    agents: Arc<Mutex<HashMap<AgentId, AgentSlot>>>,
+    agent_id: AgentId,
+    /// The actor's command sender, held until it stops: the slot no longer
+    /// holds one, and an actor whose channel has no sender left sees it closed
+    /// while it is still finishing its turn.
+    sender: mpsc::UnboundedSender<Command>,
+    /// The actor's `Shutdown` reply; `None` once received, or when the actor
+    /// was already gone.
+    stopped: Option<oneshot::Receiver<()>>,
+}
+
+impl Closing {
+    /// Wait for the actor to stop. The slot stays `Closing` for the caller to
+    /// settle.
+    async fn stopped(&mut self) {
+        if let Some(stopped) = self.stopped.as_mut() {
+            let _ = stopped.await;
+        }
+        self.stopped = None;
+    }
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        let Some(stopped) = self.stopped.take() else {
+            return;
+        };
+        let agents = Arc::clone(&self.agents);
+        let agent_id = self.agent_id;
+        let sender = self.sender.clone();
+        let finish = async move {
+            let _ = stopped.await;
+            drop(sender);
+            finish_closing(&agents, agent_id);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(finish);
+            }
+            // No runtime means nothing can send to the agent either.
+            Err(_) => finish_closing(&self.agents, agent_id),
+        }
+    }
+}
+
+/// How a removal holds the agent's slot.
+enum RemovalClaim {
+    /// This removal closed the slot: it waits for the actor, if there was one,
+    /// and settles the slot itself.
+    Owner(Option<Closing>),
+    /// Another shutdown holds the slot (flagged for removal now), or the agent
+    /// is already removed.
+    Joined,
+}
+
+/// Settle a `Closing` slot once its actor has stopped: cleared, so a later
+/// send starts a fresh actor, or `Removed` when a removal deleted the agent
+/// meanwhile. Any other state is left alone.
+fn finish_closing(agents: &Mutex<HashMap<AgentId, AgentSlot>>, agent_id: AgentId) {
+    let mut agents = lock(agents);
+    match agents.get(&agent_id) {
+        Some(AgentSlot::Closing { removed: true }) => {
+            agents.insert(agent_id, AgentSlot::Removed);
+        }
+        Some(AgentSlot::Closing { removed: false }) => {
+            agents.remove(&agent_id);
+        }
+        _ => {}
+    }
 }
 
 /// Errors returned by the conversation-journal write contract. See
@@ -956,6 +1099,34 @@ pub struct DispatchContext {
     pub locator_sink: Arc<dyn SessionLocatorSink>,
 }
 
+/// Why [`DispatchContextFactory::preflight`] refused to start a turn.
+///
+/// `message` is what the user reads on the failed send. `kind` is set only for
+/// a cause a program should act on differently from a generic failure, and
+/// rides out on the `MessageFailed` event; `None` for every other refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightRefusal {
+    pub message: String,
+    pub kind: Option<MessageFailureKind>,
+}
+
+impl PreflightRefusal {
+    /// A refusal with no typed cause.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_kind(mut self, kind: MessageFailureKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+}
+
 /// What a turn must keep alive for its whole lifetime, handed back by
 /// [`DispatchContextFactory::preflight`] and bound by the turn loop until the
 /// turn ends.
@@ -1056,8 +1227,9 @@ pub trait DispatchContextFactory: Send + Sync {
     fn preflight<'a>(
         &'a self,
         agent: &'a AgentRecord,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnPermit, String>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<TurnPermit, PreflightRefusal>> + Send + 'a>,
+    > {
         let _ = agent;
         Box::pin(async { Ok(TurnPermit::none()) })
     }
@@ -1074,23 +1246,27 @@ pub trait DispatchContextFactory: Send + Sync {
 /// Holds only the per-agent command-channel senders; all per-agent mutable
 /// state lives inside each agent's actor task.
 pub struct Dispatcher {
-    agents: Mutex<HashMap<AgentId, AgentSlot>>,
+    /// Shared with an abandoned shutdown's background cleanup ([`Closing`]).
+    agents: Arc<Mutex<HashMap<AgentId, AgentSlot>>>,
 }
 
 impl Dispatcher {
     pub fn new() -> Self {
         Self {
-            agents: Mutex::new(HashMap::new()),
+            agents: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Number of live agent slots — `Active` actors plus any mid-teardown
     /// `Closing` slots. Zero means no actor (and therefore no harness
     /// subprocess) is being kept alive. Used to assert that teardown leaves no
-    /// orphan actor.
+    /// orphan actor. A removed agent's mark holds no actor and is not counted.
     #[must_use]
     pub fn agent_slot_count(&self) -> usize {
-        lock(&self.agents).len()
+        lock(&self.agents)
+            .values()
+            .filter(|slot| !matches!(slot, AgentSlot::Removed))
+            .count()
     }
 
     /// Accept a send for `agent_id`, spawning the agent's actor on first use.
@@ -1113,21 +1289,83 @@ impl Dispatcher {
         factory: Arc<dyn DispatchContextFactory>,
         on_busy: OnBusy,
     ) -> SendOutcome {
+        self.send_message_with(
+            agent_id,
+            prompt,
+            attachments,
+            send_id,
+            factory,
+            on_busy,
+            SendOptions::default(),
+        )
+        .await
+    }
+
+    /// [`send_message`](Self::send_message) with the caller choosing what the
+    /// compose path leaves to defaults — see [`SendOptions`]. The compose path
+    /// keeps calling `send_message`, so its behaviour is unchanged by
+    /// construction.
+    // The compose path's six arguments plus the options struct; folding the
+    // dispatch identity into the struct would make the struct carry what every
+    // caller must supply anyway.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_message_with(
+        &self,
+        agent_id: AgentId,
+        prompt: &str,
+        attachments: Vec<Attachment>,
+        send_id: SendId,
+        factory: Arc<dyn DispatchContextFactory>,
+        on_busy: OnBusy,
+        options: SendOptions,
+    ) -> SendOutcome {
         let selection = factory.selection_snapshot();
         let item = WorkItem {
-            message_id: Uuid::now_v7(),
+            message_id: options.message_id.unwrap_or_else(Uuid::now_v7),
             send_id,
             payload: WorkPayload::Send {
                 prompt: prompt.to_owned(),
                 attachments,
-                // Compose-bar sends render their user turn optimistically on the
-                // frontend; no backend-emitted user message.
-                emit_user_message: false,
+                emit_user_message: options.emit_user_message,
+                announce_accepted: options.announce_accepted,
             },
             selection,
             completion: None,
         };
         self.accept(agent_id, item, factory, on_busy).await
+    }
+
+    /// Whether a send to `agent_id` would be accepted **right now** under
+    /// [`OnBusy::FailFast`] — the same rule the actor applies when it admits
+    /// one: true with no actor, true when idle with an empty backlog, true when
+    /// the running turn has reached its terminal and nothing is queued (the
+    /// post-terminal drain accept), false otherwise and for a closing agent.
+    ///
+    /// Exists beside [`Self::has_pending_work`] because that one answers true
+    /// for the whole turn including its post-terminal drain, so an up-front
+    /// check built on it would refuse sends the dispatcher would accept, such
+    /// as an immediate follow-up after the turn's terminal was observed. This
+    /// is an observation, not a reservation: another caller can occupy the
+    /// agent between the answer and the send, which then returns `Busy`.
+    pub async fn accepts_now(&self, agent_id: AgentId) -> bool {
+        let commands = {
+            let agents = lock(&self.agents);
+            match agents.get(&agent_id) {
+                Some(AgentSlot::Active(tx)) => tx.clone(),
+                Some(AgentSlot::Closing { .. } | AgentSlot::Removed) => return false,
+                None => return true,
+            }
+        };
+        let (tx, rx) = oneshot::channel();
+        if commands
+            .send(Command::PeekAcceptsNow { reply: tx })
+            .is_err()
+        {
+            // The actor is gone between the lock and the send; a fresh actor
+            // would be spawned for the send, so it would be accepted.
+            return true;
+        }
+        rx.await.unwrap_or(false)
     }
 
     /// Accept a **manual context compaction** for `agent_id`: ask the harness to
@@ -1161,14 +1399,29 @@ impl Dispatcher {
         send_id: SendId,
         factory: &Arc<dyn DispatchContextFactory>,
     ) -> MessageId {
+        self.compact_agent_with(agent_id, send_id, factory, CompactOptions::default())
+    }
+
+    /// [`Self::compact_agent`] with the receipt's `message_id` chosen by the
+    /// caller and the admission announced, for a compaction another client
+    /// asked for; the `send_message_with` pattern.
+    pub fn compact_agent_with(
+        &self,
+        agent_id: AgentId,
+        send_id: SendId,
+        factory: &Arc<dyn DispatchContextFactory>,
+        options: CompactOptions,
+    ) -> MessageId {
         // Snapshotted like a send's: the compaction must run under the model the
         // user had selected when they asked for it, not whatever is selected by
         // the time the backlog reaches it.
         let selection = factory.selection_snapshot();
         let item = WorkItem {
-            message_id: Uuid::now_v7(),
+            message_id: options.message_id.unwrap_or_else(Uuid::now_v7),
             send_id,
-            payload: WorkPayload::Compact,
+            payload: WorkPayload::Compact {
+                announce_accepted: options.announce_accepted,
+            },
             selection,
             completion: None,
         };
@@ -1277,6 +1530,7 @@ impl Dispatcher {
                 prompt: prompt.to_owned(),
                 attachments,
                 emit_user_message,
+                announce_accepted: false,
             },
             selection,
             completion: Some(completion_tx),
@@ -1306,13 +1560,13 @@ impl Dispatcher {
         match on_busy {
             OnBusy::Enqueue => SendOutcome::Accepted(self.enqueue(agent_id, item, &factory)),
             OnBusy::FailFast => {
-                // `None` ⇒ the agent is `Closing` (mid-teardown): reject rather
-                // than resurrect it with a fresh actor. Fail-fast must not
-                // falsely report acceptance, so the rejection is just `Busy` —
-                // nothing was enqueued, and there is no optimistic UI bubble
-                // waiting on an event (this path has a caller awaiting a
+                // Refused ⇒ the agent is `Closing` (mid-teardown) or `Removed`:
+                // reject rather than resurrect it with a fresh actor. Fail-fast
+                // must not falsely report acceptance, so the rejection is just
+                // `Busy` — nothing was enqueued, and there is no optimistic UI
+                // bubble waiting on an event (this path has a caller awaiting a
                 // `SendOutcome` instead).
-                let Some(commands) = self.ensure_actor(agent_id, factory) else {
+                let Ok(commands) = self.ensure_actor(agent_id, factory) else {
                     return SendOutcome::Busy;
                 };
                 let (tx, rx) = oneshot::channel();
@@ -1352,9 +1606,14 @@ impl Dispatcher {
         factory: &Arc<dyn DispatchContextFactory>,
     ) -> MessageId {
         let message_id = item.message_id;
+        let send_id = item.send_id;
+        // Taken before the item moves into the channel: an announced item that
+        // the actor refuses is still announced, so the window holds the entry
+        // its failure resolves against instead of guessing at another.
+        let announcement = announcement_of(&item);
         let failure = match self.ensure_actor(agent_id, Arc::clone(factory)) {
-            None => Some("agent is shutting down"),
-            Some(commands) => commands
+            Err(reason) => Some(reason),
+            Ok(commands) => commands
                 .send(Command::Enqueue {
                     item,
                     on_busy: OnBusy::Enqueue,
@@ -1364,15 +1623,28 @@ impl Dispatcher {
                 .then_some("agent worker is unavailable"),
         };
         if let Some(reason) = failure {
+            let emitter = factory.idle_emitter();
+            let channel = channel_name(agent_id);
+            if let Some(announcement) = announcement {
+                emit_announcement(
+                    emitter.as_ref(),
+                    &channel,
+                    agent_id,
+                    message_id,
+                    send_id,
+                    announcement,
+                );
+            }
             emit_message_failed(
-                factory.idle_emitter().as_ref(),
-                &channel_name(agent_id),
+                emitter.as_ref(),
+                &channel,
                 message_id,
                 // Pre-`record_send`: the actor never ran it, so there is no
                 // durable record for a reload to reconstruct.
                 None,
                 agent_id,
                 reason,
+                None,
             );
         }
         message_id
@@ -1568,8 +1840,8 @@ impl Dispatcher {
             let agents = lock(&self.agents);
             match agents.get(&agent_id) {
                 Some(AgentSlot::Active(tx)) => tx.clone(),
-                Some(AgentSlot::Closing) => return true,
-                None => return false,
+                Some(AgentSlot::Closing { .. }) => return true,
+                None | Some(AgentSlot::Removed) => return false,
             }
         };
         let (tx, rx) = oneshot::channel();
@@ -1593,47 +1865,159 @@ impl Dispatcher {
     /// the harness session, and no *fresh* turn starts mid-teardown. Dropping
     /// the slot only after the reply lets a *later* send (e.g. project re-open)
     /// create a new actor normally.
+    ///
+    /// Cancel-safe: dropped before the actor stops, the slot is still cleared
+    /// once it has (see [`Closing`]).
     pub async fn shutdown_agent(&self, agent_id: AgentId, source: CancelSource) {
+        // No actor, or already `Closing` (a concurrent shutdown owns the drain
+        // and the clearing) or `Removed` — nothing for this call to do.
+        let Some(mut closing) = self.begin_close(agent_id, source) else {
+            return;
+        };
+        closing.stopped().await;
+        // Actor has stopped — drop the `Closing` slot so the agent can be
+        // re-created by a later send (or mark it removed, if a removal deleted
+        // it meanwhile).
+        finish_closing(&self.agents, agent_id);
+    }
+
+    /// Remove `agent_id` for good: shut its actor down as
+    /// [`Self::shutdown_agent`] does (its running turn cancelled, its backlog
+    /// dropped), then run `deregister`, which deletes the agent's record and
+    /// returns whether the record is gone, with its own result. Gone, the slot
+    /// becomes `Removed` and no later send can start the agent again; still
+    /// there (the deletion failed), the agent works as before.
+    ///
+    /// The slot is `Closing` from before the shutdown until it is settled, and
+    /// `deregister` runs with no await after the actor stops, so no send can
+    /// start a fresh actor between the shutdown and the deletion. With no actor
+    /// at all, the slot is held `Closing` for the deletion the same way. When
+    /// another shutdown already holds the slot, this removal flags it, so the
+    /// slot turns `Removed` rather than clearing when that shutdown's actor
+    /// stops, and runs `deregister` at once.
+    ///
+    /// A failed deletion never takes a flag back: another removal joined to
+    /// the same slot may still be deleting, and reopening the agent under it
+    /// would let a send start an actor whose record then disappears. So the
+    /// agent is left usable only when this removal closed the slot itself and
+    /// no other removal joined it; when every removal of an overlap fails, it
+    /// refuses sends until the app restarts.
+    ///
+    /// Cancelled while the actor stops, `deregister` never runs and the slot
+    /// is cleared once the actor has stopped, leaving the agent in place.
+    pub async fn remove_agent<T>(
+        &self,
+        agent_id: AgentId,
+        source: CancelSource,
+        deregister: impl FnOnce() -> (bool, T),
+    ) -> T {
+        let owner = match self.claim_for_removal(agent_id, source) {
+            RemovalClaim::Owner(mut closing) => {
+                if let Some(closing) = closing.as_mut() {
+                    closing.stopped().await;
+                }
+                true
+            }
+            RemovalClaim::Joined => false,
+        };
+        let (gone, value) = deregister();
+        let mut agents = lock(&self.agents);
+        match (gone, owner) {
+            (true, true) => {
+                agents.insert(agent_id, AgentSlot::Removed);
+            }
+            // The other shutdown turns the slot `Removed` when it finishes. A
+            // failure leaves the flag this removal set: see above.
+            (_, false) => {}
+            // Cleared, unless another removal joined and flagged it meanwhile.
+            (false, true) => {
+                drop(agents);
+                finish_closing(&self.agents, agent_id);
+            }
+        }
+        value
+    }
+
+    /// Take the slot for a removal in one step: an actor is told to shut down
+    /// and no actor is held `Closing`, both owned by this removal; a slot
+    /// another shutdown holds is flagged for removal instead.
+    fn claim_for_removal(&self, agent_id: AgentId, source: CancelSource) -> RemovalClaim {
+        let sender = {
+            let mut agents = lock(&self.agents);
+            match agents.get_mut(&agent_id) {
+                Some(AgentSlot::Closing { removed }) => {
+                    *removed = true;
+                    return RemovalClaim::Joined;
+                }
+                Some(AgentSlot::Removed) => return RemovalClaim::Joined,
+                Some(AgentSlot::Active(_)) | None => {}
+            }
+            match agents.insert(agent_id, AgentSlot::Closing { removed: false }) {
+                Some(AgentSlot::Active(tx)) => tx,
+                _ => return RemovalClaim::Owner(None),
+            }
+        };
+        RemovalClaim::Owner(Some(self.shut_down(agent_id, sender, source)))
+    }
+
+    /// Mark an `Active` slot `Closing` and tell its actor to shut down; `None`
+    /// when there is no actor, or it is already closing or removed.
+    fn begin_close(&self, agent_id: AgentId, source: CancelSource) -> Option<Closing> {
         let sender = {
             let mut agents = lock(&self.agents);
             match agents.get_mut(&agent_id) {
                 Some(slot) if matches!(slot, AgentSlot::Active(_)) => {
-                    let AgentSlot::Active(tx) = std::mem::replace(slot, AgentSlot::Closing) else {
+                    let AgentSlot::Active(tx) =
+                        std::mem::replace(slot, AgentSlot::Closing { removed: false })
+                    else {
                         unreachable!("matched Active above")
                     };
                     tx
                 }
-                // No actor, or already `Closing` (a concurrent shutdown owns the
-                // drain + removal) — nothing for this call to do.
-                _ => return,
+                _ => return None,
             }
         };
+        Some(self.shut_down(agent_id, sender, source))
+    }
+
+    /// Tell an actor whose slot is now `Closing` to shut down.
+    fn shut_down(
+        &self,
+        agent_id: AgentId,
+        sender: mpsc::UnboundedSender<Command>,
+        source: CancelSource,
+    ) -> Closing {
         let (tx, rx) = oneshot::channel();
-        if sender.send(Command::Shutdown { source, reply: tx }).is_ok() {
-            let _ = rx.await;
+        let stopped = sender
+            .send(Command::Shutdown { source, reply: tx })
+            .is_ok()
+            .then_some(rx);
+        Closing {
+            agents: Arc::clone(&self.agents),
+            agent_id,
+            sender,
+            stopped,
         }
-        // Actor has stopped — drop the `Closing` slot so the agent can be
-        // re-created by a later send.
-        lock(&self.agents).remove(&agent_id);
     }
 
     /// Get the command sender for an agent's actor, spawning it on first use.
-    /// Returns `None` if the agent is `Closing` (mid-teardown) — the caller must
-    /// reject the send rather than resurrect a torn-down agent.
+    /// Refuses, with the reason, an agent that is `Closing` (mid-teardown) or
+    /// `Removed`: the caller must reject the send rather than resurrect it.
     fn ensure_actor(
         &self,
         agent_id: AgentId,
         factory: Arc<dyn DispatchContextFactory>,
-    ) -> Option<mpsc::UnboundedSender<Command>> {
+    ) -> Result<mpsc::UnboundedSender<Command>, &'static str> {
         let mut agents = lock(&self.agents);
         match agents.get(&agent_id) {
-            Some(AgentSlot::Active(tx)) => Some(tx.clone()),
-            Some(AgentSlot::Closing) => None,
+            Some(AgentSlot::Active(tx)) => Ok(tx.clone()),
+            Some(AgentSlot::Closing { .. }) => Err("agent is shutting down"),
+            Some(AgentSlot::Removed) => Err("agent was removed"),
             None => {
                 let (tx, rx) = mpsc::unbounded_channel();
                 agents.insert(agent_id, AgentSlot::Active(tx.clone()));
                 tokio::spawn(agent_actor(agent_id, factory, rx));
-                Some(tx)
+                Ok(tx)
             }
         }
     }
@@ -1759,6 +2143,7 @@ fn abandon_backlog(
             None,
             agent_id,
             "agent is shutting down",
+            None,
         );
     }
 }
@@ -1786,7 +2171,7 @@ fn apply_idle_command(
             // Idle ⇒ nothing is running and the backlog drains fully before we
             // park, so FailFast is satisfiable: accept.
             let message_id = item.message_id;
-            backlog.push_back(item);
+            admit(backlog, item, emitter, channel, agent_id);
             if let Some(reply) = reply {
                 let _ = reply.send(SendOutcome::Accepted(message_id));
             }
@@ -1809,6 +2194,12 @@ fn apply_idle_command(
         }
         Command::PeekWorkPending { reply } => {
             let _ = reply.send(!backlog.is_empty());
+            IdleAfter::Continue
+        }
+        // Idle ⇒ a FailFast send is accepted (the backlog is empty whenever the
+        // actor parks; a non-empty one here is the instant before it drains).
+        Command::PeekAcceptsNow { reply } => {
+            let _ = reply.send(backlog.is_empty());
             IdleAfter::Continue
         }
         // No turn live ⇒ cancel is a no-op.
@@ -1925,7 +2316,8 @@ async fn run_turn(
     // [`DispatchContextFactory::preflight`].
     let _permit = match factory.preflight(&agent).await {
         Ok(permit) => permit,
-        Err(reason) => {
+        Err(refusal) => {
+            let reason = refusal.message;
             emit_message_failed(
                 emitter.as_ref(),
                 channel,
@@ -1934,6 +2326,7 @@ async fn run_turn(
                 None,
                 agent_id,
                 &reason,
+                refusal.kind,
             );
             fire_completion(
                 &mut completion,
@@ -1973,6 +2366,7 @@ async fn run_turn(
             prompt,
             attachments,
             emit_user_message: announce_user_message,
+            announce_accepted: _,
         } => {
             // Clean prompt is journaled (below) and queued; the agent-facing
             // footer of `label: <absolute path>` lines is appended only here, at
@@ -1994,6 +2388,7 @@ async fn run_turn(
                     None,
                     agent_id,
                     &message,
+                    None,
                 );
                 fire_completion(
                     &mut completion,
@@ -2021,6 +2416,7 @@ async fn run_turn(
                     None,
                     agent_id,
                     &e.to_string(),
+                    None,
                 );
                 // An awaited send must not hang because its turn never started.
                 fire_completion(
@@ -2060,7 +2456,7 @@ async fn run_turn(
         // nothing is compacted, so the refusal has to live in the type of the
         // call. `options` rides through unchanged — the cancel token is what
         // makes a compaction cancellable like any other turn.
-        WorkPayload::Compact => adapter.compact(&agent, &cwd, turn_id, options).await,
+        WorkPayload::Compact { .. } => adapter.compact(&agent, &cwd, turn_id, options).await,
         // Same reasoning as the compaction above, and the same hazard: a
         // `/context` *prompt* on a harness without the local interception is
         // answered by the model with an invented breakdown, so the refusal has
@@ -2096,6 +2492,7 @@ async fn run_turn(
                 durable_send_id,
                 agent_id,
                 &message,
+                None,
             );
             fire_completion(&mut completion, outcome, String::new());
             return TurnAfter::Continue;
@@ -2588,7 +2985,10 @@ async fn drain_turn(
                 }
             }
 
-            maybe_cmd = commands.recv() => {
+            // Disabled once closed: a closed channel answers `None` at once on
+            // every poll, so leaving it enabled spins this loop at full CPU
+            // until the turn's stream ends.
+            maybe_cmd = commands.recv(), if !channel_closed => {
                 match maybe_cmd {
                     None => {
                         // All senders dropped while a turn ran (process exit) —
@@ -2621,9 +3021,9 @@ async fn drain_turn(
                                 // mid-flight (terminal not seen) or other work already
                                 // queued — still returns Busy, preserving the
                                 // workflow "contention = step failure" rule.
-                                if terminal_seen && backlog.is_empty() {
+                                if accepts_fail_fast_mid_turn(terminal_seen, backlog) {
                                     let message_id = item.message_id;
-                                    backlog.push_back(item);
+                                    admit(backlog, item, emitter.as_ref(), channel, agent_id);
                                     if let Some(reply) = reply {
                                         let _ = reply.send(SendOutcome::Accepted(message_id));
                                     }
@@ -2633,7 +3033,7 @@ async fn drain_turn(
                             }
                             OnBusy::Enqueue => {
                                 let message_id = item.message_id;
-                                backlog.push_back(item);
+                                admit(backlog, item, emitter.as_ref(), channel, agent_id);
                                 if let Some(reply) = reply {
                                     let _ = reply.send(SendOutcome::Accepted(message_id));
                                 }
@@ -2683,6 +3083,12 @@ async fn drain_turn(
                     // post-terminal enrichment, and may also hold a backlog.
                     Some(Command::PeekWorkPending { reply }) => {
                         let _ = reply.send(true);
+                    }
+                    // The same predicate as the `FailFast` enqueue arm above:
+                    // free once this turn's terminal has passed and nothing is
+                    // queued, busy otherwise.
+                    Some(Command::PeekAcceptsNow { reply }) => {
+                        let _ = reply.send(accepts_fail_fast_mid_turn(terminal_seen, backlog));
                     }
                     Some(Command::CancelSend { send_id, source }) => {
                         // Fire the running turn's cancel token only if this turn
@@ -2907,6 +3313,76 @@ fn remove_from_backlog(
     })
 }
 
+/// Admit `item` to the backlog. Every send joins the queue here, so a send
+/// that asked to be announced is announced exactly as it is admitted: before
+/// its own `TurnStart`, whether the agent was idle or busy.
+fn admit(
+    backlog: &mut VecDeque<WorkItem>,
+    item: WorkItem,
+    emitter: &dyn EventEmitter,
+    channel: &str,
+    agent_id: AgentId,
+) {
+    if let Some(announcement) = announcement_of(&item) {
+        emit_announcement(
+            emitter,
+            channel,
+            agent_id,
+            item.message_id,
+            item.send_id,
+            announcement,
+        );
+    }
+    backlog.push_back(item);
+}
+
+/// What an item's announcement says, when the item asked for one: the text
+/// the window shows and what kind of work it is.
+fn announcement_of(item: &WorkItem) -> Option<(String, Option<AnnouncedSendKind>)> {
+    match &item.payload {
+        WorkPayload::Send {
+            prompt,
+            announce_accepted: true,
+            ..
+        } => Some((prompt.clone(), None)),
+        WorkPayload::Compact {
+            announce_accepted: true,
+        } => Some((String::new(), Some(AnnouncedSendKind::Compaction))),
+        _ => None,
+    }
+}
+
+fn emit_announcement(
+    emitter: &dyn EventEmitter,
+    channel: &str,
+    agent_id: AgentId,
+    message_id: MessageId,
+    send_id: SendId,
+    (text, kind): (String, Option<AnnouncedSendKind>),
+) {
+    emit_event(
+        emitter,
+        channel,
+        &NormalizedEvent::SendAccepted {
+            message_id,
+            send_id,
+            text,
+            at: Utc::now(),
+            kind,
+        },
+        agent_id,
+    );
+}
+
+/// The one admission rule for a `FailFast` send arriving while the actor is
+/// inside a turn: free once this turn's terminal has passed and nothing is
+/// queued, busy otherwise. Both the admission arm and the `PeekAcceptsNow`
+/// answer call this, so the two cannot drift. (Idle is its own rule: an empty
+/// backlog.)
+fn accepts_fail_fast_mid_turn(terminal_seen: bool, backlog: &VecDeque<WorkItem>) -> bool {
+    terminal_seen && backlog.is_empty()
+}
+
 fn channel_name(agent_id: AgentId) -> String {
     format!("agent:{agent_id}")
 }
@@ -2964,6 +3440,9 @@ fn emit_message_failed(
     send_id: Option<SendId>,
     agent_id: AgentId,
     error: &str,
+    // The typed cause, when the failure is one a caller should act on rather
+    // than retry (today only a preflight refusal carries one).
+    kind: Option<MessageFailureKind>,
 ) {
     emit_event(
         emitter,
@@ -2973,6 +3452,7 @@ fn emit_message_failed(
             send_id,
             agent_id,
             error: error.to_owned(),
+            kind,
             at: Utc::now(),
         },
         agent_id,
@@ -3073,7 +3553,7 @@ mod fork_safety_tests {
         // public API, so the decision is pinned here instead. Reversing either
         // arm reopens the mid-teardown fork hazard.
         assert!(matches!(
-            fork_safety_from_slot(Some(&AgentSlot::Closing)),
+            fork_safety_from_slot(Some(&AgentSlot::Closing { removed: false })),
             SlotForkSafety::Decided(false)
         ));
         assert!(matches!(

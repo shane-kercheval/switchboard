@@ -26,7 +26,7 @@
 //! answer content for that purpose. The `\n\n` before a review comes from
 //! [`TextCapture`] itself.
 
-use crate::events::{AdapterEvent, ContentKind};
+use crate::events::{AdapterEvent, ContentKind, NormalizedEvent};
 use crate::facets::ToolFacet;
 use crate::transcript::{Turn, TurnItem, TurnStatus};
 
@@ -45,7 +45,7 @@ pub fn latest_completed_agent_text(turns: &[Turn]) -> Option<String> {
             status: TurnStatus::Complete,
             items,
             ..
-        } => Some(concat_answer_items(items)),
+        } => Some(turn_answer_text(items)),
         _ => None,
     })
 }
@@ -57,7 +57,12 @@ pub fn latest_completed_agent_text(turns: &[Turn]) -> Option<String> {
 /// neither emit text nor produce a doubled separator — both matching the live
 /// parser exactly (an empty block does not consume its `pending_separator`, so
 /// live yields one `\n\n` there, not two).
-fn concat_answer_items(items: &[TurnItem]) -> String {
+///
+/// Public so a caller holding one turn's items (a merged conversation's agent
+/// turn, read back by `send_id`) gets the same text as
+/// [`latest_completed_agent_text`] would for that turn.
+#[must_use]
+pub fn turn_answer_text(items: &[TurnItem]) -> String {
     let mut out = String::new();
     for item in items {
         let piece = match item {
@@ -129,44 +134,79 @@ impl TextCapture {
                 kind: ContentKind::Text,
                 text,
                 ..
-            } => {
-                if let Some(CapturedPiece::Text(last)) = self.pieces.last_mut() {
-                    last.push_str(text);
-                } else {
-                    self.pieces.push(CapturedPiece::Text(text.clone()));
-                }
-            }
+            } => self.push_text(text),
             AdapterEvent::ToolStarted {
                 tool_use_id,
                 facet: ToolFacet::Findings(report),
                 ..
-            } => self.pieces.push(CapturedPiece::Review {
-                tool_use_id: tool_use_id.clone(),
-                text: report.text.clone(),
-                status: ReviewStatus::Pending,
-            }),
+            } => self.start_review(tool_use_id, &report.text),
             AdapterEvent::ToolCompleted {
-                tool_use_id: completed_id,
+                tool_use_id,
                 is_error,
                 ..
-            } => {
-                for piece in &mut self.pieces {
-                    if let CapturedPiece::Review {
-                        tool_use_id,
-                        status: status @ ReviewStatus::Pending,
-                        ..
-                    } = piece
-                        && tool_use_id == completed_id
-                    {
-                        *status = if *is_error {
-                            ReviewStatus::Dropped
-                        } else {
-                            ReviewStatus::Accepted
-                        };
-                    }
-                }
-            }
+            } => self.complete_review(tool_use_id, *is_error),
             _ => {}
+        }
+    }
+
+    /// Feed one wire event of the turn — the same rule as [`Self::observe`],
+    /// for an observer that sits on the emitted event stream rather than inside
+    /// the dispatcher (the MCP send ledger). The two observers share one set of
+    /// arms so what counts as an agent's answer cannot drift between them; a
+    /// `NormalizedEvent` carries the same content, facet, and error fields its
+    /// adapter event did.
+    pub fn observe_normalized(&mut self, event: &NormalizedEvent) {
+        match event {
+            NormalizedEvent::ContentChunk {
+                kind: ContentKind::Text,
+                text,
+                ..
+            } => self.push_text(text),
+            NormalizedEvent::ToolStarted {
+                tool_use_id,
+                facet: ToolFacet::Findings(report),
+                ..
+            } => self.start_review(tool_use_id, &report.text),
+            NormalizedEvent::ToolCompleted {
+                tool_use_id,
+                is_error,
+                ..
+            } => self.complete_review(tool_use_id, *is_error),
+            _ => {}
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if let Some(CapturedPiece::Text(last)) = self.pieces.last_mut() {
+            last.push_str(text);
+        } else {
+            self.pieces.push(CapturedPiece::Text(text.to_owned()));
+        }
+    }
+
+    fn start_review(&mut self, tool_use_id: &str, text: &str) {
+        self.pieces.push(CapturedPiece::Review {
+            tool_use_id: tool_use_id.to_owned(),
+            text: text.to_owned(),
+            status: ReviewStatus::Pending,
+        });
+    }
+
+    fn complete_review(&mut self, completed_id: &str, is_error: bool) {
+        for piece in &mut self.pieces {
+            if let CapturedPiece::Review {
+                tool_use_id,
+                status: status @ ReviewStatus::Pending,
+                ..
+            } = piece
+                && tool_use_id == completed_id
+            {
+                *status = if is_error {
+                    ReviewStatus::Dropped
+                } else {
+                    ReviewStatus::Accepted
+                };
+            }
         }
     }
 
@@ -175,15 +215,28 @@ impl TextCapture {
     /// never got a result, so it is left out.
     #[must_use]
     pub fn finish(self) -> String {
+        self.text_so_far()
+    }
+
+    /// The last `max_chars` characters of the answer so far, by the same rule
+    /// as [`Self::finish`]: where a running turn has got to.
+    #[must_use]
+    pub fn tail(&self, max_chars: usize) -> String {
+        let text = self.text_so_far();
+        let skip = text.chars().count().saturating_sub(max_chars);
+        text.chars().skip(skip).collect()
+    }
+
+    fn text_so_far(&self) -> String {
         let mut out = String::new();
-        for piece in self.pieces {
+        for piece in &self.pieces {
             match piece {
-                CapturedPiece::Text(text) => out.push_str(&text),
+                CapturedPiece::Text(text) => out.push_str(text),
                 CapturedPiece::Review {
                     text,
                     status: ReviewStatus::Accepted,
                     ..
-                } => push_piece(&mut out, &text),
+                } => push_piece(&mut out, text),
                 CapturedPiece::Review { .. } => {}
             }
         }
@@ -574,6 +627,28 @@ mod tests {
     }
 
     #[test]
+    fn tail_is_the_end_of_the_answer_so_far_without_a_pending_review() {
+        let mut capture = TextCapture::default();
+        for event in [
+            chunk("Intro é."),
+            started("f1", findings_facet("REVIEW")),
+            completed("f1", false),
+            chunk("\n\nRunning the tests."),
+            started("f2", findings_facet("PENDING")),
+        ] {
+            capture.observe(&event);
+        }
+        assert_eq!(capture.tail(18), "Running the tests.");
+        assert_eq!(
+            capture.tail(1000),
+            "Intro é.\n\nREVIEW\n\nRunning the tests."
+        );
+        // Counted in characters, not bytes, so a cut never splits one.
+        assert_eq!(capture.tail(30), "é.\n\nREVIEW\n\nRunning the tests.");
+        assert_eq!(TextCapture::default().tail(10), "");
+    }
+
+    #[test]
     fn capture_of_a_review_only_turn_is_the_review() {
         assert_eq!(
             capture(&[
@@ -734,5 +809,39 @@ mod tests {
             out.starts_with("=== START forwarded from agent-a ==="),
             "no leading content or blank line when body is empty: {out:?}"
         );
+    }
+
+    /// The wire-side observer must agree with the adapter-side one on the same
+    /// turn: every adapter event is lifted to its normalized form and both
+    /// captures are compared byte-for-byte.
+    #[test]
+    fn normalized_observer_matches_adapter_observer() {
+        let events = [
+            chunk("Intro."),
+            AdapterEvent::ContentChunk {
+                turn_id: Uuid::now_v7(),
+                kind: ContentKind::Thinking,
+                text: "secret".to_owned(),
+            },
+            started("a", findings_facet("A")),
+            started("b", findings_facet("B")),
+            completed("b", false),
+            completed("a", true),
+            started("t1", ToolFacet::Other),
+            completed("t1", false),
+            chunk("\n\nOutro."),
+        ];
+        let mut live = TextCapture::default();
+        let mut wire = TextCapture::default();
+        for event in events {
+            live.observe(&event);
+            let normalized = event
+                .into_normalized()
+                .expect("content and tool events have a wire form");
+            wire.observe_normalized(&normalized);
+        }
+        let live = live.finish();
+        assert_eq!(live, "Intro.\n\nB\n\nOutro.");
+        assert_eq!(wire.finish(), live);
     }
 }

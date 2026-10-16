@@ -306,13 +306,15 @@ export type AgentRuntime = {
   /// ```
   /// idle  --dispatchUserTurn-->  starting        (records pending_message_id)
   /// starting  --(turn_start event, matched message_id)-->  processing
-  /// starting  --(message_failed event, matched message_id)-->  idle
-  /// starting  --(failSendStart action)-->  idle
+  /// starting  --(message_failed / message_cancelled, last queued entry)-->  idle
+  /// starting  --(failSendStart action, last queued entry)-->  idle
   /// processing  --(agent_idle event)-->  idle
   /// ```
   ///
-  /// `message_failed` / `failSendStart` are the **only legal paths** from
-  /// `starting` back to `idle` without going through `processing` —
+  /// `message_failed`, `message_cancelled`, and `failSendStart` are the **only
+  /// legal paths** from `starting` back to `idle` without going through
+  /// `processing`, and only when they remove the last queued entry: while
+  /// another remains, it is next to start (`runStatusAfterPendingRemoved`).
   /// `agent_idle` is guarded to only flip `processing → idle` (a stray
   /// `agent_idle` in the starting window must not race the gate open).
   ///

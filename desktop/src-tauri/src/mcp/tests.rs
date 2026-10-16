@@ -2688,6 +2688,6 @@ fn the_orchestrator_prompt_names_only_real_tools_and_the_announced_version() {
 /// The orchestrator prompt's version and the SHA-256 of its text at that
 /// version.
 const PROMPT_FINGERPRINT: (u32, &str) = (
-    3,
-    "fece25a91804767be4f2bb3f0ed436b74c52842c784fca3c91622e1cedad7994",
+    4,
+    "f691b91ed813b93d80a92c660801a5785eae070280afa941c29055cffe5eb8e1",
 );

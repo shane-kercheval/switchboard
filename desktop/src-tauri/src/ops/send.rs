@@ -472,18 +472,7 @@ async fn run_inner(
     budget: &WaitBudget,
 ) -> Result<SendReceipt, AppError> {
     let project_id = plan.project_id;
-    match budget
-        .run(attach::check_sources(state, &plan.attachments))
-        .await
-    {
-        Outcome::Done(checked) => checked?,
-        Outcome::Timeout => {
-            return Err(AppError::TimedOut {
-                what: "checking the attachments",
-            });
-        }
-        Outcome::Cancelled => return Err(AppError::Interrupted),
-    }
+    attach::check_within(state, budget, &plan.attachments).await?;
     open_project_impl(state, project_id)?;
     let project = lock(&state.projects)
         .get(&project_id)

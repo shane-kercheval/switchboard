@@ -26,6 +26,8 @@ use crate::commands::{stage_attachment_impl, wait_at_blocking_seam};
 use crate::error::AppError;
 use crate::state::AppState;
 
+use super::wait::{Outcome, WaitBudget};
+
 /// Extensions the window shows as images, as `desktop/src/lib/attachments.ts`
 /// lists them. A test keeps the two lists equal.
 const IMAGE_EXTENSIONS: &[&str] = &[
@@ -47,10 +49,9 @@ const TEXT_EXTENSIONS: &[&str] = &[
 /// its receipt even when the file has since been deleted. On the blocking
 /// pool, as the copy is: opening a file is blocking I/O, and it can wait (a
 /// file stored only in iCloud, a network drive that stopped answering). The
-/// caller runs it under the call's deadline and cancel, as every other step
-/// before dispatch; an open that never returns then costs a blocking thread,
-/// not the send.
-pub(super) async fn check_sources(state: &AppState, sources: &[PathBuf]) -> Result<(), AppError> {
+/// caller runs it through [`check_within`]; an open that never returns then
+/// costs a blocking thread, not the send.
+async fn check_sources(state: &AppState, sources: &[PathBuf]) -> Result<(), AppError> {
     if sources.is_empty() {
         return Ok(());
     }
@@ -72,6 +73,22 @@ pub(super) async fn check_sources(state: &AppState, sources: &[PathBuf]) -> Resu
             "checking the attachments did not finish: {join_err}"
         ))
     })?
+}
+
+/// [`check_sources`] under the call's deadline and cancel, as every other step
+/// before dispatch runs.
+pub(super) async fn check_within(
+    state: &AppState,
+    budget: &WaitBudget,
+    sources: &[PathBuf],
+) -> Result<(), AppError> {
+    match budget.run(check_sources(state, sources)).await {
+        Outcome::Done(checked) => checked,
+        Outcome::Timeout => Err(AppError::TimedOut {
+            what: "checking the attachments",
+        }),
+        Outcome::Cancelled => Err(AppError::Interrupted),
+    }
 }
 
 fn check_source(source: &Path) -> Result<(), AppError> {

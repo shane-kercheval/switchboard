@@ -325,15 +325,7 @@ async fn run_inner(
     } = plan;
     // Every attempt, before the fork is created: a file that cannot be read
     // refuses the request with no fork made.
-    match budget.run(attach::check_sources(state, &attachments)).await {
-        Outcome::Done(checked) => checked?,
-        Outcome::Timeout => {
-            return Err(AppError::TimedOut {
-                what: "checking the attachments",
-            });
-        }
-        Outcome::Cancelled => return Err(AppError::Interrupted),
-    }
+    attach::check_within(state, budget, &attachments).await?;
     open_project_impl(state, project_id)?;
     let project = lock(&state.projects)
         .get(&project_id)

@@ -52,12 +52,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
-use switchboard_core::{AgentId, AgentRecord, ProjectId, SendId};
+use switchboard_core::{AgentId, AgentRecord, ProjectId, SendId, render_prompt_with_attachments};
+use switchboard_harness::check_prompt_size;
 
 use crate::commands::{fork_agent_impl, list_project_agents_readonly_impl, open_project_impl};
 use crate::error::AppError;
 use crate::state::{AppState, lock};
 
+use super::attach;
 use super::desktop_sync::SyncFork;
 use super::error_code::error_code;
 use super::handle::AppStateHandle;
@@ -80,6 +82,9 @@ pub struct ForkRequest {
     pub agent_id: AgentId,
     pub body: Body,
     pub idempotency_key: Option<String>,
+    /// Files on this Mac to attach to the fork's first message, as absolute
+    /// paths, handled as a send's are.
+    pub attachments: Vec<PathBuf>,
 }
 
 /// What a fork request returns: the fork, and the receipt of the message
@@ -98,6 +103,8 @@ struct Fingerprint<'a> {
     project_id: ProjectId,
     agent_id: AgentId,
     body: &'a Body,
+    #[serde(skip_serializing_if = "<[PathBuf]>::is_empty")]
+    attachments: &'a [PathBuf],
 }
 
 /// Branch `agent_id`'s conversation into a new agent and send it the
@@ -113,11 +120,13 @@ pub async fn fork(
         agent_id,
         body,
         idempotency_key: key,
+        attachments,
     } = request;
     let hash = request_hash(&Fingerprint {
         project_id,
         agent_id,
         body: &body,
+        attachments: &attachments,
     });
     let ledger: &SendLedger = &handle.app_state().ledger;
     // A child of the call's cancel token: server shutdown fires it too, and
@@ -146,6 +155,7 @@ pub async fn fork(
         project_id,
         source: agent_id,
         body,
+        attachments,
         existing,
     };
     // Own task, as a send: the caller's future may be dropped at any point
@@ -176,6 +186,7 @@ struct Plan {
     project_id: ProjectId,
     source: AgentId,
     body: Body,
+    attachments: Vec<PathBuf>,
     /// The fork a resumed request sends to; `None` creates one.
     existing: Option<AgentRecord>,
 }
@@ -309,8 +320,12 @@ async fn run_inner(
         project_id,
         source,
         body,
+        attachments,
         ..
     } = plan;
+    // Every attempt, before the fork is created: a file that cannot be read
+    // refuses the request with no fork made.
+    attach::check_within(state, budget, &attachments).await?;
     open_project_impl(state, project_id)?;
     let project = lock(&state.projects)
         .get(&project_id)
@@ -391,6 +406,14 @@ async fn run_inner(
     };
     let unheard = report.hearing.unheard([fork_id]);
     refuse_if_busy(state, budget, &[fork_id], &unheard, &roster).await?;
+    // After the window has the project open, as a send copies: see `attach`.
+    // A copy that fails leaves the fork without its message, which the retry
+    // rule above covers: the same key sends to this fork again.
+    let attachments = attach::stage(state, project_id, &attachments, budget.cancel_token()).await?;
+    if !attachments.is_empty() {
+        check_prompt_size(&render_prompt_with_attachments(&text, &attachments))
+            .map_err(AppError::PromptTooLarge)?;
+    }
     dispatch_recipients(
         state,
         home_dir,
@@ -400,6 +423,7 @@ async fn run_inner(
         &unheard,
         &roster,
         &text,
+        &attachments,
     )
     .await
 }

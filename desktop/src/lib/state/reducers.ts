@@ -140,6 +140,9 @@ export function transcriptReducer(
           send_id: input.send_id,
           started_at: input.at,
           text: input.text,
+          ...(input.attachments !== undefined && input.attachments.length > 0
+            ? { attachments: input.attachments }
+            : {}),
           pending: true,
         },
       ];

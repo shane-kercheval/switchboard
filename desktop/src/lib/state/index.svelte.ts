@@ -602,7 +602,7 @@ function admitAnnouncedSend(
     runtime,
     userTurnId,
     event.text,
-    [],
+    event.attachments ?? [],
     event.send_id,
     event.at,
     event.message_id,

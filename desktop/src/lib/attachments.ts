@@ -1,8 +1,10 @@
 import type { AttachmentKind } from "$lib/types";
 
-// Extension → attachment kind. The frontend owns this mapping: it has the
-// dropped filename and assigns the numbered label, so the backend only persists
-// what it's told (the backend persists the label as given). Extend the lists here.
+// Extension → attachment kind for a file dropped into the window, which assigns
+// the numbered label; the backend persists the label as given. The server keeps
+// a copy of these lists for files an orchestrator attaches
+// (`desktop/src-tauri/src/ops/attach.rs`), and a test fails when the two differ,
+// so extend both.
 //
 // `classifyKind` never returns `"unknown"` — that variant is the wire fallback
 // for a kind a *newer* build wrote into the journal (see `AttachmentKind` in

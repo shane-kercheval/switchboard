@@ -176,7 +176,7 @@ If you miss it, Settings → Notifications tells you macOS is blocking notificat
 
 **An agent connected over MCP has the same reach as the keyboard. Agents run without approval prompts, so any program holding the token can run commands on your Mac. It is off by default; regenerate the token in Settings → Agent MCP Server to revoke every client.**
 
-Agent access is an MCP server inside Switchboard, so an agent you run elsewhere (Claude Code, Codex, or Claude Desktop) can work your projects as you do: create projects and agents, send messages and wait for replies, forward answers, run workflows, read conversations, compact and fork agents, and read the usage and context figures the window shows. Every message it sends appears in the window like your own, queued or running, and you can cancel it there.
+Agent access is an MCP server inside Switchboard, so an agent you run elsewhere (Claude Code, Codex, or Claude Desktop) can work your projects as you do: create projects and agents, send messages (files attached, such as a screenshot or a log) and wait for replies, forward answers, run workflows, read conversations, compact and fork agents, and read the usage and context figures the window shows. Every message it sends appears in the window like your own, queued or running, and you can cancel it there.
 
 Turn it on in **Settings → Agent MCP Server**. Switchboard then listens on `127.0.0.1` only (port 47821 by default) and creates a token. Settings shows ready-to-paste setup for each client, with the token filled in:
 

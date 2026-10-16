@@ -283,7 +283,14 @@ export type NormalizedEvent =
   // has no optimistic user turn for a backend-originated send). The reducer turns
   // it into a user turn; a fan-out's recipients share `send_id` so they group into
   // one user row + per-recipient columns. Manual sends don't use this.
-  | { type: "user_message"; send_id: SendId; text: string; at: string }
+  // `attachments` is absent for a send without any.
+  | {
+      type: "user_message";
+      send_id: SendId;
+      text: string;
+      at: string;
+      attachments?: Attachment[];
+    }
   // A send another client made (an orchestrator over MCP) was accepted into
   // this agent's queue. Arrives before the send's `turn_start`, idle or busy;
   // the window turns it into the same pending entry and queued row it creates
@@ -298,6 +305,8 @@ export type NormalizedEvent =
       text: string;
       at: string;
       kind?: "compaction";
+      // The files attached to the send; absent when there are none.
+      attachments?: Attachment[];
     }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
   // Content-free liveness signal: the harness is still alive mid-turn but

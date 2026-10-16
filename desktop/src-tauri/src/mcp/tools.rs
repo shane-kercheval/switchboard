@@ -119,7 +119,7 @@ pub fn instructions() -> String {
 /// new one into theirs. Bump both together whenever the prompt's text changes:
 /// a test fails when the text changes without its stored fingerprint, as a
 /// reminder.
-pub const ORCHESTRATOR_PROMPT_VERSION: u32 = 4;
+pub const ORCHESTRATOR_PROMPT_VERSION: u32 = 5;
 
 /// How Claude Code is told to show a result directly rather than save one
 /// over 50,000 characters to a file: every result is under this.

@@ -2,11 +2,11 @@
 
 ![Switchboard](docs/images/banner.png)
 
-Switchboard is a human-directed orchestrator for AI coding agents: a desktop app you run alongside your existing CLIs, **Claude Code, Codex, and Antigravity**.
+Switchboard is an orchestrator for AI coding agents: a desktop app you run alongside your existing CLIs, **Claude Code, Codex, and Antigravity**. You direct it from the keyboard, or hand the directing to another agent.
 
-Spawn several agent sessions in one project, route messages between them, and define reusable workflows for common multi-agent operations such as second-opinion code review, plan-and-implement, and parallel-solution adjudication.
+Spawn several agent sessions in one project, route messages between them, and define reusable workflows for common multi-agent operations such as second-opinion code review, plan-and-implement, and parallel-solution adjudication. Then, when a loop is routine, let an agent run it: with agent access on, a Claude Code, Codex, or Claude Desktop session you already have connects over MCP and creates agents, sends, waits, reviews, and runs your workflows, unattended, while every message shows in the window and the same Stop button works.
 
-It's for anyone who wants explicit, human-in-the-loop control over multi-agent work: not an opinionated SDLC engine, not an agent replacement, just the coordination layer between agents you already use.
+It's the coordination layer between agents you already use, at whichever level of control you want: type every message, run a saved workflow, or let an orchestrator run the whole loop under the same rules you'd follow. Not an opinionated SDLC engine, not an agent replacement, and the orchestrator is any agent you bring, with the role Switchboard's prompt gives it, not a planner of its own.
 
 ![Project view](docs/images/project-view.png)
 

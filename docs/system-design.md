@@ -2,7 +2,7 @@
 
 ## 1. What Switchboard is
 
-Switchboard is a **human-directed orchestrator for AI coding agents** — a desktop application you run alongside your existing Claude Code, Codex, and Antigravity setup. It lets you spawn multiple agent sessions within a project, route messages between them, and define reusable workflows for common multi-agent operations like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
+Switchboard is an **orchestrator for AI coding agents**, directed by you or by an agent you run elsewhere — a desktop application you run alongside your existing Claude Code, Codex, and Antigravity setup. It lets you spawn multiple agent sessions within a project, route messages between them, and define reusable workflows for common multi-agent operations like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
 
 More precisely, it is a **workflow engine for primitives, not for processes**. It codifies the *shape* of common multi-agent operations (fan-out, fan-in with template wrapping, sequential handoff, pause-for-user-input, iteration) so they can be invoked with one command instead of manually copy-pasted. It does not impose any larger structure on top of those primitives — there is no built-in concept of "plan phase" or "review phase," no SDLC walkthrough, no opinionated process. The user composes workflows ad hoc and saves the ones they reuse.
 

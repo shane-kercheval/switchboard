@@ -105,21 +105,8 @@ message you send, queued or running, in Switchboard's window and can cancel it t
 #[must_use]
 pub fn instructions() -> String {
     let names: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
-    format!(
-        "{INSTRUCTIONS} If you follow Switchboard's orchestrator prompt and its version is \
-         below {ORCHESTRATOR_PROMPT_VERSION} or missing, tell the user Settings has a newer one \
-         to bring into their copy.\n\nThe tools: {}.",
-        names.join(", ")
-    )
+    format!("{INSTRUCTIONS}\n\nThe tools: {}.", names.join(", "))
 }
-
-/// The version of the orchestrator prompt in Settings
-/// (`desktop/src/lib/orchestratorPrompt.ts`), named in the instructions so an
-/// orchestrator running an older pasted copy can tell the user to bring the
-/// new one into theirs. Bump both together whenever the prompt's text changes:
-/// a test fails when the text changes without its stored fingerprint, as a
-/// reminder.
-pub const ORCHESTRATOR_PROMPT_VERSION: u32 = 5;
 
 /// How Claude Code is told to show a result directly rather than save one
 /// over 50,000 characters to a file: every result is under this.

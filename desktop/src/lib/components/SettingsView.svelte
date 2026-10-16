@@ -991,9 +991,8 @@
             The tools tell a connected agent how Switchboard works, not how to think. These prompts
             make it your stand-in: it decides and directs, questions the way you would, and never
             writes code itself. They share every rule and differ in the lens: an engineering
-            manager's, or a data scientist's. Copy one into the CLAUDE.md or AGENTS.md of the folder
-            you orchestrate from so it loads every session, or paste it when a session starts, and
-            edit the rules to match yours.
+            manager's, or a data scientist's. Give one to your orchestration agent, and edit the
+            rules to match yours.
           </p>
         </div>
         {#each ORCHESTRATOR_PROMPTS as prompt (prompt.id)}

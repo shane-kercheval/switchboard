@@ -5585,21 +5585,29 @@ pub fn agent_session_info_impl(
 pub enum SessionFileForEditor {
     /// The session file itself.
     File(PathBuf),
-    /// The text of a session file Codex has compressed. An editor would show
-    /// the compressed bytes, so it gets a decompressed copy instead.
+    /// The session file's text, which the editor opens as a copy.
     Text(String),
 }
 
 /// Resolve what "Open session file" opens for the session file at `path`.
-/// Decompressing a long conversation takes a moment, so the command runs this
-/// on a blocking worker.
+///
+/// `as_copy` is the choice the user clicked: "Open copy of session file" is
+/// offered when the sidebar last saw the file compressed, and that answer can
+/// be stale (a reply makes Codex restore the plain file). So a copy request
+/// always gets a copy, never the live file the user may then edit. A file
+/// Codex has compressed always opens as a copy too, because an editor would
+/// show its compressed bytes. Reading a long conversation takes a moment, so
+/// the command runs this on a blocking worker.
 ///
 /// # Errors
 ///
-/// [`AppError::SessionFileRead`] when a compressed file can't be read or
-/// doesn't decode.
-pub fn session_file_for_editor(path: PathBuf) -> Result<SessionFileForEditor, AppError> {
-    if !switchboard_harness::codex::session_file::is_compressed_session_file(&path) {
+/// [`AppError::SessionFileRead`] when the file to copy can't be read or, if
+/// compressed, doesn't decode.
+pub fn session_file_for_editor(
+    path: PathBuf,
+    as_copy: bool,
+) -> Result<SessionFileForEditor, AppError> {
+    if !as_copy && !switchboard_harness::codex::session_file::is_compressed_session_file(&path) {
         return Ok(SessionFileForEditor::File(path));
     }
     switchboard_harness::codex::session_file::read_session_file(&path)
@@ -16158,8 +16166,23 @@ mod tests {
         std::fs::write(&path, "{}\n").unwrap();
 
         assert_eq!(
-            session_file_for_editor(path.clone()).unwrap(),
+            session_file_for_editor(path.clone(), false).unwrap(),
             SessionFileForEditor::File(path)
+        );
+    }
+
+    #[test]
+    fn session_file_for_editor_opens_a_requested_copy_even_of_a_plain_file() {
+        // The sidebar offered "Open copy" from a stale answer: a reply has
+        // since made Codex restore the plain file. The user must still get a
+        // copy, not the live file they may edit.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x-sess.jsonl");
+        std::fs::write(&path, "{\"a\":1}\n").unwrap();
+
+        assert_eq!(
+            session_file_for_editor(path, true).unwrap(),
+            SessionFileForEditor::Text("{\"a\":1}\n".to_owned())
         );
     }
 
@@ -16171,7 +16194,7 @@ mod tests {
         std::fs::write(&path, zstd::encode_all(&b"{\"a\":1}\n{}\n"[..], 3).unwrap()).unwrap();
 
         assert_eq!(
-            session_file_for_editor(path).unwrap(),
+            session_file_for_editor(path, false).unwrap(),
             SessionFileForEditor::Text("{\"a\":1}\n{}\n".to_owned())
         );
     }
@@ -16182,7 +16205,7 @@ mod tests {
         let path = dir.path().join("rollout-x-sess.jsonl.zst");
         std::fs::write(&path, "not really zstd").unwrap();
 
-        let error = session_file_for_editor(path.clone()).unwrap_err();
+        let error = session_file_for_editor(path.clone(), true).unwrap_err();
         assert!(
             matches!(&error, AppError::SessionFileRead { path: failed, .. } if *failed == path),
             "{error:?}"

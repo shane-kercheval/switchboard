@@ -1522,7 +1522,11 @@ async fn agent_session_info(
 }
 
 #[tauri::command]
-async fn open_session_file(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
+async fn open_session_file(
+    state: State<'_, AppState>,
+    agent_id: String,
+    as_copy: bool,
+) -> Result<(), String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -1531,11 +1535,12 @@ async fn open_session_file(state: State<'_, AppState>, agent_id: String) -> Resu
     let Some(path) = info.session_file else {
         return Err("this agent has no session file yet".to_owned());
     };
-    let target =
-        tauri::async_runtime::spawn_blocking(move || session_file_for_editor(PathBuf::from(path)))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+    let target = tauri::async_runtime::spawn_blocking(move || {
+        session_file_for_editor(PathBuf::from(path), as_copy)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
     // `.jsonl` has no default macOS app handler, so a plain open fails
     // (kLSApplicationNotFoundErr). `open -t` forces the default *text* editor,
     // and `open -f` opens text read from stdin there, as a temporary file macOS
@@ -1576,7 +1581,7 @@ async fn open_session_file(state: State<'_, AppState>, agent_id: String) -> Resu
                 Ok(())
             } else {
                 Err(format!(
-                    "`open -f` failed for the decompressed session file (exit {status})"
+                    "`open -f` failed for the copy of the session file (exit {status})"
                 ))
             }
         }

@@ -9,11 +9,16 @@
 //! lookup here follows the same rule, so Switchboard reads the file Codex
 //! would.
 //!
-//! **A conversion can land between finding a file and opening it.** So a
-//! lookup resolves each file it found to the copy that exists now, and the
-//! opener, finding its copy gone, opens the other one. Because Codex writes the
-//! new copy before deleting the old, the other copy is already there; one
-//! switch is enough, with no waiting.
+//! **A conversion can land in the middle of a lookup.** Two cases are handled.
+//! A lookup counts a plain file and its compressed copy once, by name, before
+//! checking which copy exists now. And the opener, finding its copy gone, opens
+//! the other one. Because Codex writes the new copy before deleting the old,
+//! the other copy is already there, so one switch is enough, with no waiting.
+//!
+//! One case is not handled: a directory listing that catches neither copy,
+//! because the conversion ran while the listing did. The lookup then reports
+//! the session missing, and the next load (Retry, or reopening the project)
+//! finds it.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -44,31 +49,50 @@ pub(crate) fn is_compressed_path(path: &Path) -> bool {
         .is_some_and(is_compressed)
 }
 
-/// The copy of this rollout Codex would read now: the plain file when it
-/// exists, as Codex prefers it (its `should_skip_compressed_sibling`). A
-/// directory listing that saw only the compressed copy may find the plain one
-/// has since appeared, because Codex decompresses a file before appending to
-/// it; the plain copy is then the one to use, not neither.
-pub(crate) fn current_copy(path: PathBuf) -> PathBuf {
-    if is_compressed_path(&path)
-        && let Some(plain) = other_copy(&path)
-        && plain.exists()
-    {
+/// Each rollout found, once, as its [`current_copy`]. Duplicates are removed
+/// by [`plain_path`] before anything is checked on disk, so a plain file and
+/// its compressed copy count once even if Codex deletes one of them mid-lookup.
+/// Different file names stay different rollouts, so a real duplicate is still
+/// reported.
+pub(crate) fn current_copies(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut copies: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        let plain = plain_path(&path);
+        if seen.contains(&plain) {
+            continue;
+        }
+        seen.push(plain);
+        copies.push(current_copy(path));
+    }
+    copies
+}
+
+/// The copy of this rollout to read now: the plain file if it exists, as Codex
+/// prefers it (its `should_skip_compressed_sibling`), otherwise the compressed
+/// file if it exists, otherwise `path` as found. Both directions matter: a
+/// listing can name a copy Codex has since replaced, whether it was
+/// compressing the file or decompressing it.
+fn current_copy(path: PathBuf) -> PathBuf {
+    let plain = plain_path(&path);
+    if plain.exists() {
         return plain;
+    }
+    if let Some(compressed) = other_copy(&plain)
+        && compressed.exists()
+    {
+        return compressed;
     }
     path
 }
 
-/// Each found rollout as [`current_copy`], once. A plain file and its
-/// compressed copy are one rollout.
-pub(crate) fn current_copies(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut copies: Vec<PathBuf> = Vec::new();
-    for path in paths.into_iter().map(current_copy) {
-        if !copies.contains(&path) {
-            copies.push(path);
-        }
+/// The rollout's plain path: `path` without the compression suffix. A plain
+/// file and its compressed copy share it, whichever of them exists.
+fn plain_path(path: &Path) -> PathBuf {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) if is_compressed(name) => path.with_file_name(plain_name(name)),
+        _ => path.to_path_buf(),
     }
-    copies
 }
 
 /// Open a rollout for reading, decompressing a `.jsonl.zst` one as it reads.
@@ -213,6 +237,52 @@ mod tests {
 
         assert_eq!(current_copies(vec![zst.clone()]), vec![plain.clone()]);
         assert_eq!(current_copies(vec![zst, plain.clone()]), vec![plain]);
+    }
+
+    #[test]
+    fn both_copies_listed_count_once_when_codex_has_deleted_the_plain_one() {
+        // The listing caught both while Codex was compressing; the plain file
+        // was deleted before the copies were checked.
+        let dir = tempfile::TempDir::new().unwrap();
+        let plain = dir.path().join(format!("rollout-x-{ID}.jsonl"));
+        let zst = dir.path().join(format!("rollout-x-{ID}.jsonl.zst"));
+        std::fs::write(&zst, compressed("a\n")).unwrap();
+
+        assert_eq!(
+            current_copies(vec![plain.clone(), zst.clone()]),
+            vec![zst.clone()]
+        );
+        assert_eq!(current_copies(vec![zst.clone(), plain]), vec![zst]);
+    }
+
+    #[test]
+    fn both_copies_listed_count_once_when_codex_has_deleted_the_compressed_one() {
+        // The listing caught both while Codex was decompressing to append.
+        let dir = tempfile::TempDir::new().unwrap();
+        let plain = dir.path().join(format!("rollout-x-{ID}.jsonl"));
+        let zst = dir.path().join(format!("rollout-x-{ID}.jsonl.zst"));
+        std::fs::write(&plain, "a\n").unwrap();
+
+        assert_eq!(
+            current_copies(vec![plain.clone(), zst.clone()]),
+            vec![plain.clone()]
+        );
+        assert_eq!(current_copies(vec![zst, plain.clone()]), vec![plain]);
+    }
+
+    #[test]
+    fn two_rollout_names_for_one_session_stay_two() {
+        // A real duplicate, such as a manual copy, must still be reported.
+        let dir = tempfile::TempDir::new().unwrap();
+        let first = dir.path().join(format!("rollout-a-{ID}.jsonl"));
+        let second = dir.path().join(format!("rollout-b-{ID}.jsonl.zst"));
+        std::fs::write(&first, "a\n").unwrap();
+        std::fs::write(&second, compressed("b\n")).unwrap();
+
+        assert_eq!(
+            current_copies(vec![first.clone(), second.clone()]),
+            vec![first, second]
+        );
     }
 
     #[test]

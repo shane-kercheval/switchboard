@@ -388,10 +388,13 @@
   });
 
   async function openSessionFile(agent: AgentRecord): Promise<void> {
-    if (!sessionInfoByAgent[agent.id]?.session_file) return;
+    const info = sessionInfoByAgent[agent.id];
+    if (!info?.session_file) return;
     openSessionError = null;
     try {
-      await apiOpenSessionFile(agent.id);
+      // The same cached answer that chose the label, so a click on "Open copy"
+      // always asks for a copy even if the file has changed since.
+      await apiOpenSessionFile(agent.id, info.session_file_compressed === true);
     } catch (err) {
       openSessionError = {
         agentId: agent.id,

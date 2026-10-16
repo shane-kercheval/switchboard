@@ -292,13 +292,11 @@ impl RolloutIndex {
                         else {
                             continue;
                         };
-                        let id = id.to_owned();
-                        let path = rollout_file::current_copy(path);
-                        let copies = by_id.entry(id).or_default();
-                        if !copies.contains(&path) {
-                            copies.push(path);
-                        }
+                        by_id.entry(id.to_owned()).or_default().push(path);
                     }
+                }
+                for copies in by_id.values_mut() {
+                    *copies = rollout_file::current_copies(std::mem::take(copies));
                 }
                 by_id
             })

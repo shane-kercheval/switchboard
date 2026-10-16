@@ -404,9 +404,9 @@ pub enum AppError {
     #[error(transparent)]
     LoadTranscript(#[from] switchboard_harness::LoadTranscriptError),
 
-    /// "Open session file" could not read a session file Codex has
-    /// compressed, which it decompresses for the text editor: the file is
-    /// gone, unreadable, or does not decode.
+    /// "Open session file" could not read a session file it opens as a copy
+    /// (one Codex has compressed, or one the user asked to open as a copy):
+    /// the file is gone, unreadable, or does not decode.
     #[error("reading {}: {source}", path.display())]
     SessionFileRead {
         path: PathBuf,

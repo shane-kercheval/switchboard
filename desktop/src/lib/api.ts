@@ -759,11 +759,12 @@ export async function resumeAgentInTerminal(agentId: AgentId): Promise<void> {
 }
 
 /// Open the agent's harness session file in the default text editor
-/// (backend-resolved path, opened Rust-side; a file Codex has compressed opens
-/// as a decompressed copy). Rejects if the agent has no session file yet or the
-/// file can't be read.
-export async function openSessionFile(agentId: AgentId): Promise<void> {
-  await invoke("open_session_file", { agentId });
+/// (backend-resolved path, opened Rust-side). `asCopy` is the choice the user
+/// clicked: a copy request always opens a copy, and a file Codex has compressed
+/// opens as a decompressed copy either way. Rejects if the agent has no session
+/// file yet or the file can't be read.
+export async function openSessionFile(agentId: AgentId, asCopy: boolean): Promise<void> {
+  await invoke("open_session_file", { agentId, asCopy });
 }
 
 /// Open an external URL in the OS default browser. The backend validates the

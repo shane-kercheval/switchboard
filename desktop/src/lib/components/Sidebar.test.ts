@@ -60,8 +60,8 @@ const compactAgentMock = vi.fn<(agentId: string, sendId: string) => Promise<stri
 const contextReportAgentMock = vi.fn<(agentId: string, sendId: string) => Promise<string>>();
 vi.mock("$lib/api", () => ({
   agentSessionInfo: (id: string) => agentSessionInfoMock(id),
-  openSessionFile: async (id: string) => {
-    await openSessionFileMock(id);
+  openSessionFile: async (id: string, asCopy: boolean) => {
+    await openSessionFileMock(id, asCopy);
   },
   resumeAgentInTerminal: (id: string) => resumeAgentInTerminalMock(id),
   cancelAgent: vi.fn(),
@@ -462,7 +462,7 @@ describe("Sidebar", () => {
       "Open session file",
     );
     await fireEvent.click(screen.getByTestId("agent-action-open-session"));
-    expect(openSessionFileMock).toHaveBeenCalledWith(CLAUDE_AGENT.id);
+    expect(openSessionFileMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, false);
 
     await openAgentActions();
     await fireEvent.click(screen.getByTestId("agent-action-resume"));
@@ -516,6 +516,10 @@ describe("Sidebar", () => {
     expect(await screen.findByTestId("agent-action-open-session")).toHaveTextContent(
       "Open copy of session file",
     );
+    // The click asks for a copy outright, so a reply that has since restored
+    // the plain file can't turn this item into opening the live file.
+    await fireEvent.click(screen.getByTestId("agent-action-open-session"));
+    expect(openSessionFileMock).toHaveBeenCalledWith(CODEX_AGENT.id, true);
   });
 
   it("shows why a session file couldn't be opened", async () => {

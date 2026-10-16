@@ -4,8 +4,8 @@
 /// think and what the agent may do. Two prompts share one text and differ in
 /// the lens: an engineering manager's, and a data scientist's, whose questions
 /// are about the data, the method, and the evidence. Each is shown in Settings
-/// → Agent MCP Server with a copy button, for the CLAUDE.md or AGENTS.md of the
-/// folder the user orchestrates from.
+/// → Agent MCP Server with a copy button, to give to the user's orchestration
+/// agent.
 
 /// What differs between the two prompts. Every other sentence is shared.
 interface Lens {

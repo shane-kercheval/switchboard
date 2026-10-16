@@ -7174,10 +7174,12 @@ fn gc_unreferenced_attachments(attachments_dir: &Path, referenced: &HashSet<Path
 ///    would otherwise reclaim attachments belonging to work still queued here.
 ///
 /// Both rest on a further assumption worth tripping over rather than
-/// rediscovering: backend-originated sends (workflow steps) carry no staged
-/// attachments, so nothing can enqueue an attachment-bearing send without the
-/// frontend. If that changes, or if a send path stops requiring an opened
-/// project, this boundary has to be rebuilt.
+/// rediscovering: a backend-originated send stages its attachments only after
+/// the window reports the project loaded. Workflow steps carry none; a send over
+/// MCP copies its files in after `ensure_ready` returns (`ops::attach`), by
+/// which time this pass has run and cannot run again in this process. If a
+/// backend path ever stages before the window has loaded the project, or a send
+/// path stops requiring an opened project, this boundary has to be rebuilt.
 ///
 /// Reclaiming is opportunistic — a pure function of on-disk state, re-run on the
 /// next process start — so a skipped pass costs only disk.

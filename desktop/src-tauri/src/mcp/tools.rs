@@ -797,6 +797,11 @@ pub struct SendArgs {
     /// Any string unique to this request; a retry passes the same one.
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// Files on this Mac to attach, as absolute paths: a screenshot, a log.
+    /// Each is copied into the project, and every recipient gets the copies'
+    /// paths after the message, as with a file attached in the window.
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 /// An agent whose latest answer is forwarded. It may be in another project.
@@ -1245,6 +1250,7 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 body: body_of(a.prompt, a.text)?,
                 on_busy: a.on_busy.into(),
                 idempotency_key: a.idempotency_key,
+                attachments: a.attachments.into_iter().map(PathBuf::from).collect(),
             };
             let receipt = send::send(
                 Arc::clone(&cx.handle),

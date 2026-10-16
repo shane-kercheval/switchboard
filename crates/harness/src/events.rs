@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use switchboard_core::{AgentId, SendId, SessionLocator};
+use switchboard_core::{AgentId, Attachment, SendId, SessionLocator};
 use uuid::Uuid;
 
 use crate::facets::ToolFacet;
@@ -624,6 +624,10 @@ pub enum NormalizedEvent {
         send_id: SendId,
         text: String,
         at: DateTime<Utc>,
+        /// The files attached to the send, so the row shows them as it does
+        /// for the window's own sends. Empty for a send without any.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
     /// A send another client made was **accepted** into this agent's queue:
     /// emitted as the actor admits it, so it precedes the send's `TurnStart`
@@ -644,6 +648,11 @@ pub enum NormalizedEvent {
         at: DateTime<Utc>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<AnnouncedSendKind>,
+        /// The files attached to the send, as on
+        /// [`NormalizedEvent::UserMessage`]. Empty for a send without any and
+        /// for a compaction.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
     ContentChunk {
         turn_id: TurnId,

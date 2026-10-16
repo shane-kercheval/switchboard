@@ -32,6 +32,7 @@
 //! type here. The numbers come from the client measurements recorded in
 //! `docs/research/mcp-client-behavior.md`.
 
+mod attach;
 pub mod budget;
 pub mod change;
 pub mod compact;

@@ -400,6 +400,7 @@ async fn run_inner(
         &unheard,
         &roster,
         &text,
+        &[],
     )
     .await
 }

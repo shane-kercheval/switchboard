@@ -2441,6 +2441,7 @@ async fn run_turn(
                     channel,
                     item.send_id,
                     prompt,
+                    attachments,
                     started_at,
                     agent_id,
                 );
@@ -3336,18 +3337,35 @@ fn admit(
     backlog.push_back(item);
 }
 
-/// What an item's announcement says, when the item asked for one: the text
-/// the window shows and what kind of work it is.
-fn announcement_of(item: &WorkItem) -> Option<(String, Option<AnnouncedSendKind>)> {
+/// What an item's announcement says, when the item asked for one.
+struct Announcement {
+    /// The text the window shows.
+    text: String,
+    /// The files attached to a send, shown on its row.
+    attachments: Vec<Attachment>,
+    /// What kind of work it is, when it is not a message.
+    kind: Option<AnnouncedSendKind>,
+}
+
+fn announcement_of(item: &WorkItem) -> Option<Announcement> {
     match &item.payload {
         WorkPayload::Send {
             prompt,
+            attachments,
             announce_accepted: true,
             ..
-        } => Some((prompt.clone(), None)),
+        } => Some(Announcement {
+            text: prompt.clone(),
+            attachments: attachments.clone(),
+            kind: None,
+        }),
         WorkPayload::Compact {
             announce_accepted: true,
-        } => Some((String::new(), Some(AnnouncedSendKind::Compaction))),
+        } => Some(Announcement {
+            text: String::new(),
+            attachments: Vec::new(),
+            kind: Some(AnnouncedSendKind::Compaction),
+        }),
         _ => None,
     }
 }
@@ -3358,7 +3376,7 @@ fn emit_announcement(
     agent_id: AgentId,
     message_id: MessageId,
     send_id: SendId,
-    (text, kind): (String, Option<AnnouncedSendKind>),
+    announcement: Announcement,
 ) {
     emit_event(
         emitter,
@@ -3366,9 +3384,10 @@ fn emit_announcement(
         &NormalizedEvent::SendAccepted {
             message_id,
             send_id,
-            text,
+            text: announcement.text,
             at: Utc::now(),
-            kind,
+            kind: announcement.kind,
+            attachments: announcement.attachments,
         },
         agent_id,
     );
@@ -3415,6 +3434,7 @@ fn emit_user_message(
     channel: &str,
     send_id: SendId,
     text: &str,
+    attachments: &[Attachment],
     at: DateTime<Utc>,
     agent_id: AgentId,
 ) {
@@ -3425,6 +3445,7 @@ fn emit_user_message(
             send_id,
             text: text.to_owned(),
             at,
+            attachments: attachments.to_vec(),
         },
         agent_id,
     );

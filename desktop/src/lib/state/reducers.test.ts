@@ -2335,6 +2335,26 @@ describe("workflow user_message events", () => {
     expect(again).toHaveLength(1);
   });
 
+  it("carries the send's attachments onto the user turn, and none when there are none", () => {
+    const attachments = [
+      {
+        label: "text-1",
+        kind: "text" as const,
+        path: "/store/projects/p/attachments/0__run.log",
+        original_name: "run.log",
+      },
+    ];
+    const withFiles = transcriptReducer(
+      [],
+      { ...userMessage("read this"), attachments } as NormalizedEvent,
+      AGENT_A,
+      RECEIVED_AT,
+    );
+    expect(withFiles[0]).toMatchObject({ role: "user", attachments });
+    const without = transcriptReducer([], userMessage("read this"), AGENT_A, RECEIVED_AT);
+    expect(without[0]).not.toHaveProperty("attachments");
+  });
+
   it("does not double a single-recipient send present both live and in the journal overlay", () => {
     // A workflow single-recipient send exists as a live user turn (in transcripts)
     // and, after a background refresh rebuilds the journal overlay, as an overlay

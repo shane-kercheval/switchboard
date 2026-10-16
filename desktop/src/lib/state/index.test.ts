@@ -2534,6 +2534,25 @@ describe("send_accepted (a send another client made)", () => {
     ]);
   });
 
+  it("shows the files attached to the send on its row, as the window's own send does", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    const attachments = [
+      {
+        label: "image-1",
+        kind: "image" as const,
+        path: "/store/projects/p/attachments/0__shot.png",
+        original_name: "shot.png",
+      },
+    ];
+
+    fireTo(`agent:${AGENT_A}`, { ...accepted(), attachments } as NormalizedEvent);
+
+    const rows = (state.transcripts[AGENT_A] ?? []).filter((t) => t.role === "user");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ send_id: ORCHESTRATOR_SEND, attachments });
+  });
+
   it("is not doubled by the send's user_message or turn_start", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));

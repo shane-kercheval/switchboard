@@ -53,7 +53,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId};
+use switchboard_core::{
+    AgentId, AgentRecord, Attachment, Project, ProjectId, SendId, render_prompt_with_attachments,
+};
 use switchboard_dispatcher::{OnBusy, SendOptions};
 use switchboard_harness::{TurnStatus, check_prompt_size};
 use tokio::sync::watch;
@@ -69,6 +71,7 @@ use crate::commands::{
 use crate::error::AppError;
 use crate::state::{AppState, lock};
 
+use super::attach;
 use super::budget::{BudgetSpec, CutSite};
 use super::error_code::error_code;
 use super::handle::AppStateHandle;
@@ -119,6 +122,11 @@ pub struct SendRequest {
     pub on_busy: OnBusyPolicy,
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Files on this Mac to attach, as absolute paths. Each is copied into the
+    /// project and every recipient gets the copies' paths after the message,
+    /// as with a file attached in the window.
+    #[serde(default)]
+    pub attachments: Vec<PathBuf>,
 }
 
 /// A saved prompt in a forward: rendered with `args`, with each argument in
@@ -162,11 +170,13 @@ pub async fn send(
     request: SendRequest,
     budget: WaitBudget,
 ) -> Result<SendReceipt, AppError> {
+    attach::check_sources(&request.attachments)?;
     let plan = Plan {
         project_id: request.project_id,
         recipients: request.recipients,
         on_busy: request.on_busy,
         body: request.body.into(),
+        attachments: request.attachments,
     };
     begin(handle, home_dir, plan, request.idempotency_key, budget).await
 }
@@ -198,6 +208,7 @@ pub async fn forward(
             text: request.text.unwrap_or_default(),
             prompt: request.prompt,
         },
+        attachments: Vec::new(),
     };
     begin(handle, home_dir, plan, request.idempotency_key, budget).await
 }
@@ -210,6 +221,8 @@ struct Plan {
     recipients: Vec<AgentId>,
     on_busy: OnBusyPolicy,
     body: BodyPlan,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -495,6 +508,12 @@ async fn run_inner(
     if plan.on_busy == OnBusyPolicy::Refuse {
         refuse_if_busy(state, budget, &plan.recipients, &unheard, &roster).await?;
     }
+    // After the window has the project open, never before: see `attach`.
+    let attachments = attach::stage(state, project_id, &plan.attachments).await?;
+    if !attachments.is_empty() {
+        check_prompt_size(&render_prompt_with_attachments(&body, &attachments))
+            .map_err(AppError::PromptTooLarge)?;
+    }
     dispatch_recipients(
         state,
         home_dir,
@@ -504,6 +523,7 @@ async fn run_inner(
         &unheard,
         &roster,
         &body,
+        &attachments,
     )
     .await
 }
@@ -511,9 +531,9 @@ async fn run_inner(
 /// The message as it goes out: text as given, a saved prompt rendered under
 /// the budget with its appended text, or a forward composed through the
 /// existing resolvers. Checked against the prompt size on the final text, so
-/// the whole send is refused before any recipient is dispatched; the
-/// dispatcher's own check gives the same answer (these sends carry no
-/// attachments) and stays as the backstop.
+/// the whole send is refused before any recipient is dispatched. A send with
+/// attachments is checked again with their paths once they are copied in; the
+/// dispatcher's own check gives the same answer and stays as the backstop.
 pub(super) async fn render_body(
     state: &AppState,
     home_dir: &Path,
@@ -622,6 +642,7 @@ pub(super) async fn dispatch_recipients(
     unsubscribed: &[AgentId],
     roster: &[AgentRecord],
     body: &str,
+    attachments: &[Attachment],
 ) -> Result<SendReceipt, AppError> {
     let mut dispatched_any = false;
     let mut stop = false;
@@ -662,7 +683,7 @@ pub(super) async fn dispatch_recipients(
             state,
             agent_id,
             body,
-            Vec::new(),
+            attachments.to_vec(),
             send_id,
             home_dir,
             on_busy,

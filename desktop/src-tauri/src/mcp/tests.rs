@@ -120,6 +120,7 @@ async fn send_in_process(env: &TestEnv, project_id: ProjectId, agent_id: AgentId
             },
             on_busy: OnBusyPolicy::Refuse,
             idempotency_key: None,
+            attachments: Vec::new(),
         },
         WaitBudget::default_wait(),
     )

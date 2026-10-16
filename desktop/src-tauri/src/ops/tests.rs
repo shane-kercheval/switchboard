@@ -56,6 +56,7 @@ fn text_send(project_id: ProjectId, recipients: Vec<AgentId>, text: &str) -> Sen
         },
         on_busy: OnBusyPolicy::Refuse,
         idempotency_key: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -495,6 +496,7 @@ async fn a_saved_prompt_body_renders_with_its_appended_text() {
         },
         on_busy: OnBusyPolicy::Refuse,
         idempotency_key: None,
+        attachments: Vec::new(),
     };
     let receipt = send_now(env.handle(), env.home(), request).await.unwrap();
     wait_done(&env, project_id, receipt.send_id).await;
@@ -5706,6 +5708,7 @@ async fn a_one_recipient_cancel_lands_before_or_during_the_hand_off() {
     let barrier = env.seam(TestSeam::OpsDispatch);
     let request = SendRequest {
         idempotency_key: Some("k".to_owned()),
+        attachments: Vec::new(),
         ..text_send(project_id, agents.clone(), "hi")
     };
     let task = tokio::spawn(send_now(env.handle(), env.home(), request));
@@ -6366,4 +6369,165 @@ async fn a_compaction_queues_behind_a_busy_agent_from_the_window_and_the_tools()
         }
         gate.notify_one();
     }
+}
+
+// --- attachments ------------------------------------------------------------
+
+/// Two files to attach, written outside the project: a screenshot and a log.
+fn attachment_sources() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("shot.png");
+    let log = dir.path().join("run.log");
+    std::fs::write(&image, b"png bytes").unwrap();
+    std::fs::write(&log, "line 1\nline 2\n").unwrap();
+    (dir, image, log)
+}
+
+/// The attachments the journal recorded for `send_id`, one list per recipient.
+fn journaled_attachments(
+    env: &TestEnv,
+    project_id: ProjectId,
+    send_id: Uuid,
+) -> Vec<Vec<switchboard_core::Attachment>> {
+    switchboard_core::journal::read_records(&env.journal_path(project_id))
+        .unwrap()
+        .into_iter()
+        .filter_map(|record| match record {
+            JournalRecord::Send {
+                send_id: id,
+                attachments,
+                ..
+            } if id == send_id => Some(attachments),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_send_with_attachments_copies_them_in_and_gives_every_recipient_their_paths() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b"]);
+    let (_sources, image, log) = attachment_sources();
+    let mut request = text_send(project_id, agents, "look at these");
+    request.attachments = vec![image.clone(), log.clone()];
+
+    let receipt = send_now(env.handle(), env.home(), request).await.unwrap();
+    assert!(
+        receipt
+            .recipients
+            .iter()
+            .all(|r| r.status == SendStatus::Accepted)
+    );
+    assert!(wait_done(&env, project_id, receipt.send_id).await.done);
+
+    let journaled = journaled_attachments(&env, project_id, receipt.send_id);
+    assert_eq!(journaled.len(), 2, "one journal send per recipient");
+    assert_eq!(journaled[0], journaled[1], "both recipients share one copy");
+    let attachments = &journaled[0];
+    let described: Vec<_> = attachments
+        .iter()
+        .map(|a| (a.label.as_str(), a.kind, a.original_name.as_str()))
+        .collect();
+    assert_eq!(
+        described,
+        [
+            (
+                "image-1",
+                switchboard_core::AttachmentKind::Image,
+                "shot.png"
+            ),
+            ("text-1", switchboard_core::AttachmentKind::Text, "run.log"),
+        ]
+    );
+    let attachments_dir = lock(&env.state.projects)[&project_id].attachments_dir();
+    for (attachment, source) in attachments.iter().zip([&image, &log]) {
+        let copy = PathBuf::from(&attachment.path);
+        assert!(
+            copy.starts_with(&attachments_dir),
+            "a copy lives in the project"
+        );
+        assert_eq!(
+            std::fs::read(&copy).unwrap(),
+            std::fs::read(source).unwrap()
+        );
+    }
+
+    let expected = switchboard_core::render_prompt_with_attachments("look at these", attachments);
+    assert_eq!(
+        *lock(&env.adapter.prompts),
+        vec![expected.clone(), expected],
+        "each agent gets the copies' paths after the message"
+    );
+
+    let events = env.emitter.snapshot();
+    for kind in ["send_accepted", "user_message"] {
+        let labels: Vec<Vec<String>> = events
+            .iter()
+            .filter(|(_, event)| event["type"] == kind)
+            .map(|(_, event)| {
+                event["attachments"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{kind} carries the attachments"))
+                    .iter()
+                    .map(|a| a["label"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![vec!["image-1", "text-1"]; 2],
+            "the window's {kind} row shows the attachments"
+        );
+    }
+}
+
+/// Opening a project deletes the attachment files no journaled send refers
+/// to, and a send is journaled only when its turn starts. A send that copied
+/// its files in before the window opened the project would lose them to that
+/// pass; copying after the window answers keeps them.
+#[tokio::test]
+async fn attachments_copied_in_survive_the_cleanup_the_window_runs_when_it_opens_the_project() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let (env, sync, _window, mut requests) = env.with_window(Duration::from_mins(1));
+    let (_sources, image, _log) = attachment_sources();
+    let mut request = text_send(project_id, agents.clone(), "look");
+    request.attachments = vec![image];
+    let pending = tokio::spawn(send_now(env.handle(), env.home(), request));
+
+    let sync_request = requests.recv().await.unwrap();
+    crate::commands::reclaim_project_attachments_impl(&env.state, project_id, &[])
+        .await
+        .unwrap();
+    assert!(sync.acknowledge(sync_request.request_id, ready(agents)));
+    let receipt = pending.await.unwrap().unwrap();
+    assert!(wait_done(&env, project_id, receipt.send_id).await.done);
+
+    let journaled = journaled_attachments(&env, project_id, receipt.send_id);
+    let copy = PathBuf::from(&journaled[0][0].path);
+    assert!(copy.is_file(), "the copy the agent was given still exists");
+    assert!(lock(&env.adapter.prompts)[0].contains(&journaled[0][0].path));
+}
+
+#[tokio::test]
+async fn an_attachment_that_is_not_an_absolute_path_to_a_file_sends_nothing() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let (sources, image, _log) = attachment_sources();
+    for (bad, why) in [
+        (PathBuf::from("shot.png"), "not an absolute path"),
+        (sources.path().join("missing.png"), "not a file on this Mac"),
+        (sources.path().to_path_buf(), "not a file on this Mac"),
+    ] {
+        let mut request = text_send(project_id, agents.clone(), "look");
+        request.attachments = vec![image.clone(), bad];
+        let err = send_now(env.handle(), env.home(), request)
+            .await
+            .unwrap_err();
+        assert_eq!(error_code(&err), error_code::INVALID_ARGUMENT);
+        assert!(err.to_string().contains(why), "{err}");
+    }
+    assert!(lock(&env.adapter.prompts).is_empty());
+    let attachments_dir = env.journal_path(project_id).with_file_name("attachments");
+    assert!(
+        std::fs::read_dir(&attachments_dir).map_or(true, |mut dir| dir.next().is_none()),
+        "nothing was copied in"
+    );
 }

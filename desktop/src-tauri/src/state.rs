@@ -6,7 +6,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, Store};
+use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId, Store};
 use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
 use switchboard_prompts::PromptService;
@@ -52,12 +52,24 @@ pub struct ActiveRun {
     /// Each step's agents and send as the engine resolved them, by step
     /// index, filled as steps run.
     pub resolved: std::collections::BTreeMap<usize, crate::workflow::StepResolution>,
+    /// Started through the agent tools rather than from the window. An
+    /// orchestrator may cancel only such a run, or a reply inside one: a run
+    /// the user started is the user's to stop.
+    pub through_agent_access: bool,
     /// Notified once when the run reaches a terminal status. Teardown collects a
     /// clone **before** firing cancel, then awaits it — so the wait can't be
     /// stranded by the owning task removing its own registry entry. `notify_one`
     /// stores a permit if the terminal beats the waiter, so the wakeup is never
     /// lost regardless of ordering.
     pub done: Arc<tokio::sync::Notify>,
+}
+
+/// Who started the workflow that made a send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowSendOrigin {
+    pub project_id: ProjectId,
+    /// Started through the agent tools rather than from the window.
+    pub through_agent_access: bool,
 }
 
 /// Agent removals as workflow starts see them, per project.
@@ -552,6 +564,14 @@ pub struct AppState {
     /// updates a run's step snapshot, the task removes the entry on terminal.
     pub workflow_runs: Arc<Mutex<HashMap<Uuid, ActiveRun>>>,
 
+    /// Who started the workflow behind each workflow send: through the agent
+    /// tools or from the window. Recorded when a step resolves its send, and
+    /// kept until the app quits, one small entry per send, because a reply can
+    /// outlive its run: a failed run ends at once while its sent replies keep
+    /// going, and an orchestrator may still cancel those it started. A leaf in
+    /// the lock order, taken after `workflow_runs`.
+    pub workflow_send_origins: Arc<Mutex<HashMap<SendId, WorkflowSendOrigin>>>,
+
     /// What a workflow start checks about agent removals, so a run cannot
     /// start with an agent that is being or has just been removed: it could
     /// run its first steps and then fail at that agent's. See
@@ -687,6 +707,7 @@ impl AppState {
             forwards: Mutex::new(HashMap::new()),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
             agent_removals: Mutex::new(AgentRemovals::default()),
+            workflow_send_origins: Arc::new(Mutex::new(HashMap::new())),
             notifier: Arc::new(NullNotifier),
             wake_lock: WakeLock::inert(),
             notification_gate: Arc::new(crate::notification::AuthorizationGate::new(Arc::new(

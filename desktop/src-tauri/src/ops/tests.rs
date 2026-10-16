@@ -5674,3 +5674,696 @@ async fn the_latest_answer_says_when_a_newer_turn_is_running() {
     );
     gate.notify_one();
 }
+
+/// Wait until the ledger shows `agent`'s reply to `send_id` as `status`.
+async fn await_recipient_status(env: &TestEnv, send_id: Uuid, agent: AgentId, status: SendStatus) {
+    let started = tokio::time::Instant::now();
+    loop {
+        let reached = env.state.ledger.send(send_id).is_some_and(|snapshot| {
+            snapshot
+                .recipients
+                .iter()
+                .any(|r| r.agent_id == agent && r.status == status)
+        });
+        if reached {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{agent} never reached {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_one_recipient_cancel_lands_before_or_during_the_hand_off() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b", "c"]);
+    let gate = Arc::new(Notify::new());
+    for _ in 0..3 {
+        env.adapter.push(Script::parked("reply", &gate));
+    }
+    let barrier = env.seam(TestSeam::OpsDispatch);
+    let request = SendRequest {
+        idempotency_key: Some("k".to_owned()),
+        ..text_send(project_id, agents.clone(), "hi")
+    };
+    let task = tokio::spawn(send_now(env.handle(), env.home(), request));
+    // Held just before a's hand-off: a is marked accepted but not yet with
+    // its agent, and b has not been offered the message at all.
+    barrier.entered.notified().await;
+    let send_id = env.state.ledger.send_id_for_key(project_id, "k").unwrap();
+    for agent in [agents[0], agents[1]] {
+        let cancelled = cancel_send(&env.state, project_id, send_id, Some(agent)).unwrap();
+        assert_eq!(cancelled.outcome, super::send::CancelOutcome::Cancelled);
+    }
+    env.clear_seam(TestSeam::OpsDispatch);
+    barrier.release.notify_one();
+
+    let receipt = task.await.unwrap().unwrap();
+    assert_eq!(
+        receipt.recipients[1].status,
+        SendStatus::Cancelled,
+        "b was skipped: never offered the message"
+    );
+    // a was handed over during the cancel, and is cancelled once admitted.
+    await_recipient_status(&env, send_id, agents[0], SendStatus::Cancelled).await;
+    gate.notify_one();
+    let done = wait_done(&env, project_id, send_id).await;
+    let statuses: Vec<SendStatus> = done.recipients.iter().map(|r| r.status).collect();
+    assert_eq!(
+        statuses,
+        vec![
+            SendStatus::Cancelled,
+            SendStatus::Cancelled,
+            SendStatus::Completed
+        ],
+        "c, cancelled by nobody, carried on"
+    );
+    assert!(
+        env.state
+            .dispatcher
+            .running_turn_kind(agents[1])
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_waiting_forwards_only_recipient_stops_the_forward_at_once() {
+    let (env, project_id, agents) = project_with_agents(&["source", "reader"]);
+    let (source, reader) = (agents[0], agents[1]);
+    let gate = Arc::new(Notify::new());
+    env.adapter
+        .push(Script::parked("the source's answer", &gate));
+    let sources_reply = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![source], "work"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, source).await;
+    // The forward waits for the busy source before it sends to anyone.
+    let request = || ForwardRequest {
+        project_id,
+        sources: vec![ForwardSourceRef {
+            agent_id: source,
+            project_id,
+        }],
+        recipients: vec![reader],
+        text: Some("see this".to_owned()),
+        prompt: None,
+        on_busy: OnBusyPolicy::Refuse,
+        idempotency_key: Some("f".to_owned()),
+    };
+    let task = tokio::spawn(forward(
+        env.handle(),
+        env.home(),
+        request(),
+        WaitBudget::new(Some(30), false),
+    ));
+    let started = tokio::time::Instant::now();
+    let send_id = loop {
+        if let Some(send_id) = env.state.ledger.send_id_for_key(project_id, "f") {
+            break send_id;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let cancelled = cancel_send(&env.state, project_id, send_id, Some(reader)).unwrap();
+    assert_eq!(cancelled.outcome, super::send::CancelOutcome::Cancelled);
+
+    // The source is still running: the forward stops anyway, as the window's
+    // cancel on a waiting forward does.
+    let receipt = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the forward stopped waiting")
+        .unwrap()
+        .expect("a cancelled send, not a failed one");
+    assert_eq!(receipt.recipients[0].status, SendStatus::Cancelled);
+    assert!(
+        wait_send(
+            &env.state,
+            project_id,
+            send_id,
+            &WaitBudget::new(Some(0), false),
+            &env.home()
+        )
+        .await
+        .unwrap()
+        .done,
+        "a wait on it is done"
+    );
+    // A retry under the same key returns the cancellation; it does not send.
+    let retried = forward(
+        env.handle(),
+        env.home(),
+        request(),
+        WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retried.send_id, send_id);
+    assert_eq!(retried.recipients[0].status, SendStatus::Cancelled);
+
+    gate.notify_one();
+    assert!(
+        env.state.dispatcher.accepts_now(reader).await,
+        "the reader never received the forward"
+    );
+    assert_eq!(
+        wait_done(&env, project_id, sources_reply.send_id)
+            .await
+            .recipients[0]
+            .status,
+        SendStatus::Completed,
+        "only the forward was cancelled: the source finished its reply"
+    );
+}
+
+#[tokio::test]
+async fn a_reply_the_user_started_is_not_the_orchestrators_to_cancel() {
+    let (env, project_id, agents) = workflow_env().await;
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    // A message the user typed in the window.
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("the user's reply", &gate));
+    let typed = Uuid::now_v7();
+    send_message_impl(
+        &env.state,
+        agents[1],
+        "mine",
+        Vec::new(),
+        typed,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[1]).await;
+    let refused = cancel_send(&env.state, project_id, typed, Some(agents[1])).unwrap_err();
+    assert!(
+        matches!(refused, AppError::SendNotCancellable { .. }),
+        "{refused:?}"
+    );
+    assert!(
+        env.state
+            .dispatcher
+            .running_turn_kind(agents[1])
+            .await
+            .is_some(),
+        "the user's reply keeps running"
+    );
+    gate.notify_one();
+
+    // A workflow the user started from the window.
+    let park = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("greeting", &park));
+    let run_id = crate::workflow_commands::invoke_workflow_impl(
+        &env.state,
+        project_id,
+        "pair",
+        false,
+        // The window names agents by name.
+        &BTreeMap::from([
+            ("coder".to_owned(), InputValue::Text("coder".to_owned())),
+            (
+                "reviewers".to_owned(),
+                InputValue::List(vec!["r1".to_owned(), "r2".to_owned()]),
+            ),
+            ("who".to_owned(), InputValue::Text("bob".to_owned())),
+        ]),
+        &env.home(),
+    )
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    let mut send_id = None;
+    for _ in 0..100 {
+        let reply = wait_workflow(
+            &env.state,
+            project_id,
+            run_id,
+            &WaitBudget::new(Some(0), false),
+        )
+        .await
+        .unwrap();
+        if let Some(first) = reply.sends.first() {
+            send_id = Some(first.send_id);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let send_id = send_id.expect("the run reported its first send");
+    let refused = cancel_send(&env.state, project_id, send_id, Some(agents[0])).unwrap_err();
+    assert!(
+        matches!(refused, AppError::ReplyInUserWorkflow { .. }),
+        "{refused:?}"
+    );
+    let refused = super::workflow::cancel_workflow_run(&env.state, project_id, run_id).unwrap_err();
+    assert!(
+        matches!(refused, AppError::RunStartedByUser { .. }),
+        "{refused:?}"
+    );
+    park.notify_one();
+}
+
+#[tokio::test]
+async fn the_latest_answer_flags_a_send_that_has_not_started_and_answers_at_once() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let first = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "one"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, first.send_id).await;
+    // The agent's actor is still preparing the next turn: no turn is open,
+    // and the actor answers no question until it is ready.
+    let held = Arc::new(Notify::new());
+    env.adapter
+        .push(Script::reply("two's answer").holding_dispatch(&held));
+    send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "two"),
+    )
+    .await
+    .unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_agent_output(&env.state, project_id, agents[0], &env.home()),
+    )
+    .await
+    .expect("the read does not wait on the actor")
+    .unwrap();
+    assert_eq!(output.text.as_deref(), Some("ack: one"));
+    assert!(
+        output.newer_turn_running,
+        "the orchestrator's own send is still to reach the agent"
+    );
+    held.notify_one();
+}
+
+const SEND_THEN_FAIL_WORKFLOW: &str = "name: send-then-fail
+description: Sends to the first agent, then to the second, which is busy.
+inputs:
+  first: agent
+  second: agent
+steps:
+  - label: First
+    send:
+      to: \"{{ first }}\"
+      text: go
+  - label: Second
+    send:
+      to: \"{{ second }}\"
+      text: go
+";
+
+/// A workflow that sends to `first`, then fails at its next step because
+/// `second` is busy, leaving `first`'s reply running. Returns the run id and
+/// the gates holding both agents.
+async fn failed_workflow_with_a_surviving_reply(
+    env: &TestEnv,
+    project_id: ProjectId,
+    first: AgentId,
+    second: AgentId,
+    started_by_orchestrator: bool,
+) -> (Uuid, Arc<Notify>) {
+    let gate = Arc::new(Notify::new());
+    // The second agent is busy with a reply of the user's.
+    env.adapter.push(Script::parked("busy", &gate));
+    send_message_impl(
+        &env.state,
+        second,
+        "busy",
+        Vec::new(),
+        Uuid::now_v7(),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, second).await;
+    env.adapter.push(Script::parked("first's reply", &gate));
+    let run_id = if started_by_orchestrator {
+        run_workflow(
+            &env.state,
+            &env.home(),
+            RunWorkflowRequest {
+                project_id,
+                name: "send-then-fail".to_owned(),
+                is_builtin: false,
+                inputs: BTreeMap::from([
+                    ("first".to_owned(), InputValue::Text(first.to_string())),
+                    ("second".to_owned(), InputValue::Text(second.to_string())),
+                ]),
+                forward_sources: BTreeMap::new(),
+            },
+            &WaitBudget::default_wait(),
+        )
+        .await
+        .unwrap()
+    } else {
+        crate::workflow_commands::invoke_workflow_impl(
+            &env.state,
+            project_id,
+            "send-then-fail",
+            false,
+            &BTreeMap::from([
+                ("first".to_owned(), InputValue::Text("coder".to_owned())),
+                ("second".to_owned(), InputValue::Text("r1".to_owned())),
+            ]),
+            &env.home(),
+        )
+        .unwrap()
+    };
+    let ended = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ended.status,
+        WorkflowRunStatus::Failed,
+        "the second step found its agent busy"
+    );
+    assert!(
+        env.state
+            .dispatcher
+            .running_turn_kind(first)
+            .await
+            .is_some(),
+        "the reply the run already sent keeps running"
+    );
+    (run_id, gate)
+}
+
+#[tokio::test]
+async fn a_reply_left_running_by_a_failed_workflow_is_still_the_orchestrators_to_cancel() {
+    let (env, project_id, agents) = workflow_env().await;
+    std::fs::write(
+        env.workflows_dir().join("send-then-fail.yaml"),
+        SEND_THEN_FAIL_WORKFLOW,
+    )
+    .unwrap();
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let (run_id, gate) =
+        failed_workflow_with_a_surviving_reply(&env, project_id, agents[0], agents[1], true).await;
+    let ended = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(0), false),
+    )
+    .await
+    .unwrap();
+    let first_send = ended.sends.first().expect("the run's first send").send_id;
+    // Retiring the run's record does not revoke the right to cancel its reply.
+    env.state
+        .ledger
+        .prune(chrono::Utc::now() + chrono::Duration::days(365));
+
+    let cancelled = cancel_send(&env.state, project_id, first_send, Some(agents[0])).unwrap();
+    assert_eq!(cancelled.outcome, super::send::CancelOutcome::Requested);
+    let started = tokio::time::Instant::now();
+    while env
+        .state
+        .dispatcher
+        .running_turn_kind(agents[0])
+        .await
+        .is_some()
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the reply never stopped"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn a_reply_left_running_by_a_failed_workflow_the_user_started_stays_theirs() {
+    let (env, project_id, agents) = workflow_env().await;
+    std::fs::write(
+        env.workflows_dir().join("send-then-fail.yaml"),
+        SEND_THEN_FAIL_WORKFLOW,
+    )
+    .unwrap();
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let (run_id, gate) =
+        failed_workflow_with_a_surviving_reply(&env, project_id, agents[0], agents[1], false).await;
+    let ended = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(0), false),
+    )
+    .await
+    .unwrap();
+    let first_send = ended.sends.first().expect("the run's first send").send_id;
+
+    let refused = cancel_send(&env.state, project_id, first_send, Some(agents[0])).unwrap_err();
+    assert!(
+        matches!(refused, AppError::ReplyInUserWorkflow { .. }),
+        "{refused:?}"
+    );
+    assert!(
+        env.state
+            .dispatcher
+            .running_turn_kind(agents[0])
+            .await
+            .is_some()
+    );
+    gate.notify_waiters();
+}
+
+// --- the orchestrator's actions against the window's ---------------------
+//
+// Each pair runs the same situation through the window's command and through
+// the agent tool, and checks the two end the same way. Where the two differ by
+// design (a busy recipient, removal, whose work may be cancelled), the MCP
+// plan's "Where agent access differs from the window" says why.
+
+#[tokio::test]
+async fn cancelling_one_reply_ends_the_same_from_the_window_and_the_tools() {
+    for through_tools in [false, true] {
+        let (env, project_id, agents) = project_with_agents(&["a", "b"]);
+        let gate = Arc::new(Notify::new());
+        env.adapter.push(Script::parked("reply", &gate));
+        env.adapter.push(Script::parked("reply", &gate));
+        let receipt = send_now(
+            env.handle(),
+            env.home(),
+            text_send(project_id, agents.clone(), "go"),
+        )
+        .await
+        .unwrap();
+        await_turn_running(&env.state, agents[0]).await;
+        await_turn_running(&env.state, agents[1]).await;
+        if through_tools {
+            cancel_send(&env.state, project_id, receipt.send_id, Some(agents[0])).unwrap();
+        } else {
+            // The stop control on one reply in the window.
+            crate::commands::cancel_send_impl(&env.state, receipt.send_id, &[agents[0]]);
+        }
+        await_recipient_status(&env, receipt.send_id, agents[0], SendStatus::Cancelled).await;
+        gate.notify_one();
+        let done = wait_done(&env, project_id, receipt.send_id).await;
+        let statuses: Vec<SendStatus> = done.recipients.iter().map(|r| r.status).collect();
+        assert_eq!(
+            statuses,
+            vec![SendStatus::Cancelled, SendStatus::Completed],
+            "through the tools: {through_tools}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelling_a_waiting_forward_sends_nothing_from_the_window_or_the_tools() {
+    for through_tools in [false, true] {
+        let (env, project_id, agents) = project_with_agents(&["source", "reader"]);
+        let (source, reader) = (agents[0], agents[1]);
+        let gate = Arc::new(Notify::new());
+        env.adapter
+            .push(Script::parked("the source's answer", &gate));
+        send_now(
+            env.handle(),
+            env.home(),
+            text_send(project_id, vec![source], "work"),
+        )
+        .await
+        .unwrap();
+        await_turn_running(&env.state, source).await;
+        let sources = vec![ForwardSourceRef {
+            agent_id: source,
+            project_id,
+        }];
+        if through_tools {
+            let request = ForwardRequest {
+                project_id,
+                sources,
+                recipients: vec![reader],
+                text: Some("see this".to_owned()),
+                prompt: None,
+                on_busy: OnBusyPolicy::Refuse,
+                idempotency_key: Some("f".to_owned()),
+            };
+            let task = tokio::spawn(forward(
+                env.handle(),
+                env.home(),
+                request,
+                WaitBudget::new(Some(30), false),
+            ));
+            let send_id = loop {
+                if let Some(send_id) = env.state.ledger.send_id_for_key(project_id, "f") {
+                    break send_id;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            cancel_send(&env.state, project_id, send_id, Some(reader)).unwrap();
+            let receipt = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("stopped waiting")
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.recipients[0].status, SendStatus::Cancelled);
+        } else {
+            // The cancel control on the window's "waiting for source" row.
+            let forward_id = Uuid::now_v7();
+            let state = Arc::clone(&env.state);
+            let home = env.home();
+            let task = tokio::spawn(async move {
+                crate::commands::forward_message_impl(
+                    &state,
+                    "see this".to_owned(),
+                    sources,
+                    forward_id,
+                    &home,
+                    project_id,
+                )
+                .await
+            });
+            while !lock(&env.state.forwards).contains_key(&forward_id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            crate::commands::cancel_forward_impl(&env.state, forward_id);
+            let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("stopped waiting")
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                crate::commands::ForwardOutcome::Cancelled
+            ));
+        }
+        gate.notify_one();
+        assert!(
+            env.state.dispatcher.accepts_now(reader).await,
+            "the reader received nothing (through the tools: {through_tools})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn forking_a_busy_agent_is_refused_from_the_window_and_the_tools() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    // A first reply gives the agent a session to fork.
+    let first = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "one"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, first.send_id).await;
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("busy", &gate));
+    send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "two"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+
+    let window = crate::commands::fork_agent_impl(
+        &env.state,
+        agents[0],
+        &env.home(),
+        std::path::Path::new("codex"),
+    )
+    .await
+    .unwrap_err();
+    let tools = super::fork::fork(
+        env.handle(),
+        env.home(),
+        super::fork::ForkRequest {
+            project_id,
+            agent_id: agents[0],
+            body: Body::Text {
+                text: "aside".to_owned(),
+            },
+            idempotency_key: None,
+        },
+        WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error_code(&window), error_code::SOURCE_BUSY);
+    assert_eq!(error_code(&tools), error_code::SOURCE_BUSY);
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_compaction_queues_behind_a_busy_agent_from_the_window_and_the_tools() {
+    for through_tools in [false, true] {
+        let (env, project_id, agents) = workflow_env().await;
+        let coder = agents[0];
+        // A finished reply gives the agent a session to compact.
+        let first = send_now(
+            env.handle(),
+            env.home(),
+            text_send(project_id, vec![coder], "one"),
+        )
+        .await
+        .unwrap();
+        wait_done(&env, project_id, first.send_id).await;
+        let gate = Arc::new(Notify::new());
+        env.adapter.push(Script::parked("busy", &gate));
+        send_now(
+            env.handle(),
+            env.home(),
+            text_send(project_id, vec![coder], "work"),
+        )
+        .await
+        .unwrap();
+        await_turn_running(&env.state, coder).await;
+        if through_tools {
+            let receipt = super::compact::compact(
+                env.handle(),
+                env.home(),
+                super::compact::CompactRequest {
+                    project_id,
+                    agent_id: coder,
+                    idempotency_key: None,
+                },
+                WaitBudget::default_wait(),
+            )
+            .await
+            .expect("queued, not refused");
+            assert_eq!(receipt.recipients[0].status, SendStatus::Accepted);
+        } else {
+            crate::commands::compact_agent_impl(&env.state, coder, Uuid::now_v7(), &env.home())
+                .await
+                .expect("queued, not refused");
+        }
+        gate.notify_one();
+    }
+}

@@ -402,6 +402,9 @@ struct RecipientEntry {
     code: Option<&'static str>,
     failure_kind: Option<FailureKind>,
     capture: TextCapture,
+    /// `cancel_send` named this recipient alone: the send skips it if not yet
+    /// offered, and cancels it if offered meanwhile.
+    cancel_requested: bool,
 }
 
 impl RecipientEntry {
@@ -920,6 +923,80 @@ impl SendLedger {
             .sends
             .get(&send_id)
             .is_some_and(|e| e.cancel_requested)
+    }
+
+    /// Ask for one recipient's reply to stop: flag it, so the send skips the
+    /// recipient if it has not offered it the message yet and cancels it if it
+    /// is offering it now. `false` when the ledger does not hold the send or
+    /// the recipient.
+    pub fn request_cancel_recipient(&self, send_id: SendId, agent_id: AgentId) -> bool {
+        let mut inner = lock(&self.inner);
+        let Some(recipient) = inner
+            .sends
+            .get_mut(&send_id)
+            .and_then(|entry| entry.recipients.iter_mut().find(|r| r.agent_id == agent_id))
+        else {
+            return false;
+        };
+        recipient.cancel_requested = true;
+        true
+    }
+
+    /// Whether `cancel_send` asked for this recipient's reply alone to stop.
+    #[must_use]
+    pub fn recipient_cancel_requested(&self, send_id: SendId, agent_id: AgentId) -> bool {
+        lock(&self.inner).sends.get(&send_id).is_some_and(|entry| {
+            entry
+                .recipients
+                .iter()
+                .any(|r| r.agent_id == agent_id && r.cancel_requested)
+        })
+    }
+
+    /// Whether every recipient of the send has ended or been cancelled one by
+    /// one, so nobody is left to receive it. A recipient not yet offered the
+    /// message by a send still dispatching is still to receive it.
+    #[must_use]
+    pub fn no_recipient_left(&self, send_id: SendId) -> bool {
+        lock(&self.inner).sends.get(&send_id).is_some_and(|entry| {
+            entry.recipients.iter().all(|r| {
+                r.cancel_requested
+                    || (r.status.is_terminal()
+                        && (r.status != SendStatus::NotDispatched || entry.settled))
+            })
+        })
+    }
+
+    /// Mark one recipient not yet offered its message as cancelled, at
+    /// dispatch time and now: the send skipped it.
+    pub fn cancel_recipient_undispatched(&self, send_id: SendId, agent_id: AgentId) {
+        let mut inner = lock(&self.inner);
+        if let Some(recipient) = inner
+            .sends
+            .get_mut(&send_id)
+            .and_then(|entry| entry.recipients.iter_mut().find(|r| r.agent_id == agent_id))
+            && recipient.dispatch == SendStatus::NotDispatched
+        {
+            recipient.dispatch = SendStatus::Cancelled;
+            recipient.status = SendStatus::Cancelled;
+        }
+        drop(inner);
+        self.bump();
+    }
+
+    /// Whether a send this ledger holds is still to reach `agent_id` or is
+    /// running on it: queued, being offered, or not yet offered by a send still
+    /// dispatching. What a read of the agent's latest answer checks, beside its
+    /// running turn, since a send's turn is not open until the agent starts it.
+    #[must_use]
+    pub fn has_unfinished_send_to(&self, agent_id: AgentId) -> bool {
+        lock(&self.inner).sends.values().any(|entry| {
+            entry.recipients.iter().any(|r| {
+                r.agent_id == agent_id
+                    && (!r.status.is_terminal()
+                        || (r.status == SendStatus::NotDispatched && !entry.settled))
+            })
+        })
     }
 
     /// Mark every recipient not yet offered to the dispatcher as cancelled —
@@ -1461,6 +1538,7 @@ fn recipient_entry(agent_id: AgentId) -> RecipientEntry {
         code: None,
         failure_kind: None,
         capture: TextCapture::default(),
+        cancel_requested: false,
     }
 }
 

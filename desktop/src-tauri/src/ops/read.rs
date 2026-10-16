@@ -738,8 +738,10 @@ pub struct AgentOutput {
     /// `list_agents` reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextFigures>,
-    /// The agent has a turn running or waiting, so this answer is not its
-    /// newest: a caller that just sent to it should wait on that send instead.
+    /// The agent has a turn running, or a send made through the agent tools
+    /// is still to reach it, so this answer is not its newest. `false` does not
+    /// prove the answer current: a message the user typed may be starting. A
+    /// caller following its own send waits on that send instead.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub newer_turn_running: bool,
 }
@@ -769,7 +771,10 @@ pub async fn read_agent_output(
 ) -> Result<AgentOutput, AppError> {
     let mut output = latest_agent_output(state, project_id, agent_id, home_dir).await?;
     output.context = known_context(state, agent_id);
-    output.newer_turn_running = !state.dispatcher.accepts_now(agent_id).await;
+    // From what the app already records, never by asking the agent's actor,
+    // which cannot answer while it prepares a turn.
+    output.newer_turn_running =
+        state.ledger.activity(agent_id).is_some() || state.ledger.has_unfinished_send_to(agent_id);
     Ok(output)
 }
 

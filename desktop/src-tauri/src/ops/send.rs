@@ -634,6 +634,12 @@ pub(super) async fn dispatch_recipients(
         if state.ledger.cancel_requested(send_id) {
             break;
         }
+        if state.ledger.recipient_cancel_requested(send_id, agent_id) {
+            state
+                .ledger
+                .cancel_recipient_undispatched(send_id, agent_id);
+            continue;
+        }
         if unsubscribed.contains(&agent_id) {
             let error = AppError::DesktopUnavailable { agent_id };
             state
@@ -673,10 +679,13 @@ pub(super) async fn dispatch_recipients(
         match outcome {
             Ok(_) => {
                 dispatched_any = true;
-                // A cancel that arrived between the check above and this
-                // admission found nothing in the dispatcher to cancel: cancel
-                // the message now that it is there.
-                if state.ledger.cancel_requested(send_id) {
+                // A cancel that arrived between the checks above and this
+                // admission, for the whole send or this recipient alone, found
+                // nothing in the dispatcher to cancel: cancel the message now
+                // that it is there.
+                if state.ledger.cancel_requested(send_id)
+                    || state.ledger.recipient_cancel_requested(send_id, agent_id)
+                {
                     cancel_send_impl(state, send_id, &[agent_id]);
                 }
             }
@@ -694,6 +703,13 @@ pub(super) async fn dispatch_recipients(
     }
     if state.ledger.cancel_requested(send_id) {
         return settle_cancelled(state, send_id);
+    }
+    if !dispatched_any && refusals.is_empty() {
+        // Every recipient was cancelled one by one before it was offered the
+        // message: a cancelled send, not a failed one.
+        return state.ledger.settle(send_id).ok_or_else(|| {
+            AppError::Internal("the send's ledger entry vanished while cancelling".to_owned())
+        });
     }
     if !dispatched_any {
         // `run` releases the key.
@@ -932,7 +948,10 @@ pub fn cancel_send(
     })
 }
 
-/// [`cancel_send`] for one recipient.
+/// [`cancel_send`] for one recipient. Only a send made through the agent
+/// tools (the ledger holds those) or by a workflow started through them: a
+/// reply to a message the user typed, or inside a workflow the user started
+/// from the window, is the user's to stop.
 fn cancel_one_recipient(
     state: &AppState,
     project_id: ProjectId,
@@ -944,31 +963,48 @@ fn cancel_one_recipient(
         .ledger
         .send(send_id)
         .filter(|s| s.project_id == project_id);
-    let outcome = match &held {
-        Some(snapshot) => {
-            let recipient = snapshot
-                .recipients
-                .iter()
-                .find(|r| r.agent_id == agent_id)
-                .ok_or(AppError::UnknownRecipient {
-                    project_id,
-                    agent_id,
-                })?;
-            match recipient.status {
-                // Not offered to the agent yet while the send still dispatches:
-                // the dispatch may yet reach it, and only cancelling the whole
-                // send stops that.
-                SendStatus::NotDispatched if !snapshot.settled => CancelOutcome::Requested,
-                status if status.is_terminal() => CancelOutcome::AlreadyFinished,
-                _ => CancelOutcome::Cancelled,
+    let outcome = if let Some(snapshot) = held {
+        let recipient = snapshot
+            .recipients
+            .iter()
+            .find(|r| r.agent_id == agent_id)
+            .ok_or(AppError::UnknownRecipient {
+                project_id,
+                agent_id,
+            })?;
+        let still_to_offer = recipient.status == SendStatus::NotDispatched && !snapshot.settled;
+        if recipient.status.is_terminal() && !still_to_offer {
+            CancelOutcome::AlreadyFinished
+        } else {
+            // Flagged before the dispatcher is told, so a recipient the send
+            // has not offered yet is skipped, and one it is offering now is
+            // cancelled once admitted.
+            state.ledger.request_cancel_recipient(send_id, agent_id);
+            if state.ledger.no_recipient_left(send_id) {
+                // Nobody left to receive it: stop the whole send, as the
+                // window's cancel on a waiting forward does, so a forward still
+                // waiting on its source stops now and a retry under the same
+                // key returns this cancellation rather than sending again.
+                let in_dispatcher = state.ledger.request_cancel(send_id).unwrap_or_default();
+                cancel_send_impl(state, send_id, &in_dispatcher);
+            } else {
+                cancel_send_impl(state, send_id, &[agent_id]);
             }
+            CancelOutcome::Cancelled
         }
-        None => CancelOutcome::Requested,
+    } else {
+        match workflow_send_owner(state, project_id, send_id) {
+            Some(true) => {
+                cancel_send_impl(state, send_id, &[agent_id]);
+                CancelOutcome::Requested
+            }
+            Some(false) => return Err(AppError::ReplyInUserWorkflow { send_id }),
+            None => return Err(AppError::SendNotCancellable { send_id }),
+        }
     };
     let recipients = if outcome == CancelOutcome::AlreadyFinished {
         Vec::new()
     } else {
-        cancel_send_impl(state, send_id, &[agent_id]);
         vec![agent_id]
     };
     tracing::info!(%project_id, %send_id, %agent_id, ?outcome, "one recipient of a send cancelled");
@@ -977,6 +1013,17 @@ fn cancel_one_recipient(
         outcome,
         recipients,
     })
+}
+
+/// Who started the workflow that made `send_id`, if one of the project's
+/// workflows made it: `Some(true)` through the agent tools, `Some(false)` from
+/// the window. Read from the origins recorded at each step, which outlive the
+/// run: a failed run ends while replies it sent keep running.
+fn workflow_send_owner(state: &AppState, project_id: ProjectId, send_id: SendId) -> Option<bool> {
+    lock(&state.workflow_send_origins)
+        .get(&send_id)
+        .filter(|origin| origin.project_id == project_id)
+        .map(|origin| origin.through_agent_access)
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

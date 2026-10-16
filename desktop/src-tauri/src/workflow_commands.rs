@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use switchboard_core::name::canonicalize_for_uniqueness;
-use switchboard_core::{AgentId, AgentRecord, Project, ProjectId};
+use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId};
 use switchboard_dispatcher::{DispatchContextFactory, Dispatcher, EventEmitter};
 use switchboard_prompts::{
     PromptArgument, PromptId, PromptResolutionSnapshot, PromptService, ProviderStatus,
@@ -241,6 +241,7 @@ pub struct ChannelProgressSink {
     total_steps: usize,
     emitter: Arc<dyn EventEmitter>,
     workflow_runs: Arc<Mutex<HashMap<uuid::Uuid, ActiveRun>>>,
+    send_origins: Arc<Mutex<HashMap<SendId, crate::state::WorkflowSendOrigin>>>,
 }
 
 impl ChannelProgressSink {
@@ -251,6 +252,7 @@ impl ChannelProgressSink {
         total_steps: usize,
         emitter: Arc<dyn EventEmitter>,
         workflow_runs: Arc<Mutex<HashMap<uuid::Uuid, ActiveRun>>>,
+        send_origins: Arc<Mutex<HashMap<SendId, crate::state::WorkflowSendOrigin>>>,
     ) -> Self {
         Self {
             run_id,
@@ -259,6 +261,7 @@ impl ChannelProgressSink {
             total_steps,
             emitter,
             workflow_runs,
+            send_origins,
         }
     }
 }
@@ -282,6 +285,15 @@ impl ProgressSink for ChannelProgressSink {
                 send_id,
             } => {
                 if let Some(run) = lock(&self.workflow_runs).get_mut(&self.run_id) {
+                    if let Some(send_id) = send_id {
+                        lock(&self.send_origins).insert(
+                            send_id,
+                            crate::state::WorkflowSendOrigin {
+                                project_id: self.project_id,
+                                through_agent_access: run.through_agent_access,
+                            },
+                        );
+                    }
                     run.resolved.insert(
                         step_index,
                         StepResolution {
@@ -1394,6 +1406,9 @@ pub struct InvokeOptions {
     /// the same rule a send applies per recipient. Checked against the roster
     /// this run binds with, which can be newer than the window's.
     pub hearing: crate::ops::desktop_sync::Hearing,
+    /// Started through the agent tools: recorded on the live run, which an
+    /// orchestrator may then cancel.
+    pub through_agent_access: bool,
 }
 
 /// [`invoke_workflow_impl`] with [`InvokeOptions`].
@@ -1475,6 +1490,7 @@ pub fn invoke_workflow_with(
         total_steps,
         Arc::clone(&state.emitter),
         Arc::clone(&state.workflow_runs),
+        Arc::clone(&state.workflow_send_origins),
     ));
 
     // A held failed/interrupted run occupies the project too: it replaces the
@@ -1501,6 +1517,7 @@ pub fn invoke_workflow_with(
             },
             steps: resolved_steps,
             resolved: BTreeMap::new(),
+            through_agent_access: options.through_agent_access,
             done: Arc::clone(&done),
         },
     )?;
@@ -1947,6 +1964,7 @@ mod tests {
                 },
                 steps: Vec::new(),
                 resolved: BTreeMap::new(),
+                through_agent_access: false,
                 done: Arc::new(tokio::sync::Notify::new()),
             },
         );
@@ -1963,6 +1981,7 @@ mod tests {
             },
             steps: Vec::new(),
             resolved: BTreeMap::new(),
+            through_agent_access: false,
             done: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -2048,6 +2067,7 @@ mod tests {
             8,
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
             Arc::clone(&runs),
+            Arc::new(Mutex::new(HashMap::new())),
         );
 
         sink.emit(WorkflowProgress::Terminal {
@@ -2084,6 +2104,7 @@ mod tests {
             8,
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
             Arc::clone(&runs),
+            Arc::new(Mutex::new(HashMap::new())),
         );
 
         sink.emit(WorkflowProgress::Terminal {

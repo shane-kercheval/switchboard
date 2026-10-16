@@ -150,6 +150,28 @@ pub enum AppError {
     #[error("agent {0} not found in any loaded project")]
     AgentNotFound(AgentId),
 
+    /// A single-recipient cancel named a send the agent tools did not make and
+    /// no workflow started through them made: a message the user typed, or a
+    /// wrong id.
+    #[error(
+        "send {send_id} was not made through these tools or by a workflow started through them (it may be one the user typed, or the id is wrong): to stop a reply the user started, tell the user"
+    )]
+    SendNotCancellable { send_id: SendId },
+
+    /// A single-recipient cancel named a send made by a workflow the user
+    /// started from the window.
+    #[error(
+        "send {send_id} belongs to a workflow the user started from Switchboard's window: tell the user rather than cancelling it"
+    )]
+    ReplyInUserWorkflow { send_id: SendId },
+
+    /// An agent-access cancel named a workflow run the user started from the
+    /// window.
+    #[error(
+        "workflow run {run_id} was started by the user from Switchboard's window: tell the user rather than cancelling it"
+    )]
+    RunStartedByUser { run_id: uuid::Uuid },
+
     /// An agent-access call named an agent the project does not hold: a typo,
     /// an id from another project, or an agent since removed.
     #[error("no agent {agent_id} in project {project_id}: list_agents shows the project's agents")]
@@ -618,7 +640,9 @@ pub enum AppError {
 
     /// A forward's source is still mid-turn past the caller's wait budget.
     /// The compose was cancelled and nothing was dispatched.
-    #[error("{name} is still responding — wait for it with wait_agent, then forward again")]
+    #[error(
+        "{name} is still responding, so nothing was sent — wait for it with wait_agent, then forward again; the retry sends to every recipient it names, including any you cancelled"
+    )]
     SourceBusy { name: String },
 
     /// A caller-supplied argument is malformed or inconsistent, including a
@@ -690,7 +714,7 @@ pub enum AppError {
     /// running or queued. The window's own remove cancels that work; a caller
     /// that cannot see the agent's pane must stop it on purpose first.
     #[error(
-        "{name} has a turn running or queued: wait for it with wait_agent, or stop it with cancel_agent, then remove it"
+        "{name} has a turn running or queued: wait for it with wait_agent, or cancel a reply you sent with cancel_send and agent_id, then remove it; if a reply the user started keeps it busy, ask the user"
     )]
     RemoveAgentBusy { name: String },
 

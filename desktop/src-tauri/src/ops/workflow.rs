@@ -137,6 +137,7 @@ pub async fn run_workflow(
         &InvokeOptions {
             agent_inputs_are_ids: true,
             hearing: report.hearing,
+            through_agent_access: true,
         },
     )?;
     tracing::info!(%project_id, %run_id, workflow = %request.name, "workflow run started");
@@ -378,11 +379,14 @@ pub fn cancel_workflow_run(
     project_id: ProjectId,
     run_id: Uuid,
 ) -> Result<(), AppError> {
-    let belongs = lock(&state.workflow_runs)
+    let through_agent_access = lock(&state.workflow_runs)
         .get(&run_id)
-        .is_some_and(|run| run.project_id == project_id);
-    if !belongs {
-        return Err(AppError::WorkflowRunNotFound { run_id });
+        .filter(|run| run.project_id == project_id)
+        .map(|run| run.through_agent_access);
+    match through_agent_access {
+        None => return Err(AppError::WorkflowRunNotFound { run_id }),
+        Some(false) => return Err(AppError::RunStartedByUser { run_id }),
+        Some(true) => {}
     }
     cancel_workflow_run_impl(state, run_id);
     tracing::info!(%project_id, %run_id, "workflow run cancelled");

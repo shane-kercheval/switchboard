@@ -59,35 +59,34 @@ the way the user does from Switchboard's window. Every tool takes ids: call list
 then list_agents, and use the ids they return (names are for display and can change).
 
 An agent is a persistent session of its harness, run in the project's folder with the user's \
-own configuration for that harness (including the folder's instructions file, such as \
-CLAUDE.md or AGENTS.md) and the harness's full tools: it reads and edits files, runs commands, \
-and uses git. A project's agents share its folder, so each sees the others' uncommitted \
-changes. An agent receives your message as if the user had typed it and cannot tell you from \
-the user. Each send continues its conversation: it keeps earlier sends and its own replies \
-until its context is compacted, so a follow-up need not repeat what it already knows. Its \
-reply is the text it writes; tool calls and thinking are not returned. These tools read no \
-files: to learn how the code works, ask an agent.
+own configuration for that harness (the folder's CLAUDE.md or AGENTS.md included) and the \
+harness's full tools: it reads and edits files, runs commands, and uses git. A project's \
+agents share its folder, so each sees the others' uncommitted changes. An agent receives your \
+message as if the user had typed it and cannot tell you from the user. Each send continues its \
+conversation: it keeps earlier sends and its own replies until its context is compacted, so a \
+follow-up need not repeat what it already knows. Its reply is the text it writes; tool calls \
+and thinking are not returned. These tools read no files: to learn how the code works, ask an \
+agent.
 
 The loop: send a message to one or more agents with send (or pass agents' latest answers to \
 others with forward). It returns a send_id at once. Call wait_send with that id until done is \
-true; each call waits up to its timeout and returns the current state either way, so call it \
-again. The replies come back in wait_send's final answer. With several agents working at once, \
-wait_any_send waits on all their sends and returns when the first finishes. read_conversation \
-shows a project's whole history; read_agent_output shows an agent's latest finished answer, \
-including turns you did not send. The user's saved prompts (list_prompts) and workflows \
-(list_workflows) are their standing instructions and procedures, such as a code review: use \
-one when it fits rather than writing your own. Before running a multi-step exchange across \
-agents by hand (review rounds, a fan-out and reconcile), check list_workflows for one the user \
-saved.
+true; each call waits up to its timeout and returns the current state either way. The replies \
+come back in wait_send's final answer. With several agents working at once, wait_any_send \
+waits on all their sends and returns when the first finishes. read_conversation shows a \
+project's whole history; read_agent_output shows an agent's latest finished answer, including \
+turns you did not send. The user's saved prompts (list_prompts) and workflows (list_workflows) \
+are their standing instructions and procedures, such as a code review: use one when it fits \
+rather than writing your own. Before running a multi-step exchange across agents by hand \
+(review rounds, a fan-out and reconcile), check list_workflows for one the user saved.
 
-Results are JSON: {\"result\": …, \"truncated\": […], \"items_omitted\": n}. A result is kept \
-under 100,000 characters, or 45,000 when your client sends no progress token (Claude Desktop): \
-long text may be cut, and each cut is listed in truncated with the call that reads the rest \
-(read_with), when there is one. max_chars on read_conversation, read_send_output, \
-read_agent_output, wait_send, wait_any_send, and wait_agent sets the limit for one call, and \
-the call a cut lists keeps it. Codex keeps about 10,000 tokens of a result and cuts the \
-middle: pass 25000 there. An error is {\"code\": …, \"message\": …}; the message says what to \
-do.
+Results are JSON: {\"result\": …, \"truncated\": […], \"items_omitted\": n}, kept under \
+100,000 characters. Replies, conversations, and wait_workflow are kept under 45,000 when your \
+client sends no progress token (Claude Desktop). Long text may be cut; each cut is listed in \
+truncated with the call that reads the rest (read_with), when there is one. max_chars on \
+read_conversation, read_send_output, read_agent_output, wait_send, wait_any_send, and \
+wait_agent sets the limit for one call, and the call a cut lists keeps it. Codex keeps about \
+10,000 tokens of a result and cuts the middle: pass 25000 there. An error is {\"code\": …, \
+\"message\": …}; the message says what to do.
 
 Some conditions need the user at the Mac, not a retry: a turn that failed with failure_kind \
 usage_limit or auth_failure, or whose error says a usage limit was reached (Claude and \
@@ -107,18 +106,20 @@ message you send, queued or running, in Switchboard's window and can cancel it t
 pub fn instructions() -> String {
     let names: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
     format!(
-        "{INSTRUCTIONS} The orchestrator prompt in Switchboard's Settings is version \
-         {ORCHESTRATOR_PROMPT_VERSION}: if yours is older or has none, tell the user to copy \
-         the current one.\n\nThe tools: {}.",
+        "{INSTRUCTIONS} If you follow Switchboard's orchestrator prompt and its version is \
+         below {ORCHESTRATOR_PROMPT_VERSION} or missing, tell the user Settings has a newer one \
+         to bring into their copy.\n\nThe tools: {}.",
         names.join(", ")
     )
 }
 
 /// The version of the orchestrator prompt in Settings
 /// (`desktop/src/lib/orchestratorPrompt.ts`), named in the instructions so an
-/// orchestrator running an older pasted copy can tell the user to recopy it.
-/// Bump both together whenever the prompt changes; a test checks they match.
-pub const ORCHESTRATOR_PROMPT_VERSION: u32 = 1;
+/// orchestrator running an older pasted copy can tell the user to bring the
+/// new one into theirs. Bump both together whenever the prompt's text changes:
+/// a test fails when the text changes without its stored fingerprint, as a
+/// reminder.
+pub const ORCHESTRATOR_PROMPT_VERSION: u32 = 3;
 
 /// How Claude Code is told to show a result directly rather than save one
 /// over 50,000 characters to a file: every result is under this.
@@ -129,7 +130,7 @@ const WAIT_HINTS: &str = "\
 Timeouts: timeout_seconds defaults to 50. If your client sends a progress token with the call, \
 you may ask for up to 3600 and get a progress notification every 60 seconds; without one, waits \
 are capped at 50, and the reply says so (capped_to_seconds). In the Claude Code CLI, ask for a \
-long timeout (e.g. 1800): the call moves to the background and its result arrives on its own \
+long timeout (e.g. 600): the call moves to the background and its result arrives on its own \
 when it settles. Claude Desktop, its Code tab included, sends no token: use the default and call \
 again. In Codex, stay under 300 seconds unless the user raised tool_timeout_sec.";
 
@@ -230,9 +231,8 @@ tools! {
          cancelled), failures with their reason, and a compacted marker where an agent's context \
          was compacted (it may have lost earlier instructions there). Tool calls and thinking are \
          left out; the answer says what the agent did. last_n_items keeps only the newest items. \
-         When the whole would pass the budget (100,000 characters, or max_chars), older items \
-         are left out whole \
-         (items_omitted says how many); a single answer too long on its own is cut, and \
+         When the whole would pass the budget (100,000 characters, 45,000 without a progress \
+         token, or max_chars), older items are left out whole (items_omitted says how many); a single answer too long on its own is cut, and \
          truncated names the read_send_output call that reads on.";
     ReadSendOutput = "read_send_output" (ReadSendOutputArgs) [Read]
         "One recipient's reply to one send, a page at a time, starting at offset (in \
@@ -246,8 +246,10 @@ tools! {
          workflow's), or the reason its latest turn failed or was cancelled. Carries the send_id \
          when known, so a long answer can be paged with read_send_output, and the agent's context \
          after its newest finished turn (as list_agents reports it). newer_turn_running is true \
-         when the agent has a turn running or waiting: this answer is then not its newest. To \
-         follow a message you sent, use wait_send; to wait for a running agent, wait_agent.";
+         when the agent has a turn running, or a send made through these tools is still to reach \
+         it: this answer is then not its newest. false does not prove it current (a message the \
+         user typed may be starting). To follow a message you sent, use wait_send; to wait for a \
+         running agent, wait_agent.";
     ListPrompts = "list_prompts" (NoArgs) [Read]
         "The user's saved prompts, local and from prompt servers: provider, name, description, \
          and arguments. They are the user's standing instructions (a code review, a security \
@@ -288,11 +290,12 @@ tools! {
     RemoveAgent = "remove_agent" (AgentArgs) [Acts]
         "Remove an agent from its project for good: Switchboard's record of it goes, and its \
          card and conversation leave the window. Nothing brings it back; only the harness's own \
-         session file stays on disk, outside Switchboard. Remove only an agent you created whose \
-         work is committed or passed on, and that will not be needed again; ask the user before \
-         removing any other. Refused with agent_busy while the agent has a turn \
-         running or queued (wait_agent for it, or cancel_agent to stop it) or a workflow runs in \
-         its project. A message that reaches the agent while it is being removed is cancelled or \
+         session file stays on disk, outside Switchboard. Remove only an agent you created in \
+         this session whose work is committed or passed on, and that will not be needed again; \
+         ask the user before removing any other. Refused with agent_busy while the agent has a turn \
+         running or queued (wait for it with wait_agent, or cancel a reply you sent with \
+         cancel_send and agent_id; if a reply the user started keeps it busy, ask the user) or a \
+         workflow runs in its project. A message that reaches the agent while it is being removed is cancelled or \
          refused, and no workflow can start in the project until the removal ends. Once begun, \
          it finishes even if this call is cancelled. Returns the removed agent's agent_id and \
          name.";
@@ -379,17 +382,21 @@ tools! {
          and a send still being prepared stops before reaching anyone else; this works for sends \
          you made since the app last started. With agent_id, only that agent's reply to the \
          send is cancelled, queued or running, and the other recipients carry on; this also \
-         works for a workflow's sends (wait_workflow lists their send_ids), where a cancelled \
-         reply cancels the whole run. To unstick one agent, pass its agent_id. outcome is \
-         cancelled; already_finished when there was nothing left to cancel; or requested when \
-         Switchboard holds no record of the send (a workflow's, or one from before a restart): \
-         the agent stops that reply if it is still queued or running.";
+         works for the sends of a workflow started through these tools (wait_workflow lists \
+         their send_ids), where a cancelled reply cancels the whole run. To unstick one agent, \
+         pass its agent_id. A reply to a message the user typed, or inside a workflow the user \
+         started from the window, is refused: tell the user instead. outcome is cancelled; \
+         already_finished when there was nothing left to cancel; or requested for a workflow's \
+         send, which Switchboard holds no record of: the agent stops that reply if it is still \
+         queued or running.";
     CancelAgent = "cancel_agent" (AgentArgs) [Stops]
         "Stop an agent entirely: cancel its running turn and drop every message queued for it, \
-         including ones the user or a workflow queued. To unstick one reply without dropping \
-         anything else, use cancel_send with agent_id.";
+         including ones the user or a workflow queued. It stops the user's work too: use it only \
+         when the user asks. To unstick one reply without dropping anything else, use \
+         cancel_send with agent_id.";
     CancelWorkflowRun = "cancel_workflow_run" (RunArgs) [Stops]
-        "Cancel a running workflow run.";
+        "Cancel a running workflow run started through these tools. A run the user started from \
+         Switchboard's window is refused: tell the user instead.";
     WaitSend = "wait_send" (WaitSendArgs) [Read]
         format!(
             "Wait for a send's replies. Returns when every recipient has finished or \
@@ -402,8 +409,9 @@ tools! {
              completed recipient carries its reply text and its agent's context after the turn \
              (as list_agents reports it), for deciding whether to compact before the next step. \
              Statuses: accepted (waiting in line), running, completed, failed, cancelled, \
-             rejected, not_dispatched; after an app restart, started, which means the restart \
-             cut the reply off: ask the agent where it got to. source is live, journal (read \
+             rejected, not_dispatched; after an app restart, started: the send started but its \
+             outcome could not be confirmed (often the restart cut the reply off), so ask the \
+             agent where it got to. source is live, journal (read \
              after a restart), or unknown: this project has no record of the send, so check \
              project_id and send_id; a message still waiting in line when the app restarted was \
              never sent and reads this way too. Long replies share the result evenly, each cut \
@@ -503,8 +511,8 @@ pub struct ReadAgentOutputArgs {
     project_id: ProjectId,
     #[schemars(with = "String")]
     agent_id: AgentId,
-    /// Keep the result under this many characters: 10,000 to 100,000, the
-    /// full 100,000 by default.
+    /// Keep the result under this many characters: 10,000 to 100,000. By
+    /// default 100,000, or 45,000 when the client sends no progress token.
     #[serde(default)]
     max_chars: Option<usize>,
 }
@@ -518,8 +526,8 @@ pub struct ReadConversationArgs {
     /// Keep only this many of the newest items.
     #[serde(default)]
     last_n_items: Option<usize>,
-    /// Keep the result under this many characters: 10,000 to 100,000, the
-    /// full 100,000 by default.
+    /// Keep the result under this many characters: 10,000 to 100,000. By
+    /// default 100,000, or 45,000 when the client sends no progress token.
     #[serde(default)]
     max_chars: Option<usize>,
 }
@@ -563,8 +571,8 @@ pub struct ReadSendOutputArgs {
     /// an offset only holds in the copy it came from.
     #[serde(default)]
     read_from: ReadFromArg,
-    /// Keep the result under this many characters: 10,000 to 100,000, the
-    /// full 100,000 by default.
+    /// Keep the result under this many characters: 10,000 to 100,000. By
+    /// default 100,000, or 45,000 when the client sends no progress token.
     #[serde(default)]
     max_chars: Option<usize>,
 }
@@ -933,8 +941,8 @@ pub struct WaitSendArgs {
     /// Seconds to wait before returning the current state. 50 by default.
     #[serde(default)]
     timeout_seconds: Option<u64>,
-    /// Keep the result under this many characters: 10,000 to 100,000, the
-    /// full 100,000 by default.
+    /// Keep the result under this many characters: 10,000 to 100,000. By
+    /// default 100,000, or 45,000 when the client sends no progress token.
     #[serde(default)]
     max_chars: Option<usize>,
 }
@@ -970,8 +978,8 @@ pub struct WaitAnySendArgs {
     /// Seconds to wait before returning the current state. 50 by default.
     #[serde(default)]
     timeout_seconds: Option<u64>,
-    /// Keep the result under this many characters: 10,000 to 100,000, the
-    /// full 100,000 by default.
+    /// Keep the result under this many characters: 10,000 to 100,000. By
+    /// default 100,000, or 45,000 when the client sends no progress token.
     #[serde(default)]
     max_chars: Option<usize>,
 }
@@ -987,8 +995,8 @@ pub struct WaitAgentArgs {
     /// Seconds to wait before returning the current state. 50 by default.
     #[serde(default)]
     timeout_seconds: Option<u64>,
-    /// Keep the result under this many characters: 10,000 to 100,000, the
-    /// full 100,000 by default.
+    /// Keep the result under this many characters: 10,000 to 100,000. By
+    /// default 100,000, or 45,000 when the client sends no progress token.
     #[serde(default)]
     max_chars: Option<usize>,
 }

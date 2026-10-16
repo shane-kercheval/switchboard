@@ -26942,6 +26942,7 @@ mod tests {
                 },
                 steps: Vec::new(),
                 resolved: std::collections::BTreeMap::new(),
+                through_agent_access: false,
                 done: std::sync::Arc::new(tokio::sync::Notify::new()),
             },
         );

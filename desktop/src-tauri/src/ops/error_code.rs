@@ -69,7 +69,7 @@ pub fn error_code(error: &AppError) -> &'static str {
         }
         AppError::ProjectLoadTimeout(_) => PROJECT_LOAD_TIMEOUT,
         AppError::PromptTooLarge(_) => PROMPT_TOO_LARGE,
-        AppError::SendUnknown(_) => SEND_UNKNOWN,
+        AppError::SendUnknown(_) | AppError::SendNotCancellable { .. } => SEND_UNKNOWN,
         AppError::WorkflowRunNotFound { .. } => RUN_UNKNOWN,
         AppError::WorkflowRunRequiresDismissal { .. } => WORKFLOW_RUN_REQUIRES_DISMISSAL,
         AppError::WorkflowAlreadyRunning { .. } => WORKFLOW_ALREADY_RUNNING,
@@ -87,7 +87,9 @@ pub fn error_code(error: &AppError) -> &'static str {
         | AppError::Workflow(_)
         | AppError::WorkflowNotFound { .. }
         | AppError::WorkflowStepUnsupported
-        | AppError::WorkflowRunActive { .. } => INVALID_ARGUMENT,
+        | AppError::WorkflowRunActive { .. }
+        | AppError::ReplyInUserWorkflow { .. }
+        | AppError::RunStartedByUser { .. } => INVALID_ARGUMENT,
         // Includes `TimedOut`, `Interrupted`, and `Internal`: operational
         // failures, not the caller's input; their messages say to try again.
         _ => INTERNAL,

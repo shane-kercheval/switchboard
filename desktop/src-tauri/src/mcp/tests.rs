@@ -3,6 +3,7 @@
 //! HTTP where a test needs a request that client never sends (no progress
 //! token, a browser's `Origin`, a wrong `Host`).
 
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ClientHandler, ServiceExt};
 use serde_json::{Value, json};
+use sha2::Digest as _;
 use switchboard_core::{AgentId, ProjectId, SendId};
 use switchboard_prompts::{InMemorySecretStore, SecretStore};
 use tokio::sync::Notify;
@@ -1142,7 +1144,7 @@ async fn wait_any_send_returns_when_the_first_send_finishes_and_a_busy_agent_is_
     assert!(
         body["message"]
             .as_str()
-            .is_some_and(|m| m.contains("cancel_agent")),
+            .is_some_and(|m| m.contains("cancel_send") && !m.contains("cancel_agent")),
         "{body}"
     );
     assert_eq!(
@@ -2654,5 +2656,38 @@ fn the_orchestrator_prompt_names_only_real_tools_and_the_announced_version() {
         .and_then(|n| n.trim().parse().ok())
         .expect("the prompt declares its version");
     assert_eq!(version, super::tools::ORCHESTRATOR_PROMPT_VERSION);
-    assert!(super::tools::instructions().contains(&format!("version {version}")));
+    assert!(
+        super::tools::instructions().contains(&format!("version is below {version}")),
+        "the instructions announce the prompt's version"
+    );
+
+    // A reminder, not enforcement: an edit to the prompt's text fails here
+    // until the fingerprint is updated, and whoever updates it is told to bump
+    // the version, so a pasted copy can tell it is stale.
+    let text = source
+        .split("export const ORCHESTRATOR_PROMPT = `")
+        .nth(1)
+        .and_then(|rest| rest.split("`;").next())
+        .expect("the prompt's text");
+    let fingerprint =
+        sha2::Sha256::digest(text.as_bytes())
+            .iter()
+            .fold(String::new(), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            });
+    assert_eq!(
+        (version, fingerprint.as_str()),
+        PROMPT_FINGERPRINT,
+        "the orchestrator prompt's text changed: bump ORCHESTRATOR_PROMPT_VERSION in \
+         desktop/src/lib/orchestratorPrompt.ts and desktop/src-tauri/src/mcp/tools.rs, then set \
+         PROMPT_FINGERPRINT to the new version and {fingerprint}"
+    );
 }
+
+/// The orchestrator prompt's version and the SHA-256 of its text at that
+/// version.
+const PROMPT_FINGERPRINT: (u32, &str) = (
+    3,
+    "fece25a91804767be4f2bb3f0ed436b74c52842c784fca3c91622e1cedad7994",
+);

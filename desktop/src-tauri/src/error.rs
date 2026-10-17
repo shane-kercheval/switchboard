@@ -404,6 +404,16 @@ pub enum AppError {
     #[error(transparent)]
     LoadTranscript(#[from] switchboard_harness::LoadTranscriptError),
 
+    /// "Open session file" could not read a session file it opens as a copy
+    /// (one Codex has compressed, or one the user asked to open as a copy):
+    /// the file is gone, unreadable, or does not decode.
+    #[error("reading {}: {source}", path.display())]
+    SessionFileRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Project-file search could not walk the loaded project tree. The
     /// frontend degrades this to "File search unavailable" instead of showing
     /// an empty result set that looks authoritative.

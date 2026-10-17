@@ -13,7 +13,7 @@ describe("inheritedHistoryNotice", () => {
   it("names any session in the chain, not only the immediate parent", () => {
     // The chain can break at a grandparent, so no wording may claim the agent
     // was forked directly from the session that's missing.
-    for (const reason of ["not_found", "compressed", "changed", "ambiguous", "cycle"]) {
+    for (const reason of ["not_found", "changed", "ambiguous", "cycle"]) {
       expect(inheritedHistoryNotice(reason).detail).not.toContain("forked from");
     }
   });
@@ -21,7 +21,7 @@ describe("inheritedHistoryNotice", () => {
   it("only tells the user the agent can't reply when the parent file is missing", () => {
     // Probed: Codex refuses a fork whose parent file is gone. No other reason
     // is known to stop the agent, so none may say it does.
-    for (const reason of ["compressed", "changed", "ambiguous", "cycle", "too_deep"]) {
+    for (const reason of ["changed", "ambiguous", "cycle", "too_deep"]) {
       expect(inheritedHistoryNotice(reason).detail).not.toContain("can't continue");
     }
     expect(inheritedHistoryNotice("not_found").detail).toContain("can't continue");

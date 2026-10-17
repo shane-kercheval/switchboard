@@ -27,7 +27,8 @@ pub mod workflow;
 mod workflow_commands;
 mod workspace;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use switchboard_dispatcher::EventEmitter;
@@ -35,6 +36,7 @@ use switchboard_harness::{
     AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, MockHarnessAdapter,
 };
 use tauri::{Emitter, Manager, State};
+use tokio::io::AsyncWriteExt;
 
 use crate::wake_lock::WakeLockEmitter;
 
@@ -339,36 +341,36 @@ fn handle_macos_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
 }
 use crate::commands::{
     AUTOCREATE_PATH_WAIT, AgentSessionFingerprint, AgentSessionInfo, DirectoryInfo, ForwardArg,
-    ForwardOutcome, HarnessInstallStatus, ProjectListing, RepoListing, StagedAttachment,
-    WorkspaceStatus, add_mcp_provider_impl, add_tracked_repo_impl, agent_session_info_impl,
-    attach_agent_impl, branch_comparison_file_diff_impl, branch_comparison_impl, cancel_agent_impl,
-    cancel_forward_impl, cancel_send_impl, cancel_turn_impl, change_agent_selection_impl,
-    changed_files_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
-    check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
-    check_codex_binary_impl, commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl,
-    compact_agent_impl, context_report_agent_impl, copy_builtin_prompt_impl, create_agent_impl,
-    create_project_impl, delete_project_impl, editor_open_argv, existing_attachment_paths_impl,
-    fetch_repo_impl, file_diff_impl, fork_agent_impl, forward_message_impl, forward_prompt_impl,
-    get_harness_usage_impl, get_preferences_impl, get_prompt_source_impl, harness_adapter_for,
-    install_status_for_adapter, list_agents_impl, list_mcp_providers_impl, list_message_pins_impl,
-    list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
-    load_project_conversation_impl, migrate_message_pin_impl,
-    open_branch_comparison_file_difftool_impl, open_commit_file_difftool_impl, open_project_impl,
-    open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
-    project_session_fingerprints_impl, read_codex_account_usage_impl,
-    read_tracked_repo_from_inputs, recheck_harness_installs_impl, reclaim_project_attachments_impl,
-    remove_agent_impl, remove_mcp_provider_impl, remove_message_pins_impl,
-    remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl, rename_project_impl,
-    render_prompt_impl, reorder_agents_impl, resolve_saved_prompt_fresh_impl,
-    resolve_saved_prompt_impl, resume_agent_in_terminal_impl, reveal_in_finder_argv,
-    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
-    set_active_project_impl, set_harness_usage_impl, set_message_pin_impl, set_preferences_impl,
-    set_project_archived_impl, set_project_directory_impl, set_visible_project_impl,
-    sign_in_mcp_provider_impl, sign_out_mcp_provider_impl,
-    spawn_prompt_resolution_change_notifications, stage_attachment_impl, stage_pasted_text_impl,
-    sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
-    test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
-    workspace_status_impl,
+    ForwardOutcome, HarnessInstallStatus, ProjectListing, RepoListing, SessionFileForEditor,
+    StagedAttachment, WorkspaceStatus, add_mcp_provider_impl, add_tracked_repo_impl,
+    agent_session_info_impl, attach_agent_impl, branch_comparison_file_diff_impl,
+    branch_comparison_impl, cancel_agent_impl, cancel_forward_impl, cancel_send_impl,
+    cancel_turn_impl, change_agent_selection_impl, changed_files_impl, check_antigravity_auth_impl,
+    check_antigravity_binary_impl, check_claude_auth_impl, check_claude_binary_impl,
+    check_codex_auth_impl, check_codex_binary_impl, commit_changed_files_impl,
+    commit_file_diff_impl, commit_ranges_impl, compact_agent_impl, context_report_agent_impl,
+    copy_builtin_prompt_impl, create_agent_impl, create_project_impl, delete_project_impl,
+    editor_open_argv, existing_attachment_paths_impl, fetch_repo_impl, file_diff_impl,
+    fork_agent_impl, forward_message_impl, forward_prompt_impl, get_harness_usage_impl,
+    get_preferences_impl, get_prompt_source_impl, harness_adapter_for, install_status_for_adapter,
+    list_agents_impl, list_mcp_providers_impl, list_message_pins_impl, list_projects_impl,
+    list_prompts_impl, list_tracked_repos_from_inputs, load_project_conversation_impl,
+    migrate_message_pin_impl, open_branch_comparison_file_difftool_impl,
+    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
+    parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
+    read_codex_account_usage_impl, read_tracked_repo_from_inputs, recheck_harness_installs_impl,
+    reclaim_project_attachments_impl, remove_agent_impl, remove_mcp_provider_impl,
+    remove_message_pins_impl, remove_queued_message_impl, remove_tracked_repo_impl,
+    rename_agent_impl, rename_project_impl, render_prompt_impl, reorder_agents_impl,
+    resolve_saved_prompt_fresh_impl, resolve_saved_prompt_impl, resume_agent_in_terminal_impl,
+    reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
+    send_message_impl, session_file_for_editor, set_active_project_impl, set_harness_usage_impl,
+    set_message_pin_impl, set_preferences_impl, set_project_archived_impl,
+    set_project_directory_impl, set_visible_project_impl, sign_in_mcp_provider_impl,
+    sign_out_mcp_provider_impl, spawn_prompt_resolution_change_notifications,
+    stage_attachment_impl, stage_pasted_text_impl, sync_prompts_and_notify, terminal_open_argv,
+    test_mcp_connection_impl, test_saved_mcp_provider_impl, tracked_repos_inputs, tracked_roots,
+    validate_external_url, workspace_status_impl,
 };
 use crate::error::AppError;
 use crate::harness_usage::HarnessUsage;
@@ -1520,7 +1522,11 @@ async fn agent_session_info(
 }
 
 #[tauri::command]
-async fn open_session_file(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
+async fn open_session_file(
+    state: State<'_, AppState>,
+    agent_id: String,
+    as_copy: bool,
+) -> Result<(), String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -1529,19 +1535,56 @@ async fn open_session_file(state: State<'_, AppState>, agent_id: String) -> Resu
     let Some(path) = info.session_file else {
         return Err("this agent has no session file yet".to_owned());
     };
+    let target = tauri::async_runtime::spawn_blocking(move || {
+        session_file_for_editor(PathBuf::from(path), as_copy)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
     // `.jsonl` has no default macOS app handler, so a plain open fails
-    // (kLSApplicationNotFoundErr). `open -t` forces the default *text* editor.
-    // macOS-specific, which is fine — Switchboard is macOS-only in v1.
-    let status = tokio::process::Command::new("open")
-        .arg("-t")
-        .arg(&path)
-        .status()
-        .await
-        .map_err(|e| e.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("`open -t` failed for {path} (exit {status})"))
+    // (kLSApplicationNotFoundErr). `open -t` forces the default *text* editor,
+    // and `open -f` opens text read from stdin there, as a temporary file macOS
+    // creates. macOS-specific, which is fine — Switchboard is macOS-only in v1.
+    match target {
+        SessionFileForEditor::File(path) => {
+            let status = tokio::process::Command::new("open")
+                .arg("-t")
+                .arg(&path)
+                .status()
+                .await
+                .map_err(|e| e.to_string())?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "`open -t` failed for {} (exit {status})",
+                    path.display()
+                ))
+            }
+        }
+        SessionFileForEditor::Text(text) => {
+            let mut child = tokio::process::Command::new("open")
+                .arg("-f")
+                .stdin(Stdio::piped())
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            // Dropped at the end of this block, which closes stdin: `open -f`
+            // reads until end of input.
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(text.as_bytes())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            let status = child.wait().await.map_err(|e| e.to_string())?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "`open -f` failed for the copy of the session file (exit {status})"
+                ))
+            }
+        }
     }
 }
 

@@ -141,7 +141,7 @@ pub enum SystemMarker {
 
 /// Why a Codex fork's inherited history could not be loaded. The frontend words
 /// each case for the user, because they mean different things: a missing file
-/// also stops Codex from running the fork, a compressed one does not.
+/// also stops Codex from running the fork, the others are not known to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -150,11 +150,9 @@ pub enum InheritedHistoryGap {
     /// `~/.codex/archived_sessions`, the two places Codex looks. Probed: Codex then
     /// refuses to run the fork until the file is restored.
     NotFound,
-    /// Only a compressed copy (`rollout-*.jsonl.zst`) exists. Codex can read
-    /// it; Switchboard can't yet (gap G40).
-    Compressed,
     /// The file is shorter than the fork's recorded cut-off, or the cut-off
-    /// no longer falls on a line break, so it is not the file Codex forked.
+    /// no longer falls on a line break, so it is not the file Codex forked. A
+    /// compressed file that doesn't decode is reported the same way.
     Changed,
     /// More than one rollout carries that id. Impossible by Codex's design,
     /// so nothing is guessed.

@@ -189,6 +189,7 @@
   /// still being created is read from the project's compose claim instead, so
   /// it survives this sidebar being closed and reopened.
   let forkError = $state<{ agentId: AgentId; message: string } | null>(null);
+  let openSessionError = $state<{ agentId: AgentId; message: string } | null>(null);
 
   /// Selection writes send only the parts the user changed, measured against
   /// what they started from, so another client's change to a different setting
@@ -369,6 +370,7 @@
     if (compactConfirmAgentId !== null && !ids.has(compactConfirmAgentId))
       compactConfirmAgentId = null;
     if (forkError !== null && !ids.has(forkError.agentId)) forkError = null;
+    if (openSessionError !== null && !ids.has(openSessionError.agentId)) openSessionError = null;
     if (resumeAgentId !== null && !ids.has(resumeAgentId)) {
       resumeAgentId = null;
       resumeOpen = false;
@@ -385,11 +387,20 @@
     if (hoveredAgentId !== null && !ids.has(hoveredAgentId)) hoveredAgentId = null;
   });
 
-  function openSessionFile(agent: AgentRecord): void {
-    if (!sessionInfoByAgent[agent.id]?.session_file) return;
-    void apiOpenSessionFile(agent.id).catch((err: unknown) => {
-      console.error("[switchboard] open session file failed", err);
-    });
+  async function openSessionFile(agent: AgentRecord): Promise<void> {
+    const info = sessionInfoByAgent[agent.id];
+    if (!info?.session_file) return;
+    openSessionError = null;
+    try {
+      // The same cached answer that chose the label, so a click on "Open copy"
+      // always asks for a copy even if the file has changed since.
+      await apiOpenSessionFile(agent.id, info.session_file_compressed === true);
+    } catch (err) {
+      openSessionError = {
+        agentId: agent.id,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
 
   function startRemove(agent: AgentRecord): void {
@@ -1529,7 +1540,7 @@
                     {/if}
                     {#if sessionInfo?.session_file}
                       <DropdownMenuItem
-                        onSelect={() => openSessionFile(agent)}
+                        onSelect={() => void openSessionFile(agent)}
                         class="gap-2"
                         data-testid="agent-action-open-session"
                       >
@@ -1539,7 +1550,11 @@
                           class="text-muted shrink-0"
                           aria-hidden="true"
                         />
-                        Open session file
+                        <!-- Codex compresses a file nobody has used for a week; the
+                             editor then gets a decompressed copy, which won't update. -->
+                        {sessionInfo.session_file_compressed
+                          ? "Open copy of session file"
+                          : "Open session file"}
                       </DropdownMenuItem>
                     {/if}
                     {#if canConfigureSelection(agent)}
@@ -1890,6 +1905,11 @@
           {#if forkError?.agentId === agent.id}
             <div class="text-status-failed mt-1 text-xs" data-testid="agent-fork-error">
               Couldn't fork {agent.name}: {forkError.message}
+            </div>
+          {/if}
+          {#if openSessionError?.agentId === agent.id}
+            <div class="text-status-failed mt-1 text-xs" data-testid="agent-open-session-error">
+              Couldn't open session file: {openSessionError.message}
             </div>
           {/if}
           {#if removeError?.agentId === agent.id}

@@ -34,6 +34,7 @@ pub(crate) mod facets;
 pub mod fork;
 pub(crate) mod inherited_history;
 pub mod parser;
+pub(crate) mod rollout_file;
 pub mod session_file;
 pub mod skills;
 pub(crate) mod world_state;

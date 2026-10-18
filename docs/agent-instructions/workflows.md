@@ -505,7 +505,7 @@ steps:
         Let me know what your recommendations are.
 ```
 
-The invocation form shows `reviewers`, `worker`, and the auto-derived optional `context` (from `builtin:code-review`). `context` is the scope and background handed to each reviewer; the worker never sees it directly, only the reviewers' responses, which it has already scoped.
+The invocation form shows `reviewers`, `worker`, and the auto-derived optional `context` (from `builtin:code-review`). `context` is whatever the user types there (the review's scope and background), passed to each reviewer as typed; the worker never sees it directly, only the reviewers' responses, which it has already scoped.
 
 ### `review-and-reconcile` (flagship)
 

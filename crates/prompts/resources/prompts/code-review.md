@@ -74,5 +74,5 @@ Additional context and focus for this review:
 {{ context }}
 """
 
-If it names what to review (a diff base, a commit range, or files), review that instead of the default above. If it names what was already reviewed, don't review that again except where the new changes touch it. Otherwise concentrate where it points and don't flag anything it rules out of scope. It adds to the review of the changes above; it does not replace it.
+If it says to review something other than the default (a diff base, a commit range, or a set of files), review that instead of the default above; otherwise it adds to the review of the default, without replacing it. If it names what was already reviewed, don't review that again except where the new changes touch it. In every case, concentrate where it points and don't flag anything it rules out of scope.
 {%- endif %}

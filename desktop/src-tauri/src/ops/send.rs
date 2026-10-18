@@ -1202,22 +1202,23 @@ fn workflow_send_owner(state: &AppState, project_id: ProjectId, send_id: SendId)
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct CancelledAgent {
+pub struct StoppedAgent {
     pub agent_id: AgentId,
     /// Whether the agent had an actor to deliver the cancel to.
     pub requested: bool,
 }
 
-/// Stop an agent: cancel its running turn and drop its queued backlog.
-pub fn cancel_agent(
+/// Stop an agent: cancel its running turn and drop its queued backlog, as the
+/// window's "Stop agent" does.
+pub fn stop_agent(
     state: &AppState,
     project_id: ProjectId,
     agent_id: AgentId,
-) -> Result<CancelledAgent, AppError> {
+) -> Result<StoppedAgent, AppError> {
     agent_in_project(state, project_id, agent_id)?;
     let outcome = cancel_agent_impl(state, agent_id);
-    tracing::info!(%project_id, %agent_id, ?outcome, "agent cancelled");
-    Ok(CancelledAgent {
+    tracing::info!(%project_id, %agent_id, ?outcome, "agent stopped");
+    Ok(StoppedAgent {
         agent_id,
         requested: matches!(outcome, switchboard_dispatcher::CancelOutcome::Requested),
     })

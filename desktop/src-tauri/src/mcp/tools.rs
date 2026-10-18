@@ -405,8 +405,9 @@ tools! {
     CancelSend = "cancel_send" (CancelSendArgs) [Stops]
         "Cancel a send. Without agent_id, every recipient still queued or running is cancelled, \
          and a send still being prepared stops before reaching anyone else. With agent_id, only \
-         that agent's reply to the send is cancelled, queued or running, and the other \
-         recipients carry on, except in a workflow. Both work for sends you made since the app \
+         that agent's reply to the send is cancelled, queued or running (what the stop control \
+         on that reply does in the window), and the other recipients carry on, except in a \
+         workflow. Both work for sends you made since the app \
          last started, and for the sends of a workflow started through these tools \
          (wait_workflow lists their send_ids); there a cancelled reply cancels the whole run, \
          which stops the other recipients' replies too. To unstick one agent, pass its \
@@ -415,11 +416,11 @@ tools! {
          already_finished when there was nothing left to cancel; or, with agent_id, requested \
          for a workflow's send older than Switchboard's record of it: the agent stops that \
          reply if it is still queued or running.";
-    CancelAgent = "cancel_agent" (AgentArgs) [Stops]
-        "Stop an agent entirely: cancel its running turn and drop every message queued for it, \
-         including ones the user or a workflow queued. It stops the user's work too: use it only \
-         when the user asks. To unstick one reply without dropping anything else, use \
-         cancel_send with agent_id.";
+    StopAgent = "stop_agent" (AgentArgs) [Stops]
+        "Stop the agent's current turn and drop every message queued for it, including ones the \
+         user or a workflow queued: what Stop agent does in Switchboard's window. It stops the \
+         user's work too: use it only when the user asks. To unstick one reply without dropping \
+         anything else, use cancel_send with agent_id.";
     CancelWorkflowRun = "cancel_workflow_run" (RunArgs) [Stops]
         "Cancel a running workflow run started through these tools. A run the user started from \
          Switchboard's window is refused: tell the user instead.";
@@ -1456,9 +1457,9 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 a.agent_id,
             )?)
         }
-        ToolName::CancelAgent => {
+        ToolName::StopAgent => {
             let a: AgentArgs = parse(args)?;
-            Reply::plain(&send::cancel_agent(state, a.project_id, a.agent_id)?)
+            Reply::plain(&send::stop_agent(state, a.project_id, a.agent_id)?)
         }
         ToolName::CancelWorkflowRun => {
             let a: RunArgs = parse(args)?;

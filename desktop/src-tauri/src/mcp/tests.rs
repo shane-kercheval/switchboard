@@ -867,7 +867,7 @@ async fn a_stopping_server_refuses_new_calls_but_lets_cancels_through() {
         &router,
         &session,
         3,
-        "cancel_agent",
+        "stop_agent",
         &json!({ "project_id": project_id, "agent_id": agent_id }),
     )
     .await;
@@ -1155,7 +1155,7 @@ async fn wait_any_send_returns_when_the_first_send_finishes_and_a_busy_agent_is_
     assert!(
         body["message"]
             .as_str()
-            .is_some_and(|m| m.contains("cancel_send") && !m.contains("cancel_agent")),
+            .is_some_and(|m| m.contains("cancel_send") && !m.contains("stop_agent")),
         "{body}"
     );
     assert_eq!(
@@ -1429,7 +1429,7 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     )
     .await;
     call(
-        "cancel_agent",
+        "stop_agent",
         json!({ "project_id": project_id, "agent_id": r2 }),
     )
     .await;
@@ -2664,6 +2664,7 @@ fn the_orchestrator_prompt_names_only_real_tools() {
         "dismiss_",
         "get_",
         "set_",
+        "stop_",
     ];
     // Field names that share a tool's prefix.
     const FIELDS: &[&str] = &["send_id", "send_ids", "run_id"];

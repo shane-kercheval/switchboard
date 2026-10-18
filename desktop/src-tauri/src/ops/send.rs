@@ -921,9 +921,10 @@ pub enum CancelOutcome {
     /// Every recipient had already ended: nothing to cancel.
     AlreadyFinished,
     /// One recipient's cancel was sent to its agent without a record of the
-    /// send to check against (a workflow's send the ledger no longer holds, or
-    /// one from before a restart): the agent stops the reply if it still has
-    /// it.
+    /// send to check against: a workflow's send the ledger has pruned since the
+    /// app started (who started its run is kept until the app quits, so the
+    /// cancel is still allowed; after a restart it is refused). The agent stops
+    /// the reply if it still has it.
     Requested,
 }
 

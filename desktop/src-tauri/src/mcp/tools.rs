@@ -369,10 +369,11 @@ tools! {
         "Cancel a send. Without agent_id, every recipient still queued or running is cancelled, \
          and a send still being prepared stops before reaching anyone else. With agent_id, only \
          that agent's reply to the send is cancelled, queued or running, and the other \
-         recipients carry on. Both work for sends you made since the app last started, and for \
-         the sends of a workflow started through these tools (wait_workflow lists their \
-         send_ids), where a cancelled reply cancels the whole run. To unstick one agent, pass \
-         its agent_id. A reply to a message the user typed, or inside a workflow the user \
+         recipients carry on, except in a workflow. Both work for sends you made since the app \
+         last started, and for the sends of a workflow started through these tools \
+         (wait_workflow lists their send_ids); there a cancelled reply cancels the whole run, \
+         which stops the other recipients' replies too. To unstick one agent, pass its \
+         agent_id. A reply to a message the user typed, or inside a workflow the user \
          started from the window, is refused: tell the user instead. outcome is cancelled; \
          already_finished when there was nothing left to cancel; or, with agent_id, requested \
          for a workflow's send older than Switchboard's record of it: the agent stops that \

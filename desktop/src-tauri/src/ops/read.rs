@@ -43,17 +43,25 @@ pub struct ProjectStatusListing {
     pub status: ProjectStatus,
 }
 
-/// Every project in the store with whether it is busy. A project nobody has
-/// opened has no registered agents and no run, so it is idle. Each agent's
-/// busy check asks its actor, which answers nothing while it prepares a turn,
-/// so the checks end on `cancel` (the server's stop) with `Interrupted`.
+/// Every project in the store with whether it is busy, leaving out the ones
+/// the user archived unless `include_archived`: the window's project list shows
+/// only active projects until the user opens its archived view, and an
+/// orchestrator choosing where to work should see the same set. A project
+/// nobody has opened has no registered agents and no run, so it is idle. Each
+/// agent's busy check asks its actor, which answers nothing while it prepares
+/// a turn, so the checks end on `cancel` (the server's stop) with
+/// `Interrupted`.
 pub async fn list_projects(
     state: &AppState,
+    include_archived: bool,
     cancel: &CancellationToken,
 ) -> Result<Vec<ProjectStatusListing>, AppError> {
     let listings = list_projects_impl(state)?;
     let mut out = Vec::with_capacity(listings.len());
-    for listing in listings {
+    for listing in listings
+        .into_iter()
+        .filter(|listing| include_archived || !listing.archived)
+    {
         let status = if project_is_busy(state, listing.id, cancel).await? {
             ProjectStatus::Busy
         } else {

@@ -35,8 +35,9 @@ use super::error_code::{self, error_code};
 use super::ledger::{ForkClaim, SendStatus};
 use super::read::conversation_budget;
 use super::read::{
-    DigestItem, DigestTurnStatus, LatestReplyStatus, OutputSource, ProjectStatus, ReadFrom,
-    list_agents, list_projects, read_conversation, read_latest_reply, read_reply,
+    DigestItem, DigestTurnStatus, LatestReplyStatus, OutputSource, ProjectStatus,
+    ProjectStatusListing, ReadFrom, list_agents, list_projects, read_conversation,
+    read_latest_reply, read_reply,
 };
 use super::send::{
     AgentWaitStatus, Body, ForwardFrom, ForwardPrompt, ForwardRequest, OnBusyPolicy, SendRequest,
@@ -235,7 +236,7 @@ async fn list_projects_reports_busy_and_idle() {
         env2.project("other")
     };
     let _ = other;
-    let listed = list_projects(&env.state, &CancellationToken::new())
+    let listed = list_projects(&env.state, false, &CancellationToken::new())
         .await
         .unwrap();
     assert_eq!(listed[0].status, ProjectStatus::Idle);
@@ -250,11 +251,44 @@ async fn list_projects_reports_busy_and_idle() {
     .await
     .unwrap();
     await_turn_running(&env.state, agents[0]).await;
-    let listed = list_projects(&env.state, &CancellationToken::new())
+    let listed = list_projects(&env.state, false, &CancellationToken::new())
         .await
         .unwrap();
     assert_eq!(listed[0].status, ProjectStatus::Busy);
     gate.notify_waiters();
+}
+
+/// An archived project is left out unless the caller asks for it, as the
+/// window's project list leaves it out until the user opens its archived
+/// view; the listing still says which ones are archived.
+#[tokio::test]
+async fn list_projects_leaves_out_archived_projects_unless_asked() {
+    let mut env = TestEnv::new();
+    let active = env.project("active");
+    let archived = env.project("shelved");
+    crate::commands::set_project_archived_impl(&env.state, archived, true).unwrap();
+    let ids = |listed: &[ProjectStatusListing]| -> Vec<ProjectId> {
+        listed.iter().map(|p| p.listing.id).collect()
+    };
+
+    let default = list_projects(&env.state, false, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&default),
+        vec![active],
+        "the archived project is left out"
+    );
+
+    let all = list_projects(&env.state, true, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2, "both projects are listed");
+    assert!(
+        all.iter()
+            .any(|p| p.listing.id == archived && p.listing.archived),
+        "the archived one says so"
+    );
 }
 
 // --- sends -------------------------------------------------------------------
@@ -3905,7 +3939,7 @@ async fn a_listing_cancelled_during_a_busy_check_is_interrupted() {
     });
     let projects = tokio::spawn({
         let (state, cancel) = (Arc::clone(&env.state), cancel.clone());
-        async move { list_projects(&state, &cancel).await }
+        async move { list_projects(&state, false, &cancel).await }
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(

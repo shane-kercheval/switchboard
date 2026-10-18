@@ -138,6 +138,22 @@ async fn a_client_lists_projects_creates_an_agent_sends_and_waits() {
     let projects = ok(&client, "list_projects", json!({})).await;
     assert_eq!(uuid(&projects[0]["id"]), project_id);
     assert_eq!(projects[0]["status"], "idle");
+    crate::commands::set_project_archived_impl(&env.state, project_id, true).unwrap();
+    let projects = ok(&client, "list_projects", json!({})).await;
+    assert_eq!(
+        projects,
+        json!([]),
+        "an archived project is left out by default"
+    );
+    let projects = ok(
+        &client,
+        "list_projects",
+        json!({ "include_archived": true }),
+    )
+    .await;
+    assert_eq!(uuid(&projects[0]["id"]), project_id);
+    assert_eq!(projects[0]["archived"], true);
+    crate::commands::set_project_archived_impl(&env.state, project_id, false).unwrap();
 
     let agent = ok(
         &client,

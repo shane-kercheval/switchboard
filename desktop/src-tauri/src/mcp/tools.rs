@@ -189,10 +189,12 @@ enum ToolKind {
 }
 
 tools! {
-    ListProjects = "list_projects" (NoArgs) [Read]
-        "Every project: id, name, working folder, whether the folder exists, and status (busy \
-         when an agent has running or queued work or a workflow is running, else idle). Start \
-         here: every other tool takes a project_id.";
+    ListProjects = "list_projects" (ListProjectsArgs) [Read]
+        "The user's projects: id, name, working folder, whether the folder exists, archived, and \
+         status (busy when an agent has running or queued work or a workflow is running, else \
+         idle). Start here: every other tool takes a project_id. Projects the user archived are \
+         left out, as the window's project list leaves them out; pass include_archived: true to \
+         list them too. An archived project's id still works in every other tool.";
     ListAgents = "list_agents" (ProjectArgs) [Read]
         "A project's agents: id, name, harness, model, effort, the quick-choice lists of models \
          and efforts, busy, and context. busy is an observation: the user or a workflow can occupy \
@@ -286,7 +288,10 @@ tools! {
     CreateProject = "create_project" (CreateProjectArgs) [Additive]
         "Create a project for a folder on this Mac. It starts with no agents; add them with \
          create_agent. Avoid the folder this session runs in: the agents Switchboard launches \
-         there would read the same MCP configuration and get these tools too.";
+         there would read the same MCP configuration and get these tools too. A folder may \
+         hold several projects, and list_projects leaves out the ones the user archived: \
+         before creating one, check list_projects with include_archived: true for a project the \
+         user already has for this folder, whose agents and history a new one would not have.";
     RenameProject = "rename_project" (RenameProjectArgs) [Additive]
         "Rename a project. Its id does not change.";
     CreateAgent = "create_agent" (CreateAgentArgs) [Additive]
@@ -520,6 +525,15 @@ pub fn catalog() -> Vec<Tool> {
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
 pub struct NoArgs {}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub struct ListProjectsArgs {
+    /// Also list the projects the user archived. False by default.
+    #[serde(default)]
+    include_archived: bool,
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -1231,8 +1245,8 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
     let state = cx.state();
     match tool {
         ToolName::ListProjects => {
-            parse::<NoArgs>(args)?;
-            Reply::plain(&read::list_projects(state, &cx.cancel).await?)
+            let a: ListProjectsArgs = parse(args)?;
+            Reply::plain(&read::list_projects(state, a.include_archived, &cx.cancel).await?)
         }
         ToolName::ListAgents => {
             let a: ProjectArgs = parse(args)?;

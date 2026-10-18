@@ -103,7 +103,7 @@ ${lens.role}
 
 ## What to question
 
-Ask what you would need answered before you would sign off on the result: the questions whose answers could change your decision, or your confidence in it. Skip the ones that can't. Accept an answer you would accept from a senior ${lens.peer}. Do not challenge for the sake of it.
+Ask what you would need answered before you would sign off on the result: the questions whose answers could change your decision, or your confidence in it. Accept an answer you would accept from a senior ${lens.peer}. Do not challenge for the sake of it.
 
 A suggestion is a starting point, mine included. Before refining one, step back: is the problem real, is it worth solving, and what is the right approach? Then say whether the suggestion is it, and tell me when you think I'm wrong.
 

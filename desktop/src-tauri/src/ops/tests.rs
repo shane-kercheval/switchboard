@@ -36,8 +36,8 @@ use super::ledger::{ForkClaim, SendStatus};
 use super::read::conversation_budget;
 use super::read::{
     DigestItem, DigestTurnStatus, LatestReplyStatus, OutputSource, ProjectStatus,
-    ProjectStatusListing, ReadFrom, list_agents, list_projects, read_conversation,
-    read_latest_reply, read_reply,
+    ProjectStatusListing, ReadFrom, SERVER_TEMPLATE_NOTE, UNLISTED_NOTE, list_agents,
+    list_projects, prompt_budget, read_conversation, read_latest_reply, read_prompt, read_reply,
 };
 use super::send::{
     AgentWaitStatus, Body, ForwardFrom, ForwardPrompt, ForwardRequest, OnBusyPolicy, SendRequest,
@@ -548,6 +548,267 @@ async fn a_saved_prompt_body_renders_with_its_appended_text() {
     let receipt = send_now(env.handle(), env.home(), request).await.unwrap();
     wait_done(&env, project_id, receipt.send_id).await;
     assert_eq!(lock(&env.adapter.prompts)[0], "Hi bob\n\nthanks");
+}
+
+/// A local prompt's template comes back with its placeholders intact, its
+/// arguments as `list_prompts` declares them, and no rendering until asked.
+/// With args, the rendering is the text a send of the prompt delivers.
+#[tokio::test]
+async fn read_prompt_returns_a_local_template_and_the_rendering_a_send_delivers() {
+    let mut env = TestEnv::new().with_prompts_and_workflows();
+    std::fs::write(env.prompts_dir().join("greet.md"), GREET_PROMPT).unwrap();
+    env.state.prompts.sync().await;
+    let budget = WaitBudget::default_wait();
+
+    let plain = read_prompt(&env.state, "local", "greet", None, &budget)
+        .await
+        .unwrap();
+    assert_eq!(plain.template.unwrap().text, "Hi {{ who }}\n");
+    assert_eq!(plain.template_note, None);
+    assert_eq!(plain.rendered, None, "no rendering without args");
+    let arguments = plain.arguments.unwrap();
+    assert_eq!(arguments.len(), 1);
+    assert!(arguments[0].required);
+    assert_eq!(plain.listing_note, None);
+
+    let args = BTreeMap::from([("who".to_owned(), "bob".to_owned())]);
+    let rendered = read_prompt(&env.state, "local", "greet", Some(&args), &budget)
+        .await
+        .unwrap()
+        .rendered
+        .unwrap()
+        .text;
+    let project_id = env.project("proj");
+    let agent = env.agent(project_id, "a");
+    let request = SendRequest {
+        project_id,
+        recipients: vec![agent],
+        body: Body::Prompt {
+            provider: "local".to_owned(),
+            name: "greet".to_owned(),
+            args,
+            appended_text: None,
+        },
+        on_busy: OnBusyPolicy::Refuse,
+        idempotency_key: None,
+        attachments: Vec::new(),
+    };
+    let receipt = send_now(env.handle(), env.home(), request).await.unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+    assert_eq!(
+        lock(&env.adapter.prompts)[0],
+        rendered,
+        "the rendering is what a send delivers"
+    );
+}
+
+/// The argument checks are a send's: a missing required argument and an
+/// unknown prompt are the caller's error, before anything is read.
+#[tokio::test]
+async fn read_prompt_refuses_a_missing_argument_and_an_unknown_prompt() {
+    let env = TestEnv::new().with_prompts_and_workflows();
+    std::fs::write(env.prompts_dir().join("greet.md"), GREET_PROMPT).unwrap();
+    env.state.prompts.sync().await;
+    let budget = WaitBudget::default_wait();
+
+    let missing = read_prompt(
+        &env.state,
+        "local",
+        "greet",
+        Some(&BTreeMap::new()),
+        &budget,
+    )
+    .await
+    .expect_err("who is required");
+    assert_eq!(error_code(&missing), error_code::INVALID_ARGUMENT);
+    let unknown = read_prompt(&env.state, "local", "nope", None, &budget)
+        .await
+        .expect_err("no such prompt");
+    assert_eq!(error_code(&unknown), error_code::INVALID_ARGUMENT);
+}
+
+/// A prompt server gives out no template: the result says so plainly, and
+/// with args returns the server's rendering, which is what a send delivers.
+/// Arguments the server refuses are the caller's error, as a local prompt's
+/// missing argument is.
+#[tokio::test]
+async fn read_prompt_from_a_prompt_server_has_no_template_but_renders() {
+    let server = spawn_prompt_server().await;
+    let env = TestEnv::new().with_prompts_and_workflows();
+    env.add_prompt_server("tiddly", &server.url);
+    env.state.prompts.sync().await;
+    let budget = WaitBudget::default_wait();
+
+    let plain = read_prompt(&env.state, "tiddly", "review", None, &budget)
+        .await
+        .unwrap();
+    assert_eq!(plain.template, None);
+    assert_eq!(plain.template_note, Some(SERVER_TEMPLATE_NOTE));
+    assert_eq!(plain.description.as_deref(), Some("Review code"));
+    assert_eq!(plain.arguments.unwrap()[0].name, "context");
+
+    let args = BTreeMap::from([("context".to_owned(), "the parser".to_owned())]);
+    let reading = read_prompt(&env.state, "tiddly", "review", Some(&args), &budget)
+        .await
+        .unwrap();
+    assert_eq!(reading.rendered.unwrap().text, "Review the parser");
+    assert_eq!(
+        reading.template_note,
+        Some(SERVER_TEMPLATE_NOTE),
+        "still no template beside the rendering"
+    );
+
+    let refused = read_prompt(
+        &env.state,
+        "tiddly",
+        "review",
+        Some(&BTreeMap::new()),
+        &budget,
+    )
+    .await
+    .expect_err("the server requires context");
+    assert_eq!(error_code(&refused), error_code::INVALID_ARGUMENT);
+}
+
+/// With args, a prompt server's prompt renders as a send would, whether or
+/// not Switchboard has listed it: here the server was never fetched. Its
+/// description and arguments are then unknown, null rather than an empty
+/// list that would read as "takes none", and the note says why. Without
+/// args there is nothing to return, and the error says to pass them.
+#[tokio::test]
+async fn read_prompt_renders_a_server_prompt_switchboard_has_not_listed() {
+    let server = spawn_prompt_server().await;
+    let env = TestEnv::new().with_prompts_and_workflows();
+    env.add_prompt_server("tiddly", &server.url);
+    let budget = WaitBudget::default_wait();
+
+    let args = BTreeMap::from([("context".to_owned(), "the parser".to_owned())]);
+    let reading = read_prompt(&env.state, "tiddly", "review", Some(&args), &budget)
+        .await
+        .unwrap();
+    assert_eq!(
+        reading.rendered.as_ref().map(|r| r.text.as_str()),
+        Some("Review the parser")
+    );
+    assert_eq!(reading.arguments, None);
+    assert_eq!(reading.description, None);
+    assert_eq!(reading.listing_note, Some(UNLISTED_NOTE));
+    let shape = serde_json::to_value(&reading).unwrap();
+    assert!(shape["arguments"].is_null(), "{shape}");
+
+    let unlisted = read_prompt(&env.state, "tiddly", "review", None, &budget)
+        .await
+        .expect_err("nothing is known of the prompt without a listing or args");
+    assert!(
+        unlisted.to_string().contains("pass args"),
+        "the error says how to read it anyway: {unlisted}"
+    );
+}
+
+/// A server the user is signed out of is reported as needing sign-in, never
+/// as a missing prompt: with args from the render, as a send reports it, and
+/// without them from the server's state at its last fetch.
+#[tokio::test]
+async fn read_prompt_reports_a_signed_out_server_as_needing_sign_in() {
+    let env = TestEnv::new().with_prompts_and_workflows();
+    env.add_signed_out_prompt_server("tiddly");
+    env.state.prompts.sync().await;
+    let budget = WaitBudget::default_wait();
+
+    let without = read_prompt(&env.state, "tiddly", "review", None, &budget)
+        .await
+        .expect_err("signed out");
+    assert_eq!(error_code(&without), error_code::PROMPT_NEEDS_SIGN_IN);
+    let args = BTreeMap::from([("context".to_owned(), "x".to_owned())]);
+    let with = read_prompt(&env.state, "tiddly", "review", Some(&args), &budget)
+        .await
+        .expect_err("signed out");
+    assert_eq!(error_code(&with), error_code::PROMPT_NEEDS_SIGN_IN);
+}
+
+/// A server that failed at its last fetch leaves the prompt unlisted, which
+/// is not the same as missing: without args the error says so and how to
+/// read the prompt anyway, rather than reporting it gone.
+#[tokio::test]
+async fn read_prompt_reports_a_server_that_failed_at_its_last_fetch() {
+    let env = TestEnv::new().with_prompts_and_workflows();
+    env.add_prompt_server("tiddly", "http://127.0.0.1:9/mcp");
+    env.state.prompts.sync().await;
+
+    let failed = read_prompt(
+        &env.state,
+        "tiddly",
+        "review",
+        None,
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .expect_err("the server could not be fetched");
+    assert_eq!(error_code(&failed), error_code::INTERNAL);
+    let message = failed.to_string();
+    assert!(
+        message.contains("failed at Switchboard's last fetch") && message.contains("pass args"),
+        "the error says what happened and how to read it anyway: {message}"
+    );
+}
+
+/// A prompt the server's last successful fetch did not list is missing, the
+/// caller's error, as an unknown local prompt is.
+#[tokio::test]
+async fn read_prompt_refuses_a_prompt_the_server_does_not_list() {
+    let server = spawn_prompt_server().await;
+    let env = TestEnv::new().with_prompts_and_workflows();
+    env.add_prompt_server("tiddly", &server.url);
+    env.state.prompts.sync().await;
+
+    let missing = read_prompt(
+        &env.state,
+        "tiddly",
+        "nope",
+        None,
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .expect_err("the server lists no such prompt");
+    assert_eq!(error_code(&missing), error_code::INVALID_ARGUMENT);
+}
+
+/// A prompt over the result budget is cut to fit, the cut listed with its
+/// full length and no call to read on: a saved prompt has no pager.
+#[tokio::test]
+async fn read_prompt_cuts_a_prompt_over_the_budget_and_reports_the_cut() {
+    let env = TestEnv::new().with_prompts_and_workflows();
+    let body = "x".repeat(30_000);
+    std::fs::write(
+        env.prompts_dir().join("long.md"),
+        format!("---\nname: long\ndescription: Long.\n---\n{body}\n"),
+    )
+    .unwrap();
+    env.state.prompts.sync().await;
+    let reading = read_prompt(
+        &env.state,
+        "local",
+        "long",
+        Some(&BTreeMap::new()),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+
+    let fitted = fit(
+        serde_json::to_value(&reading).unwrap(),
+        &prompt_budget(10_000),
+    )
+    .unwrap();
+    assert!(fitted.serialized_chars() <= 10_000);
+    let mut paths: Vec<&str> = fitted.truncated.iter().map(|t| t.path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec!["/rendered/text", "/template/text"], "both cut");
+    assert!(fitted.truncated.iter().all(|t| t.read_with.is_none()));
+    assert!(
+        fitted.truncated.iter().all(|t| t.total_chars >= 30_000),
+        "each cut reports the full length"
+    );
 }
 
 // --- idempotency -------------------------------------------------------------

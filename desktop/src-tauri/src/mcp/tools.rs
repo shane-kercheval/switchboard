@@ -253,7 +253,21 @@ tools! {
         "The user's saved prompts, local and from prompt servers: provider, name, description, \
          and arguments. They are the user's standing instructions (a code review, a security \
          review, an analysis of reviewers' findings): when one fits the task, send it rather than \
-         writing your own. Use one in send or forward as prompt: {provider, name, args}.";
+         writing your own. Use one in send or forward as prompt: {provider, name, args}. To \
+         see what one says before sending it, read_prompt.";
+    ReadPrompt = "read_prompt" (ReadPromptArgs) [Read]
+        "One saved prompt, to see what it says before sending it: its description and arguments \
+         as list_prompts reports them, and template.text, the template with its placeholders \
+         intact, for a builtin or local prompt. A prompt from a prompt server has no template \
+         here: the server keeps it and gives out only finished text, and template_note says \
+         so. Pass args (use {} for a prompt with no arguments) to also get rendered.text, the \
+         text a send of the prompt with those args would deliver, from any provider. With args \
+         the prompt renders as a send would even when Switchboard has no listing of it from its \
+         server; arguments is then null and listing_note says why. A missing or refused \
+         argument is invalid_argument, and a server that needs the user to sign in is \
+         prompt_needs_sign_in. Text over the result budget (100,000 characters, 45,000 \
+         without a progress token, or max_chars) is cut and listed in truncated; nothing reads \
+         on. To use the prompt, send it as prompt: {provider, name, args}, not as text.";
     ListWorkflows = "list_workflows" (NoArgs) [Read]
         "The user's workflows, saved multi-agent procedures (send to several reviewers and gather \
          their findings, for example): name, is_builtin, description, declared inputs, and \
@@ -640,6 +654,24 @@ pub struct ReadWorkflowRunArgs {
     /// The run id `run_workflow` or `list_workflow_runs` returned.
     #[schemars(with = "String")]
     run_id: Uuid,
+    /// Keep the result under this many characters: 10,000 to 100,000. By
+    /// default 100,000, or 45,000 when the client sends no progress token.
+    #[serde(default)]
+    max_chars: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub struct ReadPromptArgs {
+    /// The prompt's provider, as `list_prompts` reports it.
+    provider: String,
+    /// The prompt's name within that provider.
+    name: String,
+    /// Argument values by name, as `list_prompts` declares them. When given,
+    /// even as `{}`, the result also holds the rendering a send would deliver.
+    #[serde(default)]
+    args: Option<BTreeMap<String, String>>,
     /// Keep the result under this many characters: 10,000 to 100,000. By
     /// default 100,000, or 45,000 when the client sends no progress token.
     #[serde(default)]
@@ -1300,6 +1332,18 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
         ToolName::ListPrompts => {
             parse::<NoArgs>(args)?;
             Reply::plain(&read::list_prompts(state))
+        }
+        ToolName::ReadPrompt => {
+            let a: ReadPromptArgs = parse(args)?;
+            let reading = read::read_prompt(
+                state,
+                &a.provider,
+                &a.name,
+                a.args.as_ref(),
+                &cx.budget(None),
+            )
+            .await?;
+            Reply::fitted(&reading, read::prompt_budget(cx.result_chars(a.max_chars)))
         }
         ToolName::ListWorkflows => {
             parse::<NoArgs>(args)?;

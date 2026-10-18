@@ -1,21 +1,23 @@
-//! The read tier: lists, the conversation, and replies. Opens nothing and
-//! locks nothing, so every function here keeps working for a project the
-//! window has not loaded, when the window is slow, and when the working
-//! directory is gone.
+//! The read tier: lists, the conversation, replies, and saved prompts. Opens
+//! nothing and locks nothing, so every function here keeps working for a
+//! project the window has not loaded, when the window is slow, and when the
+//! working directory is gone.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId};
 use switchboard_harness::{SystemMarker, Turn, TurnOutcome, TurnStatus, turn_answer_text};
+use switchboard_prompts::{PromptError, ProviderStatus};
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::{
     AgentJournalView, ConversationItem, OutcomeStatus, ProjectConversation, ProjectListing,
-    SendCorrelation, TurnRender, list_project_agents_readonly_impl, list_projects_impl,
-    load_agent_transcript, load_project_conversation_impl, open_project_from_store,
+    SavedPromptResolution, SendCorrelation, TurnRender, list_project_agents_readonly_impl,
+    list_projects_impl, load_agent_transcript, load_project_conversation_impl,
+    open_project_from_store, resolve_saved_prompt_impl,
 };
 use crate::error::AppError;
 use crate::state::{AppState, lock};
@@ -25,6 +27,7 @@ use super::budget::{BudgetSpec, CutSite, json_escaped_len};
 use super::context::{CONTEXT_READ_WAIT, ContextFigures, ContextState, ContextStore};
 use super::ledger::AgentActivity;
 use super::ledger::SendStatus;
+use super::wait::{Outcome, WaitBudget};
 use super::with_cap;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -941,6 +944,198 @@ pub fn latest_reply_budget(project_id: ProjectId, budget_chars: usize) -> Budget
 #[must_use]
 pub fn list_prompts(state: &AppState) -> Vec<switchboard_prompts::Prompt> {
     crate::commands::list_prompts_impl(state)
+}
+
+/// What a prompt server says in place of a template it does not give out.
+pub const SERVER_TEMPLATE_NOTE: &str = "This prompt comes from a prompt server, which keeps its \
+template on the server and gives out only finished text, so there is no template to show. Pass \
+args (use {} for a prompt with no arguments) to get the text a send of this prompt would \
+deliver.";
+
+/// A saved prompt's text: a template, or a rendering, or both.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PromptText {
+    /// The only field the result budget cuts (see [`super::budget`]).
+    pub text: String,
+}
+
+/// Said in place of a description and arguments Switchboard has no listing
+/// for: a prompt server's prompt whose last fetch did not list it.
+pub const UNLISTED_NOTE: &str = "Switchboard has no listing of this prompt from its server \
+right now (it may need sign-in, have been unreachable at the last fetch, or not have been \
+fetched yet), so its description and arguments are unknown here; the rendering is current.";
+
+/// A saved prompt as `read_prompt` returns it: what `list_prompts` lists for
+/// it, its template, and on request its rendering.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PromptReading {
+    pub provider: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The declared arguments; `None` when Switchboard has no listing of the
+    /// prompt, so it cannot read as "takes no arguments".
+    pub arguments: Option<Vec<switchboard_prompts::PromptArgument>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// The template with its placeholders intact, for a built-in or local
+    /// prompt; `None` for a prompt server's.
+    pub template: Option<PromptText>,
+    /// Why there is no template, when the prompt comes from a prompt server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_note: Option<&'static str>,
+    /// Why the description and arguments are missing, when the prompt
+    /// rendered but Switchboard has no listing of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listing_note: Option<&'static str>,
+    /// The text a send of this prompt with the given args would deliver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendered: Option<PromptText>,
+}
+
+/// One saved prompt: its metadata as `list_prompts` reports it, its template,
+/// and with `args`, its rendering.
+///
+/// **Why an orchestrator may read a template.** The user's prompts are their
+/// standing instructions, and an orchestrator choosing between them, or
+/// deciding what to append, needs to know what one says before sending it,
+/// as the user does from the window's prompt preview. The template is shown
+/// to the caller, never sent to an agent: a send still delivers the rendering.
+///
+/// **A prompt server gives out no template.** MCP's `prompts/get` returns
+/// finished text, so a prompt server's prompt has metadata and, with `args`,
+/// a rendering, which is exactly what a send would deliver. The result says
+/// so in [`SERVER_TEMPLATE_NOTE`] rather than leaving `template` null
+/// unexplained.
+///
+/// **With `args`, it renders as a send does.** A send renders without
+/// consulting Switchboard's cached copy of each server's prompt list, so this
+/// does too: the same render, argument checks, and errors, bounded by
+/// `budget` because a server's render is a network call. The cache supplies
+/// the description and arguments when it has them; when it does not (the
+/// server needed sign-in or was unreachable at its last fetch, or has not
+/// been fetched yet) they are unknown and [`UNLISTED_NOTE`] says so.
+///
+/// **Without `args`, it reads the cache and nothing else.** The cache is the
+/// only source of a server prompt's metadata, and refreshing it means
+/// refetching every configured server and reloading the window's prompt list,
+/// which one read should not cost. A miss is classified as the window
+/// classifies a saved prompt ([`resolve_saved_prompt_impl`]): missing only
+/// when the server's last fetch succeeded without it; otherwise the server's
+/// state at that fetch, such as needing sign-in.
+pub async fn read_prompt(
+    state: &AppState,
+    provider: &str,
+    name: &str,
+    args: Option<&BTreeMap<String, String>>,
+    budget: &WaitBudget,
+) -> Result<PromptReading, AppError> {
+    let listed = match resolve_saved_prompt_impl(state, provider, name) {
+        SavedPromptResolution::Available { prompt, .. } => Some(prompt),
+        _ if args.is_some() => None,
+        SavedPromptResolution::NotConfigured { .. } => {
+            return Err(PromptError::ProviderNotFound {
+                provider: provider.to_owned(),
+            }
+            .into());
+        }
+        SavedPromptResolution::TemporarilyUnavailable { .. } => {
+            return Err(unlisted_provider_error(state, provider));
+        }
+        SavedPromptResolution::ConfirmedMissing { .. } => {
+            return Err(PromptError::PromptNotFound {
+                provider: provider.to_owned(),
+                name: name.to_owned(),
+            }
+            .into());
+        }
+    };
+    let rendered = match args {
+        None => None,
+        Some(args) => match budget.run(state.prompts.render(provider, name, args)).await {
+            Outcome::Done(rendered) => Some(PromptText {
+                text: rendered?.text,
+            }),
+            Outcome::Timeout => {
+                return Err(AppError::TimedOut {
+                    what: "rendering the prompt",
+                });
+            }
+            Outcome::Cancelled => return Err(AppError::Interrupted),
+        },
+    };
+    let template = state
+        .prompts
+        .source(provider, name)
+        .map(|source| PromptText { text: source.text });
+    let from_server = ![
+        switchboard_prompts::BUILTIN_PROVIDER,
+        switchboard_prompts::LOCAL_PROVIDER,
+    ]
+    .contains(&provider);
+    let listing_note = listed.is_none().then_some(UNLISTED_NOTE);
+    let (title, description, arguments, tags) = match listed {
+        Some(prompt) => (
+            prompt.title,
+            prompt.description,
+            Some(prompt.arguments),
+            prompt.tags,
+        ),
+        None => (None, None, None, Vec::new()),
+    };
+    Ok(PromptReading {
+        provider: provider.to_owned(),
+        name: name.to_owned(),
+        title,
+        description,
+        arguments,
+        tags,
+        template_note: (template.is_none() && from_server).then_some(SERVER_TEMPLATE_NOTE),
+        template,
+        listing_note,
+        rendered,
+    })
+}
+
+/// Why a prompt server's prompt is not in the cache, from the server's state
+/// at its last fetch: the sign-in error when it needed sign-in, so the caller
+/// reports that rather than a missing prompt.
+fn unlisted_provider_error(state: &AppState, provider: &str) -> AppError {
+    match state
+        .prompts
+        .resolution_snapshot()
+        .provider_status(provider)
+    {
+        Some(ProviderStatus::NeedsAuth) => PromptError::McpNeedsAuth {
+            provider: provider.to_owned(),
+        }
+        .into(),
+        Some(ProviderStatus::Errored { message }) => AppError::Internal(format!(
+            "prompt provider {provider} failed at Switchboard's last fetch of its prompts \
+             ({message}), so the prompt's description and arguments are unknown: pass args to \
+             render it anyway"
+        )),
+        Some(ProviderStatus::StoreUnavailable) => AppError::Internal(format!(
+            "Switchboard could not read the stored sign-in for prompt provider {provider} at \
+             its last fetch (the user may need to unlock the keychain at the Mac): pass args to \
+             render the prompt anyway"
+        )),
+        _ => AppError::Internal(format!(
+            "Switchboard has not listed prompt provider {provider}'s prompts yet: pass args to \
+             render the prompt now, or call again in a moment"
+        )),
+    }
+}
+
+/// The budget rules for a [`PromptReading`]: the template and the rendering
+/// are cut evenly to fit, each cut reported, and nothing reads on, because a
+/// saved prompt is a few thousand characters and one over the result budget
+/// is not worth a pager. Nothing else is cut.
+#[must_use]
+pub fn prompt_budget(budget_chars: usize) -> BudgetSpec {
+    BudgetSpec::whole(budget_chars)
 }
 
 #[must_use]

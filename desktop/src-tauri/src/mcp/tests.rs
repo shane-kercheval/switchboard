@@ -1317,6 +1317,14 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
             .iter()
             .any(|p| p["name"] == "greet")
     );
+    let greet = call(
+        "read_prompt",
+        json!({ "provider": "local", "name": "greet", "args": { "who": "bob" } }),
+    )
+    .await;
+    assert_eq!(greet["template"]["text"], "Hi {{ who }}\n");
+    assert_eq!(greet["rendered"]["text"], "Hi bob");
+    assert!(greet.get("template_note").is_none(), "{greet}");
     let workflows = call("list_workflows", json!({})).await;
     assert!(
         workflows

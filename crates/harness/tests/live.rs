@@ -2176,12 +2176,27 @@ async fn live_codex_world_state_yields_inventory() {
         .as_deref()
         .expect("`turn_context` + `world_state.environments` must still yield settings pairs");
     let labels: Vec<&str> = settings.iter().map(|p| p.label.as_str()).collect();
-    for expected in ["Sandbox", "Approval policy", "Shell", "Timezone"] {
+    for expected in [
+        "Sandbox",
+        "Approval policy",
+        "Personality",
+        "Shell",
+        "Timezone",
+    ] {
         assert!(
             labels.contains(&expected),
             "the settings line must still carry `{expected}`; got {labels:?}"
         );
     }
+    // Since Codex 0.163 the first turn writes its own `thread_settings_applied`,
+    // the only record that carries the personality, so the row shows the
+    // requested value from turn one.
+    assert!(
+        settings
+            .iter()
+            .any(|p| p.label == "Personality" && p.value == LIVE_CODEX_PERSONALITY),
+        "the first turn's settings must show the requested personality; got {labels:?}"
+    );
     assert!(
         inventory.approved_commands.is_some(),
         "`world_state.permissions.approved_command_prefixes` must still be reported — absent \
@@ -2230,12 +2245,13 @@ async fn live_codex_world_state_yields_inventory() {
             .is_some_and(|s| !s.is_empty()),
         "the resume turn's inventory must be read fresh from the rollout, not left empty"
     );
-    // Since Codex 0.162 the personality reaches the rollout only through the
-    // resumed turn's `thread_settings_applied`, so this is the one turn that
-    // can show it. Read the record straight from the file rather than through
-    // our parser, so a parser bug cannot agree with itself: its absence means
-    // Codex stopped writing it on resume, and a different value means the
-    // requested personality no longer reaches it.
+    // Since Codex 0.162 the personality reaches the rollout only through a
+    // `thread_settings_applied` record, which a resumed turn writes (and,
+    // since 0.163, the first turn too). Read the resumed turn's record
+    // straight from the file rather than through our parser, so a parser bug
+    // cannot agree with itself: its absence means Codex stopped writing it on
+    // resume, and a different value means the requested personality no longer
+    // reaches it.
     let rollout = switchboard_harness::codex::session_file::locate_session_file(
         &home_dir(),
         partition_date,

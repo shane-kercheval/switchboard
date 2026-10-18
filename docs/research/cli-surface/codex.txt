@@ -1,4 +1,4 @@
-version: codex-cli 0.162.1
+version: codex-cli 0.163.0
 
 ===== codex --help
 Codex CLI
@@ -1871,7 +1871,7 @@ Options:
           shell_environment_policy.inherit=all`
 
       --sandbox-state-json <JSON>
-          JSON value from `codex/sandbox-state-meta` to apply directly
+          Opaque JSON value from `codex/sandbox-state` to apply directly
 
       --enable <FEATURE>
           Enable a feature (repeatable). Equivalent to `-c features.<name>=true`

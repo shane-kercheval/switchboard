@@ -4738,8 +4738,16 @@ async fn resolve_all_sources(
 ) -> Result<Vec<SourceResolution>, AppError> {
     // One journal read per distinct owning project — `latest_turn_failure_note`
     // consults it for each idle source, and sources may span projects. See
-    // [`SourceJournals`].
-    let journals = SourceJournals::read(state, sources.iter().map(|s| s.agent_id))?;
+    // [`SourceJournals`]. A source with settled text needs no journal, so its
+    // project's is not read: a damaged line there must not block forwarding a
+    // reply already in hand.
+    let journals = SourceJournals::read(
+        state,
+        sources
+            .iter()
+            .filter(|s| s.settled_text.is_none())
+            .map(|s| s.agent_id),
+    )?;
     // `try_join_all` polls every source on the first poll (so all waits register
     // up front, before any can settle) and preserves declared order; a source's
     // *turn* failing is an `Ok(Invalidated)` it collects, while a genuine error
@@ -4861,7 +4869,6 @@ async fn resolve_source(
 ) -> Result<SourceResolution, AppError> {
     let agent_id = source.agent_id;
     let (project, agent) = lookup_agent(state, agent_id)?;
-    let journal = journals.for_project(project.id)?;
     let agent = AgentRecord {
         name: qualified_source_name(&agent.name, &project, recipient_project),
         ..agent
@@ -4872,6 +4879,7 @@ async fn resolve_source(
             text: text.clone(),
         });
     }
+    let journal = journals.for_project(project.id)?;
     match state.dispatcher.wait_for_current_turn(agent_id).await {
         CurrentTurnWait::Terminal { outcome, .. } if !matches!(outcome, TurnOutcome::Completed) => {
             Ok(SourceResolution::Invalidated {

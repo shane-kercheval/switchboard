@@ -406,6 +406,20 @@ pub struct RunReply {
 /// or interrupted run's file remains, which names no sends, and that is said
 /// with `sends_unavailable` rather than an empty list that reads as "no
 /// replies".
+///
+/// **Known cost.** A send the ledger no longer holds is read from the journal
+/// and each recipient's session file, once per send: the ledger can prune a
+/// run's sends (past its count bound, which every project's sends share)
+/// while it still holds the run. A run of a few sends then costs a few extra
+/// file reads; one of many sends against long session files could take
+/// seconds. Reading the journal once and each agent's file once per call
+/// would bound it by agents rather than sends, at the price of reworking the
+/// reader `wait_send` uses after a restart.
+///
+/// Once the ledger no longer holds a send, a recipient the step refused (busy,
+/// or never offered because the step failed) reads `not_dispatched`: only the
+/// ledger recorded why, and the journal holds nothing for a recipient that was
+/// never sent the message.
 pub async fn read_workflow_run(
     state: &AppState,
     project_id: ProjectId,
@@ -418,7 +432,9 @@ pub async fn read_workflow_run(
     };
     let mut sends = Vec::with_capacity(run.sends.len());
     for send in run.sends {
-        let current = current_send(state, project_id, send.send_id, home_dir).await?;
+        let current = current_send(state, project_id, send.send_id, home_dir)
+            .await?
+            .reply;
         let recipients = send
             .recipients
             .iter()

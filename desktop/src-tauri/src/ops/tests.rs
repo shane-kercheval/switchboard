@@ -8142,6 +8142,163 @@ async fn a_forward_names_a_workflow_steps_reply() {
     assert!(last_prompt(&env).contains("=== START forwarded from r1 ===\nR1 REVIEW"));
 }
 
+#[tokio::test]
+async fn a_forward_naming_a_reply_its_send_has_not_reached_yet_is_unfinished() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b", "reader"]);
+    let (a, b, reader) = (agents[0], agents[1], agents[2]);
+    env.adapter.push_for(b, Script::reply("B ANSWER"));
+    let request = SendRequest {
+        idempotency_key: Some("fan".to_owned()),
+        ..text_send(project_id, vec![a, b], "hi")
+    };
+    let barrier = env.seam(TestSeam::OpsDispatch);
+    let task = tokio::spawn(send_now(env.handle(), env.home(), request.clone()));
+    // Hold the send at its first recipient: a is being offered the message,
+    // and b has not been reached.
+    barrier.entered.notified().await;
+    let err = send(env.handle(), env.home(), request, short())
+        .await
+        .unwrap_err();
+    let AppError::RequestInProgress { send_id } = err else {
+        panic!("the retry joins the send still handing out: {err:?}");
+    };
+
+    let err = forward_at_once(
+        &env,
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, b, send_id)],
+            reader,
+            Some("named"),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err.root(),
+            AppError::ForwardReplyUnfinished {
+                state: "waiting to be sent",
+                ..
+            }
+        ),
+        "not yet offered is not never offered: {err:?}"
+    );
+    assert_eq!(error_code(&err), error_code::SOURCE_BUSY);
+    assert!(err.to_string().contains("wait_send"), "{err}");
+
+    env.clear_seam(TestSeam::OpsDispatch);
+    barrier.release.notify_one();
+    task.await.unwrap().unwrap();
+    wait_done(&env, project_id, send_id).await;
+    let receipt = forward_at_once(
+        &env,
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, b, send_id)],
+            reader,
+            Some("named"),
+        ),
+    )
+    .await
+    .expect("once the send reaches b and b answers, the retry goes out");
+    wait_done(&env, project_id, receipt.send_id).await;
+    assert!(last_prompt(&env).contains("B ANSWER"));
+}
+
+#[tokio::test]
+async fn a_forward_refuses_a_reply_matched_to_its_send_only_by_position() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("proj");
+    let src = env.agent(project_id, "src");
+    let reader = env.agent(project_id, "reader");
+    // A send with no durable link to its reply, as a harness that records none
+    // leaves it: the reply is matched to the send by position only.
+    let send_id = Uuid::now_v7();
+    let at = Utc::now() - chrono::Duration::minutes(1);
+    switchboard_core::journal::append_record(
+        &env.journal_path(project_id),
+        &JournalRecord::Send {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: src,
+            prompt: "hi".to_owned(),
+            attachments: Vec::new(),
+            at,
+        },
+    )
+    .unwrap();
+    env.seed_claude_turn(project_id, src, "A GUESSED REPLY", "m1");
+    let env = env.restart();
+
+    let page = read_send_output(
+        &env.state,
+        project_id,
+        send_id,
+        src,
+        0,
+        ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (page.source, page.text.as_str()),
+        (OutputSource::Positional, "A GUESSED REPLY"),
+        "the reply is readable, and matched only by position"
+    );
+
+    let err = forward_at_once(
+        &env,
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, src, send_id)],
+            reader,
+            None,
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err.root(), AppError::ForwardReplyUnconfirmed { .. }),
+        "{err:?}"
+    );
+    assert_eq!(error_code(&err), error_code::INVALID_ARGUMENT);
+    let message = err.to_string();
+    assert!(
+        message.contains("read_send_output") && !message.contains("leave out send_id"),
+        "{message}"
+    );
+    assert!(lock(&env.adapter.prompts).is_empty(), "nothing was sent");
+}
+
+#[tokio::test]
+async fn a_named_reply_in_hand_is_forwarded_though_its_projects_journal_is_damaged() {
+    let mut env = TestEnv::new();
+    let p1 = env.project("one");
+    let p2 = env.project("two");
+    let reader = env.agent(p1, "reader");
+    let src = env.agent(p2, "src");
+    let env = env.restart();
+    env.adapter.push_for(src, Script::reply("HELD REPLY"));
+    let held = answered(&env, p2, src, "one").await;
+    let mut journal = std::fs::OpenOptions::new()
+        .append(true)
+        .open(env.journal_path(p2))
+        .unwrap();
+    std::io::Write::write_all(&mut journal, b"not a journal record\n").unwrap();
+
+    let receipt = forward_at_once(
+        &env,
+        forward_to(p1, vec![named_reply(p2, src, held)], reader, None),
+    )
+    .await
+    .expect("a reply already in hand needs no journal");
+    wait_done(&env, p1, receipt.send_id).await;
+    assert!(last_prompt(&env).contains("HELD REPLY"));
+}
+
 // --- reading a workflow run's replies -----------------------------------------
 
 /// Two rounds to the same reviewers, so each has answered two of the run's
@@ -8470,4 +8627,80 @@ async fn read_workflow_run_cuts_long_replies_evenly_and_each_cut_reads_on() {
         let rest: String = whole.chars().skip(offset).collect();
         assert_eq!(page.text, rest, "the cut for {tag} {round} reads on");
     }
+}
+
+#[tokio::test]
+async fn read_workflow_run_reads_a_send_it_no_longer_holds_from_disk() {
+    let (env, project_id, agents) = workflow_env().await;
+    let (coder, r1, r2) = (agents[0], agents[1], agents[2]);
+    let coder_gate = Arc::new(Notify::new());
+    env.adapter
+        .push_for(coder, Script::parked("greeting", &coder_gate));
+    env.adapter.push_for(r1, Script::reply("R1 REVIEW"));
+    let r2_gate = Arc::new(Notify::new());
+    env.adapter
+        .push_for(r2, Script::parked("elsewhere", &r2_gate));
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, coder).await;
+    // r2 is busy when the reviewers' step reaches it.
+    send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![r2], "other work"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, r2).await;
+    coder_gate.notify_waiters();
+    let ended = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ended.status, WorkflowRunStatus::Failed, "{ended:?}");
+    let review = ended.sends[1].send_id;
+    wait_done(&env, project_id, review).await;
+
+    let live = read_workflow_run(&env.state, project_id, run_id, &env.home())
+        .await
+        .unwrap();
+    let r2_live = &live.sends[1].recipients[1].reply;
+    assert_eq!(r2_live.status, SendStatus::Rejected, "{r2_live:?}");
+    assert!(r2_live.code.is_some(), "the ledger says why");
+
+    for send in &ended.sends {
+        env.state.ledger.forget_send(send.send_id);
+    }
+    let read = read_workflow_run(&env.state, project_id, run_id, &env.home())
+        .await
+        .unwrap();
+    assert!(!read.sends_unavailable, "the run itself is still held");
+    assert!(read.sends.iter().all(|s| s.source == WaitSource::Journal));
+    assert_eq!(
+        read.sends[0].recipients[0].reply.status,
+        SendStatus::Completed
+    );
+    assert_eq!(
+        reply_texts(&read.sends[1]),
+        [
+            (
+                "r1".to_owned(),
+                SendStatus::Completed,
+                Some("R1 REVIEW".to_owned())
+            ),
+            ("r2".to_owned(), SendStatus::NotDispatched, None),
+        ],
+        "a completed reply reads on from disk; the refusal's reason is not kept there"
+    );
+    r2_gate.notify_waiters();
 }

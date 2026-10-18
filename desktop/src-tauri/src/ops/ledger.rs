@@ -1227,6 +1227,14 @@ impl SendLedger {
         prune(&mut lock(&self.inner), now);
     }
 
+    /// Forget one send as pruning does, keeping its run: the state a run is
+    /// in once newer sends have pushed its own out past the count bound,
+    /// reached here without registering hundreds of them.
+    #[cfg(test)]
+    pub fn forget_send(&self, send_id: SendId) {
+        drop_send(&mut lock(&self.inner), send_id);
+    }
+
     // --- event observation --------------------------------------------------
 
     /// Feed one emitted event. Routes on the channel name and the event's
@@ -1606,6 +1614,27 @@ fn recipient_mut(inner: &mut Inner, send_id: SendId, index: usize) -> Option<&mu
     inner.sends.get_mut(&send_id)?.recipients.get_mut(index)
 }
 
+/// Forget one send: its entry, its message and turn indexes, and its retry
+/// key's claim. A key naming a fork outlives its entry, up to the age bound
+/// in [`prune`], so a repeat under it finds the fork rather than making
+/// another.
+fn drop_send(inner: &mut Inner, send_id: SendId) {
+    inner.send_order.retain(|id| *id != send_id);
+    if let Some(entry) = inner.sends.remove(&send_id) {
+        for recipient in &entry.recipients {
+            if let Some(message_id) = recipient.message_id {
+                inner.by_message.remove(&message_id);
+            }
+            if let Some(turn_id) = recipient.turn_id {
+                inner.by_turn.remove(&turn_id);
+            }
+        }
+        inner
+            .claims
+            .retain(|_, claim| claim.send_id != send_id || claim.fork.is_some());
+    }
+}
+
 /// Drop sends and runs older than [`MAX_AGE`], and retired ones past the
 /// count bound. Live sends are stepped past, never dropped by count. A dropped
 /// send's claim stays only while the entry does: once the receipt is gone, a
@@ -1632,23 +1661,7 @@ fn prune(inner: &mut Inner, now: DateTime<Utc>) {
         }
     }
     for send_id in dropped {
-        inner.send_order.retain(|id| *id != send_id);
-        if let Some(entry) = inner.sends.remove(&send_id) {
-            for recipient in &entry.recipients {
-                if let Some(message_id) = recipient.message_id {
-                    inner.by_message.remove(&message_id);
-                }
-                if let Some(turn_id) = recipient.turn_id {
-                    inner.by_turn.remove(&turn_id);
-                }
-            }
-            // A key naming a fork outlives its entry, up to the age bound
-            // below, so a repeat under it finds the fork rather than making
-            // another.
-            inner
-                .claims
-                .retain(|_, claim| claim.send_id != send_id || claim.fork.is_some());
-        }
+        drop_send(inner, send_id);
     }
     inner
         .claims

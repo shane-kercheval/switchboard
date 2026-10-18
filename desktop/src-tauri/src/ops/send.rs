@@ -902,7 +902,8 @@ async fn forward_inputs(
 /// send, otherwise the journal's answer, where a reply counts as completed
 /// only through a durable link to its send, so a guess never stands in for
 /// the reply the caller named. Only a completed reply is returned; one still
-/// waiting or running, or one that did not complete, refuses the forward.
+/// to be sent, waiting, or running, one that did not complete, and one that
+/// cannot be tied to the send refuse the forward.
 async fn named_reply(
     state: &AppState,
     source: ForwardFrom,
@@ -910,8 +911,9 @@ async fn named_reply(
     home_dir: &Path,
 ) -> Result<String, AppError> {
     let agent = agent_in_project(state, source.project_id, source.agent_id)?;
-    let reply = current_send(state, source.project_id, send_id, home_dir).await?;
-    let Some(recipient) = reply
+    let current = current_send(state, source.project_id, send_id, home_dir).await?;
+    let Some(recipient) = current
+        .reply
         .recipients
         .into_iter()
         .find(|r| r.agent_id == source.agent_id)
@@ -938,14 +940,26 @@ async fn named_reply(
             send_id,
             state: "running",
         }),
+        SendStatus::NotDispatched if !current.handed_out => Err(AppError::ForwardReplyUnfinished {
+            name: agent.name,
+            send_id,
+            state: "waiting to be sent",
+        }),
         SendStatus::Failed => Err(not_completed("failed")),
         SendStatus::Cancelled => Err(not_completed("was cancelled")),
         SendStatus::Rejected | SendStatus::NotDispatched => {
             Err(not_completed("never reached the agent"))
         }
-        SendStatus::Started | SendStatus::Unknown => Err(not_completed(
-            "could not be confirmed finished (the app restarted while it ran)",
-        )),
+        // The journal could not tie a finished reply to this send: it may
+        // still be running (a message the window sent, which Switchboard
+        // follows only on disk), the app may have restarted while it ran, or
+        // its harness keeps no link from a reply to its send and Switchboard
+        // no longer holds the send. A reply matched by position is a guess,
+        // and a forward cannot mark it as one, so it is refused.
+        SendStatus::Started | SendStatus::Unknown => Err(AppError::ForwardReplyUnconfirmed {
+            name: agent.name,
+            send_id,
+        }),
     }
 }
 
@@ -1381,17 +1395,37 @@ pub(super) async fn current_send(
     project_id: ProjectId,
     send_id: SendId,
     home_dir: &Path,
-) -> Result<WaitSendReply, AppError> {
+) -> Result<CurrentSend, AppError> {
     match held_send(state, project_id, send_id) {
-        Some(snapshot) => Ok(WaitSendReply {
-            send_id,
-            capped_to_seconds: None,
-            done: snapshot.is_done(),
-            source: WaitSource::Live,
-            recipients: snapshot.recipients,
+        Some(snapshot) => Ok(CurrentSend {
+            handed_out: snapshot.settled,
+            reply: WaitSendReply {
+                send_id,
+                capped_to_seconds: None,
+                done: snapshot.is_done(),
+                source: WaitSource::Live,
+                recipients: snapshot.recipients,
+            },
         }),
-        None => journal_fallback(state, project_id, send_id, home_dir).await,
+        None => Ok(CurrentSend {
+            handed_out: true,
+            reply: journal_fallback(state, project_id, send_id, home_dir).await?,
+        }),
     }
+}
+
+/// A send as [`current_send`] reads it.
+pub(super) struct CurrentSend {
+    pub reply: WaitSendReply,
+    /// The send has been offered to every recipient it will reach. Until then
+    /// a recipient not yet offered reads `not_dispatched` though its turn may
+    /// be moments away: a send is handed to its recipients one at a time, and
+    /// its id can be known before the last is reached. A send read from the
+    /// journal is reported as handed out because the journal cannot say
+    /// otherwise: it records a recipient's copy only when that recipient's turn
+    /// starts, so a recipient of a message the window sent that is still
+    /// waiting in line is absent from it, as if it never received the send.
+    pub handed_out: bool,
 }
 
 /// A send the ledger holds, as a wait reports it: reply text only once every

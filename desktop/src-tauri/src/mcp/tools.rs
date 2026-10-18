@@ -270,8 +270,10 @@ tools! {
          characters, 45,000 without a progress token, or max_chars), each cut listed in \
          truncated with the read_send_output call that reads on. sends_unavailable is true \
          once Switchboard no longer holds the run's record (after a restart, or once it \
-         pruned the run): the replies are then in read_conversation. After a restart a \
-         completed or cancelled run is run_unknown.";
+         pruned the run): the replies are then in read_conversation. Once Switchboard no \
+         longer holds the run, a completed or cancelled run is run_unknown. A send \
+         Switchboard no longer holds is read from disk (source journal), where a recipient \
+         that was refused reads not_dispatched.";
     CreateProject = "create_project" (CreateProjectArgs) [Additive]
         "Create a project for a folder on this Mac. It starts with no agents; add them with \
          create_agent. Avoid the folder this session runs in: the agents Switchboard launches \
@@ -368,11 +370,13 @@ tools! {
              latest turn failed or was cancelled is still forwarded, as a note saying so in \
              place of an answer: check a source's status first. A source with send_id sends its \
              reply to that send instead, verbatim, whatever the agent has said since, and never \
-             waits: a reply still waiting in line or running refuses the forward at once \
-             (source_busy: wait_agent on the source, then retry); one that failed, was cancelled, never \
-             reached the agent, or could not be confirmed after a restart refuses it \
-             (invalid_argument); a send the agent did not receive in the source's project is \
-             send_unknown. A source with no answer text refuses the forward (invalid_argument). \
+             waits: a reply still to be sent, waiting in line, or running refuses the forward \
+             at once (source_busy: wait_send on that send, then retry); one that failed, was \
+             cancelled, or never reached the agent refuses it (invalid_argument), as does one \
+             Switchboard cannot tie to the send (it may still be running, the app may have \
+             restarted, or it cannot tell which turn answered: read it with read_send_output \
+             and send its text yourself); a send the agent did not receive in the source's \
+             project, or whose reply has not started, is send_unknown. A source with no answer text refuses the forward (invalid_argument). \
              A refused forward sends nothing. With a saved prompt, forward_args fills a prompt \
              argument from sources instead. on_busy, idempotency_key, and the receipt work as \
              in send.\n\

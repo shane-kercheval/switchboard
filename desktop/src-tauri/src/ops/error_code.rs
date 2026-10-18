@@ -94,6 +94,7 @@ pub fn error_code(error: &AppError) -> &'static str {
         | AppError::InvalidUuid { .. }
         | AppError::NoForwardSources
         | AppError::ForwardReplyNotCompleted { .. }
+        | AppError::ForwardReplyUnconfirmed { .. }
         | AppError::Workflow(_)
         | AppError::WorkflowNotFound { .. }
         | AppError::WorkflowStepUnsupported
@@ -198,6 +199,13 @@ mod tests {
                 name: name(),
                 send_id,
                 state: "failed"
+            }),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            error_code(&AppError::ForwardReplyUnconfirmed {
+                name: name(),
+                send_id
             }),
             INVALID_ARGUMENT
         );

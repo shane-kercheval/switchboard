@@ -39,8 +39,9 @@ use super::read::{
     list_agents, list_projects, read_agent_output, read_conversation, read_send_output,
 };
 use super::send::{
-    AgentWaitStatus, Body, ForwardPrompt, ForwardRequest, OnBusyPolicy, SendRequest, WaitSource,
-    cancel_send, forward, refuse_if_busy, send, wait_agent, wait_send, wait_send_budget,
+    AgentWaitStatus, Body, ForwardFrom, ForwardPrompt, ForwardRequest, OnBusyPolicy, SendRequest,
+    WaitSource, cancel_send, forward, refuse_if_busy, send, wait_agent, wait_send,
+    wait_send_budget,
 };
 use super::test_support::*;
 use super::wait::{FINAL_OBSERVATION_GRACE, WaitBudget};
@@ -101,6 +102,15 @@ async fn wait_done(
 }
 
 // --- agents and projects ----------------------------------------------------
+
+/// A forward source by its latest answer, as a forward without `send_id` names it.
+fn latest_answer(project_id: ProjectId, agent_id: AgentId) -> ForwardFrom {
+    ForwardFrom {
+        project_id,
+        agent_id,
+        send_id: None,
+    }
+}
 
 #[tokio::test]
 async fn agent_lifecycle_on_an_unopened_project() {
@@ -633,10 +643,7 @@ async fn forward_from_a_source_in_a_second_unopened_project() {
     let env = env.restart();
     let request = ForwardRequest {
         project_id: p1,
-        sources: vec![ForwardSourceRef {
-            agent_id: source,
-            project_id: p2,
-        }],
+        sources: vec![latest_answer(p2, source)],
         recipients: vec![recipient],
         text: Some("Please review:".to_owned()),
         prompt: None,
@@ -679,10 +686,7 @@ async fn forward_with_a_mid_turn_source_past_the_budget_is_source_busy() {
     await_turn_running(&env.state, agents[0]).await;
     let request = ForwardRequest {
         project_id,
-        sources: vec![ForwardSourceRef {
-            agent_id: agents[0],
-            project_id,
-        }],
+        sources: vec![latest_answer(project_id, agents[0])],
         recipients: vec![agents[1]],
         text: None,
         prompt: None,
@@ -746,10 +750,7 @@ async fn forward_into_a_named_prompt_argument() {
             args: BTreeMap::new(),
             forward_args: BTreeMap::from([(
                 "diff".to_owned(),
-                vec![ForwardSourceRef {
-                    agent_id: source,
-                    project_id,
-                }],
+                vec![latest_answer(project_id, source)],
             )]),
         }),
         on_busy: OnBusyPolicy::Refuse,
@@ -796,10 +797,7 @@ async fn forward_into_a_named_prompt_argument() {
         args: BTreeMap::new(),
         forward_args: BTreeMap::from([(
             "nope".to_owned(),
-            vec![ForwardSourceRef {
-                agent_id: source,
-                project_id,
-            }],
+            vec![latest_answer(project_id, source)],
         )]),
     });
     let err = forward(
@@ -1530,10 +1528,7 @@ async fn create_send_forward_and_read_leave_the_expected_files() {
         env.home(),
         ForwardRequest {
             project_id: project.id,
-            sources: vec![ForwardSourceRef {
-                agent_id: coder.id,
-                project_id: project.id,
-            }],
+            sources: vec![latest_answer(project.id, coder.id)],
             recipients: vec![reviewer.id],
             text: Some("critique this".to_owned()),
             prompt: None,
@@ -1687,10 +1682,7 @@ async fn a_kept_alive_forward_fires_progress_past_five_minutes_and_completes() {
     });
     let request = ForwardRequest {
         project_id,
-        sources: vec![ForwardSourceRef {
-            agent_id: agents[0],
-            project_id,
-        }],
+        sources: vec![latest_answer(project_id, agents[0])],
         recipients: vec![agents[1]],
         text: None,
         prompt: None,
@@ -1730,10 +1722,7 @@ async fn a_retry_that_joins_an_in_flight_send_and_runs_out_of_budget_reports_in_
     await_turn_running(&env.state, agents[0]).await;
     let request = ForwardRequest {
         project_id,
-        sources: vec![ForwardSourceRef {
-            agent_id: agents[0],
-            project_id,
-        }],
+        sources: vec![latest_answer(project_id, agents[0])],
         recipients: vec![agents[1]],
         text: None,
         prompt: None,
@@ -2284,10 +2273,7 @@ async fn cancelling_a_forward_while_it_waits_on_a_source_dispatches_nothing() {
     await_turn_running(&env.state, agents[0]).await;
     let request = ForwardRequest {
         project_id,
-        sources: vec![ForwardSourceRef {
-            agent_id: agents[0],
-            project_id,
-        }],
+        sources: vec![latest_answer(project_id, agents[0])],
         recipients: vec![agents[1]],
         text: None,
         prompt: None,
@@ -3517,10 +3503,7 @@ async fn a_forward_asks_the_window_only_once_its_source_has_finished() {
         env.home(),
         ForwardRequest {
             project_id,
-            sources: vec![ForwardSourceRef {
-                agent_id: agents[0],
-                project_id,
-            }],
+            sources: vec![latest_answer(project_id, agents[0])],
             recipients: vec![agents[1]],
             text: None,
             prompt: None,
@@ -4296,10 +4279,7 @@ async fn a_message_registered_before_a_compaction_but_admitted_after_it_keeps_th
                 home,
                 ForwardRequest {
                     project_id,
-                    sources: vec![ForwardSourceRef {
-                        agent_id: source,
-                        project_id,
-                    }],
+                    sources: vec![latest_answer(project_id, source)],
                     recipients: vec![target],
                     text: Some("see this".to_owned()),
                     prompt: None,
@@ -6515,10 +6495,7 @@ async fn cancelling_a_waiting_forwards_only_recipient_stops_the_forward_at_once(
     // The forward waits for the busy source before it sends to anyone.
     let request = || ForwardRequest {
         project_id,
-        sources: vec![ForwardSourceRef {
-            agent_id: source,
-            project_id,
-        }],
+        sources: vec![latest_answer(project_id, source)],
         recipients: vec![reader],
         text: Some("see this".to_owned()),
         prompt: None,
@@ -7033,7 +7010,7 @@ async fn cancelling_a_waiting_forward_sends_nothing_from_the_window_or_the_tools
         if through_tools {
             let request = ForwardRequest {
                 project_id,
-                sources,
+                sources: sources.iter().copied().map(ForwardFrom::from).collect(),
                 recipients: vec![reader],
                 text: Some("see this".to_owned()),
                 prompt: None,
@@ -7428,10 +7405,7 @@ async fn a_forward_with_an_attachment_gives_the_recipient_the_forwarded_text_and
     let (_sources, image, _log) = attachment_sources();
     let request = ForwardRequest {
         project_id,
-        sources: vec![ForwardSourceRef {
-            agent_id: source,
-            project_id,
-        }],
+        sources: vec![latest_answer(project_id, source)],
         recipients: vec![recipient],
         text: Some("Please review:".to_owned()),
         prompt: None,
@@ -7722,6 +7696,450 @@ async fn cancelling_a_send_while_its_copy_is_stuck_ends_it_with_nothing_sent() {
         .unwrap();
     assert_eq!(receipt.recipients[0].status, SendStatus::Cancelled);
     assert!(lock(&env.adapter.prompts).is_empty());
+}
+
+// --- forwarding a named reply -------------------------------------------------
+
+/// A forward source naming one of the agent's replies.
+fn named_reply(project_id: ProjectId, agent_id: AgentId, send_id: Uuid) -> ForwardFrom {
+    ForwardFrom {
+        project_id,
+        agent_id,
+        send_id: Some(send_id),
+    }
+}
+
+fn forward_to(
+    project_id: ProjectId,
+    sources: Vec<ForwardFrom>,
+    recipient: AgentId,
+    key: Option<&str>,
+) -> ForwardRequest {
+    ForwardRequest {
+        project_id,
+        sources,
+        recipients: vec![recipient],
+        text: Some("see this".to_owned()),
+        prompt: None,
+        on_busy: OnBusyPolicy::Refuse,
+        idempotency_key: key.map(str::to_owned),
+        attachments: Vec::new(),
+    }
+}
+
+/// Send `text` to `agent` alone, wait for its reply, and return the send.
+async fn answered(env: &TestEnv, project_id: ProjectId, agent: AgentId, text: &str) -> Uuid {
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agent], text),
+    )
+    .await
+    .unwrap();
+    wait_done(env, project_id, receipt.send_id).await;
+    receipt.send_id
+}
+
+/// Forward under a 50-second budget, failing the test if it takes over five
+/// seconds: a forward naming a reply must never wait on the agent.
+async fn forward_at_once(
+    env: &TestEnv,
+    request: ForwardRequest,
+) -> Result<super::ledger::SendReceipt, AppError> {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        forward(
+            env.handle(),
+            env.home(),
+            request,
+            WaitBudget::default_wait(),
+        ),
+    )
+    .await
+    .expect("a forward naming a reply does not wait")
+}
+
+fn last_prompt(env: &TestEnv) -> String {
+    lock(&env.adapter.prompts).last().cloned().unwrap()
+}
+
+#[tokio::test]
+async fn a_forward_naming_a_reply_sends_it_though_the_agent_has_answered_since() {
+    let (env, project_id, agents) = project_with_agents(&["src", "reader"]);
+    let (src, reader) = (agents[0], agents[1]);
+    env.adapter.push_for(src, Script::reply("FIRST ANSWER"));
+    env.adapter.push_for(src, Script::reply("SECOND ANSWER"));
+    let first = answered(&env, project_id, src, "one").await;
+    answered(&env, project_id, src, "two").await;
+
+    let receipt = forward_at_once(
+        &env,
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, src, first)],
+            reader,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+    assert_eq!(
+        last_prompt(&env),
+        "see this\n\n=== START forwarded from src ===\nFIRST ANSWER\n=== END forwarded from src ===",
+        "the named reply, verbatim, under the agent's usual label"
+    );
+}
+
+#[tokio::test]
+async fn a_forward_naming_a_finished_reply_goes_out_while_the_agent_is_busy() {
+    let (env, project_id, agents) = project_with_agents(&["src", "reader"]);
+    let (src, reader) = (agents[0], agents[1]);
+    env.adapter.push_for(src, Script::reply("THE REPORT"));
+    let report = answered(&env, project_id, src, "report").await;
+    let gate = Arc::new(Notify::new());
+    env.adapter
+        .push_for(src, Script::parked("still going", &gate));
+    send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![src], "more work"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, src).await;
+
+    let receipt = forward_at_once(
+        &env,
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, src, report)],
+            reader,
+            None,
+        ),
+    )
+    .await
+    .expect("a finished reply is forwarded without waiting for the running turn");
+    wait_done(&env, project_id, receipt.send_id).await;
+    assert!(last_prompt(&env).contains("THE REPORT"));
+    gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn a_forward_naming_an_unfinished_reply_is_refused_at_once_and_sends_nothing() {
+    let (env, project_id, agents) = project_with_agents(&["src", "reader"]);
+    let (src, reader) = (agents[0], agents[1]);
+    let gate = Arc::new(Notify::new());
+    env.adapter
+        .push_for(src, Script::parked("half done", &gate));
+    let running = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![src], "work"),
+    )
+    .await
+    .unwrap()
+    .send_id;
+    await_turn_running(&env.state, src).await;
+    let queued = send_now(
+        env.handle(),
+        env.home(),
+        SendRequest {
+            on_busy: OnBusyPolicy::Queue,
+            ..text_send(project_id, vec![src], "after that")
+        },
+    )
+    .await
+    .unwrap()
+    .send_id;
+    let dispatched_before = lock(&env.adapter.prompts).len();
+
+    for (send_id, state) in [(running, "running"), (queued, "waiting in line")] {
+        let err = forward_at_once(
+            &env,
+            forward_to(
+                project_id,
+                vec![named_reply(project_id, src, send_id)],
+                reader,
+                Some("named"),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err.root(), AppError::ForwardReplyUnfinished { state: s, .. } if *s == state),
+            "{err:?}"
+        );
+        assert_eq!(error_code(&err), error_code::SOURCE_BUSY);
+    }
+    assert_eq!(
+        lock(&env.adapter.prompts).len(),
+        dispatched_before,
+        "nothing was sent to the reader"
+    );
+
+    gate.notify_waiters();
+    wait_done(&env, project_id, queued).await;
+    forward_at_once(
+        &env,
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, src, running)],
+            reader,
+            Some("named"),
+        ),
+    )
+    .await
+    .expect("the key was released, so the retry once the reply finished goes out");
+}
+
+#[tokio::test]
+async fn a_forward_naming_a_failed_or_cancelled_reply_is_refused() {
+    let (env, project_id, agents) = project_with_agents(&["src", "reader"]);
+    let (src, reader) = (agents[0], agents[1]);
+    env.adapter.push_for(src, Script::failing("partial"));
+    let failed = answered(&env, project_id, src, "try").await;
+    let gate = Arc::new(Notify::new());
+    env.adapter.push_for(src, Script::parked("cut off", &gate));
+    let cancelled = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![src], "again"),
+    )
+    .await
+    .unwrap()
+    .send_id;
+    await_turn_running(&env.state, src).await;
+    cancel_send(&env.state, project_id, cancelled, None).unwrap();
+    wait_done(&env, project_id, cancelled).await;
+
+    for (send_id, state) in [(failed, "failed"), (cancelled, "was cancelled")] {
+        let err = forward_at_once(
+            &env,
+            forward_to(
+                project_id,
+                vec![named_reply(project_id, src, send_id)],
+                reader,
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err.root(), AppError::ForwardReplyNotCompleted { state: s, .. } if *s == state),
+            "{err:?}"
+        );
+        assert_eq!(error_code(&err), error_code::INVALID_ARGUMENT);
+    }
+    assert!(
+        !lock(&env.adapter.prompts)
+            .iter()
+            .any(|p| p.starts_with("see this")),
+        "nothing was forwarded"
+    );
+}
+
+#[tokio::test]
+async fn a_forward_naming_a_send_its_source_did_not_receive_is_send_unknown() {
+    let mut env = TestEnv::new();
+    let p1 = env.project("one");
+    let p2 = env.project("two");
+    let a = env.agent(p1, "a");
+    let b = env.agent(p1, "b");
+    let reader = env.agent(p1, "reader");
+    let elsewhere = env.agent(p2, "x");
+    let env = env.restart();
+    let to_a = answered(&env, p1, a, "only a").await;
+    let in_p2 = answered(&env, p2, elsewhere, "in two").await;
+
+    for source in [
+        // Another agent's send.
+        named_reply(p1, b, to_a),
+        // A send made in another project than the source's.
+        named_reply(p1, a, in_p2),
+    ] {
+        let err = forward_at_once(&env, forward_to(p1, vec![source], reader, None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.root(), AppError::ForwardReplyUnknown { .. }),
+            "{err:?}"
+        );
+        assert_eq!(error_code(&err), error_code::SEND_UNKNOWN);
+    }
+}
+
+#[tokio::test]
+async fn named_and_latest_sources_keep_their_declared_order() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b", "reader"]);
+    let (a, b, reader) = (agents[0], agents[1], agents[2]);
+    env.adapter.push_for(a, Script::reply("A FIRST"));
+    env.adapter.push_for(a, Script::reply("A LATEST"));
+    env.adapter.push_for(b, Script::reply("B LATEST"));
+    let a_first = answered(&env, project_id, a, "one").await;
+    answered(&env, project_id, a, "two").await;
+    answered(&env, project_id, b, "one").await;
+
+    let receipt = forward_at_once(
+        &env,
+        forward_to(
+            project_id,
+            vec![
+                latest_answer(project_id, b),
+                named_reply(project_id, a, a_first),
+            ],
+            reader,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+    assert_eq!(
+        last_prompt(&env),
+        "see this\n\n=== START forwarded from b ===\nB LATEST\n=== END forwarded from b ===\n\n\
+         === START forwarded from a ===\nA FIRST\n=== END forwarded from a ==="
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_argument_can_forward_a_named_reply() {
+    let mut env = TestEnv::new().with_prompts_and_workflows();
+    std::fs::write(env.prompts_dir().join("review.md"), REVIEW_PROMPT).unwrap();
+    env.state.prompts.sync().await;
+    let project_id = env.project("proj");
+    let coder = env.agent(project_id, "coder");
+    let reviewer = env.agent(project_id, "reviewer");
+    env.adapter.push_for(coder, Script::reply("THE FIRST DIFF"));
+    env.adapter.push_for(coder, Script::reply("SOMETHING ELSE"));
+    let diff = answered(&env, project_id, coder, "diff").await;
+    answered(&env, project_id, coder, "chat").await;
+
+    let receipt = forward_at_once(
+        &env,
+        ForwardRequest {
+            project_id,
+            sources: Vec::new(),
+            recipients: vec![reviewer],
+            text: None,
+            prompt: Some(ForwardPrompt {
+                provider: "local".to_owned(),
+                name: "review".to_owned(),
+                args: BTreeMap::new(),
+                forward_args: BTreeMap::from([(
+                    "diff".to_owned(),
+                    vec![named_reply(project_id, coder, diff)],
+                )]),
+            }),
+            on_busy: OnBusyPolicy::Refuse,
+            idempotency_key: None,
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+    let prompt = last_prompt(&env);
+    assert!(
+        prompt.starts_with("Review this:\n=== START forwarded from coder ===\nTHE FIRST DIFF"),
+        "{prompt}"
+    );
+}
+
+#[tokio::test]
+async fn a_retry_key_reused_with_another_named_reply_is_refused() {
+    let (env, project_id, agents) = project_with_agents(&["src", "reader"]);
+    let (src, reader) = (agents[0], agents[1]);
+    let first = answered(&env, project_id, src, "one").await;
+    let second = answered(&env, project_id, src, "two").await;
+    let receipt = forward_at_once(
+        &env,
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, src, first)],
+            reader,
+            Some("k"),
+        ),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+
+    let err = forward_at_once(
+        &env,
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, src, second)],
+            reader,
+            Some("k"),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error_code(&err), error_code::INVALID_ARGUMENT, "{err:?}");
+}
+
+#[tokio::test]
+async fn a_forward_names_a_reply_from_before_a_restart() {
+    let (env, project_id, agents) = project_with_agents(&["src", "reader"]);
+    let (src, reader) = (agents[0], agents[1]);
+    env.adapter
+        .push_for(src, Script::reply("BEFORE THE RESTART"));
+    let first = answered(&env, project_id, src, "one").await;
+    answered(&env, project_id, src, "two").await;
+    let env = env.restart();
+
+    let receipt = forward_at_once(
+        &env,
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, src, first)],
+            reader,
+            None,
+        ),
+    )
+    .await
+    .expect("read from the journal, through the reply's durable link");
+    wait_done(&env, project_id, receipt.send_id).await;
+    assert!(last_prompt(&env).contains("BEFORE THE RESTART"));
+}
+
+#[tokio::test]
+async fn a_forward_names_a_workflow_steps_reply() {
+    let (env, project_id, agents) = workflow_env().await;
+    env.adapter.push_for(agents[1], Script::reply("R1 REVIEW"));
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    let run = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(run.status, WorkflowRunStatus::Completed);
+    let review = run.sends[1].send_id;
+    // r1's reply to the run's second send, named by the id wait_workflow lists.
+    let receipt = forward_at_once(
+        &env,
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, agents[1], review)],
+            agents[0],
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+    assert!(last_prompt(&env).contains("=== START forwarded from r1 ===\nR1 REVIEW"));
 }
 
 // --- reading a workflow run's replies -----------------------------------------

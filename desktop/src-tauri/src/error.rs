@@ -165,6 +165,38 @@ pub enum AppError {
     )]
     ReplyInUserWorkflow { send_id: SendId },
 
+    /// A forward named a source's reply by `send_id`, and the source did not
+    /// receive that send in its project: the id is wrong, or belongs to
+    /// another agent or another project. Nothing was sent.
+    #[error(
+        "{name} has no reply to send {send_id} in its project, so nothing was sent: check the send_id, and the source's project_id if the send was made in another project"
+    )]
+    ForwardReplyUnknown { name: String, send_id: SendId },
+
+    /// A forward named a source's reply by `send_id` while that reply is
+    /// still waiting in line or running. A named reply is never waited for, so
+    /// nothing was sent.
+    #[error(
+        "{name}'s reply to send {send_id} is still {state}, so nothing was sent: wait for {name} with wait_agent, then forward again"
+    )]
+    ForwardReplyUnfinished {
+        name: String,
+        send_id: SendId,
+        state: &'static str,
+    },
+
+    /// A forward named a source's reply by `send_id` and that reply did not
+    /// complete: it failed, was cancelled, never reached the agent, or could
+    /// not be confirmed after a restart. Nothing was sent.
+    #[error(
+        "{name}'s reply to send {send_id} {state}, so nothing was sent: forward a completed reply, or leave out send_id to forward {name}'s latest answer"
+    )]
+    ForwardReplyNotCompleted {
+        name: String,
+        send_id: SendId,
+        state: &'static str,
+    },
+
     /// An agent-access cancel named a workflow run the user started from the
     /// window.
     #[error(

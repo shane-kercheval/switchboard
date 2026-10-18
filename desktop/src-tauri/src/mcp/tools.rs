@@ -43,7 +43,8 @@ use crate::ops::fork::{self, ForkRequest};
 use crate::ops::handle::AppStateHandle;
 use crate::ops::read::{self, ReadFrom};
 use crate::ops::send::{
-    self, Body, ForwardPrompt, ForwardRequest, OnBusyPolicy, SendRequest, wait_send_budget,
+    self, Body, ForwardFrom, ForwardPrompt, ForwardRequest, OnBusyPolicy, SendRequest,
+    wait_send_budget,
 };
 use crate::ops::usage;
 use crate::ops::wait::{ProgressHook, WaitBudget};
@@ -358,15 +359,23 @@ tools! {
          it there.";
     Forward = "forward" (ForwardArgs) [Acts]
         format!(
-            "Send agents' latest answers to other agents, composed the way the user's own \
-             forwards are: your text first, then each source's latest answer in a labeled block. \
-             Sources may be in other projects. Prefer this to copying a reply into send. A \
-             source still mid-turn is waited for, up to timeout_seconds; if it is still running \
-             then, the forward fails with source_busy and nothing is sent: call wait_agent on the \
-             source, then retry. A source whose latest turn failed or was cancelled is still \
-             forwarded, as a note saying so in place of an answer: check a source's status \
-             first. A source with no answer text refuses the forward (invalid_argument). With a \
-             saved prompt, forward_args fills a prompt argument from sources instead. on_busy, idempotency_key, and the receipt work as in send.\n\
+            "Send agents' answers to other agents, composed the way the user's own forwards \
+             are: your text first, then each source's answer in a labeled block. Sources may be \
+             in other projects. Prefer this to copying a reply into send. A source without \
+             send_id sends its latest answer: one still mid-turn is waited for, up to \
+             timeout_seconds; if it is still running then, the forward fails with source_busy \
+             and nothing is sent: call wait_agent on the source, then retry. A source whose \
+             latest turn failed or was cancelled is still forwarded, as a note saying so in \
+             place of an answer: check a source's status first. A source with send_id sends its \
+             reply to that send instead, verbatim, whatever the agent has said since, and never \
+             waits: a reply still waiting in line or running refuses the forward at once \
+             (source_busy: wait_agent on the source, then retry); one that failed, was cancelled, never \
+             reached the agent, or could not be confirmed after a restart refuses it \
+             (invalid_argument); a send the agent did not receive in the source's project is \
+             send_unknown. A source with no answer text refuses the forward (invalid_argument). \
+             A refused forward sends nothing. With a saved prompt, forward_args fills a prompt \
+             argument from sources instead. on_busy, idempotency_key, and the receipt work as \
+             in send.\n\
              {WAIT_HINTS}"
         );
     RunWorkflow = "run_workflow" (RunWorkflowArgs) [Acts]
@@ -830,11 +839,63 @@ pub struct SendArgs {
     attachments: Vec<String>,
 }
 
-/// An agent whose latest answer is forwarded. It may be in another project.
+/// A forward's source: an agent whose latest answer is forwarded, or with
+/// `send_id`, one of its earlier replies. It may be in another project.
 #[derive(Deserialize, JsonSchema, Clone, Copy)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)] // The three ids that name a source's reply.
 struct SourceArg {
+    /// The source's project; leave it out for an agent in the call's own
+    /// project.
+    #[serde(default)]
+    #[schemars(with = "Option<String>")]
+    project_id: Option<ProjectId>,
+    #[schemars(with = "String")]
+    agent_id: AgentId,
+    /// Forward this agent's reply to this send (a `send_id` from `send`,
+    /// `forward`, or `wait_workflow`'s sends) instead of its latest answer,
+    /// without waiting on the agent. The reply must be finished and completed.
+    #[serde(default)]
+    #[schemars(with = "Option<String>")]
+    send_id: Option<SendId>,
+}
+
+impl SourceArg {
+    fn in_project(self, project_id: ProjectId) -> ForwardFrom {
+        ForwardFrom {
+            project_id: self.project_id.unwrap_or(project_id),
+            agent_id: self.agent_id,
+            send_id: self.send_id,
+        }
+    }
+}
+
+/// The sources as the call names them, a source without a project taken to
+/// be in the call's own `project_id`.
+fn sources(args: Vec<SourceArg>, project_id: ProjectId) -> Vec<ForwardFrom> {
+    args.into_iter()
+        .map(|arg| arg.in_project(project_id))
+        .collect()
+}
+
+fn source_map(
+    args: BTreeMap<String, Vec<SourceArg>>,
+    project_id: ProjectId,
+) -> BTreeMap<String, Vec<ForwardFrom>> {
+    args.into_iter()
+        .map(|(name, list)| (name, sources(list, project_id)))
+        .collect()
+}
+
+/// An agent whose latest answer fills a workflow input. It may be in another
+/// project. Unlike a forward's source it cannot name an earlier reply: a
+/// workflow's forwarded inputs are read from each agent's latest completed
+/// answer when the run starts.
+#[derive(Deserialize, JsonSchema, Clone, Copy)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(deny_unknown_fields)]
+struct WorkflowSourceArg {
     /// The source's project; leave it out for an agent in the call's own
     /// project.
     #[serde(default)]
@@ -844,29 +905,21 @@ struct SourceArg {
     agent_id: AgentId,
 }
 
-impl SourceArg {
-    fn in_project(self, project_id: ProjectId) -> ForwardSourceRef {
-        ForwardSourceRef {
-            project_id: self.project_id.unwrap_or(project_id),
-            agent_id: self.agent_id,
-        }
-    }
-}
-
-/// The sources as the call names them, a source without a project taken to
-/// be in the call's own `project_id`.
-fn sources(args: Vec<SourceArg>, project_id: ProjectId) -> Vec<ForwardSourceRef> {
-    args.into_iter()
-        .map(|arg| arg.in_project(project_id))
-        .collect()
-}
-
-fn source_map(
-    args: BTreeMap<String, Vec<SourceArg>>,
+fn workflow_source_map(
+    args: BTreeMap<String, Vec<WorkflowSourceArg>>,
     project_id: ProjectId,
 ) -> BTreeMap<String, Vec<ForwardSourceRef>> {
     args.into_iter()
-        .map(|(name, list)| (name, sources(list, project_id)))
+        .map(|(name, list)| {
+            let refs = list
+                .into_iter()
+                .map(|arg| ForwardSourceRef {
+                    project_id: arg.project_id.unwrap_or(project_id),
+                    agent_id: arg.agent_id,
+                })
+                .collect();
+            (name, refs)
+        })
         .collect()
 }
 
@@ -883,8 +936,9 @@ struct ForwardPromptArg {
     #[serde(default)]
     args: BTreeMap<String, String>,
     /// Prompt arguments filled from sources, each source `{agent_id}`, with
-    /// `project_id` for an agent in another project: each named argument
-    /// becomes its typed text (from args) followed by the sources' answers.
+    /// `project_id` for an agent in another project and `send_id` for one of
+    /// its earlier replies: each named argument becomes its typed text (from
+    /// args) followed by the sources' answers.
     #[serde(default)]
     forward_args: BTreeMap<String, Vec<SourceArg>>,
 }
@@ -895,8 +949,9 @@ struct ForwardPromptArg {
 pub struct ForwardArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
-    /// Agents whose latest answers are appended after the text, each as
-    /// `{agent_id}`, with `project_id` for an agent in another project.
+    /// Agents whose answers are appended after the text, each as
+    /// `{agent_id}`, with `project_id` for an agent in another project and
+    /// `send_id` to forward one of its earlier replies instead of its latest.
     #[serde(default)]
     sources: Vec<SourceArg>,
     /// Agent ids in this project. At least one; none repeated.
@@ -961,7 +1016,7 @@ pub struct RunWorkflowArgs {
     /// Inputs filled with agents' latest answers, by input name; each source
     /// is `{agent_id}`, with `project_id` for an agent in another project.
     #[serde(default)]
-    forward_sources: BTreeMap<String, Vec<SourceArg>>,
+    forward_sources: BTreeMap<String, Vec<WorkflowSourceArg>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1370,7 +1425,7 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                     .into_iter()
                     .map(|(name, value)| (name, value.into()))
                     .collect(),
-                forward_sources: source_map(a.forward_sources, a.project_id),
+                forward_sources: workflow_source_map(a.forward_sources, a.project_id),
             };
             let run_id =
                 workflow::run_workflow(state, cx.home(), request, &cx.budget(None)).await?;

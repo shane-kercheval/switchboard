@@ -63,10 +63,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::commands::{
-    AgentJournalView, ForwardArg, ForwardOutcome, ForwardSourceRef, OutcomeStatus, SendCorrelation,
-    cancel_agent_impl, cancel_send_impl, combine_prompt_message, dispatch_message_impl,
-    forward_message_impl, forward_prompt_impl, list_project_agents_readonly_impl,
-    open_project_impl,
+    AgentJournalView, ForwardArgInputs, ForwardInput, ForwardOutcome, ForwardSourceRef,
+    OutcomeStatus, SendCorrelation, cancel_agent_impl, cancel_send_impl, combine_prompt_message,
+    dispatch_message_impl, forward_message_inputs, forward_prompt_inputs,
+    list_project_agents_readonly_impl, open_project_impl,
 };
 use crate::error::AppError;
 use crate::state::{AppState, lock};
@@ -139,15 +139,54 @@ pub struct ForwardPrompt {
     #[serde(default)]
     pub args: BTreeMap<String, String>,
     #[serde(default)]
-    pub forward_args: BTreeMap<String, Vec<ForwardSourceRef>>,
+    pub forward_args: BTreeMap<String, Vec<ForwardFrom>>,
+}
+
+/// One source of a forward: an agent, possibly in another project, and
+/// optionally one of its earlier replies.
+///
+/// **Why a source can name a reply.** Without `send_id` the source's latest
+/// answer is forwarded, waiting for a turn in flight. An orchestrator often
+/// wants an answer that is no longer the latest: a reviewer's first round
+/// after a workflow's later step, or a report the agent has since followed
+/// with other work. With `send_id`, that reply is forwarded as it is. A
+/// finished reply cannot change, so nothing waits on the agent, which may be
+/// busy with something else. A reply that is not finished, or did not
+/// complete, is refused rather than waited for or replaced by a note: the
+/// caller named it, so anything else would not be what it asked for.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForwardFrom {
+    pub project_id: ProjectId,
+    pub agent_id: AgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_id: Option<SendId>,
+}
+
+impl From<ForwardSourceRef> for ForwardFrom {
+    fn from(source: ForwardSourceRef) -> Self {
+        Self {
+            project_id: source.project_id,
+            agent_id: source.agent_id,
+            send_id: None,
+        }
+    }
+}
+
+impl ForwardFrom {
+    fn source_ref(self) -> ForwardSourceRef {
+        ForwardSourceRef {
+            agent_id: self.agent_id,
+            project_id: self.project_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForwardRequest {
     pub project_id: ProjectId,
     /// Sources appended after the text (or after the rendered prompt). A
-    /// source may live in another project.
-    pub sources: Vec<ForwardSourceRef>,
+    /// source may live in another project, and may name one of its replies.
+    pub sources: Vec<ForwardFrom>,
     pub recipients: Vec<AgentId>,
     #[serde(default)]
     pub text: Option<String>,
@@ -239,7 +278,7 @@ pub(super) enum BodyPlan {
         appended_text: String,
     },
     Forward {
-        sources: Vec<ForwardSourceRef>,
+        sources: Vec<ForwardFrom>,
         text: String,
         prompt: Option<ForwardPrompt>,
     },
@@ -766,41 +805,54 @@ fn first_refusal(refusals: Vec<(AgentId, AppError)>, roster: &[AgentRecord]) -> 
 /// sources' projects and wait for a mid-turn source), under the call's budget:
 /// the kept-alive caller gets progress while a source finishes, and at the
 /// deadline the resolver's future is dropped, which releases its hold (its
-/// guard removes the cancel token), so nothing is left registered.
+/// guard removes the cancel token), so nothing is left registered. A source
+/// that names a reply is read first ([`named_reply`]) and handed to the
+/// resolver as settled text, so it never waits.
 async fn compose_forward(
     state: &AppState,
     home_dir: &Path,
     project_id: ProjectId,
-    sources: Vec<ForwardSourceRef>,
+    sources: Vec<ForwardFrom>,
     text: String,
     prompt: Option<ForwardPrompt>,
     budget: &WaitBudget,
 ) -> Result<String, AppError> {
     let forward_id = Uuid::now_v7();
-    let all_sources: Vec<ForwardSourceRef> = sources
+    // Only the sources forwarded by latest answer can be waited on.
+    let waited_on: Vec<ForwardSourceRef> = sources
         .iter()
-        .copied()
         .chain(
             prompt
                 .iter()
-                .flat_map(|p| p.forward_args.values().flatten().copied()),
+                .flat_map(|p| p.forward_args.values().flatten()),
         )
+        .filter(|source| source.send_id.is_none())
+        .map(|source| source.source_ref())
         .collect();
     let compose = async {
+        let appended = forward_inputs(state, &sources, home_dir).await?;
         match prompt {
             None => {
-                forward_message_impl(state, text, sources, forward_id, home_dir, project_id).await
+                forward_message_inputs(state, text, appended, forward_id, home_dir, project_id)
+                    .await
             }
             Some(prompt) => {
-                let forward_args = forward_args_for(state, &prompt)?;
-                forward_prompt_impl(
+                let mut forward_args = Vec::new();
+                for (name, sources, required) in forward_args_for(state, &prompt)? {
+                    forward_args.push(ForwardArgInputs {
+                        name,
+                        sources: forward_inputs(state, &sources, home_dir).await?,
+                        required,
+                    });
+                }
+                forward_prompt_inputs(
                     state,
                     prompt.provider,
                     prompt.name,
                     prompt.args,
                     forward_args,
                     text,
-                    sources,
+                    appended,
                     forward_id,
                     home_dir,
                     project_id,
@@ -811,7 +863,7 @@ async fn compose_forward(
     };
     let outcome = match budget.run(Box::pin(compose)).await {
         Outcome::Done(outcome) => outcome?,
-        Outcome::Timeout => return Err(compose_timeout(state, budget, &all_sources).await),
+        Outcome::Timeout => return Err(compose_timeout(state, budget, &waited_on).await),
         Outcome::Cancelled => return Err(AppError::Interrupted),
     };
     match outcome {
@@ -820,6 +872,80 @@ async fn compose_forward(
         // Only this function holds the forward id, so nothing else cancels
         // the hold; reaching this means it was torn down from outside.
         ForwardOutcome::Cancelled => Err(AppError::Interrupted),
+    }
+}
+
+/// The resolver's inputs for `sources`, in order: a source that names a reply
+/// carries that reply's text, read now; the others are forwarded by latest
+/// answer.
+async fn forward_inputs(
+    state: &AppState,
+    sources: &[ForwardFrom],
+    home_dir: &Path,
+) -> Result<Vec<ForwardInput>, AppError> {
+    let mut inputs = Vec::with_capacity(sources.len());
+    for source in sources {
+        let settled_text = match source.send_id {
+            Some(send_id) => Some(named_reply(state, *source, send_id, home_dir).await?),
+            None => None,
+        };
+        inputs.push(ForwardInput {
+            source: source.source_ref(),
+            settled_text,
+        });
+    }
+    Ok(inputs)
+}
+
+/// The text of `source`'s reply to `send_id`, read as `wait_send` reads the
+/// send ([`current_send`]): the ledger's captured reply while it holds the
+/// send, otherwise the journal's answer, where a reply counts as completed
+/// only through a durable link to its send, so a guess never stands in for
+/// the reply the caller named. Only a completed reply is returned; one still
+/// waiting or running, or one that did not complete, refuses the forward.
+async fn named_reply(
+    state: &AppState,
+    source: ForwardFrom,
+    send_id: SendId,
+    home_dir: &Path,
+) -> Result<String, AppError> {
+    let agent = agent_in_project(state, source.project_id, source.agent_id)?;
+    let reply = current_send(state, source.project_id, send_id, home_dir).await?;
+    let Some(recipient) = reply
+        .recipients
+        .into_iter()
+        .find(|r| r.agent_id == source.agent_id)
+    else {
+        return Err(AppError::ForwardReplyUnknown {
+            name: agent.name,
+            send_id,
+        });
+    };
+    let not_completed = |state: &'static str| AppError::ForwardReplyNotCompleted {
+        name: agent.name.clone(),
+        send_id,
+        state,
+    };
+    match recipient.status {
+        SendStatus::Completed => Ok(recipient.text.unwrap_or_default()),
+        SendStatus::Accepted => Err(AppError::ForwardReplyUnfinished {
+            name: agent.name,
+            send_id,
+            state: "waiting in line",
+        }),
+        SendStatus::Running => Err(AppError::ForwardReplyUnfinished {
+            name: agent.name,
+            send_id,
+            state: "running",
+        }),
+        SendStatus::Failed => Err(not_completed("failed")),
+        SendStatus::Cancelled => Err(not_completed("was cancelled")),
+        SendStatus::Rejected | SendStatus::NotDispatched => {
+            Err(not_completed("never reached the agent"))
+        }
+        SendStatus::Started | SendStatus::Unknown => Err(not_completed(
+            "could not be confirmed finished (the app restarted while it ran)",
+        )),
     }
 }
 
@@ -864,9 +990,12 @@ async fn compose_timeout(
     }
 }
 
-/// The forwarded arguments with `required` read from the prompt's own schema,
-/// never from the caller.
-fn forward_args_for(state: &AppState, prompt: &ForwardPrompt) -> Result<Vec<ForwardArg>, AppError> {
+/// The forwarded arguments, each with its sources and `required` read from
+/// the prompt's own schema, never from the caller.
+fn forward_args_for(
+    state: &AppState,
+    prompt: &ForwardPrompt,
+) -> Result<Vec<(String, Vec<ForwardFrom>, bool)>, AppError> {
     let schema = state
         .prompts
         .list()
@@ -892,11 +1021,7 @@ fn forward_args_for(state: &AppState, prompt: &ForwardPrompt) -> Result<Vec<Forw
                         prompt.provider, prompt.name
                     ))
                 })?;
-            Ok(ForwardArg {
-                name: name.clone(),
-                sources: sources.clone(),
-                required: argument.required,
-            })
+            Ok((name.clone(), sources.clone(), argument.required))
         })
         .collect()
 }
@@ -1248,8 +1373,9 @@ fn held_send(state: &AppState, project_id: ProjectId, send_id: SendId) -> Option
 /// while it holds the send, each completed recipient with its reply even while
 /// others still run; otherwise the journal's answer, as after a restart, where
 /// `started` means the outcome could not be confirmed. The same reading
-/// `wait_send` gives once it stops waiting; `read_workflow_run` reads sends
-/// through this, so the two agree on every status.
+/// `wait_send` gives once it stops waiting; a forward naming a reply and
+/// `read_workflow_run` read sends through this, so all three agree on every
+/// status.
 pub(super) async fn current_send(
     state: &AppState,
     project_id: ProjectId,

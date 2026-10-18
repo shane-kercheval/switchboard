@@ -221,6 +221,18 @@ async fn the_tool_list_is_the_catalog_and_declares_the_result_size() {
         json!(["agent_id"]),
         "a source in the call's own project needs no project_id"
     );
+    assert!(
+        source["properties"]["send_id"].is_object(),
+        "a forward source can name one of its agent's replies: {source}"
+    );
+    let run = tools.iter().find(|t| t.name == "run_workflow").unwrap();
+    let input_source =
+        &run.input_schema["properties"]["forward_sources"]["additionalProperties"]["items"];
+    assert!(
+        input_source["properties"]["agent_id"].is_object()
+            && input_source["properties"].get("send_id").is_none(),
+        "a workflow input is filled from latest answers only: {input_source}"
+    );
     for tool in &tools {
         let meta = tool.meta.as_ref().unwrap();
         assert_eq!(

@@ -77,7 +77,7 @@ pub struct RunWorkflowRequest {
 }
 
 /// Start a workflow run and return its id. The run reports its status; the
-/// caller reads output with `read_agent_output` or `read_send_output`.
+/// caller reads output with `read_latest_reply` or `read_reply`.
 ///
 /// Agent inputs arrive as ids and are converted to names **inside** the
 /// invocation, against the roster and workflow it binds with, so a rename and
@@ -184,7 +184,7 @@ pub struct WaitWorkflowReply {
     pub recipients: Vec<ResolvedRecipient>,
     /// Every send the run's send steps made so far, in step order: follow
     /// one with `wait_send`, and read any recipient's reply with
-    /// `read_send_output` and its `send_id`, even after a later step.
+    /// `read_reply` and its `send_id`, even after a later step.
     pub sends: Vec<RunSend>,
     /// Switchboard no longer holds the run's live record (after a restart, or
     /// once it pruned the run), so its sends are not known, which is not the
@@ -406,7 +406,7 @@ pub struct RunReply {
 ///
 /// **Why a separate read.** `wait_workflow` lists the run's sends without
 /// their text, so a caller that wants the replies reads each recipient with
-/// `read_send_output`, one call per reply, and an agent's latest answer holds
+/// `read_reply`, one call per reply, and an agent's latest answer holds
 /// only its last step. This returns them all at once, a reviewer's first round
 /// under its own step. Each send is read as `wait_send` reads it
 /// ([`current_send`]): from the ledger while it holds the send, so a running
@@ -488,7 +488,7 @@ pub async fn read_workflow_run(
 /// The budget rules for [`WorkflowRunReplies`]: those of every reply-carrying
 /// result. Reply text is cut evenly across every recipient of every send;
 /// sends and recipients are never dropped; a cut reply reads on through
-/// `read_send_output` with its own send.
+/// `read_reply` with its own send.
 #[must_use]
 pub fn read_workflow_run_budget(project_id: ProjectId, budget_chars: usize) -> BudgetSpec {
     wait_any_send_budget(project_id, budget_chars)

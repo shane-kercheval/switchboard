@@ -77,8 +77,8 @@ use super::error_code::error_code;
 use super::handle::AppStateHandle;
 use super::ledger::{Claim, ClaimResult, RecipientSnapshot, SendReceipt, SendSnapshot, SendStatus};
 use super::read::{
-    AgentOutput, agent_in_project, correlate_turns, project_readonly, read_agent_output,
-    read_journal,
+    LatestReply, agent_in_project, correlate_turns, project_readonly, read_journal,
+    read_latest_reply,
 };
 use super::usage::stored_usage;
 use super::wait::{Observed, Outcome, WaitBudget, wait_until};
@@ -1668,9 +1668,9 @@ pub struct WaitAgentReply {
     pub status: AgentWaitStatus,
     /// The agent's latest output, once idle.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<AgentOutput>,
+    pub output: Option<LatestReply>,
     /// The agent is idle but its output could not be read within the call's
-    /// allowance: call `read_agent_output`. Distinguishes "nothing to show"
+    /// allowance: call `read_latest_reply`. Distinguishes "nothing to show"
     /// from "not read".
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub output_unavailable: bool,
@@ -1734,7 +1734,7 @@ async fn wait_agent_unreported(
         });
     }
     let output = match budget
-        .run_with_grace(read_agent_output(state, project_id, agent_id, home_dir))
+        .run_with_grace(read_latest_reply(state, project_id, agent_id, home_dir))
         .await
     {
         Outcome::Done(output) => Some(output?),
@@ -1758,7 +1758,7 @@ pub fn wait_any_send_budget(project_id: ProjectId, budget_chars: usize) -> Budge
     BudgetSpec {
         budget_chars,
         droppable_list: None,
-        read_with: Some("read_send_output"),
+        read_with: Some("read_reply"),
         pointer: Box::new(move |site: &CutSite<'_>| {
             let agent_id = site.ancestors.last()?.get("agent_id")?.clone();
             let send_id = site
@@ -1769,7 +1769,7 @@ pub fn wait_any_send_budget(project_id: ProjectId, budget_chars: usize) -> Budge
                 .clone();
             Some(super::with_cap(
                 serde_json::json!({
-                    "tool": "read_send_output",
+                    "tool": "read_reply",
                     "project_id": project_id,
                     "send_id": send_id,
                     "agent_id": agent_id,
@@ -1783,18 +1783,18 @@ pub fn wait_any_send_budget(project_id: ProjectId, budget_chars: usize) -> Budge
 
 /// The budget rules for a [`WaitSendReply`]: reply text may be cut, shared
 /// evenly across recipients; recipients are never dropped; a cut reply reads
-/// on through `read_send_output` from where the cut ended.
+/// on through `read_reply` from where the cut ended.
 #[must_use]
 pub fn wait_send_budget(project_id: ProjectId, send_id: SendId, budget_chars: usize) -> BudgetSpec {
     BudgetSpec {
         budget_chars,
         droppable_list: None,
-        read_with: Some("read_send_output"),
+        read_with: Some("read_reply"),
         pointer: Box::new(move |site: &CutSite<'_>| {
             let agent_id = site.ancestors.last()?.get("agent_id")?.clone();
             Some(super::with_cap(
                 serde_json::json!({
-                    "tool": "read_send_output",
+                    "tool": "read_reply",
                     "project_id": project_id,
                     "send_id": send_id,
                     "agent_id": agent_id,

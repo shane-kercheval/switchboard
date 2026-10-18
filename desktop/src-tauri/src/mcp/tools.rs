@@ -74,7 +74,7 @@ others with forward). It returns a send_id at once. Call wait_send with that id 
 true; each call waits up to its timeout and returns the current state either way. The replies \
 come back in wait_send's final answer. With several agents working at once, wait_any_send \
 waits on all their sends and returns when the first finishes. read_conversation shows a \
-project's whole history; read_agent_output shows an agent's latest finished answer, including \
+project's whole history; read_latest_reply shows an agent's latest finished answer, including \
 turns you did not send. The user's saved prompts (list_prompts) and workflows (list_workflows) \
 are their standing instructions and procedures, such as a code review: use one when it fits \
 rather than writing your own. Before running a multi-step exchange across agents by hand \
@@ -84,7 +84,7 @@ Results are JSON: {\"result\": …, \"truncated\": […], \"items_omitted\": n},
 100,000 characters. Replies, conversations, and wait_workflow are kept under 45,000 when your \
 client sends no progress token (Claude Desktop). Long text may be cut; each cut is listed in \
 truncated with the call that reads the rest (read_with), when there is one. max_chars on \
-read_conversation, read_send_output, read_agent_output, read_workflow_run, wait_send, \
+read_conversation, read_reply, read_latest_reply, read_workflow_run, wait_send, \
 wait_any_send, and wait_agent sets the limit for one call, and the call a cut lists keeps it. Codex keeps about \
 10,000 tokens of a result and cuts the middle: pass 25000 there. An error is {\"code\": …, \
 \"message\": …}; the message says what to do.
@@ -230,18 +230,18 @@ tools! {
          left out; the answer says what the agent did. last_n_items keeps only the newest items. \
          When the whole would pass the budget (100,000 characters, 45,000 without a progress \
          token, or max_chars), older items are left out whole (items_omitted says how many); a single answer too long on its own is cut, and \
-         truncated names the read_send_output call that reads on.";
-    ReadSendOutput = "read_send_output" (ReadSendOutputArgs) [Read]
+         truncated names the read_reply call that reads on.";
+    ReadReply = "read_reply" (ReadReplyArgs) [Read]
         "One recipient's reply to one send, a page at a time, starting at offset (in \
          characters); a page holds up to 95,000 characters, less under max_chars. The way to \
          read a reply that another result cut: pass the arguments its \
          truncated entry's read_with gives, read_from included. next_offset is where the next \
          page starts and is absent on the last page. Also reads a reply still running (the text \
          so far), failed, or cancelled.";
-    ReadAgentOutput = "read_agent_output" (ReadAgentOutputArgs) [Read]
+    ReadLatestReply = "read_latest_reply" (ReadLatestReplyArgs) [Read]
         "An agent's latest finished answer, including turns you did not send (the user's, a \
          workflow's), or the reason its latest turn failed or was cancelled. Carries the send_id \
-         when known, so a long answer can be paged with read_send_output, and the agent's context \
+         when known, so a long answer can be paged with read_reply, and the agent's context \
          after its newest finished turn (as list_agents reports it). newer_turn_running is true \
          when the agent has a turn running, or a send made through these tools is still to reach \
          it: this answer is then not its newest. false does not prove it current (a message the \
@@ -277,7 +277,7 @@ tools! {
          recent_text). started appears only with source journal: after a restart the reply's \
          outcome could not be confirmed. Long replies share the result evenly (100,000 \
          characters, 45,000 without a progress token, or max_chars), each cut listed in \
-         truncated with the read_send_output call that reads on. sends_unavailable is true \
+         truncated with the read_reply call that reads on. sends_unavailable is true \
          once Switchboard no longer holds the run's record (after a restart, or once it \
          pruned the run): the replies are then in read_conversation. Once Switchboard no \
          longer holds the run, a completed or cancelled run is run_unknown. A send \
@@ -335,7 +335,7 @@ tools! {
          must not disturb the source. The fork is named <source>-fork and is an agent like any \
          other from then on (its id is the agent_id for every later call); the source is \
          untouched. Returns the fork's record and a send_id: call wait_send until done, then \
-         read_agent_output or read_conversation. Claude Code and Codex agents only \
+         read_latest_reply or read_conversation. Claude Code and Codex agents only \
          (fork_unsupported otherwise); the source must have replied at least once (no_session) \
          and must be idle (source_busy: wait_agent on it first). The message is text, or a saved \
          prompt with text appended, as in send. idempotency_key as in send, with one more rule: \
@@ -383,7 +383,7 @@ tools! {
              at once (source_busy: wait_send on that send, then retry); one that failed, was \
              cancelled, or never reached the agent refuses it (invalid_argument), as does one \
              Switchboard cannot tie to the send (it may still be running, the app may have \
-             restarted, or it cannot tell which turn answered: read it with read_send_output \
+             restarted, or it cannot tell which turn answered: read it with read_reply \
              and send its text yourself); a send the agent did not receive in the source's \
              project, or whose reply has not started, is send_unknown. A source with no answer text refuses the forward (invalid_argument). \
              A refused forward sends nothing. With a saved prompt, forward_args fills a prompt \
@@ -397,7 +397,7 @@ tools! {
          list input a list. forward_sources fills an input with agents' latest answers. \
          wait_workflow lists every send the run made with its send_id: follow one with wait_send \
          as you would your own. read_workflow_run returns every reply in step order; read it \
-         rather than read_agent_output, since an agent's latest answer holds only its last \
+         rather than read_latest_reply, since an agent's latest answer holds only its last \
          step. Refused with \
          workflow_already_running while another run is in progress in the project, with \
          workflow_run_requires_dismissal while a failed run is held there, and while an agent \
@@ -442,7 +442,7 @@ tools! {
              Switchboard's record of it), or unknown: this project has no record of the send, so \
              check project_id and send_id; a message still waiting in line when the app restarted \
              was never sent and reads this way too. Long replies share the result evenly, each cut \
-             one listed in truncated with the read_send_output call that reads on. When done, \
+             one listed in truncated with the read_reply call that reads on. When done, \
              the result also {USAGE_NOTE}\n{WAIT_HINTS}"
         );
     WaitAnySend = "wait_any_send" (WaitAnySendArgs) [Read]
@@ -453,14 +453,15 @@ tools! {
              returns it: a done one carries its replies, the others their recipients' statuses, \
              activity, and recent_text. any_done says whether one finished. Call again with the \
              sends still running; a send already done returns at once. Long replies share the \
-             result evenly, each cut one listed in truncated with the read_send_output call \
+             result evenly, each cut one listed in truncated with the read_reply call \
              that reads on. When any_done, the result also, once at its top level, \
              {USAGE_NOTE}\n{WAIT_HINTS}"
         );
     WaitAgent = "wait_agent" (WaitAgentArgs) [Read]
         format!(
             "Wait until an agent would accept a new send, then return idle with its latest \
-             output; or running once timeout_seconds passes (call again), with the agent's \
+             reply in output, as read_latest_reply returns it; or running once timeout_seconds \
+             passes (call again), with the agent's \
              activity (as list_agents describes it). idle is an \
              observation: the user or a workflow can occupy the agent before your next send, \
              which then returns agent_busy. When idle, the result also {USAGE_NOTE}\n{WAIT_HINTS}"
@@ -536,7 +537,7 @@ pub struct AgentArgs {
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
-pub struct ReadAgentOutputArgs {
+pub struct ReadLatestReplyArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
     #[schemars(with = "String")]
@@ -568,7 +569,7 @@ pub struct ReadConversationArgs {
 #[serde(rename_all = "snake_case")]
 enum ReadFromArg {
     /// The text captured as the reply streamed when the app holds it, else
-    /// the agent's session file. What `wait_send` and `read_agent_output` show.
+    /// the agent's session file. What `wait_send` and `read_latest_reply` show.
     #[default]
     Auto,
     /// The agent's session file, as `read_conversation` shows the reply.
@@ -587,7 +588,7 @@ impl From<ReadFromArg> for ReadFrom {
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
-pub struct ReadSendOutputArgs {
+pub struct ReadReplyArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
     #[schemars(with = "String")]
@@ -1248,10 +1249,10 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 read::conversation_budget(a.project_id, cx.result_chars(a.max_chars)),
             )
         }
-        ToolName::ReadSendOutput => {
-            let a: ReadSendOutputArgs = parse(args)?;
+        ToolName::ReadReply => {
+            let a: ReadReplyArgs = parse(args)?;
             Reply::plain(
-                &read::read_send_output(
+                &read::read_reply(
                     state,
                     a.project_id,
                     a.send_id,
@@ -1264,13 +1265,13 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 .await?,
             )
         }
-        ToolName::ReadAgentOutput => {
-            let a: ReadAgentOutputArgs = parse(args)?;
+        ToolName::ReadLatestReply => {
+            let a: ReadLatestReplyArgs = parse(args)?;
             let output =
-                read::read_agent_output(state, a.project_id, a.agent_id, cx.home()).await?;
+                read::read_latest_reply(state, a.project_id, a.agent_id, cx.home()).await?;
             Reply::fitted(
                 &output,
-                read::agent_output_budget(a.project_id, cx.result_chars(a.max_chars)),
+                read::latest_reply_budget(a.project_id, cx.result_chars(a.max_chars)),
             )
         }
         ToolName::ListPrompts => {
@@ -1490,7 +1491,7 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 send::wait_agent(state, a.project_id, a.agent_id, &budget, cx.home()).await?;
             Reply::fitted(
                 &reply,
-                read::agent_output_budget(a.project_id, cx.result_chars(a.max_chars)),
+                read::latest_reply_budget(a.project_id, cx.result_chars(a.max_chars)),
             )
         }
         ToolName::WaitWorkflow => {

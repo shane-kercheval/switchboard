@@ -1329,7 +1329,7 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     assert_eq!(waited["done"], true);
     assert_eq!(waited["recipients"][0]["text"], "ack: hi");
     let page = call(
-        "read_send_output",
+        "read_reply",
         json!({ "project_id": project_id, "send_id": send_id, "agent_id": coder }),
     )
     .await;
@@ -1347,7 +1347,7 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     assert_eq!(waited["done"], true);
     assert_eq!(waited["recipients"][0]["status"], "completed");
     let output = call(
-        "read_agent_output",
+        "read_latest_reply",
         json!({ "project_id": project_id, "agent_id": coder }),
     )
     .await;
@@ -1374,7 +1374,7 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     assert_eq!(waited["done"], true);
     assert_eq!(waited["recipients"][0]["text"], "ack: aside");
     let forks_output = call(
-        "read_agent_output",
+        "read_latest_reply",
         json!({ "project_id": project_id, "agent_id": fork_id }),
     )
     .await;
@@ -1595,11 +1595,19 @@ fn serialized_len(body: &Value) -> usize {
     serde_json::to_string(body).unwrap().len()
 }
 
-/// The one cut's follow-up call, as a capped result lists it.
+/// The one cut's follow-up call, as a capped result lists it. The tool it
+/// names is checked against the catalog: the name is a string in `ops`, so a
+/// renamed tool would otherwise leave every cut pointing at one that is gone.
 fn hint_of(body: &Value) -> Value {
     let cuts = body["truncated"].as_array().unwrap();
     assert_eq!(cuts.len(), 1, "one reply was cut: {body}");
-    cuts[0]["read_with"].clone()
+    let hint = cuts[0]["read_with"].clone();
+    let tool = hint["tool"].as_str().unwrap();
+    assert!(
+        ToolName::parse(tool).is_some(),
+        "a cut's read_with names {tool}, which is not a tool"
+    );
+    hint
 }
 
 /// A hint's arguments, without the tool name it carries.
@@ -1692,7 +1700,7 @@ async fn a_capped_reply_lists_a_follow_up_call_that_keeps_the_cap() {
     assert!(serialized_len(&waited) <= 10_000);
     let hint = hint_of(&waited);
     assert_eq!(hint["max_chars"], 10_000, "the follow-up keeps the cap");
-    let rest = t.call("read_send_output", args_of(&hint)).await;
+    let rest = t.call("read_reply", args_of(&hint)).await;
     assert!(serialized_len(&rest) <= 10_000);
     assert_eq!(rest["result"]["offset"], hint["offset"]);
     assert!(
@@ -1702,7 +1710,7 @@ async fn a_capped_reply_lists_a_follow_up_call_that_keeps_the_cap() {
 
     let page = t
         .call(
-            "read_send_output",
+            "read_reply",
             json!({ "project_id": project_id, "send_id": send_id, "agent_id": coder, "max_chars": 12_000 }),
         )
         .await;
@@ -1711,7 +1719,7 @@ async fn a_capped_reply_lists_a_follow_up_call_that_keeps_the_cap() {
 
     let output = t
         .call(
-            "read_agent_output",
+            "read_latest_reply",
             json!({ "project_id": project_id, "agent_id": coder, "max_chars": 10_000 }),
         )
         .await;
@@ -1859,7 +1867,7 @@ async fn a_finished_reply_carries_the_agents_context() {
 
     let latest = t
         .call(
-            "read_agent_output",
+            "read_latest_reply",
             json!({ "project_id": project_id, "agent_id": coder }),
         )
         .await;
@@ -1932,14 +1940,14 @@ async fn a_workflow_lists_each_send_so_an_earlier_reply_stays_readable() {
 
     let first = t
         .call(
-            "read_send_output",
+            "read_reply",
             json!({ "project_id": project_id, "send_id": sends[0]["send_id"], "agent_id": coder }),
         )
         .await;
     assert_eq!(first["result"]["text"], "first answer");
     let latest = t
         .call(
-            "read_agent_output",
+            "read_latest_reply",
             json!({ "project_id": project_id, "agent_id": coder }),
         )
         .await;

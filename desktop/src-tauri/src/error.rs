@@ -208,7 +208,7 @@ pub enum AppError {
     /// answer, so it is refused; the caller can read it, see how it was
     /// matched, and send its text itself. Nothing was sent.
     #[error(
-        "Switchboard cannot confirm a finished reply from {name} to send {send_id}, so nothing was sent. The reply may still be running, the app may have restarted while it ran, or Switchboard can't tell which turn answered that send. Read it with read_send_output, which says how the reply was matched, and if it is the one you want, send its text with send"
+        "Switchboard cannot confirm a finished reply from {name} to send {send_id}, so nothing was sent. The reply may still be running, the app may have restarted while it ran, or Switchboard can't tell which turn answered that send. Read it with read_reply, which says how the reply was matched, and if it is the one you want, send its text with send"
     )]
     ForwardReplyUnconfirmed { name: String, send_id: SendId },
 

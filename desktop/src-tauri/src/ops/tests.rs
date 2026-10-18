@@ -35,8 +35,8 @@ use super::error_code::{self, error_code};
 use super::ledger::{ForkClaim, SendStatus};
 use super::read::conversation_budget;
 use super::read::{
-    AgentOutputStatus, DigestItem, DigestTurnStatus, OutputSource, ProjectStatus, ReadFrom,
-    list_agents, list_projects, read_agent_output, read_conversation, read_send_output,
+    DigestItem, DigestTurnStatus, LatestReplyStatus, OutputSource, ProjectStatus, ReadFrom,
+    list_agents, list_projects, read_conversation, read_latest_reply, read_reply,
 };
 use super::send::{
     AgentWaitStatus, Body, ForwardFrom, ForwardPrompt, ForwardRequest, OnBusyPolicy, SendRequest,
@@ -194,10 +194,10 @@ async fn agent_lifecycle_on_an_unopened_project() {
     assert_eq!(listed.len(), 1);
     assert!(!listed[0].busy);
 
-    let output = read_agent_output(&env.state, project_id, created.id, &env.home())
+    let output = read_latest_reply(&env.state, project_id, created.id, &env.home())
         .await
         .unwrap();
-    assert_eq!(output.status, AgentOutputStatus::None);
+    assert_eq!(output.status, LatestReplyStatus::None);
 
     assert_eq!(
         lock(&env.sync.roster_changed).len(),
@@ -865,7 +865,7 @@ async fn wait_agent_across_a_running_turn_with_one_queued_returns_running_until_
     .unwrap();
     assert_eq!(reply.status, AgentWaitStatus::Idle);
     let output = reply.output.unwrap();
-    assert_eq!(output.status, AgentOutputStatus::Completed);
+    assert_eq!(output.status, LatestReplyStatus::Completed);
     assert_eq!(output.source, OutputSource::DurableLink);
 }
 
@@ -979,7 +979,7 @@ async fn cancel_send_stops_running_recipients() {
 // --- outputs and the budget ------------------------------------------------------
 
 #[tokio::test]
-async fn read_send_output_pages_one_reply_stably_while_the_agent_starts_a_new_turn() {
+async fn read_reply_pages_one_reply_stably_while_the_agent_starts_a_new_turn() {
     let (env, project_id, agents) = project_with_agents(&["a"]);
     let long = "x".repeat(OUTPUT_PAGE_CHARS * 2 + 5);
     env.adapter.push(Script::reply(&long));
@@ -991,7 +991,7 @@ async fn read_send_output_pages_one_reply_stably_while_the_agent_starts_a_new_tu
     .await
     .unwrap();
     wait_done(&env, project_id, receipt.send_id).await;
-    let first = read_send_output(
+    let first = read_reply(
         &env.state,
         project_id,
         receipt.send_id,
@@ -1019,7 +1019,7 @@ async fn read_send_output_pages_one_reply_stably_while_the_agent_starts_a_new_tu
     .unwrap();
     await_turn_running(&env.state, agents[0]).await;
 
-    let last = read_send_output(
+    let last = read_reply(
         &env.state,
         project_id,
         receipt.send_id,
@@ -1165,7 +1165,7 @@ async fn the_restart_fallback_answers_from_the_journal() {
     assert_eq!(reply.source, WaitSource::Unknown);
     assert!(reply.recipients.is_empty());
 
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project_id,
         s_a,
@@ -1542,7 +1542,7 @@ async fn create_send_forward_and_read_leave_the_expected_files() {
     .unwrap();
     let reply = wait_done(&env, project.id, second.send_id).await;
     assert_eq!(reply.recipients[0].status, SendStatus::Completed);
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project.id,
         second.send_id,
@@ -1992,20 +1992,20 @@ async fn a_workflow_runs_the_agent_an_id_names_even_after_a_rename_and_name_reus
     )
     .await
     .unwrap();
-    let builder = read_agent_output(&env.state, project_id, agents[0], &env.home())
+    let builder = read_latest_reply(&env.state, project_id, agents[0], &env.home())
         .await
         .unwrap();
     assert_eq!(
         builder.status,
-        AgentOutputStatus::Completed,
+        LatestReplyStatus::Completed,
         "the renamed agent ran"
     );
-    let coder = read_agent_output(&env.state, project_id, usurper.id, &env.home())
+    let coder = read_latest_reply(&env.state, project_id, usurper.id, &env.home())
         .await
         .unwrap();
     assert_eq!(
         coder.status,
-        AgentOutputStatus::None,
+        LatestReplyStatus::None,
         "the name's new owner did not"
     );
 }
@@ -2023,7 +2023,7 @@ async fn a_page_is_sized_by_its_serialized_length() {
     .await
     .unwrap();
     wait_done(&env, project_id, receipt.send_id).await;
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project_id,
         receipt.send_id,
@@ -2354,7 +2354,7 @@ async fn paging_after_a_restart_agrees_with_wait_send_on_a_failed_send() {
     let env = env.restart();
     let waited = wait_done(&env, project_id, send_id).await;
     assert_eq!(waited.recipients[0].status, SendStatus::Failed);
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project_id,
         send_id,
@@ -2543,7 +2543,7 @@ async fn the_merged_conversation_and_reply_paging_agree_on_every_turn() {
             );
             continue;
         };
-        let page = read_send_output(
+        let page = read_reply(
             &env.state,
             project_id,
             *send_id,
@@ -2575,7 +2575,7 @@ async fn the_merged_conversation_and_reply_paging_agree_on_every_turn() {
     }
     assert_eq!(checked, 4, "a1, a2, a4, and b1 each carry a send");
 
-    let failed = read_send_output(
+    let failed = read_reply(
         &env.state,
         project_id,
         s3,
@@ -2589,7 +2589,7 @@ async fn the_merged_conversation_and_reply_paging_agree_on_every_turn() {
     .unwrap();
     assert_eq!(failed.status, SendStatus::Failed);
     assert!(failed.text.is_empty());
-    let latest = read_agent_output(&env.state, project_id, a, &env.home())
+    let latest = read_latest_reply(&env.state, project_id, a, &env.home())
         .await
         .unwrap();
     assert_eq!(latest.text.as_deref(), Some("answer four"));
@@ -2855,7 +2855,7 @@ async fn cut_answer(
         .read_with
         .clone()
         .expect("an answer with a send reads on");
-    assert_eq!(read_with["tool"], "read_send_output");
+    assert_eq!(read_with["tool"], "read_reply");
     (kept, read_with)
 }
 
@@ -2868,7 +2868,7 @@ async fn read_on(env: &TestEnv, project_id: ProjectId, read_with: &serde_json::V
     let mut offset = usize::try_from(read_with["offset"].as_u64().unwrap()).unwrap();
     let mut text = String::new();
     loop {
-        let page = read_send_output(
+        let page = read_reply(
             &env.state,
             project_id,
             send_id,
@@ -2931,7 +2931,7 @@ async fn a_cancelled_partial_reply_reads_on_in_the_same_session() {
     let reply = wait_done(&env, project_id, receipt.send_id).await;
     assert_eq!(reply.recipients[0].status, SendStatus::Cancelled);
 
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project_id,
         receipt.send_id,
@@ -3068,7 +3068,7 @@ async fn a_reply_split_by_compaction_pages_the_piece_the_conversation_shows() {
     )
     .await;
     assert_eq!(rest, first[offset..]);
-    let captured = read_send_output(
+    let captured = read_reply(
         &env.state,
         project_id,
         receipt.send_id,
@@ -3776,7 +3776,7 @@ async fn list_agents_settles_an_unreadable_file_as_no_context() {
 }
 
 #[tokio::test]
-async fn read_agent_output_records_the_figures_it_parsed() {
+async fn read_latest_reply_records_the_figures_it_parsed() {
     let mut env = TestEnv::new();
     let project_id = env.project("p");
     let agent_id = env.agent(project_id, "a");
@@ -3784,7 +3784,7 @@ async fn read_agent_output_records_the_figures_it_parsed() {
     env.seed_claude_turns(project_id, agent_id, &[("one", "answer", "a1", at)]);
     save_window_for(&env, project_id, agent_id, "a1", 200_000);
     let env = env.restart();
-    read_agent_output(&env.state, project_id, agent_id, &env.home())
+    read_latest_reply(&env.state, project_id, agent_id, &env.home())
         .await
         .unwrap();
     assert_eq!(
@@ -4406,10 +4406,10 @@ async fn the_latest_answer_survives_an_orchestrators_compaction() {
         .unwrap();
     wait_done(&env, project_id, compacted.send_id).await;
 
-    let output = read_agent_output(&env.state, project_id, agent_id, &env.home())
+    let output = read_latest_reply(&env.state, project_id, agent_id, &env.home())
         .await
         .unwrap();
-    assert_eq!(output.status, AgentOutputStatus::Completed);
+    assert_eq!(output.status, LatestReplyStatus::Completed);
     assert_eq!(output.text.as_deref(), Some("ack: hi"));
     assert_eq!(output.send_id, Some(receipt.send_id));
     let idle = wait_agent(
@@ -5772,12 +5772,12 @@ async fn wait_any_send_follows_a_workflow_send_to_its_reply() {
 }
 
 #[tokio::test]
-async fn read_send_output_on_a_running_workflow_send_reports_it_running() {
+async fn read_reply_on_a_running_workflow_send_reports_it_running() {
     let (env, project_id, agents) = workflow_env().await;
     let (_run_id, send_id, gate) =
         workflow_with_a_running_first_send(&env, project_id, &agents).await;
 
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project_id,
         send_id,
@@ -5896,7 +5896,7 @@ async fn answer_once_idle(
     env: &TestEnv,
     project_id: ProjectId,
     agent_id: AgentId,
-) -> super::read::AgentOutput {
+) -> super::read::LatestReply {
     let reply = wait_agent(
         &env.state,
         project_id,
@@ -5974,7 +5974,7 @@ async fn a_cancelled_run_leaves_a_message_the_user_queued_behind_its_reply() {
         let answer = answer_once_idle(&env, project_id, second).await;
         assert_eq!(
             answer.status,
-            AgentOutputStatus::Completed,
+            LatestReplyStatus::Completed,
             "the run's cleanup left the user's message alone (whole send: {whole_send})"
         );
         assert_eq!(answer.text.as_deref(), Some("the user's reply"));
@@ -6295,10 +6295,10 @@ async fn the_latest_answer_is_a_workflow_steps_reply_read_live() {
     .await
     .unwrap();
 
-    let output = read_agent_output(&env.state, project_id, agents[0], &env.home())
+    let output = read_latest_reply(&env.state, project_id, agents[0], &env.home())
         .await
         .unwrap();
-    assert_eq!(output.status, AgentOutputStatus::Completed);
+    assert_eq!(output.status, LatestReplyStatus::Completed);
     assert_eq!(output.text.as_deref(), Some("greeting"));
     assert_eq!(output.send_id, Some(send_id));
     assert_eq!(
@@ -6325,7 +6325,7 @@ async fn the_latest_answer_flags_a_workflow_step_still_preparing() {
     .unwrap();
     first_workflow_send(&env, project_id, run_id).await;
 
-    let output = read_agent_output(&env.state, project_id, agents[0], &env.home())
+    let output = read_latest_reply(&env.state, project_id, agents[0], &env.home())
         .await
         .unwrap();
     assert!(
@@ -6373,7 +6373,7 @@ async fn the_latest_answer_says_when_a_newer_turn_is_running() {
     .await
     .unwrap();
     wait_done(&env, project_id, first.send_id).await;
-    let settled = read_agent_output(&env.state, project_id, agents[0], &env.home())
+    let settled = read_latest_reply(&env.state, project_id, agents[0], &env.home())
         .await
         .unwrap();
     assert!(!settled.newer_turn_running);
@@ -6388,7 +6388,7 @@ async fn the_latest_answer_says_when_a_newer_turn_is_running() {
     .await
     .unwrap();
     await_turn_running(&env.state, agents[0]).await;
-    let mid_turn = read_agent_output(&env.state, project_id, agents[0], &env.home())
+    let mid_turn = read_latest_reply(&env.state, project_id, agents[0], &env.home())
         .await
         .unwrap();
     assert_eq!(
@@ -6685,7 +6685,7 @@ async fn the_latest_answer_flags_a_send_that_has_not_started_and_answers_at_once
     .unwrap();
     let output = tokio::time::timeout(
         Duration::from_secs(2),
-        read_agent_output(&env.state, project_id, agents[0], &env.home()),
+        read_latest_reply(&env.state, project_id, agents[0], &env.home()),
     )
     .await
     .expect("the read does not wait on the actor")
@@ -6869,7 +6869,7 @@ async fn a_busy_agent_is_recorded_refused_and_its_users_reply_runs_on() {
 
     gate.notify_waiters();
     let answer = answer_once_idle(&env, project_id, second).await;
-    assert_eq!(answer.status, AgentOutputStatus::Completed);
+    assert_eq!(answer.status, LatestReplyStatus::Completed);
     assert_eq!(
         answer.text.as_deref(),
         Some("busy"),
@@ -8232,7 +8232,7 @@ async fn a_forward_refuses_a_reply_matched_to_its_send_only_by_position() {
     env.seed_claude_turn(project_id, src, "A GUESSED REPLY", "m1");
     let env = env.restart();
 
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project_id,
         send_id,
@@ -8268,7 +8268,7 @@ async fn a_forward_refuses_a_reply_matched_to_its_send_only_by_position() {
     assert_eq!(error_code(&err), error_code::INVALID_ARGUMENT);
     let message = err.to_string();
     assert!(
-        message.contains("read_send_output") && !message.contains("leave out send_id"),
+        message.contains("read_reply") && !message.contains("leave out send_id"),
         "{message}"
     );
     assert!(lock(&env.adapter.prompts).is_empty(), "nothing was sent");
@@ -8602,11 +8602,11 @@ async fn read_workflow_run_cuts_long_replies_evenly_and_each_cut_reads_on() {
     assert!(kept.iter().all(|k| *k == kept[0]), "cut evenly: {kept:?}");
     for cut in &fitted.truncated {
         let call = cut.read_with.as_ref().unwrap();
-        assert_eq!(call["tool"], "read_send_output");
+        assert_eq!(call["tool"], "read_reply");
         let send_id: Uuid = serde_json::from_value(call["send_id"].clone()).unwrap();
         let agent_id: AgentId = serde_json::from_value(call["agent_id"].clone()).unwrap();
         let offset = usize::try_from(call["offset"].as_u64().unwrap()).unwrap();
-        let page = read_send_output(
+        let page = read_reply(
             &env.state,
             project_id,
             send_id,

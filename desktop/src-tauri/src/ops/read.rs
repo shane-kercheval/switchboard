@@ -1,4 +1,4 @@
-//! The read tier: lists, the conversation, and outputs. Opens nothing and
+//! The read tier: lists, the conversation, and replies. Opens nothing and
 //! locks nothing, so every function here keeps working for a project the
 //! window has not loaded, when the window is slow, and when the working
 //! directory is gone.
@@ -215,7 +215,7 @@ pub enum DigestItem {
         attachments: Vec<String>,
         at: DateTime<Utc>,
     },
-    /// One agent's turn. With a `send_id`, `read_send_output` with
+    /// One agent's turn. With a `send_id`, `read_reply` with
     /// [`ReadFrom::Transcript`] pages exactly this text; `send_correlation`
     /// says whether that match is a durable link or positional (a guess), and
     /// so how far to trust a journaled outcome applied through it.
@@ -489,7 +489,7 @@ pub struct OutputPage {
     pub source: OutputSource,
 }
 
-/// Which copy of a reply [`read_send_output`] pages.
+/// Which copy of a reply [`read_reply`] pages.
 ///
 /// A completed reply exists twice: the text the app captured as the turn
 /// streamed, and the session file's. They agree for a whole turn, but the
@@ -502,7 +502,7 @@ pub struct OutputPage {
 pub enum ReadFrom {
     /// The captured text when the app holds it (a completed reply sent since
     /// the app started), otherwise the session file's. What `wait_send` and
-    /// `read_agent_output` return, and so where their cuts read on.
+    /// `read_latest_reply` return, and so where their cuts read on.
     #[default]
     Auto,
     /// The session file's, as `read_conversation` shows the reply.
@@ -517,7 +517,7 @@ pub enum ReadFrom {
 /// one. The page holds up to `page_chars` of text; the full budget's page is
 /// [`super::OUTPUT_PAGE_CHARS`].
 #[allow(clippy::too_many_arguments)] // One reader: the ids, the position, the copy, and the size.
-pub async fn read_send_output(
+pub async fn read_reply(
     state: &AppState,
     project_id: ProjectId,
     send_id: SendId,
@@ -613,7 +613,7 @@ pub(crate) async fn read_journal(
 /// Read one agent's transcript and correlate its turns to its journaled
 /// sends with the merge's own per-agent derivation — one file parsed, the
 /// same matching the merged conversation applies, so a `send_id` reported
-/// here pages the same reply through `read_send_output`.
+/// here pages the same reply through `read_reply`.
 pub(crate) async fn correlate_turns(
     project: &Project,
     agent: &AgentRecord,
@@ -711,7 +711,7 @@ fn page(
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentOutputStatus {
+pub enum LatestReplyStatus {
     /// `text` is the latest completed answer.
     Completed,
     /// The latest turn failed or was cancelled; `text` is the note the forward
@@ -722,15 +722,15 @@ pub enum AgentOutputStatus {
     None,
 }
 
-/// An agent's latest output, for turns the caller did not send.
+/// An agent's latest reply, including turns the caller did not send.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct AgentOutput {
+pub struct LatestReply {
     pub agent_id: AgentId,
-    pub status: AgentOutputStatus,
+    pub status: LatestReplyStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     /// The send the latest turn answered, when known, so a caller pages with
-    /// `read_send_output`.
+    /// `read_reply`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub send_id: Option<SendId>,
     pub source: OutputSource,
@@ -764,13 +764,13 @@ pub(crate) fn known_context(state: &AppState, agent_id: AgentId) -> Option<Conte
 /// when that classifier assigns one: guessing from the last journaled send
 /// would name a newer turn that is still running. Carries the agent's context
 /// after its newest finished turn.
-pub async fn read_agent_output(
+pub async fn read_latest_reply(
     state: &AppState,
     project_id: ProjectId,
     agent_id: AgentId,
     home_dir: &Path,
-) -> Result<AgentOutput, AppError> {
-    let mut output = latest_agent_output(state, project_id, agent_id, home_dir).await?;
+) -> Result<LatestReply, AppError> {
+    let mut output = latest_reply_alone(state, project_id, agent_id, home_dir).await?;
     output.context = known_context(state, agent_id);
     // From what the app already records, never by asking the agent's actor,
     // which cannot answer while it prepares a turn.
@@ -779,19 +779,19 @@ pub async fn read_agent_output(
     Ok(output)
 }
 
-async fn latest_agent_output(
+async fn latest_reply_alone(
     state: &AppState,
     project_id: ProjectId,
     agent_id: AgentId,
     home_dir: &Path,
-) -> Result<AgentOutput, AppError> {
+) -> Result<LatestReply, AppError> {
     let agent = agent_in_project(state, project_id, agent_id)?;
     if let Some((send_id, latest)) = state.ledger.latest_turn(agent_id)
         && latest.status == SendStatus::Completed
     {
-        return Ok(AgentOutput {
+        return Ok(LatestReply {
             agent_id,
-            status: AgentOutputStatus::Completed,
+            status: LatestReplyStatus::Completed,
             text: latest.text,
             send_id: Some(send_id),
             source: OutputSource::Live,
@@ -816,10 +816,10 @@ async fn latest_agent_output(
             })
             .next_back();
         let status = match outcome {
-            Some(TurnOutcome::Cancelled { .. }) => AgentOutputStatus::Cancelled,
-            _ => AgentOutputStatus::Failed,
+            Some(TurnOutcome::Cancelled { .. }) => LatestReplyStatus::Cancelled,
+            _ => LatestReplyStatus::Failed,
         };
-        return Ok(AgentOutput {
+        return Ok(LatestReply {
             agent_id,
             status,
             text: Some(note),
@@ -836,9 +836,9 @@ async fn latest_agent_output(
         .rev()
         .find(|turn| turn.status == TurnStatus::Complete);
     Ok(match latest {
-        Some(turn) => AgentOutput {
+        Some(turn) => LatestReply {
             agent_id,
-            status: AgentOutputStatus::Completed,
+            status: LatestReplyStatus::Completed,
             text: Some(turn.text),
             send_id: turn.send_id,
             source: match turn.correlation {
@@ -849,9 +849,9 @@ async fn latest_agent_output(
             context: None,
             newer_turn_running: false,
         },
-        None => AgentOutput {
+        None => LatestReply {
             agent_id,
-            status: AgentOutputStatus::None,
+            status: LatestReplyStatus::None,
             text: None,
             send_id: None,
             source: OutputSource::Uncorrelated,
@@ -863,7 +863,7 @@ async fn latest_agent_output(
 
 /// The budget rules for a [`ConversationDigest`]: message and answer text may
 /// be cut; the oldest items are dropped when the structure alone is over; an
-/// agent turn's text reads on through `read_send_output` from the session
+/// agent turn's text reads on through `read_reply` from the session
 /// file's copy, from where it was cut, when the turn has a send; a user
 /// message's cannot be read on.
 #[must_use]
@@ -884,7 +884,7 @@ pub fn conversation_budget(project_id: ProjectId, budget_chars: usize) -> Budget
             // keeps to that copy (see `ReadFrom`).
             Some(with_cap(
                 serde_json::json!({
-                    "tool": "read_send_output",
+                    "tool": "read_reply",
                     "project_id": project_id,
                     "send_id": send_id,
                     "agent_id": item.get("agent_id")?.clone(),
@@ -897,15 +897,15 @@ pub fn conversation_budget(project_id: ProjectId, budget_chars: usize) -> Budget
     }
 }
 
-/// The budget rules for an [`AgentOutput`]: a reply may be cut and reads on
-/// through `read_send_output`, from the copy its text came from, when the
+/// The budget rules for a [`LatestReply`]: a reply may be cut and reads on
+/// through `read_reply`, from the copy its text came from, when the
 /// output has a send. A journal note is not a reply and has no read-on.
 #[must_use]
-pub fn agent_output_budget(project_id: ProjectId, budget_chars: usize) -> BudgetSpec {
+pub fn latest_reply_budget(project_id: ProjectId, budget_chars: usize) -> BudgetSpec {
     BudgetSpec {
         budget_chars,
         droppable_list: None,
-        read_with: Some("read_send_output"),
+        read_with: Some("read_reply"),
         pointer: Box::new(move |site: &CutSite<'_>| {
             let output = site.ancestors.last()?;
             let send_id = output.get("send_id")?.as_str()?;
@@ -917,7 +917,7 @@ pub fn agent_output_budget(project_id: ProjectId, budget_chars: usize) -> Budget
             };
             Some(with_cap(
                 serde_json::json!({
-                    "tool": "read_send_output",
+                    "tool": "read_reply",
                     "project_id": project_id,
                     "send_id": send_id,
                     "agent_id": output.get("agent_id")?.clone(),

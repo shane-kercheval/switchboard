@@ -1078,6 +1078,7 @@ async fn workflow_send_emits_user_message_after_journal_before_turn_start() {
             "review this diff",
             vec![],
             send_id,
+            Uuid::now_v7(),
             factory,
         )
         .await;
@@ -1117,6 +1118,59 @@ async fn workflow_send_emits_user_message_after_journal_before_turn_start() {
         .position(|(_, v)| event_type(v) == "turn_start")
         .unwrap();
     assert!(um < ts, "UserMessage precedes TurnStart");
+}
+
+#[tokio::test]
+async fn workflow_send_runs_under_the_message_id_its_caller_chose() {
+    // The app registers a workflow send's message id with its send ledger
+    // before dispatching, so the turn's first event must carry that id, not
+    // one the dispatcher minted.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::new(RecordingJournal::default()) as Arc<dyn ConversationJournal>,
+    );
+
+    let message_id = Uuid::now_v7();
+    let outcome = dispatcher
+        .send_workflow_message_awaiting_completion(
+            agent.id,
+            "review this diff",
+            vec![],
+            Uuid::now_v7(),
+            message_id,
+            factory,
+        )
+        .await;
+    let AwaitableSendOutcome::Accepted {
+        message_id: accepted,
+        ..
+    } = outcome
+    else {
+        panic!("an idle agent accepts the workflow send");
+    };
+    assert_eq!(accepted, message_id, "the receipt names the caller's id");
+
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let events = emitter.snapshot();
+    let turn_start = events
+        .iter()
+        .find(|(_, v)| event_type(v) == "turn_start")
+        .expect("the turn started");
+    assert_eq!(
+        turn_start.1["message_id"].as_str(),
+        Some(message_id.to_string().as_str()),
+        "the turn's first event carries the caller's id"
+    );
 }
 
 #[tokio::test]
@@ -1237,6 +1291,7 @@ async fn a_start_moment_refusal_stops_the_turn_before_anything_durable() {
             "would fork a busy parent",
             vec![],
             Uuid::now_v7(),
+            Uuid::now_v7(),
             factory,
         )
         .await;
@@ -1291,6 +1346,7 @@ async fn workflow_send_journal_failure_suppresses_user_message() {
             agent.id,
             "never durable",
             vec![],
+            Uuid::now_v7(),
             Uuid::now_v7(),
             factory,
         )

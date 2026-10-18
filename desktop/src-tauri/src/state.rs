@@ -572,7 +572,8 @@ pub struct AppState {
     pub workflow_runs: Arc<Mutex<HashMap<Uuid, ActiveRun>>>,
 
     /// Who started the workflow behind each workflow send: through the agent
-    /// tools or from the window. Recorded when a step resolves its send, and
+    /// tools or from the window. Recorded when a send step starts, before its
+    /// send's ledger entry, and
     /// kept until the app quits, one small entry per send, because a reply can
     /// outlive its run: a failed run ends at once while its sent replies keep
     /// going, and an orchestrator may still cancel those it started. A leaf in

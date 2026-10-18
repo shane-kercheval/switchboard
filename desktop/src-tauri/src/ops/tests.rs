@@ -22,6 +22,8 @@ use crate::commands::{
 };
 use crate::error::AppError;
 use crate::state::{TestSeam, lock};
+use crate::workflow::DispatchFactoryProvider as _;
+use crate::workflow_commands::ProjectDispatchFactoryProvider;
 
 use super::budget::fit;
 use super::change::{
@@ -5629,9 +5631,10 @@ async fn cancelling_one_agents_reply_to_a_workflow_send_ends_the_run() {
     let cancelled = cancel_send(&env.state, project_id, send_id, Some(agents[0])).unwrap();
     assert_eq!(
         cancelled.outcome,
-        super::send::CancelOutcome::Requested,
-        "Switchboard holds no record of a workflow's send to check against"
+        super::send::CancelOutcome::Cancelled,
+        "the ledger holds the workflow's send, so the cancel is checked against it"
     );
+    assert_eq!(cancelled.recipients, vec![agents[0]]);
     let reply = wait_workflow(
         &env.state,
         project_id,
@@ -5645,6 +5648,306 @@ async fn cancelling_one_agents_reply_to_a_workflow_send_ends_the_run() {
         WorkflowRunStatus::Cancelled,
         "the agent stopped that reply, and a cancelled reply ends the run"
     );
+}
+
+/// The run's first send, as an orchestrator reads it from `wait_workflow`
+/// once the step has dispatched.
+async fn first_workflow_send(env: &TestEnv, project_id: ProjectId, run_id: Uuid) -> Uuid {
+    for _ in 0..500 {
+        let reply = wait_workflow(
+            &env.state,
+            project_id,
+            run_id,
+            &WaitBudget::new(Some(0), false),
+        )
+        .await
+        .unwrap();
+        if let Some(first) = reply.sends.first() {
+            return first.send_id;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the run never reported its first send");
+}
+
+/// The pair workflow started through the tools, its first step's reply
+/// (`greeting`, to the coder) held running until the returned gate fires.
+async fn workflow_with_a_running_first_send(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agents: &[AgentId],
+) -> (Uuid, Uuid, Arc<Notify>) {
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("greeting", &gate));
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    let send_id = first_workflow_send(env, project_id, run_id).await;
+    (run_id, send_id, gate)
+}
+
+#[tokio::test]
+async fn wait_send_on_a_running_workflow_send_reports_it_running_not_done() {
+    let (env, project_id, agents) = workflow_env().await;
+    let (_run_id, send_id, gate) =
+        workflow_with_a_running_first_send(&env, project_id, &agents).await;
+
+    let reply = wait_send(
+        &env.state,
+        project_id,
+        send_id,
+        &WaitBudget::new(Some(0), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !reply.done,
+        "the workflow's first step is still running on its agent, so the send is not done"
+    );
+    assert_eq!(
+        reply.source,
+        WaitSource::Live,
+        "no restart happened: the send is followed live, not read back from the journal"
+    );
+    assert_eq!(reply.recipients.len(), 1);
+    assert_eq!(reply.recipients[0].agent_id, agents[0]);
+    assert_eq!(
+        reply.recipients[0].status,
+        SendStatus::Running,
+        "the agent's turn for this send is running, and no restart happened"
+    );
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn wait_send_follows_a_workflow_send_to_its_reply() {
+    let (env, project_id, agents) = workflow_env().await;
+    let (run_id, send_id, gate) =
+        workflow_with_a_running_first_send(&env, project_id, &agents).await;
+    gate.notify_one();
+
+    let reply = wait_done(&env, project_id, send_id).await;
+    assert!(reply.done);
+    assert_eq!(reply.source, WaitSource::Live);
+    assert_eq!(reply.recipients[0].status, SendStatus::Completed);
+    assert_eq!(reply.recipients[0].text.as_deref(), Some("greeting"));
+    let ended = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ended.status, WorkflowRunStatus::Completed);
+}
+
+#[tokio::test]
+async fn wait_any_send_follows_a_workflow_send_to_its_reply() {
+    let (env, project_id, agents) = workflow_env().await;
+    let (_run_id, send_id, gate) =
+        workflow_with_a_running_first_send(&env, project_id, &agents).await;
+
+    let running = super::send::wait_any_send(
+        &env.state,
+        project_id,
+        vec![send_id],
+        &WaitBudget::new(Some(0), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert!(!running.any_done, "the step's reply is still running");
+    assert_eq!(running.sends[0].source, WaitSource::Live);
+    assert_eq!(running.sends[0].recipients[0].status, SendStatus::Running);
+
+    gate.notify_one();
+    let done = super::send::wait_any_send(
+        &env.state,
+        project_id,
+        vec![send_id],
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert!(done.any_done);
+    assert_eq!(done.sends[0].source, WaitSource::Live);
+    assert_eq!(done.sends[0].recipients[0].status, SendStatus::Completed);
+    assert_eq!(
+        done.sends[0].recipients[0].text.as_deref(),
+        Some("greeting")
+    );
+}
+
+#[tokio::test]
+async fn read_send_output_on_a_running_workflow_send_reports_it_running() {
+    let (env, project_id, agents) = workflow_env().await;
+    let (_run_id, send_id, gate) =
+        workflow_with_a_running_first_send(&env, project_id, &agents).await;
+
+    let page = read_send_output(
+        &env.state,
+        project_id,
+        send_id,
+        agents[0],
+        0,
+        ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        page.status,
+        SendStatus::Running,
+        "a running reply, not one a restart cut off"
+    );
+    assert_eq!(page.source, OutputSource::Live);
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn cancelling_a_whole_workflow_send_ends_the_run() {
+    let (env, project_id, agents) = workflow_env().await;
+    let (run_id, send_id, _gate) =
+        workflow_with_a_running_first_send(&env, project_id, &agents).await;
+
+    let cancelled = cancel_send(&env.state, project_id, send_id, None).unwrap();
+    assert_eq!(cancelled.outcome, super::send::CancelOutcome::Cancelled);
+    assert_eq!(cancelled.recipients, vec![agents[0]]);
+    let reply = wait_done(&env, project_id, send_id).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Cancelled);
+    let ended = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ended.status,
+        WorkflowRunStatus::Cancelled,
+        "a cancelled reply ends the run, whichever form of cancel stopped it"
+    );
+}
+
+#[tokio::test]
+async fn a_workflow_reply_cancelled_before_it_is_offered_is_never_sent() {
+    let (env, project_id, agents) = workflow_env().await;
+    // The workflow's first send, registered and not yet offered: the step is
+    // dispatching, and the cancel lands before this recipient's turn.
+    let send_id = Uuid::now_v7();
+    let provider = ProjectDispatchFactoryProvider::new(
+        &env.state,
+        &super::read::project_readonly(&env.state, project_id).unwrap(),
+        &[],
+        &env.home(),
+        0,
+    )
+    .with_agent_access(true);
+    provider.send_starting(send_id, &[agents[0], agents[1]]);
+
+    let cancelled = cancel_send(&env.state, project_id, send_id, Some(agents[1])).unwrap();
+    assert_eq!(cancelled.outcome, super::send::CancelOutcome::Cancelled);
+    assert!(provider.admit(send_id, agents[0]).is_some());
+    assert!(
+        provider.admit(send_id, agents[1]).is_none(),
+        "the cancelled recipient is skipped"
+    );
+    provider.send_finished(send_id);
+    let held = env.state.ledger.send(send_id).unwrap();
+    assert_eq!(held.recipients[1].status, SendStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn the_latest_answer_is_a_workflow_steps_reply_read_live() {
+    let (env, project_id, agents) = workflow_env().await;
+    let (run_id, send_id, gate) =
+        workflow_with_a_running_first_send(&env, project_id, &agents).await;
+    gate.notify_one();
+    wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+
+    let output = read_agent_output(&env.state, project_id, agents[0], &env.home())
+        .await
+        .unwrap();
+    assert_eq!(output.status, AgentOutputStatus::Completed);
+    assert_eq!(output.text.as_deref(), Some("greeting"));
+    assert_eq!(output.send_id, Some(send_id));
+    assert_eq!(
+        output.source,
+        OutputSource::Live,
+        "the workflow's reply is read from what the app captured, not the session file"
+    );
+}
+
+#[tokio::test]
+async fn the_latest_answer_flags_a_workflow_step_still_preparing() {
+    let (env, project_id, agents) = workflow_env().await;
+    // The coder's turn is being prepared: no turn is open yet.
+    let held = Arc::new(Notify::new());
+    env.adapter
+        .push(Script::reply("greeting").holding_dispatch(&held));
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    first_workflow_send(&env, project_id, run_id).await;
+
+    let output = read_agent_output(&env.state, project_id, agents[0], &env.home())
+        .await
+        .unwrap();
+    assert!(
+        output.newer_turn_running,
+        "the workflow's message is still to reach the agent"
+    );
+    held.notify_one();
+}
+
+#[tokio::test]
+async fn after_a_restart_a_workflow_send_is_answered_from_the_journal() {
+    let (env, project_id, agents) = workflow_env().await;
+    let (run_id, send_id, gate) =
+        workflow_with_a_running_first_send(&env, project_id, &agents).await;
+    gate.notify_one();
+    wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    let env = env.restart();
+
+    let reply = wait_done(&env, project_id, send_id).await;
+    assert!(reply.done);
+    assert_eq!(
+        reply.source,
+        WaitSource::Journal,
+        "the ledger is empty after a restart, so the fallback answers as before"
+    );
+    assert_eq!(reply.recipients[0].status, SendStatus::Completed);
+    assert_eq!(reply.recipients[0].text.as_deref(), Some("greeting"));
 }
 
 #[tokio::test]
@@ -5934,6 +6237,12 @@ async fn a_reply_the_user_started_is_not_the_orchestrators_to_cancel() {
         matches!(refused, AppError::ReplyInUserWorkflow { .. }),
         "{refused:?}"
     );
+    // The ledger holds the send, but the whole-send form is refused too.
+    let refused = cancel_send(&env.state, project_id, send_id, None).unwrap_err();
+    assert!(
+        matches!(refused, AppError::ReplyInUserWorkflow { .. }),
+        "{refused:?}"
+    );
     let refused = super::workflow::cancel_workflow_run(&env.state, project_id, run_id).unwrap_err();
     assert!(
         matches!(refused, AppError::RunStartedByUser { .. }),
@@ -6193,6 +6502,40 @@ async fn cancelling_one_reply_ends_the_same_from_the_window_and_the_tools() {
         assert_eq!(
             statuses,
             vec![SendStatus::Cancelled, SendStatus::Completed],
+            "through the tools: {through_tools}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelling_a_workflows_send_ends_its_run_from_the_window_and_the_tools() {
+    for through_tools in [false, true] {
+        let (env, project_id, agents) = workflow_env().await;
+        let (run_id, send_id, _gate) =
+            workflow_with_a_running_first_send(&env, project_id, &agents).await;
+        if through_tools {
+            cancel_send(&env.state, project_id, send_id, None).unwrap();
+        } else {
+            // The stop control on the step's reply in the window.
+            crate::commands::cancel_send_impl(&env.state, send_id, &[agents[0]]);
+        }
+        let ended = wait_workflow(
+            &env.state,
+            project_id,
+            run_id,
+            &WaitBudget::new(Some(30), false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ended.status,
+            WorkflowRunStatus::Cancelled,
+            "through the tools: {through_tools}"
+        );
+        let reply = wait_done(&env, project_id, send_id).await;
+        assert_eq!(
+            reply.recipients[0].status,
+            SendStatus::Cancelled,
             "through the tools: {through_tools}"
         );
     }

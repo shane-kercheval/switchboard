@@ -8,9 +8,12 @@
 //! A step-based interpreter (not a DAG scheduler — v1 doesn't need one). It walks
 //! the snapshotted steps and:
 //!
-//! - `send` dispatches each recipient via [`Dispatcher::send_message_awaiting_completion`]
+//! - `send` dispatches each recipient via [`Dispatcher::send_workflow_message_awaiting_completion`]
 //!   (`FailFast`), minting one `send_id` per step (shared across a fan-out's
-//!   recipients), and keeps each turn's completion handle.
+//!   recipients), and keeps each turn's completion handle. The provider's send
+//!   hooks ([`DispatchFactoryProvider::send_starting`] and the ones after it)
+//!   let the app record the send in its send ledger, and choose each
+//!   recipient's message id, before anything is dispatched.
 //! - `wait_for` / `wait_for_all` await those handles; on a `Completed` terminal
 //!   the agent's resolved text enters the **in-memory per-run output scope** that
 //!   `forward_from` and the template helpers read. The scope is never persisted
@@ -45,7 +48,7 @@ use switchboard_dispatcher::{
     AwaitableSendOutcome, CompletionResult, DispatchContextFactory, Dispatcher,
 };
 use switchboard_harness::forward::{ForwardedBlock, compose_forwarded_message};
-use switchboard_harness::{CancelSource, TurnOutcome};
+use switchboard_harness::{CancelSource, MessageId, TurnOutcome};
 use switchboard_prompts::{BUILTIN_PROVIDER, LOCAL_PROVIDER, PromptId, PromptService};
 use switchboard_workflow::{
     OutputScope, RunRecord, RunStatus, Scope, ScopeValue, SendStep, Step, Templated,
@@ -88,6 +91,35 @@ pub trait DispatchFactoryProvider: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
         let _ = agent_id;
         Box::pin(async { Ok(()) })
+    }
+
+    /// A send step is about to prepare and dispatch `send_id` to `recipients`,
+    /// in order. Called once per send step, before its message is built, so a
+    /// reader of the send sees it from the start. Default: nothing.
+    fn send_starting(&self, send_id: Uuid, recipients: &[AgentId]) {
+        let _ = (send_id, recipients);
+    }
+
+    /// The message id for `agent_id`'s copy of `send_id`, chosen immediately
+    /// before it is offered to the dispatcher, or `None` when the send was
+    /// cancelled for this recipient before it was offered: the step then stops
+    /// as a cancelled participant does, cancelling the run. Default: a fresh
+    /// id.
+    fn admit(&self, send_id: Uuid, agent_id: AgentId) -> Option<MessageId> {
+        let _ = (send_id, agent_id);
+        Some(Uuid::now_v7())
+    }
+
+    /// The dispatcher's answer to an offer [`Self::admit`] allowed: `accepted`,
+    /// or refused because the agent was busy. Default: nothing.
+    fn offered(&self, send_id: Uuid, agent_id: AgentId, accepted: bool) {
+        let _ = (send_id, agent_id, accepted);
+    }
+
+    /// The step's dispatch is over, whatever its outcome: recipients not
+    /// offered by now never will be. Default: nothing.
+    fn send_finished(&self, send_id: Uuid) {
+        let _ = send_id;
     }
 }
 
@@ -312,9 +344,12 @@ impl WorkflowRun {
                 dispatched: Some(false),
             })
             .collect();
+        let recipients: Vec<AgentId> = report.iter().map(|r| r.agent_id).collect();
+        self.factories.send_starting(send_id, &recipients);
         let result = self
             .dispatch_send(step, outputs, &mut report, send_id, pending, in_flight)
             .await;
+        self.factories.send_finished(send_id);
         self.progress.emit(WorkflowProgress::StepResolved {
             step_index: index,
             recipients: report,
@@ -349,6 +384,9 @@ impl WorkflowRun {
             if let Err(reason) = self.factories.preflight(agent_id).await {
                 return Err(StepError::Failed(reason));
             }
+            let Some(message_id) = self.factories.admit(send_id, agent_id) else {
+                return Err(StepError::Cancelled);
+            };
             match self
                 .dispatcher
                 .send_workflow_message_awaiting_completion(
@@ -367,6 +405,7 @@ impl WorkflowRun {
                     // this.
                     Vec::new(),
                     send_id,
+                    message_id,
                     factory,
                 )
                 .await
@@ -375,6 +414,7 @@ impl WorkflowRun {
                     pending.entry(agent_id).or_default().push_back(completion);
                     *in_flight.entry(agent_id).or_insert(0) += 1;
                     recipient.dispatched = Some(true);
+                    self.factories.offered(send_id, agent_id, true);
                     // The dispatcher emits this send's live user message once it is
                     // durable (after `record_send`, before `TurnStart`) — see
                     // `send_workflow_message_awaiting_completion`. A fan-out's
@@ -387,6 +427,7 @@ impl WorkflowRun {
                 // turns are left to run to their natural terminal (not cancelled —
                 // their output stays visible in the transcript).
                 AwaitableSendOutcome::Busy => {
+                    self.factories.offered(send_id, agent_id, false);
                     return Err(StepError::Failed(
                         "an agent is busy — workflow steps fail fast on contention".to_owned(),
                     ));

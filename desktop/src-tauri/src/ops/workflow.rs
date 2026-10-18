@@ -175,9 +175,9 @@ pub struct WaitWorkflowReply {
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recipients: Vec<ResolvedRecipient>,
-    /// Every send the run's send steps made so far, in step order: read any
-    /// recipient's reply with `read_send_output` and its `send_id`, even
-    /// after a later step.
+    /// Every send the run's send steps made so far, in step order: follow
+    /// one with `wait_send`, and read any recipient's reply with
+    /// `read_send_output` and its `send_id`, even after a later step.
     pub sends: Vec<RunSend>,
     /// Switchboard no longer holds the run's live record (after a restart, or
     /// once it pruned the run), so its sends are not known, which is not the

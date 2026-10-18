@@ -921,29 +921,36 @@ pub enum CancelOutcome {
     /// Every recipient had already ended: nothing to cancel.
     AlreadyFinished,
     /// One recipient's cancel was sent to its agent without a record of the
-    /// send to check against (a workflow's send, or one from before a restart,
-    /// or a recipient not yet offered its message): the agent stops the reply
-    /// if it still has it.
+    /// send to check against (a workflow's send the ledger no longer holds, or
+    /// one from before a restart): the agent stops the reply if it still has
+    /// it.
     Requested,
 }
 
 /// Cancel a send: every recipient still accepted or running is cancelled
 /// through the dispatcher, and a send still preparing or dispatching is told to
 /// stop, so its remaining recipients are never sent. Needs the ledger's record
-/// of the send: a queued send does not survive a restart.
+/// of the send: a queued send does not survive a restart. A workflow's send is
+/// held like the agent tools' own, so this reaches it too, and the cancelled
+/// replies end its run as any cancelled participant does.
 ///
 /// With `agent_id`, only that recipient's reply is cancelled, queued or
 /// running: its actor drops the send's item, and the other recipients carry
-/// on. That needs no ledger record, so it also reaches a workflow's sends (the
-/// ledger does not hold them) and one from before a restart; the outcome is
-/// then `requested`, because nothing here can see whether the agent still had
-/// the reply.
+/// on. That needs no ledger record, so it also reaches a workflow's send the
+/// ledger no longer holds; the outcome is then `requested`, because nothing
+/// here can see whether the agent still had the reply.
+///
+/// Either way, a send made by a workflow the user started from the window is
+/// refused: the user's work is the user's to stop.
 pub fn cancel_send(
     state: &AppState,
     project_id: ProjectId,
     send_id: SendId,
     agent_id: Option<AgentId>,
 ) -> Result<CancelledSend, AppError> {
+    if workflow_send_owner(state, project_id, send_id) == Some(false) {
+        return Err(AppError::ReplyInUserWorkflow { send_id });
+    }
     if let Some(agent_id) = agent_id {
         return cancel_one_recipient(state, project_id, send_id, agent_id);
     }
@@ -976,9 +983,9 @@ pub fn cancel_send(
 }
 
 /// [`cancel_send`] for one recipient. Only a send made through the agent
-/// tools (the ledger holds those) or by a workflow started through them: a
-/// reply to a message the user typed, or inside a workflow the user started
-/// from the window, is the user's to stop.
+/// tools or by a workflow started through them (the ledger holds both, and
+/// [`cancel_send`] has already refused a workflow the user started): a reply
+/// to a message the user typed is the user's to stop.
 fn cancel_one_recipient(
     state: &AppState,
     project_id: ProjectId,

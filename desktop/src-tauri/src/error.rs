@@ -158,8 +158,8 @@ pub enum AppError {
     )]
     SendNotCancellable { send_id: SendId },
 
-    /// A single-recipient cancel named a send made by a workflow the user
-    /// started from the window.
+    /// A cancel named a send made by a workflow the user started from the
+    /// window.
     #[error(
         "send {send_id} belongs to a workflow the user started from Switchboard's window: tell the user rather than cancelling it"
     )]

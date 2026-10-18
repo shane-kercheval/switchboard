@@ -13,16 +13,29 @@
 //! feeds every turn end's usage to [`super::context`], the read tier's record
 //! of each agent's context fullness.
 //!
-//! **Correlation.** `ops` chooses each send's `message_id` and registers it
-//! here *before* dispatching, so the first event the actor emits for it lands
-//! on an entry that already exists: no orphan map, no fallback matching.
-//! `turn_start`, `message_failed`, and `message_cancelled` carry `message_id`;
-//! `turn_end` and content carry the `turn_id` that `turn_start` announced.
-//! Events for message ids the ledger never registered (compose sends,
-//! workflow steps) are ignored, except that every agent's latest `turn_start`
-//! is noted so a reader can tell whether the agent's newest turn is one the
-//! ledger holds. A compaction's `turn_start` is the exception: a compaction
-//! is not an answer, so the agent's newest answer stays readable through it.
+//! **Correlation.** `ops`, and the workflow engine through its dispatch
+//! provider, choose each send's `message_id` and register it here *before*
+//! dispatching, so the first event the actor emits for it lands on an entry
+//! that already exists: no orphan map, no fallback matching. `turn_start`,
+//! `message_failed`, and `message_cancelled` carry `message_id`; `turn_end`
+//! and content carry the `turn_id` that `turn_start` announced. Events for
+//! message ids the ledger never registered (the window's compose sends) are
+//! ignored, except that every agent's latest `turn_start` is noted so a
+//! reader can tell whether the agent's newest turn is one the ledger holds. A
+//! compaction's `turn_start` is the exception: a compaction is not an answer,
+//! so the agent's newest answer stays readable through it.
+//!
+//! **Workflow sends** are held like the agent tools' own, whoever started the
+//! run, so `wait_send`, `read_send_output`, and `cancel_send` follow a step's
+//! send while it runs rather than reading it back from the journal as if the
+//! app had restarted. The app's workflow provider
+//! (`ProjectDispatchFactoryProvider`) registers the step's send before
+//! building its message, every recipient `not_dispatched`; marks each
+//! recipient accepted, minting its `message_id`, just before offering it; records a
+//! busy agent as rejected; and settles the send when the step's dispatch
+//! ends. A workflow send has no idempotency key. A cancel `cancel_send`
+//! records is honoured at the provider's next offer, as an agent-tools send
+//! honours it in its dispatch loop.
 //!
 //! **Text.** What counts as an agent's answer is [`TextCapture`]'s rule,
 //! observed over the wire events; it is the same rule the dispatcher applies
@@ -67,8 +80,8 @@
 //! time, not registration time: an entry is registered at its claim and
 //! admitted at dispatch, after preparation, so a message registered first can
 //! be admitted after a compaction registered later. The ledger holds only
-//! what orchestrators queued, so work the window queued is not seen; nothing
-//! is lost or duplicated either way.
+//! what orchestrators and workflows queued, so work the window's compose bar
+//! queued is not seen; nothing is lost or duplicated either way.
 //!
 //! **Idempotency.** A caller's `idempotency_key`, scoped to the project, is
 //! claimed here under the ledger lock together with a hash of the request. A
@@ -313,9 +326,9 @@ pub struct RunSnapshot {
     pub sends: Vec<RunSend>,
 }
 
-/// One send a workflow step made: read any recipient's reply with
-/// `read_send_output` and this `send_id`, even after the agent answered a
-/// later step.
+/// One send a workflow step made: follow it with `wait_send`, and read any
+/// recipient's reply with `read_send_output` and this `send_id`, even after
+/// the agent answered a later step.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RunSend {
     pub step: usize,

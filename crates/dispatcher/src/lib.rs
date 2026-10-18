@@ -1488,8 +1488,15 @@ impl Dispatcher {
         send_id: SendId,
         factory: Arc<dyn DispatchContextFactory>,
     ) -> AwaitableSendOutcome {
-        self.send_awaitable(agent_id, prompt, attachments, send_id, factory, false)
-            .await
+        self.send_awaitable(
+            agent_id,
+            prompt,
+            attachments,
+            send_id,
+            factory,
+            SendOptions::default(),
+        )
+        .await
     }
 
     /// Like [`send_message_awaiting_completion`](Self::send_message_awaiting_completion),
@@ -1500,16 +1507,32 @@ impl Dispatcher {
     /// as it does after a reload from the journal. Emitting at the journal boundary
     /// (in the actor, after `record_send` succeeds) keeps live == reload by
     /// construction — a send whose journal write fails shows no live user message.
+    ///
+    /// `message_id` is the caller's, for the same reason as
+    /// [`SendOptions::message_id`]: the app registers it with the send ledger
+    /// before dispatching, so the turn's first event finds the entry.
     pub async fn send_workflow_message_awaiting_completion(
         &self,
         agent_id: AgentId,
         prompt: &str,
         attachments: Vec<Attachment>,
         send_id: SendId,
+        message_id: MessageId,
         factory: Arc<dyn DispatchContextFactory>,
     ) -> AwaitableSendOutcome {
-        self.send_awaitable(agent_id, prompt, attachments, send_id, factory, true)
-            .await
+        self.send_awaitable(
+            agent_id,
+            prompt,
+            attachments,
+            send_id,
+            factory,
+            SendOptions {
+                message_id: Some(message_id),
+                emit_user_message: true,
+                announce_accepted: false,
+            },
+        )
+        .await
     }
 
     async fn send_awaitable(
@@ -1519,18 +1542,18 @@ impl Dispatcher {
         attachments: Vec<Attachment>,
         send_id: SendId,
         factory: Arc<dyn DispatchContextFactory>,
-        emit_user_message: bool,
+        options: SendOptions,
     ) -> AwaitableSendOutcome {
         let (completion_tx, completion_rx) = oneshot::channel();
         let selection = factory.selection_snapshot();
         let item = WorkItem {
-            message_id: Uuid::now_v7(),
+            message_id: options.message_id.unwrap_or_else(Uuid::now_v7),
             send_id,
             payload: WorkPayload::Send {
                 prompt: prompt.to_owned(),
                 attachments,
-                emit_user_message,
-                announce_accepted: false,
+                emit_user_message: options.emit_user_message,
+                announce_accepted: options.announce_accepted,
             },
             selection,
             completion: Some(completion_tx),

@@ -2077,55 +2077,67 @@ async fn agent_actor(
         }
         // Busy: drain the backlog one turn at a time. New work / removals /
         // cancels arriving *mid-turn* are handled inside `run_turn` via
-        // `select!`. Between turns, absorb any already-delivered commands
-        // non-blockingly *before* deciding the agent is idle — so a message
-        // enqueued while the prior turn was finishing chains deterministically,
-        // with no `AgentIdle` flickering out between the two turns.
+        // `select!`. Between turns, absorb every already-delivered command
+        // non-blockingly *before* starting the next queued message, and before
+        // deciding the agent is idle. A turn stops reading commands once its
+        // stream ends, and a starting turn reads none until its message has
+        // reached the harness, so a cancel or removal of the next queued
+        // message that arrived as the previous turn ended is honoured here or
+        // not at all. A message enqueued while the prior turn was finishing
+        // chains deterministically, with no `AgentIdle` flickering out between
+        // the two turns.
         'busy: loop {
-            if let Some(item) = backlog.pop_front() {
-                match run_turn(
-                    agent_id,
-                    &channel,
-                    &factory,
-                    item,
-                    &mut commands,
-                    &mut backlog,
-                )
-                .await
-                {
-                    TurnAfter::Continue => continue 'busy,
-                    TurnAfter::Shutdown(reply) => {
-                        abandon_backlog(&mut backlog, idle_emitter.as_ref(), &channel, agent_id);
-                        let _ = reply.send(());
-                        break 'main;
+            loop {
+                match commands.try_recv() {
+                    Ok(cmd) => {
+                        if let IdleAfter::Shutdown(reply) = apply_between_turns_command(
+                            cmd,
+                            agent_id,
+                            &mut backlog,
+                            idle_emitter.as_ref(),
+                            &channel,
+                        ) {
+                            abandon_backlog(
+                                &mut backlog,
+                                idle_emitter.as_ref(),
+                                &channel,
+                                agent_id,
+                            );
+                            let _ = reply.send(());
+                            break 'main;
+                        }
                     }
-                    TurnAfter::ChannelClosed => {
-                        // Process exit (all senders dropped mid-turn). No
-                        // frontend to notify — just abandon and stop.
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    // All senders dropped → process exit.
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
                         backlog.clear();
                         break 'main;
                     }
                 }
             }
-            match commands.try_recv() {
-                Ok(cmd) => {
-                    if let IdleAfter::Shutdown(reply) = apply_idle_command(
-                        cmd,
-                        agent_id,
-                        &mut backlog,
-                        idle_emitter.as_ref(),
-                        &channel,
-                    ) {
-                        abandon_backlog(&mut backlog, idle_emitter.as_ref(), &channel, agent_id);
-                        let _ = reply.send(());
-                        break 'main;
-                    }
-                    // Continue 'busy — the command may have pushed to the backlog.
+            // Backlog empty and no command waiting → genuinely idle.
+            let Some(item) = backlog.pop_front() else {
+                break 'busy;
+            };
+            match run_turn(
+                agent_id,
+                &channel,
+                &factory,
+                item,
+                &mut commands,
+                &mut backlog,
+            )
+            .await
+            {
+                TurnAfter::Continue => {}
+                TurnAfter::Shutdown(reply) => {
+                    abandon_backlog(&mut backlog, idle_emitter.as_ref(), &channel, agent_id);
+                    let _ = reply.send(());
+                    break 'main;
                 }
-                // Backlog empty and no command waiting → genuinely idle.
-                Err(mpsc::error::TryRecvError::Empty) => break 'busy,
-                // All senders dropped → process exit.
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                TurnAfter::ChannelClosed => {
+                    // Process exit (all senders dropped mid-turn). No
+                    // frontend to notify — just abandon and stop.
                     backlog.clear();
                     break 'main;
                 }
@@ -2177,6 +2189,32 @@ enum IdleAfter {
     Shutdown(oneshot::Sender<()>),
 }
 
+/// Handle a command received between two turns, before the next queued
+/// message starts: as while idle, except that a `FailFast` send is refused
+/// while work is still queued, as it is while a turn runs. The agent is not
+/// free until its queue is empty.
+fn apply_between_turns_command(
+    cmd: Command,
+    agent_id: AgentId,
+    backlog: &mut VecDeque<WorkItem>,
+    emitter: &dyn EventEmitter,
+    channel: &str,
+) -> IdleAfter {
+    match cmd {
+        Command::Enqueue {
+            on_busy: OnBusy::FailFast,
+            reply,
+            ..
+        } if !backlog.is_empty() => {
+            if let Some(reply) = reply {
+                let _ = reply.send(SendOutcome::Busy);
+            }
+            IdleAfter::Continue
+        }
+        cmd => apply_idle_command(cmd, agent_id, backlog, emitter, channel),
+    }
+}
+
 /// Handle a command received while no turn is running.
 fn apply_idle_command(
     cmd: Command,
@@ -2191,8 +2229,9 @@ fn apply_idle_command(
             on_busy: _,
             reply,
         } => {
-            // Idle ⇒ nothing is running and the backlog drains fully before we
-            // park, so FailFast is satisfiable: accept.
+            // Idle, or between turns with nothing queued (a queued backlog
+            // refuses FailFast in `apply_between_turns_command`) ⇒ nothing is
+            // running or waiting, so FailFast is satisfiable: accept.
             let message_id = item.message_id;
             admit(backlog, item, emitter, channel, agent_id);
             if let Some(reply) = reply {

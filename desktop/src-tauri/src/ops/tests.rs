@@ -852,7 +852,9 @@ async fn wait_agent_across_a_running_turn_with_one_queued_returns_running_until_
         AgentWaitStatus::Running,
         "the queued turn runs next"
     );
-    gate2.notify_waiters();
+    // A stored release: the second turn may not have parked on its gate yet,
+    // since the agent can answer the wait between the two turns.
+    gate2.notify_one();
     let reply = wait_agent(
         &env.state,
         project_id,

@@ -571,6 +571,155 @@ impl HarnessAdapter for DispatchRecordingAdapter {
     }
 }
 
+/// One turn per dispatch whose stream the test ends: each driven turn's events
+/// come from a channel whose sender the test holds, so the test decides the
+/// instant the turn's stream ends. A dispatch past the driven turns completes
+/// at once. Records every prompt it is handed.
+struct DrivenAdapter {
+    turns: Mutex<std::collections::VecDeque<tokio::sync::mpsc::UnboundedReceiver<AdapterEvent>>>,
+    prompts: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl HarnessAdapter for DrivenAdapter {
+    fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
+        Ok(())
+    }
+
+    fn version(&self) -> Option<String> {
+        None
+    }
+
+    async fn dispatch(
+        &self,
+        _agent: &AgentRecord,
+        _cwd: &std::path::Path,
+        prompt: &str,
+        turn_id: TurnId,
+        _options: DispatchOptions,
+    ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError> {
+        self.prompts.lock().unwrap().push(prompt.to_owned());
+        let driven = self.turns.lock().unwrap().pop_front();
+        Ok(match driven {
+            Some(events) => Box::pin(futures::stream::unfold(events, |mut events| async move {
+                events.recv().await.map(|event| (event, events))
+            })),
+            None => Box::pin(futures::stream::iter([completed_turn_end(turn_id)])),
+        })
+    }
+}
+
+/// A completed turn's terminal event.
+fn completed_turn_end(turn_id: TurnId) -> AdapterEvent {
+    AdapterEvent::TurnEnd {
+        turn_id,
+        outcome: TurnOutcome::Completed,
+        ended_at: Utc::now(),
+        usage: None,
+        context_window_source: None,
+        stable_message_id: None,
+        first_message_id: None,
+        spend: None,
+        model: None,
+        effort: None,
+    }
+}
+
+/// An agent whose first turn runs with its stream held open by the test, and
+/// a second message queued behind it.
+struct QueuedBehindATurn {
+    dispatcher: Arc<Dispatcher>,
+    emitter: Arc<RecordingEmitter>,
+    agent: AgentRecord,
+    factory: Arc<TestFactory>,
+    /// Ends the first turn's stream when sent its terminal and dropped.
+    first_turn: Option<tokio::sync::mpsc::UnboundedSender<AdapterEvent>>,
+    first_turn_id: TurnId,
+    queued_send: SendId,
+    queued_message: MessageId,
+    prompts: Arc<Mutex<Vec<String>>>,
+}
+
+async fn queued_behind_a_turn() -> QueuedBehindATurn {
+    let (first_turn, events) = tokio::sync::mpsc::unbounded_channel();
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let adapter: Arc<dyn HarnessAdapter> = Arc::new(DrivenAdapter {
+        turns: Mutex::new(std::collections::VecDeque::from([events])),
+        prompts: Arc::clone(&prompts),
+    });
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::with_adapters(
+        [adapter],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+    accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "first",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                OnBusy::Enqueue,
+            )
+            .await,
+    );
+    within(
+        &emitter,
+        "turn_start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    let first_turn_id = emitter
+        .snapshot()
+        .iter()
+        .find(|(_, v)| event_type(v) == "turn_start")
+        .map(|(_, v)| extract_turn_id(v))
+        .expect("the first turn started");
+    let queued_send = Uuid::now_v7();
+    let queued_message = accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "second",
+                vec![],
+                queued_send,
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                OnBusy::Enqueue,
+            )
+            .await,
+    );
+    QueuedBehindATurn {
+        dispatcher,
+        emitter,
+        agent,
+        factory,
+        first_turn: Some(first_turn),
+        first_turn_id,
+        queued_send,
+        queued_message,
+        prompts,
+    }
+}
+
+impl QueuedBehindATurn {
+    /// End the first turn: its terminal, then the end of its stream. Called
+    /// with no `.await` before the next command is sent, so on the test's
+    /// single-threaded runtime the actor finds the stream's end and that
+    /// command both ready at once, and its stream-first `select!` leaves the
+    /// turn without reading the command.
+    fn end_first_turn(&mut self) {
+        let first_turn = self.first_turn.take().expect("the first turn is running");
+        first_turn
+            .send(completed_turn_end(self.first_turn_id))
+            .unwrap();
+    }
+}
+
 /// Emits one turn that delivers a code review through a findings tool call and
 /// then replies `ack` — the event shape a real Claude review turn produces.
 /// Test-only rather than a `MockScenario`, which ships in the app.
@@ -7702,4 +7851,90 @@ fn an_actor_whose_channel_closes_mid_turn_does_not_spin() {
     finish
         .recv_timeout(Duration::from_secs(20))
         .expect("the actor spun on its closed command channel");
+}
+
+#[tokio::test]
+async fn a_cancel_waiting_as_a_turn_ends_stops_the_next_queued_message_before_it_starts() {
+    let mut agent = queued_behind_a_turn().await;
+    agent.end_first_turn();
+    agent
+        .dispatcher
+        .cancel_send(agent.queued_send, &[agent.agent.id], CancelSource::User);
+
+    within(
+        &agent.emitter,
+        "agent_idle",
+        agent.emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    assert_eq!(
+        *agent.prompts.lock().unwrap(),
+        vec!["first".to_owned()],
+        "the cancelled message never reached the harness"
+    );
+    let events = agent.emitter.snapshot();
+    assert_eq!(count_type(&events, "message_cancelled"), 1);
+    assert_eq!(
+        count_type(&events, "turn_start"),
+        1,
+        "only the first turn started"
+    );
+}
+
+#[tokio::test]
+async fn a_removal_waiting_as_a_turn_ends_takes_the_queued_message_back_before_it_starts() {
+    let mut agent = queued_behind_a_turn().await;
+    agent.end_first_turn();
+    let mut removal = Box::pin(
+        agent
+            .dispatcher
+            .remove_queued_message(agent.agent.id, agent.queued_message),
+    );
+    // The first poll sends the removal to the actor, which has not run yet.
+    assert!(futures::poll!(removal.as_mut()).is_pending());
+
+    let removed = removal
+        .await
+        .expect("the message was still queued when the removal was read");
+    assert_eq!(removed.prompt, "second");
+    within(
+        &agent.emitter,
+        "agent_idle",
+        agent.emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    assert_eq!(*agent.prompts.lock().unwrap(), vec!["first".to_owned()]);
+}
+
+#[tokio::test]
+async fn a_fail_fast_send_waiting_as_a_turn_ends_is_refused_while_work_is_queued() {
+    let mut agent = queued_behind_a_turn().await;
+    agent.end_first_turn();
+    let mut offer = Box::pin(agent.dispatcher.send_message(
+        agent.agent.id,
+        "third",
+        vec![],
+        Uuid::now_v7(),
+        Arc::clone(&agent.factory) as Arc<dyn DispatchContextFactory>,
+        OnBusy::FailFast,
+    ));
+    // The first poll sends the offer to the actor, which has not run yet.
+    assert!(futures::poll!(offer.as_mut()).is_pending());
+
+    assert_eq!(
+        offer.await,
+        SendOutcome::Busy,
+        "a queued message is still waiting, so the agent is busy"
+    );
+    within(
+        &agent.emitter,
+        "agent_idle",
+        agent.emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    assert_eq!(
+        *agent.prompts.lock().unwrap(),
+        vec!["first".to_owned(), "second".to_owned()],
+        "the queued message ran and the refused one never did"
+    );
 }

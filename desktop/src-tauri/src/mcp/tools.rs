@@ -359,23 +359,24 @@ tools! {
         "Start a workflow in a project and return its run_id; then call wait_workflow until \
          done. Pass inputs as describe_workflow lists them: an agent input takes an agent id, a \
          list input a list. forward_sources fills an input with agents' latest answers. \
-         wait_workflow lists every send the run made with its send_id: read each reply with \
-         read_send_output, since an agent's latest answer holds only its last step. Refused with \
+         wait_workflow lists every send the run made with its send_id: follow one with wait_send \
+         as you would your own, and read a step's replies with read_send_output rather than \
+         read_agent_output, since an agent's latest answer holds only its last step. Refused with \
          workflow_already_running while another run is in progress in the project, with \
          workflow_run_requires_dismissal while a failed run is held there, and while an agent \
          is being removed from it (start again in a moment).";
     CancelSend = "cancel_send" (CancelSendArgs) [Stops]
         "Cancel a send. Without agent_id, every recipient still queued or running is cancelled, \
-         and a send still being prepared stops before reaching anyone else; this works for sends \
-         you made since the app last started. With agent_id, only that agent's reply to the \
-         send is cancelled, queued or running, and the other recipients carry on; this also \
-         works for the sends of a workflow started through these tools (wait_workflow lists \
-         their send_ids), where a cancelled reply cancels the whole run. To unstick one agent, \
-         pass its agent_id. A reply to a message the user typed, or inside a workflow the user \
+         and a send still being prepared stops before reaching anyone else. With agent_id, only \
+         that agent's reply to the send is cancelled, queued or running, and the other \
+         recipients carry on. Both work for sends you made since the app last started, and for \
+         the sends of a workflow started through these tools (wait_workflow lists their \
+         send_ids), where a cancelled reply cancels the whole run. To unstick one agent, pass \
+         its agent_id. A reply to a message the user typed, or inside a workflow the user \
          started from the window, is refused: tell the user instead. outcome is cancelled; \
-         already_finished when there was nothing left to cancel; or requested for a workflow's \
-         send, which Switchboard holds no record of: the agent stops that reply if it is still \
-         queued or running.";
+         already_finished when there was nothing left to cancel; or, with agent_id, requested \
+         for a workflow's send older than Switchboard's record of it: the agent stops that \
+         reply if it is still queued or running.";
     CancelAgent = "cancel_agent" (AgentArgs) [Stops]
         "Stop an agent entirely: cancel its running turn and drop every message queued for it, \
          including ones the user or a workflow queued. It stops the user's work too: use it only \
@@ -386,22 +387,23 @@ tools! {
          Switchboard's window is refused: tell the user instead.";
     WaitSend = "wait_send" (WaitSendArgs) [Read]
         format!(
-            "Wait for a send's replies. Returns when every recipient has finished or \
-             timeout_seconds passes, with the current state either way: call again until done \
-             is true. While not done, recipients carry statuses, and each running one its \
-             activity (as list_agents describes it) and recent_text: the last 500 characters \
-             it has written in this turn so far (its answer text, not tool output; absent until \
-             it writes some). An accepted recipient is waiting in line behind another turn and \
-             carries no activity: list_agents shows that other turn's. When done, each \
-             completed recipient carries its reply text and its agent's context after the turn \
-             (as list_agents reports it), for deciding whether to compact before the next step. \
-             Statuses: accepted (waiting in line), running, completed, failed, cancelled, \
-             rejected, not_dispatched; after an app restart, started: the send started but its \
-             outcome could not be confirmed (often the restart cut the reply off), so ask the \
-             agent where it got to. source is live, journal (read \
-             after a restart), or unknown: this project has no record of the send, so check \
-             project_id and send_id; a message still waiting in line when the app restarted was \
-             never sent and reads this way too. Long replies share the result evenly, each cut \
+            "Wait for a send's replies: one you made, or one a workflow made (wait_workflow \
+             lists those). Returns when every recipient has finished or timeout_seconds passes, \
+             with the current state either way: call again until done is true. While not done, \
+             recipients carry statuses, and each running one its activity (as list_agents \
+             describes it) and recent_text: the last 500 characters it has written in this turn \
+             so far (its answer text, not tool output; absent until it writes some). An accepted \
+             recipient is waiting in line behind another turn and carries no activity: \
+             list_agents shows that other turn's. When done, each completed recipient carries its \
+             reply text and its agent's context after the turn (as list_agents reports it), for \
+             deciding whether to compact before the next step. Statuses: accepted (waiting in \
+             line), running, completed, failed, cancelled, rejected, not_dispatched; and only \
+             with source journal, started: the send started but its outcome could not be \
+             confirmed (often a restart cut the reply off), so ask the agent where it got to. \
+             source is live, journal (read after a restart, or for a send older than \
+             Switchboard's record of it), or unknown: this project has no record of the send, so \
+             check project_id and send_id; a message still waiting in line when the app restarted \
+             was never sent and reads this way too. Long replies share the result evenly, each cut \
              one listed in truncated with the read_send_output call that reads on.\n{WAIT_HINTS}"
         );
     WaitAnySend = "wait_any_send" (WaitAnySendArgs) [Read]
@@ -430,13 +432,14 @@ tools! {
              the step that failed and why. Either way it gives the current step (counted from \
              0, its label, and its agents as {{agent_id, name}}) and sends: every send the run's \
              send steps made so far, each with its step, label, send_id, and recipients \
-             (dispatched false for one a failed step never reached). Read any of those replies \
-             with read_send_output and its send_id, even after the agent answered a later step: \
-             an agent's latest answer holds only its last one. A run with more sends than one \
-             reply holds lists only the newest: items_omitted says how many of the earliest were \
-             left out, and their replies cannot be read through this tool. sends_unavailable is \
-             true once Switchboard no longer holds the run's record (after a restart, or once it \
-             pruned the run): its sends are no longer known.\n{WAIT_HINTS}"
+             (dispatched false for one a failed step never reached). Follow any of those sends \
+             with wait_send, and read its replies with read_send_output and its send_id, even \
+             after the agent answered a later step: an agent's latest answer holds only its last \
+             one. A run with more sends than one reply holds lists only the newest: items_omitted \
+             says how many of the earliest were left out, and their replies cannot be read \
+             through this tool. sends_unavailable is true once Switchboard no longer holds the \
+             run's record (after a restart, or once it pruned the run): its sends are no longer \
+             known.\n{WAIT_HINTS}"
         );
 }
 

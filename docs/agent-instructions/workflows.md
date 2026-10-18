@@ -476,7 +476,7 @@ Review in parallel with several agents, then hand the combined feedback to a wor
 
 ```yaml
 name: review-and-recommend
-description: Fan a code review out to several reviewers in parallel, then hand the combined feedback to a worker agent for recommendations.
+description: "Fan a code review out to several reviewers in parallel, then hand the combined feedback to a worker agent for recommendations. One pass, with no pushback round: for a follow-up review or a small change."
 inputs:
   reviewers:
     type: [agent]
@@ -513,7 +513,7 @@ Reviewers review in parallel with `builtin:code-review`; a worker distills their
 
 ```yaml
 name: review-and-reconcile
-description: Reviewers review in parallel, a worker distills their feedback into a decision-ready verdict, the reviewers respond to it, and the worker gives a final recommendation.
+description: Reviewers review in parallel, a worker distills their feedback into a decision-ready verdict, the reviewers respond to it, and the worker gives a final recommendation. The reviewers' pushback round suits a new or contested change. For a follow-up or small change, use review-and-recommend.
 inputs:
   reviewers:
     type: [agent]

@@ -219,5 +219,20 @@ Measurements made after the milestones, each with how it was made.
   that loads upfront, are cut at 4,096 characters; a description loaded through tool search at
   16,384; the model sees only the text before the cut. Our instructions are about 2,900
   characters and the longest tool description 1,650. A test pins the instructions under 4,096.
+- **2026-10-18, Claude Code's text caps rechecked, from its documentation**
+  (<https://code.claude.com/docs/en/mcp>, "Tool search for MCP server authors", read that
+  day; the installed CLI was 2.1.301). Unchanged since the entry above: server instructions,
+  and the description of a tool that loads up front, are cut at 4,096 characters; a
+  description loaded through tool search at 16,384; the model sees only the text before the
+  cut. A tool loads up front, and keeps the shorter limit, when tool search is off, when the
+  tool is marked to load up front, or when its server is exempt from deferral. Two facts the
+  entry above lacked. First, before v2.1.296 the shorter limit was 2,048 characters (and
+  before v2.1.295 it applied to every description), so the 4,096 figure holds from v2.1.296
+  on. Second, `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH` replaces both limits with one number
+  of the user's choosing (v2.1.280 or later). The documentation also says to put critical
+  details and the words a model would search for near the start. What followed (the MCP
+  plan's revision 47): the instructions list every tool near their start and are 3,555
+  characters; a test keeps them under 4,096, and another keeps every tool description under
+  4,096 (the longest is 2,516).
 - The Codex figure in E6 (about 10,000 tokens kept, head and tail, with a warning and a marker
   where it cut) was measured on Codex 0.161.0 and has not been rechecked since.

@@ -138,6 +138,22 @@ async fn a_client_lists_projects_creates_an_agent_sends_and_waits() {
     let projects = ok(&client, "list_projects", json!({})).await;
     assert_eq!(uuid(&projects[0]["id"]), project_id);
     assert_eq!(projects[0]["status"], "idle");
+    crate::commands::set_project_archived_impl(&env.state, project_id, true).unwrap();
+    let projects = ok(&client, "list_projects", json!({})).await;
+    assert_eq!(
+        projects,
+        json!([]),
+        "an archived project is left out by default"
+    );
+    let projects = ok(
+        &client,
+        "list_projects",
+        json!({ "include_archived": true }),
+    )
+    .await;
+    assert_eq!(uuid(&projects[0]["id"]), project_id);
+    assert_eq!(projects[0]["archived"], true);
+    crate::commands::set_project_archived_impl(&env.state, project_id, false).unwrap();
 
     let agent = ok(
         &client,
@@ -191,7 +207,8 @@ async fn the_tool_list_is_the_catalog_and_declares_the_result_size() {
     );
     // Claude Code cuts server instructions at 4,096 characters and shows the
     // model only the text before the cut (its MCP documentation, "Tool search
-    // for MCP server authors"; recorded in docs/research/mcp-client-behavior.md).
+    // for MCP server authors", rechecked 2026-10-18; recorded in
+    // docs/research/mcp-client-behavior.md).
     assert!(
         info.instructions
             .as_deref()
@@ -242,6 +259,15 @@ async fn the_tool_list_is_the_catalog_and_declares_the_result_size() {
             tool.name
         );
         assert!(tool.description.as_ref().is_some_and(|d| !d.is_empty()));
+        // Claude Code cuts a tool's description at 4,096 characters when the
+        // tool loads up front (tool search off), the same source as above.
+        assert!(
+            tool.description
+                .as_deref()
+                .is_some_and(|d| d.chars().count() < 4_096),
+            "{}'s description fits under Claude Code's cut",
+            tool.name
+        );
     }
     let wait = tools.iter().find(|t| t.name == "wait_send").unwrap();
     let description = wait.description.as_deref().unwrap();
@@ -867,7 +893,7 @@ async fn a_stopping_server_refuses_new_calls_but_lets_cancels_through() {
         &router,
         &session,
         3,
-        "cancel_agent",
+        "stop_agent",
         &json!({ "project_id": project_id, "agent_id": agent_id }),
     )
     .await;
@@ -1155,7 +1181,7 @@ async fn wait_any_send_returns_when_the_first_send_finishes_and_a_busy_agent_is_
     assert!(
         body["message"]
             .as_str()
-            .is_some_and(|m| m.contains("cancel_send") && !m.contains("cancel_agent")),
+            .is_some_and(|m| m.contains("cancel_send") && !m.contains("stop_agent")),
         "{body}"
     );
     assert_eq!(
@@ -1288,7 +1314,7 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     .await;
     assert_eq!(extra["name"], "extra2");
     let selected = call(
-        "set_agent_selection",
+        "set_agent_model_and_effort",
         json!({ "project_id": project_id, "agent_id": coder, "model": "sonnet" }),
     )
     .await;
@@ -1301,6 +1327,14 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
             .iter()
             .any(|p| p["name"] == "greet")
     );
+    let greet = call(
+        "read_prompt",
+        json!({ "provider": "local", "name": "greet", "args": { "who": "bob" } }),
+    )
+    .await;
+    assert_eq!(greet["template"]["text"], "Hi {{ who }}\n");
+    assert_eq!(greet["rendered"]["text"], "Hi bob");
+    assert!(greet.get("template_note").is_none(), "{greet}");
     let workflows = call("list_workflows", json!({})).await;
     assert!(
         workflows
@@ -1329,7 +1363,7 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     assert_eq!(waited["done"], true);
     assert_eq!(waited["recipients"][0]["text"], "ack: hi");
     let page = call(
-        "read_send_output",
+        "read_reply",
         json!({ "project_id": project_id, "send_id": send_id, "agent_id": coder }),
     )
     .await;
@@ -1347,7 +1381,7 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     assert_eq!(waited["done"], true);
     assert_eq!(waited["recipients"][0]["status"], "completed");
     let output = call(
-        "read_agent_output",
+        "read_latest_reply",
         json!({ "project_id": project_id, "agent_id": coder }),
     )
     .await;
@@ -1374,7 +1408,7 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     assert_eq!(waited["done"], true);
     assert_eq!(waited["recipients"][0]["text"], "ack: aside");
     let forks_output = call(
-        "read_agent_output",
+        "read_latest_reply",
         json!({ "project_id": project_id, "agent_id": fork_id }),
     )
     .await;
@@ -1429,7 +1463,7 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     )
     .await;
     call(
-        "cancel_agent",
+        "stop_agent",
         json!({ "project_id": project_id, "agent_id": r2 }),
     )
     .await;
@@ -1595,11 +1629,19 @@ fn serialized_len(body: &Value) -> usize {
     serde_json::to_string(body).unwrap().len()
 }
 
-/// The one cut's follow-up call, as a capped result lists it.
+/// The one cut's follow-up call, as a capped result lists it. The tool it
+/// names is checked against the catalog: the name is a string in `ops`, so a
+/// renamed tool would otherwise leave every cut pointing at one that is gone.
 fn hint_of(body: &Value) -> Value {
     let cuts = body["truncated"].as_array().unwrap();
     assert_eq!(cuts.len(), 1, "one reply was cut: {body}");
-    cuts[0]["read_with"].clone()
+    let hint = cuts[0]["read_with"].clone();
+    let tool = hint["tool"].as_str().unwrap();
+    assert!(
+        ToolName::parse(tool).is_some(),
+        "a cut's read_with names {tool}, which is not a tool"
+    );
+    hint
 }
 
 /// A hint's arguments, without the tool name it carries.
@@ -1692,7 +1734,7 @@ async fn a_capped_reply_lists_a_follow_up_call_that_keeps_the_cap() {
     assert!(serialized_len(&waited) <= 10_000);
     let hint = hint_of(&waited);
     assert_eq!(hint["max_chars"], 10_000, "the follow-up keeps the cap");
-    let rest = t.call("read_send_output", args_of(&hint)).await;
+    let rest = t.call("read_reply", args_of(&hint)).await;
     assert!(serialized_len(&rest) <= 10_000);
     assert_eq!(rest["result"]["offset"], hint["offset"]);
     assert!(
@@ -1702,7 +1744,7 @@ async fn a_capped_reply_lists_a_follow_up_call_that_keeps_the_cap() {
 
     let page = t
         .call(
-            "read_send_output",
+            "read_reply",
             json!({ "project_id": project_id, "send_id": send_id, "agent_id": coder, "max_chars": 12_000 }),
         )
         .await;
@@ -1711,7 +1753,7 @@ async fn a_capped_reply_lists_a_follow_up_call_that_keeps_the_cap() {
 
     let output = t
         .call(
-            "read_agent_output",
+            "read_latest_reply",
             json!({ "project_id": project_id, "agent_id": coder, "max_chars": 10_000 }),
         )
         .await;
@@ -1859,7 +1901,7 @@ async fn a_finished_reply_carries_the_agents_context() {
 
     let latest = t
         .call(
-            "read_agent_output",
+            "read_latest_reply",
             json!({ "project_id": project_id, "agent_id": coder }),
         )
         .await;
@@ -1932,14 +1974,14 @@ async fn a_workflow_lists_each_send_so_an_earlier_reply_stays_readable() {
 
     let first = t
         .call(
-            "read_send_output",
+            "read_reply",
             json!({ "project_id": project_id, "send_id": sends[0]["send_id"], "agent_id": coder }),
         )
         .await;
     assert_eq!(first["result"]["text"], "first answer");
     let latest = t
         .call(
-            "read_agent_output",
+            "read_latest_reply",
             json!({ "project_id": project_id, "agent_id": coder }),
         )
         .await;
@@ -2635,11 +2677,9 @@ async fn live_codex_mcp_compact() {
     live_compact_through_the_server(switchboard_core::HarnessKind::Codex).await;
 }
 
-/// The orchestrator prompts in Settings name tools by name. A rename or a
-/// removal here would leave a pasted prompt pointing at a tool that is gone,
-/// so every tool-like name in them must be a tool.
-#[test]
-fn the_orchestrator_prompt_names_only_real_tools() {
+/// The words in `text` shaped like a tool name: a tool's verb prefix, less
+/// the field names and error codes that share one.
+fn tool_like_words(text: &str) -> Vec<&str> {
     const VERBS: &[&str] = &[
         "list_",
         "read_",
@@ -2656,21 +2696,109 @@ fn the_orchestrator_prompt_names_only_real_tools() {
         "dismiss_",
         "get_",
         "set_",
+        "stop_",
     ];
-    // Field names that share a tool's prefix.
-    const FIELDS: &[&str] = &["send_id", "send_ids", "run_id"];
-    let source = include_str!("../../../src/lib/orchestratorPrompt.ts");
-    let tools: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
-    let named: Vec<&str> = source
-        .split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+    // Field names and error codes that share a tool's prefix.
+    const NOT_TOOLS: &[&str] = &[
+        "send_id",
+        "send_ids",
+        "run_id",
+        "read_from",
+        "read_with",
+        "fork_unsupported",
+        "fork_not_materialized",
+        "run_unknown",
+        "send_unknown",
+    ];
+    text.split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
         .filter(|word| VERBS.iter().any(|verb| word.starts_with(verb)))
-        .filter(|word| !FIELDS.contains(word))
-        .collect();
-    assert!(!named.is_empty(), "the scan found the prompt's tool names");
+        .filter(|word| !NOT_TOOLS.contains(word))
+        .collect()
+}
+
+fn assert_names_only_real_tools(text: &str, what: &str) {
+    let tools: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
+    let named = tool_like_words(text);
+    assert!(!named.is_empty(), "the scan found {what}'s tool names");
     for word in named {
         assert!(
             tools.contains(&word),
-            "the prompt names {word}, which is not a tool"
+            "{what} names {word}, which is not a tool"
         );
+    }
+}
+
+/// The orchestrator prompts in Settings name tools by name. A rename or a
+/// removal here would leave a pasted prompt pointing at a tool that is gone,
+/// so every tool-like name in them must be a tool.
+#[test]
+fn the_orchestrator_prompt_names_only_real_tools() {
+    assert_names_only_real_tools(
+        include_str!("../../../src/lib/orchestratorPrompt.ts"),
+        "the orchestrator prompt",
+    );
+}
+
+/// The instructions and the tool descriptions point callers from one tool to
+/// another by name, so a rename that misses one leaves a caller told to use a
+/// tool that is gone.
+#[test]
+fn the_instructions_and_descriptions_name_only_real_tools() {
+    assert_names_only_real_tools(&super::tools::instructions(), "the instructions");
+    for tool in super::tools::catalog() {
+        let description = tool.description.as_deref().unwrap_or_default();
+        if !tool_like_words(description).is_empty() {
+            assert_names_only_real_tools(description, &format!("{}'s description", tool.name));
+        }
+    }
+}
+
+/// Tools retired by a rename. Error messages also name the window's own
+/// commands, which are not tools, so they are checked against this list
+/// rather than the catalog: add a tool's old name here when renaming it.
+const RETIRED_TOOLS: &[&str] = &[
+    "read_send_output",
+    "read_agent_output",
+    "set_agent_selection",
+    "cancel_agent",
+];
+
+/// The text inside the string literals of Rust `source`, escapes kept as
+/// written: an error's message is its `#[error("...")]` string.
+fn string_literals(source: &str) -> Vec<String> {
+    let mut literals = Vec::new();
+    let mut current: Option<String> = None;
+    let mut chars = source.chars();
+    while let Some(c) = chars.next() {
+        match (&mut current, c) {
+            (None, '"') => current = Some(String::new()),
+            (Some(_), '"') => literals.extend(current.take()),
+            (Some(literal), '\\') => {
+                literal.push(c);
+                literal.extend(chars.next());
+            }
+            (Some(literal), c) => literal.push(c),
+            (None, _) => {}
+        }
+    }
+    literals
+}
+
+/// An error message that tells a caller to use a renamed tool sends it to a
+/// tool that is gone.
+#[test]
+fn no_error_message_names_a_retired_tool() {
+    let literals = string_literals(include_str!("../error.rs"));
+    assert!(
+        literals.iter().any(|l| l.contains("read_reply")),
+        "the scan reads the error messages"
+    );
+    for literal in &literals {
+        for retired in RETIRED_TOOLS {
+            assert!(
+                !tool_like_words(literal).contains(retired),
+                "an error message names the retired tool {retired}: {literal}"
+            );
+        }
     }
 }

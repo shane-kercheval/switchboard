@@ -28,15 +28,16 @@ use crate::workflow_commands::ProjectDispatchFactoryProvider;
 use super::budget::fit;
 use super::change::{
     SelectionChange, SelectionChanges, create_agent, create_project, dismiss_workflow_run,
-    rename_agent, set_agent_selection,
+    rename_agent, set_agent_model_and_effort,
 };
 use super::desktop_sync::{Hearing, SyncAck, SyncFork};
 use super::error_code::{self, error_code};
 use super::ledger::{ForkClaim, SendStatus};
 use super::read::conversation_budget;
 use super::read::{
-    AgentOutputStatus, DigestItem, DigestTurnStatus, OutputSource, ProjectStatus, ReadFrom,
-    list_agents, list_projects, read_agent_output, read_conversation, read_send_output,
+    DigestItem, DigestTurnStatus, LatestReplyStatus, OutputSource, ProjectStatus,
+    ProjectStatusListing, ReadFrom, SERVER_TEMPLATE_NOTE, UNLISTED_NOTE, list_agents,
+    list_projects, prompt_budget, read_conversation, read_latest_reply, read_prompt, read_reply,
 };
 use super::send::{
     AgentWaitStatus, Body, ForwardFrom, ForwardPrompt, ForwardRequest, OnBusyPolicy, SendRequest,
@@ -159,7 +160,7 @@ async fn agent_lifecycle_on_an_unopened_project() {
     let renamed = rename_agent(&env.state, project_id, created.id, "builder").unwrap();
     assert_eq!(renamed.name, "builder");
 
-    let changed = set_agent_selection(
+    let changed = set_agent_model_and_effort(
         &env.state,
         project_id,
         created.id,
@@ -173,7 +174,7 @@ async fn agent_lifecycle_on_an_unopened_project() {
         "a new value joins the list"
     );
 
-    let reset = set_agent_selection(
+    let reset = set_agent_model_and_effort(
         &env.state,
         project_id,
         created.id,
@@ -194,10 +195,10 @@ async fn agent_lifecycle_on_an_unopened_project() {
     assert_eq!(listed.len(), 1);
     assert!(!listed[0].busy);
 
-    let output = read_agent_output(&env.state, project_id, created.id, &env.home())
+    let output = read_latest_reply(&env.state, project_id, created.id, &env.home())
         .await
         .unwrap();
-    assert_eq!(output.status, AgentOutputStatus::None);
+    assert_eq!(output.status, LatestReplyStatus::None);
 
     assert_eq!(
         lock(&env.sync.roster_changed).len(),
@@ -235,7 +236,7 @@ async fn list_projects_reports_busy_and_idle() {
         env2.project("other")
     };
     let _ = other;
-    let listed = list_projects(&env.state, &CancellationToken::new())
+    let listed = list_projects(&env.state, false, &CancellationToken::new())
         .await
         .unwrap();
     assert_eq!(listed[0].status, ProjectStatus::Idle);
@@ -250,11 +251,44 @@ async fn list_projects_reports_busy_and_idle() {
     .await
     .unwrap();
     await_turn_running(&env.state, agents[0]).await;
-    let listed = list_projects(&env.state, &CancellationToken::new())
+    let listed = list_projects(&env.state, false, &CancellationToken::new())
         .await
         .unwrap();
     assert_eq!(listed[0].status, ProjectStatus::Busy);
     gate.notify_waiters();
+}
+
+/// An archived project is left out unless the caller asks for it, as the
+/// window's project list leaves it out until the user opens its archived
+/// view; the listing still says which ones are archived.
+#[tokio::test]
+async fn list_projects_leaves_out_archived_projects_unless_asked() {
+    let mut env = TestEnv::new();
+    let active = env.project("active");
+    let archived = env.project("shelved");
+    crate::commands::set_project_archived_impl(&env.state, archived, true).unwrap();
+    let ids = |listed: &[ProjectStatusListing]| -> Vec<ProjectId> {
+        listed.iter().map(|p| p.listing.id).collect()
+    };
+
+    let default = list_projects(&env.state, false, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&default),
+        vec![active],
+        "the archived project is left out"
+    );
+
+    let all = list_projects(&env.state, true, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2, "both projects are listed");
+    assert!(
+        all.iter()
+            .any(|p| p.listing.id == archived && p.listing.archived),
+        "the archived one says so"
+    );
 }
 
 // --- sends -------------------------------------------------------------------
@@ -514,6 +548,267 @@ async fn a_saved_prompt_body_renders_with_its_appended_text() {
     let receipt = send_now(env.handle(), env.home(), request).await.unwrap();
     wait_done(&env, project_id, receipt.send_id).await;
     assert_eq!(lock(&env.adapter.prompts)[0], "Hi bob\n\nthanks");
+}
+
+/// A local prompt's template comes back with its placeholders intact, its
+/// arguments as `list_prompts` declares them, and no rendering until asked.
+/// With args, the rendering is the text a send of the prompt delivers.
+#[tokio::test]
+async fn read_prompt_returns_a_local_template_and_the_rendering_a_send_delivers() {
+    let mut env = TestEnv::new().with_prompts_and_workflows();
+    std::fs::write(env.prompts_dir().join("greet.md"), GREET_PROMPT).unwrap();
+    env.state.prompts.sync().await;
+    let budget = WaitBudget::default_wait();
+
+    let plain = read_prompt(&env.state, "local", "greet", None, &budget)
+        .await
+        .unwrap();
+    assert_eq!(plain.template.unwrap().text, "Hi {{ who }}\n");
+    assert_eq!(plain.template_note, None);
+    assert_eq!(plain.rendered, None, "no rendering without args");
+    let arguments = plain.arguments.unwrap();
+    assert_eq!(arguments.len(), 1);
+    assert!(arguments[0].required);
+    assert_eq!(plain.listing_note, None);
+
+    let args = BTreeMap::from([("who".to_owned(), "bob".to_owned())]);
+    let rendered = read_prompt(&env.state, "local", "greet", Some(&args), &budget)
+        .await
+        .unwrap()
+        .rendered
+        .unwrap()
+        .text;
+    let project_id = env.project("proj");
+    let agent = env.agent(project_id, "a");
+    let request = SendRequest {
+        project_id,
+        recipients: vec![agent],
+        body: Body::Prompt {
+            provider: "local".to_owned(),
+            name: "greet".to_owned(),
+            args,
+            appended_text: None,
+        },
+        on_busy: OnBusyPolicy::Refuse,
+        idempotency_key: None,
+        attachments: Vec::new(),
+    };
+    let receipt = send_now(env.handle(), env.home(), request).await.unwrap();
+    wait_done(&env, project_id, receipt.send_id).await;
+    assert_eq!(
+        lock(&env.adapter.prompts)[0],
+        rendered,
+        "the rendering is what a send delivers"
+    );
+}
+
+/// The argument checks are a send's: a missing required argument and an
+/// unknown prompt are the caller's error, before anything is read.
+#[tokio::test]
+async fn read_prompt_refuses_a_missing_argument_and_an_unknown_prompt() {
+    let env = TestEnv::new().with_prompts_and_workflows();
+    std::fs::write(env.prompts_dir().join("greet.md"), GREET_PROMPT).unwrap();
+    env.state.prompts.sync().await;
+    let budget = WaitBudget::default_wait();
+
+    let missing = read_prompt(
+        &env.state,
+        "local",
+        "greet",
+        Some(&BTreeMap::new()),
+        &budget,
+    )
+    .await
+    .expect_err("who is required");
+    assert_eq!(error_code(&missing), error_code::INVALID_ARGUMENT);
+    let unknown = read_prompt(&env.state, "local", "nope", None, &budget)
+        .await
+        .expect_err("no such prompt");
+    assert_eq!(error_code(&unknown), error_code::INVALID_ARGUMENT);
+}
+
+/// A prompt server gives out no template: the result says so plainly, and
+/// with args returns the server's rendering, which is what a send delivers.
+/// Arguments the server refuses are the caller's error, as a local prompt's
+/// missing argument is.
+#[tokio::test]
+async fn read_prompt_from_a_prompt_server_has_no_template_but_renders() {
+    let server = spawn_prompt_server().await;
+    let env = TestEnv::new().with_prompts_and_workflows();
+    env.add_prompt_server("tiddly", &server.url);
+    env.state.prompts.sync().await;
+    let budget = WaitBudget::default_wait();
+
+    let plain = read_prompt(&env.state, "tiddly", "review", None, &budget)
+        .await
+        .unwrap();
+    assert_eq!(plain.template, None);
+    assert_eq!(plain.template_note, Some(SERVER_TEMPLATE_NOTE));
+    assert_eq!(plain.description.as_deref(), Some("Review code"));
+    assert_eq!(plain.arguments.unwrap()[0].name, "context");
+
+    let args = BTreeMap::from([("context".to_owned(), "the parser".to_owned())]);
+    let reading = read_prompt(&env.state, "tiddly", "review", Some(&args), &budget)
+        .await
+        .unwrap();
+    assert_eq!(reading.rendered.unwrap().text, "Review the parser");
+    assert_eq!(
+        reading.template_note,
+        Some(SERVER_TEMPLATE_NOTE),
+        "still no template beside the rendering"
+    );
+
+    let refused = read_prompt(
+        &env.state,
+        "tiddly",
+        "review",
+        Some(&BTreeMap::new()),
+        &budget,
+    )
+    .await
+    .expect_err("the server requires context");
+    assert_eq!(error_code(&refused), error_code::INVALID_ARGUMENT);
+}
+
+/// With args, a prompt server's prompt renders as a send would, whether or
+/// not Switchboard has listed it: here the server was never fetched. Its
+/// description and arguments are then unknown, null rather than an empty
+/// list that would read as "takes none", and the note says why. Without
+/// args there is nothing to return, and the error says to pass them.
+#[tokio::test]
+async fn read_prompt_renders_a_server_prompt_switchboard_has_not_listed() {
+    let server = spawn_prompt_server().await;
+    let env = TestEnv::new().with_prompts_and_workflows();
+    env.add_prompt_server("tiddly", &server.url);
+    let budget = WaitBudget::default_wait();
+
+    let args = BTreeMap::from([("context".to_owned(), "the parser".to_owned())]);
+    let reading = read_prompt(&env.state, "tiddly", "review", Some(&args), &budget)
+        .await
+        .unwrap();
+    assert_eq!(
+        reading.rendered.as_ref().map(|r| r.text.as_str()),
+        Some("Review the parser")
+    );
+    assert_eq!(reading.arguments, None);
+    assert_eq!(reading.description, None);
+    assert_eq!(reading.listing_note, Some(UNLISTED_NOTE));
+    let shape = serde_json::to_value(&reading).unwrap();
+    assert!(shape["arguments"].is_null(), "{shape}");
+
+    let unlisted = read_prompt(&env.state, "tiddly", "review", None, &budget)
+        .await
+        .expect_err("nothing is known of the prompt without a listing or args");
+    assert!(
+        unlisted.to_string().contains("pass args"),
+        "the error says how to read it anyway: {unlisted}"
+    );
+}
+
+/// A server the user is signed out of is reported as needing sign-in, never
+/// as a missing prompt: with args from the render, as a send reports it, and
+/// without them from the server's state at its last fetch.
+#[tokio::test]
+async fn read_prompt_reports_a_signed_out_server_as_needing_sign_in() {
+    let env = TestEnv::new().with_prompts_and_workflows();
+    env.add_signed_out_prompt_server("tiddly");
+    env.state.prompts.sync().await;
+    let budget = WaitBudget::default_wait();
+
+    let without = read_prompt(&env.state, "tiddly", "review", None, &budget)
+        .await
+        .expect_err("signed out");
+    assert_eq!(error_code(&without), error_code::PROMPT_NEEDS_SIGN_IN);
+    let args = BTreeMap::from([("context".to_owned(), "x".to_owned())]);
+    let with = read_prompt(&env.state, "tiddly", "review", Some(&args), &budget)
+        .await
+        .expect_err("signed out");
+    assert_eq!(error_code(&with), error_code::PROMPT_NEEDS_SIGN_IN);
+}
+
+/// A server that failed at its last fetch leaves the prompt unlisted, which
+/// is not the same as missing: without args the error says so and how to
+/// read the prompt anyway, rather than reporting it gone.
+#[tokio::test]
+async fn read_prompt_reports_a_server_that_failed_at_its_last_fetch() {
+    let env = TestEnv::new().with_prompts_and_workflows();
+    env.add_prompt_server("tiddly", "http://127.0.0.1:9/mcp");
+    env.state.prompts.sync().await;
+
+    let failed = read_prompt(
+        &env.state,
+        "tiddly",
+        "review",
+        None,
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .expect_err("the server could not be fetched");
+    assert_eq!(error_code(&failed), error_code::INTERNAL);
+    let message = failed.to_string();
+    assert!(
+        message.contains("failed at Switchboard's last fetch") && message.contains("pass args"),
+        "the error says what happened and how to read it anyway: {message}"
+    );
+}
+
+/// A prompt the server's last successful fetch did not list is missing, the
+/// caller's error, as an unknown local prompt is.
+#[tokio::test]
+async fn read_prompt_refuses_a_prompt_the_server_does_not_list() {
+    let server = spawn_prompt_server().await;
+    let env = TestEnv::new().with_prompts_and_workflows();
+    env.add_prompt_server("tiddly", &server.url);
+    env.state.prompts.sync().await;
+
+    let missing = read_prompt(
+        &env.state,
+        "tiddly",
+        "nope",
+        None,
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .expect_err("the server lists no such prompt");
+    assert_eq!(error_code(&missing), error_code::INVALID_ARGUMENT);
+}
+
+/// A prompt over the result budget is cut to fit, the cut listed with its
+/// full length and no call to read on: a saved prompt has no pager.
+#[tokio::test]
+async fn read_prompt_cuts_a_prompt_over_the_budget_and_reports_the_cut() {
+    let env = TestEnv::new().with_prompts_and_workflows();
+    let body = "x".repeat(30_000);
+    std::fs::write(
+        env.prompts_dir().join("long.md"),
+        format!("---\nname: long\ndescription: Long.\n---\n{body}\n"),
+    )
+    .unwrap();
+    env.state.prompts.sync().await;
+    let reading = read_prompt(
+        &env.state,
+        "local",
+        "long",
+        Some(&BTreeMap::new()),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+
+    let fitted = fit(
+        serde_json::to_value(&reading).unwrap(),
+        &prompt_budget(10_000),
+    )
+    .unwrap();
+    assert!(fitted.serialized_chars() <= 10_000);
+    let mut paths: Vec<&str> = fitted.truncated.iter().map(|t| t.path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec!["/rendered/text", "/template/text"], "both cut");
+    assert!(fitted.truncated.iter().all(|t| t.read_with.is_none()));
+    assert!(
+        fitted.truncated.iter().all(|t| t.total_chars >= 30_000),
+        "each cut reports the full length"
+    );
 }
 
 // --- idempotency -------------------------------------------------------------
@@ -865,7 +1160,7 @@ async fn wait_agent_across_a_running_turn_with_one_queued_returns_running_until_
     .unwrap();
     assert_eq!(reply.status, AgentWaitStatus::Idle);
     let output = reply.output.unwrap();
-    assert_eq!(output.status, AgentOutputStatus::Completed);
+    assert_eq!(output.status, LatestReplyStatus::Completed);
     assert_eq!(output.source, OutputSource::DurableLink);
 }
 
@@ -979,7 +1274,7 @@ async fn cancel_send_stops_running_recipients() {
 // --- outputs and the budget ------------------------------------------------------
 
 #[tokio::test]
-async fn read_send_output_pages_one_reply_stably_while_the_agent_starts_a_new_turn() {
+async fn read_reply_pages_one_reply_stably_while_the_agent_starts_a_new_turn() {
     let (env, project_id, agents) = project_with_agents(&["a"]);
     let long = "x".repeat(OUTPUT_PAGE_CHARS * 2 + 5);
     env.adapter.push(Script::reply(&long));
@@ -991,7 +1286,7 @@ async fn read_send_output_pages_one_reply_stably_while_the_agent_starts_a_new_tu
     .await
     .unwrap();
     wait_done(&env, project_id, receipt.send_id).await;
-    let first = read_send_output(
+    let first = read_reply(
         &env.state,
         project_id,
         receipt.send_id,
@@ -1019,7 +1314,7 @@ async fn read_send_output_pages_one_reply_stably_while_the_agent_starts_a_new_tu
     .unwrap();
     await_turn_running(&env.state, agents[0]).await;
 
-    let last = read_send_output(
+    let last = read_reply(
         &env.state,
         project_id,
         receipt.send_id,
@@ -1165,7 +1460,7 @@ async fn the_restart_fallback_answers_from_the_journal() {
     assert_eq!(reply.source, WaitSource::Unknown);
     assert!(reply.recipients.is_empty());
 
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project_id,
         s_a,
@@ -1542,7 +1837,7 @@ async fn create_send_forward_and_read_leave_the_expected_files() {
     .unwrap();
     let reply = wait_done(&env, project.id, second.send_id).await;
     assert_eq!(reply.recipients[0].status, SendStatus::Completed);
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project.id,
         second.send_id,
@@ -1910,7 +2205,7 @@ async fn concurrent_selection_changes_both_survive() {
     let barrier = env.seam(TestSeam::SelectionUpdate);
     let state = Arc::clone(&env.state);
     let first = tokio::task::spawn_blocking(move || {
-        set_agent_selection(
+        set_agent_model_and_effort(
             &state,
             project_id,
             agent_id,
@@ -1923,7 +2218,7 @@ async fn concurrent_selection_changes_both_survive() {
     // second must wait for it rather than merge onto a stale read.
     let state = Arc::clone(&env.state);
     let second = tokio::task::spawn_blocking(move || {
-        set_agent_selection(
+        set_agent_model_and_effort(
             &state,
             project_id,
             agent_id,
@@ -1992,20 +2287,20 @@ async fn a_workflow_runs_the_agent_an_id_names_even_after_a_rename_and_name_reus
     )
     .await
     .unwrap();
-    let builder = read_agent_output(&env.state, project_id, agents[0], &env.home())
+    let builder = read_latest_reply(&env.state, project_id, agents[0], &env.home())
         .await
         .unwrap();
     assert_eq!(
         builder.status,
-        AgentOutputStatus::Completed,
+        LatestReplyStatus::Completed,
         "the renamed agent ran"
     );
-    let coder = read_agent_output(&env.state, project_id, usurper.id, &env.home())
+    let coder = read_latest_reply(&env.state, project_id, usurper.id, &env.home())
         .await
         .unwrap();
     assert_eq!(
         coder.status,
-        AgentOutputStatus::None,
+        LatestReplyStatus::None,
         "the name's new owner did not"
     );
 }
@@ -2023,7 +2318,7 @@ async fn a_page_is_sized_by_its_serialized_length() {
     .await
     .unwrap();
     wait_done(&env, project_id, receipt.send_id).await;
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project_id,
         receipt.send_id,
@@ -2354,7 +2649,7 @@ async fn paging_after_a_restart_agrees_with_wait_send_on_a_failed_send() {
     let env = env.restart();
     let waited = wait_done(&env, project_id, send_id).await;
     assert_eq!(waited.recipients[0].status, SendStatus::Failed);
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project_id,
         send_id,
@@ -2543,7 +2838,7 @@ async fn the_merged_conversation_and_reply_paging_agree_on_every_turn() {
             );
             continue;
         };
-        let page = read_send_output(
+        let page = read_reply(
             &env.state,
             project_id,
             *send_id,
@@ -2575,7 +2870,7 @@ async fn the_merged_conversation_and_reply_paging_agree_on_every_turn() {
     }
     assert_eq!(checked, 4, "a1, a2, a4, and b1 each carry a send");
 
-    let failed = read_send_output(
+    let failed = read_reply(
         &env.state,
         project_id,
         s3,
@@ -2589,7 +2884,7 @@ async fn the_merged_conversation_and_reply_paging_agree_on_every_turn() {
     .unwrap();
     assert_eq!(failed.status, SendStatus::Failed);
     assert!(failed.text.is_empty());
-    let latest = read_agent_output(&env.state, project_id, a, &env.home())
+    let latest = read_latest_reply(&env.state, project_id, a, &env.home())
         .await
         .unwrap();
     assert_eq!(latest.text.as_deref(), Some("answer four"));
@@ -2855,7 +3150,7 @@ async fn cut_answer(
         .read_with
         .clone()
         .expect("an answer with a send reads on");
-    assert_eq!(read_with["tool"], "read_send_output");
+    assert_eq!(read_with["tool"], "read_reply");
     (kept, read_with)
 }
 
@@ -2868,7 +3163,7 @@ async fn read_on(env: &TestEnv, project_id: ProjectId, read_with: &serde_json::V
     let mut offset = usize::try_from(read_with["offset"].as_u64().unwrap()).unwrap();
     let mut text = String::new();
     loop {
-        let page = read_send_output(
+        let page = read_reply(
             &env.state,
             project_id,
             send_id,
@@ -2931,7 +3226,7 @@ async fn a_cancelled_partial_reply_reads_on_in_the_same_session() {
     let reply = wait_done(&env, project_id, receipt.send_id).await;
     assert_eq!(reply.recipients[0].status, SendStatus::Cancelled);
 
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project_id,
         receipt.send_id,
@@ -3068,7 +3363,7 @@ async fn a_reply_split_by_compaction_pages_the_piece_the_conversation_shows() {
     )
     .await;
     assert_eq!(rest, first[offset..]);
-    let captured = read_send_output(
+    let captured = read_reply(
         &env.state,
         project_id,
         receipt.send_id,
@@ -3422,7 +3717,7 @@ async fn a_window_model_change_and_an_ops_effort_change_made_together_both_survi
     barrier.entered.notified().await;
     let state = Arc::clone(&env.state);
     let orchestrator = tokio::task::spawn_blocking(move || {
-        set_agent_selection(
+        set_agent_model_and_effort(
             &state,
             project_id,
             agent_id,
@@ -3776,7 +4071,7 @@ async fn list_agents_settles_an_unreadable_file_as_no_context() {
 }
 
 #[tokio::test]
-async fn read_agent_output_records_the_figures_it_parsed() {
+async fn read_latest_reply_records_the_figures_it_parsed() {
     let mut env = TestEnv::new();
     let project_id = env.project("p");
     let agent_id = env.agent(project_id, "a");
@@ -3784,7 +4079,7 @@ async fn read_agent_output_records_the_figures_it_parsed() {
     env.seed_claude_turns(project_id, agent_id, &[("one", "answer", "a1", at)]);
     save_window_for(&env, project_id, agent_id, "a1", 200_000);
     let env = env.restart();
-    read_agent_output(&env.state, project_id, agent_id, &env.home())
+    read_latest_reply(&env.state, project_id, agent_id, &env.home())
         .await
         .unwrap();
     assert_eq!(
@@ -3905,7 +4200,7 @@ async fn a_listing_cancelled_during_a_busy_check_is_interrupted() {
     });
     let projects = tokio::spawn({
         let (state, cancel) = (Arc::clone(&env.state), cancel.clone());
-        async move { list_projects(&state, &cancel).await }
+        async move { list_projects(&state, false, &cancel).await }
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
@@ -4406,10 +4701,10 @@ async fn the_latest_answer_survives_an_orchestrators_compaction() {
         .unwrap();
     wait_done(&env, project_id, compacted.send_id).await;
 
-    let output = read_agent_output(&env.state, project_id, agent_id, &env.home())
+    let output = read_latest_reply(&env.state, project_id, agent_id, &env.home())
         .await
         .unwrap();
-    assert_eq!(output.status, AgentOutputStatus::Completed);
+    assert_eq!(output.status, LatestReplyStatus::Completed);
     assert_eq!(output.text.as_deref(), Some("ack: hi"));
     assert_eq!(output.send_id, Some(receipt.send_id));
     let idle = wait_agent(
@@ -5634,6 +5929,105 @@ async fn cancelling_one_agents_reply_to_a_workflow_send_ends_the_run() {
     );
 }
 
+/// While a run waits on its agents, each agent of the current step carries
+/// what `wait_send` gives an unfinished recipient. The step doing the waiting
+/// is a wait step, which made no send of its own, so each agent reports the
+/// run's newest send that reached it: one reviewer finished (completed, no
+/// activity), the other still writing (running, with its activity and text so
+/// far). A finished run carries none of it.
+#[tokio::test]
+async fn wait_workflow_shows_what_each_agent_of_the_current_step_is_doing() {
+    let (env, project_id, agents) = workflow_env().await;
+    let gate = Arc::new(Notify::new());
+    env.adapter.push_for(agents[0], Script::reply("greeting"));
+    env.adapter.push_for(agents[1], Script::reply("looks fine"));
+    env.adapter
+        .push_for(agents[2], Script::parked("still reading", &gate));
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    // Content wakes no waiter, so look until the slow reviewer's text and the
+    // quick one's completion have both landed.
+    let mut waiting = None;
+    for _ in 0..500 {
+        let reply = wait_workflow(
+            &env.state,
+            project_id,
+            run_id,
+            &WaitBudget::new(Some(0), false),
+        )
+        .await
+        .unwrap();
+        let landed = |agent: AgentId, ready: &dyn Fn(&super::workflow::StepAgent) -> bool| {
+            reply
+                .recipients
+                .iter()
+                .any(|a| a.agent.agent_id == agent && ready(a))
+        };
+        if reply.label.as_deref() == Some("Reviewed")
+            && landed(agents[1], &|a| a.status == Some(SendStatus::Completed))
+            && landed(agents[2], &|a| a.recent_text.is_some())
+        {
+            waiting = Some(reply);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let waiting = waiting.expect("the run reached its wait step with one reviewer done");
+    let review = waiting.sends.iter().find(|s| s.step == 2).unwrap().send_id;
+    let of = |agent: AgentId| {
+        waiting
+            .recipients
+            .iter()
+            .find(|a| a.agent.agent_id == agent)
+            .unwrap()
+    };
+
+    let slow = of(agents[2]);
+    assert_eq!(
+        slow.send_id,
+        Some(review),
+        "the wait step's agent reports the newest send that reached it, the send step's"
+    );
+    assert_eq!(slow.status, Some(SendStatus::Running));
+    assert!(slow.activity.is_some(), "a running turn's activity");
+    assert_eq!(slow.recent_text.as_deref(), Some("still reading"));
+    let shape = serde_json::to_value(slow).unwrap();
+    assert_eq!(shape["agent_id"], agents[2].to_string(), "{shape}");
+    assert_eq!(shape["name"], "r2", "{shape}");
+    assert_eq!(shape["status"], "running", "{shape}");
+
+    let quick = of(agents[1]);
+    assert_eq!(quick.send_id, Some(review));
+    assert_eq!(quick.status, Some(SendStatus::Completed));
+    assert_eq!(quick.activity, None, "a finished reply has no activity");
+    assert_eq!(quick.recent_text, None);
+
+    gate.notify_waiters();
+    let ended = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ended.status, WorkflowRunStatus::Completed);
+    assert!(
+        ended.recipients.iter().all(|a| a.send_id.is_none()
+            && a.status.is_none()
+            && a.activity.is_none()
+            && a.recent_text.is_none()),
+        "a finished run carries no step progress: {:?}",
+        ended.recipients
+    );
+}
+
 /// The run's first send, as an orchestrator reads it from `wait_workflow`
 /// once the step has dispatched.
 async fn first_workflow_send(env: &TestEnv, project_id: ProjectId, run_id: Uuid) -> Uuid {
@@ -5772,12 +6166,12 @@ async fn wait_any_send_follows_a_workflow_send_to_its_reply() {
 }
 
 #[tokio::test]
-async fn read_send_output_on_a_running_workflow_send_reports_it_running() {
+async fn read_reply_on_a_running_workflow_send_reports_it_running() {
     let (env, project_id, agents) = workflow_env().await;
     let (_run_id, send_id, gate) =
         workflow_with_a_running_first_send(&env, project_id, &agents).await;
 
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project_id,
         send_id,
@@ -5896,7 +6290,7 @@ async fn answer_once_idle(
     env: &TestEnv,
     project_id: ProjectId,
     agent_id: AgentId,
-) -> super::read::AgentOutput {
+) -> super::read::LatestReply {
     let reply = wait_agent(
         &env.state,
         project_id,
@@ -5974,7 +6368,7 @@ async fn a_cancelled_run_leaves_a_message_the_user_queued_behind_its_reply() {
         let answer = answer_once_idle(&env, project_id, second).await;
         assert_eq!(
             answer.status,
-            AgentOutputStatus::Completed,
+            LatestReplyStatus::Completed,
             "the run's cleanup left the user's message alone (whole send: {whole_send})"
         );
         assert_eq!(answer.text.as_deref(), Some("the user's reply"));
@@ -6295,10 +6689,10 @@ async fn the_latest_answer_is_a_workflow_steps_reply_read_live() {
     .await
     .unwrap();
 
-    let output = read_agent_output(&env.state, project_id, agents[0], &env.home())
+    let output = read_latest_reply(&env.state, project_id, agents[0], &env.home())
         .await
         .unwrap();
-    assert_eq!(output.status, AgentOutputStatus::Completed);
+    assert_eq!(output.status, LatestReplyStatus::Completed);
     assert_eq!(output.text.as_deref(), Some("greeting"));
     assert_eq!(output.send_id, Some(send_id));
     assert_eq!(
@@ -6325,7 +6719,7 @@ async fn the_latest_answer_flags_a_workflow_step_still_preparing() {
     .unwrap();
     first_workflow_send(&env, project_id, run_id).await;
 
-    let output = read_agent_output(&env.state, project_id, agents[0], &env.home())
+    let output = read_latest_reply(&env.state, project_id, agents[0], &env.home())
         .await
         .unwrap();
     assert!(
@@ -6373,7 +6767,7 @@ async fn the_latest_answer_says_when_a_newer_turn_is_running() {
     .await
     .unwrap();
     wait_done(&env, project_id, first.send_id).await;
-    let settled = read_agent_output(&env.state, project_id, agents[0], &env.home())
+    let settled = read_latest_reply(&env.state, project_id, agents[0], &env.home())
         .await
         .unwrap();
     assert!(!settled.newer_turn_running);
@@ -6388,7 +6782,7 @@ async fn the_latest_answer_says_when_a_newer_turn_is_running() {
     .await
     .unwrap();
     await_turn_running(&env.state, agents[0]).await;
-    let mid_turn = read_agent_output(&env.state, project_id, agents[0], &env.home())
+    let mid_turn = read_latest_reply(&env.state, project_id, agents[0], &env.home())
         .await
         .unwrap();
     assert_eq!(
@@ -6685,7 +7079,7 @@ async fn the_latest_answer_flags_a_send_that_has_not_started_and_answers_at_once
     .unwrap();
     let output = tokio::time::timeout(
         Duration::from_secs(2),
-        read_agent_output(&env.state, project_id, agents[0], &env.home()),
+        read_latest_reply(&env.state, project_id, agents[0], &env.home()),
     )
     .await
     .expect("the read does not wait on the actor")
@@ -6869,7 +7263,7 @@ async fn a_busy_agent_is_recorded_refused_and_its_users_reply_runs_on() {
 
     gate.notify_waiters();
     let answer = answer_once_idle(&env, project_id, second).await;
-    assert_eq!(answer.status, AgentOutputStatus::Completed);
+    assert_eq!(answer.status, LatestReplyStatus::Completed);
     assert_eq!(
         answer.text.as_deref(),
         Some("busy"),
@@ -8232,7 +8626,7 @@ async fn a_forward_refuses_a_reply_matched_to_its_send_only_by_position() {
     env.seed_claude_turn(project_id, src, "A GUESSED REPLY", "m1");
     let env = env.restart();
 
-    let page = read_send_output(
+    let page = read_reply(
         &env.state,
         project_id,
         send_id,
@@ -8268,7 +8662,7 @@ async fn a_forward_refuses_a_reply_matched_to_its_send_only_by_position() {
     assert_eq!(error_code(&err), error_code::INVALID_ARGUMENT);
     let message = err.to_string();
     assert!(
-        message.contains("read_send_output") && !message.contains("leave out send_id"),
+        message.contains("read_reply") && !message.contains("leave out send_id"),
         "{message}"
     );
     assert!(lock(&env.adapter.prompts).is_empty(), "nothing was sent");
@@ -8602,11 +8996,11 @@ async fn read_workflow_run_cuts_long_replies_evenly_and_each_cut_reads_on() {
     assert!(kept.iter().all(|k| *k == kept[0]), "cut evenly: {kept:?}");
     for cut in &fitted.truncated {
         let call = cut.read_with.as_ref().unwrap();
-        assert_eq!(call["tool"], "read_send_output");
+        assert_eq!(call["tool"], "read_reply");
         let send_id: Uuid = serde_json::from_value(call["send_id"].clone()).unwrap();
         let agent_id: AgentId = serde_json::from_value(call["agent_id"].clone()).unwrap();
         let offset = usize::try_from(call["offset"].as_u64().unwrap()).unwrap();
-        let page = read_send_output(
+        let page = read_reply(
             &env.state,
             project_id,
             send_id,

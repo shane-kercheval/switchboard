@@ -125,7 +125,9 @@ fn core_code(error: &CoreError) -> &'static str {
 fn prompt_code(error: &PromptError) -> &'static str {
     match error {
         PromptError::McpNeedsAuth { .. } => PROMPT_NEEDS_SIGN_IN,
-        PromptError::MalformedId { .. }
+        // The server refused the arguments the caller gave: the caller's to fix.
+        PromptError::McpInvalidArguments { .. }
+        | PromptError::MalformedId { .. }
         | PromptError::ProviderNotFound { .. }
         | PromptError::PromptNotFound { .. }
         | PromptError::MissingRequiredArgument { .. }
@@ -209,6 +211,24 @@ mod tests {
             }),
             INVALID_ARGUMENT
         );
+    }
+
+    /// A prompt server refusing the arguments it was given is the caller's
+    /// to fix, as a missing argument to a local prompt is; a failure to reach
+    /// the server is not.
+    #[test]
+    fn a_prompt_servers_refused_arguments_are_the_callers_error() {
+        let refused = PromptError::McpInvalidArguments {
+            provider: "tiddly".to_owned(),
+            name: "review".to_owned(),
+            message: "missing required argument: context".to_owned(),
+        };
+        assert_eq!(error_code(&AppError::Prompt(refused)), INVALID_ARGUMENT);
+        let unreachable = PromptError::McpConnect {
+            provider: "tiddly".to_owned(),
+            message: "connection refused".to_owned(),
+        };
+        assert_eq!(error_code(&AppError::Prompt(unreachable)), INTERNAL);
     }
 
     #[test]

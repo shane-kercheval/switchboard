@@ -280,7 +280,7 @@ impl SelectionChanges {
 /// reachable from the desktop's picker. The read of the current record and
 /// the write happen under one registry lock, so a window edit landing in
 /// between is not undone.
-pub fn set_agent_selection(
+pub fn set_agent_model_and_effort(
     state: &AppState,
     project_id: ProjectId,
     agent_id: AgentId,

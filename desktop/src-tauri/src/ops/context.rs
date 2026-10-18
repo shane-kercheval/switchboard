@@ -25,7 +25,7 @@
 //! site cannot take it late.
 //!
 //! **The fallback read.** An agent nothing has parsed since launch is read
-//! once, the way `read_agent_output` reads it, by the first listing that needs
+//! once, the way `read_latest_reply` reads it, by the first listing that needs
 //! it; listings that arrive while that read runs join it. These reads run one
 //! at a time, because each parses a whole file into memory (the largest local
 //! files, 107 MB and 218 MB, parse in about 1 and 3.5 seconds and peak near

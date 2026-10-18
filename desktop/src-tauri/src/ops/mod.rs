@@ -58,10 +58,10 @@ mod tests;
 /// Code shows the model up to about 50,000 characters directly and saves a
 /// larger result to a file the model can open; Codex keeps about 10,000
 /// tokens and cuts the middle of anything longer. A model that needs more
-/// pages with `read_send_output` or asks the agent.
+/// pages with `read_reply` or asks the agent.
 pub const RESULT_BUDGET_CHARS: usize = 100_000;
 
-/// Characters per page of [`read::read_send_output`]: the result budget less
+/// Characters per page of [`read::read_reply`]: the result budget less
 /// room for the envelope around the text.
 pub const OUTPUT_PAGE_CHARS: usize = 95_000;
 
@@ -91,7 +91,7 @@ pub fn with_cap(mut call: serde_json::Value, budget_chars: usize) -> serde_json:
     call
 }
 
-/// Characters of text a `read_send_output` page may hold within
+/// Characters of text a `read_reply` page may hold within
 /// `budget_chars`: the budget less the envelope room the full budget leaves
 /// for [`OUTPUT_PAGE_CHARS`].
 #[must_use]

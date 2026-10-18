@@ -26,7 +26,7 @@
 //! so the agent's newest answer stays readable through it.
 //!
 //! **Workflow sends** are held like the agent tools' own, whoever started the
-//! run, so `wait_send`, `read_send_output`, and `cancel_send` follow a step's
+//! run, so `wait_send`, `read_reply`, and `cancel_send` follow a step's
 //! send while it runs rather than reading it back from the journal as if the
 //! app had restarted. The app's workflow provider
 //! (`ProjectDispatchFactoryProvider`) registers the step's send before
@@ -352,7 +352,7 @@ pub struct RunSnapshot {
 }
 
 /// One send a workflow step made: follow it with `wait_send`, and read any
-/// recipient's reply with `read_send_output` and this `send_id`, even after
+/// recipient's reply with `read_reply` and this `send_id`, even after
 /// the agent answered a later step.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RunSend {

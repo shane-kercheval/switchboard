@@ -73,7 +73,7 @@ pub struct ProjectDispatchFactoryProvider {
     /// lower }}`), which only the interpreter resolves.
     unheard: Vec<AgentId>,
     /// Where each send step is recorded before it dispatches, so `wait_send`,
-    /// `read_send_output`, and `cancel_send` follow a workflow's sends as they
+    /// `read_reply`, and `cancel_send` follow a workflow's sends as they
     /// do the agent tools' own.
     ledger: Arc<SendLedger>,
     /// Who started the run, recorded per send as it starts: the cancel tools

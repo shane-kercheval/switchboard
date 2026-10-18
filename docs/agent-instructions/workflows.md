@@ -462,7 +462,7 @@ steps:
 
 Three prompts ship as read-only built-ins under the `builtin:` provider. Reference one from a `send` step's `prompt:` field as `prompt: "builtin:<name>"`, or copy it into your own prompts to edit. These are the **only** `builtin:` prompt ids — any other `prompt:` id must resolve to a `local:` or MCP prompt that exists, or invocation is rejected.
 
-- **`builtin:code-review`** — review the current uncommitted changes for correctness, design, tests, and risk. Optional `context` argument.
+- **`builtin:code-review`** — review the current uncommitted changes (else the branch against main) for correctness, design, tests, and risk. Optional `context` argument: what to review instead (a diff base, a commit range, or files), what was already reviewed, and background.
 - **`builtin:security-review`** — review the current uncommitted changes for real, exploitable security vulnerabilities (high confidence bar, low noise). Optional `context` argument.
 - **`builtin:analyze-ai-reviews`** — analyze one or more reviews into a decision-ready, de-duplicated verdict. Required `review` argument (usually wired via `template_vars` with `aggregated_responses(...)`).
 
@@ -505,7 +505,7 @@ steps:
         Let me know what your recommendations are.
 ```
 
-The invocation form shows `reviewers`, `worker`, and the auto-derived optional `context` (from `builtin:code-review`). `context` is the background handed to each reviewer; the worker never sees it directly — only the reviewers' responses.
+The invocation form shows `reviewers`, `worker`, and the auto-derived optional `context` (from `builtin:code-review`). `context` is the scope and background handed to each reviewer; the worker never sees it directly, only the reviewers' responses, which it has already scoped.
 
 ### `review-and-reconcile` (flagship)
 
@@ -572,7 +572,7 @@ steps:
       agent: "{{ worker }}"
 ```
 
-The final step's rules for that response are shortened above; `crates/workflow/resources/workflows/review-and-reconcile.yaml` holds them in full. Both prompts are hardcoded. The invocation form shows `reviewers`, `worker`, and `code-review`'s auto-derived optional `context`. `analyze-ai-reviews`'s `review` argument is a computed binding, so it is hidden; if that prompt ever renamed `review`, invocation would be blocked with an error naming the prompt and argument rather than failing mid-run.
+The final step's rules for that response are shortened above; `crates/workflow/resources/workflows/review-and-reconcile.yaml` holds them in full. Both prompts are hardcoded. The invocation form shows `reviewers`, `worker`, and `code-review`'s auto-derived optional `context`, which reaches only the first step's reviewers; they keep it in their conversations for the pushback round. `analyze-ai-reviews`'s `review` argument is a computed binding, so it is hidden; if that prompt ever renamed `review`, invocation would be blocked with an error naming the prompt and argument rather than failing mid-run.
 
 ## Conventions
 

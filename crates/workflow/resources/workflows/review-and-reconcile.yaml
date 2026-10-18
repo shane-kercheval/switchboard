@@ -3,6 +3,8 @@ description: Reviewers review in parallel, a worker distills their feedback into
 # Both prompts are hardcoded: `builtin:code-review` for the reviewers and
 # `builtin:analyze-ai-reviews` for the worker's analysis. code-review's `context`
 # argument is auto-derived from the prompt and offered as a user-fillable field;
+# it reaches only the first step's reviewers, who keep it in their conversations
+# for the pushback round, while the worker sees only their scoped reviews;
 # analyze-ai-reviews's required `review` argument is a computed binding (filled
 # from the reviewers' aggregated responses) and never shown to the user.
 #

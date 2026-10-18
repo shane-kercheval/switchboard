@@ -3,7 +3,7 @@ name: code-review
 description: Architectural code review — design, correctness, and real bugs, not style nits.
 arguments:
   - name: context
-    description: Optional background or focus — what the change is for, areas to concentrate on, or constraints to weigh. Supplements (does not replace) the review of the changes.
+    description: "Optional. What to review when not the default (uncommitted changes, else this branch against main): a diff base, a commit range, or a subset of files. What was already reviewed, so it is not reviewed again. And background: what the change is for, areas to concentrate on, constraints to weigh."
     required: false
 ---
 # Code Review Guidelines
@@ -74,5 +74,5 @@ Additional context and focus for this review:
 {{ context }}
 """
 
-Concentrate where it points, and don't flag anything it explicitly rules out of scope. It supplements the review of the changes above — it does not replace it.
+If it names what to review (a diff base, a commit range, or files), review that instead of the default above. If it names what was already reviewed, don't review that again except where the new changes touch it. Otherwise concentrate where it points and don't flag anything it rules out of scope. It adds to the review of the changes above; it does not replace it.
 {%- endif %}

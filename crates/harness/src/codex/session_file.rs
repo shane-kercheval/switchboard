@@ -3868,6 +3868,35 @@ mod tests {
         );
     }
 
+    /// A Codex 0.163 first turn, trimmed from a rollout written by 0.163.0:
+    /// the turn writes its own `thread_settings_applied` after `turn_context`,
+    /// where 0.162 wrote one only on a resumed turn.
+    const CODEX_0163_FIRST_TURN: &str = r#"{"type":"session_meta","payload":{"id":"t-0163","cli_version":"0.163.0","history_mode":"paginated"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","turn_attribution":{"turn_id":"turn-1","turn_trigger":"exec"}}}
+{"type":"world_state","payload":{"full":true,"state":{"environments":{"environments":{"local":{"cwd":"/x","status":"available","shell":"zsh"}},"current_date":"2026-10-18","timezone":"America/Chicago"}}}}
+{"type":"turn_context","payload":{"turn_id":"turn-1","cwd":"/x","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"model":"gpt-6.1-sol","effort":"low","summary":"none"}}
+{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_id":"t-0163","thread_settings":{"model":"gpt-6.1-sol","approval_policy":"never","reasoning_effort":"low","personality":"pragmatic"}}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}
+"#;
+
+    #[test]
+    fn a_codex_0163_first_turn_reports_the_personality_from_its_own_settings_snapshot() {
+        let rendered = rendered_settings(CODEX_0163_FIRST_TURN);
+        let labels: Vec<&str> = rendered.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Sandbox",
+                "Approval policy",
+                "Personality",
+                "Shell",
+                "Timezone"
+            ],
+            "{rendered:?}"
+        );
+        assert!(rendered.contains(&("Personality".to_owned(), "pragmatic".to_owned())));
+    }
+
     #[test]
     fn personality_survives_a_file_that_mixes_codex_versions() {
         // Started on 0.161 (personality on `turn_context`), resumed on 0.162

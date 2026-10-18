@@ -26,6 +26,22 @@ cat >"$bin/codex" <<'FAKE'
 #!/bin/sh
 [ "$*" = "${FAKE_FAIL_ARGS:-}" ] && { echo "boom" >&2; exit 1; }
 method() { printf '{"properties":{"method":{"enum":["%s"]}}}' "$1"; }
+# Writes ClientRequest.json into $1. With $2 set, adds two experimental methods
+# (one listed twice), as `--experimental` adds them to the stable set.
+schema() {
+  mkdir -p "$1"
+  if [ -n "${FAKE_EMPTY:-}" ]; then
+    echo '{"oneOf":[]}' >"$1/ClientRequest.json"
+    return
+  fi
+  extra=""
+  [ -n "${2:-}" ] && extra=",$(method thread/readState/update),$(method thread/items/read),$(method thread/items/read)"
+  # One method per entry, as in Codex's schema, including names with no
+  # slash, a duplicate, and an unrelated enum that must not be listed.
+  printf '{"oneOf":[%s,%s,%s,%s%s],"definitions":{"Mode":{"enum":["read/only"]}}}\n' \
+    "$(method thread/start)" "$(method initialize)" \
+    "$(method account/rateLimits/read)" "$(method thread/start)" "$extra" >"$1/ClientRequest.json"
+}
 case "$*" in
   "--version") echo "codex-cli 9.9.9" ;;
   "help")
@@ -38,18 +54,8 @@ case "$*" in
   "help exec") printf 'Usage: codex exec\n\nCommands:\n  fork  Fork a session\n' ;;
   "help exec fork") echo "Usage: codex exec fork <SESSION_ID>" ;;
   "help plugin") echo "Usage: codex plugin" ;;
-  "app-server generate-json-schema --out "*)
-    mkdir -p "$4"
-    if [ -n "${FAKE_EMPTY:-}" ]; then
-      echo '{"oneOf":[]}' >"$4/ClientRequest.json"
-    else
-      # One method per entry, as in Codex's schema, including names with no
-      # slash, a duplicate, and an unrelated enum that must not be listed.
-      printf '{"oneOf":[%s,%s,%s,%s],"definitions":{"Mode":{"enum":["read/only"]}}}\n' \
-        "$(method thread/start)" "$(method initialize)" \
-        "$(method account/rateLimits/read)" "$(method thread/start)" >"$4/ClientRequest.json"
-    fi
-    ;;
+  "app-server generate-json-schema --out "*) schema "$4" ;;
+  "app-server generate-json-schema --experimental --out "*) schema "$5" experimental ;;
   *) echo "fake codex: unexpected arguments: $*" >&2; exit 64 ;;
 esac
 FAKE
@@ -178,8 +184,15 @@ fi
 
 name="codex: lists every app-server method, sorted and de-duplicated, and nothing else"
 if expect_success "$name" codex; then
-  table=$(sed -n '/^===== codex app-server methods/,$p' "$out" | tail -n +2)
+  table=$(sed -n '/^===== codex app-server methods (ClientRequest)$/,/^===== /p' "$out" | sed '1d;/^===== /d;/^$/d')
   expected=$(printf 'account/rateLimits/read\ninitialize\nthread/start')
+  if [[ $table == "$expected" ]]; then pass "$name"; else fail_test "$name" "got: $table"; fi
+fi
+
+name="codex: lists only the experimental app-server methods in their own table, sorted and de-duplicated"
+if expect_success "$name" codex; then
+  table=$(sed -n '/^===== codex app-server methods (ClientRequest, experimental only)$/,$p' "$out" | tail -n +2)
+  expected=$(printf 'thread/items/read\nthread/readState/update')
   if [[ $table == "$expected" ]]; then pass "$name"; else fail_test "$name" "got: $table"; fi
 fi
 

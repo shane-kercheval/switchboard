@@ -40,7 +40,7 @@ use super::read::{
 };
 use super::send::{
     AgentWaitStatus, Body, ForwardFrom, ForwardPrompt, ForwardRequest, OnBusyPolicy, SendRequest,
-    WaitSource, cancel_send, forward, refuse_if_busy, send, wait_agent, wait_send,
+    WaitSource, cancel_send, forward, refuse_if_busy, send, wait_agent, wait_any_send, wait_send,
     wait_send_budget,
 };
 use super::test_support::*;
@@ -2061,6 +2061,7 @@ fn a_workflow_wait_with_more_sends_than_fit_keeps_the_newest() {
     let reply = crate::ops::workflow::WaitWorkflowReply {
         run_id: Uuid::now_v7(),
         capped_to_seconds: None,
+        usage: None,
         status: WorkflowRunStatus::Completed,
         done: true,
         workflow: "long".to_owned(),
@@ -8703,4 +8704,297 @@ async fn read_workflow_run_reads_a_send_it_no_longer_holds_from_disk() {
         "a completed reply reads on from disk; the refusal's reason is not kept there"
     );
     r2_gate.notify_waiters();
+}
+
+// --- account usage on finished waits ------------------------------------------
+
+/// Store a Claude reading at `claude_used` and a Codex one at `codex_used`
+/// percent, observed `codex_age` ago, each window resetting tomorrow, as the
+/// window saves them.
+fn store_usage(env: &TestEnv, claude_used: f64, codex_used: u64, codex_age: chrono::Duration) {
+    let resets = (Utc::now() + chrono::Duration::days(1)).timestamp();
+    let claude_at = (Utc::now() - chrono::Duration::minutes(3)).to_rfc3339();
+    let codex_at = (Utc::now() - codex_age).to_rfc3339();
+    *lock(&env.state.harness_usage) = crate::harness_usage::HarnessUsage {
+        harnesses: [
+            (
+                "claude_code".to_owned(),
+                serde_json::json!({
+                    "observed_at": claude_at,
+                    "payload": {},
+                    "windows": { "five_hour": {
+                        "window": { "utilization": claude_used, "resetsAt": resets },
+                        "observed_at": claude_at,
+                    } },
+                }),
+            ),
+            (
+                "codex".to_owned(),
+                serde_json::json!({
+                    "observed_at": codex_at,
+                    "payload": { "ordinaryUsageAllowed": true, "rateLimitsByLimitId": {
+                        "codex": { "normalModelSlug": null, "planType": "pro",
+                                   "credits": { "balance": "12" },
+                                   "primary": { "usedPercent": codex_used, "resetsAt": resets,
+                                                "windowDurationMins": 300 },
+                                   "secondary": null } } },
+                }),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+}
+
+/// Make the Codex account read count its calls and answer `used` percent.
+fn counting_codex_read(env: &TestEnv, used: u64) -> Arc<std::sync::atomic::AtomicUsize> {
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let resets = (Utc::now() + chrono::Duration::days(1)).timestamp();
+    env.state.codex_usage_reader.set_read(Arc::new({
+        let reads = Arc::clone(&reads);
+        move |_handle| {
+            reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let usage: switchboard_harness::CodexAccountUsage =
+                serde_json::from_value(serde_json::json!({
+                    "ordinaryUsageAllowed": true,
+                    "rateLimitsByLimitId": { "codex": {
+                        "normalModelSlug": null, "planType": "pro",
+                        "primary": { "usedPercent": used, "resetsAt": resets,
+                                     "windowDurationMins": 300 },
+                        "secondary": null } }
+                }))
+                .unwrap();
+            Box::pin(async move { Some(usage) })
+        }
+    }));
+    reads
+}
+
+/// The used fraction of one harness's first window in a wait's usage.
+fn used(usage: Option<&Vec<super::usage::HarnessUsageReport>>, harness: &str) -> f64 {
+    let report = usage
+        .expect("a finished wait carries usage")
+        .iter()
+        .find(|r| r.harness == harness)
+        .unwrap();
+    report.windows[0].used_fraction
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Every wait, unfinished then finished, in one run.
+async fn finished_waits_carry_the_stored_usage_and_never_read_the_codex_account() {
+    let (env, project_id, agents) = workflow_env().await;
+    let coder = agents[0];
+    store_usage(&env, 0.25, 10, chrono::Duration::minutes(10));
+    let reads = counting_codex_read(&env, 77);
+    // Agent access's own Codex reading, newer than the window's stored one.
+    super::usage::get_usage(
+        env.handle(),
+        Duration::from_secs(5),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // From here on every reading is past the reader's one-minute freshness
+    // rule, so a wait that reached the reader would read the account.
+    env.state
+        .codex_usage_reader
+        .set_clock(Arc::new(|| Utc::now() + chrono::Duration::minutes(2)));
+
+    // Unfinished: no usage on any of the four waits.
+    let gate = Arc::new(Notify::new());
+    env.adapter
+        .push_for(coder, Script::parked("working", &gate));
+    let send_id = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![coder], "work"),
+    )
+    .await
+    .unwrap()
+    .send_id;
+    await_turn_running(&env.state, coder).await;
+    let now_only = WaitBudget::new(Some(0), false);
+    let pending = wait_send(&env.state, project_id, send_id, &now_only, &env.home())
+        .await
+        .unwrap();
+    assert!(!pending.done && pending.usage.is_none());
+    let pending_any = wait_any_send(
+        &env.state,
+        project_id,
+        vec![send_id],
+        &now_only,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert!(!pending_any.any_done && pending_any.usage.is_none());
+    let busy = wait_agent(&env.state, project_id, coder, &now_only, &env.home())
+        .await
+        .unwrap();
+    assert!(busy.status == AgentWaitStatus::Running && busy.usage.is_none());
+    gate.notify_waiters();
+
+    // Finished: the stored reading, with agent access's newer Codex one.
+    let done = wait_done(&env, project_id, send_id).await;
+    assert!((used(done.usage.as_ref(), "claude_code") - 0.25).abs() < f64::EPSILON);
+    assert!(
+        (used(done.usage.as_ref(), "codex") - 0.77).abs() < f64::EPSILON,
+        "agent access's own reading is newer than the stored one"
+    );
+    let done_json = serde_json::to_value(&done).unwrap();
+    let codex_window = &done_json["usage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["harness"] == "codex")
+        .unwrap()["windows"][0];
+    assert!(
+        codex_window.get("credits").is_none() && codex_window.get("duration_minutes").is_none(),
+        "the compact form: {codex_window}"
+    );
+    let done_any = wait_any_send(
+        &env.state,
+        project_id,
+        vec![send_id],
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert!(done_any.any_done);
+    assert!((used(done_any.usage.as_ref(), "codex") - 0.77).abs() < f64::EPSILON);
+    let idle = wait_agent(
+        &env.state,
+        project_id,
+        coder,
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(idle.status, AgentWaitStatus::Idle);
+    assert!((used(idle.usage.as_ref(), "claude_code") - 0.25).abs() < f64::EPSILON);
+
+    // A reading the window saves later than agent access's own is the one used.
+    store_usage(&env, 0.5, 50, chrono::Duration::zero());
+    let workflow_gate = Arc::new(Notify::new());
+    env.adapter
+        .push_for(coder, Script::parked("greeting", &workflow_gate));
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, coder).await;
+    let running = wait_workflow(&env.state, project_id, run_id, &now_only)
+        .await
+        .unwrap();
+    assert!(!running.done && running.usage.is_none());
+    workflow_gate.notify_waiters();
+    let ended = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert!(ended.done);
+    assert!(
+        (used(ended.usage.as_ref(), "codex") - 0.5).abs() < f64::EPSILON,
+        "the window's newer reading wins"
+    );
+
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "no wait read the Codex account"
+    );
+}
+
+#[tokio::test]
+async fn wait_any_send_carries_usage_once_at_its_top_level() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b"]);
+    store_usage(&env, 0.25, 10, chrono::Duration::minutes(10));
+    let first = answered(&env, project_id, agents[0], "one").await;
+    let second = answered(&env, project_id, agents[1], "two").await;
+    let reply = wait_any_send(
+        &env.state,
+        project_id,
+        vec![first, second],
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    let json = serde_json::to_value(&reply).unwrap();
+    assert!(json["usage"].is_array(), "{json}");
+    for send in json["sends"].as_array().unwrap() {
+        assert!(send.get("usage").is_none(), "not repeated per send: {send}");
+    }
+}
+
+#[tokio::test]
+async fn the_first_finished_waits_carry_a_stale_codex_reading_without_reading_the_account() {
+    let (env, project_id, agents) = workflow_env().await;
+    let coder = agents[0];
+    // Nothing fresh: the window's Codex reading is ten minutes old and agent
+    // access has read nothing, as for the first wait after the app starts.
+    store_usage(&env, 0.25, 10, chrono::Duration::minutes(10));
+    let reads = counting_codex_read(&env, 77);
+    let stale = |usage: Option<&Vec<super::usage::HarnessUsageReport>>| {
+        (used(usage, "codex") - 0.10).abs() < f64::EPSILON
+    };
+
+    let send_id = answered(&env, project_id, coder, "work").await;
+    let done = wait_done(&env, project_id, send_id).await;
+    assert!(stale(done.usage.as_ref()), "{:?}", done.usage);
+    let done_any = wait_any_send(
+        &env.state,
+        project_id,
+        vec![send_id],
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert!(stale(done_any.usage.as_ref()));
+    let idle = wait_agent(
+        &env.state,
+        project_id,
+        coder,
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert!(stale(idle.usage.as_ref()));
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    let ended = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert!(ended.done && stale(ended.usage.as_ref()));
+
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "with nothing fresh, no wait read the Codex account"
+    );
 }

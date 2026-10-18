@@ -47,7 +47,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::AppError;
 use crate::harness_usage::HarnessUsage;
 use crate::ops::handle::AppStateHandle;
-use crate::state::lock;
+use crate::state::{AppState, lock};
 
 /// How long `get_usage` waits for a Codex account read before answering from
 /// what is stored. Covers the read's own bound (30 seconds plus its teardown),
@@ -189,6 +189,13 @@ impl CodexUsageReader {
         Utc::now()
     }
 
+    /// This module's newest Codex reading and when it was taken, without
+    /// reading the account.
+    #[must_use]
+    pub fn latest(&self) -> Option<CodexReading> {
+        lock(&self.inner).latest.clone()
+    }
+
     /// This module's newest Codex reading after reading if the newest of
     /// `stored_at` (the window's reading), its own reading, and its last
     /// attempt is a minute old or more, waiting up to `budget` for a read in
@@ -267,6 +274,28 @@ pub async fn get_usage(
     // one to report.
     let stored = lock(&state.harness_usage).clone();
     Ok(report(&stored, fresh.as_ref(), Utc::now()))
+}
+
+/// Every harness account's limits as last read, reading nothing: the window's
+/// stored readings, with agent access's own Codex reading in place of the
+/// stored one when it is newer. For the waits' finished results, which must
+/// not start a Codex account read per wait (an orchestrator waits often, and a
+/// read can take half a minute). A Claude reading is as old as the newest
+/// Claude reply in the app; a Codex reading as old as the window's last account
+/// read, which it starts after each Codex turn ends, or this module's last
+/// one; each window's `observed_at` says. Each window's `credits` block and
+/// `duration_minutes` are left out to keep a wait's result small; `get_usage`
+/// carries them.
+#[must_use]
+pub fn stored_usage(state: &AppState) -> Vec<HarnessUsageReport> {
+    let stored = lock(&state.harness_usage).clone();
+    let own = state.codex_usage_reader.latest();
+    let mut reports = report(&stored, own.as_ref(), Utc::now());
+    for window in reports.iter_mut().flat_map(|r| r.windows.iter_mut()) {
+        window.credits = None;
+        window.duration_minutes = None;
+    }
+    reports
 }
 
 /// The report for a stored map, taking `fresh` for Codex when it is newer than

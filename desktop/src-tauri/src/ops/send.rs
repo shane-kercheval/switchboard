@@ -80,6 +80,7 @@ use super::read::{
     AgentOutput, agent_in_project, correlate_turns, project_readonly, read_agent_output,
     read_journal,
 };
+use super::usage::stored_usage;
 use super::wait::{Observed, Outcome, WaitBudget, wait_until};
 
 /// What a send says.
@@ -1244,6 +1245,12 @@ pub struct WaitSendReply {
     /// progress token to keep a longer one alive (or asked for over an hour).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capped_to_seconds: Option<u64>,
+    /// Each harness account's limits as last read, as `get_usage` reports them
+    /// without each window's credits and duration, on a finished result only:
+    /// information for choosing the next step's model and effort. No Codex
+    /// account is read for it; each window's `observed_at` says how old it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Vec<super::usage::HarnessUsageReport>>,
     /// Every recipient reached a terminal status. While `false`, recipients
     /// carry statuses, activity, and the end of their text so far, never the
     /// whole reply, so a caller that must call again every 50 seconds pays a
@@ -1265,6 +1272,9 @@ pub async fn wait_send(
     let mut reply = wait_send_unreported(state, project_id, send_id, budget, home_dir).await?;
     reply.capped_to_seconds = budget.capped_to_seconds();
     add_context(state, &mut reply);
+    if reply.done {
+        reply.usage = Some(stored_usage(state));
+    }
     Ok(reply)
 }
 
@@ -1303,6 +1313,12 @@ pub struct WaitAnySendReply {
     /// progress token to keep a longer one alive (or asked for over an hour).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capped_to_seconds: Option<u64>,
+    /// Each harness account's limits as last read, as `get_usage` reports them
+    /// without each window's credits and duration, on a finished result only:
+    /// information for choosing the next step's model and effort. No Codex
+    /// account is read for it; each window's `observed_at` says how old it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Vec<super::usage::HarnessUsageReport>>,
     /// At least one of the sends is done.
     pub any_done: bool,
     /// Each send asked about, once, in the order asked, as `wait_send`
@@ -1368,9 +1384,11 @@ pub async fn wait_any_send(
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
+    let any_done = sends.iter().any(|send| send.done);
     Ok(WaitAnySendReply {
         capped_to_seconds: budget.capped_to_seconds(),
-        any_done: sends.iter().any(|send| send.done),
+        usage: any_done.then(|| stored_usage(state)),
+        any_done,
         sends,
     })
 }
@@ -1402,6 +1420,7 @@ pub(super) async fn current_send(
             reply: WaitSendReply {
                 send_id,
                 capped_to_seconds: None,
+                usage: None,
                 done: snapshot.is_done(),
                 source: WaitSource::Live,
                 recipients: snapshot.recipients,
@@ -1445,6 +1464,7 @@ fn live_reply(send_id: SendId, snapshot: SendSnapshot) -> WaitSendReply {
     WaitSendReply {
         send_id,
         capped_to_seconds: None,
+        usage: None,
         done,
         source: WaitSource::Live,
         recipients,
@@ -1471,6 +1491,7 @@ async fn unheld_reply(
         Outcome::Timeout | Outcome::Cancelled => Ok(WaitSendReply {
             send_id,
             capped_to_seconds: None,
+            usage: None,
             done: false,
             source: WaitSource::Journal,
             recipients: Vec::new(),
@@ -1542,6 +1563,7 @@ async fn journal_fallback(
         return Ok(WaitSendReply {
             send_id,
             capped_to_seconds: None,
+            usage: None,
             done: true,
             source: WaitSource::Unknown,
             recipients: Vec::new(),
@@ -1565,6 +1587,7 @@ async fn journal_fallback(
     Ok(WaitSendReply {
         send_id,
         capped_to_seconds: None,
+        usage: None,
         // Nothing more can arrive from a restart's journal; the caller decides
         // what a lingering `started` means.
         done: true,
@@ -1636,6 +1659,12 @@ pub struct WaitAgentReply {
     /// progress token to keep a longer one alive (or asked for over an hour).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capped_to_seconds: Option<u64>,
+    /// Each harness account's limits as last read, as `get_usage` reports them
+    /// without each window's credits and duration, on a finished result only:
+    /// information for choosing the next step's model and effort. No Codex
+    /// account is read for it; each window's `observed_at` says how old it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Vec<super::usage::HarnessUsageReport>>,
     pub status: AgentWaitStatus,
     /// The agent's latest output, once idle.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1658,6 +1687,9 @@ pub async fn wait_agent(
 ) -> Result<WaitAgentReply, AppError> {
     let mut reply = wait_agent_unreported(state, project_id, agent_id, budget, home_dir).await?;
     reply.capped_to_seconds = budget.capped_to_seconds();
+    if reply.status == AgentWaitStatus::Idle {
+        reply.usage = Some(stored_usage(state));
+    }
     Ok(reply)
 }
 
@@ -1695,6 +1727,7 @@ async fn wait_agent_unreported(
             agent_id,
             activity: state.ledger.activity(agent_id),
             capped_to_seconds: None,
+            usage: None,
             status: AgentWaitStatus::Running,
             output: None,
             output_unavailable: false,
@@ -1711,6 +1744,7 @@ async fn wait_agent_unreported(
         agent_id,
         activity: state.ledger.activity(agent_id),
         capped_to_seconds: None,
+        usage: None,
         status: AgentWaitStatus::Idle,
         output_unavailable: output.is_none(),
         output,

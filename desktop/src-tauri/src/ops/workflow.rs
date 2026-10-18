@@ -157,13 +157,19 @@ pub enum WorkflowRunStatus {
     Interrupted,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WaitWorkflowReply {
     pub run_id: Uuid,
     /// The wait was shortened to this many seconds: the client sent no
     /// progress token to keep a longer one alive (or asked for over an hour).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capped_to_seconds: Option<u64>,
+    /// Each harness account's limits as last read, as `get_usage` reports them
+    /// without each window's credits and duration, on a finished result only:
+    /// information for choosing the next step's model and effort. No Codex
+    /// account is read for it; each window's `observed_at` says how old it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Vec<super::usage::HarnessUsageReport>>,
     pub status: WorkflowRunStatus,
     pub done: bool,
     pub workflow: String,
@@ -215,6 +221,9 @@ pub async fn wait_workflow(
 ) -> Result<WaitWorkflowReply, AppError> {
     let mut reply = wait_workflow_unreported(state, project_id, run_id, budget).await?;
     reply.capped_to_seconds = budget.capped_to_seconds();
+    if reply.done {
+        reply.usage = Some(super::usage::stored_usage(state));
+    }
     Ok(reply)
 }
 
@@ -253,6 +262,7 @@ fn observe_run(state: &AppState, project_id: ProjectId, run_id: Uuid) -> Option<
         Some(run) if run.project_id == project_id => Some(WaitWorkflowReply {
             run_id,
             capped_to_seconds: None,
+            usage: None,
             status: match run.status {
                 RunState::Running => WorkflowRunStatus::Running,
                 RunState::Completed => WorkflowRunStatus::Completed,
@@ -294,6 +304,7 @@ fn run_from_files(
     Ok(WaitWorkflowReply {
         run_id,
         capped_to_seconds: None,
+        usage: None,
         status,
         done: status != WorkflowRunStatus::Running,
         label: step_label(&info.steps, info.step),
@@ -328,6 +339,7 @@ fn live_run(state: &AppState, project_id: ProjectId, run_id: Uuid) -> Option<Wai
     Some(WaitWorkflowReply {
         run_id,
         capped_to_seconds: None,
+        usage: None,
         status: WorkflowRunStatus::Running,
         done: false,
         workflow: run.workflow.clone(),

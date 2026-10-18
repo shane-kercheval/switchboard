@@ -122,6 +122,15 @@ long timeout (e.g. 600): the call moves to the background and its result arrives
 when it settles. Claude Desktop, its Code tab included, sends no token: use the default and call \
 again. In Codex, stay under 300 seconds unless the user raised tool_timeout_sec.";
 
+/// What a finished wait's `usage` is, shared by every wait's description.
+const USAGE_NOTE: &str = "\
+carries usage: each harness account's limits as get_usage reports them, without each window's \
+credits and duration_minutes, from the last reading Switchboard holds; the wait reads no \
+account. A Claude reading is as old as the newest Claude reply anywhere in the app. A Codex \
+reading is as old as Switchboard's last account read, which it starts after each Codex turn \
+ends, so it can predate the turn that just finished. Each window's observed_at says. Call \
+get_usage for a fresh Codex reading.";
+
 // --- the catalog ---------------------------------------------------------------
 
 macro_rules! tools {
@@ -433,7 +442,8 @@ tools! {
              Switchboard's record of it), or unknown: this project has no record of the send, so \
              check project_id and send_id; a message still waiting in line when the app restarted \
              was never sent and reads this way too. Long replies share the result evenly, each cut \
-             one listed in truncated with the read_send_output call that reads on.\n{WAIT_HINTS}"
+             one listed in truncated with the read_send_output call that reads on. When done, \
+             the result also {USAGE_NOTE}\n{WAIT_HINTS}"
         );
     WaitAnySend = "wait_any_send" (WaitAnySendArgs) [Read]
         format!(
@@ -444,7 +454,8 @@ tools! {
              activity, and recent_text. any_done says whether one finished. Call again with the \
              sends still running; a send already done returns at once. Long replies share the \
              result evenly, each cut one listed in truncated with the read_send_output call \
-             that reads on.\n{WAIT_HINTS}"
+             that reads on. When any_done, the result also, once at its top level, \
+             {USAGE_NOTE}\n{WAIT_HINTS}"
         );
     WaitAgent = "wait_agent" (WaitAgentArgs) [Read]
         format!(
@@ -452,7 +463,7 @@ tools! {
              output; or running once timeout_seconds passes (call again), with the agent's \
              activity (as list_agents describes it). idle is an \
              observation: the user or a workflow can occupy the agent before your next send, \
-             which then returns agent_busy.\n{WAIT_HINTS}"
+             which then returns agent_busy. When idle, the result also {USAGE_NOTE}\n{WAIT_HINTS}"
         );
     WaitWorkflow = "wait_workflow" (WaitWorkflowArgs) [Read]
         format!(
@@ -468,7 +479,7 @@ tools! {
              says how many of the earliest were left out, and read_workflow_run still lists \
              them. sends_unavailable is true once Switchboard no longer holds the \
              run's record (after a restart, or once it pruned the run): its sends are no longer \
-             known.\n{WAIT_HINTS}"
+             known. When done, the result also {USAGE_NOTE}\n{WAIT_HINTS}"
         );
 }
 

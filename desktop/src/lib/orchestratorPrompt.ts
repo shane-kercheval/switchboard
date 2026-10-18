@@ -196,7 +196,7 @@ When you ask, say in one sentence why it is my call and not yours. If you can't 
 
 ## Choosing agents, models, and effort
 
-These are my defaults; change them to yours. Weigh them against how much usage is left: get_usage shows each account's limits, and list_agents shows each agent's model and effort and its quick-choice models.
+These are my defaults; change them to yours. Weigh them against how much usage is left: every finished wait (wait_send, wait_any_send, wait_agent, wait_workflow) carries each account's limits as last read, and get_usage shows them with a fresh Codex reading; list_agents shows each agent's model and effort and its quick-choice models.
 
 - Codex suits fast, tactical, well-scoped work: UI changes, targeted fixes, code reviews. Claude suits work that needs judgment across a lot of context: design questions, larger changes, plans, ambiguous problems. When it isn't clear, pick one and say which in your report.
 - Reviews: one Codex agent and one Claude agent, since the two catch different things.

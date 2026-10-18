@@ -1,4 +1,4 @@
-version: 2.1.296 (Claude Code)
+version: 2.1.302 (Claude Code)
 
 ===== claude --help
 Usage: claude [options] [command] [prompt]
@@ -196,19 +196,19 @@ Options:
                                         --output-format=stream-json)
   --restricted                          Restricted mode: removes the built-in
                                         tools that run commands or code (Bash,
-                                        PowerShell, REPL and the other
-                                        code-running tools) and WebFetch unless
-                                        --tools names them, and ignores user,
-                                        project and local settings files
-                                        (managed settings and --settings still
-                                        apply; add --strict-mcp-config to skip
-                                        MCP servers too). Also confines the file
-                                        tools to the working directories
-                                        (--add-dir included), refuses
-                                        bypassPermissions, and lets only a
-                                        person or the configured permission
-                                        handler approve writes to settings, git
-                                        and tool-configuration files.
+                                        PowerShell and the other code-running
+                                        tools) and WebFetch unless --tools names
+                                        them, and ignores user, project and
+                                        local settings files (managed settings
+                                        and --settings still apply; add
+                                        --strict-mcp-config to skip MCP servers
+                                        too). Also confines the file tools to
+                                        the working directories (--add-dir
+                                        included), refuses bypassPermissions,
+                                        and lets only a person or the configured
+                                        permission handler approve writes to
+                                        settings, git and tool-configuration
+                                        files.
   -r, --resume [value]                  Resume a conversation by session ID, or
                                         open interactive picker with optional
                                         search term
@@ -805,83 +805,90 @@ passing is not a security vetting. The first run in an untrusted plugin
 directory asks you to confirm (--trust-plugin answers for CI)
 
 Options:
-  --ablation <mode>         Run a no-plugin baseline arm and report the score
-                            delta (none | with-without; default: with-without
-                            whenever a plugin resolves — by name, or from the
-                            target path — and none when nothing does; under
-                            with-without, graders marked with-only, incl.
-                            `tool_used: Skill`, are a plugin-fired indicator
-                            rather than part of the score)
-  --allow-real-servers      With --mocks record: also start the plugin's REAL
-                            MCP server processes for servers that have no mock
-                            (they run as you, outside the OS sandbox that
-                            confines shell tools; use only on plugins you trust)
-  --allow-tools <tools...>  Operator grant for gated tools (Bash, Write, Edit,
-                            WebFetch, mcp__*). Supports Tool(pattern:*) syntax
-  --case <glob>             Filter cases by name glob
-  -j, --concurrency <n>     Run up to <n> agent runs at once (1-8; default 1).
-                            Each run is a full claude child on your own
-                            credential, so they share one rate limit; results
-                            and the report keep case order
-  --eval-dir <dir>          Directory name (below the plugin) that holds the
-                            eval cases; results go to <plugin>/<dir>/results/ —
-                            for an installed-plugin target, ./<dir>/results/
-                            with this flag, else ./evals/results/ (default dir:
-                            the manifest's experimental.evals value, else
-                            evals/)
-  -h, --help                Display help for command
-  --json [path]             Print the full run result (prompts, graders, per-run
-                            scores) as JSON to stdout, or write it to this .json
-                            file
-  --judge-model <model>     Override LLM-grader model (default: haiku)
-  --keep-temp               Preserve scaffold dirs for debugging
-  --max-cost-usd <usd>      Optional hard cost ceiling; abort and report partial
-                            results if hit (exit 2). The ceiling is checked
-                            before each run launches, so overrun is bounded to
-                            the runs in flight (one, or up to --concurrency) —
-                            when a run breaches, paid graders (llm/baseline) are
-                            skipped while free graders still score it. Runs are
-                            already bounded by max_turns and timeout_seconds —
-                            only set this when you need a strict budget
-  --mocks <mode>            Mock stand-ins for MCP servers, from <eval
-                            dir>/mocks/ (record | off; default: record). record:
-                            a plugin server with no mock is NOT started (see
-                            --allow-real-servers); off: no stand-ins, every real
-                            server starts (as you, outside the OS sandbox), its
-                            tools gated by --allow-tools
-  --model <model>           Override model for all cases
-  --no-publish              Keep the HTML report local only; skip publishing it
-                            to claude.ai
-  --no-scaffold             Explicitly skip scaffold_script
-  --output-dir <dir>        Directory for aggregate-result.json (default:
-                            ./<eval dir>/results/<timestamp>/)
-  --publish-report          Also require publishing the report to claude.ai
-                            (already the default when your account supports it);
-                            explains why if unavailable
-  --report <path>           Write the self-contained HTML report (scores,
-                            prompts, grader verdicts) to <path> instead of the
-                            results dir
-  --runs <n>                Override per-case runs (default: case.runs ?? 3)
-  --scaffold                Run each case's scaffold_script (runs
-                            author-supplied bash as you; off by default — only
-                            use on case files you authored)
-  --tag <tag...>            Filter cases by tag (repeatable)
-  --threshold <0..1>        Exit 1 if any case score is below this threshold
-                            (default: 1.0)
-  --trust-plugin            Assert that you trust this plugin's code and eval
-                            suite, and skip the first-run trust prompt (for CI;
-                            like --dangerously-skip-permissions, only pass it
-                            for plugins you would run yourself). Does not imply
-                            --scaffold, --allow-tools or --mocks off
-  --verbose                 Log per-message trace events to the debug log (use
-                            --debug-file to read them)
+  --ablation <mode>            Run a no-plugin baseline arm and report the score
+                               delta (none | with-without; default: with-without
+                               whenever a plugin resolves — by name, or from the
+                               target path — and none when nothing does; under
+                               with-without, graders marked with-only, incl.
+                               `tool_used: Skill`, are a plugin-fired indicator
+                               rather than part of the score)
+  --allow-real-servers         With --mocks record: also start the plugin's REAL
+                               MCP server processes for servers that have no
+                               mock (they run as you, outside the OS sandbox
+                               that confines shell tools; use only on plugins
+                               you trust)
+  --allow-tools <tools...>     Operator grant for gated tools (Bash, Write,
+                               Edit, WebFetch, mcp__*). Supports Tool(pattern:*)
+                               syntax
+  --case <glob>                Filter cases by name glob
+  -j, --concurrency <n>        Run up to <n> agent runs at once (1-8; default
+                               1). Each run is a full claude child on your own
+                               credential, so they share one rate limit; results
+                               and the report keep case order
+  --disallow-tools <tools...>  Built-in tools to keep from Claude in every case,
+                               even if granted (e.g. Agent TaskStop)
+  --eval-dir <dir>             Directory name (below the plugin) that holds the
+                               eval cases; results go to <plugin>/<dir>/results/
+                               — for an installed-plugin target,
+                               ./<dir>/results/ with this flag, else
+                               ./evals/results/ (default dir: the manifest's
+                               experimental.evals value, else evals/)
+  -h, --help                   Display help for command
+  --json [path]                Print the full run result (prompts, graders,
+                               per-run scores) as JSON to stdout, or write it to
+                               this .json file
+  --judge-model <model>        Override LLM-grader model (default: haiku)
+  --keep-temp                  Preserve scaffold dirs for debugging
+  --max-cost-usd <usd>         Optional hard cost ceiling; abort and report
+                               partial results if hit (exit 2). The ceiling is
+                               checked before each run launches, so overrun is
+                               bounded to the runs in flight (one, or up to
+                               --concurrency) — when a run breaches, paid
+                               graders (llm/baseline) are skipped while free
+                               graders still score it. Runs are already bounded
+                               by max_turns and timeout_seconds — only set this
+                               when you need a strict budget
+  --mocks <mode>               Mock stand-ins for MCP servers, from <eval
+                               dir>/mocks/ (record | off; default: record).
+                               record: a plugin server with no mock is NOT
+                               started (see --allow-real-servers); off: no
+                               stand-ins, every real server starts (as you,
+                               outside the OS sandbox), its tools gated by
+                               --allow-tools
+  --model <model>              Override model for all cases
+  --no-publish                 Keep the HTML report local only; skip publishing
+                               it to claude.ai
+  --no-scaffold                Explicitly skip scaffold_script
+  --output-dir <dir>           Directory for aggregate-result.json (default:
+                               ./<eval dir>/results/<timestamp>/)
+  --publish-report             Also require publishing the report to claude.ai
+                               (already the default when your account supports
+                               it); explains why if unavailable
+  --report <path>              Write the self-contained HTML report (scores,
+                               prompts, grader verdicts) to <path> instead of
+                               the results dir
+  --runs <n>                   Override per-case runs (default: case.runs ?? 3)
+  --scaffold                   Run each case's scaffold_script (runs
+                               author-supplied bash as you; off by default —
+                               only use on case files you authored)
+  --tag <tag...>               Filter cases by tag (repeatable)
+  --threshold <0..1>           Exit 1 if any case score is below this threshold
+                               (default: 1.0)
+  --trust-plugin               Assert that you trust this plugin's code and eval
+                               suite, and skip the first-run trust prompt (for
+                               CI; like --dangerously-skip-permissions, only
+                               pass it for plugins you would run yourself). Does
+                               not imply --scaffold, --allow-tools or --mocks
+                               off
+  --verbose                    Log per-message trace events to the debug log
+                               (use --debug-file to read them)
 
 Commands:
-  init [options] [name]     Author an eval suite under the eval dir (evals/
-                            unless --eval-dir or the manifest says otherwise)
-                            via an interview that sources inputs and designs
-                            graders. Use --bare <name> for a blank single-case
-                            template.
+  init [options] [name]        Author an eval suite under the eval dir (evals/
+                               unless --eval-dir or the manifest says otherwise)
+                               via an interview that sources inputs and designs
+                               graders. Use --bare <name> for a blank
+                               single-case template.
 
 ===== claude plugin eval init --help
 Usage: claude plugin eval init [options] [name]

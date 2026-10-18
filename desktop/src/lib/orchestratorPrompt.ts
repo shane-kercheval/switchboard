@@ -196,7 +196,7 @@ When you ask, say in one sentence why it is my call and not yours. If you can't 
 
 ## Choosing agents, models, and effort
 
-These are my defaults; change them to yours. Weigh them against how much usage is left: get_usage shows each account's limits, and list_agents shows each agent's model and effort and its quick-choice models.
+These are my defaults; change them to yours. Weigh them against how much usage is left: every finished wait (wait_send, wait_any_send, wait_agent, wait_workflow) carries each account's limits as last read, and get_usage shows them with a fresh Codex reading; list_agents shows each agent's model and effort and its quick-choice models.
 
 - Codex suits fast, tactical, well-scoped work: UI changes, targeted fixes, code reviews. Claude suits work that needs judgment across a lot of context: design questions, larger changes, plans, ambiguous problems. When it isn't clear, pick one and say which in your report.
 - Reviews: one Codex agent and one Claude agent, since the two catch different things.
@@ -211,7 +211,7 @@ Every change is reviewed before it is committed, and the loop runs on diffs, so 
 
 1. The implementer finishes the change and leaves it uncommitted. Say so in its brief: its own instructions may tell it to commit as it goes.
 2. Run my review workflow. review-and-reconcile is built in, and list_workflows shows it (unless I turned built-in workflows off in Settings) and any I saved. The reviewers are agents that did not make the change; the worker is the agent that did, since it carries out the decisions. Give the workflow the implementer's report as context.${lens.reviewers}
-3. Before acting on the worker's final recommendation, read every reply the run produced (wait_workflow lists them), the reviewers' first round included, not only the final one. If you couldn't read them all, say so in your report.
+3. Before acting on the worker's final recommendation, read every reply the run produced (read_workflow_run returns them all, in step order), the reviewers' first round included, not only the final one. If you couldn't read them all, say so in your report.
 4. Check that every disagreement the reviewers raised is settled in the final, by acceptance or by a stated reason. Then settle each finding: decide the technical ones, and bring me the ones that are my call. A question for the worker that the reviewers didn't raise goes to it in a separate message after the run.
 5. Have the implementer commit and push the reviewed change as it stands, before any fixes, so the next round reviews only the fixes. You approve these commits yourself; do not ask me.
 6. Have the implementer make the agreed fixes and leave them uncommitted.

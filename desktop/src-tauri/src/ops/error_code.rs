@@ -30,6 +30,11 @@ pub const SEND_UNKNOWN: &str = "send_unknown";
 pub const RUN_UNKNOWN: &str = "run_unknown";
 pub const WORKFLOW_RUN_REQUIRES_DISMISSAL: &str = "workflow_run_requires_dismissal";
 pub const WORKFLOW_ALREADY_RUNNING: &str = "workflow_already_running";
+/// A workflow step's recipient was never offered the message because the
+/// step could not get it ready (its prompt did not render, an agent was
+/// unavailable, or a pre-dispatch check refused one). Carried by the
+/// recipient, not returned as an error: the run reports the step's failure.
+pub const WORKFLOW_STEP_FAILED: &str = "workflow_step_failed";
 pub const RESULT_TOO_LARGE: &str = "result_too_large";
 pub const REQUEST_IN_PROGRESS: &str = "request_in_progress";
 pub const COMPACTION_UNSUPPORTED: &str = "compaction_unsupported";
@@ -62,14 +67,18 @@ pub fn error_code(error: &AppError) -> &'static str {
         // A fork's source mid-turn, including the Codex case where another
         // program holds the parent's session: the advice is the same, wait for
         // the source.
-        AppError::SourceBusy { .. } | AppError::ForkSourceBusy { .. } => SOURCE_BUSY,
+        AppError::SourceBusy { .. }
+        | AppError::ForkSourceBusy { .. }
+        | AppError::ForwardReplyUnfinished { .. } => SOURCE_BUSY,
         AppError::DirectoryMissing { .. } => DIRECTORY_MISSING,
         AppError::DesktopUnavailable { .. } | AppError::DesktopSyncFailed { .. } => {
             DESKTOP_UNAVAILABLE
         }
         AppError::ProjectLoadTimeout(_) => PROJECT_LOAD_TIMEOUT,
         AppError::PromptTooLarge(_) => PROMPT_TOO_LARGE,
-        AppError::SendUnknown(_) | AppError::SendNotCancellable { .. } => SEND_UNKNOWN,
+        AppError::SendUnknown(_)
+        | AppError::SendNotCancellable { .. }
+        | AppError::ForwardReplyUnknown { .. } => SEND_UNKNOWN,
         AppError::WorkflowRunNotFound { .. } => RUN_UNKNOWN,
         AppError::WorkflowRunRequiresDismissal { .. } => WORKFLOW_RUN_REQUIRES_DISMISSAL,
         AppError::WorkflowAlreadyRunning { .. } => WORKFLOW_ALREADY_RUNNING,
@@ -84,6 +93,8 @@ pub fn error_code(error: &AppError) -> &'static str {
         AppError::InvalidArgument(_)
         | AppError::InvalidUuid { .. }
         | AppError::NoForwardSources
+        | AppError::ForwardReplyNotCompleted { .. }
+        | AppError::ForwardReplyUnconfirmed { .. }
         | AppError::Workflow(_)
         | AppError::WorkflowNotFound { .. }
         | AppError::WorkflowStepUnsupported
@@ -162,6 +173,42 @@ mod tests {
             FORK_UNSUPPORTED
         );
         assert_eq!(error_code(&AppError::CodexForkNeedsRealHarness), INTERNAL);
+    }
+
+    #[test]
+    fn a_forward_naming_a_reply_it_cannot_send_says_why_in_its_code() {
+        let name = || "reviewer".to_owned();
+        let send_id = uuid::Uuid::now_v7();
+        assert_eq!(
+            error_code(&AppError::ForwardReplyUnknown {
+                name: name(),
+                send_id
+            }),
+            SEND_UNKNOWN
+        );
+        assert_eq!(
+            error_code(&AppError::ForwardReplyUnfinished {
+                name: name(),
+                send_id,
+                state: "running"
+            }),
+            SOURCE_BUSY
+        );
+        assert_eq!(
+            error_code(&AppError::ForwardReplyNotCompleted {
+                name: name(),
+                send_id,
+                state: "failed"
+            }),
+            INVALID_ARGUMENT
+        );
+        assert_eq!(
+            error_code(&AppError::ForwardReplyUnconfirmed {
+                name: name(),
+                send_id
+            }),
+            INVALID_ARGUMENT
+        );
     }
 
     #[test]

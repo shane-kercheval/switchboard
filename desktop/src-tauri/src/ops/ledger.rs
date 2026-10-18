@@ -13,16 +13,35 @@
 //! feeds every turn end's usage to [`super::context`], the read tier's record
 //! of each agent's context fullness.
 //!
-//! **Correlation.** `ops` chooses each send's `message_id` and registers it
-//! here *before* dispatching, so the first event the actor emits for it lands
-//! on an entry that already exists: no orphan map, no fallback matching.
-//! `turn_start`, `message_failed`, and `message_cancelled` carry `message_id`;
-//! `turn_end` and content carry the `turn_id` that `turn_start` announced.
-//! Events for message ids the ledger never registered (compose sends,
-//! workflow steps) are ignored, except that every agent's latest `turn_start`
-//! is noted so a reader can tell whether the agent's newest turn is one the
-//! ledger holds. A compaction's `turn_start` is the exception: a compaction
-//! is not an answer, so the agent's newest answer stays readable through it.
+//! **Correlation.** `ops`, and the workflow engine through its dispatch
+//! provider, choose each send's `message_id` and register it here *before*
+//! dispatching, so the first event the actor emits for it lands on an entry
+//! that already exists: no orphan map, no fallback matching. `turn_start`,
+//! `message_failed`, and `message_cancelled` carry `message_id`; `turn_end`
+//! and content carry the `turn_id` that `turn_start` announced. Events for
+//! message ids the ledger never registered (the window's compose sends) are
+//! ignored, except that every agent's latest `turn_start` is noted so a
+//! reader can tell whether the agent's newest turn is one the ledger holds. A
+//! compaction's `turn_start` is the exception: a compaction is not an answer,
+//! so the agent's newest answer stays readable through it.
+//!
+//! **Workflow sends** are held like the agent tools' own, whoever started the
+//! run, so `wait_send`, `read_send_output`, and `cancel_send` follow a step's
+//! send while it runs rather than reading it back from the journal as if the
+//! app had restarted. The app's workflow provider
+//! (`ProjectDispatchFactoryProvider`) registers the step's send before
+//! building its message, every recipient `not_dispatched`; marks each
+//! recipient accepted, minting its `message_id`, just before offering it;
+//! records a busy agent as rejected; and settles the send when the step's
+//! dispatch ends, refusing the recipients it never reached with
+//! `workflow_step_failed` when the step could not get its message ready. A
+//! workflow send has no idempotency key. A cancel `cancel_send` records, of
+//! the send or of any one of its replies (which ends the run), stops the
+//! step offering the message to anyone else and ends the run cancelled, even
+//! when the dispatcher's answer was that the agent was busy or a later
+//! recipient's pre-dispatch check refused: the engine decides once, when the
+//! step stops, and tells the provider, so the recipients it never reached read
+//! `cancelled`.
 //!
 //! **Text.** What counts as an agent's answer is [`TextCapture`]'s rule,
 //! observed over the wire events; it is the same rule the dispatcher applies
@@ -67,8 +86,8 @@
 //! time, not registration time: an entry is registered at its claim and
 //! admitted at dispatch, after preparation, so a message registered first can
 //! be admitted after a compaction registered later. The ledger holds only
-//! what orchestrators queued, so work the window queued is not seen; nothing
-//! is lost or duplicated either way.
+//! what orchestrators and workflows queued, so work the window's compose bar
+//! queued is not seen; nothing is lost or duplicated either way.
 //!
 //! **Idempotency.** A caller's `idempotency_key`, scoped to the project, is
 //! claimed here under the ledger lock together with a hash of the request. A
@@ -184,6 +203,25 @@ pub struct RecipientSnapshot {
     /// before the next step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<super::context::ContextFigures>,
+}
+
+impl RecipientSnapshot {
+    /// A recipient known only by its status: nothing it wrote, no error.
+    #[must_use]
+    pub fn bare(agent_id: AgentId, status: SendStatus) -> Self {
+        Self {
+            agent_id,
+            message_id: None,
+            status,
+            text: None,
+            error: None,
+            code: None,
+            failure_kind: None,
+            activity: None,
+            recent_text: None,
+            context: None,
+        }
+    }
 }
 
 /// How much of a running turn's text a send's snapshot carries.
@@ -313,9 +351,9 @@ pub struct RunSnapshot {
     pub sends: Vec<RunSend>,
 }
 
-/// One send a workflow step made: read any recipient's reply with
-/// `read_send_output` and this `send_id`, even after the agent answered a
-/// later step.
+/// One send a workflow step made: follow it with `wait_send`, and read any
+/// recipient's reply with `read_send_output` and this `send_id`, even after
+/// the agent answered a later step.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RunSend {
     pub step: usize,
@@ -942,6 +980,16 @@ impl SendLedger {
         true
     }
 
+    /// Whether `cancel_send` asked this send to stop, whole or for any one of
+    /// its recipients. A workflow's send stops dispatching on either, since a
+    /// cancelled reply ends its run.
+    #[must_use]
+    pub fn any_cancel_requested(&self, send_id: SendId) -> bool {
+        lock(&self.inner).sends.get(&send_id).is_some_and(|entry| {
+            entry.cancel_requested || entry.recipients.iter().any(|r| r.cancel_requested)
+        })
+    }
+
     /// Whether `cancel_send` asked for this recipient's reply alone to stop.
     #[must_use]
     pub fn recipient_cancel_requested(&self, send_id: SendId, agent_id: AgentId) -> bool {
@@ -1177,6 +1225,14 @@ impl SendLedger {
     /// without a clock.
     pub fn prune(&self, now: DateTime<Utc>) {
         prune(&mut lock(&self.inner), now);
+    }
+
+    /// Forget one send as pruning does, keeping its run: the state a run is
+    /// in once newer sends have pushed its own out past the count bound,
+    /// reached here without registering hundreds of them.
+    #[cfg(test)]
+    pub fn forget_send(&self, send_id: SendId) {
+        drop_send(&mut lock(&self.inner), send_id);
     }
 
     // --- event observation --------------------------------------------------
@@ -1558,6 +1614,27 @@ fn recipient_mut(inner: &mut Inner, send_id: SendId, index: usize) -> Option<&mu
     inner.sends.get_mut(&send_id)?.recipients.get_mut(index)
 }
 
+/// Forget one send: its entry, its message and turn indexes, and its retry
+/// key's claim. A key naming a fork outlives its entry, up to the age bound
+/// in [`prune`], so a repeat under it finds the fork rather than making
+/// another.
+fn drop_send(inner: &mut Inner, send_id: SendId) {
+    inner.send_order.retain(|id| *id != send_id);
+    if let Some(entry) = inner.sends.remove(&send_id) {
+        for recipient in &entry.recipients {
+            if let Some(message_id) = recipient.message_id {
+                inner.by_message.remove(&message_id);
+            }
+            if let Some(turn_id) = recipient.turn_id {
+                inner.by_turn.remove(&turn_id);
+            }
+        }
+        inner
+            .claims
+            .retain(|_, claim| claim.send_id != send_id || claim.fork.is_some());
+    }
+}
+
 /// Drop sends and runs older than [`MAX_AGE`], and retired ones past the
 /// count bound. Live sends are stepped past, never dropped by count. A dropped
 /// send's claim stays only while the entry does: once the receipt is gone, a
@@ -1584,23 +1661,7 @@ fn prune(inner: &mut Inner, now: DateTime<Utc>) {
         }
     }
     for send_id in dropped {
-        inner.send_order.retain(|id| *id != send_id);
-        if let Some(entry) = inner.sends.remove(&send_id) {
-            for recipient in &entry.recipients {
-                if let Some(message_id) = recipient.message_id {
-                    inner.by_message.remove(&message_id);
-                }
-                if let Some(turn_id) = recipient.turn_id {
-                    inner.by_turn.remove(&turn_id);
-                }
-            }
-            // A key naming a fork outlives its entry, up to the age bound
-            // below, so a repeat under it finds the fork rather than making
-            // another.
-            inner
-                .claims
-                .retain(|_, claim| claim.send_id != send_id || claim.fork.is_some());
-        }
+        drop_send(inner, send_id);
     }
     inner
         .claims

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use switchboard_core::name::canonicalize_for_uniqueness;
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId};
 use switchboard_dispatcher::{DispatchContextFactory, Dispatcher, EventEmitter};
+use switchboard_harness::MessageId;
 use switchboard_prompts::{
     PromptArgument, PromptId, PromptResolutionSnapshot, PromptService, ProviderStatus,
 };
@@ -31,10 +32,11 @@ use uuid::Uuid;
 use crate::commands::adapter_for;
 use crate::dispatch_context::ProjectDispatchContextFactory;
 use crate::error::AppError;
-use crate::state::{ActiveRun, AppState, RunSnapshot, lock};
+use crate::ops::ledger::SendLedger;
+use crate::state::{ActiveRun, AppState, RunSnapshot, WorkflowSendOrigin, lock};
 use crate::workflow::{
-    DispatchFactoryProvider, ProgressSink, ResolvedRecipient, StepResolution, WorkflowProgress,
-    WorkflowRun,
+    DispatchEnd, DispatchFactoryProvider, ProgressSink, ResolvedRecipient, StepResolution,
+    WorkflowProgress, WorkflowRun,
 };
 
 /// The project-scoped progress channel name. The frontend subscribes once per
@@ -70,6 +72,14 @@ pub struct ProjectDispatchFactoryProvider {
     /// may name its agent through any template expression (`{{ worker |
     /// lower }}`), which only the interpreter resolves.
     unheard: Vec<AgentId>,
+    /// Where each send step is recorded before it dispatches, so `wait_send`,
+    /// `read_send_output`, and `cancel_send` follow a workflow's sends as they
+    /// do the agent tools' own.
+    ledger: Arc<SendLedger>,
+    /// Who started the run, recorded per send as it starts: the cancel tools
+    /// refuse a reply in a run the user started from the window.
+    send_origins: Arc<Mutex<HashMap<SendId, WorkflowSendOrigin>>>,
+    through_agent_access: bool,
 }
 
 impl ProjectDispatchFactoryProvider {
@@ -130,6 +140,9 @@ impl ProjectDispatchFactoryProvider {
             agents_by_id: Arc::clone(&state.agents_by_id),
             home_dir: home_dir.to_path_buf(),
             unheard: Vec::new(),
+            ledger: Arc::clone(&state.ledger),
+            send_origins: Arc::clone(&state.workflow_send_origins),
+            through_agent_access: false,
         }
     }
 
@@ -137,6 +150,14 @@ impl ProjectDispatchFactoryProvider {
     #[must_use]
     pub fn with_unheard(mut self, unheard: Vec<AgentId>) -> Self {
         self.unheard = unheard;
+        self
+    }
+
+    /// The run was started through the agent tools, so an orchestrator may
+    /// cancel its replies.
+    #[must_use]
+    pub fn with_agent_access(mut self, through_agent_access: bool) -> Self {
+        self.through_agent_access = through_agent_access;
         self
     }
 }
@@ -183,6 +204,77 @@ impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
 
     fn factory_for(&self, agent_id: AgentId) -> Option<Arc<dyn DispatchContextFactory>> {
         self.factories.get(&agent_id).cloned()
+    }
+
+    /// Record the send's owner, then its ledger entry, every recipient not yet
+    /// offered: the owner first, so a cancel that finds the entry also finds
+    /// whose run it is.
+    fn send_starting(&self, send_id: SendId, recipients: &[AgentId]) {
+        lock(&self.send_origins).insert(
+            send_id,
+            WorkflowSendOrigin {
+                project_id: self.project.id,
+                through_agent_access: self.through_agent_access,
+            },
+        );
+        self.ledger.register_send(
+            send_id,
+            self.project.id,
+            recipients,
+            CancellationToken::new(),
+        );
+    }
+
+    /// The ledger mints the id and marks the recipient accepted before the
+    /// dispatcher sees it, so the turn's first event finds the entry. Once
+    /// `cancel_send` has stopped the send, or any one of its replies (which
+    /// ends the run), nobody else is offered it; [`Self::send_finished`] marks
+    /// those left cancelled. An entry the ledger no longer holds is no reason to
+    /// stop the step: the message goes out under a fresh id, unfollowed.
+    fn admit(&self, send_id: SendId, agent_id: AgentId) -> Option<MessageId> {
+        if self.ledger.any_cancel_requested(send_id) {
+            return None;
+        }
+        Some(
+            self.ledger
+                .mark_accepted(send_id, agent_id)
+                .unwrap_or_else(Uuid::now_v7),
+        )
+    }
+
+    /// A busy agent is recorded as refused.
+    fn offered(&self, send_id: SendId, agent_id: AgentId, accepted: bool) {
+        if !accepted {
+            self.ledger.mark_rejected(
+                send_id,
+                agent_id,
+                crate::ops::error_code::AGENT_BUSY,
+                "the agent was busy: workflow steps fail fast on contention",
+            );
+        }
+    }
+
+    /// A cancel of the send, or of any of its replies, as the ledger recorded
+    /// it from `cancel_send`.
+    fn send_cancelled(&self, send_id: SendId) -> bool {
+        self.ledger.any_cancel_requested(send_id)
+    }
+
+    /// Recipients never offered the message, by the engine's one decision
+    /// about why the step stopped: refused with the reason when it could not
+    /// get the message ready; cancelled when a cancel stopped it; otherwise
+    /// `not_dispatched`, since an earlier recipient was busy.
+    fn send_finished(&self, send_id: SendId, end: DispatchEnd<'_>) {
+        match end {
+            DispatchEnd::NotReady(reason) => self.ledger.reject_undispatched(
+                send_id,
+                crate::ops::error_code::WORKFLOW_STEP_FAILED,
+                reason,
+            ),
+            DispatchEnd::Cancelled => self.ledger.cancel_undispatched(send_id),
+            DispatchEnd::Ran => {}
+        }
+        self.ledger.settle(send_id);
     }
 }
 
@@ -241,7 +333,6 @@ pub struct ChannelProgressSink {
     total_steps: usize,
     emitter: Arc<dyn EventEmitter>,
     workflow_runs: Arc<Mutex<HashMap<uuid::Uuid, ActiveRun>>>,
-    send_origins: Arc<Mutex<HashMap<SendId, crate::state::WorkflowSendOrigin>>>,
 }
 
 impl ChannelProgressSink {
@@ -252,7 +343,6 @@ impl ChannelProgressSink {
         total_steps: usize,
         emitter: Arc<dyn EventEmitter>,
         workflow_runs: Arc<Mutex<HashMap<uuid::Uuid, ActiveRun>>>,
-        send_origins: Arc<Mutex<HashMap<SendId, crate::state::WorkflowSendOrigin>>>,
     ) -> Self {
         Self {
             run_id,
@@ -261,7 +351,6 @@ impl ChannelProgressSink {
             total_steps,
             emitter,
             workflow_runs,
-            send_origins,
         }
     }
 }
@@ -285,15 +374,6 @@ impl ProgressSink for ChannelProgressSink {
                 send_id,
             } => {
                 if let Some(run) = lock(&self.workflow_runs).get_mut(&self.run_id) {
-                    if let Some(send_id) = send_id {
-                        lock(&self.send_origins).insert(
-                            send_id,
-                            crate::state::WorkflowSendOrigin {
-                                project_id: self.project_id,
-                                through_agent_access: run.through_agent_access,
-                            },
-                        );
-                    }
                     run.resolved.insert(
                         step_index,
                         StepResolution {
@@ -1468,7 +1548,8 @@ pub fn invoke_workflow_with(
 
     let provider = Arc::new(
         ProjectDispatchFactoryProvider::new(state, &project, &roster, home_dir, generation)
-            .with_unheard(unheard.clone()),
+            .with_unheard(unheard.clone())
+            .with_agent_access(options.through_agent_access),
     );
 
     let run_id = Uuid::now_v7();
@@ -1490,7 +1571,6 @@ pub fn invoke_workflow_with(
         total_steps,
         Arc::clone(&state.emitter),
         Arc::clone(&state.workflow_runs),
-        Arc::clone(&state.workflow_send_origins),
     ));
 
     // A held failed/interrupted run occupies the project too: it replaces the
@@ -2067,7 +2147,6 @@ mod tests {
             8,
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
             Arc::clone(&runs),
-            Arc::new(Mutex::new(HashMap::new())),
         );
 
         sink.emit(WorkflowProgress::Terminal {
@@ -2104,7 +2183,6 @@ mod tests {
             8,
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
             Arc::clone(&runs),
-            Arc::new(Mutex::new(HashMap::new())),
         );
 
         sink.emit(WorkflowProgress::Terminal {

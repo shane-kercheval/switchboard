@@ -4328,6 +4328,27 @@ pub async fn forward_message_impl(
     home_dir: &Path,
     recipient_project: ProjectId,
 ) -> Result<ForwardOutcome, AppError> {
+    forward_message_inputs(
+        state,
+        body,
+        sources.into_iter().map(ForwardInput::latest).collect(),
+        forward_id,
+        home_dir,
+        recipient_project,
+    )
+    .await
+}
+
+/// [`forward_message_impl`] over [`ForwardInput`]s, so a caller can forward a
+/// reply it already read in place of a source's latest answer.
+pub(crate) async fn forward_message_inputs(
+    state: &AppState,
+    body: String,
+    sources: Vec<ForwardInput>,
+    forward_id: Uuid,
+    home_dir: &Path,
+    recipient_project: ProjectId,
+) -> Result<ForwardOutcome, AppError> {
     // A forward with no sources is malformed (a frontend bug or a direct IPC
     // call) — there is nothing to forward. Reject at the boundary.
     if sources.is_empty() {
@@ -4337,7 +4358,7 @@ pub async fn forward_message_impl(
     // Open each source's declared project (idempotent) and verify ownership
     // before the hold is registered — a bad reference must fail fast, not after
     // the user waits out a hold.
-    let sources = resolve_source_refs(state, &sources)?;
+    let sources = resolve_source_inputs(state, sources)?;
 
     let token = CancellationToken::new();
     lock(&state.forwards).insert(forward_id, token.clone());
@@ -4373,7 +4394,7 @@ impl Drop for ForwardGuard<'_> {
 async fn forward_resolve(
     state: &AppState,
     body: String,
-    sources: Vec<AgentId>,
+    sources: Vec<ResolvedInput>,
     token: &CancellationToken,
     home_dir: &Path,
     recipient_project: ProjectId,
@@ -4480,6 +4501,53 @@ fn resolve_source_refs(
     sources
         .iter()
         .map(|&s| resolve_source_ref(state, s))
+        .collect()
+}
+
+/// One source of a manual forward as the resolver takes it: the agent, and
+/// the text to forward for it when the caller has already read it.
+///
+/// `settled_text` is a specific earlier reply the caller chose (the agent
+/// tools' `forward` with a `send_id`). A finished reply cannot change, so the
+/// resolver forwards it as given, under the same label, without waiting on
+/// the agent's current turn or reading its latest answer. The window's
+/// forwards always forward the latest answer and never set it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForwardInput {
+    pub source: ForwardSourceRef,
+    pub settled_text: Option<String>,
+}
+
+impl ForwardInput {
+    /// The source's latest answer, waiting for a turn in flight.
+    #[must_use]
+    pub(crate) fn latest(source: ForwardSourceRef) -> Self {
+        Self {
+            source,
+            settled_text: None,
+        }
+    }
+}
+
+/// A [`ForwardInput`] whose project has been opened and ownership verified.
+struct ResolvedInput {
+    agent_id: AgentId,
+    settled_text: Option<String>,
+}
+
+/// [`resolve_source_refs`] for inputs, keeping each one's settled text.
+fn resolve_source_inputs(
+    state: &AppState,
+    inputs: Vec<ForwardInput>,
+) -> Result<Vec<ResolvedInput>, AppError> {
+    inputs
+        .into_iter()
+        .map(|input| {
+            Ok(ResolvedInput {
+                agent_id: resolve_source_ref(state, input.source)?,
+                settled_text: input.settled_text,
+            })
+        })
         .collect()
 }
 
@@ -4664,14 +4732,22 @@ async fn resolve_source_completed_only(
 /// later sources only after earlier ones resolve, would miss).
 async fn resolve_all_sources(
     state: &AppState,
-    sources: &[AgentId],
+    sources: &[ResolvedInput],
     home_dir: &Path,
     recipient_project: ProjectId,
 ) -> Result<Vec<SourceResolution>, AppError> {
     // One journal read per distinct owning project — `latest_turn_failure_note`
     // consults it for each idle source, and sources may span projects. See
-    // [`SourceJournals`].
-    let journals = SourceJournals::read(state, sources.iter().copied())?;
+    // [`SourceJournals`]. A source with settled text needs no journal, so its
+    // project's is not read: a damaged line there must not block forwarding a
+    // reply already in hand.
+    let journals = SourceJournals::read(
+        state,
+        sources
+            .iter()
+            .filter(|s| s.settled_text.is_none())
+            .map(|s| s.agent_id),
+    )?;
     // `try_join_all` polls every source on the first poll (so all waits register
     // up front, before any can settle) and preserves declared order; a source's
     // *turn* failing is an `Ok(Invalidated)` it collects, while a genuine error
@@ -4679,7 +4755,7 @@ async fn resolve_all_sources(
     futures::future::try_join_all(
         sources
             .iter()
-            .map(|&s| resolve_source(state, s, home_dir, &journals, recipient_project)),
+            .map(|s| resolve_source(state, s, home_dir, &journals, recipient_project)),
     )
     .await
 }
@@ -4782,19 +4858,28 @@ pub(crate) fn latest_turn_outcome(
 /// invalidates the source (the held forward aborts — see system-design §7); a
 /// source whose most recent turn *already* failed before we forwarded resolves to
 /// a failure note (so the recipient learns it failed instead of a stale answer).
+/// A source with settled text resolves to that text at once, under the same
+/// label: the caller chose a finished reply, which no turn can change.
 async fn resolve_source(
     state: &AppState,
-    agent_id: AgentId,
+    source: &ResolvedInput,
     home_dir: &Path,
     journals: &SourceJournals,
     recipient_project: ProjectId,
 ) -> Result<SourceResolution, AppError> {
+    let agent_id = source.agent_id;
     let (project, agent) = lookup_agent(state, agent_id)?;
-    let journal = journals.for_project(project.id)?;
     let agent = AgentRecord {
         name: qualified_source_name(&agent.name, &project, recipient_project),
         ..agent
     };
+    if let Some(text) = &source.settled_text {
+        return Ok(SourceResolution::Resolved {
+            name: agent.name,
+            text: text.clone(),
+        });
+    }
+    let journal = journals.for_project(project.id)?;
     match state.dispatcher.wait_for_current_turn(agent_id).await {
         CurrentTurnWait::Terminal { outcome, .. } if !matches!(outcome, TurnOutcome::Completed) => {
             Ok(SourceResolution::Invalidated {
@@ -4843,6 +4928,24 @@ pub struct ForwardArg {
     pub required: bool,
 }
 
+/// A [`ForwardArg`] whose sources may carry settled text ([`ForwardInput`]).
+#[derive(Debug, Clone)]
+pub(crate) struct ForwardArgInputs {
+    pub name: String,
+    pub sources: Vec<ForwardInput>,
+    pub required: bool,
+}
+
+impl From<ForwardArg> for ForwardArgInputs {
+    fn from(arg: ForwardArg) -> Self {
+        Self {
+            name: arg.name,
+            sources: arg.sources.into_iter().map(ForwardInput::latest).collect(),
+            required: arg.required,
+        }
+    }
+}
+
 /// Manual forward into a prompt's arguments (the prompt-composer analogue of
 /// [`forward_message_impl`], and the manual precursor of the workflow `send`
 /// with `prompt` + `template_vars` — the workflow `send` reuses this resolve →
@@ -4865,6 +4968,42 @@ pub async fn forward_prompt_impl(
     forward_args: Vec<ForwardArg>,
     appended_text: String,
     appended_sources: Vec<ForwardSourceRef>,
+    forward_id: Uuid,
+    home_dir: &Path,
+    recipient_project: ProjectId,
+) -> Result<ForwardOutcome, AppError> {
+    forward_prompt_inputs(
+        state,
+        provider,
+        name,
+        typed_args,
+        forward_args
+            .into_iter()
+            .map(ForwardArgInputs::from)
+            .collect(),
+        appended_text,
+        appended_sources
+            .into_iter()
+            .map(ForwardInput::latest)
+            .collect(),
+        forward_id,
+        home_dir,
+        recipient_project,
+    )
+    .await
+}
+
+/// [`forward_prompt_impl`] over [`ForwardInput`]s, so a caller can forward a
+/// reply it already read in place of a source's latest answer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_prompt_inputs(
+    state: &AppState,
+    provider: String,
+    name: String,
+    typed_args: std::collections::BTreeMap<String, String>,
+    forward_args: Vec<ForwardArgInputs>,
+    appended_text: String,
+    appended_sources: Vec<ForwardInput>,
     forward_id: Uuid,
     home_dir: &Path,
     recipient_project: ProjectId,
@@ -4975,9 +5114,9 @@ async fn forward_prompt_resolve(
     provider: &str,
     name: &str,
     mut args: std::collections::BTreeMap<String, String>,
-    forward_args: &[ForwardArg],
+    forward_args: &[ForwardArgInputs],
     appended_text: &str,
-    appended_sources: &[ForwardSourceRef],
+    appended_sources: &[ForwardInput],
     token: &CancellationToken,
     home_dir: &Path,
     recipient_project: ProjectId,
@@ -4987,12 +5126,12 @@ async fn forward_prompt_resolve(
     // cross-source invalidation guarantee *across fields*, not just within one —
     // then regroup per field below. Each ref's declared project is opened and
     // verified here, before any wait registers.
-    let flat_refs: Vec<ForwardSourceRef> = forward_args
+    let flat_inputs: Vec<ForwardInput> = forward_args
         .iter()
-        .flat_map(|a| a.sources.iter().copied())
-        .chain(appended_sources.iter().copied())
+        .flat_map(|a| a.sources.iter().cloned())
+        .chain(appended_sources.iter().cloned())
         .collect();
-    let flat: Vec<AgentId> = resolve_source_refs(state, &flat_refs)?;
+    let flat = resolve_source_inputs(state, flat_inputs)?;
     let resolved = tokio::select! {
         biased;
         () = token.cancelled() => return Ok(ForwardOutcome::Cancelled),

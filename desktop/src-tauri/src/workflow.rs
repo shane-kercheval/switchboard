@@ -8,9 +8,12 @@
 //! A step-based interpreter (not a DAG scheduler — v1 doesn't need one). It walks
 //! the snapshotted steps and:
 //!
-//! - `send` dispatches each recipient via [`Dispatcher::send_message_awaiting_completion`]
+//! - `send` dispatches each recipient via [`Dispatcher::send_workflow_message_awaiting_completion`]
 //!   (`FailFast`), minting one `send_id` per step (shared across a fan-out's
-//!   recipients), and keeps each turn's completion handle.
+//!   recipients), and keeps each turn's completion handle. The provider's send
+//!   hooks ([`DispatchFactoryProvider::send_starting`] and the ones after it)
+//!   let the app record the send in its send ledger, and choose each
+//!   recipient's message id, before anything is dispatched.
 //! - `wait_for` / `wait_for_all` await those handles; on a `Completed` terminal
 //!   the agent's resolved text enters the **in-memory per-run output scope** that
 //!   `forward_from` and the template helpers read. The scope is never persisted
@@ -34,7 +37,7 @@
 //! surface an active or interrupted run for abandon, and mirrored live through a
 //! [`ProgressSink`] for the run indicator. No agent text is written or emitted.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,7 +48,7 @@ use switchboard_dispatcher::{
     AwaitableSendOutcome, CompletionResult, DispatchContextFactory, Dispatcher,
 };
 use switchboard_harness::forward::{ForwardedBlock, compose_forwarded_message};
-use switchboard_harness::{CancelSource, TurnOutcome};
+use switchboard_harness::{CancelSource, MessageId, TurnOutcome};
 use switchboard_prompts::{BUILTIN_PROVIDER, LOCAL_PROVIDER, PromptId, PromptService};
 use switchboard_workflow::{
     OutputScope, RunRecord, RunStatus, Scope, ScopeValue, SendStep, Step, Templated,
@@ -89,6 +92,85 @@ pub trait DispatchFactoryProvider: Send + Sync {
         let _ = agent_id;
         Box::pin(async { Ok(()) })
     }
+
+    /// A send step is about to prepare and dispatch `send_id` to `recipients`,
+    /// in order. Called once per send step, before its message is built, so a
+    /// reader of the send sees it from the start. Default: nothing.
+    fn send_starting(&self, send_id: Uuid, recipients: &[AgentId]) {
+        let _ = (send_id, recipients);
+    }
+
+    /// The message id for `agent_id`'s copy of `send_id`, chosen immediately
+    /// before it is offered to the dispatcher, or `None` when the send was
+    /// cancelled for this recipient before it was offered: the step then stops
+    /// as a cancelled participant does, cancelling the run. Default: a fresh
+    /// id.
+    fn admit(&self, send_id: Uuid, agent_id: AgentId) -> Option<MessageId> {
+        let _ = (send_id, agent_id);
+        Some(Uuid::now_v7())
+    }
+
+    /// The dispatcher's answer to an offer [`Self::admit`] allowed: `accepted`,
+    /// or refused because the agent was busy. Default: nothing.
+    fn offered(&self, send_id: Uuid, agent_id: AgentId, accepted: bool) {
+        let _ = (send_id, agent_id, accepted);
+    }
+
+    /// Whether the send was cancelled, whole or for any one of its
+    /// recipients. Asked after each offer, and once more when the step stops
+    /// on a busy agent or because it was not ready: a cancel wins either way,
+    /// since a cancelled reply ends the run. Default: not cancelled.
+    fn send_cancelled(&self, send_id: Uuid) -> bool {
+        let _ = send_id;
+        false
+    }
+
+    /// The step's dispatch is over: recipients not offered by now never will
+    /// be. `end` is the step's one decision about why it stopped, the same one
+    /// that sets the run's result. Default: nothing.
+    fn send_finished(&self, send_id: Uuid, end: DispatchEnd<'_>) {
+        let _ = (send_id, end);
+    }
+}
+
+/// How a send step's dispatch ended, as [`DispatchFactoryProvider::send_finished`]
+/// is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchEnd<'a> {
+    /// Dispatch ran its course: every recipient was offered the message, or
+    /// it stopped at a busy agent, recorded as it happened.
+    Ran,
+    /// The message could not be prepared, or a recipient's pre-dispatch check
+    /// refused it, before every recipient was offered: this is why.
+    NotReady(&'a str),
+    /// The send was cancelled before every recipient was offered: the step
+    /// stopped, and the run ends cancelled.
+    Cancelled,
+}
+
+/// A dispatched turn the run has not awaited yet: the send it answers and the
+/// handle that resolves when it ends.
+struct PendingTurn {
+    send_id: Uuid,
+    completion: oneshot::Receiver<CompletionResult>,
+}
+
+/// Per agent, the run's dispatched turns not yet awaited, oldest first.
+type Pending = BTreeMap<AgentId, VecDeque<PendingTurn>>;
+
+/// The run's turns not yet seen to end, each by its agent and its send: what a
+/// cancelled run cancels, send by send, so it never stops a turn that is not
+/// the run's own.
+type InFlight = BTreeSet<(AgentId, Uuid)>;
+
+/// Why a send step's dispatch stopped early.
+enum DispatchStop {
+    /// The message could not be prepared, or a recipient's check refused it.
+    NotReady(String),
+    /// A recipient was busy: workflow steps fail fast on contention.
+    Busy(String),
+    /// The send was cancelled for one of its recipients.
+    Cancelled,
 }
 
 /// A live progress event emitted by the interpreter as a run advances. It carries
@@ -219,15 +301,16 @@ impl WorkflowRun {
         // workflow explicitly awaited ("most-recent-completed-turn-this-workflow-saw"),
         // which in the unusual multi-outstanding-same-agent case leaves a never-
         // awaited turn settled-for-failure-accounting but not absorbed into scope.
-        let mut pending: BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>> =
-            BTreeMap::new();
-        // Count of this run's turns currently in flight per agent (incremented on
-        // dispatch, decremented when a turn's terminal is observed). This — not
-        // the declared roster — is what a workflow cancel targets, so cancelling
-        // never kills an agent's *unrelated* (manual / other-run) turn. Tracked
-        // separately from `pending` because `wait_for_all` moves handles out of
-        // `pending` while awaiting, so `pending` alone undercounts in flight.
-        let mut in_flight: BTreeMap<AgentId, usize> = BTreeMap::new();
+        let mut pending: Pending = BTreeMap::new();
+        // This run's turns in flight, by agent and send (added on dispatch,
+        // removed when a turn's terminal is observed). This — not the declared
+        // roster — is what a workflow cancel targets, and it cancels by send, so
+        // cancelling never kills an agent's *unrelated* (manual / other-run)
+        // turn, even one the agent started after the run's turn ended unseen.
+        // Tracked separately from `pending` because `wait_for_all` moves handles
+        // out of `pending` while awaiting, so `pending` alone undercounts in
+        // flight.
+        let mut in_flight: InFlight = BTreeSet::new();
 
         self.record(&RunRecord::Started {
             workflow: self.workflow.name.clone(),
@@ -297,8 +380,8 @@ impl WorkflowRun {
         index: usize,
         step: &SendStep,
         outputs: &OutputScope,
-        pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
-        in_flight: &mut BTreeMap<AgentId, usize>,
+        pending: &mut Pending,
+        in_flight: &mut InFlight,
     ) -> Result<(), StepError> {
         let resolved = self.resolve_named_agent_ids(&step.to, outputs)?;
         // One send_id for the whole step; a fan-out's recipients share it so the
@@ -312,15 +395,42 @@ impl WorkflowRun {
                 dispatched: Some(false),
             })
             .collect();
-        let result = self
+        let recipients: Vec<AgentId> = report.iter().map(|r| r.agent_id).collect();
+        self.factories.send_starting(send_id, &recipients);
+        let outcome = self
             .dispatch_send(step, outputs, &mut report, send_id, pending, in_flight)
             .await;
+        // One decision about why the step stopped, made here and nowhere else:
+        // it sets both the run's result and, through `send_finished`, what the
+        // recipients never offered show. A cancel wins over a busy agent and
+        // over a step that was not ready, because the caller asked the run to
+        // stop, not to fail and be held for dismissal.
+        let cancelled = match &outcome {
+            Ok(()) => false,
+            Err(DispatchStop::Cancelled) => true,
+            Err(DispatchStop::NotReady(_) | DispatchStop::Busy(_)) => {
+                self.factories.send_cancelled(send_id)
+            }
+        };
+        let end = match &outcome {
+            _ if cancelled => DispatchEnd::Cancelled,
+            Err(DispatchStop::NotReady(reason)) => DispatchEnd::NotReady(reason),
+            Ok(()) | Err(DispatchStop::Busy(_) | DispatchStop::Cancelled) => DispatchEnd::Ran,
+        };
+        self.factories.send_finished(send_id, end);
         self.progress.emit(WorkflowProgress::StepResolved {
             step_index: index,
             recipients: report,
             send_id: Some(send_id),
         });
-        result
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(_) if cancelled => Err(StepError::Cancelled),
+            Err(DispatchStop::NotReady(reason) | DispatchStop::Busy(reason)) => {
+                Err(StepError::Failed(reason))
+            }
+            Err(DispatchStop::Cancelled) => Err(StepError::Cancelled),
+        }
     }
 
     /// Render the step's message and queue it for each recipient in order,
@@ -331,14 +441,20 @@ impl WorkflowRun {
         outputs: &OutputScope,
         report: &mut [ResolvedRecipient],
         send_id: Uuid,
-        pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
-        in_flight: &mut BTreeMap<AgentId, usize>,
-    ) -> Result<(), StepError> {
-        let body = self.build_body(step, outputs).await?;
+        pending: &mut Pending,
+        in_flight: &mut InFlight,
+    ) -> Result<(), DispatchStop> {
+        let body = self
+            .build_body(step, outputs)
+            .await
+            .map_err(|error| match error {
+                StepError::Failed(reason) => DispatchStop::NotReady(reason),
+                StepError::Cancelled => DispatchStop::Cancelled,
+            })?;
         for recipient in report.iter_mut() {
             let agent_id = recipient.agent_id;
             let factory = self.factories.factory_for(agent_id).ok_or_else(|| {
-                StepError::Failed(
+                DispatchStop::NotReady(
                     "a participating agent is unavailable for dispatch (removed mid-run, or its harness is unsupported)".to_owned(),
                 )
             })?;
@@ -347,8 +463,11 @@ impl WorkflowRun {
             // `send_message_impl`, so a check sited only there would not cover
             // them — a materializing fork could branch from a working parent.
             if let Err(reason) = self.factories.preflight(agent_id).await {
-                return Err(StepError::Failed(reason));
+                return Err(DispatchStop::NotReady(reason));
             }
+            let Some(message_id) = self.factories.admit(send_id, agent_id) else {
+                return Err(DispatchStop::Cancelled);
+            };
             match self
                 .dispatcher
                 .send_workflow_message_awaiting_completion(
@@ -367,14 +486,25 @@ impl WorkflowRun {
                     // this.
                     Vec::new(),
                     send_id,
+                    message_id,
                     factory,
                 )
                 .await
             {
                 AwaitableSendOutcome::Accepted { completion, .. } => {
-                    pending.entry(agent_id).or_default().push_back(completion);
-                    *in_flight.entry(agent_id).or_insert(0) += 1;
+                    pending.entry(agent_id).or_default().push_back(PendingTurn {
+                        send_id,
+                        completion,
+                    });
+                    in_flight.insert((agent_id, send_id));
                     recipient.dispatched = Some(true);
+                    self.factories.offered(send_id, agent_id, true);
+                    // Recorded in flight first, so the run's cancel reaches it:
+                    // a cancel that found nothing in the dispatcher to stop
+                    // while this offer was answered is carried out by the run.
+                    if self.factories.send_cancelled(send_id) {
+                        return Err(DispatchStop::Cancelled);
+                    }
                     // The dispatcher emits this send's live user message once it is
                     // durable (after `record_send`, before `TurnStart`) — see
                     // `send_workflow_message_awaiting_completion`. A fan-out's
@@ -386,8 +516,11 @@ impl WorkflowRun {
                 // rule, remaining recipients are not dispatched and already-issued
                 // turns are left to run to their natural terminal (not cancelled —
                 // their output stays visible in the transcript).
+                // `execute_send` asks whether a cancel landed meanwhile, and
+                // if one did, the step ends cancelled rather than failed.
                 AwaitableSendOutcome::Busy => {
-                    return Err(StepError::Failed(
+                    self.factories.offered(send_id, agent_id, false);
+                    return Err(DispatchStop::Busy(
                         "an agent is busy — workflow steps fail fast on contention".to_owned(),
                     ));
                 }
@@ -401,19 +534,19 @@ impl WorkflowRun {
         index: usize,
         step: &WaitForStep,
         outputs: &mut OutputScope,
-        pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
-        in_flight: &mut BTreeMap<AgentId, usize>,
+        pending: &mut Pending,
+        in_flight: &mut InFlight,
     ) -> Result<(), StepError> {
         let (name, agent_id) = self.resolve_single_agent(&step.agent, outputs)?;
         self.report_waited(index, &[(name.clone(), agent_id)]);
-        let rx = pending
+        let turn = pending
             .get_mut(&agent_id)
             .and_then(VecDeque::pop_front)
             .ok_or_else(|| StepError::Failed(format!("no turn to wait on for agent `{name}`")))?;
-        // On a cancel-race (`?` returns early) the turn is *not* observed, so its
-        // in-flight count stays live for `finish_cancelled` to cancel.
-        let result = self.await_completion(rx).await?;
-        Self::observe(in_flight, agent_id);
+        // On a cancel-race (`?` returns early) the turn is *not* observed, so it
+        // stays in flight for `finish_cancelled` to cancel.
+        let result = self.await_completion(turn.completion).await?;
+        Self::observe(in_flight, agent_id, turn.send_id);
         Self::absorb(&name, result, outputs)
     }
 
@@ -422,8 +555,8 @@ impl WorkflowRun {
         index: usize,
         step: &WaitForAllStep,
         outputs: &mut OutputScope,
-        pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
-        in_flight: &mut BTreeMap<AgentId, usize>,
+        pending: &mut Pending,
+        in_flight: &mut InFlight,
     ) -> Result<(), StepError> {
         let agents = self.resolve_named_agent_ids(&step.agents, outputs)?;
         self.report_waited(index, &agents);
@@ -431,21 +564,21 @@ impl WorkflowRun {
         // before we block on the first.
         let mut waits = Vec::with_capacity(agents.len());
         for (name, agent_id) in agents {
-            let rx = pending
+            let turn = pending
                 .get_mut(&agent_id)
                 .and_then(VecDeque::pop_front)
                 .ok_or_else(|| {
                     StepError::Failed(format!("no turn to wait on for agent `{name}`"))
                 })?;
-            waits.push((name, agent_id, rx));
+            waits.push((name, agent_id, turn));
         }
         // Await all (the non-destructive floor: a sibling failing does not stop
         // the others — every survivor settles and its output is retained), then
         // fail the step if any one failed. Cancellation short-circuits the run.
         let mut failure: Option<String> = None;
-        for (name, agent_id, rx) in waits {
-            let result = self.await_completion(rx).await?;
-            Self::observe(in_flight, agent_id);
+        for (name, agent_id, turn) in waits {
+            let result = self.await_completion(turn.completion).await?;
+            Self::observe(in_flight, agent_id, turn.send_id);
             match Self::absorb(&name, result, outputs) {
                 Ok(()) => {}
                 Err(StepError::Failed(reason)) => {
@@ -460,16 +593,11 @@ impl WorkflowRun {
         }
     }
 
-    /// Mark one of `agent`'s in-flight turns as observed-terminal (decrementing
-    /// the per-agent count, dropping the entry at zero). Called only after a turn
-    /// actually settles, so a cancel that races the await leaves the count live.
-    fn observe(in_flight: &mut BTreeMap<AgentId, usize>, agent: AgentId) {
-        if let Some(count) = in_flight.get_mut(&agent) {
-            *count -= 1;
-            if *count == 0 {
-                in_flight.remove(&agent);
-            }
-        }
+    /// Mark `agent`'s turn for `send_id` as observed-terminal. Called only
+    /// after a turn actually settles, so a cancel that races the await leaves
+    /// it in flight.
+    fn observe(in_flight: &mut InFlight, agent: AgentId, send_id: Uuid) {
+        in_flight.remove(&(agent, send_id));
     }
 
     /// Fold one awaited turn's outcome into the run: store a completed turn's text
@@ -517,18 +645,17 @@ impl WorkflowRun {
     /// `complete` while a fire-and-forget send is in flight.
     async fn settle_remaining(
         &self,
-        pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
-        in_flight: &mut BTreeMap<AgentId, usize>,
+        pending: &mut Pending,
+        in_flight: &mut InFlight,
     ) -> Result<(), StepError> {
         let mut failure: Option<String> = None;
-        let outstanding: Vec<(AgentId, oneshot::Receiver<CompletionResult>)> =
-            std::mem::take(pending)
-                .into_iter()
-                .flat_map(|(agent_id, queue)| queue.into_iter().map(move |rx| (agent_id, rx)))
-                .collect();
-        for (agent_id, rx) in outstanding {
-            let result = self.await_completion(rx).await?;
-            Self::observe(in_flight, agent_id);
+        let outstanding: Vec<(AgentId, PendingTurn)> = std::mem::take(pending)
+            .into_iter()
+            .flat_map(|(agent_id, queue)| queue.into_iter().map(move |turn| (agent_id, turn)))
+            .collect();
+        for (agent_id, turn) in outstanding {
+            let result = self.await_completion(turn.completion).await?;
+            Self::observe(in_flight, agent_id, turn.send_id);
             match result.outcome {
                 TurnOutcome::Completed => {}
                 TurnOutcome::Failed { message, .. } => {
@@ -734,24 +861,21 @@ impl WorkflowRun {
         }
     }
 
-    /// Cancel the run's **own** in-flight turns with `CancelSource::Workflow` —
-    /// only agents this run currently has a turn running on, never the whole
-    /// declared roster (which would kill an agent's unrelated manual / other-run
-    /// turn). Cancel is per-agent, so an inherent residual race remains: a
-    /// workflow turn that finished but isn't yet observed (a fire-and-forget not
-    /// yet settled) still counts here, so if a manual turn started on that agent
-    /// in the gap, this can hit it. That window is narrow and uncloseable without
-    /// per-turn cancellation; the fix narrows it from "all participants" to
-    /// "agents with a live workflow turn."
-    fn cancel_inflight(&self, in_flight: &BTreeMap<AgentId, usize>) {
-        for (agent_id, count) in in_flight {
-            if *count > 0 {
-                self.dispatcher.cancel(*agent_id, CancelSource::Workflow);
-            }
+    /// Cancel the run's **own** in-flight turns with `CancelSource::Workflow`,
+    /// each by its send: never the whole declared roster, and never whatever an
+    /// agent happens to be running. A send-scoped cancel stops the agent's turn
+    /// only while it answers that send, and drops the send if it is still
+    /// queued, so a turn that ended unobserved (its agent may since have started
+    /// a message the user queued behind it) is left alone, and one still
+    /// waiting in line never starts.
+    fn cancel_inflight(&self, in_flight: &InFlight) {
+        for &(agent_id, send_id) in in_flight {
+            self.dispatcher
+                .cancel_send(send_id, &[agent_id], CancelSource::Workflow);
         }
     }
 
-    fn finish_cancelled(&self, in_flight: &BTreeMap<AgentId, usize>) -> RunStatus {
+    fn finish_cancelled(&self, in_flight: &InFlight) -> RunStatus {
         self.cancel_inflight(in_flight);
         self.finish_terminal(TerminalStatus::Cancelled, None, None)
     }
@@ -812,6 +936,7 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use switchboard_core::{AgentRecord, Attachment, HarnessKind, SendId, SessionLocator};
     use switchboard_dispatcher::{
         ConversationJournal, DispatchContext, JournalError, NoopMetadataCache,
@@ -898,6 +1023,24 @@ mod tests {
         /// Agents whose `preflight` refuses, with the reason. Empty in most
         /// tests (the trait's default allows).
         refuse: HashMap<AgentId, String>,
+        /// Agents whose offer is answered while `cancel_send` lands: the send
+        /// reads as cancelled from then on.
+        cancel_on_offer: Vec<AgentId>,
+        /// Agents whose refused pre-dispatch check is answered while
+        /// `cancel_send` lands: the send reads as cancelled from then on.
+        cancel_during_preflight: Vec<AgentId>,
+        /// Whether the send has been cancelled, as the app's ledger records.
+        cancelled: AtomicBool,
+        /// How each send's dispatch ended.
+        finished: Mutex<Vec<(Uuid, Ended)>>,
+    }
+
+    /// [`DispatchEnd`], owned, as the test provider records it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Ended {
+        Ran,
+        NotReady(String),
+        Cancelled,
     }
     impl DispatchFactoryProvider for Provider {
         fn factory_for(&self, agent_id: AgentId) -> Option<Arc<dyn DispatchContextFactory>> {
@@ -912,7 +1055,42 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>
         {
             let refusal = self.refuse.get(&agent_id).cloned();
+            if refusal.is_some() && self.cancel_during_preflight.contains(&agent_id) {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
             Box::pin(async move { refusal.map_or(Ok(()), Err) })
+        }
+
+        fn offered(&self, _send_id: Uuid, agent_id: AgentId, _accepted: bool) {
+            if self.cancel_on_offer.contains(&agent_id) {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn send_cancelled(&self, _send_id: Uuid) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+
+        fn send_finished(&self, send_id: Uuid, end: DispatchEnd<'_>) {
+            let ended = match end {
+                DispatchEnd::Ran => Ended::Ran,
+                DispatchEnd::NotReady(reason) => Ended::NotReady(reason.to_owned()),
+                DispatchEnd::Cancelled => Ended::Cancelled,
+            };
+            self.finished.lock().unwrap().push((send_id, ended));
+        }
+    }
+
+    impl Provider {
+        fn new(factories: HashMap<AgentId, Arc<MockFactory>>) -> Self {
+            Self {
+                factories,
+                refuse: HashMap::new(),
+                cancel_on_offer: Vec::new(),
+                cancel_during_preflight: Vec::new(),
+                cancelled: AtomicBool::new(false),
+                finished: Mutex::new(Vec::new()),
+            }
         }
     }
 
@@ -970,10 +1148,7 @@ mod tests {
         }
         Rig {
             dispatcher: Arc::new(Dispatcher::new()),
-            provider: Arc::new(Provider {
-                factories,
-                refuse: HashMap::new(),
-            }),
+            provider: Arc::new(Provider::new(factories)),
             agents: agent_map,
             names,
             ids,
@@ -1205,8 +1380,8 @@ mod tests {
         // "agent unavailable" and the test would pass without exercising
         // preflight at all.
         rig.provider = Arc::new(Provider {
-            factories: rig.provider.factories.clone(),
             refuse: HashMap::from([(implementer, "alice is working".to_owned())]),
+            ..Provider::new(rig.provider.factories.clone())
         });
 
         let (run, _dir, path) = build_run(
@@ -1241,6 +1416,12 @@ mod tests {
                 .iter()
                 .any(|(id, _)| *id == implementer),
             "the refused agent must never be dispatched"
+        );
+        let finished = rig.provider.finished.lock().unwrap().clone();
+        assert_eq!(
+            finished.last().map(|(_, ended)| ended.clone()),
+            Some(Ended::NotReady("alice is working".to_owned())),
+            "the provider is told the step was not ready, and why"
         );
     }
 
@@ -2239,6 +2420,17 @@ mod tests {
             Arc::clone(&sink) as Arc<dyn ProgressSink>,
         );
         assert_eq!(run.execute().await, RunStatus::Failed);
+        assert_eq!(
+            rig.provider
+                .finished
+                .lock()
+                .unwrap()
+                .clone()
+                .last()
+                .map(|(_, r)| r.clone()),
+            Some(Ended::Ran),
+            "a busy agent is not a step that was not ready: those not reached stay not dispatched"
+        );
         // The step reports whom it reached: `a` dispatched, `busy` not, under
         // the step's one send id.
         let resolved: Vec<(usize, Vec<ResolvedRecipient>, Option<Uuid>)> = sink
@@ -2280,5 +2472,152 @@ mod tests {
             })
             .await;
         signal.notify_one();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_landing_on_a_busy_agent_cancels_the_run_rather_than_failing_it() {
+        // `cancel_send` lands while the dispatcher answers that `busy` is busy:
+        // the caller asked for the run to stop, so it ends cancelled, not
+        // failed and held for dismissal.
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let mut rig = rig(vec![
+            ("a", vec![MockScenario::Streaming]),
+            (
+                "busy",
+                vec![MockScenario::CompletesOnSignal(Arc::clone(&signal))],
+            ),
+        ]);
+        let busy = rig.ids["busy"];
+        rig.provider = Arc::new(Provider {
+            cancel_on_offer: vec![busy],
+            ..Provider::new(rig.provider.factories.clone())
+        });
+        let _occupy = rig
+            .dispatcher
+            .send_message_awaiting_completion(
+                busy,
+                "occupy",
+                Vec::new(),
+                Uuid::now_v7(),
+                rig.provider.factory_for(busy).unwrap(),
+            )
+            .await;
+        rig.emitter.wait_for_type("turn_start", 1).await;
+
+        let yaml = "name: p\ndescription: d\ninputs:\n  rs: [agent]\nsteps:\n  - label: s\n    send:\n      to: \"{{ rs }}\"\n      text: hi\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "p",
+            supplied(vec![("rs", list(&["a", "busy"]))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Cancelled);
+        assert!(
+            matches!(
+                records(&path).last(),
+                Some(RunRecord::Terminal {
+                    status: TerminalStatus::Cancelled,
+                    ..
+                })
+            ),
+            "the run is recorded cancelled, so it is not held for dismissal"
+        );
+        assert_eq!(
+            rig.provider
+                .finished
+                .lock()
+                .unwrap()
+                .last()
+                .map(|(_, ended)| ended.clone()),
+            Some(Ended::Cancelled)
+        );
+        signal.notify_one();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_reported_after_an_acceptance_stops_the_fan_out() {
+        // A cancel of any of the send's replies ends the run, so once the
+        // provider reports one, nobody further in the fan-out is offered it.
+        let mut rig = rig(vec![
+            ("a", vec![MockScenario::Streaming]),
+            ("b", vec![MockScenario::Streaming]),
+            ("c", vec![MockScenario::Streaming]),
+        ]);
+        let a = rig.ids["a"];
+        rig.provider = Arc::new(Provider {
+            cancel_on_offer: vec![a],
+            ..Provider::new(rig.provider.factories.clone())
+        });
+        let yaml = "name: p\ndescription: d\ninputs:\n  rs: [agent]\nsteps:\n  - label: s\n    send:\n      to: \"{{ rs }}\"\n      text: hi\n";
+        let (run, _dir, _path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "p",
+            supplied(vec![("rs", list(&["a", "b", "c"]))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Cancelled);
+        let reached: Vec<AgentId> = rig
+            .sends
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(
+            !reached.contains(&rig.ids["b"]) && !reached.contains(&rig.ids["c"]),
+            "the recipients after the cancelled one are never sent the message: {reached:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_landing_during_a_later_agents_refused_check_cancels_the_run() {
+        // `a` is offered the message; then, while `b`'s pre-dispatch check
+        // runs, the send is cancelled, and the check refuses. One decision
+        // when the step stops: the cancel wins, so the run ends cancelled and
+        // the provider is told so, not that the step was not ready.
+        let mut rig = rig(vec![
+            ("a", vec![MockScenario::Streaming]),
+            ("b", vec![MockScenario::Streaming]),
+        ]);
+        let b = rig.ids["b"];
+        rig.provider = Arc::new(Provider {
+            refuse: HashMap::from([(b, "b's parent is busy".to_owned())]),
+            cancel_during_preflight: vec![b],
+            ..Provider::new(rig.provider.factories.clone())
+        });
+        let yaml = "name: p\ndescription: d\ninputs:\n  rs: [agent]\nsteps:\n  - label: s\n    send:\n      to: \"{{ rs }}\"\n      text: hi\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "p",
+            supplied(vec![("rs", list(&["a", "b"]))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Cancelled);
+        assert!(
+            matches!(
+                records(&path).last(),
+                Some(RunRecord::Terminal {
+                    status: TerminalStatus::Cancelled,
+                    ..
+                })
+            ),
+            "recorded cancelled, so the run is not held for dismissal"
+        );
+        assert_eq!(
+            rig.provider
+                .finished
+                .lock()
+                .unwrap()
+                .last()
+                .map(|(_, ended)| ended.clone()),
+            Some(Ended::Cancelled),
+            "the provider is told the step was cancelled, not that it was not ready"
+        );
     }
 }

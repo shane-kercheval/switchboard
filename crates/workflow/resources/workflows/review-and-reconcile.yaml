@@ -1,8 +1,10 @@
 name: review-and-reconcile
-description: Reviewers review in parallel, a worker distills their feedback into a decision-ready verdict, the reviewers respond to it, and the worker gives a final recommendation.
+description: Reviewers review in parallel, a worker distills their feedback into a decision-ready verdict, the reviewers respond to it, and the worker gives a final recommendation. The reviewers' pushback round suits a new or contested change. For a follow-up or small change, use review-and-recommend.
 # Both prompts are hardcoded: `builtin:code-review` for the reviewers and
 # `builtin:analyze-ai-reviews` for the worker's analysis. code-review's `context`
 # argument is auto-derived from the prompt and offered as a user-fillable field;
+# it reaches only the first step's reviewers, who keep it in their conversations
+# for the pushback round, while the worker sees only their scoped reviews;
 # analyze-ai-reviews's required `review` argument is a computed binding (filled
 # from the reviewers' aggregated responses) and never shown to the user.
 #

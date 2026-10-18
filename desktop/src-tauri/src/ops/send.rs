@@ -63,10 +63,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::commands::{
-    AgentJournalView, ForwardArg, ForwardOutcome, ForwardSourceRef, OutcomeStatus, SendCorrelation,
-    cancel_agent_impl, cancel_send_impl, combine_prompt_message, dispatch_message_impl,
-    forward_message_impl, forward_prompt_impl, list_project_agents_readonly_impl,
-    open_project_impl,
+    AgentJournalView, ForwardArgInputs, ForwardInput, ForwardOutcome, ForwardSourceRef,
+    OutcomeStatus, SendCorrelation, cancel_agent_impl, cancel_send_impl, combine_prompt_message,
+    dispatch_message_impl, forward_message_inputs, forward_prompt_inputs,
+    list_project_agents_readonly_impl, open_project_impl,
 };
 use crate::error::AppError;
 use crate::state::{AppState, lock};
@@ -80,6 +80,7 @@ use super::read::{
     AgentOutput, agent_in_project, correlate_turns, project_readonly, read_agent_output,
     read_journal,
 };
+use super::usage::stored_usage;
 use super::wait::{Observed, Outcome, WaitBudget, wait_until};
 
 /// What a send says.
@@ -139,15 +140,54 @@ pub struct ForwardPrompt {
     #[serde(default)]
     pub args: BTreeMap<String, String>,
     #[serde(default)]
-    pub forward_args: BTreeMap<String, Vec<ForwardSourceRef>>,
+    pub forward_args: BTreeMap<String, Vec<ForwardFrom>>,
+}
+
+/// One source of a forward: an agent, possibly in another project, and
+/// optionally one of its earlier replies.
+///
+/// **Why a source can name a reply.** Without `send_id` the source's latest
+/// answer is forwarded, waiting for a turn in flight. An orchestrator often
+/// wants an answer that is no longer the latest: a reviewer's first round
+/// after a workflow's later step, or a report the agent has since followed
+/// with other work. With `send_id`, that reply is forwarded as it is. A
+/// finished reply cannot change, so nothing waits on the agent, which may be
+/// busy with something else. A reply that is not finished, or did not
+/// complete, is refused rather than waited for or replaced by a note: the
+/// caller named it, so anything else would not be what it asked for.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForwardFrom {
+    pub project_id: ProjectId,
+    pub agent_id: AgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_id: Option<SendId>,
+}
+
+impl From<ForwardSourceRef> for ForwardFrom {
+    fn from(source: ForwardSourceRef) -> Self {
+        Self {
+            project_id: source.project_id,
+            agent_id: source.agent_id,
+            send_id: None,
+        }
+    }
+}
+
+impl ForwardFrom {
+    fn source_ref(self) -> ForwardSourceRef {
+        ForwardSourceRef {
+            agent_id: self.agent_id,
+            project_id: self.project_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForwardRequest {
     pub project_id: ProjectId,
     /// Sources appended after the text (or after the rendered prompt). A
-    /// source may live in another project.
-    pub sources: Vec<ForwardSourceRef>,
+    /// source may live in another project, and may name one of its replies.
+    pub sources: Vec<ForwardFrom>,
     pub recipients: Vec<AgentId>,
     #[serde(default)]
     pub text: Option<String>,
@@ -239,7 +279,7 @@ pub(super) enum BodyPlan {
         appended_text: String,
     },
     Forward {
-        sources: Vec<ForwardSourceRef>,
+        sources: Vec<ForwardFrom>,
         text: String,
         prompt: Option<ForwardPrompt>,
     },
@@ -766,41 +806,54 @@ fn first_refusal(refusals: Vec<(AgentId, AppError)>, roster: &[AgentRecord]) -> 
 /// sources' projects and wait for a mid-turn source), under the call's budget:
 /// the kept-alive caller gets progress while a source finishes, and at the
 /// deadline the resolver's future is dropped, which releases its hold (its
-/// guard removes the cancel token), so nothing is left registered.
+/// guard removes the cancel token), so nothing is left registered. A source
+/// that names a reply is read first ([`named_reply`]) and handed to the
+/// resolver as settled text, so it never waits.
 async fn compose_forward(
     state: &AppState,
     home_dir: &Path,
     project_id: ProjectId,
-    sources: Vec<ForwardSourceRef>,
+    sources: Vec<ForwardFrom>,
     text: String,
     prompt: Option<ForwardPrompt>,
     budget: &WaitBudget,
 ) -> Result<String, AppError> {
     let forward_id = Uuid::now_v7();
-    let all_sources: Vec<ForwardSourceRef> = sources
+    // Only the sources forwarded by latest answer can be waited on.
+    let waited_on: Vec<ForwardSourceRef> = sources
         .iter()
-        .copied()
         .chain(
             prompt
                 .iter()
-                .flat_map(|p| p.forward_args.values().flatten().copied()),
+                .flat_map(|p| p.forward_args.values().flatten()),
         )
+        .filter(|source| source.send_id.is_none())
+        .map(|source| source.source_ref())
         .collect();
     let compose = async {
+        let appended = forward_inputs(state, &sources, home_dir).await?;
         match prompt {
             None => {
-                forward_message_impl(state, text, sources, forward_id, home_dir, project_id).await
+                forward_message_inputs(state, text, appended, forward_id, home_dir, project_id)
+                    .await
             }
             Some(prompt) => {
-                let forward_args = forward_args_for(state, &prompt)?;
-                forward_prompt_impl(
+                let mut forward_args = Vec::new();
+                for (name, sources, required) in forward_args_for(state, &prompt)? {
+                    forward_args.push(ForwardArgInputs {
+                        name,
+                        sources: forward_inputs(state, &sources, home_dir).await?,
+                        required,
+                    });
+                }
+                forward_prompt_inputs(
                     state,
                     prompt.provider,
                     prompt.name,
                     prompt.args,
                     forward_args,
                     text,
-                    sources,
+                    appended,
                     forward_id,
                     home_dir,
                     project_id,
@@ -811,7 +864,7 @@ async fn compose_forward(
     };
     let outcome = match budget.run(Box::pin(compose)).await {
         Outcome::Done(outcome) => outcome?,
-        Outcome::Timeout => return Err(compose_timeout(state, budget, &all_sources).await),
+        Outcome::Timeout => return Err(compose_timeout(state, budget, &waited_on).await),
         Outcome::Cancelled => return Err(AppError::Interrupted),
     };
     match outcome {
@@ -820,6 +873,94 @@ async fn compose_forward(
         // Only this function holds the forward id, so nothing else cancels
         // the hold; reaching this means it was torn down from outside.
         ForwardOutcome::Cancelled => Err(AppError::Interrupted),
+    }
+}
+
+/// The resolver's inputs for `sources`, in order: a source that names a reply
+/// carries that reply's text, read now; the others are forwarded by latest
+/// answer.
+async fn forward_inputs(
+    state: &AppState,
+    sources: &[ForwardFrom],
+    home_dir: &Path,
+) -> Result<Vec<ForwardInput>, AppError> {
+    let mut inputs = Vec::with_capacity(sources.len());
+    for source in sources {
+        let settled_text = match source.send_id {
+            Some(send_id) => Some(named_reply(state, *source, send_id, home_dir).await?),
+            None => None,
+        };
+        inputs.push(ForwardInput {
+            source: source.source_ref(),
+            settled_text,
+        });
+    }
+    Ok(inputs)
+}
+
+/// The text of `source`'s reply to `send_id`, read as `wait_send` reads the
+/// send ([`current_send`]): the ledger's captured reply while it holds the
+/// send, otherwise the journal's answer, where a reply counts as completed
+/// only through a durable link to its send, so a guess never stands in for
+/// the reply the caller named. Only a completed reply is returned; one still
+/// to be sent, waiting, or running, one that did not complete, and one that
+/// cannot be tied to the send refuse the forward.
+async fn named_reply(
+    state: &AppState,
+    source: ForwardFrom,
+    send_id: SendId,
+    home_dir: &Path,
+) -> Result<String, AppError> {
+    let agent = agent_in_project(state, source.project_id, source.agent_id)?;
+    let current = current_send(state, source.project_id, send_id, home_dir).await?;
+    let Some(recipient) = current
+        .reply
+        .recipients
+        .into_iter()
+        .find(|r| r.agent_id == source.agent_id)
+    else {
+        return Err(AppError::ForwardReplyUnknown {
+            name: agent.name,
+            send_id,
+        });
+    };
+    let not_completed = |state: &'static str| AppError::ForwardReplyNotCompleted {
+        name: agent.name.clone(),
+        send_id,
+        state,
+    };
+    match recipient.status {
+        SendStatus::Completed => Ok(recipient.text.unwrap_or_default()),
+        SendStatus::Accepted => Err(AppError::ForwardReplyUnfinished {
+            name: agent.name,
+            send_id,
+            state: "waiting in line",
+        }),
+        SendStatus::Running => Err(AppError::ForwardReplyUnfinished {
+            name: agent.name,
+            send_id,
+            state: "running",
+        }),
+        SendStatus::NotDispatched if !current.handed_out => Err(AppError::ForwardReplyUnfinished {
+            name: agent.name,
+            send_id,
+            state: "waiting to be sent",
+        }),
+        SendStatus::Failed => Err(not_completed("failed")),
+        SendStatus::Cancelled => Err(not_completed("was cancelled")),
+        SendStatus::Rejected | SendStatus::NotDispatched => {
+            Err(not_completed("never reached the agent"))
+        }
+        // The journal could not tie a finished reply to this send: it may
+        // still be running (a message the window sent, which Switchboard
+        // follows only on disk), the app may have restarted while it ran, or
+        // its harness keeps no link from a reply to its send and Switchboard
+        // no longer holds the send. A reply matched by position is a guess,
+        // and a forward cannot mark it as one, so it is refused.
+        SendStatus::Started | SendStatus::Unknown => Err(AppError::ForwardReplyUnconfirmed {
+            name: agent.name,
+            send_id,
+        }),
     }
 }
 
@@ -864,9 +1005,12 @@ async fn compose_timeout(
     }
 }
 
-/// The forwarded arguments with `required` read from the prompt's own schema,
-/// never from the caller.
-fn forward_args_for(state: &AppState, prompt: &ForwardPrompt) -> Result<Vec<ForwardArg>, AppError> {
+/// The forwarded arguments, each with its sources and `required` read from
+/// the prompt's own schema, never from the caller.
+fn forward_args_for(
+    state: &AppState,
+    prompt: &ForwardPrompt,
+) -> Result<Vec<(String, Vec<ForwardFrom>, bool)>, AppError> {
     let schema = state
         .prompts
         .list()
@@ -892,11 +1036,7 @@ fn forward_args_for(state: &AppState, prompt: &ForwardPrompt) -> Result<Vec<Forw
                         prompt.provider, prompt.name
                     ))
                 })?;
-            Ok(ForwardArg {
-                name: name.clone(),
-                sources: sources.clone(),
-                required: argument.required,
-            })
+            Ok((name.clone(), sources.clone(), argument.required))
         })
         .collect()
 }
@@ -921,29 +1061,37 @@ pub enum CancelOutcome {
     /// Every recipient had already ended: nothing to cancel.
     AlreadyFinished,
     /// One recipient's cancel was sent to its agent without a record of the
-    /// send to check against (a workflow's send, or one from before a restart,
-    /// or a recipient not yet offered its message): the agent stops the reply
-    /// if it still has it.
+    /// send to check against: a workflow's send the ledger has pruned since the
+    /// app started (who started its run is kept until the app quits, so the
+    /// cancel is still allowed; after a restart it is refused). The agent stops
+    /// the reply if it still has it.
     Requested,
 }
 
 /// Cancel a send: every recipient still accepted or running is cancelled
 /// through the dispatcher, and a send still preparing or dispatching is told to
 /// stop, so its remaining recipients are never sent. Needs the ledger's record
-/// of the send: a queued send does not survive a restart.
+/// of the send: a queued send does not survive a restart. A workflow's send is
+/// held like the agent tools' own, so this reaches it too, and the cancelled
+/// replies end its run as any cancelled participant does.
 ///
 /// With `agent_id`, only that recipient's reply is cancelled, queued or
 /// running: its actor drops the send's item, and the other recipients carry
-/// on. That needs no ledger record, so it also reaches a workflow's sends (the
-/// ledger does not hold them) and one from before a restart; the outcome is
-/// then `requested`, because nothing here can see whether the agent still had
-/// the reply.
+/// on. That needs no ledger record, so it also reaches a workflow's send the
+/// ledger no longer holds; the outcome is then `requested`, because nothing
+/// here can see whether the agent still had the reply.
+///
+/// Either way, a send made by a workflow the user started from the window is
+/// refused: the user's work is the user's to stop.
 pub fn cancel_send(
     state: &AppState,
     project_id: ProjectId,
     send_id: SendId,
     agent_id: Option<AgentId>,
 ) -> Result<CancelledSend, AppError> {
+    if workflow_send_owner(state, project_id, send_id) == Some(false) {
+        return Err(AppError::ReplyInUserWorkflow { send_id });
+    }
     if let Some(agent_id) = agent_id {
         return cancel_one_recipient(state, project_id, send_id, agent_id);
     }
@@ -976,9 +1124,9 @@ pub fn cancel_send(
 }
 
 /// [`cancel_send`] for one recipient. Only a send made through the agent
-/// tools (the ledger holds those) or by a workflow started through them: a
-/// reply to a message the user typed, or inside a workflow the user started
-/// from the window, is the user's to stop.
+/// tools or by a workflow started through them (the ledger holds both, and
+/// [`cancel_send`] has already refused a workflow the user started): a reply
+/// to a message the user typed is the user's to stop.
 fn cancel_one_recipient(
     state: &AppState,
     project_id: ProjectId,
@@ -1097,6 +1245,12 @@ pub struct WaitSendReply {
     /// progress token to keep a longer one alive (or asked for over an hour).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capped_to_seconds: Option<u64>,
+    /// Each harness account's limits as last read, as `get_usage` reports them
+    /// without each window's credits and duration, on a finished result only:
+    /// information for choosing the next step's model and effort. No Codex
+    /// account is read for it; each window's `observed_at` says how old it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Vec<super::usage::HarnessUsageReport>>,
     /// Every recipient reached a terminal status. While `false`, recipients
     /// carry statuses, activity, and the end of their text so far, never the
     /// whole reply, so a caller that must call again every 50 seconds pays a
@@ -1118,6 +1272,9 @@ pub async fn wait_send(
     let mut reply = wait_send_unreported(state, project_id, send_id, budget, home_dir).await?;
     reply.capped_to_seconds = budget.capped_to_seconds();
     add_context(state, &mut reply);
+    if reply.done {
+        reply.usage = Some(stored_usage(state));
+    }
     Ok(reply)
 }
 
@@ -1156,6 +1313,12 @@ pub struct WaitAnySendReply {
     /// progress token to keep a longer one alive (or asked for over an hour).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capped_to_seconds: Option<u64>,
+    /// Each harness account's limits as last read, as `get_usage` reports them
+    /// without each window's credits and duration, on a finished result only:
+    /// information for choosing the next step's model and effort. No Codex
+    /// account is read for it; each window's `observed_at` says how old it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Vec<super::usage::HarnessUsageReport>>,
     /// At least one of the sends is done.
     pub any_done: bool,
     /// Each send asked about, once, in the order asked, as `wait_send`
@@ -1221,9 +1384,11 @@ pub async fn wait_any_send(
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
+    let any_done = sends.iter().any(|send| send.done);
     Ok(WaitAnySendReply {
         capped_to_seconds: budget.capped_to_seconds(),
-        any_done: sends.iter().any(|send| send.done),
+        usage: any_done.then(|| stored_usage(state)),
+        any_done,
         sends,
     })
 }
@@ -1234,6 +1399,52 @@ fn held_send(state: &AppState, project_id: ProjectId, send_id: SendId) -> Option
         .ledger
         .send(send_id)
         .filter(|snapshot| snapshot.project_id == project_id)
+}
+
+/// A send's recipients as they stand, without waiting: the ledger's snapshot
+/// while it holds the send, each completed recipient with its reply even while
+/// others still run; otherwise the journal's answer, as after a restart, where
+/// `started` means the outcome could not be confirmed. The same reading
+/// `wait_send` gives once it stops waiting; a forward naming a reply and
+/// `read_workflow_run` read sends through this, so all three agree on every
+/// status.
+pub(super) async fn current_send(
+    state: &AppState,
+    project_id: ProjectId,
+    send_id: SendId,
+    home_dir: &Path,
+) -> Result<CurrentSend, AppError> {
+    match held_send(state, project_id, send_id) {
+        Some(snapshot) => Ok(CurrentSend {
+            handed_out: snapshot.settled,
+            reply: WaitSendReply {
+                send_id,
+                capped_to_seconds: None,
+                usage: None,
+                done: snapshot.is_done(),
+                source: WaitSource::Live,
+                recipients: snapshot.recipients,
+            },
+        }),
+        None => Ok(CurrentSend {
+            handed_out: true,
+            reply: journal_fallback(state, project_id, send_id, home_dir).await?,
+        }),
+    }
+}
+
+/// A send as [`current_send`] reads it.
+pub(super) struct CurrentSend {
+    pub reply: WaitSendReply,
+    /// The send has been offered to every recipient it will reach. Until then
+    /// a recipient not yet offered reads `not_dispatched` though its turn may
+    /// be moments away: a send is handed to its recipients one at a time, and
+    /// its id can be known before the last is reached. A send read from the
+    /// journal is reported as handed out because the journal cannot say
+    /// otherwise: it records a recipient's copy only when that recipient's turn
+    /// starts, so a recipient of a message the window sent that is still
+    /// waiting in line is absent from it, as if it never received the send.
+    pub handed_out: bool,
 }
 
 /// A send the ledger holds, as a wait reports it: reply text only once every
@@ -1253,6 +1464,7 @@ fn live_reply(send_id: SendId, snapshot: SendSnapshot) -> WaitSendReply {
     WaitSendReply {
         send_id,
         capped_to_seconds: None,
+        usage: None,
         done,
         source: WaitSource::Live,
         recipients,
@@ -1279,6 +1491,7 @@ async fn unheld_reply(
         Outcome::Timeout | Outcome::Cancelled => Ok(WaitSendReply {
             send_id,
             capped_to_seconds: None,
+            usage: None,
             done: false,
             source: WaitSource::Journal,
             recipients: Vec::new(),
@@ -1350,6 +1563,7 @@ async fn journal_fallback(
         return Ok(WaitSendReply {
             send_id,
             capped_to_seconds: None,
+            usage: None,
             done: true,
             source: WaitSource::Unknown,
             recipients: Vec::new(),
@@ -1373,6 +1587,7 @@ async fn journal_fallback(
     Ok(WaitSendReply {
         send_id,
         capped_to_seconds: None,
+        usage: None,
         // Nothing more can arrive from a restart's journal; the caller decides
         // what a lingering `started` means.
         done: true,
@@ -1392,18 +1607,7 @@ async fn fallback_recipient(
     home_dir: &Path,
     context: &super::context::ContextStore,
 ) -> RecipientSnapshot {
-    let mut recipient = RecipientSnapshot {
-        agent_id,
-        activity: None,
-        recent_text: None,
-        context: None,
-        message_id: None,
-        status: SendStatus::Started,
-        text: None,
-        error: None,
-        code: None,
-        failure_kind: None,
-    };
+    let mut recipient = RecipientSnapshot::bare(agent_id, SendStatus::Started);
     match view.and_then(|v| v.outcomes.get(&send_id)) {
         Some((OutcomeStatus::Cancelled, _)) => recipient.status = SendStatus::Cancelled,
         Some((OutcomeStatus::Failed, reason)) => {
@@ -1455,6 +1659,12 @@ pub struct WaitAgentReply {
     /// progress token to keep a longer one alive (or asked for over an hour).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capped_to_seconds: Option<u64>,
+    /// Each harness account's limits as last read, as `get_usage` reports them
+    /// without each window's credits and duration, on a finished result only:
+    /// information for choosing the next step's model and effort. No Codex
+    /// account is read for it; each window's `observed_at` says how old it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Vec<super::usage::HarnessUsageReport>>,
     pub status: AgentWaitStatus,
     /// The agent's latest output, once idle.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1477,6 +1687,9 @@ pub async fn wait_agent(
 ) -> Result<WaitAgentReply, AppError> {
     let mut reply = wait_agent_unreported(state, project_id, agent_id, budget, home_dir).await?;
     reply.capped_to_seconds = budget.capped_to_seconds();
+    if reply.status == AgentWaitStatus::Idle {
+        reply.usage = Some(stored_usage(state));
+    }
     Ok(reply)
 }
 
@@ -1514,6 +1727,7 @@ async fn wait_agent_unreported(
             agent_id,
             activity: state.ledger.activity(agent_id),
             capped_to_seconds: None,
+            usage: None,
             status: AgentWaitStatus::Running,
             output: None,
             output_unavailable: false,
@@ -1530,6 +1744,7 @@ async fn wait_agent_unreported(
         agent_id,
         activity: state.ledger.activity(agent_id),
         capped_to_seconds: None,
+        usage: None,
         status: AgentWaitStatus::Idle,
         output_unavailable: output.is_none(),
         output,

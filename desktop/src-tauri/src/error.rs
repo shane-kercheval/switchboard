@@ -158,12 +158,59 @@ pub enum AppError {
     )]
     SendNotCancellable { send_id: SendId },
 
-    /// A single-recipient cancel named a send made by a workflow the user
-    /// started from the window.
+    /// A cancel named a send made by a workflow the user started from the
+    /// window.
     #[error(
         "send {send_id} belongs to a workflow the user started from Switchboard's window: tell the user rather than cancelling it"
     )]
     ReplyInUserWorkflow { send_id: SendId },
+
+    /// A forward named a source's reply by `send_id`, and nothing records the
+    /// source receiving that send in its project: the id is wrong, belongs to
+    /// another agent or another project, or names a message the window sent
+    /// whose reply has not started (the journal records a recipient's copy
+    /// only when its turn starts, so the two cannot be told apart). Nothing
+    /// was sent.
+    #[error(
+        "{name} has no reply to send {send_id} in its project, or that reply has not started yet, so nothing was sent: check the send_id, and the source's project_id if the send was made in another project"
+    )]
+    ForwardReplyUnknown { name: String, send_id: SendId },
+
+    /// A forward named a source's reply by `send_id` while that reply is
+    /// still to be sent, waiting in line, or running. A named reply is never
+    /// waited for, so nothing was sent. Each of these states arises only for a
+    /// send Switchboard follows live, which `wait_send` follows to its end;
+    /// `wait_agent` would return at once for an agent the send has not reached.
+    #[error(
+        "{name}'s reply to send {send_id} is still {state}, so nothing was sent: wait for that send with wait_send, then forward again"
+    )]
+    ForwardReplyUnfinished {
+        name: String,
+        send_id: SendId,
+        state: &'static str,
+    },
+
+    /// A forward named a source's reply by `send_id` and that reply did not
+    /// complete: it failed, was cancelled, or never reached the agent. Nothing
+    /// was sent.
+    #[error(
+        "{name}'s reply to send {send_id} {state}, so nothing was sent: forward a completed reply, or leave out send_id to forward {name}'s latest answer"
+    )]
+    ForwardReplyNotCompleted {
+        name: String,
+        send_id: SendId,
+        state: &'static str,
+    },
+
+    /// A forward named a source's reply by `send_id` and Switchboard cannot
+    /// tie a finished reply to that send. A reply matched to its send only by
+    /// position is a guess the recipient could not tell from the agent's real
+    /// answer, so it is refused; the caller can read it, see how it was
+    /// matched, and send its text itself. Nothing was sent.
+    #[error(
+        "Switchboard cannot confirm a finished reply from {name} to send {send_id}, so nothing was sent. The reply may still be running, the app may have restarted while it ran, or Switchboard can't tell which turn answered that send. Read it with read_send_output, which says how the reply was matched, and if it is the one you want, send its text with send"
+    )]
+    ForwardReplyUnconfirmed { name: String, send_id: SendId },
 
     /// An agent-access cancel named a workflow run the user started from the
     /// window.

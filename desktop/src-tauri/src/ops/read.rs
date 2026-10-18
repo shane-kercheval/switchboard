@@ -739,7 +739,8 @@ pub struct AgentOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextFigures>,
     /// The agent has a turn running, or a send made through the agent tools
-    /// is still to reach it, so this answer is not its newest. `false` does not
+    /// or by a workflow is still to reach it, so this answer is not its
+    /// newest. `false` does not
     /// prove the answer current: a message the user typed may be starting. A
     /// caller following its own send waits on that send instead.
     #[serde(skip_serializing_if = "std::ops::Not::not")]

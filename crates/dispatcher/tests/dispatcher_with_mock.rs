@@ -625,8 +625,20 @@ fn completed_turn_end(turn_id: TurnId) -> AdapterEvent {
     }
 }
 
+/// What waits behind the first turn when it ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Behind {
+    /// Nothing: the agent is free once the first turn ends.
+    Nothing,
+    /// "second", whose turn completes as soon as it starts.
+    Message,
+    /// "second", whose turn runs until the test ends it, so a command the old
+    /// ordering read during that turn is seen acting on it.
+    HeldMessage,
+}
+
 /// An agent whose first turn runs with its stream held open by the test, and
-/// a second message queued behind it.
+/// what [`Behind`] says waits behind it.
 struct QueuedBehindATurn {
     dispatcher: Arc<Dispatcher>,
     emitter: Arc<RecordingEmitter>,
@@ -635,16 +647,28 @@ struct QueuedBehindATurn {
     /// Ends the first turn's stream when sent its terminal and dropped.
     first_turn: Option<tokio::sync::mpsc::UnboundedSender<AdapterEvent>>,
     first_turn_id: TurnId,
-    queued_send: SendId,
-    queued_message: MessageId,
+    /// The same for "second", when it is held.
+    second_turn: Option<tokio::sync::mpsc::UnboundedSender<AdapterEvent>>,
+    /// "second"'s send and message ids, when it is queued.
+    queued: Option<(SendId, MessageId)>,
     prompts: Arc<Mutex<Vec<String>>>,
 }
 
 async fn queued_behind_a_turn() -> QueuedBehindATurn {
+    a_turn_with(Behind::Message).await
+}
+
+async fn a_turn_with(behind: Behind) -> QueuedBehindATurn {
     let (first_turn, events) = tokio::sync::mpsc::unbounded_channel();
+    let mut driven = std::collections::VecDeque::from([events]);
+    let second_turn = (behind == Behind::HeldMessage).then(|| {
+        let (second_turn, events) = tokio::sync::mpsc::unbounded_channel();
+        driven.push_back(events);
+        second_turn
+    });
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let adapter: Arc<dyn HarnessAdapter> = Arc::new(DrivenAdapter {
-        turns: Mutex::new(std::collections::VecDeque::from([events])),
+        turns: Mutex::new(driven),
         prompts: Arc::clone(&prompts),
     });
     let dispatcher = Arc::new(Dispatcher::new());
@@ -680,19 +704,24 @@ async fn queued_behind_a_turn() -> QueuedBehindATurn {
         .find(|(_, v)| event_type(v) == "turn_start")
         .map(|(_, v)| extract_turn_id(v))
         .expect("the first turn started");
-    let queued_send = Uuid::now_v7();
-    let queued_message = accepted(
-        dispatcher
-            .send_message(
-                agent.id,
-                "second",
-                vec![],
-                queued_send,
-                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
-                OnBusy::Enqueue,
-            )
-            .await,
-    );
+    let queued = if behind == Behind::Nothing {
+        None
+    } else {
+        let queued_send = Uuid::now_v7();
+        let queued_message = accepted(
+            dispatcher
+                .send_message(
+                    agent.id,
+                    "second",
+                    vec![],
+                    queued_send,
+                    Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                    OnBusy::Enqueue,
+                )
+                .await,
+        );
+        Some((queued_send, queued_message))
+    };
     QueuedBehindATurn {
         dispatcher,
         emitter,
@@ -700,8 +729,8 @@ async fn queued_behind_a_turn() -> QueuedBehindATurn {
         factory,
         first_turn: Some(first_turn),
         first_turn_id,
-        queued_send,
-        queued_message,
+        second_turn,
+        queued,
         prompts,
     }
 }
@@ -718,6 +747,58 @@ impl QueuedBehindATurn {
             .send(completed_turn_end(self.first_turn_id))
             .unwrap();
     }
+
+    /// End a held "second" once its turn has started.
+    async fn end_second_turn(&mut self) {
+        within(
+            &self.emitter,
+            "the second turn_start",
+            self.emitter.wait_for_type("turn_start", 2),
+        )
+        .await;
+        let second_turn_id = self
+            .emitter
+            .snapshot()
+            .iter()
+            .filter(|(_, v)| event_type(v) == "turn_start")
+            .nth(1)
+            .map(|(_, v)| extract_turn_id(v))
+            .expect("the second turn started");
+        let second_turn = self.second_turn.take().expect("the second turn is held");
+        second_turn
+            .send(completed_turn_end(second_turn_id))
+            .unwrap();
+    }
+
+    fn queued_send(&self) -> SendId {
+        self.queued.expect("a message is queued").0
+    }
+
+    fn queued_message(&self) -> MessageId {
+        self.queued.expect("a message is queued").1
+    }
+
+    async fn until_idle(&self) {
+        within(
+            &self.emitter,
+            "agent_idle",
+            self.emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+    }
+
+    fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().unwrap().clone()
+    }
+}
+
+/// The outcome status of each turn that ended, in order.
+fn turn_outcomes(events: &[(String, serde_json::Value)]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|(_, v)| event_type(v) == "turn_end")
+        .map(|(_, v)| v["outcome"]["status"].as_str().unwrap_or("?").to_owned())
+        .collect()
 }
 
 /// Emits one turn that delivers a code review through a findings tool call and
@@ -7859,7 +7940,7 @@ async fn a_cancel_waiting_as_a_turn_ends_stops_the_next_queued_message_before_it
     agent.end_first_turn();
     agent
         .dispatcher
-        .cancel_send(agent.queued_send, &[agent.agent.id], CancelSource::User);
+        .cancel_send(agent.queued_send(), &[agent.agent.id], CancelSource::User);
 
     within(
         &agent.emitter,
@@ -7888,7 +7969,7 @@ async fn a_removal_waiting_as_a_turn_ends_takes_the_queued_message_back_before_i
     let mut removal = Box::pin(
         agent
             .dispatcher
-            .remove_queued_message(agent.agent.id, agent.queued_message),
+            .remove_queued_message(agent.agent.id, agent.queued_message()),
     );
     // The first poll sends the removal to the actor, which has not run yet.
     assert!(futures::poll!(removal.as_mut()).is_pending());
@@ -7936,5 +8017,175 @@ async fn a_fail_fast_send_waiting_as_a_turn_ends_is_refused_while_work_is_queued
         *agent.prompts.lock().unwrap(),
         vec!["first".to_owned(), "second".to_owned()],
         "the queued message ran and the refused one never did"
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_send_waiting_as_a_turn_ends_queues_behind_the_waiting_message() {
+    let mut agent = queued_behind_a_turn().await;
+    agent.end_first_turn();
+    let mut send = Box::pin(agent.dispatcher.send_message(
+        agent.agent.id,
+        "third",
+        vec![],
+        Uuid::now_v7(),
+        Arc::clone(&agent.factory) as Arc<dyn DispatchContextFactory>,
+        OnBusy::Enqueue,
+    ));
+    // An ordinary send hands its message to the actor and returns at once,
+    // without waiting for the actor: the first poll finishes it, before the
+    // actor has run.
+    assert!(matches!(
+        futures::poll!(send.as_mut()),
+        std::task::Poll::Ready(SendOutcome::Accepted(_))
+    ));
+
+    agent.until_idle().await;
+    assert_eq!(
+        agent.prompts(),
+        vec!["first".to_owned(), "second".to_owned(), "third".to_owned()],
+        "admitted behind the message already waiting, in order, none lost"
+    );
+    assert_eq!(
+        turn_outcomes(&agent.emitter.snapshot()),
+        vec!["completed"; 3]
+    );
+}
+
+#[tokio::test]
+async fn a_stop_waiting_as_a_reply_ends_leaves_the_next_queued_message_alone() {
+    let mut agent = a_turn_with(Behind::HeldMessage).await;
+    agent.end_first_turn();
+    // The stop button on the first reply, pressed as that reply ended.
+    agent.dispatcher.cancel(agent.agent.id, CancelSource::User);
+
+    agent.end_second_turn().await;
+    agent.until_idle().await;
+    assert_eq!(
+        agent.prompts(),
+        vec!["first".to_owned(), "second".to_owned()]
+    );
+    let events = agent.emitter.snapshot();
+    assert_eq!(
+        turn_outcomes(&events),
+        vec!["completed"; 2],
+        "the stop was for the reply that had ended; the next message runs to its end"
+    );
+    assert_eq!(count_type(&events, "message_cancelled"), 0);
+}
+
+#[tokio::test]
+async fn stop_agent_waiting_as_a_turn_ends_drops_the_next_message_unstarted() {
+    let mut agent = queued_behind_a_turn().await;
+    agent.end_first_turn();
+    agent
+        .dispatcher
+        .cancel_agent(agent.agent.id, CancelSource::User);
+
+    agent.until_idle().await;
+    assert_eq!(
+        agent.prompts(),
+        vec!["first".to_owned()],
+        "the next message never reached the harness"
+    );
+    let events = agent.emitter.snapshot();
+    assert_eq!(count_type(&events, "message_cancelled"), 1);
+    assert_eq!(count_type(&events, "turn_start"), 1);
+}
+
+#[tokio::test]
+async fn a_fail_fast_send_waiting_as_a_turn_ends_with_nothing_queued_is_accepted() {
+    let mut agent = a_turn_with(Behind::Nothing).await;
+    agent.end_first_turn();
+    let mut offer = Box::pin(agent.dispatcher.send_message(
+        agent.agent.id,
+        "next",
+        vec![],
+        Uuid::now_v7(),
+        Arc::clone(&agent.factory) as Arc<dyn DispatchContextFactory>,
+        OnBusy::FailFast,
+    ));
+    // The first poll sends the offer to the actor, which has not run yet.
+    assert!(futures::poll!(offer.as_mut()).is_pending());
+
+    accepted(offer.await);
+    agent.until_idle().await;
+    assert_eq!(
+        agent.prompts(),
+        vec!["first".to_owned(), "next".to_owned()],
+        "the agent is free once its turn ends and nothing waits, so the offer runs"
+    );
+}
+
+#[tokio::test]
+async fn a_forward_waiting_as_a_turn_ends_answers_idle_without_waiting_on_the_next_turn() {
+    let mut agent = a_turn_with(Behind::HeldMessage).await;
+    agent.end_first_turn();
+    let mut wait = Box::pin(agent.dispatcher.wait_for_current_turn(agent.agent.id));
+    // The first poll sends the wait to the actor, which has not run yet.
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+
+    // "second" is held running until the test ends it, so a wait bound to
+    // its turn would not answer here.
+    let answer = tokio::time::timeout(WAIT, wait)
+        .await
+        .expect("the wait answered without waiting on the next queued turn");
+    assert!(
+        matches!(answer, CurrentTurnWait::Idle),
+        "no turn was running when it asked: read the latest completed answer"
+    );
+    agent.end_second_turn().await;
+    agent.until_idle().await;
+}
+
+#[tokio::test]
+async fn shutdown_waiting_as_a_turn_ends_fails_the_next_message_unstarted() {
+    let mut agent = queued_behind_a_turn().await;
+    agent.end_first_turn();
+    let mut shutdown = Box::pin(
+        agent
+            .dispatcher
+            .shutdown_agent(agent.agent.id, CancelSource::Shutdown),
+    );
+    // The first poll sends the shutdown to the actor, which has not run yet.
+    assert!(futures::poll!(shutdown.as_mut()).is_pending());
+
+    assert!(
+        tokio::time::timeout(WAIT, shutdown).await.is_ok(),
+        "the shutdown finished"
+    );
+    assert_eq!(
+        agent.prompts(),
+        vec!["first".to_owned()],
+        "the next message never reached the harness"
+    );
+    let events = agent.emitter.snapshot();
+    assert_eq!(
+        count_type(&events, "message_failed"),
+        1,
+        "the queued message is failed, as a shutdown fails every queued message"
+    );
+    assert_eq!(count_type(&events, "turn_start"), 1);
+}
+
+#[tokio::test]
+async fn whether_an_agent_is_free_as_a_turn_ends_counts_its_queued_message() {
+    let mut agent = queued_behind_a_turn().await;
+    agent.end_first_turn();
+    let mut busy = Box::pin(agent.dispatcher.accepts_now(agent.agent.id));
+    assert!(futures::poll!(busy.as_mut()).is_pending());
+    assert!(
+        !busy.await,
+        "a message is still waiting when it asked, so the agent is not free"
+    );
+    agent.until_idle().await;
+
+    let mut alone = a_turn_with(Behind::Nothing).await;
+    alone.end_first_turn();
+    let mut free = Box::pin(alone.dispatcher.accepts_now(alone.agent.id));
+    assert!(futures::poll!(free.as_mut()).is_pending());
+    assert!(
+        free.await,
+        "nothing waits behind the ended turn, so it is free"
     );
 }

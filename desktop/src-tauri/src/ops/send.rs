@@ -1244,6 +1244,30 @@ fn held_send(state: &AppState, project_id: ProjectId, send_id: SendId) -> Option
         .filter(|snapshot| snapshot.project_id == project_id)
 }
 
+/// A send's recipients as they stand, without waiting: the ledger's snapshot
+/// while it holds the send, each completed recipient with its reply even while
+/// others still run; otherwise the journal's answer, as after a restart, where
+/// `started` means the outcome could not be confirmed. The same reading
+/// `wait_send` gives once it stops waiting; `read_workflow_run` reads sends
+/// through this, so the two agree on every status.
+pub(super) async fn current_send(
+    state: &AppState,
+    project_id: ProjectId,
+    send_id: SendId,
+    home_dir: &Path,
+) -> Result<WaitSendReply, AppError> {
+    match held_send(state, project_id, send_id) {
+        Some(snapshot) => Ok(WaitSendReply {
+            send_id,
+            capped_to_seconds: None,
+            done: snapshot.is_done(),
+            source: WaitSource::Live,
+            recipients: snapshot.recipients,
+        }),
+        None => journal_fallback(state, project_id, send_id, home_dir).await,
+    }
+}
+
 /// A send the ledger holds, as a wait reports it: reply text only once every
 /// recipient is done.
 fn live_reply(send_id: SendId, snapshot: SendSnapshot) -> WaitSendReply {
@@ -1400,18 +1424,7 @@ async fn fallback_recipient(
     home_dir: &Path,
     context: &super::context::ContextStore,
 ) -> RecipientSnapshot {
-    let mut recipient = RecipientSnapshot {
-        agent_id,
-        activity: None,
-        recent_text: None,
-        context: None,
-        message_id: None,
-        status: SendStatus::Started,
-        text: None,
-        error: None,
-        code: None,
-        failure_kind: None,
-    };
+    let mut recipient = RecipientSnapshot::bare(agent_id, SendStatus::Started);
     match view.and_then(|v| v.outcomes.get(&send_id)) {
         Some((OutcomeStatus::Cancelled, _)) => recipient.status = SendStatus::Cancelled,
         Some((OutcomeStatus::Failed, reason)) => {

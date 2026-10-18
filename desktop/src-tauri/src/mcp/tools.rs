@@ -83,8 +83,8 @@ Results are JSON: {\"result\": …, \"truncated\": […], \"items_omitted\": n},
 100,000 characters. Replies, conversations, and wait_workflow are kept under 45,000 when your \
 client sends no progress token (Claude Desktop). Long text may be cut; each cut is listed in \
 truncated with the call that reads the rest (read_with), when there is one. max_chars on \
-read_conversation, read_send_output, read_agent_output, wait_send, wait_any_send, and \
-wait_agent sets the limit for one call, and the call a cut lists keeps it. Codex keeps about \
+read_conversation, read_send_output, read_agent_output, read_workflow_run, wait_send, \
+wait_any_send, and wait_agent sets the limit for one call, and the call a cut lists keeps it. Codex keeps about \
 10,000 tokens of a result and cuts the middle: pass 25000 there. An error is {\"code\": …, \
 \"message\": …}; the message says what to do.
 
@@ -257,6 +257,20 @@ tools! {
         "A project's workflow runs: running ones, and failed or interrupted ones still held. A \
          held run blocks every new workflow in the project until dismiss_workflow_run removes \
          it.";
+    ReadWorkflowRun = "read_workflow_run" (ReadWorkflowRunArgs) [Read]
+        "Every reply a workflow run produced, in step order, without waiting: its status and \
+         done, then each send with its step, label, send_id, done, and source, and each \
+         recipient as wait_send reports it, with its agent's name and, once that recipient \
+         completed, its reply text. A reviewer's first round comes back under its own step, \
+         which the agent's latest answer no longer holds. On a running run it gives the \
+         replies so far and the others' statuses (a running one with activity and \
+         recent_text). started appears only with source journal: after a restart the reply's \
+         outcome could not be confirmed. Long replies share the result evenly (100,000 \
+         characters, 45,000 without a progress token, or max_chars), each cut listed in \
+         truncated with the read_send_output call that reads on. sends_unavailable is true \
+         once Switchboard no longer holds the run's record (after a restart, or once it \
+         pruned the run): the replies are then in read_conversation. After a restart a \
+         completed or cancelled run is run_unknown.";
     CreateProject = "create_project" (CreateProjectArgs) [Additive]
         "Create a project for a folder on this Mac. It starts with no agents; add them with \
          create_agent. Avoid the folder this session runs in: the agents Switchboard launches \
@@ -360,8 +374,9 @@ tools! {
          done. Pass inputs as describe_workflow lists them: an agent input takes an agent id, a \
          list input a list. forward_sources fills an input with agents' latest answers. \
          wait_workflow lists every send the run made with its send_id: follow one with wait_send \
-         as you would your own, and read a step's replies with read_send_output rather than \
-         read_agent_output, since an agent's latest answer holds only its last step. Refused with \
+         as you would your own. read_workflow_run returns every reply in step order; read it \
+         rather than read_agent_output, since an agent's latest answer holds only its last \
+         step. Refused with \
          workflow_already_running while another run is in progress in the project, with \
          workflow_run_requires_dismissal while a failed run is held there, and while an agent \
          is being removed from it (start again in a moment).";
@@ -434,11 +449,11 @@ tools! {
              0, its label, and its agents as {{agent_id, name}}) and sends: every send the run's \
              send steps made so far, each with its step, label, send_id, and recipients \
              (dispatched false for one a failed step never reached). Follow any of those sends \
-             with wait_send, and read its replies with read_send_output and its send_id, even \
-             after the agent answered a later step: an agent's latest answer holds only its last \
+             with wait_send. read_workflow_run returns all their replies in step order, even \
+             after an agent answered a later step: an agent's latest answer holds only its last \
              one. A run with more sends than one reply holds lists only the newest: items_omitted \
-             says how many of the earliest were left out, and their replies cannot be read \
-             through this tool. sends_unavailable is true once Switchboard no longer holds the \
+             says how many of the earliest were left out, and read_workflow_run still lists \
+             them. sends_unavailable is true once Switchboard no longer holds the \
              run's record (after a restart, or once it pruned the run): its sends are no longer \
              known.\n{WAIT_HINTS}"
         );
@@ -562,6 +577,21 @@ pub struct ReadSendOutputArgs {
     /// an offset only holds in the copy it came from.
     #[serde(default)]
     read_from: ReadFromArg,
+    /// Keep the result under this many characters: 10,000 to 100,000. By
+    /// default 100,000, or 45,000 when the client sends no progress token.
+    #[serde(default)]
+    max_chars: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub struct ReadWorkflowRunArgs {
+    #[schemars(with = "String")]
+    project_id: ProjectId,
+    /// The run id `run_workflow` or `list_workflow_runs` returned.
+    #[schemars(with = "String")]
+    run_id: Uuid,
     /// Keep the result under this many characters: 10,000 to 100,000. By
     /// default 100,000, or 45,000 when the client sends no progress token.
     #[serde(default)]
@@ -1190,6 +1220,15 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
         ToolName::ListWorkflowRuns => {
             let a: ProjectArgs = parse(args)?;
             Reply::plain(&workflow::list_workflow_runs(state, a.project_id)?)
+        }
+        ToolName::ReadWorkflowRun => {
+            let a: ReadWorkflowRunArgs = parse(args)?;
+            let replies =
+                workflow::read_workflow_run(state, a.project_id, a.run_id, cx.home()).await?;
+            Reply::fitted(
+                &replies,
+                workflow::read_workflow_run_budget(a.project_id, cx.result_chars(a.max_chars)),
+            )
         }
         ToolName::CreateProject => {
             let a: CreateProjectArgs = parse(args)?;

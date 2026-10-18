@@ -205,6 +205,25 @@ pub struct RecipientSnapshot {
     pub context: Option<super::context::ContextFigures>,
 }
 
+impl RecipientSnapshot {
+    /// A recipient known only by its status: nothing it wrote, no error.
+    #[must_use]
+    pub fn bare(agent_id: AgentId, status: SendStatus) -> Self {
+        Self {
+            agent_id,
+            message_id: None,
+            status,
+            text: None,
+            error: None,
+            code: None,
+            failure_kind: None,
+            activity: None,
+            recent_text: None,
+            context: None,
+        }
+    }
+}
+
 /// How much of a running turn's text a send's snapshot carries.
 pub const RECENT_TEXT_CHARS: usize = 500;
 

@@ -1448,6 +1448,21 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
         json!([{ "agent_id": coder, "name": "coder", "dispatched": true }]),
         "the send the run made, with whom it reached"
     );
+    let replies = call(
+        "read_workflow_run",
+        json!({ "project_id": project_id, "run_id": failed["run_id"] }),
+    )
+    .await;
+    assert_eq!(replies["status"], "failed");
+    assert_eq!(
+        (
+            &replies["sends"][0]["label"],
+            &replies["sends"][0]["recipients"][0]["name"],
+            &replies["sends"][0]["recipients"][0]["status"],
+        ),
+        (&json!("Greet"), &json!("coder"), &json!("failed")),
+        "the run's send, with its recipient's reply status"
+    );
     let runs = call("list_workflow_runs", json!({ "project_id": project_id })).await;
     assert_eq!(runs.as_array().unwrap().len(), 1);
     let dismissed = call(

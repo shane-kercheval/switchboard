@@ -45,7 +45,8 @@ use super::send::{
 use super::test_support::*;
 use super::wait::{FINAL_OBSERVATION_GRACE, WaitBudget};
 use super::workflow::{
-    RunWorkflowRequest, WorkflowRunStatus, describe_workflow, run_workflow, wait_workflow,
+    RunSendReplies, RunWorkflowRequest, WorkflowRunStatus, describe_workflow, read_workflow_run,
+    read_workflow_run_budget, run_workflow, wait_workflow,
 };
 use super::{OUTPUT_PAGE_CHARS, RESULT_BUDGET_CHARS};
 
@@ -7721,4 +7722,334 @@ async fn cancelling_a_send_while_its_copy_is_stuck_ends_it_with_nothing_sent() {
         .unwrap();
     assert_eq!(receipt.recipients[0].status, SendStatus::Cancelled);
     assert!(lock(&env.adapter.prompts).is_empty());
+}
+
+// --- reading a workflow run's replies -----------------------------------------
+
+/// Two rounds to the same reviewers, so each has answered two of the run's
+/// sends by the end.
+const ROUNDS_WORKFLOW: &str = "name: rounds
+description: test
+inputs:
+  reviewers:
+    type: [agent]
+steps:
+  - label: First round
+    send:
+      to: \"{{ reviewers }}\"
+      text: first round
+  - label: First received
+    wait_for_all:
+      agents: \"{{ reviewers }}\"
+  - label: Second round
+    send:
+      to: \"{{ reviewers }}\"
+      text: second round
+  - label: Second received
+    wait_for_all:
+      agents: \"{{ reviewers }}\"
+";
+
+/// An env with the rounds workflow and two reviewers, `r1` and `r2`.
+fn rounds_env() -> (TestEnv, ProjectId, Vec<AgentId>) {
+    let mut env = TestEnv::new().with_prompts_and_workflows();
+    std::fs::write(env.workflows_dir().join("rounds.yaml"), ROUNDS_WORKFLOW).unwrap();
+    let project_id = env.project("proj");
+    let agents = ["r1", "r2"]
+        .iter()
+        .map(|n| env.agent(project_id, n))
+        .collect();
+    (env, project_id, agents)
+}
+
+async fn run_rounds(env: &TestEnv, project_id: ProjectId, reviewers: &[AgentId]) -> Uuid {
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        RunWorkflowRequest {
+            project_id,
+            name: "rounds".to_owned(),
+            is_builtin: false,
+            inputs: BTreeMap::from([(
+                "reviewers".to_owned(),
+                InputValue::List(reviewers.iter().map(ToString::to_string).collect()),
+            )]),
+            forward_sources: BTreeMap::new(),
+        },
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    let run = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    run_id
+}
+
+fn reply_texts(send: &RunSendReplies) -> Vec<(String, SendStatus, Option<String>)> {
+    send.recipients
+        .iter()
+        .map(|r| (r.name.clone(), r.reply.status, r.reply.text.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn read_workflow_run_returns_each_rounds_replies_under_its_own_step() {
+    let (env, project_id, reviewers) = rounds_env();
+    for (agent, tag) in reviewers.iter().zip(["R1", "R2"]) {
+        env.adapter
+            .push_for(*agent, Script::reply(&format!("{tag} FIRST")));
+        env.adapter
+            .push_for(*agent, Script::reply(&format!("{tag} SECOND")));
+    }
+    let run_id = run_rounds(&env, project_id, &reviewers).await;
+
+    let run = read_workflow_run(&env.state, project_id, run_id, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(run.status, WorkflowRunStatus::Completed);
+    assert!(run.done);
+    assert!(!run.sends_unavailable);
+    let steps: Vec<(usize, Option<&str>)> = run
+        .sends
+        .iter()
+        .map(|s| (s.step, s.label.as_deref()))
+        .collect();
+    assert_eq!(steps, [(0, Some("First round")), (2, Some("Second round"))]);
+    let completed = |text: &str| Some(text.to_owned());
+    assert_eq!(
+        reply_texts(&run.sends[0]),
+        [
+            (
+                "r1".to_owned(),
+                SendStatus::Completed,
+                completed("R1 FIRST")
+            ),
+            (
+                "r2".to_owned(),
+                SendStatus::Completed,
+                completed("R2 FIRST")
+            ),
+        ],
+        "the first round, which each reviewer's latest answer no longer holds"
+    );
+    assert_eq!(
+        reply_texts(&run.sends[1]),
+        [
+            (
+                "r1".to_owned(),
+                SendStatus::Completed,
+                completed("R1 SECOND")
+            ),
+            (
+                "r2".to_owned(),
+                SendStatus::Completed,
+                completed("R2 SECOND")
+            ),
+        ]
+    );
+    assert!(
+        run.sends
+            .iter()
+            .all(|s| s.done && s.source == WaitSource::Live)
+    );
+}
+
+#[tokio::test]
+async fn read_workflow_run_on_a_running_run_reports_its_recipient_running_from_the_ledger() {
+    let (env, project_id, agents) = workflow_env().await;
+    let gate = Arc::new(Notify::new());
+    env.adapter
+        .push_for(agents[0], Script::parked("greeting", &gate));
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+
+    let mut run = None;
+    for _ in 0..100 {
+        let read = read_workflow_run(&env.state, project_id, run_id, &env.home())
+            .await
+            .unwrap();
+        if read
+            .sends
+            .first()
+            .is_some_and(|s| s.recipients[0].reply.status == SendStatus::Running)
+        {
+            run = Some(read);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let run = run.expect("the coder's reply reads running while its turn runs");
+    assert_eq!(run.status, WorkflowRunStatus::Running);
+    assert!(!run.done);
+    assert_eq!(run.sends.len(), 1, "the reviewers' step has not sent yet");
+    assert_eq!(
+        run.sends[0].source,
+        WaitSource::Live,
+        "not the restart path"
+    );
+    assert!(!run.sends[0].done);
+    assert_eq!(run.sends[0].recipients[0].reply.text, None);
+
+    gate.notify_waiters();
+    wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn read_workflow_run_reports_a_failed_steps_reply_as_failed() {
+    let (env, project_id, agents) = workflow_env().await;
+    env.adapter.push_for(agents[0], Script::failing("crashed"));
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+
+    let run = read_workflow_run(&env.state, project_id, run_id, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(run.status, WorkflowRunStatus::Failed);
+    assert!(run.reason.is_some());
+    assert_eq!(run.sends.len(), 1, "the reviewers were never sent to");
+    assert_eq!(run.sends[0].recipients[0].reply.status, SendStatus::Failed);
+}
+
+#[tokio::test]
+async fn read_workflow_run_after_a_restart_knows_a_held_failed_run_but_not_its_sends() {
+    let (env, project_id, agents) = workflow_env().await;
+    env.adapter.push_for(agents[0], Script::failing("crashed"));
+    let failed = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    wait_workflow(
+        &env.state,
+        project_id,
+        failed,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    let env = env.restart();
+
+    let run = read_workflow_run(&env.state, project_id, failed, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(run.status, WorkflowRunStatus::Failed);
+    assert!(run.sends_unavailable, "its sends are not known, not absent");
+    assert!(run.sends.is_empty());
+}
+
+#[tokio::test]
+async fn read_workflow_run_after_a_restart_does_not_know_a_completed_run() {
+    let (env, project_id, reviewers) = rounds_env();
+    let run_id = run_rounds(&env, project_id, &reviewers).await;
+    let env = env.restart();
+    let err = read_workflow_run(&env.state, project_id, run_id, &env.home())
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), error_code::RUN_UNKNOWN, "{err:?}");
+}
+
+#[tokio::test]
+async fn read_workflow_run_under_another_project_is_run_unknown() {
+    let (mut env, project_id, reviewers) = rounds_env();
+    let other = env.project("other");
+    let run_id = run_rounds(&env, project_id, &reviewers).await;
+    let err = read_workflow_run(&env.state, other, run_id, &env.home())
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), error_code::RUN_UNKNOWN, "{err:?}");
+}
+
+#[tokio::test]
+async fn read_workflow_run_cuts_long_replies_evenly_and_each_cut_reads_on() {
+    let (env, project_id, reviewers) = rounds_env();
+    let mut full = BTreeMap::new();
+    for (agent, tag) in reviewers.iter().zip(["R1", "R2"]) {
+        for round in ["FIRST", "SECOND"] {
+            let text = format!("{tag} {round} {}", "x".repeat(30_000));
+            env.adapter.push_for(*agent, Script::reply(&text));
+            full.insert(format!("{tag} {round}"), text);
+        }
+    }
+    let run_id = run_rounds(&env, project_id, &reviewers).await;
+    let run = read_workflow_run(&env.state, project_id, run_id, &env.home())
+        .await
+        .unwrap();
+
+    let budget = 45_000;
+    let fitted = fit(
+        serde_json::to_value(&run).unwrap(),
+        &read_workflow_run_budget(project_id, budget),
+    )
+    .unwrap();
+    assert!(fitted.serialized_chars() <= budget);
+    assert_eq!(fitted.items_omitted, 0, "no send is dropped");
+    assert_eq!(fitted.truncated.len(), 4, "every reply is cut");
+    let kept: Vec<usize> = fitted.truncated.iter().map(|t| t.kept_chars).collect();
+    assert!(kept.iter().all(|k| *k == kept[0]), "cut evenly: {kept:?}");
+    for cut in &fitted.truncated {
+        let call = cut.read_with.as_ref().unwrap();
+        assert_eq!(call["tool"], "read_send_output");
+        let send_id: Uuid = serde_json::from_value(call["send_id"].clone()).unwrap();
+        let agent_id: AgentId = serde_json::from_value(call["agent_id"].clone()).unwrap();
+        let offset = usize::try_from(call["offset"].as_u64().unwrap()).unwrap();
+        let page = read_send_output(
+            &env.state,
+            project_id,
+            send_id,
+            agent_id,
+            offset,
+            ReadFrom::Auto,
+            OUTPUT_PAGE_CHARS,
+            &env.home(),
+        )
+        .await
+        .unwrap();
+        let tag = if agent_id == reviewers[0] { "R1" } else { "R2" };
+        let round = if send_id == run.sends[0].send_id {
+            "FIRST"
+        } else {
+            "SECOND"
+        };
+        let whole = &full[&format!("{tag} {round}")];
+        let rest: String = whole.chars().skip(offset).collect();
+        assert_eq!(page.text, rest, "the cut for {tag} {round} reads on");
+    }
 }

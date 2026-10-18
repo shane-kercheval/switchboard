@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use switchboard_core::ProjectId;
+use switchboard_core::{ProjectId, SendId};
 use switchboard_workflow::InputValue;
 use uuid::Uuid;
 
@@ -20,8 +20,9 @@ use crate::workflow_commands::{
 };
 
 use super::budget::BudgetSpec;
-use super::ledger::{RunSend, RunState};
+use super::ledger::{RecipientSnapshot, RunSend, RunState, SendStatus};
 use super::read::project_readonly;
+use super::send::{WaitSource, current_send, wait_any_send_budget};
 use super::wait::{Observed, Outcome, WaitBudget, wait_until};
 
 /// Resolve any forward fields (completed-only) and merge the composed text
@@ -190,9 +191,9 @@ pub struct WaitWorkflowReply {
 
 /// The workflow wait's result fits the budget by dropping its oldest sends
 /// first, so a run with more sends than one reply holds still reports its
-/// status; `items_omitted` says how many were left out, and their replies
-/// cannot be read through this tool. Reaching that takes hundreds of send
-/// steps in one fixed workflow file; revisit with real paging when loops
+/// status; `items_omitted` says how many were left out, and
+/// [`read_workflow_run`] still lists them all. Reaching that takes hundreds of
+/// send steps in one fixed workflow file; revisit with real paging when loops
 /// (`for_each`) can run.
 #[must_use]
 pub fn wait_workflow_budget(budget_chars: usize) -> BudgetSpec {
@@ -228,48 +229,59 @@ async fn wait_workflow_unreported(
         budget,
         signal,
         || async move {
-            match state.ledger.run(run_id) {
-                Some(run) if run.project_id == project_id => {
-                    let reply = WaitWorkflowReply {
-                        run_id,
-                        capped_to_seconds: None,
-                        status: match run.status {
-                            RunState::Running => WorkflowRunStatus::Running,
-                            RunState::Completed => WorkflowRunStatus::Completed,
-                            RunState::Failed => WorkflowRunStatus::Failed,
-                            RunState::Cancelled => WorkflowRunStatus::Cancelled,
-                        },
-                        done: run.status != RunState::Running,
-                        workflow: run.workflow,
-                        step: run.step,
-                        total: run.total,
-                        label: run.label,
-                        recipients: run.recipients,
-                        sends: run.sends,
-                        sends_unavailable: false,
-                        reason: run.reason,
-                    };
-                    if reply.done {
-                        Observed::Done(Some(reply))
-                    } else {
-                        Observed::NotYet(Some(reply))
-                    }
-                }
-                // Registered but not yet announced on its channel: the run's first
-                // progress event is moments away, so keep waiting on the signal
-                // rather than answering from the registry and returning early.
-                _ => match live_run(state, project_id, run_id) {
-                    Some(reply) => Observed::NotYet(Some(reply)),
-                    None => Observed::Done(None),
-                },
+            match observe_run(state, project_id, run_id) {
+                Some(reply) if reply.done => Observed::Done(Some(reply)),
+                Some(reply) => Observed::NotYet(Some(reply)),
+                None => Observed::Done(None),
             }
         },
         || None,
     )
     .await;
-    if let Some(reply) = observed {
-        return Ok(reply);
+    match observed {
+        Some(reply) => Ok(reply),
+        None => run_from_files(state, project_id, run_id),
     }
+}
+
+/// The run as this process holds it now: the ledger's entry, or for a run
+/// registered but not yet announced on its channel, the live registry (its
+/// first progress event is moments away, so a wait keeps waiting on it).
+/// `None` when the process holds neither.
+fn observe_run(state: &AppState, project_id: ProjectId, run_id: Uuid) -> Option<WaitWorkflowReply> {
+    match state.ledger.run(run_id) {
+        Some(run) if run.project_id == project_id => Some(WaitWorkflowReply {
+            run_id,
+            capped_to_seconds: None,
+            status: match run.status {
+                RunState::Running => WorkflowRunStatus::Running,
+                RunState::Completed => WorkflowRunStatus::Completed,
+                RunState::Failed => WorkflowRunStatus::Failed,
+                RunState::Cancelled => WorkflowRunStatus::Cancelled,
+            },
+            done: run.status != RunState::Running,
+            workflow: run.workflow,
+            step: run.step,
+            total: run.total,
+            label: run.label,
+            recipients: run.recipients,
+            sends: run.sends,
+            sends_unavailable: false,
+            reason: run.reason,
+        }),
+        _ => live_run(state, project_id, run_id),
+    }
+}
+
+/// A run this process no longer holds, read from its retained file: a failed
+/// or interrupted run after a restart. Its step is known; which agents the
+/// engine resolved and which sends it made are not. A completed or cancelled
+/// run's file is deleted when it ends, so such a run is not found.
+fn run_from_files(
+    state: &AppState,
+    project_id: ProjectId,
+    run_id: Uuid,
+) -> Result<WaitWorkflowReply, AppError> {
     let info = list_workflow_runs(state, project_id)?
         .into_iter()
         .find(|r| r.run_id == run_id.to_string())
@@ -279,8 +291,6 @@ async fn wait_workflow_unreported(
         "interrupted" => WorkflowRunStatus::Interrupted,
         _ => WorkflowRunStatus::Failed,
     };
-    // A run read from its file after a restart: its step is known, which
-    // agents the engine resolved and which sends it made are not.
     Ok(WaitWorkflowReply {
         run_id,
         capped_to_seconds: None,
@@ -333,6 +343,127 @@ fn live_run(state: &AppState, project_id: ProjectId, run_id: Uuid) -> Option<Wai
         sends_unavailable: false,
         reason: None,
     })
+}
+
+/// Every reply a workflow run produced, by send, in step order.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct WorkflowRunReplies {
+    pub run_id: Uuid,
+    pub workflow: String,
+    pub status: WorkflowRunStatus,
+    pub done: bool,
+    /// Every send the run's send steps made so far, in step order, each with
+    /// its recipients' replies.
+    pub sends: Vec<RunSendReplies>,
+    /// Switchboard no longer holds the run's live record (after a restart, or
+    /// once it pruned the run), so its sends are not known: the replies are
+    /// still in the conversation.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sends_unavailable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One send of a run and its recipients' replies.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RunSendReplies {
+    pub step: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub send_id: SendId,
+    /// Every recipient reached a terminal status.
+    pub done: bool,
+    /// Where the statuses came from: `live` while Switchboard holds the send,
+    /// else `journal`, where `started` means the outcome could not be
+    /// confirmed.
+    pub source: WaitSource,
+    pub recipients: Vec<RunReply>,
+}
+
+/// One recipient's reply to a run's send: as `wait_send` reports it, with
+/// the agent's name, and the reply text once that recipient completed, even
+/// while the others still run.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RunReply {
+    pub name: String,
+    #[serde(flatten)]
+    pub reply: RecipientSnapshot,
+}
+
+/// Every reply a workflow run produced, in step order, without waiting.
+///
+/// **Why a separate read.** `wait_workflow` lists the run's sends without
+/// their text, so a caller that wants the replies reads each recipient with
+/// `read_send_output`, one call per reply, and an agent's latest answer holds
+/// only its last step. This returns them all at once, a reviewer's first round
+/// under its own step. Each send is read as `wait_send` reads it
+/// ([`current_send`]): from the ledger while it holds the send, so a running
+/// recipient reads `running`; from the journal after that, where `started`
+/// means a restart cut the outcome off. A recipient the run resolved but the
+/// send's record lacks never received the message.
+///
+/// The run is found as `wait_workflow` finds it; after a restart only a failed
+/// or interrupted run's file remains, which names no sends, and that is said
+/// with `sends_unavailable` rather than an empty list that reads as "no
+/// replies".
+pub async fn read_workflow_run(
+    state: &AppState,
+    project_id: ProjectId,
+    run_id: Uuid,
+    home_dir: &Path,
+) -> Result<WorkflowRunReplies, AppError> {
+    let run = match observe_run(state, project_id, run_id) {
+        Some(run) => run,
+        None => run_from_files(state, project_id, run_id)?,
+    };
+    let mut sends = Vec::with_capacity(run.sends.len());
+    for send in run.sends {
+        let current = current_send(state, project_id, send.send_id, home_dir).await?;
+        let recipients = send
+            .recipients
+            .iter()
+            .map(|resolved| {
+                let reply = current
+                    .recipients
+                    .iter()
+                    .find(|r| r.agent_id == resolved.agent_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        RecipientSnapshot::bare(resolved.agent_id, SendStatus::NotDispatched)
+                    });
+                RunReply {
+                    name: resolved.name.clone(),
+                    reply,
+                }
+            })
+            .collect();
+        sends.push(RunSendReplies {
+            step: send.step,
+            label: send.label,
+            send_id: send.send_id,
+            done: current.done,
+            source: current.source,
+            recipients,
+        });
+    }
+    Ok(WorkflowRunReplies {
+        run_id,
+        workflow: run.workflow,
+        status: run.status,
+        done: run.done,
+        sends,
+        sends_unavailable: run.sends_unavailable,
+        reason: run.reason,
+    })
+}
+
+/// The budget rules for [`WorkflowRunReplies`]: those of every reply-carrying
+/// result. Reply text is cut evenly across every recipient of every send;
+/// sends and recipients are never dropped; a cut reply reads on through
+/// `read_send_output` with its own send.
+#[must_use]
+pub fn read_workflow_run_budget(project_id: ProjectId, budget_chars: usize) -> BudgetSpec {
+    wait_any_send_budget(project_id, budget_chars)
 }
 
 /// Live runs plus retained failed and interrupted run files, read without

@@ -1,7 +1,7 @@
 //! One size budget for every result, applied to the serialized JSON at the
 //! tool layer. The rules for each result type live beside that type in `ops`
 //! (see `send::wait_send_budget`, `read::conversation_budget`,
-//! `read::agent_output_budget`), so M1's tests exercise what the tools ship.
+//! `read::latest_reply_budget`), so M1's tests exercise what the tools ship.
 //!
 //! **What may be cut.** Only fields named `text`, the one name that holds
 //! free text in a result: replies, messages, an agent's latest answer. Every
@@ -52,7 +52,7 @@
 //! path (a JSON pointer), its full length, the length kept, and, when the
 //! caller can fetch the rest, the call that reads on with the offset the cut
 //! ended at. The caller decides that per result type: an agent reply pages
-//! through `read_send_output`; a user message or a tool output has no paging
+//! through `read_reply`; a user message or a tool output has no paging
 //! tool, and the envelope says so.
 //!
 //! **Progress is guaranteed.** Fields are addressed by JSON pointer, which
@@ -595,7 +595,7 @@ mod tests {
     use serde_json::json;
 
     fn spec(budget: usize, droppable: Option<&'static str>) -> BudgetSpec {
-        BudgetSpec::unpageable(budget, droppable, "read_send_output")
+        BudgetSpec::unpageable(budget, droppable, "read_reply")
     }
 
     #[test]
@@ -658,11 +658,11 @@ mod tests {
         let budget = BudgetSpec {
             budget_chars: 500,
             droppable_list: None,
-            read_with: Some("read_send_output"),
+            read_with: Some("read_reply"),
             pointer: Box::new(|site: &CutSite<'_>| {
                 let agent = site.ancestors.last()?.get("agent_id")?.clone();
                 Some(json!({
-                    "tool": "read_send_output",
+                    "tool": "read_reply",
                     "agent_id": agent,
                     "key": site.key,
                     "offset": site.kept_chars,
@@ -721,7 +721,7 @@ mod tests {
         assert!(matches!(
             err,
             AppError::ResultTooLarge {
-                read_with: Some("read_send_output")
+                read_with: Some("read_reply")
             }
         ));
         let value = json!({ "name": "n".repeat(600) });
@@ -792,11 +792,8 @@ mod round_three {
         // than the characters it removes: the fitting caps form a window, and
         // the search must find it.
         let value = json!({ "a": { "text": "b".repeat(20) }, "b": { "text": "t".repeat(1_000) } });
-        let fitted = fit(
-            value,
-            &BudgetSpec::unpageable(194, None, "read_send_output"),
-        )
-        .expect("caps 20 through 27 fit");
+        let fitted = fit(value, &BudgetSpec::unpageable(194, None, "read_reply"))
+            .expect("caps 20 through 27 fit");
         assert!(fitted.serialized_chars() <= 194);
         assert_eq!(fitted.truncated.len(), 1, "only the long field is cut");
         assert_eq!(

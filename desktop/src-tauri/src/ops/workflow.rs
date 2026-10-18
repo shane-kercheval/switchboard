@@ -1,7 +1,7 @@
 //! Workflow operations: describe, run, wait, list, cancel, and the forward
 //! merge the Tauri wrappers share with `run_workflow`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -20,9 +20,11 @@ use crate::workflow_commands::{
 };
 
 use super::budget::BudgetSpec;
-use super::ledger::{RecipientSnapshot, RunSend, RunState, SendStatus};
+use super::ledger::{
+    AgentActivity, RecipientSnapshot, RunSend, RunState, SendSnapshot, SendStatus,
+};
 use super::read::project_readonly;
-use super::send::{WaitSource, current_send, wait_any_send_budget};
+use super::send::{WaitSource, current_send, held_send, wait_any_send_budget};
 use super::wait::{Observed, Outcome, WaitBudget, wait_until};
 
 /// Resolve any forward fields (completed-only) and merge the composed text
@@ -77,7 +79,7 @@ pub struct RunWorkflowRequest {
 }
 
 /// Start a workflow run and return its id. The run reports its status; the
-/// caller reads output with `read_agent_output` or `read_send_output`.
+/// caller reads output with `read_latest_reply` or `read_reply`.
 ///
 /// Agent inputs arrive as ids and are converted to names **inside** the
 /// invocation, against the roster and workflow it binds with, so a rename and
@@ -177,14 +179,15 @@ pub struct WaitWorkflowReply {
     pub step: usize,
     pub total: usize,
     /// That step's label, and its agents as the engine resolved them once it
-    /// has (each with `agent_id` and `name`; for a send step, `dispatched`).
+    /// has (each with `agent_id` and `name`; for a send step, `dispatched`),
+    /// each with what it is doing while the run is unfinished.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub recipients: Vec<ResolvedRecipient>,
+    pub recipients: Vec<StepAgent>,
     /// Every send the run's send steps made so far, in step order: follow
     /// one with `wait_send`, and read any recipient's reply with
-    /// `read_send_output` and its `send_id`, even after a later step.
+    /// `read_reply` and its `send_id`, even after a later step.
     pub sends: Vec<RunSend>,
     /// Switchboard no longer holds the run's live record (after a restart, or
     /// once it pruned the run), so its sends are not known, which is not the
@@ -193,6 +196,95 @@ pub struct WaitWorkflowReply {
     pub sends_unavailable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// One agent of the run's current step.
+///
+/// **Why it carries the agent's reply in progress.** An orchestrator polls
+/// `wait_workflow` while a step runs, and a step's agents can work for many
+/// minutes. Without this it sees only the step's label and has to follow each
+/// send with `wait_send` to learn whether an agent is working or stuck. The
+/// step whose agents are working is usually a wait step (`wait_for_all` after
+/// the send step that dispatched), which made no send of its own, so the
+/// figures come from the run's newest send that reached the agent. That is
+/// usually the turn a blocked wait step waits on, since a workflow sends to
+/// an agent again only once its earlier turn has finished; the field promises
+/// only "newest send that reached it", because the engine awaits an agent's
+/// turns oldest first.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StepAgent {
+    #[serde(flatten)]
+    pub agent: ResolvedRecipient,
+    /// The run's newest send that reached this agent, while the run is
+    /// unfinished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_id: Option<SendId>,
+    /// This agent's status on that send, as `wait_send` reports it, while
+    /// Switchboard holds the send. Absent after a restart or once the send is
+    /// pruned: polls read no journal or session file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<SendStatus>,
+    /// As on an unfinished `wait_send` recipient: present while this agent's
+    /// own turn runs, absent while it waits in line or once it finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<AgentActivity>,
+    /// As on an unfinished `wait_send` recipient: the end of the text the
+    /// agent has written in this turn so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_text: Option<String>,
+}
+
+impl From<ResolvedRecipient> for StepAgent {
+    fn from(agent: ResolvedRecipient) -> Self {
+        Self {
+            agent,
+            send_id: None,
+            status: None,
+            activity: None,
+            recent_text: None,
+        }
+    }
+}
+
+/// Fill each current-step agent's figures from the run's newest send that
+/// reached it, as the ledger holds that send now. A recipient a failed step
+/// never offered the message to was not reached, so its send is skipped. Each
+/// send is read from the ledger once, however many of the step's agents it
+/// reached: a read copies every recipient's reply. A finished run gets none,
+/// so its result stays a status and a list of sends.
+fn add_step_progress(state: &AppState, project_id: ProjectId, reply: &mut WaitWorkflowReply) {
+    if reply.done {
+        return;
+    }
+    let mut held: HashMap<SendId, Option<SendSnapshot>> = HashMap::new();
+    for step_agent in &mut reply.recipients {
+        let agent_id = step_agent.agent.agent_id;
+        let Some(send_id) = reply
+            .sends
+            .iter()
+            .rev()
+            .find(|send| {
+                send.recipients
+                    .iter()
+                    .any(|r| r.agent_id == agent_id && r.dispatched != Some(false))
+            })
+            .map(|send| send.send_id)
+        else {
+            continue;
+        };
+        step_agent.send_id = Some(send_id);
+        let Some(recipient) = held
+            .entry(send_id)
+            .or_insert_with(|| held_send(state, project_id, send_id))
+            .as_ref()
+            .and_then(|send| send.recipients.iter().find(|r| r.agent_id == agent_id))
+        else {
+            continue;
+        };
+        step_agent.status = Some(recipient.status);
+        step_agent.activity.clone_from(&recipient.activity);
+        step_agent.recent_text.clone_from(&recipient.recent_text);
+    }
 }
 
 /// The workflow wait's result fits the budget by dropping its oldest sends
@@ -221,6 +313,7 @@ pub async fn wait_workflow(
 ) -> Result<WaitWorkflowReply, AppError> {
     let mut reply = wait_workflow_unreported(state, project_id, run_id, budget).await?;
     reply.capped_to_seconds = budget.capped_to_seconds();
+    add_step_progress(state, project_id, &mut reply);
     if reply.done {
         reply.usage = Some(super::usage::stored_usage(state));
     }
@@ -274,7 +367,7 @@ fn observe_run(state: &AppState, project_id: ProjectId, run_id: Uuid) -> Option<
             step: run.step,
             total: run.total,
             label: run.label,
-            recipients: run.recipients,
+            recipients: run.recipients.into_iter().map(StepAgent::from).collect(),
             sends: run.sends,
             sends_unavailable: false,
             reason: run.reason,
@@ -349,7 +442,14 @@ fn live_run(state: &AppState, project_id: ProjectId, run_id: Uuid) -> Option<Wai
         recipients: run
             .resolved
             .get(&step)
-            .map(|resolution| resolution.recipients.clone())
+            .map(|resolution| {
+                resolution
+                    .recipients
+                    .iter()
+                    .cloned()
+                    .map(StepAgent::from)
+                    .collect()
+            })
             .unwrap_or_default(),
         sends,
         sends_unavailable: false,
@@ -406,7 +506,7 @@ pub struct RunReply {
 ///
 /// **Why a separate read.** `wait_workflow` lists the run's sends without
 /// their text, so a caller that wants the replies reads each recipient with
-/// `read_send_output`, one call per reply, and an agent's latest answer holds
+/// `read_reply`, one call per reply, and an agent's latest answer holds
 /// only its last step. This returns them all at once, a reviewer's first round
 /// under its own step. Each send is read as `wait_send` reads it
 /// ([`current_send`]): from the ledger while it holds the send, so a running
@@ -488,7 +588,7 @@ pub async fn read_workflow_run(
 /// The budget rules for [`WorkflowRunReplies`]: those of every reply-carrying
 /// result. Reply text is cut evenly across every recipient of every send;
 /// sends and recipients are never dropped; a cut reply reads on through
-/// `read_send_output` with its own send.
+/// `read_reply` with its own send.
 #[must_use]
 pub fn read_workflow_run_budget(project_id: ProjectId, budget_chars: usize) -> BudgetSpec {
     wait_any_send_budget(project_id, budget_chars)
@@ -550,4 +650,61 @@ pub fn cancel_workflow_run(
     cancel_workflow_run_impl(state, run_id);
     tracing::info!(%project_id, %run_id, "workflow run cancelled");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::test_support::TestEnv;
+
+    fn recipient(
+        agent_id: switchboard_core::AgentId,
+        dispatched: Option<bool>,
+    ) -> ResolvedRecipient {
+        ResolvedRecipient {
+            agent_id,
+            name: "reviewer".to_owned(),
+            dispatched,
+        }
+    }
+
+    /// A send step that failed part-way lists the agents it never offered the
+    /// message to. Such a send did not reach them, so an agent of the current
+    /// step reports the older send that did.
+    #[test]
+    fn step_progress_skips_a_send_that_never_reached_the_agent() {
+        let env = TestEnv::new();
+        let agent_id = Uuid::now_v7();
+        let (reached, failed) = (Uuid::now_v7(), Uuid::now_v7());
+        let mut reply = WaitWorkflowReply {
+            run_id: Uuid::now_v7(),
+            capped_to_seconds: None,
+            usage: None,
+            status: WorkflowRunStatus::Running,
+            done: false,
+            workflow: "rounds".to_owned(),
+            step: 3,
+            total: 4,
+            label: None,
+            recipients: vec![StepAgent::from(recipient(agent_id, None))],
+            sends: vec![
+                RunSend {
+                    step: 0,
+                    label: None,
+                    send_id: reached,
+                    recipients: vec![recipient(agent_id, Some(true))],
+                },
+                RunSend {
+                    step: 2,
+                    label: None,
+                    send_id: failed,
+                    recipients: vec![recipient(agent_id, Some(false))],
+                },
+            ],
+            sends_unavailable: false,
+            reason: None,
+        };
+        add_step_progress(&env.state, Uuid::now_v7(), &mut reply);
+        assert_eq!(reply.recipients[0].send_id, Some(reached));
+    }
 }

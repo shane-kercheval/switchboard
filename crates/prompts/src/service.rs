@@ -434,7 +434,8 @@ impl PromptService {
 
     /// The raw, **unrendered** template body of a `builtin` or `local` prompt
     /// (frontmatter stripped, `MiniJinja` placeholders intact), for a **read-only
-    /// preview** in the UI. Synchronous and offline.
+    /// preview**: the window's, and an orchestrating agent's through the app's
+    /// `read_prompt` tool. Synchronous and offline.
     ///
     /// Returns `None` for an MCP provider: the MCP protocol exposes only rendered
     /// output (`prompts/get`), never the un-rendered template, so a server-side
@@ -442,8 +443,8 @@ impl PromptService {
     /// (description + arguments). Also `None` for a prompt that doesn't resolve.
     ///
     /// Deliberately exposes the template, unlike [`render`](Self::render): the
-    /// body is shown to the *user* as a preview, never sent to an agent (agents
-    /// only ever receive rendered text). Built-ins resolve regardless of the
+    /// body is shown to whoever is choosing a prompt, never sent as a message
+    /// (an agent that is sent a prompt only ever receives rendered text). Built-ins resolve regardless of the
     /// app's "show built-ins" toggle, matching [`get`](Self::get)/`render`.
     #[must_use]
     pub fn source(&self, provider: &str, name: &str) -> Option<PromptSource> {

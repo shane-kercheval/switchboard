@@ -567,6 +567,32 @@ impl TestEnv {
         self.library.path().join("workflows")
     }
 
+    /// Register a prompt server at `url` under `name` in the library's
+    /// `config.yaml`, which the prompt service reads on each call; sync the
+    /// prompts afterwards to list its prompts.
+    pub fn add_prompt_server(&self, name: &str, url: &str) {
+        std::fs::write(
+            self.library.path().join("config.yaml"),
+            format!(
+                "mcp_providers:\n  - name: {name}\n    transport:\n      type: http\n      url: {url}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Register a prompt server that signs in with OAuth and holds no
+    /// sign-in, as one the user signed out of: every fetch and render of it
+    /// needs sign-in, decided before any request is made.
+    pub fn add_signed_out_prompt_server(&self, name: &str) {
+        std::fs::write(
+            self.library.path().join("config.yaml"),
+            format!(
+                "mcp_providers:\n  - name: {name}\n    transport:\n      type: http\n      url: http://127.0.0.1:9/mcp\n    auth:\n      type: oauth\n"
+            ),
+        )
+        .unwrap();
+    }
+
     /// A fresh state over the same store and home: nothing loaded, the
     /// ledger empty, the scripts cleared. The old state is dropped first so
     /// its project locks are released.
@@ -1025,3 +1051,97 @@ steps:
     wait_for_all:
       agents: \"{{ reviewers }}\"
 ";
+
+/// A prompt server, as the user's own (a tiddly server) is to Switchboard: it
+/// lists one prompt, `review`, with a required argument `context`, and gives
+/// out only its rendering, `Review <context>`, as MCP's `prompts/get` does.
+#[derive(Clone)]
+struct ReviewPromptServer;
+
+impl rmcp::ServerHandler for ReviewPromptServer {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_prompts()
+                .build(),
+        )
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListPromptsResult, rmcp::model::ErrorData> {
+        Ok(rmcp::model::ListPromptsResult {
+            meta: None,
+            next_cursor: None,
+            prompts: vec![rmcp::model::Prompt::new(
+                "review",
+                Some("Review code"),
+                Some(vec![
+                    rmcp::model::PromptArgument::new("context")
+                        .with_description("what to review")
+                        .with_required(true),
+                ]),
+            )],
+        })
+    }
+
+    async fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::GetPromptResult, rmcp::model::ErrorData> {
+        let Some(context) = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("context"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Err(rmcp::model::ErrorData::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "missing required argument: context",
+                None,
+            ));
+        };
+        Ok(rmcp::model::GetPromptResult::new(vec![
+            rmcp::model::PromptMessage::new_text(
+                rmcp::model::PromptMessageRole::User,
+                format!("Review {context}"),
+            ),
+        ]))
+    }
+}
+
+/// A running [`ReviewPromptServer`]; it stops when dropped.
+pub struct RunningPromptServer {
+    pub url: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RunningPromptServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Serve a [`ReviewPromptServer`] on a free local port.
+pub async fn spawn_prompt_server() -> RunningPromptServer {
+    let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+        || Ok(ReviewPromptServer),
+        Arc::new(
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+        ),
+        rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default(),
+    );
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    RunningPromptServer {
+        url: format!("http://{addr}/mcp"),
+        task,
+    }
+}

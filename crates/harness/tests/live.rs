@@ -2176,12 +2176,27 @@ async fn live_codex_world_state_yields_inventory() {
         .as_deref()
         .expect("`turn_context` + `world_state.environments` must still yield settings pairs");
     let labels: Vec<&str> = settings.iter().map(|p| p.label.as_str()).collect();
-    for expected in ["Sandbox", "Approval policy", "Shell", "Timezone"] {
+    for expected in [
+        "Sandbox",
+        "Approval policy",
+        "Personality",
+        "Shell",
+        "Timezone",
+    ] {
         assert!(
             labels.contains(&expected),
             "the settings line must still carry `{expected}`; got {labels:?}"
         );
     }
+    // Since Codex 0.163 the first turn writes its own `thread_settings_applied`,
+    // the only record that carries the personality, so the row shows the
+    // requested value from turn one.
+    assert!(
+        settings
+            .iter()
+            .any(|p| p.label == "Personality" && p.value == LIVE_CODEX_PERSONALITY),
+        "the first turn's settings must show the requested personality; got {settings:?}"
+    );
     assert!(
         inventory.approved_commands.is_some(),
         "`world_state.permissions.approved_command_prefixes` must still be reported — absent \
@@ -2230,20 +2245,27 @@ async fn live_codex_world_state_yields_inventory() {
             .is_some_and(|s| !s.is_empty()),
         "the resume turn's inventory must be read fresh from the rollout, not left empty"
     );
-    // Since Codex 0.162 the personality reaches the rollout only through the
-    // resumed turn's `thread_settings_applied`, so this is the one turn that
-    // can show it. Read the record straight from the file rather than through
-    // our parser, so a parser bug cannot agree with itself: its absence means
-    // Codex stopped writing it on resume, and a different value means the
-    // requested personality no longer reaches it.
+    // Since Codex 0.162 the personality reaches the rollout only through a
+    // `thread_settings_applied` record, which a resumed turn writes (and,
+    // since 0.163, the first turn too). Both turns request the same
+    // personality, so only a record written after the first turn's
+    // `task_complete` proves the resume wrote its own. It is read straight
+    // from the file rather than through our parser, so a parser bug cannot
+    // agree with itself: its absence means Codex stopped writing one on
+    // resume, and a different value means the requested personality no
+    // longer reaches it. The row check after it proves the card still shows
+    // the personality on a resumed turn; it cannot tell which turn's record
+    // supplied it.
     let rollout = switchboard_harness::codex::session_file::locate_session_file(
         &home_dir(),
         partition_date,
         &thread_id,
     )
     .expect("the resumed session's rollout must be on disk");
-    let recorded = last_thread_settings(&rollout)
-        .expect("the resumed turn must write a `thread_settings_applied` record");
+    let recorded = resumed_thread_settings(&rollout).expect(
+        "the resumed turn must write a `thread_settings_applied` record after the first turn's \
+         `task_complete`",
+    );
     assert_eq!(
         recorded["personality"], LIVE_CODEX_PERSONALITY,
         "the resumed turn's `thread_settings_applied` must carry the requested personality; \
@@ -2282,16 +2304,20 @@ fn codex_wrapper_requesting_personality(dir: &Path, personality: &str) -> std::p
 }
 
 /// The `thread_settings` object of the last `thread_settings_applied` record
-/// in a rollout, read as raw JSON. `None` when the rollout has no such record.
-fn last_thread_settings(rollout: &Path) -> Option<serde_json::Value> {
+/// written after the rollout's first `task_complete`, that is by a later turn,
+/// read as raw JSON. `None` when no later turn wrote one.
+fn resumed_thread_settings(rollout: &Path) -> Option<serde_json::Value> {
+    let is_event = |record: &serde_json::Value, kind: &str| {
+        record["type"] == "event_msg" && record["payload"]["type"] == kind
+    };
     let content = std::fs::read_to_string(rollout).unwrap();
     content
         .lines()
-        .rev()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|record| {
-            record["type"] == "event_msg" && record["payload"]["type"] == "thread_settings_applied"
-        })
+        .skip_while(|record| !is_event(record, "task_complete"))
+        .skip(1)
+        .filter(|record| is_event(record, "thread_settings_applied"))
+        .last()
         .map(|record| record["payload"]["thread_settings"].clone())
 }
 

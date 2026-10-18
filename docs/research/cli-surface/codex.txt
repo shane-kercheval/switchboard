@@ -1,4 +1,4 @@
-version: codex-cli 0.162.1
+version: codex-cli 0.163.0
 
 ===== codex --help
 Codex CLI
@@ -1871,7 +1871,7 @@ Options:
           shell_environment_policy.inherit=all`
 
       --sandbox-state-json <JSON>
-          JSON value from `codex/sandbox-state-meta` to apply directly
+          Opaque JSON value from `codex/sandbox-state` to apply directly
 
       --enable <FEATURE>
           Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
@@ -3297,3 +3297,72 @@ turn/start
 turn/steer
 windowsSandbox/readiness
 windowsSandbox/setupStart
+
+===== codex app-server methods (ClientRequest, experimental only)
+account/bedrock/checkGovCloudRequirements
+account/bedrock/discover
+account/bedrock/setup
+collaborationMode/list
+environment/add
+environment/info
+environment/status
+fuzzyFileSearch/sessionStart
+fuzzyFileSearch/sessionStop
+fuzzyFileSearch/sessionUpdate
+mcpServer/event/stream/start
+mcpServer/event/stream/stop
+memory/reset
+memory/status
+mock/experimentalMethod
+plugin/search
+process/kill
+process/resizePty
+process/spawn
+process/writeStdin
+project/create
+project/delete
+project/import
+project/list
+project/move
+project/read
+project/update
+remoteControl/client/list
+remoteControl/client/revoke
+remoteControl/disable
+remoteControl/enable
+remoteControl/pairing/start
+remoteControl/pairing/status
+remoteControl/status/read
+rollout/compress
+server/diagnostics
+thread/backgroundTerminals/clean
+thread/backgroundTerminals/list
+thread/backgroundTerminals/terminate
+thread/decrement_elicitation
+thread/increment_elicitation
+thread/items/read
+thread/memoryMode/set
+thread/prediction/request
+thread/queue/add
+thread/queue/delete
+thread/queue/list
+thread/queue/reorder
+thread/queue/start
+thread/queue/update
+thread/readState/update
+thread/realtime/appendAudio
+thread/realtime/appendSpeech
+thread/realtime/appendText
+thread/realtime/listVoices
+thread/realtime/start
+thread/realtime/stop
+thread/search
+thread/searchOccurrences
+thread/settings/update
+thread/timeline/list
+turn/settings/update
+userVerification/cancel
+userVerification/delete
+userVerification/enroll
+userVerification/status
+userVerification/verify

@@ -1288,7 +1288,7 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     .await;
     assert_eq!(extra["name"], "extra2");
     let selected = call(
-        "set_agent_selection",
+        "set_agent_model_and_effort",
         json!({ "project_id": project_id, "agent_id": coder, "model": "sonnet" }),
     )
     .await;

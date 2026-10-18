@@ -28,7 +28,7 @@ use crate::workflow_commands::ProjectDispatchFactoryProvider;
 use super::budget::fit;
 use super::change::{
     SelectionChange, SelectionChanges, create_agent, create_project, dismiss_workflow_run,
-    rename_agent, set_agent_selection,
+    rename_agent, set_agent_model_and_effort,
 };
 use super::desktop_sync::{Hearing, SyncAck, SyncFork};
 use super::error_code::{self, error_code};
@@ -159,7 +159,7 @@ async fn agent_lifecycle_on_an_unopened_project() {
     let renamed = rename_agent(&env.state, project_id, created.id, "builder").unwrap();
     assert_eq!(renamed.name, "builder");
 
-    let changed = set_agent_selection(
+    let changed = set_agent_model_and_effort(
         &env.state,
         project_id,
         created.id,
@@ -173,7 +173,7 @@ async fn agent_lifecycle_on_an_unopened_project() {
         "a new value joins the list"
     );
 
-    let reset = set_agent_selection(
+    let reset = set_agent_model_and_effort(
         &env.state,
         project_id,
         created.id,
@@ -1910,7 +1910,7 @@ async fn concurrent_selection_changes_both_survive() {
     let barrier = env.seam(TestSeam::SelectionUpdate);
     let state = Arc::clone(&env.state);
     let first = tokio::task::spawn_blocking(move || {
-        set_agent_selection(
+        set_agent_model_and_effort(
             &state,
             project_id,
             agent_id,
@@ -1923,7 +1923,7 @@ async fn concurrent_selection_changes_both_survive() {
     // second must wait for it rather than merge onto a stale read.
     let state = Arc::clone(&env.state);
     let second = tokio::task::spawn_blocking(move || {
-        set_agent_selection(
+        set_agent_model_and_effort(
             &state,
             project_id,
             agent_id,
@@ -3422,7 +3422,7 @@ async fn a_window_model_change_and_an_ops_effort_change_made_together_both_survi
     barrier.entered.notified().await;
     let state = Arc::clone(&env.state);
     let orchestrator = tokio::task::spawn_blocking(move || {
-        set_agent_selection(
+        set_agent_model_and_effort(
             &state,
             project_id,
             agent_id,

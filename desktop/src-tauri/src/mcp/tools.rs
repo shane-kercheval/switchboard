@@ -294,12 +294,16 @@ tools! {
          effort start from the user's defaults for that harness; pass either to override it, in \
          the harness's own naming. A value the harness does not know is not caught here: the \
          agent's next turn fails with the harness's error. list_agents shows the quick-choice \
-         lists of known values.";
+         lists of known values. To change the model or effort later, use \
+         set_agent_model_and_effort.";
     RenameAgent = "rename_agent" (RenameAgentArgs) [Additive]
         "Rename an agent. Its id does not change.";
-    SetAgentSelection = "set_agent_selection" (SetAgentSelectionArgs) [Additive]
-        "Change an agent's model or effort; it applies from the agent's next turn. Omit a field \
-         to leave it as it is; pass null to reset it to the harness's default.";
+    SetAgentModelAndEffort = "set_agent_model_and_effort" (SetAgentModelAndEffortArgs) [Additive]
+        "Change an agent's model, effort, or both; the change applies from the agent's next \
+         turn. Omit a field to leave it as it is; pass null to reset it to the harness's \
+         default. Values are in the harness's own naming and are not checked here: a value the \
+         harness does not know fails the agent's next turn. list_agents shows the quick-choice \
+         lists of known values.";
     RemoveAgent = "remove_agent" (AgentArgs) [Acts]
         "Remove an agent from its project for good: Switchboard's record of it goes, and its \
          card and conversation leave the window. Nothing brings it back; only the harness's own \
@@ -711,7 +715,7 @@ pub struct RenameAgentArgs {
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
-pub struct SetAgentSelectionArgs {
+pub struct SetAgentModelAndEffortArgs {
     #[schemars(with = "String")]
     project_id: ProjectId,
     #[schemars(with = "String")]
@@ -1330,9 +1334,9 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
                 &a.name,
             )?)
         }
-        ToolName::SetAgentSelection => {
-            let a: SetAgentSelectionArgs = parse(args)?;
-            Reply::plain(&change::set_agent_selection(
+        ToolName::SetAgentModelAndEffort => {
+            let a: SetAgentModelAndEffortArgs = parse(args)?;
+            Reply::plain(&change::set_agent_model_and_effort(
                 state,
                 a.project_id,
                 a.agent_id,

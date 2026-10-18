@@ -207,7 +207,8 @@ async fn the_tool_list_is_the_catalog_and_declares_the_result_size() {
     );
     // Claude Code cuts server instructions at 4,096 characters and shows the
     // model only the text before the cut (its MCP documentation, "Tool search
-    // for MCP server authors"; recorded in docs/research/mcp-client-behavior.md).
+    // for MCP server authors", rechecked 2026-10-18; recorded in
+    // docs/research/mcp-client-behavior.md).
     assert!(
         info.instructions
             .as_deref()
@@ -258,6 +259,15 @@ async fn the_tool_list_is_the_catalog_and_declares_the_result_size() {
             tool.name
         );
         assert!(tool.description.as_ref().is_some_and(|d| !d.is_empty()));
+        // Claude Code cuts a tool's description at 4,096 characters when the
+        // tool loads up front (tool search off), the same source as above.
+        assert!(
+            tool.description
+                .as_deref()
+                .is_some_and(|d| d.chars().count() < 4_096),
+            "{}'s description fits under Claude Code's cut",
+            tool.name
+        );
     }
     let wait = tools.iter().find(|t| t.name == "wait_send").unwrap();
     let description = wait.description.as_deref().unwrap();
@@ -2667,11 +2677,9 @@ async fn live_codex_mcp_compact() {
     live_compact_through_the_server(switchboard_core::HarnessKind::Codex).await;
 }
 
-/// The orchestrator prompts in Settings name tools by name. A rename or a
-/// removal here would leave a pasted prompt pointing at a tool that is gone,
-/// so every tool-like name in them must be a tool.
-#[test]
-fn the_orchestrator_prompt_names_only_real_tools() {
+/// The words in `text` shaped like a tool name: a tool's verb prefix, less
+/// the field names and error codes that share one.
+fn tool_like_words(text: &str) -> Vec<&str> {
     const VERBS: &[&str] = &[
         "list_",
         "read_",
@@ -2690,20 +2698,107 @@ fn the_orchestrator_prompt_names_only_real_tools() {
         "set_",
         "stop_",
     ];
-    // Field names that share a tool's prefix.
-    const FIELDS: &[&str] = &["send_id", "send_ids", "run_id"];
-    let source = include_str!("../../../src/lib/orchestratorPrompt.ts");
-    let tools: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
-    let named: Vec<&str> = source
-        .split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+    // Field names and error codes that share a tool's prefix.
+    const NOT_TOOLS: &[&str] = &[
+        "send_id",
+        "send_ids",
+        "run_id",
+        "read_from",
+        "read_with",
+        "fork_unsupported",
+        "fork_not_materialized",
+        "run_unknown",
+        "send_unknown",
+    ];
+    text.split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
         .filter(|word| VERBS.iter().any(|verb| word.starts_with(verb)))
-        .filter(|word| !FIELDS.contains(word))
-        .collect();
-    assert!(!named.is_empty(), "the scan found the prompt's tool names");
+        .filter(|word| !NOT_TOOLS.contains(word))
+        .collect()
+}
+
+fn assert_names_only_real_tools(text: &str, what: &str) {
+    let tools: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
+    let named = tool_like_words(text);
+    assert!(!named.is_empty(), "the scan found {what}'s tool names");
     for word in named {
         assert!(
             tools.contains(&word),
-            "the prompt names {word}, which is not a tool"
+            "{what} names {word}, which is not a tool"
         );
+    }
+}
+
+/// The orchestrator prompts in Settings name tools by name. A rename or a
+/// removal here would leave a pasted prompt pointing at a tool that is gone,
+/// so every tool-like name in them must be a tool.
+#[test]
+fn the_orchestrator_prompt_names_only_real_tools() {
+    assert_names_only_real_tools(
+        include_str!("../../../src/lib/orchestratorPrompt.ts"),
+        "the orchestrator prompt",
+    );
+}
+
+/// The instructions and the tool descriptions point callers from one tool to
+/// another by name, so a rename that misses one leaves a caller told to use a
+/// tool that is gone.
+#[test]
+fn the_instructions_and_descriptions_name_only_real_tools() {
+    assert_names_only_real_tools(&super::tools::instructions(), "the instructions");
+    for tool in super::tools::catalog() {
+        let description = tool.description.as_deref().unwrap_or_default();
+        if !tool_like_words(description).is_empty() {
+            assert_names_only_real_tools(description, &format!("{}'s description", tool.name));
+        }
+    }
+}
+
+/// Tools retired by a rename. Error messages also name the window's own
+/// commands, which are not tools, so they are checked against this list
+/// rather than the catalog: add a tool's old name here when renaming it.
+const RETIRED_TOOLS: &[&str] = &[
+    "read_send_output",
+    "read_agent_output",
+    "set_agent_selection",
+    "cancel_agent",
+];
+
+/// The text inside the string literals of Rust `source`, escapes kept as
+/// written: an error's message is its `#[error("...")]` string.
+fn string_literals(source: &str) -> Vec<String> {
+    let mut literals = Vec::new();
+    let mut current: Option<String> = None;
+    let mut chars = source.chars();
+    while let Some(c) = chars.next() {
+        match (&mut current, c) {
+            (None, '"') => current = Some(String::new()),
+            (Some(_), '"') => literals.extend(current.take()),
+            (Some(literal), '\\') => {
+                literal.push(c);
+                literal.extend(chars.next());
+            }
+            (Some(literal), c) => literal.push(c),
+            (None, _) => {}
+        }
+    }
+    literals
+}
+
+/// An error message that tells a caller to use a renamed tool sends it to a
+/// tool that is gone.
+#[test]
+fn no_error_message_names_a_retired_tool() {
+    let literals = string_literals(include_str!("../error.rs"));
+    assert!(
+        literals.iter().any(|l| l.contains("read_reply")),
+        "the scan reads the error messages"
+    );
+    for literal in &literals {
+        for retired in RETIRED_TOOLS {
+            assert!(
+                !tool_like_words(literal).contains(retired),
+                "an error message names the retired tool {retired}: {literal}"
+            );
+        }
     }
 }

@@ -52,13 +52,17 @@ use crate::ops::workflow::{self, RunWorkflowRequest};
 use crate::ops::{RESULT_BUDGET_CHARS, output_page_chars, result_budget_chars};
 use crate::state::AppState;
 
-/// The orchestration loop, sent once when a client connects.
-pub const INSTRUCTIONS: &str = "\
+/// What Switchboard is and how to name things, sent first when a client
+/// connects.
+const INSTRUCTIONS_INTRO: &str = "\
 Switchboard runs AI coding agents (Claude Code, Codex, Antigravity) on this Mac, grouped into \
 projects; each project has a working folder and any number of agents. These tools direct them \
 the way the user does from Switchboard's window. Every tool takes ids: call list_projects, \
-then list_agents, and use the ids they return (names are for display and can change).
+then list_agents, and use the ids they return (names are for display and can change).";
 
+/// The orchestration loop, sent after the tool list. Each tool's own rules
+/// live in its description; this says only what spans tools.
+const INSTRUCTIONS_LOOP: &str = "\
 An agent is a persistent session of its harness, run in the project's folder with the user's \
 own configuration for that harness (the folder's CLAUDE.md or AGENTS.md included) and the \
 harness's full tools: it reads and edits files, runs commands, and uses git. A project's \
@@ -66,47 +70,57 @@ agents share its folder, so each sees the others' uncommitted changes. An agent 
 message as if the user had typed it and cannot tell you from the user. Each send continues its \
 conversation: it keeps earlier sends and its own replies until its context is compacted, so a \
 follow-up need not repeat what it already knows. Its reply is the text it writes; tool calls \
-and thinking are not returned. These tools read no files: to learn how the code works, ask an \
-agent.
+and thinking are not returned. These tools read none of the project's files: to learn how the \
+code works, ask an agent.
 
-The loop: send a message to one or more agents with send (or pass agents' latest answers to \
-others with forward). It returns a send_id at once. Call wait_send with that id until done is \
-true; each call waits up to its timeout and returns the current state either way. The replies \
-come back in wait_send's final answer. With several agents working at once, wait_any_send \
-waits on all their sends and returns when the first finishes. read_conversation shows a \
-project's whole history; read_latest_reply shows an agent's latest finished answer, including \
-turns you did not send. The user's saved prompts (list_prompts) and workflows (list_workflows) \
-are their standing instructions and procedures, such as a code review: use one when it fits \
-rather than writing your own. Before running a multi-step exchange across agents by hand \
-(review rounds, a fan-out and reconcile), check list_workflows for one the user saved.
+The loop: send a message to one or more agents with send (or pass agents' replies to others \
+with forward). It returns a send_id at once. Call wait_send with that id until done is true; \
+each call waits up to its timeout and returns the current state either way. The replies come \
+back in wait_send's final answer. The user's saved prompts (list_prompts, read_prompt) \
+and workflows (list_workflows) are their standing instructions and procedures, such as a code \
+review: use one when it fits rather than writing your own, and check list_workflows before \
+running a multi-step exchange across agents by hand (review rounds, a fan-out and reconcile).
 
-Results are JSON: {\"result\": …, \"truncated\": […], \"items_omitted\": n}, kept under \
-100,000 characters. Replies, conversations, and wait_workflow are kept under 45,000 when your \
-client sends no progress token (Claude Desktop). Long text may be cut; each cut is listed in \
-truncated with the call that reads the rest (read_with), when there is one. max_chars on \
-read_conversation, read_reply, read_latest_reply, read_workflow_run, wait_send, \
-wait_any_send, and wait_agent sets the limit for one call, and the call a cut lists keeps it. Codex keeps about \
-10,000 tokens of a result and cuts the middle: pass 25000 there. An error is {\"code\": …, \
-\"message\": …}; the message says what to do.
+Results are JSON: {\"result\": …, \"truncated\": […], \"items_omitted\": n}, under 100,000 \
+characters, or 45,000 for any result that can be cut when your client sends no progress token \
+(Claude Desktop). Each cut is listed in truncated with the call that reads the rest \
+(read_with), when there is one. max_chars sets the limit for one call, and the call a cut \
+lists keeps it: Codex keeps about 10,000 tokens of a result and cuts the middle, so pass 25000 \
+there. An error is \
+{\"code\": …, \"message\": …}; the message says what to do.
 
 Some conditions need the user at the Mac, not a retry: a turn that failed with failure_kind \
 usage_limit or auth_failure, or whose error says a usage limit was reached (Claude and \
 Antigravity report one as harness_error); prompt_needs_sign_in; directory_missing; \
 project_locked (another Switchboard holds the project). Report them and pause the work that \
-needs them. agent_busy_elsewhere means another process holds the agent's session: after \
-fork_agent it is the fork's first reply, so wait and resend; if it persists, report it. A \
-workflow whose invocable is false cannot run here: skip it.
+needs them. agent_busy_elsewhere means another process holds the agent's session: wait and \
+resend, and report it if it persists.
 
 The agents run without approval prompts and act on the user's files. The user sees every \
 message you send, queued or running, in Switchboard's window and can cancel it there.";
 
-/// The instructions a client receives: the loop, then every tool's name, so
-/// a client that loads tool definitions on demand (Claude Code's tool search)
-/// knows what exists from the start.
+/// The instructions a client receives: what Switchboard is, then every tool's
+/// name grouped by what the caller is doing, then the loop. The list comes
+/// early because a client that loads tool definitions on demand (Claude
+/// Code's tool search) knows what exists only from it, and Claude Code keeps
+/// only the start of instructions longer than its limit.
 #[must_use]
 pub fn instructions() -> String {
-    let names: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
-    format!("{INSTRUCTIONS}\n\nThe tools: {}.", names.join(", "))
+    let groups: Vec<String> = ToolGroup::ALL
+        .iter()
+        .map(|&group| {
+            let names: Vec<&str> = ToolName::ALL
+                .iter()
+                .filter(|tool| tool.group() == group)
+                .map(|tool| tool.as_str())
+                .collect();
+            format!("- {}: {}.", group.label(), names.join(", "))
+        })
+        .collect();
+    format!(
+        "{INSTRUCTIONS_INTRO}\n\nThe tools, by what you are doing:\n{}\n\n{INSTRUCTIONS_LOOP}",
+        groups.join("\n")
+    )
 }
 
 /// How Claude Code is told to show a result directly rather than save one
@@ -134,7 +148,7 @@ get_usage for a fresh Codex reading.";
 // --- the catalog ---------------------------------------------------------------
 
 macro_rules! tools {
-    ($( $variant:ident = $name:literal ($params:ty) [$kind:ident] $description:expr; )*) => {
+    ($( $variant:ident = $name:literal ($params:ty) [$kind:ident, $group:ident] $description:expr; )*) => {
         /// Every tool, by name.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum ToolName { $($variant,)* }
@@ -164,6 +178,10 @@ macro_rules! tools {
                 match self { $(Self::$variant => ToolKind::$kind,)* }
             }
 
+            fn group(self) -> ToolGroup {
+                match self { $(Self::$variant => ToolGroup::$group,)* }
+            }
+
             /// Whether a stopping server still takes this call. Only the
             /// cancels: they stop work and start none, and refusing one would
             /// leave running the very work a client was trying to stop.
@@ -173,6 +191,32 @@ macro_rules! tools {
             }
         }
     };
+}
+
+/// What a caller is doing when it reaches for a tool, for the grouped list in
+/// the server instructions. Every tool names one, so a new tool cannot be left
+/// out of the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolGroup {
+    Look,
+    SetUp,
+    Act,
+    Stop,
+    Wait,
+}
+
+impl ToolGroup {
+    const ALL: [ToolGroup; 5] = [Self::Look, Self::SetUp, Self::Act, Self::Stop, Self::Wait];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Look => "Look (changes nothing)",
+            Self::SetUp => "Set up and tidy",
+            Self::Act => "Start work",
+            Self::Stop => "Stop work",
+            Self::Wait => "Wait for work",
+        }
+    }
 }
 
 /// What a tool does to the Mac, for the clients' approval prompts.
@@ -189,13 +233,13 @@ enum ToolKind {
 }
 
 tools! {
-    ListProjects = "list_projects" (ListProjectsArgs) [Read]
+    ListProjects = "list_projects" (ListProjectsArgs) [Read, Look]
         "The user's projects: id, name, working folder, whether the folder exists, archived, and \
          status (busy when an agent has running or queued work or a workflow is running, else \
          idle). Start here: every other tool takes a project_id. Projects the user archived are \
          left out, as the window's project list leaves them out; pass include_archived: true to \
          list them too. An archived project's id still works in every other tool.";
-    ListAgents = "list_agents" (ProjectArgs) [Read]
+    ListAgents = "list_agents" (ProjectArgs) [Read, Look]
         "A project's agents: id, name, harness, model, effort, the quick-choice lists of models \
          and efforts, busy, and context. busy is an observation: the user or a workflow can occupy \
          an idle agent before your next send. context is the agent's context fullness \
@@ -210,7 +254,7 @@ tools! {
          \"No response\" counter measures), and open_tool_calls, each with its name and \
          running_seconds. A tool call open is work in progress: a test suite produces \
          nothing until it ends. Absent while the agent has no turn running.";
-    GetUsage = "get_usage" (NoArgs) [Read]
+    GetUsage = "get_usage" (NoArgs) [Read, Look]
         "How much of each harness account's limits is used, for choosing a model and effort for \
          the work at hand. One entry per account the app has a reading for: {harness, \
          observed_at, ordinary_usage_allowed, plan, windows}, each window {key, scope, model, \
@@ -224,7 +268,7 @@ tools! {
          request, unless a reading under a minute old is held or a read failed under a minute \
          ago, and when the read does not finish in time the newest stored reading is returned \
          with its own observed_at. Empty when no account has reported.";
-    ReadConversation = "read_conversation" (ReadConversationArgs) [Read]
+    ReadConversation = "read_conversation" (ReadConversationArgs) [Read, Look]
         "A project's conversation in time order: each message sent (text and recipients), each \
          agent turn's answer text with its send_id and status (complete, running, failed, \
          cancelled), failures with their reason, and a compacted marker where an agent's context \
@@ -233,14 +277,14 @@ tools! {
          When the whole would pass the budget (100,000 characters, 45,000 without a progress \
          token, or max_chars), older items are left out whole (items_omitted says how many); a single answer too long on its own is cut, and \
          truncated names the read_reply call that reads on.";
-    ReadReply = "read_reply" (ReadReplyArgs) [Read]
+    ReadReply = "read_reply" (ReadReplyArgs) [Read, Look]
         "One recipient's reply to one send, a page at a time, starting at offset (in \
          characters); a page holds up to 95,000 characters, less under max_chars. The way to \
          read a reply that another result cut: pass the arguments its \
          truncated entry's read_with gives, read_from included. next_offset is where the next \
          page starts and is absent on the last page. Also reads a reply still running (the text \
          so far), failed, or cancelled.";
-    ReadLatestReply = "read_latest_reply" (ReadLatestReplyArgs) [Read]
+    ReadLatestReply = "read_latest_reply" (ReadLatestReplyArgs) [Read, Look]
         "An agent's latest finished answer, including turns you did not send (the user's, a \
          workflow's), or the reason its latest turn failed or was cancelled. Carries the send_id \
          when known, so a long answer can be paged with read_reply, and the agent's context \
@@ -249,13 +293,13 @@ tools! {
          it: this answer is then not its newest. false does not prove it current (a message the \
          user typed may be starting). To follow a message you sent, use wait_send; to wait for a \
          running agent, wait_agent.";
-    ListPrompts = "list_prompts" (NoArgs) [Read]
+    ListPrompts = "list_prompts" (NoArgs) [Read, Look]
         "The user's saved prompts, local and from prompt servers: provider, name, description, \
          and arguments. They are the user's standing instructions (a code review, a security \
          review, an analysis of reviewers' findings): when one fits the task, send it rather than \
          writing your own. Use one in send or forward as prompt: {provider, name, args}. To \
          see what one says before sending it, read_prompt.";
-    ReadPrompt = "read_prompt" (ReadPromptArgs) [Read]
+    ReadPrompt = "read_prompt" (ReadPromptArgs) [Read, Look]
         "One saved prompt, to see what it says before sending it: its description and arguments \
          as list_prompts reports them, and template.text, the template with its placeholders \
          intact, for a builtin or local prompt. A prompt from a prompt server has no template \
@@ -268,22 +312,22 @@ tools! {
          prompt_needs_sign_in. Text over the result budget (100,000 characters, 45,000 \
          without a progress token, or max_chars) is cut and listed in truncated; nothing reads \
          on. To use the prompt, send it as prompt: {provider, name, args}, not as text.";
-    ListWorkflows = "list_workflows" (NoArgs) [Read]
+    ListWorkflows = "list_workflows" (NoArgs) [Read, Look]
         "The user's workflows, saved multi-agent procedures (send to several reviewers and gather \
          their findings, for example): name, is_builtin, description, declared inputs, and \
          invocable: false when this server cannot run it (a pause_for_user or for_each step, or a \
          file that failed to parse, with its parse_error). Skip one that is not invocable and say \
          so. Prefer one to running its steps by hand. Call describe_workflow before run_workflow: it also lists the arguments the \
          workflow's saved prompts need.";
-    DescribeWorkflow = "describe_workflow" (DescribeWorkflowArgs) [Read]
+    DescribeWorkflow = "describe_workflow" (DescribeWorkflowArgs) [Read, Look]
         "Everything run_workflow needs for one workflow: its declared inputs (an agent input \
          takes an agent id, a list input a list) and the arguments derived from its saved \
          prompts, with which are required.";
-    ListWorkflowRuns = "list_workflow_runs" (ProjectArgs) [Read]
+    ListWorkflowRuns = "list_workflow_runs" (ProjectArgs) [Read, Look]
         "A project's workflow runs: running ones, and failed or interrupted ones still held. A \
          held run blocks every new workflow in the project until dismiss_workflow_run removes \
          it.";
-    ReadWorkflowRun = "read_workflow_run" (ReadWorkflowRunArgs) [Read]
+    ReadWorkflowRun = "read_workflow_run" (ReadWorkflowRunArgs) [Read, Look]
         "Every reply a workflow run produced, in step order, without waiting: its status and \
          done, then each send with its step, label, send_id, done, and source, and each \
          recipient as wait_send reports it, with its agent's name and, once that recipient \
@@ -299,31 +343,31 @@ tools! {
          longer holds the run, a completed or cancelled run is run_unknown. A send \
          Switchboard no longer holds is read from disk (source journal), where a recipient \
          that was refused reads not_dispatched.";
-    CreateProject = "create_project" (CreateProjectArgs) [Additive]
+    CreateProject = "create_project" (CreateProjectArgs) [Additive, SetUp]
         "Create a project for a folder on this Mac. It starts with no agents; add them with \
          create_agent. Avoid the folder this session runs in: the agents Switchboard launches \
          there would read the same MCP configuration and get these tools too. A folder may \
          hold several projects, and list_projects leaves out the ones the user archived: \
          before creating one, check list_projects with include_archived: true for a project the \
          user already has for this folder, whose agents and history a new one would not have.";
-    RenameProject = "rename_project" (RenameProjectArgs) [Additive]
+    RenameProject = "rename_project" (RenameProjectArgs) [Additive, SetUp]
         "Rename a project. Its id does not change.";
-    CreateAgent = "create_agent" (CreateAgentArgs) [Additive]
+    CreateAgent = "create_agent" (CreateAgentArgs) [Additive, SetUp]
         "Add an agent to a project. harness is claude_code, codex, or antigravity. The model and \
          effort start from the user's defaults for that harness; pass either to override it, in \
          the harness's own naming. A value the harness does not know is not caught here: the \
          agent's next turn fails with the harness's error. list_agents shows the quick-choice \
          lists of known values. To change the model or effort later, use \
          set_agent_model_and_effort.";
-    RenameAgent = "rename_agent" (RenameAgentArgs) [Additive]
+    RenameAgent = "rename_agent" (RenameAgentArgs) [Additive, SetUp]
         "Rename an agent. Its id does not change.";
-    SetAgentModelAndEffort = "set_agent_model_and_effort" (SetAgentModelAndEffortArgs) [Additive]
+    SetAgentModelAndEffort = "set_agent_model_and_effort" (SetAgentModelAndEffortArgs) [Additive, SetUp]
         "Change an agent's model, effort, or both; the change applies from the agent's next \
          turn. Omit a field to leave it as it is; pass null to reset it to the harness's \
          default. Values are in the harness's own naming and are not checked here: a value the \
          harness does not know fails the agent's next turn. list_agents shows the quick-choice \
          lists of known values.";
-    RemoveAgent = "remove_agent" (AgentArgs) [Acts]
+    RemoveAgent = "remove_agent" (AgentArgs) [Acts, SetUp]
         "Remove an agent from its project for good: Switchboard's record of it goes, and its \
          card and conversation leave the window. Nothing brings it back; only the harness's own \
          session file stays on disk, outside Switchboard. Remove only an agent you created in \
@@ -335,11 +379,11 @@ tools! {
          refused, and no workflow can start in the project until the removal ends. Once begun, \
          it finishes even if this call is cancelled. Returns the removed agent's agent_id and \
          name.";
-    DismissWorkflowRun = "dismiss_workflow_run" (RunArgs) [Acts]
+    DismissWorkflowRun = "dismiss_workflow_run" (RunArgs) [Acts, SetUp]
         "Delete a failed or interrupted workflow run's record, which otherwise blocks every new \
          workflow in the project. Returns the step that failed and why, which this removes from \
          the window, so read it. Refuses a running or completed run.";
-    CompactAgent = "compact_agent" (CompactArgs) [Acts]
+    CompactAgent = "compact_agent" (CompactArgs) [Acts, Act]
         "Compact an agent's conversation: its harness summarizes the history so far and continues \
          from the summary, freeing context. Read context from list_agents to decide when: the \
          harness compacts on its own once the context fills, possibly mid-task, so compact between \
@@ -352,7 +396,7 @@ tools! {
          compaction is queued or running for the agent, another request returns its send_id \
          instead of queuing a second. The user sees it in Switchboard's window as a compaction \
          row and can cancel it there.";
-    ForkAgent = "fork_agent" (ForkArgs) [Acts]
+    ForkAgent = "fork_agent" (ForkArgs) [Acts, Act]
         "Branch an agent's conversation into a new agent that starts with the source's \
          conversation so far, and send it a message: for a side question or a rabbit hole that \
          must not disturb the source. The fork is named <source>-fork and is an agent like any \
@@ -374,7 +418,7 @@ tools! {
          Until a Claude fork's first reply ends, sends to its source fail with \
          agent_busy_elsewhere: wait for that reply, then resend. A fork stays until someone \
          removes it (remove_agent): fork for a reason, not per message.";
-    Send = "send" (SendArgs) [Acts]
+    Send = "send" (SendArgs) [Acts, Act]
         "Send one message to one or more agents of a project, as the user's next message in each \
          one's conversation. Returns at once with a send_id and each recipient's status at \
          dispatch: accepted, rejected (with a code), or not_dispatched. Then call wait_send until \
@@ -391,7 +435,7 @@ tools! {
          returns request_in_progress with its send_id: call again later with the same key.\n\
          The user sees the message in Switchboard's window, queued or running, and can cancel \
          it there.";
-    Forward = "forward" (ForwardArgs) [Acts]
+    Forward = "forward" (ForwardArgs) [Acts, Act]
         format!(
             "Send agents' answers to other agents, composed the way the user's own forwards \
              are: your text first, then each source's answer in a labeled block. Sources may be \
@@ -414,7 +458,7 @@ tools! {
              in send.\n\
              {WAIT_HINTS}"
         );
-    RunWorkflow = "run_workflow" (RunWorkflowArgs) [Acts]
+    RunWorkflow = "run_workflow" (RunWorkflowArgs) [Acts, Act]
         "Start a workflow in a project and return its run_id; then call wait_workflow until \
          done. Pass inputs as describe_workflow lists them: an agent input takes an agent id, a \
          list input a list. forward_sources fills an input with agents' latest answers. \
@@ -425,7 +469,7 @@ tools! {
          workflow_already_running while another run is in progress in the project, with \
          workflow_run_requires_dismissal while a failed run is held there, and while an agent \
          is being removed from it (start again in a moment).";
-    CancelSend = "cancel_send" (CancelSendArgs) [Stops]
+    CancelSend = "cancel_send" (CancelSendArgs) [Stops, Stop]
         "Cancel a send. Without agent_id, every recipient still queued or running is cancelled, \
          and a send still being prepared stops before reaching anyone else. With agent_id, only \
          that agent's reply to the send is cancelled, queued or running (what the stop control \
@@ -439,15 +483,15 @@ tools! {
          already_finished when there was nothing left to cancel; or, with agent_id, requested \
          for a workflow's send older than Switchboard's record of it: the agent stops that \
          reply if it is still queued or running.";
-    StopAgent = "stop_agent" (AgentArgs) [Stops]
+    StopAgent = "stop_agent" (AgentArgs) [Stops, Stop]
         "Stop the agent's current turn and drop every message queued for it, including ones the \
          user or a workflow queued: what Stop agent does in Switchboard's window. It stops the \
          user's work too: use it only when the user asks. To unstick one reply without dropping \
          anything else, use cancel_send with agent_id.";
-    CancelWorkflowRun = "cancel_workflow_run" (RunArgs) [Stops]
+    CancelWorkflowRun = "cancel_workflow_run" (RunArgs) [Stops, Stop]
         "Cancel a running workflow run started through these tools. A run the user started from \
          Switchboard's window is refused: tell the user instead.";
-    WaitSend = "wait_send" (WaitSendArgs) [Read]
+    WaitSend = "wait_send" (WaitSendArgs) [Read, Wait]
         format!(
             "Wait for a send's replies: one you made, or one a workflow made (wait_workflow \
              lists those). Returns when every recipient has finished or timeout_seconds passes, \
@@ -469,7 +513,7 @@ tools! {
              one listed in truncated with the read_reply call that reads on. When done, \
              the result also {USAGE_NOTE}\n{WAIT_HINTS}"
         );
-    WaitAnySend = "wait_any_send" (WaitAnySendArgs) [Read]
+    WaitAnySend = "wait_any_send" (WaitAnySendArgs) [Read, Wait]
         format!(
             "Wait on several sends at once, for agents working in parallel: returns as soon as \
              any one is done, or when timeout_seconds passes, with every send's current state \
@@ -481,7 +525,7 @@ tools! {
              that reads on. When any_done, the result also, once at its top level, \
              {USAGE_NOTE}\n{WAIT_HINTS}"
         );
-    WaitAgent = "wait_agent" (WaitAgentArgs) [Read]
+    WaitAgent = "wait_agent" (WaitAgentArgs) [Read, Wait]
         format!(
             "Wait until an agent would accept a new send, then return idle with its latest \
              reply in output, as read_latest_reply returns it; or running once timeout_seconds \
@@ -490,7 +534,7 @@ tools! {
              observation: the user or a workflow can occupy the agent before your next send, \
              which then returns agent_busy. When idle, the result also {USAGE_NOTE}\n{WAIT_HINTS}"
         );
-    WaitWorkflow = "wait_workflow" (WaitWorkflowArgs) [Read]
+    WaitWorkflow = "wait_workflow" (WaitWorkflowArgs) [Read, Wait]
         format!(
             "Wait for a workflow run to finish. Returns running once timeout_seconds passes \
              (call again), or the final status (completed, failed, cancelled, interrupted) with \

@@ -22,7 +22,7 @@ use crate::commands::{
 };
 use crate::error::AppError;
 use crate::state::{TestSeam, lock};
-use crate::workflow::DispatchFactoryProvider as _;
+use crate::workflow::{DispatchEnd, DispatchFactoryProvider as _};
 use crate::workflow_commands::ProjectDispatchFactoryProvider;
 
 use super::budget::fit;
@@ -5840,32 +5840,460 @@ async fn cancelling_a_whole_workflow_send_ends_the_run() {
     );
 }
 
-#[tokio::test]
-async fn a_workflow_reply_cancelled_before_it_is_offered_is_never_sent() {
-    let (env, project_id, agents) = workflow_env().await;
-    // The workflow's first send, registered and not yet offered: the step is
-    // dispatching, and the cancel lands before this recipient's turn.
-    let send_id = Uuid::now_v7();
-    let provider = ProjectDispatchFactoryProvider::new(
+/// The app's workflow provider for `project_id`, as a run started through the
+/// tools builds it, for driving a send's dispatch hooks one at a time.
+fn workflow_provider(env: &TestEnv, project_id: ProjectId) -> ProjectDispatchFactoryProvider {
+    ProjectDispatchFactoryProvider::new(
         &env.state,
         &super::read::project_readonly(&env.state, project_id).unwrap(),
         &[],
         &env.home(),
         0,
     )
-    .with_agent_access(true);
+    .with_agent_access(true)
+}
+
+/// Poll until the adapter has been handed a prompt containing `needle`.
+async fn await_prompt(env: &TestEnv, needle: &str) {
+    for _ in 0..1000 {
+        if lock(&env.adapter.prompts)
+            .iter()
+            .any(|p| p.contains(needle))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("no prompt containing {needle:?} was dispatched");
+}
+
+/// The run's sends once it has made `count` of them.
+async fn workflow_sends(
+    env: &TestEnv,
+    project_id: ProjectId,
+    run_id: Uuid,
+    count: usize,
+) -> Vec<Uuid> {
+    for _ in 0..1000 {
+        let reply = wait_workflow(
+            &env.state,
+            project_id,
+            run_id,
+            &WaitBudget::new(Some(0), false),
+        )
+        .await
+        .unwrap();
+        if reply.sends.len() >= count {
+            return reply.sends.iter().map(|send| send.send_id).collect();
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the run never made {count} sends");
+}
+
+/// Cancel the run as an orchestrator would: the whole run, or the whole of
+/// its send `send_id`.
+fn cancel_the_run(
+    env: &TestEnv,
+    project_id: ProjectId,
+    run_id: Uuid,
+    send_id: Uuid,
+    whole_send: bool,
+) {
+    if whole_send {
+        cancel_send(&env.state, project_id, send_id, None).unwrap();
+    } else {
+        super::workflow::cancel_workflow_run(&env.state, project_id, run_id).unwrap();
+    }
+}
+
+/// The agent's answer once it is idle again.
+async fn answer_once_idle(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent_id: AgentId,
+) -> super::read::AgentOutput {
+    let reply = wait_agent(
+        &env.state,
+        project_id,
+        agent_id,
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply.status, AgentWaitStatus::Idle);
+    reply.output.expect("an idle agent's answer is read")
+}
+
+#[tokio::test]
+async fn a_cancelled_run_leaves_a_message_the_user_queued_behind_its_reply() {
+    for whole_send in [false, true] {
+        let (env, project_id, agents) = workflow_env().await;
+        let (first, second) = (agents[1], agents[2]);
+        let (first_gate, second_gate, user_gate) = (
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+        );
+        env.adapter.push(Script::reply("greeting"));
+        env.adapter
+            .push_for(first, Script::parked("first review", &first_gate));
+        env.adapter
+            .push_for(second, Script::parked("second review", &second_gate));
+        let run_id = run_workflow(
+            &env.state,
+            &env.home(),
+            pair_request(project_id, &agents),
+            &WaitBudget::default_wait(),
+        )
+        .await
+        .unwrap();
+        await_turn_running(&env.state, first).await;
+        await_turn_running(&env.state, second).await;
+        // The user queues a message behind the second reviewer's reply, which
+        // then finishes, so the second reviewer starts the user's message
+        // while the run still waits on the first.
+        env.adapter
+            .push_for(second, Script::parked("the user's reply", &user_gate));
+        send_message_impl(
+            &env.state,
+            second,
+            "mine",
+            Vec::new(),
+            Uuid::now_v7(),
+            &env.home(),
+        )
+        .await
+        .unwrap();
+        second_gate.notify_one();
+        await_prompt(&env, "mine").await;
+        await_turn_running(&env.state, second).await;
+        let review = workflow_sends(&env, project_id, run_id, 2).await[1];
+
+        cancel_the_run(&env, project_id, run_id, review, whole_send);
+        let ended = wait_workflow(
+            &env.state,
+            project_id,
+            run_id,
+            &WaitBudget::new(Some(30), false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ended.status,
+            WorkflowRunStatus::Cancelled,
+            "whole send: {whole_send}"
+        );
+
+        user_gate.notify_one();
+        let answer = answer_once_idle(&env, project_id, second).await;
+        assert_eq!(
+            answer.status,
+            AgentOutputStatus::Completed,
+            "the run's cleanup left the user's message alone (whole send: {whole_send})"
+        );
+        assert_eq!(answer.text.as_deref(), Some("the user's reply"));
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_run_leaves_a_reply_that_finished_and_is_draining_alone() {
+    for whole_send in [false, true] {
+        let (env, project_id, agents) = workflow_env().await;
+        let (first, second) = (agents[1], agents[2]);
+        let (first_gate, drain_gate, user_gate) = (
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+        );
+        env.adapter.push(Script::reply("greeting"));
+        env.adapter
+            .push_for(first, Script::parked("first review", &first_gate));
+        // The second reviewer's reply ends at once, then its stream stays open:
+        // finished, but the agent is not idle yet.
+        env.adapter
+            .push_for(second, Script::reply("second review").draining(&drain_gate));
+        let run_id = run_workflow(
+            &env.state,
+            &env.home(),
+            pair_request(project_id, &agents),
+            &WaitBudget::default_wait(),
+        )
+        .await
+        .unwrap();
+        await_turn_running(&env.state, first).await;
+        let review = workflow_sends(&env, project_id, run_id, 2).await[1];
+        await_recipient_status(&env, review, second, SendStatus::Completed).await;
+        env.adapter
+            .push_for(second, Script::parked("the user's reply", &user_gate));
+        send_message_impl(
+            &env.state,
+            second,
+            "mine",
+            Vec::new(),
+            Uuid::now_v7(),
+            &env.home(),
+        )
+        .await
+        .unwrap();
+
+        cancel_the_run(&env, project_id, run_id, review, whole_send);
+        let ended = wait_workflow(
+            &env.state,
+            project_id,
+            run_id,
+            &WaitBudget::new(Some(30), false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ended.status,
+            WorkflowRunStatus::Cancelled,
+            "whole send: {whole_send}"
+        );
+        drain_gate.notify_one();
+        await_prompt(&env, "mine").await;
+        user_gate.notify_one();
+        let answer = answer_once_idle(&env, project_id, second).await;
+        assert_eq!(
+            answer.text.as_deref(),
+            Some("the user's reply"),
+            "whole send: {whole_send}"
+        );
+
+        let statuses: Vec<SendStatus> = env
+            .state
+            .ledger
+            .send(review)
+            .unwrap()
+            .recipients
+            .iter()
+            .map(|r| r.status)
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![SendStatus::Cancelled, SendStatus::Completed],
+            "the finished reply stays completed, and nothing of the run is left running (whole send: {whole_send})"
+        );
+        assert!(
+            env.state
+                .dispatcher
+                .running_turn_kind(first)
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_run_never_starts_its_message_still_waiting_in_line() {
+    let (env, project_id, agents) = workflow_env().await;
+    let coder = agents[0];
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    // The coder is draining a reply of the user's: finished, not yet idle, so
+    // the workflow's first message is accepted and waits in line behind it.
+    let drain_gate = Arc::new(Notify::new());
+    env.adapter
+        .push(Script::reply("the user's reply").draining(&drain_gate));
+    send_message_impl(
+        &env.state,
+        coder,
+        "mine",
+        Vec::new(),
+        Uuid::now_v7(),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    await_prompt(&env, "mine").await;
+    for _ in 0..1000 {
+        if env.state.dispatcher.accepts_now(coder).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    let greet = first_workflow_send(&env, project_id, run_id).await;
+
+    super::workflow::cancel_workflow_run(&env.state, project_id, run_id).unwrap();
+    let ended = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ended.status, WorkflowRunStatus::Cancelled);
+    drain_gate.notify_one();
+    answer_once_idle(&env, project_id, coder).await;
+    assert!(
+        !lock(&env.adapter.prompts)
+            .iter()
+            .any(|p| p.contains("Hi bob")),
+        "the run's message was dropped from the line, never sent"
+    );
+    await_recipient_status(&env, greet, coder, SendStatus::Cancelled).await;
+}
+
+#[tokio::test]
+async fn a_workflow_reply_cancelled_before_it_is_offered_is_never_sent() {
+    let (env, project_id, agents) = workflow_env().await;
+    // The workflow's send, registered and not yet offered: the step is
+    // dispatching, and the cancel lands before the second recipient's turn.
+    let send_id = Uuid::now_v7();
+    let provider = workflow_provider(&env, project_id);
     provider.send_starting(send_id, &[agents[0], agents[1]]);
 
     let cancelled = cancel_send(&env.state, project_id, send_id, Some(agents[1])).unwrap();
     assert_eq!(cancelled.outcome, super::send::CancelOutcome::Cancelled);
+    assert!(
+        provider.admit(send_id, agents[0]).is_none(),
+        "a cancelled reply ends the run, so nobody is offered the message"
+    );
+    // The engine stops the step as cancelled and says so.
+    provider.send_finished(send_id, DispatchEnd::Cancelled);
+    let held = env.state.ledger.send(send_id).unwrap();
+    assert_eq!(
+        held.recipients.iter().map(|r| r.status).collect::<Vec<_>>(),
+        vec![SendStatus::Cancelled, SendStatus::Cancelled]
+    );
+}
+
+#[tokio::test]
+async fn cancelling_one_workflow_reply_stops_the_step_offering_the_rest() {
+    let (env, project_id, agents) = workflow_env().await;
+    let send_id = Uuid::now_v7();
+    let provider = workflow_provider(&env, project_id);
+    provider.send_starting(send_id, &agents);
     assert!(provider.admit(send_id, agents[0]).is_some());
+    provider.offered(send_id, agents[0], true);
+    assert!(
+        !provider.send_cancelled(send_id),
+        "nothing was cancelled yet"
+    );
+
+    // The first reply is cancelled while the step is still dispatching.
+    cancel_send(&env.state, project_id, send_id, Some(agents[0])).unwrap();
+    assert!(
+        provider.send_cancelled(send_id),
+        "a cancel of one recipient's reply reads as the send cancelled"
+    );
     assert!(
         provider.admit(send_id, agents[1]).is_none(),
-        "the cancelled recipient is skipped"
+        "a cancel of another recipient's reply stops the fan-out too"
     );
-    provider.send_finished(send_id);
+    provider.send_finished(send_id, DispatchEnd::Cancelled);
     let held = env.state.ledger.send(send_id).unwrap();
     assert_eq!(held.recipients[1].status, SendStatus::Cancelled);
+    assert_eq!(held.recipients[2].status, SendStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn a_cancel_wins_over_a_busy_answer_on_the_workflow_provider() {
+    let (env, project_id, agents) = workflow_env().await;
+    let send_id = Uuid::now_v7();
+    let provider = workflow_provider(&env, project_id);
+    provider.send_starting(send_id, &[agents[0], agents[1]]);
+    assert!(provider.admit(send_id, agents[0]).is_some());
+    provider.offered(send_id, agents[0], true);
+    assert!(provider.admit(send_id, agents[1]).is_some());
+
+    // The whole send is cancelled while the dispatcher answers for the
+    // second recipient, which turns out busy.
+    cancel_send(&env.state, project_id, send_id, None).unwrap();
+    provider.offered(send_id, agents[1], false);
+    assert!(
+        provider.send_cancelled(send_id),
+        "the engine reads the cancel, so the run ends cancelled, not failed"
+    );
+    provider.send_finished(send_id, DispatchEnd::Cancelled);
+    let held = env.state.ledger.send(send_id).unwrap();
+    assert_eq!(held.recipients[1].status, SendStatus::Rejected);
+    assert_eq!(held.recipients[1].code, Some(error_code::AGENT_BUSY));
+}
+
+#[tokio::test]
+async fn a_cancel_decided_when_the_step_stops_marks_the_rest_cancelled_not_refused() {
+    let (env, project_id, agents) = workflow_env().await;
+    let send_id = Uuid::now_v7();
+    let provider = workflow_provider(&env, project_id);
+    provider.send_starting(send_id, &agents);
+    assert!(provider.admit(send_id, agents[0]).is_some());
+    provider.offered(send_id, agents[0], true);
+
+    // The send is cancelled while the second recipient's pre-dispatch check
+    // runs; the check then refuses. The engine asks once, finds the cancel,
+    // and tells the provider the step was cancelled, not that it was not
+    // ready.
+    cancel_send(&env.state, project_id, send_id, None).unwrap();
+    assert!(provider.send_cancelled(send_id));
+    provider.send_finished(send_id, DispatchEnd::Cancelled);
+
+    let held = env.state.ledger.send(send_id).unwrap();
+    for recipient in &held.recipients[1..] {
+        assert_eq!(recipient.status, SendStatus::Cancelled);
+        assert_eq!(
+            recipient.code, None,
+            "never refused with workflow_step_failed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_busy_refusal_leaves_later_workflow_recipients_not_dispatched() {
+    let (env, project_id, agents) = workflow_env().await;
+    let send_id = Uuid::now_v7();
+    let provider = workflow_provider(&env, project_id);
+    provider.send_starting(send_id, &agents);
+    assert!(provider.admit(send_id, agents[0]).is_some());
+    provider.offered(send_id, agents[0], true);
+    assert!(provider.admit(send_id, agents[1]).is_some());
+    provider.offered(send_id, agents[1], false);
+    assert!(
+        !provider.send_cancelled(send_id),
+        "recording a busy refusal is not a cancel"
+    );
+    provider.send_finished(send_id, DispatchEnd::Ran);
+
+    let held = env.state.ledger.send(send_id).unwrap();
+    assert_eq!(held.recipients[1].status, SendStatus::Rejected);
+    assert_eq!(held.recipients[1].code, Some(error_code::AGENT_BUSY));
+    assert_eq!(
+        held.recipients[2].status,
+        SendStatus::NotDispatched,
+        "an earlier recipient was refused, which is what not_dispatched means"
+    );
+    assert_eq!(held.recipients[2].code, None);
+}
+
+#[tokio::test]
+async fn a_workflow_step_that_could_not_prepare_refuses_its_recipients_with_the_reason() {
+    let (env, project_id, agents) = workflow_env().await;
+    let send_id = Uuid::now_v7();
+    let provider = workflow_provider(&env, project_id);
+    provider.send_starting(send_id, &[agents[0], agents[1]]);
+    provider.send_finished(send_id, DispatchEnd::NotReady("the prompt did not render"));
+
+    let reply = wait_done(&env, project_id, send_id).await;
+    assert!(reply.done);
+    assert_eq!(reply.source, WaitSource::Live);
+    for recipient in &reply.recipients {
+        assert_eq!(recipient.status, SendStatus::Rejected);
+        assert_eq!(recipient.code, Some(error_code::WORKFLOW_STEP_FAILED));
+        assert_eq!(
+            recipient.error.as_deref(),
+            Some("the prompt did not render")
+        );
+    }
 }
 
 #[tokio::test]
@@ -6428,6 +6856,44 @@ async fn a_reply_left_running_by_a_failed_workflow_is_still_the_orchestrators_to
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn a_busy_agent_is_recorded_refused_and_its_users_reply_runs_on() {
+    let (env, project_id, agents) = workflow_env().await;
+    std::fs::write(
+        env.workflows_dir().join("send-then-fail.yaml"),
+        SEND_THEN_FAIL_WORKFLOW,
+    )
+    .unwrap();
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let (first, second) = (agents[0], agents[1]);
+    let (run_id, gate) =
+        failed_workflow_with_a_surviving_reply(&env, project_id, first, second, true).await;
+    let refused = workflow_sends(&env, project_id, run_id, 2).await[1];
+
+    let reply = wait_done(&env, project_id, refused).await;
+    assert_eq!(reply.source, WaitSource::Live);
+    assert_eq!(reply.recipients[0].agent_id, second);
+    assert_eq!(reply.recipients[0].status, SendStatus::Rejected);
+    assert_eq!(reply.recipients[0].code, Some(error_code::AGENT_BUSY));
+    assert!(
+        env.state
+            .dispatcher
+            .running_turn_kind(second)
+            .await
+            .is_some(),
+        "recording the refusal stopped nothing"
+    );
+
+    gate.notify_waiters();
+    let answer = answer_once_idle(&env, project_id, second).await;
+    assert_eq!(answer.status, AgentOutputStatus::Completed);
+    assert_eq!(
+        answer.text.as_deref(),
+        Some("busy"),
+        "the user's reply on the busy agent runs to its end"
+    );
 }
 
 #[tokio::test]

@@ -30,6 +30,11 @@ pub const SEND_UNKNOWN: &str = "send_unknown";
 pub const RUN_UNKNOWN: &str = "run_unknown";
 pub const WORKFLOW_RUN_REQUIRES_DISMISSAL: &str = "workflow_run_requires_dismissal";
 pub const WORKFLOW_ALREADY_RUNNING: &str = "workflow_already_running";
+/// A workflow step's recipient was never offered the message because the
+/// step could not get it ready (its prompt did not render, an agent was
+/// unavailable, or a pre-dispatch check refused one). Carried by the
+/// recipient, not returned as an error: the run reports the step's failure.
+pub const WORKFLOW_STEP_FAILED: &str = "workflow_step_failed";
 pub const RESULT_TOO_LARGE: &str = "result_too_large";
 pub const REQUEST_IN_PROGRESS: &str = "request_in_progress";
 pub const COMPACTION_UNSUPPORTED: &str = "compaction_unsupported";

@@ -31,11 +31,17 @@
 //! app had restarted. The app's workflow provider
 //! (`ProjectDispatchFactoryProvider`) registers the step's send before
 //! building its message, every recipient `not_dispatched`; marks each
-//! recipient accepted, minting its `message_id`, just before offering it; records a
-//! busy agent as rejected; and settles the send when the step's dispatch
-//! ends. A workflow send has no idempotency key. A cancel `cancel_send`
-//! records is honoured at the provider's next offer, as an agent-tools send
-//! honours it in its dispatch loop.
+//! recipient accepted, minting its `message_id`, just before offering it;
+//! records a busy agent as rejected; and settles the send when the step's
+//! dispatch ends, refusing the recipients it never reached with
+//! `workflow_step_failed` when the step could not get its message ready. A
+//! workflow send has no idempotency key. A cancel `cancel_send` records, of
+//! the send or of any one of its replies (which ends the run), stops the
+//! step offering the message to anyone else and ends the run cancelled, even
+//! when the dispatcher's answer was that the agent was busy or a later
+//! recipient's pre-dispatch check refused: the engine decides once, when the
+//! step stops, and tells the provider, so the recipients it never reached read
+//! `cancelled`.
 //!
 //! **Text.** What counts as an agent's answer is [`TextCapture`]'s rule,
 //! observed over the wire events; it is the same rule the dispatcher applies
@@ -953,6 +959,16 @@ impl SendLedger {
         };
         recipient.cancel_requested = true;
         true
+    }
+
+    /// Whether `cancel_send` asked this send to stop, whole or for any one of
+    /// its recipients. A workflow's send stops dispatching on either, since a
+    /// cancelled reply ends its run.
+    #[must_use]
+    pub fn any_cancel_requested(&self, send_id: SendId) -> bool {
+        lock(&self.inner).sends.get(&send_id).is_some_and(|entry| {
+            entry.cancel_requested || entry.recipients.iter().any(|r| r.cancel_requested)
+        })
     }
 
     /// Whether `cancel_send` asked for this recipient's reply alone to stop.

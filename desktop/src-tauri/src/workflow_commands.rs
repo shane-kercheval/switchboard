@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use switchboard_core::name::canonicalize_for_uniqueness;
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId};
 use switchboard_dispatcher::{DispatchContextFactory, Dispatcher, EventEmitter};
-use switchboard_harness::{CancelSource, MessageId};
+use switchboard_harness::MessageId;
 use switchboard_prompts::{
     PromptArgument, PromptId, PromptResolutionSnapshot, PromptService, ProviderStatus,
 };
@@ -35,8 +35,8 @@ use crate::error::AppError;
 use crate::ops::ledger::SendLedger;
 use crate::state::{ActiveRun, AppState, RunSnapshot, WorkflowSendOrigin, lock};
 use crate::workflow::{
-    DispatchFactoryProvider, ProgressSink, ResolvedRecipient, StepResolution, WorkflowProgress,
-    WorkflowRun,
+    DispatchEnd, DispatchFactoryProvider, ProgressSink, ResolvedRecipient, StepResolution,
+    WorkflowProgress, WorkflowRun,
 };
 
 /// The project-scoped progress channel name. The frontend subscribes once per
@@ -160,12 +160,6 @@ impl ProjectDispatchFactoryProvider {
         self.through_agent_access = through_agent_access;
         self
     }
-
-    /// A cancel `cancel_send` asked for, of the whole send or this recipient.
-    fn cancel_requested(&self, send_id: SendId, agent_id: AgentId) -> bool {
-        self.ledger.cancel_requested(send_id)
-            || self.ledger.recipient_cancel_requested(send_id, agent_id)
-    }
 }
 
 impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
@@ -232,13 +226,13 @@ impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
     }
 
     /// The ledger mints the id and marks the recipient accepted before the
-    /// dispatcher sees it, so the turn's first event finds the entry. A
-    /// recipient `cancel_send` already stopped is skipped, as an agent-tools
-    /// send skips it. An entry the ledger no longer holds is no reason to stop
-    /// the step: the message goes out under a fresh id, unfollowed.
+    /// dispatcher sees it, so the turn's first event finds the entry. Once
+    /// `cancel_send` has stopped the send, or any one of its replies (which
+    /// ends the run), nobody else is offered it; [`Self::send_finished`] marks
+    /// those left cancelled. An entry the ledger no longer holds is no reason to
+    /// stop the step: the message goes out under a fresh id, unfollowed.
     fn admit(&self, send_id: SendId, agent_id: AgentId) -> Option<MessageId> {
-        if self.cancel_requested(send_id, agent_id) {
-            self.ledger.cancel_recipient_undispatched(send_id, agent_id);
+        if self.ledger.any_cancel_requested(send_id) {
             return None;
         }
         Some(
@@ -248,10 +242,7 @@ impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
         )
     }
 
-    /// A busy agent is recorded as refused. An accepted message a cancel
-    /// reached between [`Self::admit`] and the dispatcher's answer found
-    /// nothing to cancel then, so it is cancelled now that the dispatcher has
-    /// it.
+    /// A busy agent is recorded as refused.
     fn offered(&self, send_id: SendId, agent_id: AgentId, accepted: bool) {
         if !accepted {
             self.ledger.mark_rejected(
@@ -260,17 +251,28 @@ impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
                 crate::ops::error_code::AGENT_BUSY,
                 "the agent was busy: workflow steps fail fast on contention",
             );
-        } else if self.cancel_requested(send_id, agent_id) {
-            self.dispatcher
-                .cancel_send(send_id, &[agent_id], CancelSource::User);
         }
     }
 
-    /// Recipients a whole-send cancel stopped before they were offered are
-    /// cancelled; any others not offered stay `not_dispatched`.
-    fn send_finished(&self, send_id: SendId) {
-        if self.ledger.cancel_requested(send_id) {
-            self.ledger.cancel_undispatched(send_id);
+    /// A cancel of the send, or of any of its replies, as the ledger recorded
+    /// it from `cancel_send`.
+    fn send_cancelled(&self, send_id: SendId) -> bool {
+        self.ledger.any_cancel_requested(send_id)
+    }
+
+    /// Recipients never offered the message, by the engine's one decision
+    /// about why the step stopped: refused with the reason when it could not
+    /// get the message ready; cancelled when a cancel stopped it; otherwise
+    /// `not_dispatched`, since an earlier recipient was busy.
+    fn send_finished(&self, send_id: SendId, end: DispatchEnd<'_>) {
+        match end {
+            DispatchEnd::NotReady(reason) => self.ledger.reject_undispatched(
+                send_id,
+                crate::ops::error_code::WORKFLOW_STEP_FAILED,
+                reason,
+            ),
+            DispatchEnd::Cancelled => self.ledger.cancel_undispatched(send_id),
+            DispatchEnd::Ran => {}
         }
         self.ledger.settle(send_id);
     }

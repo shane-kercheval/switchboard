@@ -2,7 +2,7 @@
 //! can park and release, an `AppState` over a store that survives a "restart",
 //! and a window-sync double.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -112,6 +112,10 @@ impl Script {
 /// conversation) see what the turn produced.
 pub struct ScriptedAdapter {
     scripts: Mutex<VecDeque<Script>>,
+    /// Scripts for one agent's turns, played before the shared queue: agents
+    /// whose turns start concurrently (a workflow's fan-out) reach the adapter
+    /// in no fixed order, so a test that holds one of them names its agent.
+    agent_scripts: Mutex<HashMap<AgentId, VecDeque<Script>>>,
     home: PathBuf,
     pub prompts: Mutex<Vec<String>>,
     /// The agents whose compactions ran, in order.
@@ -122,6 +126,7 @@ impl ScriptedAdapter {
     pub fn new(scripts: Vec<Script>, home: &Path) -> Self {
         Self {
             scripts: Mutex::new(scripts.into()),
+            agent_scripts: Mutex::new(HashMap::new()),
             home: home.to_path_buf(),
             prompts: Mutex::new(Vec::new()),
             compactions: Mutex::new(Vec::new()),
@@ -130,6 +135,14 @@ impl ScriptedAdapter {
 
     pub fn push(&self, script: Script) {
         lock(&self.scripts).push_back(script);
+    }
+
+    /// Queue `script` for `agent_id`'s next turn alone.
+    pub fn push_for(&self, agent_id: AgentId, script: Script) {
+        lock(&self.agent_scripts)
+            .entry(agent_id)
+            .or_default()
+            .push_back(script);
     }
 }
 
@@ -152,8 +165,11 @@ impl HarnessAdapter for ScriptedAdapter {
         options: DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
         lock(&self.prompts).push(prompt.to_owned());
-        let script = lock(&self.scripts)
-            .pop_front()
+        let own = lock(&self.agent_scripts)
+            .get_mut(&agent.id)
+            .and_then(VecDeque::pop_front);
+        let script = own
+            .or_else(|| lock(&self.scripts).pop_front())
             .unwrap_or_else(|| Script::reply(&format!("ack: {prompt}")));
         if let Some(gate) = &script.hold_dispatch {
             gate.notified().await;

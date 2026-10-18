@@ -1395,7 +1395,11 @@ pub async fn wait_any_send(
 }
 
 /// The send as the ledger holds it, when it is this project's.
-fn held_send(state: &AppState, project_id: ProjectId, send_id: SendId) -> Option<SendSnapshot> {
+pub(super) fn held_send(
+    state: &AppState,
+    project_id: ProjectId,
+    send_id: SendId,
+) -> Option<SendSnapshot> {
     state
         .ledger
         .send(send_id)

@@ -5668,6 +5668,105 @@ async fn cancelling_one_agents_reply_to_a_workflow_send_ends_the_run() {
     );
 }
 
+/// While a run waits on its agents, each agent of the current step carries
+/// what `wait_send` gives an unfinished recipient. The step doing the waiting
+/// is a wait step, which made no send of its own, so each agent reports the
+/// run's newest send that reached it: one reviewer finished (completed, no
+/// activity), the other still writing (running, with its activity and text so
+/// far). A finished run carries none of it.
+#[tokio::test]
+async fn wait_workflow_shows_what_each_agent_of_the_current_step_is_doing() {
+    let (env, project_id, agents) = workflow_env().await;
+    let gate = Arc::new(Notify::new());
+    env.adapter.push_for(agents[0], Script::reply("greeting"));
+    env.adapter.push_for(agents[1], Script::reply("looks fine"));
+    env.adapter
+        .push_for(agents[2], Script::parked("still reading", &gate));
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    // Content wakes no waiter, so look until the slow reviewer's text and the
+    // quick one's completion have both landed.
+    let mut waiting = None;
+    for _ in 0..500 {
+        let reply = wait_workflow(
+            &env.state,
+            project_id,
+            run_id,
+            &WaitBudget::new(Some(0), false),
+        )
+        .await
+        .unwrap();
+        let landed = |agent: AgentId, ready: &dyn Fn(&super::workflow::StepAgent) -> bool| {
+            reply
+                .recipients
+                .iter()
+                .any(|a| a.agent.agent_id == agent && ready(a))
+        };
+        if reply.label.as_deref() == Some("Reviewed")
+            && landed(agents[1], &|a| a.status == Some(SendStatus::Completed))
+            && landed(agents[2], &|a| a.recent_text.is_some())
+        {
+            waiting = Some(reply);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let waiting = waiting.expect("the run reached its wait step with one reviewer done");
+    let review = waiting.sends.iter().find(|s| s.step == 2).unwrap().send_id;
+    let of = |agent: AgentId| {
+        waiting
+            .recipients
+            .iter()
+            .find(|a| a.agent.agent_id == agent)
+            .unwrap()
+    };
+
+    let slow = of(agents[2]);
+    assert_eq!(
+        slow.send_id,
+        Some(review),
+        "the wait step's agent reports the newest send that reached it, the send step's"
+    );
+    assert_eq!(slow.status, Some(SendStatus::Running));
+    assert!(slow.activity.is_some(), "a running turn's activity");
+    assert_eq!(slow.recent_text.as_deref(), Some("still reading"));
+    let shape = serde_json::to_value(slow).unwrap();
+    assert_eq!(shape["agent_id"], agents[2].to_string(), "{shape}");
+    assert_eq!(shape["name"], "r2", "{shape}");
+    assert_eq!(shape["status"], "running", "{shape}");
+
+    let quick = of(agents[1]);
+    assert_eq!(quick.send_id, Some(review));
+    assert_eq!(quick.status, Some(SendStatus::Completed));
+    assert_eq!(quick.activity, None, "a finished reply has no activity");
+    assert_eq!(quick.recent_text, None);
+
+    gate.notify_waiters();
+    let ended = wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ended.status, WorkflowRunStatus::Completed);
+    assert!(
+        ended.recipients.iter().all(|a| a.send_id.is_none()
+            && a.status.is_none()
+            && a.activity.is_none()
+            && a.recent_text.is_none()),
+        "a finished run carries no step progress: {:?}",
+        ended.recipients
+    );
+}
+
 /// The run's first send, as an orchestrator reads it from `wait_workflow`
 /// once the step has dispatched.
 async fn first_workflow_send(env: &TestEnv, project_id: ProjectId, run_id: Uuid) -> Uuid {

@@ -481,7 +481,11 @@ tools! {
             "Wait for a workflow run to finish. Returns running once timeout_seconds passes \
              (call again), or the final status (completed, failed, cancelled, interrupted) with \
              the step that failed and why. Either way it gives the current step (counted from \
-             0, its label, and its agents as {{agent_id, name}}) and sends: every send the run's \
+             0, its label, and its agents as {{agent_id, name}}) and sends. While the run is \
+             unfinished, each of the step's agents also carries the send_id of the run's \
+             newest send that reached it and, while Switchboard holds that send, its status, \
+             activity, and recent_text as wait_send reports them. On a wait step that is the \
+             send step's turn, usually the one the step waits on. sends lists every send the run's \
              send steps made so far, each with its step, label, send_id, and recipients \
              (dispatched false for one a failed step never reached). Follow any of those sends \
              with wait_send. read_workflow_run returns all their replies in step order, even \

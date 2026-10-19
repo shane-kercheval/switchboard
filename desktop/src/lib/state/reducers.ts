@@ -708,7 +708,14 @@ function nextBackgroundTasks(
     case "background_task_started":
       return existing !== undefined
         ? tasks
-        : [...tasks, { task_id: event.task_id, description: event.description }];
+        : [
+            ...tasks,
+            {
+              task_id: event.task_id,
+              description: event.description,
+              ...(event.tool_use_id !== undefined ? { tool_use_id: event.tool_use_id } : {}),
+            },
+          ];
     case "background_task_progress":
       if (existing === undefined || event.activity === "") return tasks;
       return [...others, { ...existing, activity: event.activity }];

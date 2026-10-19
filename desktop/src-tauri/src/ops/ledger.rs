@@ -234,22 +234,29 @@ pub const RECENT_TEXT_CHARS: usize = 500;
 /// text, sent a heartbeat, started or finished a tool call, or a background
 /// task started, reported progress, or ended. A tool call left open (a test
 /// suite running) is reported with how long it has run, since it produces
-/// nothing until it ends. Work the agent handed to a sub-agent or a
-/// background command is not a tool call of its own, so it is reported apart,
-/// under `open_background_tasks`. Reported only while a turn runs: an idle
-/// agent has nothing to be stuck on.
+/// nothing until it ends. A sub-agent the agent waits on is its open `Agent`
+/// tool call, which carries what the sub-agent last reported doing. Work the
+/// agent handed off to run apart from it (a sub-agent or a command started in
+/// the background) is no open call of its own, so it is reported under
+/// `open_background_tasks`. Each piece of work appears once. Reported only
+/// while a turn runs: an idle agent has nothing to be stuck on.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AgentActivity {
     pub seconds_since_output: u64,
     /// Oldest first.
     pub open_tool_calls: Vec<OpenToolCall>,
-    /// Oldest first.
+    /// Work running apart from the agent: a task whose starting call has
+    /// closed, or that names none. Oldest first.
     pub open_background_tasks: Vec<OpenBackgroundTask>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OpenToolCall {
     pub name: String,
+    /// For a sub-agent the agent waits on, what the sub-agent last reported
+    /// doing; absent for any other call and until it reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
     pub running_seconds: u64,
 }
 
@@ -288,10 +295,21 @@ struct OpenTask {
     task_id: String,
     description: String,
     activity: Option<String>,
+    /// The tool call that started the task, when its start named one.
+    tool_use_id: Option<String>,
     started: Instant,
 }
 
+impl OpenTask {
+    fn started_by(&self, tool: &OpenTool) -> bool {
+        self.tool_use_id.as_deref() == Some(tool.tool_use_id.as_str())
+    }
+}
+
 impl ActivityState {
+    /// Decided here rather than as events arrive, so a task and its starting
+    /// call can arrive or end in either order: while the call is open, the
+    /// agent waits on the task and its step shows on the call.
     fn report(&self, now: Instant) -> AgentActivity {
         AgentActivity {
             seconds_since_output: now.saturating_duration_since(self.last_output).as_secs(),
@@ -300,12 +318,19 @@ impl ActivityState {
                 .iter()
                 .map(|tool| OpenToolCall {
                     name: tool.name.clone(),
+                    activity: self
+                        .open_tasks
+                        .iter()
+                        .rev()
+                        .find(|task| task.started_by(tool))
+                        .and_then(|task| task.activity.clone()),
                     running_seconds: now.saturating_duration_since(tool.started).as_secs(),
                 })
                 .collect(),
             open_background_tasks: self
                 .open_tasks
                 .iter()
+                .filter(|task| !self.open_tools.iter().any(|tool| task.started_by(tool)))
                 .map(|task| OpenBackgroundTask {
                     description: task.description.clone(),
                     activity: task.activity.clone(),
@@ -1417,12 +1442,14 @@ impl SendLedger {
             NormalizedEvent::BackgroundTaskStarted {
                 task_id,
                 description,
+                tool_use_id,
                 ..
             } if !state.open_tasks.iter().any(|task| task.task_id == task_id) => {
                 state.open_tasks.push(OpenTask {
                     task_id,
                     description,
                     activity: None,
+                    tool_use_id,
                     started: now,
                 });
             }
@@ -1934,6 +1961,15 @@ mod tests {
         json!({ "type": "background_task_started", "turn_id": turn_id, "task_id": id, "description": description })
     }
 
+    fn task_started_by(
+        turn_id: TurnId,
+        id: &str,
+        description: &str,
+        tool_use_id: &str,
+    ) -> serde_json::Value {
+        json!({ "type": "background_task_started", "turn_id": turn_id, "task_id": id, "description": description, "tool_use_id": tool_use_id })
+    }
+
     fn task_progress(turn_id: TurnId, id: &str, activity: &str) -> serde_json::Value {
         json!({ "type": "background_task_progress", "turn_id": turn_id, "task_id": id, "activity": activity })
     }
@@ -2045,6 +2081,109 @@ mod tests {
         );
     }
 
+    /// Where a sub-agent's task ends relative to its `Agent` call closing is
+    /// inferred, not recorded (the 2.1.149 notes show the task events during
+    /// a run, not their order against the call), so both orders are covered.
+    #[test]
+    fn a_sub_agent_the_agent_waits_on_is_its_open_call_whichever_ends_first() {
+        for task_ends_first in [true, false] {
+            let ledger = SendLedger::new();
+            let (_, send_id, agent_id, message_id) = registered(&ledger);
+            let turn_id = Uuid::now_v7();
+            ledger.observe(
+                &channel(agent_id),
+                &turn_start(message_id, turn_id, send_id),
+            );
+            ledger.observe(
+                &channel(agent_id),
+                &tool_started(turn_id, "toolu_A", "Agent"),
+            );
+            ledger.observe(
+                &channel(agent_id),
+                &task_started_by(turn_id, "a1", "Review the parser", "toolu_A"),
+            );
+            let activity = ledger.activity(agent_id).unwrap();
+            assert_eq!(activity.open_tool_calls.len(), 1);
+            assert_eq!(activity.open_tool_calls[0].activity, None, "no step yet");
+            assert_eq!(
+                activity.open_background_tasks,
+                [],
+                "the agent waits on it: not background work"
+            );
+            ledger.observe(
+                &channel(agent_id),
+                &task_progress(turn_id, "a1", "Reading parser.rs"),
+            );
+            let activity = ledger.activity(agent_id).unwrap();
+            assert_eq!(
+                activity.open_tool_calls[0].activity.as_deref(),
+                Some("Reading parser.rs"),
+                "the sub-agent's step shows on its call"
+            );
+            assert_eq!(activity.open_background_tasks, []);
+
+            let task_end = task_ended(turn_id, "a1");
+            let call_end = tool_completed(turn_id, "toolu_A");
+            let (first, second) = if task_ends_first {
+                (&task_end, &call_end)
+            } else {
+                (&call_end, &task_end)
+            };
+            ledger.observe(&channel(agent_id), first);
+            let between = ledger.activity(agent_id).unwrap();
+            if task_ends_first {
+                assert_eq!(between.open_tool_calls[0].activity, None);
+                assert_eq!(between.open_background_tasks, []);
+            } else {
+                assert_eq!(between.open_tool_calls, []);
+                assert_eq!(
+                    between.open_background_tasks.len(),
+                    1,
+                    "a task outliving its call runs apart from the agent"
+                );
+            }
+            ledger.observe(&channel(agent_id), second);
+            let after = ledger.activity(agent_id).unwrap();
+            assert_eq!(after.open_tool_calls, []);
+            assert_eq!(after.open_background_tasks, []);
+        }
+    }
+
+    #[test]
+    fn a_task_whose_call_closed_or_that_names_none_is_background_work() {
+        let ledger = SendLedger::new();
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        let turn_id = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(message_id, turn_id, send_id),
+        );
+        // A background launch: the call returns as soon as the task starts.
+        ledger.observe(
+            &channel(agent_id),
+            &tool_started(turn_id, "toolu_B", "Agent"),
+        );
+        ledger.observe(
+            &channel(agent_id),
+            &task_started_by(turn_id, "b1", "Ack test", "toolu_B"),
+        );
+        ledger.observe(&channel(agent_id), &tool_completed(turn_id, "toolu_B"));
+        ledger.observe(
+            &channel(agent_id),
+            &task_started(turn_id, "c1", "Sleep for 45 seconds"),
+        );
+        let activity = ledger.activity(agent_id).unwrap();
+        assert_eq!(activity.open_tool_calls, []);
+        assert_eq!(
+            activity
+                .open_background_tasks
+                .iter()
+                .map(|task| task.description.as_str())
+                .collect::<Vec<_>>(),
+            ["Ack test", "Sleep for 45 seconds"]
+        );
+    }
+
     #[test]
     fn a_turns_end_clears_its_background_tasks() {
         let ledger = SendLedger::new();
@@ -2129,6 +2268,7 @@ mod tests {
                 seconds_since_output: 600,
                 open_tool_calls: vec![OpenToolCall {
                     name: "Bash".to_owned(),
+                    activity: None,
                     running_seconds: 600
                 }],
                 open_background_tasks: Vec::new(),

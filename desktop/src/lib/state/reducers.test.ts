@@ -1735,6 +1735,23 @@ describe("runtimeReducer", () => {
     expect(r.background_tasks).toEqual([{ task_id: "b2", description: "Run the tests" }]);
   });
 
+  it("re-reading the agent's history mid-turn keeps the turn's open tasks", () => {
+    let r = runtimeReducer(fresh(), turnStart(TURN_1));
+    r = runtimeReducer(r, {
+      type: "background_task_started",
+      turn_id: TURN_1,
+      task_id: "a1",
+      description: "Review the parser",
+      tool_use_id: "toolu_A",
+    });
+    const before = r.background_tasks;
+    r = runtimeReducer(r, { type: "hydrate", agent_id: AGENT_A, turns: [] });
+    expect(r.background_tasks).toEqual(before);
+    expect(r.background_tasks).toEqual([
+      { task_id: "a1", description: "Review the parser", tool_use_id: "toolu_A" },
+    ]);
+  });
+
   it("a turn's end clears its background tasks, and another turn's task events are ignored", () => {
     let r = runtimeReducer(fresh(), turnStart(TURN_1));
     r = runtimeReducer(r, {

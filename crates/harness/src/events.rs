@@ -426,11 +426,14 @@ pub enum AdapterEvent {
     /// `docs/harness-behavior.md` G20). Like `Liveness`, a content-free sign
     /// of life that never becomes a transcript item; consumers track the task
     /// until `BackgroundTaskEnded` or the turn's end, since a Claude turn ends
-    /// only when its process exits.
+    /// only when its process exits. `tool_use_id` names the tool call that
+    /// started it: a sub-agent the turn waits on keeps that call open until
+    /// it returns, while a background launch closes it at once.
     BackgroundTaskStarted {
         turn_id: TurnId,
         task_id: String,
         description: String,
+        tool_use_id: Option<String>,
     },
     /// What a running background task is doing now (Claude's
     /// `system/task_progress`, emitted repeatedly while a sub-agent works).
@@ -692,6 +695,8 @@ pub enum NormalizedEvent {
         turn_id: TurnId,
         task_id: String,
         description: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
     },
     /// A running background task's current activity (see
     /// [`AdapterEvent::BackgroundTaskProgress`]).
@@ -910,10 +915,12 @@ impl AdapterEvent {
                 turn_id,
                 task_id,
                 description,
+                tool_use_id,
             } => NormalizedEvent::BackgroundTaskStarted {
                 turn_id,
                 task_id,
                 description,
+                tool_use_id,
             },
             AdapterEvent::BackgroundTaskProgress {
                 turn_id,
@@ -1620,12 +1627,14 @@ mod tests {
                     turn_id,
                     task_id: task_id(),
                     description: "Sleep 45 then reply ok".to_owned(),
+                    tool_use_id: Some("toolu_01B1AN52bDdxfyrLDXQrrXJx".to_owned()),
                 },
                 serde_json::json!({
                     "type": "background_task_started",
                     "turn_id": turn_id,
                     "task_id": "a7cb77a05059e4590",
                     "description": "Sleep 45 then reply ok",
+                    "tool_use_id": "toolu_01B1AN52bDdxfyrLDXQrrXJx",
                 }),
             ),
             (

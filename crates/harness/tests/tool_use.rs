@@ -410,6 +410,48 @@ fn collect_subagent_tool_use_ids(session_id: uuid::Uuid) -> Vec<String> {
     ids
 }
 
+/// A sub-agent the agent waits on also reports a task that names its Agent
+/// call (seen at 2.1.149), which is what lets the activity report show it as
+/// that open call rather than as background work. Where the task's end falls
+/// against the call's close was never recorded, and the report handles either
+/// order, so either passes; the run prints which.
+fn assert_task_names_waited_on_call(events: &[AdapterEvent], agent_call_id: &str) {
+    let task = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::BackgroundTaskStarted {
+                task_id,
+                tool_use_id,
+                ..
+            } if tool_use_id.as_deref() == Some(agent_call_id) => Some(task_id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("no task names the Agent call {agent_call_id}; events: {events:?}")
+        });
+    let position = |wanted: &dyn Fn(&AdapterEvent) -> bool| events.iter().position(wanted);
+    let call_closed = position(&|e| {
+        matches!(e, AdapterEvent::ToolCompleted { tool_use_id, .. } if tool_use_id == agent_call_id)
+    })
+    .expect("the Agent call closes");
+    let task_ended = position(
+        &|e| matches!(e, AdapterEvent::BackgroundTaskEnded { task_id, .. } if *task_id == task),
+    )
+    .unwrap_or_else(|| panic!("task {task} never ended; events: {events:?}"));
+    let turn_ended = position(&|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("must observe a terminal TurnEnd");
+    assert!(task_ended < turn_ended, "the task ends inside its turn");
+    eprintln!(
+        "foreground sub-agent: task ended at event {task_ended}, Agent call closed at event \
+         {call_closed} ({})",
+        if task_ended < call_closed {
+            "task ended first"
+        } else {
+            "call closed first"
+        }
+    );
+}
+
 /// Probes the `parent_tool_use_id` short-circuit in `parser.rs`: when a
 /// Claude turn delegates via the `Agent` tool, the parent stream carries
 /// subagent-internal `tool_use` / `tool_result` records tagged with
@@ -500,6 +542,9 @@ async fn live_claude_subagent_collapses_to_parent_tool_call() {
         agent_completed.is_some(),
         "Agent ToolStarted ({agent_call_id}) had no matching ToolCompleted. Events: {events:?}",
     );
+
+    // (1b) The task this delegation reports names its Agent call.
+    assert_task_names_waited_on_call(&events, agent_call_id);
 
     // (2) No parent-stream ToolStarted/ToolCompleted may carry a tool_use_id
     // that was emitted inside a subagent. A match here is the subagent-leak bug —

@@ -439,8 +439,12 @@ async fn background_tasks_surface_their_lifecycle_in_stream_order() {
             AdapterEvent::BackgroundTaskStarted {
                 task_id,
                 description,
+                tool_use_id,
                 ..
-            } => Some(format!("started {task_id}: {description}")),
+            } => Some(format!(
+                "started {task_id} by {}: {description}",
+                tool_use_id.as_deref().unwrap_or("-")
+            )),
             AdapterEvent::BackgroundTaskProgress {
                 task_id, activity, ..
             } => Some(format!("progress {task_id}: {activity}")),
@@ -451,14 +455,27 @@ async fn background_tasks_surface_their_lifecycle_in_stream_order() {
     assert_eq!(
         tasks,
         [
-            "started a7cb77a05059e4590: Sleep 45 then reply ok",
+            "started a7cb77a05059e4590 by toolu_01B1AN52bDdxfyrLDXQrrXJx: Sleep 45 then reply ok",
             "progress a7cb77a05059e4590: Running Sleep for 45 seconds",
             "progress a7cb77a05059e4590: Running Sleep for 45 seconds",
-            "started bzggpsjub: Sleep for 45 seconds",
+            "started bzggpsjub by toolu_01755n1P4CQTutKzmDT4pj49: Sleep for 45 seconds",
             "ended a7cb77a05059e4590",
             "ended bzggpsjub",
         ]
     );
+    // A background launch returns at once: the Agent call that started the
+    // sub-agent closes before the sub-agent's task ends, so the task is
+    // reported as work running apart from the agent.
+    let position = |wanted: &dyn Fn(&AdapterEvent) -> bool| {
+        events.iter().position(wanted).expect("event present")
+    };
+    let call_closed = position(
+        &|e| matches!(e, AdapterEvent::ToolCompleted { tool_use_id, .. } if tool_use_id == "toolu_01B1AN52bDdxfyrLDXQrrXJx"),
+    );
+    let task_ended = position(
+        &|e| matches!(e, AdapterEvent::BackgroundTaskEnded { task_id, .. } if task_id == "a7cb77a05059e4590"),
+    );
+    assert!(call_closed < task_ended, "the launch call closes first");
     let terminals = events
         .iter()
         .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))

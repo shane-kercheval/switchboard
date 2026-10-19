@@ -255,9 +255,11 @@ tools! {
          open_tool_calls, each with its name and running_seconds; and open_background_tasks, \
          each with its description, activity (what it last reported doing, absent until it \
          reports), and running_seconds. A tool call open is work in progress: a test suite \
-         produces nothing until it ends. Work inside a sub-agent the agent delegated to, or a \
-         command it runs in the background, does not show as a tool call and is reported \
-         under open_background_tasks. Absent while the agent has no turn running.";
+         produces nothing until it ends. A sub-agent the agent waits on is its open Agent tool \
+         call, whose activity is the sub-agent's latest step. Work the agent handed off to run \
+         in the background, a sub-agent or a command, is no open call and is reported under \
+         open_background_tasks. Each piece of work appears once. Absent while the agent has no \
+         turn running.";
     GetUsage = "get_usage" (NoArgs) [Read, Look]
         "How much of each harness account's limits is used, for choosing a model and effort for \
          the work at hand. One entry per account the app has a reading for: {harness, \

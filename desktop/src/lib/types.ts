@@ -317,7 +317,15 @@ export type NormalizedEvent =
   // it delegated to, or a command it runs in the background (Claude only).
   // Each is a sign of life that re-arms the heartbeat like `liveness`; none
   // renders in the transcript. The runtime tracks open tasks for the footer.
-  | { type: "background_task_started"; turn_id: TurnId; task_id: string; description: string }
+  // `tool_use_id` names the tool call that started the task: a sub-agent the
+  // agent waits on keeps that call running; a background launch closes it.
+  | {
+      type: "background_task_started";
+      turn_id: TurnId;
+      task_id: string;
+      description: string;
+      tool_use_id?: string;
+    }
   // What a running task is doing now (a sub-agent's current step).
   | { type: "background_task_progress"; turn_id: TurnId; task_id: string; activity: string }
   // A task finished, whatever its status.

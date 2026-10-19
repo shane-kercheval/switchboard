@@ -92,6 +92,7 @@ impl Script {
                 turn_id,
                 task_id: task_id.clone(),
                 description: description.clone(),
+                tool_use_id: None,
             });
         }
         events

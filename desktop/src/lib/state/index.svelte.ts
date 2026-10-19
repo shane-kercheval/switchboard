@@ -70,7 +70,15 @@ import {
   settleRecipient,
   settleTurn,
 } from "./sendCompletion";
-import type { AgentRuntime, PendingSend, RuntimeMap, ToolCall, TranscriptMap, Turn } from "./types";
+import type {
+  AgentRuntime,
+  BackgroundTask,
+  PendingSend,
+  RuntimeMap,
+  ToolCall,
+  TranscriptMap,
+  Turn,
+} from "./types";
 import {
   nameUsageModel,
   observeUsage,
@@ -1357,4 +1365,4 @@ export const _testing = {
 
 // Re-export the state-shape types so consumers can import everything from
 // one path without reaching into `./types` directly.
-export type { AgentRuntime, RuntimeMap, ToolCall, TranscriptMap, Turn };
+export type { AgentRuntime, BackgroundTask, RuntimeMap, ToolCall, TranscriptMap, Turn };

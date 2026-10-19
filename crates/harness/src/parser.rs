@@ -1266,8 +1266,9 @@ fn parse_system_event(
 }
 
 /// Claude's background-task lifecycle as typed events (G20). `task_progress`'s
-/// `description` is the task's current activity, not its name. A record with
-/// no task id stays plain `Liveness`, like any other non-init subtype.
+/// `description` is the task's current activity, not its name, and
+/// `task_started`'s `tool_use_id` is the call that started the task. A record
+/// with no task id stays plain `Liveness`, like any other non-init subtype.
 fn background_task_event(
     subtype: Option<&str>,
     obj: &Value,
@@ -1285,6 +1286,10 @@ fn background_task_event(
             turn_id,
             task_id,
             description: description(),
+            tool_use_id: obj
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         },
         "task_progress" => AdapterEvent::BackgroundTaskProgress {
             turn_id,
@@ -2852,10 +2857,16 @@ mod tests {
                 turn_id,
                 task_id,
                 description,
+                tool_use_id,
             }) => {
                 assert_eq!(turn_id, turn);
                 assert_eq!(task_id, "a7cb77a05059e4590");
                 assert_eq!(description, "Sleep 45 then reply ok");
+                assert_eq!(
+                    tool_use_id.as_deref(),
+                    Some("toolu_01B1AN52bDdxfyrLDXQrrXJx"),
+                    "the Agent call that started it"
+                );
             }
             other => panic!("expected BackgroundTaskStarted, got {other:?}"),
         }

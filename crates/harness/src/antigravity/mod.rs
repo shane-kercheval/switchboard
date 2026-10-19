@@ -19,12 +19,14 @@
 //!   1.1.18 was still fixing a dropped stream that reported a failed turn as a
 //!   clean success. Hence: a stream *failure* is authoritative, a stream
 //!   *success* only corroborates.
-//! - **The stream is the only witness to a failed tool call.** agy 1.1.19
-//!   writes **no transcript record at all** for a tool call rejected during
-//!   argument validation — the `step_index` sequence simply skips it. Without
-//!   the stream that tool stays pending forever and the next tool's result
-//!   FIFO-pairs onto it. Reopened history cannot recover these (the data is not
-//!   on disk); see the dangling-tool backstop in [`session_file`].
+//! - **The stream is the fallback witness to a failed tool call.** agy 1.1.19
+//!   wrote **no transcript record at all** for a tool call rejected during
+//!   argument validation — the `step_index` sequence simply skipped it — so
+//!   only the stream's `state:"ERROR"` step reported it, and reopened history
+//!   cannot recover those (see the dangling-tool backstop in
+//!   [`session_file`]). agy 1.4.2 writes the failure to the transcript as a
+//!   `status:"ERROR"` result, which then settles the step; the stream's report
+//!   is used only for a call that still leaves no record.
 //! - **One-shot process = one turn.** `agy -p` runs exactly one turn and
 //!   exits. Process exit — not a stream/transcript record — remains the
 //!   authoritative turn terminator. Exit codes became meaningful in the 1.1.x
@@ -695,9 +697,11 @@ async fn run_producer(ctx: ProducerCtx) {
                                     }
                                 }
                                 stream::StreamEvent::ToolFailed { step_index, message } => {
-                                    // The one signal with no transcript
-                                    // equivalent (agy 1.1.19 writes no record
-                                    // for a rejected tool call). Recorded, not
+                                    // A rejected tool call. agy 1.1.19 wrote
+                                    // no transcript record for one, so this
+                                    // was its only trace; agy 1.4.2 also
+                                    // writes a `status:"ERROR"` result, which
+                                    // settles the step first. Recorded, not
                                     // paired: which tool it belongs to cannot
                                     // be known until the transcript has caught
                                     // up, so resolution happens at the final
@@ -1025,6 +1029,19 @@ async fn run_producer(ctx: ProducerCtx) {
             agent_id = %agent_id,
             unmatched_steps = ?unmatched_tool_result_steps,
             "antigravity: transcript had tool result records that never matched a tool call"
+        );
+    }
+    let contradicted = parser_state.contradicted_stream_failures();
+    if !contradicted.is_empty() {
+        // Never observed: the transcript, which owns the displayed result,
+        // recorded these steps as successes while the stream called them
+        // failed. The transcript's verdict stands; this is the tripwire.
+        tracing::warn!(
+            %turn_id,
+            agent_id = %agent_id,
+            failures = ?contradicted,
+            "antigravity: stream reported tool failures for steps the transcript recorded as \
+             successes; showing the transcript's result"
         );
     }
 
@@ -1755,14 +1772,16 @@ fn classify_outcome(
     // that says "fine" is corroboration, never a substitute.
     //
     // **Gated on the turn having produced no answer.** Live-probed @ 1.1.19:
-    // `agy` taints the whole turn's `result.status` with `ERROR` when a single
-    // tool call is rejected, even though the model recovered and answered —
-    // e.g. a `view_file` on a missing path yields
+    // `agy` tainted the whole turn's `result.status` with `ERROR` when a single
+    // tool call was rejected, even though the model recovered and answered —
+    // e.g. a `view_file` on a missing path yielded
     // `status:"ERROR"` + `… invalid tool call error (invalid_args) failed to
-    // read file …` on a turn whose transcript carries a normal answer. Failing
-    // on that would mark every recovered tool failure as a failed turn, which
-    // is ordinary agentic behavior, and the failure is already surfaced
-    // precisely — as a failed *tool* row, from the same stream. So a terminal
+    // read file …` on a turn whose transcript carried a normal answer. agy
+    // 1.4.2 no longer does this (the same turn ends `status:"SUCCESS"`); the
+    // gate stays for builds that still do. Failing on that would mark every
+    // recovered tool failure as a failed turn, which is ordinary agentic
+    // behavior, and the failure is already surfaced precisely — as a failed
+    // *tool* row, from the transcript or the stream. So a terminal
     // answer wins: same shape as the streamed-then-error rescue recorded as
     // G17 in `harness-behavior.md` (observed on a since-removed harness),
     // and it leaves the no-answer cases (timeout, hard failure) failing as

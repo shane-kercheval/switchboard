@@ -1,4 +1,4 @@
-version: 1.2.10
+version: 1.4.2
 
 ===== agy --help
 Usage of agy:
@@ -9,12 +9,12 @@ Usage of agy:
   --conversation                  Resume a previous conversation by ID
   --dangerously-skip-permissions  Auto-approve all tool permission requests without prompting
   --disable-slash-commands        Disable slash command and skill expansion in print mode
-  --effort                        Reasoning effort for the current CLI session (low|medium|high)
+  --effort                        Reasoning effort for the current CLI session (low|medium|high|xhigh|max)
   -i                              Short alias for --prompt-interactive
   --input-format                  Input format for print mode (text, stream-json). stream-json reads one NDJSON message per line from stdin and runs a turn for each; it requires --output-format stream-json (default text)
   --json-schema                   Optional JSON schema string or path to a schema file to enforce structured output (for stream-json, only applicable to the final result)
   --log-file                      Override CLI log file path
-  --mode                          Set the agent execution mode for this session (accept-edits, plan)
+  --mode                          Set the agent execution mode for this session (accept-edits, auto, plan)
   --model                         Model for the current CLI session
   --new-project                   Create a new project for this session
   --output-format                 Output format for print mode (text, json, stream-json) (default text)
@@ -181,13 +181,14 @@ Flags:
 Usage: agy plugin <command> [arguments]
 
 Commands:
-  list                   List imported plugins
+  list [--json]          List installed plugins
   import [source]        Import plugins from gemini or claude
-  install <target>       Install a plugin (supports plugin@marketplace)
+  install <target>       Install a plugin (supports plugin[@marketplace])
   uninstall <name>       Uninstall a plugin
   enable <name>          Enable a plugin
   disable <name>         Disable a plugin
-  validate [path]        Validate a plugin
+  validate [path] [--strict] [--json]
+                         Check a plugin's manifest and files
   link <mp> <target>     Generate link to a marketplace
   help                   Show this help
 
@@ -195,13 +196,14 @@ Commands:
 Usage: agy plugin <command> [arguments]
 
 Commands:
-  list                   List imported plugins
+  list [--json]          List installed plugins
   import [source]        Import plugins from gemini or claude
-  install <target>       Install a plugin (supports plugin@marketplace)
+  install <target>       Install a plugin (supports plugin[@marketplace])
   uninstall <name>       Uninstall a plugin
   enable <name>          Enable a plugin
   disable <name>         Disable a plugin
-  validate [path]        Validate a plugin
+  validate [path] [--strict] [--json]
+                         Check a plugin's manifest and files
   link <mp> <target>     Generate link to a marketplace
   help                   Show this help
 
@@ -257,5 +259,6 @@ Usage of update:
 /hooks	Manage hook configurations for tool events
 /model	Set a model, or run a single prompt on another model
 /permissions	Manage tool permissions
+/plugin	Manage, discover, install, uninstall, enable, and disable plugins
 /skills	List available skills
 /usage	View model quota usage

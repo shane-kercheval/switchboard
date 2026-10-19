@@ -877,6 +877,51 @@ mod tests {
         assert!(transcript.warnings.is_empty());
     }
 
+    /// Captured @ agy 1.4.2 (2026-10-19): a rejected edit written as a
+    /// `status:"ERROR"` result, and a command whose result says `The command
+    /// exited with code 1.`. Reopening must show both as failed, as the live
+    /// view does.
+    #[test]
+    fn status_error_results_and_non_zero_exits_reopen_as_failed() {
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-19T17:59:38Z","content":"<USER_REQUEST>\nedit then list\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:39Z","tool_calls":[{"name":"replace_file_content","args":{"TargetContent":"\"alpha\"","ReplacementContent":"\"beta\"","TargetFile":"\"/tmp/agyprobe/ABSENT_EDIT.txt\""}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"ERROR","error":"declaring permissions: cortex tool replace_file_content: convert tool call for permissions: model output error: invalid tool call error (invalid_args) /tmp/agyprobe/ABSENT_EDIT.txt does not exist in the current location. Make sure the file path correct. In addition, the user may have moved, renamed, or deleted file.","created_at":"2026-10-19T17:59:42Z","content":"Created At: 2026-10-19T12:59:42-05:00\nCompleted At: 2026-10-19T12:59:42-05:00\nEncountered error in step execution: declaring permissions: cortex tool replace_file_content: convert tool call for permissions: model output error: invalid tool call error (invalid_args) /tmp/agyprobe/ABSENT_EDIT.txt does not exist in the current location."}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:42Z","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"ls /definitely/not/here\"","Cwd":"\"/tmp/agyprobe/cwd\""}}]}"#,
+            "\n",
+            r#"{"step_index":4,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-10-19T17:59:44Z","content":"Created At: 2026-10-19T12:59:44-05:00\nCompleted At: 2026-10-19T12:59:44-05:00\n\nThe command exited with code 1.\nOutput:\nls: /definitely/not/here: No such file or directory\r\n\n"}"#,
+            "\n",
+            r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:44Z","content":"done"}"#,
+            "\n",
+        );
+        let transcript = parse_antigravity_transcript_content(content, agent_id());
+        let items = agent_items(&transcript.turns[1]);
+        let tools: Vec<(&str, &str, bool)> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Tool {
+                    name,
+                    output: Some(output),
+                    is_error: Some(is_error),
+                    completed_at: Some(_),
+                    ..
+                } => Some((name.as_str(), output.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(tools.len(), 2, "{tools:?}");
+        assert_eq!(tools[0].0, "replace_file_content");
+        assert!(tools[0].1.starts_with("declaring permissions:"));
+        assert_eq!(tools[1].0, "run_command");
+        assert!(tools[1].1.contains("No such file or directory"));
+        assert!(tools.iter().all(|(_, _, is_error)| *is_error), "{tools:?}");
+        assert!(transcript.warnings.is_empty());
+    }
+
     #[test]
     fn mcp_wrappers_pair_normal_and_invalid_results_on_reload() {
         let content = concat!(

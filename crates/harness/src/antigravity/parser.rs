@@ -112,7 +112,7 @@ impl TranscriptRecord {
     ///
     /// `status:"FAILED"` predates these captures and is kept. A command that
     /// ran and exited non-zero carries no structured signal in any version, so
-    /// it is read from the record's prose by [`tool_result_content_is_error`].
+    /// it is read from the record's prose by [`header_reports_nonzero_exit`].
     pub(crate) fn tool_result_failure(&self) -> ResultFailure {
         ResultFailure {
             structured: self.is_invalid_tool_call_error()
@@ -120,7 +120,7 @@ impl TranscriptRecord {
             nonzero_exit_header: self
                 .content
                 .as_deref()
-                .is_some_and(tool_result_content_is_error),
+                .is_some_and(header_reports_nonzero_exit),
         }
     }
 
@@ -206,7 +206,7 @@ impl ResultFailure {
 /// sentence is not misread either. A third rewording would read as success
 /// again; `live_antigravity_failing_command_completes_as_tool_error` is the
 /// guard.
-fn tool_result_content_is_error(content: &str) -> bool {
+fn header_reports_nonzero_exit(content: &str) -> bool {
     for line in content.lines() {
         let trimmed = line.trim();
         let lower = trimmed.to_ascii_lowercase();
@@ -1186,13 +1186,13 @@ mod tests {
 
     #[test]
     fn an_unparseable_exit_code_is_not_called_a_failure() {
-        assert!(!tool_result_content_is_error(
+        assert!(!header_reports_nonzero_exit(
             "The command exited with code unknown.\nOutput:\n"
         ));
-        assert!(tool_result_content_is_error(
+        assert!(header_reports_nonzero_exit(
             "The command exited with code -1.\nOutput:\n"
         ));
-        assert!(tool_result_content_is_error(
+        assert!(header_reports_nonzero_exit(
             "The command exited with code 137.\nOutput:\n"
         ));
     }

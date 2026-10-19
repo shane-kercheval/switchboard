@@ -358,7 +358,7 @@ async fn live_antigravity_failing_command_completes_as_tool_error() {
         ),
         "expected the failing command to complete as an error; if its output's \
          header no longer reads `The command exited with code <n>.`, agy has \
-         reworded it and `tool_result_content_is_error` needs the new wording. \
+         reworded it and `header_reports_nonzero_exit` needs the new wording. \
          Got: {completed:?}"
     );
     // The command's own output proves the transcript's result settled the

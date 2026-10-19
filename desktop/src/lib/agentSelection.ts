@@ -215,11 +215,13 @@ export function effortOptionsFor(
 
 /// Whether this harness/model pair **requires** an effort to dispatch.
 ///
-/// Antigravity-only, and Switchboard's rule rather than the CLI's: `agy` has
+/// Antigravity-only, and the window's rule rather than the CLI's: `agy` has
 /// accepted a bare axis-bearing model since 1.3.4 (it picks the model's default
-/// level), but Switchboard always sends an explicit effort for one, so the
-/// picker offers no "Default" for those. Every other harness treats effort as
-/// optional — an unset effort means "pass no flag, let the harness choose".
+/// level), but the window's pickers always store a level for one, so they offer
+/// no "Default" for those. Core does not enforce it, so an agent whose effort
+/// was cleared through MCP dispatches a bare model and `agy` picks its default.
+/// Every other harness treats effort as optional — an unset effort means "pass
+/// no flag, let the harness choose".
 export function effortIsRequired(harness: HarnessKind, model: string | undefined): boolean {
   return harness === "antigravity" && effortSupportFor(harness, model ?? null).kind === "known";
 }
@@ -240,9 +242,9 @@ export const DEFAULT_AGENT_SELECTIONS: Preferences["agent_defaults"] = {
     default_model: "gpt-6.1-sol",
     default_effort: "medium",
   },
-  // Both carry explicit effort because Switchboard always sends one for a model
-  // with an effort axis (see `effortIsRequired`). Mirrored by the Rust
-  // built-in in `preferences.rs`.
+  // Both carry explicit effort because the window's pickers always store one
+  // for a model with an effort axis (see `effortIsRequired`). Mirrored by the
+  // Rust built-in in `preferences.rs`.
   antigravity: {
     model_choices: ["gemini-3.8-flash", "gemini-4-argon"],
     effort_choices: ["medium", "high"],

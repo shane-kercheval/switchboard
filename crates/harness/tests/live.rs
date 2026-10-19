@@ -3803,12 +3803,14 @@ async fn live_antigravity_tool_result_steps_follow_the_call_index() {
 /// Whether a single-tool-call turn is the **known benign non-exercise**: the
 /// model completed the turn but did both requested jobs inside one shell call.
 ///
-/// This must be *proven*, not inferred from what's missing. G32 means agy
-/// writes **no transcript record at all** for a tool call it rejects — so
-/// "the model merged the two jobs" and "the file-reading tool failed and left
-/// no trace" produce a byte-identical transcript: one `run_command` entry and
-/// nothing else. Retrying on that shape alone would let this test absorb the
-/// exact class of upstream regression it exists to catch.
+/// This must be *proven*, not inferred from what's missing. Under G32 (agy
+/// 1.1.19) agy wrote **no transcript record at all** for a tool call it
+/// rejected, so "the model merged the two jobs" and "the file-reading tool
+/// failed and left no trace" produced a byte-identical transcript: one
+/// `run_command` entry and nothing else. agy 1.4.2 records a rejected call as a
+/// `status:"ERROR"` result, but a call that leaves no record is still possible
+/// in principle, and retrying on that shape alone would let this test absorb
+/// the exact class of upstream regression it exists to catch.
 ///
 /// So the bar is positive evidence on three counts: the turn `Completed`, the
 /// sole call is `run_command`, and its `CommandLine` contains **both**
@@ -3852,9 +3854,10 @@ const STEP_PROBE_FILE: &str = "STEP_PROBE.txt";
 /// exercised only by the live path it guards — the same reasoning that keeps
 /// `antigravity_transient_matcher_is_exact` in the default suite.
 ///
-/// The rejection cases are the point. Under G32 a failed tool leaves no
-/// transcript record, so a genuine upstream breakage is *shape-identical* to a
-/// benign merge; only the positive evidence below separates them.
+/// The rejection cases are the point. Under G32 (agy 1.1.19) a failed tool left
+/// no transcript record, so a genuine upstream breakage was *shape-identical* to
+/// a benign merge, and could be again if agy stopped recording one; only the
+/// positive evidence below separates them.
 #[test]
 fn benign_merge_requires_positive_evidence_of_both_jobs() {
     fn planner(tool_calls: &serde_json::Value) -> String {

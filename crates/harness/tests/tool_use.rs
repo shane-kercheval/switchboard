@@ -301,6 +301,90 @@ async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
     );
 }
 
+/// A command that exits non-zero must complete as a tool error. `agy` records
+/// no exit code as a field — only in the result's prose (`The command exited
+/// with code 1.` @ 1.4.2) — and the stream reports the step `DONE`, so the
+/// adapter reads that sentence. This test is what fails when `agy` rewords it.
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+async fn live_antigravity_failing_command_completes_as_tool_error() {
+    let tmp = tempfile::Builder::new()
+        .prefix("agy-command-error-test")
+        .tempdir()
+        .expect("tempdir");
+    let missing_dir = tmp.path().join("SWITCHBOARD_MISSING_DIR");
+    let missing_dir_text = missing_dir.display().to_string();
+
+    let adapter = AntigravityAdapter::new();
+    let agent = antigravity_agent();
+    let turn_id = Uuid::now_v7();
+    let prompt = format!(
+        "Use the run_command tool exactly once to run `ls {missing_dir_text}`. The directory intentionally does not exist, so the command will exit with an error. After it fails, reply with only the word ack."
+    );
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            &prompt,
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real agy");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let started = events.iter().find(|event| match event {
+        AdapterEvent::ToolStarted { name, input, .. } => {
+            name == "run_command"
+                && serde_json::to_string(input)
+                    .is_ok_and(|text| text.contains("SWITCHBOARD_MISSING_DIR"))
+        }
+        _ => false,
+    });
+    let AdapterEvent::ToolStarted {
+        tool_use_id: started_id,
+        ..
+    } = started.unwrap_or_else(|| panic!("expected the failing command's start; got: {events:?}"))
+    else {
+        unreachable!();
+    };
+    let completed = events.iter().find(|event| {
+        matches!(event, AdapterEvent::ToolCompleted { tool_use_id, .. } if tool_use_id == started_id)
+    });
+    assert!(
+        matches!(
+            completed,
+            Some(AdapterEvent::ToolCompleted { is_error: true, .. })
+        ),
+        "expected the failing command to complete as an error; if its output's \
+         header no longer reads `The command exited with code <n>.`, agy has \
+         reworded it and `header_reports_nonzero_exit` needs the new wording. \
+         Got: {completed:?}"
+    );
+    // The command's own output proves the transcript's result settled the
+    // row, not the turn-end fallback that closes a call with no result as
+    // failed, which would satisfy the assertion above without this sentence
+    // being read at all.
+    assert!(
+        matches!(
+            completed,
+            Some(AdapterEvent::ToolCompleted { output, .. })
+                if output.contains("No such file or directory")
+        ),
+        "expected the command's output from the transcript; got: {completed:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "expected the agent to recover and complete the turn; got: {events:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_emits_tool_started_and_tool_completed_for_shell_command() {

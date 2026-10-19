@@ -12,6 +12,12 @@ import { DATA_SCIENCE_ORCHESTRATOR_PROMPT, ORCHESTRATOR_PROMPT } from "$lib/orch
 import { DEFAULT_AGENT_SELECTIONS } from "$lib/agentSelection";
 import type { Preferences } from "$lib/types";
 
+// No model agy offers today lacks an effort axis, but the pickers still handle
+// one (agy 1.1.19 offered two), so these tests add one to the model table.
+vi.mock("$lib/antigravityModels.json", async (importOriginal) =>
+  (await import("../../../tests/fixtures/antigravityModels")).withStandIns(importOriginal),
+);
+
 // SettingsView embeds HarnessStatusList (probes install/auth on mount) and
 // McpServersSettings (loads providers on mount). Tests that override the mock
 // must keep these baseline stubs, so it's a named default restored per test.
@@ -245,7 +251,7 @@ describe("SettingsView", () => {
     await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
 
     expect(
-      screen.getByTestId("settings-selection-antigravity-model-choice-gemini-3.1-pro"),
+      screen.getByTestId("settings-selection-antigravity-model-choice-gemini-4-argon"),
     ).toHaveAttribute("aria-pressed", "true");
     expect(
       screen.getByTestId("settings-selection-antigravity-model-choice-gemini-3.8-flash"),
@@ -256,16 +262,18 @@ describe("SettingsView", () => {
   });
 
   it("refuses an invalid Antigravity default before it can leak through another save", async () => {
-    preferences.agent_defaults.antigravity = {
+    const stored = {
       ...DEFAULT_AGENT_SELECTIONS.antigravity,
-      default_model: "gemini-3.1-pro",
-      default_effort: "high",
+      model_choices: [...DEFAULT_AGENT_SELECTIONS.antigravity.model_choices, "medium-only-model"],
+      default_model: "medium-only-model",
+      default_effort: "medium",
     };
+    preferences.agent_defaults.antigravity = structuredClone(stored);
     const view = render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
     await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
     const effortDefault = screen.getByTestId("settings-selection-antigravity-effort-current");
-    expect(within(effortDefault).getByRole("option", { name: "Medium" })).toBeDisabled();
-    await fireEvent.change(effortDefault, { target: { value: "medium" } });
+    expect(within(effortDefault).getByRole("option", { name: "High" })).toBeDisabled();
+    await fireEvent.change(effortDefault, { target: { value: "high" } });
     expect(invokeMock.mock.calls.filter(([command]) => command === "set_preferences")).toHaveLength(
       0,
     );
@@ -275,13 +283,7 @@ describe("SettingsView", () => {
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
         preferences: expect.objectContaining({
-          agent_defaults: expect.objectContaining({
-            antigravity: {
-              ...DEFAULT_AGENT_SELECTIONS.antigravity,
-              default_model: "gemini-3.1-pro",
-              default_effort: "high",
-            },
-          }),
+          agent_defaults: expect.objectContaining({ antigravity: stored }),
         }),
       }),
     );
@@ -289,10 +291,10 @@ describe("SettingsView", () => {
 
   it("keeps an invalid Antigravity repair local until the default becomes valid", async () => {
     const storedDefaults = {
-      model_choices: ["gemini-3.1-pro"],
-      effort_choices: ["medium"],
-      default_model: "gemini-3.1-pro",
-      default_effort: "medium",
+      model_choices: ["medium-only-model"],
+      effort_choices: ["high"],
+      default_model: "medium-only-model",
+      default_effort: "high",
     };
     preferences.agent_defaults.antigravity = structuredClone(storedDefaults);
     const view = render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
@@ -300,10 +302,12 @@ describe("SettingsView", () => {
     await fireEvent.click(antigravitySummary);
 
     expect(screen.getByTestId("settings-selection-antigravity-invalid")).toBeInTheDocument();
-    await fireEvent.click(screen.getByTestId("settings-selection-antigravity-effort-choice-high"));
+    await fireEvent.click(
+      screen.getByTestId("settings-selection-antigravity-effort-choice-medium"),
+    );
     await waitFor(() =>
       expect(
-        screen.getByTestId("settings-selection-antigravity-effort-choice-high"),
+        screen.getByTestId("settings-selection-antigravity-effort-choice-medium"),
       ).toHaveAttribute("aria-pressed", "true"),
     );
     expect(invokeMock.mock.calls.filter(([command]) => command === "set_preferences")).toHaveLength(
@@ -312,10 +316,9 @@ describe("SettingsView", () => {
 
     await fireEvent.click(antigravitySummary);
     await fireEvent.click(antigravitySummary);
-    expect(screen.getByTestId("settings-selection-antigravity-effort-choice-high")).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    expect(
+      screen.getByTestId("settings-selection-antigravity-effort-choice-medium"),
+    ).toHaveAttribute("aria-pressed", "true");
 
     await view.rerender({ section: "prompts" });
     await fireEvent.click(screen.getByTestId("show-builtins-toggle"));
@@ -329,7 +332,7 @@ describe("SettingsView", () => {
 
     await view.rerender({ section: "agents" });
     await fireEvent.change(screen.getByTestId("settings-selection-antigravity-effort-current"), {
-      target: { value: "high" },
+      target: { value: "medium" },
     });
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
@@ -337,8 +340,8 @@ describe("SettingsView", () => {
           agent_defaults: expect.objectContaining({
             antigravity: {
               ...storedDefaults,
-              effort_choices: ["medium", "high"],
-              default_effort: "high",
+              effort_choices: ["high", "medium"],
+              default_effort: "medium",
             },
           }),
         }),
@@ -348,34 +351,35 @@ describe("SettingsView", () => {
 
   it("discards an incomplete default repair when Settings is closed", async () => {
     preferences.agent_defaults.antigravity = {
-      model_choices: ["gemini-3.1-pro"],
-      effort_choices: ["medium"],
-      default_model: "gemini-3.1-pro",
-      default_effort: "medium",
+      model_choices: ["medium-only-model"],
+      effort_choices: ["high"],
+      default_model: "medium-only-model",
+      default_effort: "high",
     };
     const view = render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
     await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
-    await fireEvent.click(screen.getByTestId("settings-selection-antigravity-effort-choice-high"));
+    await fireEvent.click(
+      screen.getByTestId("settings-selection-antigravity-effort-choice-medium"),
+    );
     await waitFor(() =>
       expect(
-        screen.getByTestId("settings-selection-antigravity-effort-choice-high"),
+        screen.getByTestId("settings-selection-antigravity-effort-choice-medium"),
       ).toHaveAttribute("aria-pressed", "true"),
     );
 
     view.unmount();
     render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
     await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
-    expect(screen.getByTestId("settings-selection-antigravity-effort-choice-high")).toHaveAttribute(
-      "aria-pressed",
-      "false",
-    );
+    expect(
+      screen.getByTestId("settings-selection-antigravity-effort-choice-medium"),
+    ).toHaveAttribute("aria-pressed", "false");
   });
 
   it("keeps the effort default independent when the default model has no effort axis", async () => {
     preferences.agent_defaults.antigravity = {
-      model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
+      model_choices: ["no-effort-model", "three-level-model"],
       effort_choices: ["high", "medium"],
-      default_model: "claude-sonnet-4-6",
+      default_model: "no-effort-model",
       default_effort: "high",
     };
     render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
@@ -390,9 +394,9 @@ describe("SettingsView", () => {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             antigravity: {
-              model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
+              model_choices: ["no-effort-model", "three-level-model"],
               effort_choices: ["high", "medium"],
-              default_model: "claude-sonnet-4-6",
+              default_model: "no-effort-model",
               default_effort: "medium",
             },
           }),

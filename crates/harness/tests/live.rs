@@ -3803,12 +3803,14 @@ async fn live_antigravity_tool_result_steps_follow_the_call_index() {
 /// Whether a single-tool-call turn is the **known benign non-exercise**: the
 /// model completed the turn but did both requested jobs inside one shell call.
 ///
-/// This must be *proven*, not inferred from what's missing. G32 means agy
-/// writes **no transcript record at all** for a tool call it rejects — so
-/// "the model merged the two jobs" and "the file-reading tool failed and left
-/// no trace" produce a byte-identical transcript: one `run_command` entry and
-/// nothing else. Retrying on that shape alone would let this test absorb the
-/// exact class of upstream regression it exists to catch.
+/// This must be *proven*, not inferred from what's missing. Under G32 (agy
+/// 1.1.19) agy wrote **no transcript record at all** for a tool call it
+/// rejected, so "the model merged the two jobs" and "the file-reading tool
+/// failed and left no trace" produced a byte-identical transcript: one
+/// `run_command` entry and nothing else. agy 1.4.2 records a rejected call as a
+/// `status:"ERROR"` result, but a call that leaves no record is still possible
+/// in principle, and retrying on that shape alone would let this test absorb
+/// the exact class of upstream regression it exists to catch.
 ///
 /// So the bar is positive evidence on three counts: the turn `Completed`, the
 /// sole call is `run_command`, and its `CommandLine` contains **both**
@@ -3852,9 +3854,10 @@ const STEP_PROBE_FILE: &str = "STEP_PROBE.txt";
 /// exercised only by the live path it guards — the same reasoning that keeps
 /// `antigravity_transient_matcher_is_exact` in the default suite.
 ///
-/// The rejection cases are the point. Under G32 a failed tool leaves no
-/// transcript record, so a genuine upstream breakage is *shape-identical* to a
-/// benign merge; only the positive evidence below separates them.
+/// The rejection cases are the point. Under G32 (agy 1.1.19) a failed tool left
+/// no transcript record, so a genuine upstream breakage was *shape-identical* to
+/// a benign merge, and could be again if agy stopped recording one; only the
+/// positive evidence below separates them.
 #[test]
 fn benign_merge_requires_positive_evidence_of_both_jobs() {
     fn planner(tool_calls: &serde_json::Value) -> String {
@@ -4971,7 +4974,7 @@ async fn live_antigravity_model_change_announced_on_resume() {
     };
 
     // Turn 1 on model X.
-    set_model("Gemini 3.1 Pro (High)");
+    set_model("Gemini 3.8 Flash (Low)");
     let events1 = antigravity_live_turn(
         &adapter,
         &agent,
@@ -4984,14 +4987,15 @@ async fn live_antigravity_model_change_announced_on_resume() {
     .await;
     let (m1, _) = turn_end_model_effort(&events1).expect("turn 1 TurnEnd");
     assert!(
-        m1.as_deref().is_some_and(|m| m.contains("Gemini 3.1 Pro")),
-        "turn 1 per-turn model = Gemini 3.1 Pro; got {m1:?}"
+        m1.as_deref()
+            .is_some_and(|m| m.contains("Gemini 3.8 Flash")),
+        "turn 1 per-turn model = Gemini 3.8 Flash; got {m1:?}"
     );
     let conversation_id = antigravity_capture(&events1).expect("captured conversation id");
 
     // Turn 2: switch the global model to Y, resume.
     agent.session_locator = Some(SessionLocator::Uuid(conversation_id));
-    set_model("Claude Sonnet 4.6 (Thinking)");
+    set_model("Claude Sonnet 5.5 (Low)");
     let events2 = antigravity_live_turn(
         &adapter,
         &agent,
@@ -5008,8 +5012,8 @@ async fn live_antigravity_model_change_announced_on_resume() {
     let (m2, _) = turn_end_model_effort(&events2).expect("turn 2 TurnEnd");
     assert!(
         m2.as_deref()
-            .is_some_and(|m| m.contains("Claude Sonnet 4.6")),
-        "turn 2 per-turn model = Claude Sonnet 4.6; got {m2:?}"
+            .is_some_and(|m| m.contains("Claude Sonnet 5.5")),
+        "turn 2 per-turn model = Claude Sonnet 5.5; got {m2:?}"
     );
 
     // Hydration reconstructs the carry-forward from the transcript.
@@ -5020,15 +5024,15 @@ async fn live_antigravity_model_change_announced_on_resume() {
         models
             .first()
             .and_then(Option::as_deref)
-            .is_some_and(|m| m.contains("Gemini 3.1 Pro")),
-        "hydrated turn 1 = Gemini 3.1 Pro; got {models:?}"
+            .is_some_and(|m| m.contains("Gemini 3.8 Flash")),
+        "hydrated turn 1 = Gemini 3.8 Flash; got {models:?}"
     );
     assert!(
         models
             .last()
             .and_then(Option::as_deref)
-            .is_some_and(|m| m.contains("Claude Sonnet 4.6")),
-        "hydrated last turn = Claude Sonnet 4.6; got {models:?}"
+            .is_some_and(|m| m.contains("Claude Sonnet 5.5")),
+        "hydrated last turn = Claude Sonnet 5.5; got {models:?}"
     );
 }
 

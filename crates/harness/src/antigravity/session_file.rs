@@ -208,7 +208,7 @@ struct PendingToolResult {
     line_number: usize,
     step_index: i64,
     output: String,
-    is_error: bool,
+    failure: super::parser::ResultFailure,
     completed_at: DateTime<Utc>,
 }
 
@@ -356,7 +356,7 @@ impl Reconstruction {
                         name: call.name.clone(),
                         input: call.args.clone(),
                         output: result.as_ref().map(|r| r.output.clone()),
-                        is_error: result.as_ref().map(|r| r.is_error),
+                        is_error: result.as_ref().map(|r| r.failure.is_error_for(&call.name)),
                         warnings: Vec::new(),
                         started_at: ts,
                         completed_at: result.as_ref().map(|r| r.completed_at),
@@ -384,7 +384,7 @@ impl Reconstruction {
                 builder.ended_at = Some(builder.ended_at.map_or(ts, |ended| ended.max(ts)));
             }
         } else if rec.is_tool_result() {
-            let is_error = rec.tool_result_is_error();
+            let failure = rec.tool_result_failure();
             let output = rec.tool_result_output();
             // Exact-step attribution, mirroring the live parser — see
             // `parser::PendingToolStart::expected_result_step` for the captures
@@ -403,6 +403,7 @@ impl Reconstruction {
                     .remove(index)
                     .expect("index from position");
                 if let Some(TurnItem::Tool {
+                    name,
                     output: out,
                     is_error: err,
                     completed_at: cat,
@@ -410,7 +411,7 @@ impl Reconstruction {
                 }) = builder.items.get_mut(pending.item_idx)
                 {
                     *out = Some(output);
-                    *err = Some(is_error);
+                    *err = Some(failure.is_error_for(name));
                     *cat = Some(ts);
                 }
             } else {
@@ -418,7 +419,7 @@ impl Reconstruction {
                     line_number,
                     step_index: rec.step_index,
                     output,
-                    is_error,
+                    failure,
                     completed_at: ts,
                 });
             }
@@ -874,6 +875,93 @@ mod tests {
         assert_eq!(tools[2].0, "run_command");
         assert!(tools[2].1.contains("command not found"));
         assert!(tools.iter().all(|(_, _, is_error)| *is_error));
+        assert!(transcript.warnings.is_empty());
+    }
+
+    /// Captured @ agy 1.4.2 (2026-10-19): a rejected edit written as a
+    /// `status:"ERROR"` result, and a command whose result says `The command
+    /// exited with code 1.`. Reopening must show both as failed, as the live
+    /// view does.
+    #[test]
+    fn status_error_results_and_non_zero_exits_reopen_as_failed() {
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-19T17:59:38Z","content":"<USER_REQUEST>\nedit then list\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:39Z","tool_calls":[{"name":"replace_file_content","args":{"TargetContent":"\"alpha\"","ReplacementContent":"\"beta\"","TargetFile":"\"/tmp/agyprobe/ABSENT_EDIT.txt\""}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"ERROR","error":"declaring permissions: cortex tool replace_file_content: convert tool call for permissions: model output error: invalid tool call error (invalid_args) /tmp/agyprobe/ABSENT_EDIT.txt does not exist in the current location. Make sure the file path correct. In addition, the user may have moved, renamed, or deleted file.","created_at":"2026-10-19T17:59:42Z","content":"Created At: 2026-10-19T12:59:42-05:00\nCompleted At: 2026-10-19T12:59:42-05:00\nEncountered error in step execution: declaring permissions: cortex tool replace_file_content: convert tool call for permissions: model output error: invalid tool call error (invalid_args) /tmp/agyprobe/ABSENT_EDIT.txt does not exist in the current location."}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:42Z","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"ls /definitely/not/here\"","Cwd":"\"/tmp/agyprobe/cwd\""}}]}"#,
+            "\n",
+            r#"{"step_index":4,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-10-19T17:59:44Z","content":"Created At: 2026-10-19T12:59:44-05:00\nCompleted At: 2026-10-19T12:59:44-05:00\n\nThe command exited with code 1.\nOutput:\nls: /definitely/not/here: No such file or directory\r\n\n"}"#,
+            "\n",
+            r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:44Z","content":"done"}"#,
+            "\n",
+        );
+        let transcript = parse_antigravity_transcript_content(content, agent_id());
+        let items = agent_items(&transcript.turns[1]);
+        let tools: Vec<(&str, &str, bool)> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Tool {
+                    name,
+                    output: Some(output),
+                    is_error: Some(is_error),
+                    completed_at: Some(_),
+                    ..
+                } => Some((name.as_str(), output.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(tools.len(), 2, "{tools:?}");
+        assert_eq!(tools[0].0, "replace_file_content");
+        assert!(tools[0].1.starts_with("declaring permissions:"));
+        assert_eq!(tools[1].0, "run_command");
+        assert!(tools[1].1.contains("No such file or directory"));
+        assert!(tools.iter().all(|(_, _, is_error)| *is_error), "{tools:?}");
+        assert!(transcript.warnings.is_empty());
+    }
+
+    /// Reopen applies the same command-only rule as the live parser: an MCP
+    /// reply quoting the exit sentence stays a success, and a failed command
+    /// whose result was written before its planner record still fails.
+    #[test]
+    fn only_a_command_result_reopens_as_failed_on_its_exit_sentence() {
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-19T18:05:10Z","content":"<USER_REQUEST>\nread the reply, then list\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T18:05:11Z","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"switchboard\"","ToolName":"\"read_reply\""}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-10-19T18:05:13Z","content":"Created At: 2026-10-19T13:05:13-05:00\nCompleted At: 2026-10-19T13:05:13-05:00\nThe build agent replied:\nThe command exited with code 1.\n"}"#,
+            "\n",
+            r#"{"step_index":4,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-10-19T18:05:15Z","content":"Created At: 2026-10-19T13:05:15-05:00\nCompleted At: 2026-10-19T13:05:15-05:00\n\nThe command exited with code 1.\nOutput:\nls: /definitely/not/here: No such file or directory\r\n\n"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T18:05:14Z","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"ls /definitely/not/here\""}}]}"#,
+            "\n",
+            r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T18:05:16Z","content":"done"}"#,
+            "\n",
+        );
+        let transcript = parse_antigravity_transcript_content(content, agent_id());
+        let items = agent_items(&transcript.turns[1]);
+        let tools: Vec<(&str, bool)> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Tool {
+                    name,
+                    is_error: Some(is_error),
+                    completed_at: Some(_),
+                    ..
+                } => Some((name.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            tools,
+            vec![("call_mcp_tool", false), ("run_command", true)],
+            "{tools:?}"
+        );
         assert!(transcript.warnings.is_empty());
     }
 

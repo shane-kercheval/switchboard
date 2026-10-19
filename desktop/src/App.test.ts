@@ -16,6 +16,12 @@ import type {
 } from "$lib/types";
 import { ALL_HARNESSES } from "$lib/harnessDisplay";
 import { DEFAULT_AGENT_SELECTIONS } from "$lib/agentSelection";
+
+// No model agy offers today lacks an effort axis, but the pickers still handle
+// one (agy 1.1.19 offered two), so these tests add one to the model table.
+vi.mock("$lib/antigravityModels.json", async (importOriginal) =>
+  (await import("../tests/fixtures/antigravityModels")).withStandIns(importOriginal),
+);
 import { shortcut } from "$lib/platform";
 // Static import so App.svelte's (large) component-tree transform happens at
 // module collection, not inside the first test that calls `mountApp`. `vi.mock`
@@ -841,7 +847,7 @@ describe("App", () => {
         selection: {
           model: "gemini-3.8-flash",
           effort: "medium",
-          model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
+          model_choices: ["gemini-3.8-flash", "gemini-4-argon"],
           effort_choices: ["medium", "high"],
         },
       },
@@ -878,9 +884,9 @@ describe("App", () => {
 
   it("new project: clears active effort but preserves choices for a no-effort default model", async () => {
     backend.agentDefaults.antigravity = {
-      model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
+      model_choices: ["no-effort-model", "three-level-model"],
       effort_choices: ["high", "medium"],
-      default_model: "claude-sonnet-4-6",
+      default_model: "no-effort-model",
       default_effort: "high",
     };
     await mountApp();
@@ -894,9 +900,9 @@ describe("App", () => {
       name: "antigravity",
       harness: "antigravity",
       selection: {
-        model: "claude-sonnet-4-6",
+        model: "no-effort-model",
         effort: null,
-        model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
+        model_choices: ["no-effort-model", "three-level-model"],
         effort_choices: ["high", "medium"],
       },
     });
@@ -904,10 +910,10 @@ describe("App", () => {
 
   it("new project: reports an Antigravity default with no compatible effort", async () => {
     backend.agentDefaults.antigravity = {
-      model_choices: ["gemini-3.1-pro"],
-      effort_choices: ["medium"],
-      default_model: "gemini-3.1-pro",
-      default_effort: "medium",
+      model_choices: ["medium-only-model"],
+      effort_choices: ["high"],
+      default_model: "medium-only-model",
+      default_effort: "high",
     };
     await mountApp();
     await createNewProjectViaDialog("invalid-antigravity-default");

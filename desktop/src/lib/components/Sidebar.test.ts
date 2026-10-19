@@ -15,6 +15,21 @@ import type { Turn } from "$lib/state/types";
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
 import Sidebar from "./Sidebar.svelte";
 
+// No model agy offers today lacks an effort axis, but the pickers still handle
+// one (agy 1.1.19 offered two), so these tests add one to the model table.
+vi.mock("$lib/antigravityModels.json", async (importOriginal) => {
+  const actual = await importOriginal<{ default: { models: unknown[] } }>();
+  return {
+    default: {
+      ...actual.default,
+      models: [
+        ...actual.default.models,
+        { value: "no-effort-model", label: "No Effort Model", efforts: null },
+      ],
+    },
+  };
+});
+
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => vi.fn()),
 }));
@@ -1386,26 +1401,27 @@ describe("Sidebar", () => {
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
       model: "gemini-3.8-flash",
-      effort: "medium",
-      model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
-      effort_choices: ["medium", "high"],
+      effort: "high",
+      model_choices: ["gemini-3.8-flash", "gpt-oss-120b"],
+      effort_choices: ["high", "medium"],
     };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     const modelChip = screen.getByTestId("agent-model-chip");
-    expect(modelChip).toHaveAccessibleName(/Switch to Gemini 3.1 Pro — effort becomes High/);
+    expect(modelChip).toHaveAccessibleName(/Switch to GPT-OSS 120B — effort becomes Medium/);
     await fireEvent.click(modelChip);
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "gemini-3.1-pro",
-      effort: "high",
+      model: "gpt-oss-120b",
+      effort: "medium",
     });
   });
 
-  // `gemini-3.7-flash` is deliberately NOT updated to 3.8 here: it is a real
-  // model retired from the picker but still valid at dispatch, so this pins the
-  // promise that retiring an entry doesn't strand an agent already using it.
+  // `gemini-3.7-flash` is deliberately NOT updated: it is a real model the
+  // table no longer lists, as an agent created before its removal still
+  // carries, so this pins that the sidebar keeps working for such an agent.
+  // (Google has since retired it from `agy` too, so its turns now fail.)
   it("preserves effort when switching to an unknown Antigravity model", async () => {
     const state = await loadState();
     const agent: AgentRecord = {
@@ -1429,9 +1445,9 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
-      model: "claude-sonnet-4-6",
+      model: "no-effort-model",
       effort: null,
-      model_choices: ["claude-sonnet-4-6"],
+      model_choices: ["no-effort-model"],
       effort_choices: ["high"],
     };
     await state.registerAgent(agent);
@@ -1446,9 +1462,9 @@ describe("Sidebar", () => {
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
       model: "gemini-3.8-flash",
-      effort: "medium",
-      model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
-      effort_choices: ["medium"],
+      effort: "high",
+      model_choices: ["gemini-3.8-flash", "gpt-oss-120b"],
+      effort_choices: ["high"],
     };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
@@ -1532,10 +1548,10 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
-      model: "gemini-3.1-pro",
-      effort: "high",
-      model_choices: ["gemini-3.1-pro"],
-      effort_choices: ["high", "medium"],
+      model: "gpt-oss-120b",
+      effort: "medium",
+      model_choices: ["gpt-oss-120b"],
+      effort_choices: ["medium", "high"],
     };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });

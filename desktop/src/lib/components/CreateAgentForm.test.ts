@@ -7,6 +7,21 @@ import type { AgentRecord, HarnessAvailability, Preferences } from "$lib/types";
 import { preferences, _testing as preferencesTesting } from "$lib/preferences.svelte";
 import { DEFAULT_AGENT_SELECTIONS } from "$lib/agentSelection";
 
+// No model agy offers today lacks an effort axis, but the pickers still handle
+// one (agy 1.1.19 offered two), so these tests add one to the model table.
+vi.mock("$lib/antigravityModels.json", async (importOriginal) => {
+  const actual = await importOriginal<{ default: { models: unknown[] } }>();
+  return {
+    default: {
+      ...actual.default,
+      models: [
+        ...actual.default.models,
+        { value: "no-effort-model", label: "No Effort Model", efforts: null },
+      ],
+    },
+  };
+});
+
 const apiMocks = vi.hoisted(() => ({
   getPreferences: vi.fn(),
 }));
@@ -595,7 +610,7 @@ describe("CreateAgentForm", () => {
       selection: {
         model: "gemini-3.8-flash",
         effort: "medium",
-        model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
+        model_choices: ["gemini-3.8-flash", "gemini-4-argon"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
@@ -604,7 +619,7 @@ describe("CreateAgentForm", () => {
   it("create + Antigravity: a model with no effort axis keeps future choices configurable", async () => {
     renderForm();
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
-    await choosePicker("model-select", "claude-sonnet-4-6");
+    await choosePicker("model-select", "no-effort-model");
     expect(screen.getByTestId("create-selection-effort-choice-high")).toBeEnabled();
     expect(screen.queryByTestId("create-selection-effort-current")).not.toBeInTheDocument();
     expect(screen.getByTestId("create-selection-effort-unavailable")).toHaveTextContent(
@@ -613,25 +628,26 @@ describe("CreateAgentForm", () => {
   });
 
   it("create + Antigravity: an effort-bearing model offers no Default and only its own levels", async () => {
-    // Gemini 3.1 Pro has low/high but not medium, and `agy` rejects a bare
-    // effort-bearing model — so "Default" must not be offered.
+    // GPT-OSS 120B takes only medium, and Switchboard always sends an effort
+    // for a model with levels — so "Default" must not be offered.
     renderForm();
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
-    // 3.1 Pro is not the default (3.7 Flash is), so select it explicitly —
-    // it is the one curated model whose levels exclude `medium`.
-    await choosePicker("model-select", "gemini-3.1-pro");
+    // GPT-OSS is not the default (3.8 Flash is), so select it explicitly —
+    // it is the one curated model whose levels are not all three.
+    await choosePicker("model-select", "gpt-oss-120b");
     expect(screen.getByTestId("create-selection-effort-choice-low")).toBeEnabled();
     expect(screen.getByTestId("create-selection-effort-choice-high")).toBeEnabled();
     expect(screen.getByTestId("create-selection-effort-choice-medium")).toBeEnabled();
     const effortCurrent = screen.getByTestId("create-selection-effort-current");
-    expect(within(effortCurrent).getByRole("option", { name: "Medium" })).toBeDisabled();
+    expect(within(effortCurrent).getByRole("option", { name: "High" })).toBeDisabled();
+    expect(within(effortCurrent).getByRole("option", { name: "Medium" })).toBeEnabled();
   });
 
   it("create + Antigravity: converts independent defaults into a dispatch-ready pair", async () => {
     preferences.agent_defaults.antigravity = {
-      model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
+      model_choices: ["no-effort-model", "gemini-3.8-flash"],
       effort_choices: ["high", "medium"],
-      default_model: "claude-sonnet-4-6",
+      default_model: "no-effort-model",
       default_effort: "high",
     };
     const { onSubmit } = renderForm();
@@ -644,9 +660,9 @@ describe("CreateAgentForm", () => {
       name: "antigravity",
       harness: "antigravity",
       selection: {
-        model: "claude-sonnet-4-6",
+        model: "no-effort-model",
         effort: null,
-        model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
+        model_choices: ["no-effort-model", "gemini-3.8-flash"],
         effort_choices: ["high", "medium"],
       },
     } satisfies AgentFormSubmit);
@@ -654,10 +670,10 @@ describe("CreateAgentForm", () => {
 
   it("create + Antigravity: blocks an unresolvable saved configuration", async () => {
     preferences.agent_defaults.antigravity = {
-      model_choices: ["gemini-3.1-pro"],
-      effort_choices: ["medium"],
-      default_model: "gemini-3.1-pro",
-      default_effort: "medium",
+      model_choices: ["gpt-oss-120b"],
+      effort_choices: ["high"],
+      default_model: "gpt-oss-120b",
+      default_effort: "high",
     };
     renderForm();
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
@@ -670,16 +686,16 @@ describe("CreateAgentForm", () => {
     // `agy` fails the turn when the level isn't in the model's own set, so an
     // effort left over from the previous model has to be brought back into
     // range at selection time rather than discovered at dispatch. 3.8 Flash
-    // takes low/medium/high; 3.1 Pro only low/high.
+    // takes low/medium/high; GPT-OSS 120B only medium.
     const { onSubmit } = renderForm();
     await fireEvent.click(screen.getByTestId("harness-antigravity"));
     await choosePicker("model-select", "gemini-3.8-flash");
-    await choosePicker("effort-select", "medium");
-    expect(pickerValue("effort-select")).toBe("medium");
-
-    await choosePicker("model-select", "gemini-3.1-pro");
-
+    await choosePicker("effort-select", "high");
     expect(pickerValue("effort-select")).toBe("high");
+
+    await choosePicker("model-select", "gpt-oss-120b");
+
+    expect(pickerValue("effort-select")).toBe("medium");
     // Pinned at the wire too: a clamp the picker shows but the payload drops
     // would still fail the turn.
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
@@ -688,9 +704,9 @@ describe("CreateAgentForm", () => {
       name: "antigravity",
       harness: "antigravity",
       selection: {
-        model: "gemini-3.1-pro",
-        effort: "high",
-        model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
+        model: "gpt-oss-120b",
+        effort: "medium",
+        model_choices: ["gemini-3.8-flash", "gemini-4-argon", "gpt-oss-120b"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);

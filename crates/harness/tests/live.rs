@@ -4971,7 +4971,7 @@ async fn live_antigravity_model_change_announced_on_resume() {
     };
 
     // Turn 1 on model X.
-    set_model("Gemini 3.1 Pro (High)");
+    set_model("Gemini 3.8 Flash (Low)");
     let events1 = antigravity_live_turn(
         &adapter,
         &agent,
@@ -4984,14 +4984,15 @@ async fn live_antigravity_model_change_announced_on_resume() {
     .await;
     let (m1, _) = turn_end_model_effort(&events1).expect("turn 1 TurnEnd");
     assert!(
-        m1.as_deref().is_some_and(|m| m.contains("Gemini 3.1 Pro")),
-        "turn 1 per-turn model = Gemini 3.1 Pro; got {m1:?}"
+        m1.as_deref()
+            .is_some_and(|m| m.contains("Gemini 3.8 Flash")),
+        "turn 1 per-turn model = Gemini 3.8 Flash; got {m1:?}"
     );
     let conversation_id = antigravity_capture(&events1).expect("captured conversation id");
 
     // Turn 2: switch the global model to Y, resume.
     agent.session_locator = Some(SessionLocator::Uuid(conversation_id));
-    set_model("Claude Sonnet 4.6 (Thinking)");
+    set_model("Claude Sonnet 5.5 (Low)");
     let events2 = antigravity_live_turn(
         &adapter,
         &agent,
@@ -5008,8 +5009,8 @@ async fn live_antigravity_model_change_announced_on_resume() {
     let (m2, _) = turn_end_model_effort(&events2).expect("turn 2 TurnEnd");
     assert!(
         m2.as_deref()
-            .is_some_and(|m| m.contains("Claude Sonnet 4.6")),
-        "turn 2 per-turn model = Claude Sonnet 4.6; got {m2:?}"
+            .is_some_and(|m| m.contains("Claude Sonnet 5.5")),
+        "turn 2 per-turn model = Claude Sonnet 5.5; got {m2:?}"
     );
 
     // Hydration reconstructs the carry-forward from the transcript.
@@ -5020,15 +5021,15 @@ async fn live_antigravity_model_change_announced_on_resume() {
         models
             .first()
             .and_then(Option::as_deref)
-            .is_some_and(|m| m.contains("Gemini 3.1 Pro")),
-        "hydrated turn 1 = Gemini 3.1 Pro; got {models:?}"
+            .is_some_and(|m| m.contains("Gemini 3.8 Flash")),
+        "hydrated turn 1 = Gemini 3.8 Flash; got {models:?}"
     );
     assert!(
         models
             .last()
             .and_then(Option::as_deref)
-            .is_some_and(|m| m.contains("Claude Sonnet 4.6")),
-        "hydrated last turn = Claude Sonnet 4.6; got {models:?}"
+            .is_some_and(|m| m.contains("Claude Sonnet 5.5")),
+        "hydrated last turn = Claude Sonnet 5.5; got {models:?}"
     );
 }
 

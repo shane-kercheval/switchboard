@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   ALL_HARNESSES,
   SUPPORTS_EFFORT_SELECTION,
@@ -19,8 +19,24 @@ import {
   selectionForNewAgent,
   selectionIsValid,
 } from "./agentSelection";
+import antigravityModels from "./antigravityModels.json";
 import { canonicalizeForUniqueness, validateAgentName } from "./agentName";
 import type { AgentSelection } from "./types";
+
+// No model agy offers today lacks an effort axis, but the pickers still handle
+// one (agy 1.1.19 offered two), so these tests add one to the model table.
+vi.mock("./antigravityModels.json", async (importOriginal) => {
+  const actual = await importOriginal<{ default: { models: unknown[] } }>();
+  return {
+    default: {
+      ...actual.default,
+      models: [
+        ...actual.default.models,
+        { value: "no-effort-model", label: "No Effort Model", efforts: null },
+      ],
+    },
+  };
+});
 
 function selection(over: Partial<AgentSelection> = {}): AgentSelection {
   return {
@@ -66,7 +82,7 @@ describe("agent selection catalogs", () => {
       default_effort: "medium",
     });
     expect(DEFAULT_AGENT_SELECTIONS.antigravity).toEqual({
-      model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
+      model_choices: ["gemini-3.8-flash", "gemini-4-argon"],
       effort_choices: ["medium", "high"],
       default_model: "gemini-3.8-flash",
       default_effort: "medium",
@@ -100,9 +116,8 @@ describe("Antigravity effort support", () => {
 
   it("distinguishes known levels, explicit no-effort models, and unknown models", () => {
     expect(values("gemini-3.8-flash")).toEqual(["low", "medium", "high"]);
-    expect(values("gemini-3.1-pro")).toEqual(["low", "high"]);
     expect(values("gpt-oss-120b")).toEqual(["medium"]);
-    expect(effortSupportFor("antigravity", "claude-sonnet-4-6")).toEqual({ kind: "none" });
+    expect(effortSupportFor("antigravity", "no-effort-model")).toEqual({ kind: "none" });
     expect(effortSupportFor("antigravity", "future-model").kind).toBe("unknown");
   });
 
@@ -112,22 +127,30 @@ describe("Antigravity effort support", () => {
     }
   });
 
+  it("offers every effort level the model table lists", () => {
+    const models: readonly { value: string; efforts: readonly string[] | null }[] =
+      antigravityModels.models;
+    for (const { value, efforts } of models) {
+      expect(values(value), value).toHaveLength(efforts?.length ?? 0);
+    }
+  });
+
   it("requires effort only for known effort-bearing Antigravity models", () => {
-    expect(effortIsRequired("antigravity", "gemini-3.1-pro")).toBe(true);
-    expect(effortIsRequired("antigravity", "claude-sonnet-4-6")).toBe(false);
+    expect(effortIsRequired("antigravity", "gpt-oss-120b")).toBe(true);
+    expect(effortIsRequired("antigravity", "no-effort-model")).toBe(false);
     expect(effortIsRequired("antigravity", "future-model")).toBe(false);
     expect(effortIsRequired("codex", "gpt-5.6-sol")).toBe(false);
   });
 
   it("keeps the configured presentation set while restricting activation", () => {
     const configured = selection({
-      model: "gemini-3.1-pro",
-      effort: "high",
-      model_choices: ["gemini-3.1-pro"],
+      model: "gpt-oss-120b",
+      effort: "medium",
+      model_choices: ["gpt-oss-120b"],
       effort_choices: ["medium", "high"],
     });
     expect(configured.effort_choices).toEqual(["medium", "high"]);
-    expect([...activatableEffortValues(configured, "antigravity")]).toEqual(["high"]);
+    expect([...activatableEffortValues(configured, "antigravity")]).toEqual(["medium"]);
   });
 });
 
@@ -136,9 +159,9 @@ describe("selectionForNewAgent", () => {
     expect(
       selectionForNewAgent(
         {
-          model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
+          model_choices: ["no-effort-model", "gemini-3.8-flash"],
           effort_choices: ["high", "medium"],
-          default_model: "claude-sonnet-4-6",
+          default_model: "no-effort-model",
           default_effort: "high",
         },
         "antigravity",
@@ -146,9 +169,9 @@ describe("selectionForNewAgent", () => {
     ).toEqual({
       ok: true,
       selection: {
-        model: "claude-sonnet-4-6",
+        model: "no-effort-model",
         effort: null,
-        model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
+        model_choices: ["no-effort-model", "gemini-3.8-flash"],
         effort_choices: ["high", "medium"],
       },
     });
@@ -158,28 +181,28 @@ describe("selectionForNewAgent", () => {
     expect(
       selectionForNewAgent(
         {
-          model_choices: ["gemini-3.1-pro"],
-          effort_choices: ["medium", "high"],
-          default_model: "gemini-3.1-pro",
-          default_effort: "medium",
+          model_choices: ["gpt-oss-120b"],
+          effort_choices: ["high", "medium"],
+          default_model: "gpt-oss-120b",
+          default_effort: "high",
         },
         "antigravity",
       ),
-    ).toMatchObject({ ok: true, selection: { effort: "high" } });
+    ).toMatchObject({ ok: true, selection: { effort: "medium" } });
 
     expect(
       selectionForNewAgent(
         {
-          model_choices: ["gemini-3.1-pro"],
-          effort_choices: ["medium"],
-          default_model: "gemini-3.1-pro",
-          default_effort: "medium",
+          model_choices: ["gpt-oss-120b"],
+          effort_choices: ["high"],
+          default_model: "gpt-oss-120b",
+          default_effort: "high",
         },
         "antigravity",
       ),
     ).toMatchObject({
       ok: false,
-      selection: { model: "gemini-3.1-pro", effort: "medium" },
+      selection: { model: "gpt-oss-120b", effort: "high" },
     });
   });
 });
@@ -187,38 +210,52 @@ describe("selectionForNewAgent", () => {
 describe("resolveModelChange", () => {
   const configured = selection({
     model: "gemini-3.8-flash",
-    effort: "medium",
-    model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
-    effort_choices: ["medium", "high", "low"],
+    effort: "high",
+    model_choices: ["gemini-3.8-flash", "gpt-oss-120b"],
+    effort_choices: ["high", "medium", "low"],
   });
 
   it("preserves valid effort and otherwise chooses the first compatible configured effort", () => {
-    expect(
-      resolveModelChange({ ...configured, effort: "high" }, "antigravity", "gemini-3.1-pro"),
-    ).toMatchObject({ ok: true, selection: { model: "gemini-3.1-pro", effort: "high" } });
-    expect(resolveModelChange(configured, "antigravity", "gemini-3.1-pro")).toMatchObject({
+    expect(resolveModelChange(configured, "antigravity", "gemini-4-argon")).toMatchObject({
       ok: true,
-      selection: { model: "gemini-3.1-pro", effort: "low" },
+      selection: { model: "gemini-4-argon", effort: "high" },
     });
+    expect(resolveModelChange(configured, "antigravity", "gpt-oss-120b")).toMatchObject({
+      ok: true,
+      selection: { model: "gpt-oss-120b", effort: "medium" },
+    });
+    // "First" is in level order, not quick-choice order: `low` before `high`.
+    expect(
+      resolveModelChange(
+        {
+          ...configured,
+          model: "future-model",
+          effort: "max",
+          effort_choices: ["max", "high", "low"],
+        },
+        "antigravity",
+        "gemini-3.8-flash",
+      ),
+    ).toMatchObject({ ok: true, selection: { model: "gemini-3.8-flash", effort: "low" } });
   });
 
   it("clears effort only for an explicitly known no-effort model", () => {
-    expect(resolveModelChange(configured, "antigravity", "claude-sonnet-4-6")).toMatchObject({
+    expect(resolveModelChange(configured, "antigravity", "no-effort-model")).toMatchObject({
       ok: true,
-      selection: { model: "claude-sonnet-4-6", effort: null },
+      selection: { model: "no-effort-model", effort: null },
     });
     expect(resolveModelChange(configured, "antigravity", "future-model")).toMatchObject({
       ok: true,
-      selection: { model: "future-model", effort: "medium" },
+      selection: { model: "future-model", effort: "high" },
     });
   });
 
   it("refuses a known model when no configured effort can satisfy it", () => {
     expect(
       resolveModelChange(
-        { ...configured, effort: "medium", effort_choices: ["medium"] },
+        { ...configured, effort: "high", effort_choices: ["high"] },
         "antigravity",
-        "gemini-3.1-pro",
+        "gpt-oss-120b",
       ),
     ).toEqual({
       ok: false,
@@ -228,7 +265,7 @@ describe("resolveModelChange", () => {
 
   it("validates known pairs without treating unknown models as invalid", () => {
     expect(selectionIsValid(configured, "antigravity")).toBe(true);
-    expect(selectionIsValid({ ...configured, model: "gemini-3.1-pro" }, "antigravity")).toBe(false);
+    expect(selectionIsValid({ ...configured, model: "gpt-oss-120b" }, "antigravity")).toBe(false);
     expect(selectionIsValid({ ...configured, model: "future-model" }, "antigravity")).toBe(true);
   });
 });

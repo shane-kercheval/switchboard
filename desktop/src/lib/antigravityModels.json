@@ -1,0 +1,30 @@
+{
+  "$comment": "The Antigravity models the window's pickers offer, each with the levels `agy` accepts for `--effort` (null: the model takes no effort). agentSelection.ts reads this file for the pickers; live_antigravity_model_table_matches_the_cli_model_list (desktop/src-tauri/src/antigravity_models.rs) compares it with `agy --output-format json models`, so a model Google adds, retires or re-levels fails `make test-live-antigravity`. Matches agy 1.4.2 (2026-10-19). Labels drop agy's `Claude ` prefix; see MODEL_OPTIONS in agentSelection.ts.",
+  "models": [
+    {
+      "value": "gemini-4-argon",
+      "label": "Gemini 4 Argon",
+      "efforts": ["low", "medium", "high"]
+    },
+    {
+      "value": "gemini-3.8-flash",
+      "label": "Gemini 3.8 Flash",
+      "efforts": ["low", "medium", "high"]
+    },
+    {
+      "value": "claude-opus-5-5",
+      "label": "Opus 5.5",
+      "efforts": ["low", "medium", "high"]
+    },
+    {
+      "value": "claude-sonnet-5-5",
+      "label": "Sonnet 5.5",
+      "efforts": ["low", "medium", "high"]
+    },
+    {
+      "value": "gpt-oss-120b",
+      "label": "GPT-OSS 120B",
+      "efforts": ["medium"]
+    }
+  ]
+}

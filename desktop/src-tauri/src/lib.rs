@@ -3,6 +3,8 @@
 //! at startup. Business logic lives in `commands` and `state`; this file
 //! is the Tauri wiring layer.
 
+#[cfg(test)]
+mod antigravity_models;
 mod commands;
 mod dispatch_context;
 mod emitter;

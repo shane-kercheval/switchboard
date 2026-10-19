@@ -50,13 +50,14 @@ impl HarnessKind {
     /// model_reasoning_effort=`), Antigravity (`--effort`) — per
     /// `harness-behavior.md` §3.4.
     ///
-    /// **Antigravity's levels are per-model and mandatory where they exist.**
-    /// Unlike Claude, which accepts any level for any model and silently
-    /// degrades, `agy` validates client-side before dispatch: a model with an
-    /// effort axis *requires* one, a model without an axis *rejects* one, and
-    /// the valid set differs by model (Gemini 3.1 Pro has low/high; the Flash
-    /// models add medium). This flag only says the axis is drivable; which
-    /// levels a given model accepts is the picker's business — see
+    /// **Antigravity's levels are per-model.** Unlike Claude, which accepts
+    /// any level for any model and silently degrades, `agy` validates
+    /// client-side before dispatch: a model without an axis *rejects* one, and
+    /// the valid set differs by model (GPT-OSS 120B takes only medium; the
+    /// Gemini and Claude models take low, medium and high). Switchboard always
+    /// sends a level for a model that has them, although `agy` has picked a
+    /// default for a bare one since 1.3.4. This flag only says the axis is
+    /// drivable; which levels a given model accepts is the picker's business — see
     /// `effortOptionsFor` in `desktop/src/lib/agentSelection.ts`.
     ///
     /// A *separate* axis from model selection, kept as its own gate even though

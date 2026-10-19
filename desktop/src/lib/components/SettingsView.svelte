@@ -58,6 +58,14 @@
   let workflowsDirError = $state<string | null>(null);
   const activeSection = $derived(section ?? "general");
   let agentDefaultDrafts = $state<Partial<Record<HarnessKind, AgentSelection>>>({});
+  // Which agent-defaults cards are open, following the person's clicks. A
+  // constant `open` closed a card whenever its header's default changed:
+  // Svelte re-applies `open` with the header text.
+  let openDefaultCards = $state<Record<HarnessKind, boolean>>({
+    claude_code: true,
+    codex: false,
+    antigravity: false,
+  });
   const workflowPrompt = $derived(workflowAuthoringPrompt(workflowsDir));
   const localPromptInstructions = $derived(promptAuthoringPrompt(promptsDir));
 
@@ -440,7 +448,7 @@
             {#each ALL_HARNESSES as harness (harness)}
               <details
                 class="group/defaults border-border bg-raised rounded-md border"
-                open={harness === "claude_code"}
+                bind:open={openDefaultCards[harness]}
               >
                 <summary
                   class="bg-panel text-fg hover:bg-control-hover focus-visible:ring-focus flex min-h-11 cursor-pointer list-none items-center gap-3 rounded-md px-3 py-2.5 text-sm font-medium outline-none group-open/defaults:rounded-b-none focus-visible:ring-1 focus-visible:ring-inset [&::-webkit-details-marker]:hidden"

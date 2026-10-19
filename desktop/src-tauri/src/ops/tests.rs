@@ -6797,6 +6797,60 @@ async fn the_latest_answer_says_when_a_newer_turn_is_running() {
     gate.notify_one();
 }
 
+/// Claude writes a reply's first cycle, end-of-turn marker included, while
+/// the turn waits on background work, so the session file holds a
+/// complete-looking record for a send the ledger still shows as running. That
+/// record is not the latest answer: one send never reads as both completed
+/// and running.
+#[tokio::test]
+async fn a_running_send_already_on_disk_is_not_the_latest_answer() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let first = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "one"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, first.send_id).await;
+
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("two's answer", &gate));
+    let second = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "two"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    env.append_claude_turn(project_id, agents[0], "two", "two's answer so far", "m-two");
+    switchboard_core::journal::append_record(
+        &env.journal_path(project_id),
+        &JournalRecord::TurnLink {
+            send_id: second.send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: agents[0],
+            hydration_key: "m-two".to_owned(),
+            at: Utc::now(),
+        },
+    )
+    .unwrap();
+
+    let mid_turn = read_latest_reply(&env.state, project_id, agents[0], &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        mid_turn.text.as_deref(),
+        Some("ack: one"),
+        "the finished answer before the running send"
+    );
+    assert_eq!(mid_turn.send_id, Some(first.send_id));
+    assert_eq!(mid_turn.status, LatestReplyStatus::Completed);
+    assert!(mid_turn.newer_turn_running);
+    gate.notify_one();
+}
+
 /// Wait until the ledger shows `agent`'s reply to `send_id` as `status`.
 async fn await_recipient_status(env: &TestEnv, send_id: Uuid, agent: AgentId, status: SendStatus) {
     let started = tokio::time::Instant::now();

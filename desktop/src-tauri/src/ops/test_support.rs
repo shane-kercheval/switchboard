@@ -747,15 +747,10 @@ impl TestEnv {
         self.write_claude_session(project_id, agent_id, &claude_turn_lines(turns));
     }
 
-    /// Rewrite the agent's current Claude session file (the one its locator
-    /// names, without minting a new session) with these turns, through the
-    /// store rather than the loaded-project map, so it works after a restart.
-    pub fn overwrite_claude_turns(
-        &self,
-        project_id: ProjectId,
-        agent_id: AgentId,
-        turns: &[(&str, &str, &str, chrono::DateTime<Utc>)],
-    ) {
+    /// The agent's current Claude session file (the one its locator names,
+    /// without minting a new session), through the store rather than the
+    /// loaded-project map, so it works after a restart.
+    fn current_claude_session_path(&self, project_id: ProjectId, agent_id: AgentId) -> PathBuf {
         let project = super::read::project_readonly(&self.state, project_id).unwrap();
         let agent = project
             .list_agents()
@@ -766,16 +761,41 @@ impl TestEnv {
         let Some(SessionLocator::Uuid(session)) = agent.session_locator else {
             panic!("the agent has a Claude session");
         };
-        let path = switchboard_harness::claude_session_file_path(
+        switchboard_harness::claude_session_file_path(
             self.home.path(),
             &project.directory,
             &session,
-        );
+        )
+    }
+
+    /// Rewrite the agent's current Claude session file with these turns.
+    pub fn overwrite_claude_turns(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        turns: &[(&str, &str, &str, chrono::DateTime<Utc>)],
+    ) {
+        let path = self.current_claude_session_path(project_id, agent_id);
         let body: String = claude_turn_lines(turns)
             .iter()
             .map(|l| serde_json::to_string(l).unwrap() + "\n")
             .collect();
         std::fs::write(&path, body).unwrap();
+    }
+
+    /// Append one completed-looking turn (prompt, answer, message id `key`)
+    /// to the agent's current Claude session file, as Claude writes a reply's
+    /// first cycle, end-of-turn marker included, while the turn still runs.
+    pub fn append_claude_turn(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        prompt: &str,
+        text: &str,
+        key: &str,
+    ) {
+        let path = self.current_claude_session_path(project_id, agent_id);
+        append_claude_turn(&path, prompt, text, key);
     }
 
     /// Give the agent a Claude session file holding one completed turn that

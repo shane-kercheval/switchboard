@@ -797,7 +797,8 @@ async fn latest_reply_alone(
     home_dir: &Path,
 ) -> Result<LatestReply, AppError> {
     let agent = agent_in_project(state, project_id, agent_id)?;
-    if let Some((send_id, latest)) = state.ledger.latest_turn(agent_id)
+    let live = state.ledger.latest_turn(agent_id);
+    if let Some((send_id, latest)) = live.clone()
         && latest.status == SendStatus::Completed
     {
         return Ok(LatestReply {
@@ -842,10 +843,17 @@ async fn latest_reply_alone(
     }
     let view = AgentJournalView::from_records(&records, agent_id);
     let correlated = correlate_turns(&project, &agent, &view, home_dir, &state.context).await?;
-    let latest = correlated
-        .into_iter()
-        .rev()
-        .find(|turn| turn.status == TurnStatus::Complete);
+    // A reply still running can already be on disk looking complete: Claude
+    // writes each cycle of a turn with an end-of-turn marker while the turn
+    // waits on background work. The ledger owns that send until it ends, so
+    // the latest answer is the finished one before it.
+    let running_send = live
+        .filter(|(_, latest)| !latest.status.is_terminal())
+        .map(|(send_id, _)| send_id);
+    let latest = correlated.into_iter().rev().find(|turn| {
+        turn.status == TurnStatus::Complete
+            && running_send.is_none_or(|running| turn.send_id != Some(running))
+    });
     Ok(match latest {
         Some(turn) => LatestReply {
             agent_id,

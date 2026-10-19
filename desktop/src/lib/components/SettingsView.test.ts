@@ -160,6 +160,52 @@ describe("SettingsView", () => {
     );
   });
 
+  // Leaving the Agents section hides it rather than unmounting it, so a card a
+  // person opened is still open when they come back without closing Settings.
+  it("keeps an opened harness card open across leaving and returning to the Agents section", async () => {
+    const view = render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+    const card = screen.getByTestId("agent-defaults-codex-summary").closest("details");
+    const toggled = new Promise((resolve) =>
+      card?.addEventListener("toggle", resolve, { once: true }),
+    );
+    await fireEvent.click(screen.getByTestId("agent-defaults-codex-summary"));
+    await toggled;
+
+    await view.rerender({ section: "prompts" });
+    await view.rerender({ section: "agents" });
+
+    expect(screen.getByTestId("agent-defaults-codex-summary").closest("details")?.open).toBe(true);
+    expect(screen.getByTestId("agent-defaults-claude_code-summary").closest("details")?.open).toBe(
+      true,
+    );
+  });
+
+  // Saving an unrelated preference must neither collapse nor reopen a card.
+  it("keeps the harness cards as the person left them when an unrelated preference is saved", async () => {
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+    const card = (harness: string) =>
+      screen.getByTestId(`agent-defaults-${harness}-summary`).closest("details");
+    const toggle = async (harness: string) => {
+      const toggled = new Promise((resolve) =>
+        card(harness)?.addEventListener("toggle", resolve, { once: true }),
+      );
+      await fireEvent.click(screen.getByTestId(`agent-defaults-${harness}-summary`));
+      await toggled;
+    };
+    await toggle("claude_code");
+    await toggle("codex");
+
+    await fireEvent.click(screen.getByTestId("claude-chrome-toggle"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: expect.objectContaining({ claude_chrome_enabled: true }),
+      }),
+    );
+
+    expect(card("claude_code")?.open).toBe(false);
+    expect(card("codex")?.open).toBe(true);
+  });
+
   it("shows custom model and effort names and unset defaults in the headers", (): void => {
     preferences.agent_defaults.codex.default_model = "custom-model";
     preferences.agent_defaults.codex.default_effort = "custom-effort";
@@ -238,6 +284,43 @@ describe("SettingsView", () => {
       "Codex Default model: GPT-6.1 Sol · Default effort: Medium",
       "Antigravity Default model: Gemini 3.8 Flash · Default effort: Medium",
     ]);
+  });
+
+  // Only an explicit expand or collapse control may resize the page: changing
+  // a default inside an open harness card must leave the card open, and the
+  // same element (a rebuilt card would replace the dropdown the person just
+  // used, taking its keyboard focus).
+  it("keeps a harness's defaults card open when its default model or effort changes", async () => {
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+    const summary = screen.getByTestId("agent-defaults-codex-summary");
+    const card = summary.closest("details");
+    expect(card).not.toBeNull();
+    expect(card?.open).toBe(false);
+    // The browser reports the open through a `toggle` event one task after the
+    // click; wait for it, as a person's next click always would.
+    const toggled = new Promise((resolve) =>
+      card?.addEventListener("toggle", resolve, { once: true }),
+    );
+    await fireEvent.click(summary);
+    await toggled;
+    expect(card?.open).toBe(true);
+
+    await fireEvent.change(screen.getByTestId("settings-selection-codex-model-current"), {
+      target: { value: "gpt-5.6-terra" },
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("GPT-5.6 Terra"),
+    );
+    expect(screen.getByTestId("agent-defaults-codex-summary").closest("details")).toBe(card);
+    expect(card?.open).toBe(true);
+
+    await fireEvent.change(screen.getByTestId("settings-selection-codex-effort-current"), {
+      target: { value: "high" },
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("High"),
+    );
+    expect(card?.open).toBe(true);
   });
 
   it("shows the Antigravity quick choices and defaults", async () => {

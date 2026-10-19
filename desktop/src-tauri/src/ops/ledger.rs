@@ -188,8 +188,9 @@ pub struct RecipientSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<FailureKind>,
     /// What the agent is doing while this recipient's own turn runs: how long
-    /// since it last produced output, and the tool calls it has open. Absent
-    /// while the recipient waits in line behind another turn.
+    /// since it last produced output, and the tool calls and background tasks
+    /// it has open. Absent while the recipient waits in line behind another
+    /// turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<AgentActivity>,
     /// The end of what the agent has written in this turn so far, up to
@@ -230,29 +231,58 @@ pub const RECENT_TEXT_CHARS: usize = 500;
 /// What an agent's running turn is doing, for telling a stuck turn from a
 /// long one. Silence is measured as the window measures it for its "No
 /// response" label: the time since the turn started or the agent last wrote
-/// text, sent a heartbeat, or started or finished a tool call. A tool call
-/// left open (a test suite running) is reported with how long it has run,
-/// since it produces nothing until it ends. Reported only while a turn runs:
-/// an idle agent has nothing to be stuck on.
+/// text, sent a heartbeat, started or finished a tool call, or heard from a
+/// sub-agent or a background command. A tool call left open (a test
+/// suite running) is reported with how long it has run, since it produces
+/// nothing until it ends. A sub-agent the agent waits on is its open `Agent`
+/// tool call, which carries what the sub-agent last reported doing. Work the
+/// agent handed off to run apart from it (a sub-agent or a command started in
+/// the background) is no open call of its own, so it is reported under
+/// `open_background_tasks`. Each piece of work appears once. Reported only
+/// while a turn runs: an idle agent has nothing to be stuck on.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AgentActivity {
     pub seconds_since_output: u64,
     /// Oldest first.
     pub open_tool_calls: Vec<OpenToolCall>,
+    /// Work running apart from the agent: a task whose starting call has
+    /// closed, or that names none. Oldest first.
+    pub open_background_tasks: Vec<OpenBackgroundTask>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OpenToolCall {
     pub name: String,
+    /// For a sub-agent the agent waits on, what the sub-agent last reported
+    /// doing; absent for any other call and until it reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
     pub running_seconds: u64,
 }
 
-/// An agent's last output and its open tool calls, as the ledger tracks them.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OpenBackgroundTask {
+    /// What the task was started to do.
+    pub description: String,
+    /// What it reported doing most recently; absent before it reports any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    pub running_seconds: u64,
+}
+
+/// An agent's last output, its open tool calls, and its open background
+/// tasks, as the ledger tracks them.
 struct ActivityState {
     last_output: Instant,
     open_tools: Vec<OpenTool>,
+    open_tasks: Vec<OpenTask>,
     /// A turn has started and not ended.
     turn_open: bool,
+    /// The send the open turn answers, from its typed start event, for any
+    /// turn: one the user typed in the window included. Kept beside
+    /// `turn_open` rather than in its place, so a start event that fails to
+    /// parse still reads as a running turn.
+    open_send: Option<SendId>,
 }
 
 struct OpenTool {
@@ -261,7 +291,25 @@ struct OpenTool {
     started: Instant,
 }
 
+struct OpenTask {
+    task_id: String,
+    description: String,
+    activity: Option<String>,
+    /// The tool call that started the task, when its start named one.
+    tool_use_id: Option<String>,
+    started: Instant,
+}
+
+impl OpenTask {
+    fn started_by(&self, tool: &OpenTool) -> bool {
+        self.tool_use_id.as_deref() == Some(tool.tool_use_id.as_str())
+    }
+}
+
 impl ActivityState {
+    /// Decided here rather than as events arrive, so a task and its starting
+    /// call can arrive or end in either order: while the call is open, the
+    /// agent waits on the task and its step shows on the call.
     fn report(&self, now: Instant) -> AgentActivity {
         AgentActivity {
             seconds_since_output: now.saturating_duration_since(self.last_output).as_secs(),
@@ -270,7 +318,23 @@ impl ActivityState {
                 .iter()
                 .map(|tool| OpenToolCall {
                     name: tool.name.clone(),
+                    activity: self
+                        .open_tasks
+                        .iter()
+                        .rev()
+                        .find(|task| task.started_by(tool))
+                        .and_then(|task| task.activity.clone()),
                     running_seconds: now.saturating_duration_since(tool.started).as_secs(),
+                })
+                .collect(),
+            open_background_tasks: self
+                .open_tasks
+                .iter()
+                .filter(|task| !self.open_tools.iter().any(|tool| task.started_by(tool)))
+                .map(|task| OpenBackgroundTask {
+                    description: task.description.clone(),
+                    activity: task.activity.clone(),
+                    running_seconds: now.saturating_duration_since(task.started).as_secs(),
                 })
                 .collect(),
         }
@@ -286,6 +350,9 @@ const OUTPUT_EVENTS: &[&str] = &[
     "turn_identity",
     "tool_started",
     "tool_completed",
+    "task_started",
+    "task_progress",
+    "task_ended",
 ];
 
 /// The ledger's clock for activity durations: monotonic, so a change to the
@@ -1127,6 +1194,19 @@ impl SendLedger {
             .map(|state| state.report(now))
     }
 
+    /// `Some` while the agent has a turn running, whoever sent it, holding the
+    /// send it answers, or `None` inside when its start event failed to
+    /// parse; `None` while no turn runs. A send still waiting for the agent
+    /// has no turn yet.
+    #[must_use]
+    pub fn open_turn(&self, agent_id: AgentId) -> Option<Option<SendId>> {
+        lock(&self.inner)
+            .activity
+            .get(&agent_id)
+            .filter(|state| state.turn_open)
+            .map(|state| state.open_send)
+    }
+
     /// Note an agent-channel event against the agent's activity: a turn's
     /// start or the agent's output restarts the silence, a tool call opens or
     /// closes, and a turn's end closes the turn and whatever it left open.
@@ -1140,7 +1220,9 @@ impl SendLedger {
         if !output {
             if let Some(state) = inner.activity.get_mut(&agent_id) {
                 state.open_tools.clear();
+                state.open_tasks.clear();
                 state.turn_open = false;
+                state.open_send = None;
             }
             return;
         }
@@ -1150,12 +1232,16 @@ impl SendLedger {
             .or_insert_with(|| ActivityState {
                 last_output: now,
                 open_tools: Vec::new(),
+                open_tasks: Vec::new(),
                 turn_open: false,
+                open_send: None,
             });
         state.last_output = now;
         if kind == "turn_start" {
             state.turn_open = true;
+            state.open_send = None;
             state.open_tools.clear();
+            state.open_tasks.clear();
         }
         let tool_use_id = payload
             .get("tool_use_id")
@@ -1260,6 +1346,12 @@ impl SendLedger {
                 self.on_content(payload);
                 return;
             }
+            // A task changes only the agent's activity, never admission or a
+            // send's text: note it and wake nobody.
+            "task_started" | "task_progress" | "task_ended" => {
+                self.on_task(agent_id, payload);
+                return;
+            }
             "turn_start" | "turn_end" | "message_failed" | "message_cancelled" | "agent_idle" => {}
             _ => return,
         }
@@ -1267,8 +1359,9 @@ impl SendLedger {
             Ok(NormalizedEvent::TurnStart {
                 turn_id,
                 message_id,
+                send_id,
                 ..
-            }) => self.on_turn_start(agent_id, message_id, turn_id),
+            }) => self.on_turn_start(agent_id, message_id, send_id, turn_id),
             Ok(NormalizedEvent::TurnEnd {
                 turn_id, outcome, ..
             }) => self.on_turn_end(turn_id, &outcome),
@@ -1295,8 +1388,17 @@ impl SendLedger {
         }
     }
 
-    fn on_turn_start(&self, agent_id: AgentId, message_id: MessageId, turn_id: TurnId) -> bool {
+    fn on_turn_start(
+        &self,
+        agent_id: AgentId,
+        message_id: MessageId,
+        turn_send: SendId,
+        turn_id: TurnId,
+    ) -> bool {
         let mut inner = lock(&self.inner);
+        if let Some(state) = inner.activity.get_mut(&agent_id) {
+            state.open_send = Some(turn_send);
+        }
         let registered: LatestTurn = inner.by_message.get(&message_id).copied();
         // A compaction is not an answer: the agent's newest answer stays
         // whatever it was, as it does for a compaction the window ran.
@@ -1318,6 +1420,56 @@ impl SendLedger {
             recipient.status = SendStatus::Running;
         }
         true
+    }
+
+    /// Track the agent's open tasks from their typed events: a start
+    /// opens one, progress records what it is doing now, and an end closes
+    /// it. A turn's start and end clear them all (`note_activity`), since a
+    /// task never outlives the turn that started it.
+    fn on_task(&self, agent_id: AgentId, payload: &serde_json::Value) {
+        let event = match serde_json::from_value::<NormalizedEvent>(payload.clone()) {
+            Ok(event) => event,
+            Err(e) => {
+                tracing::warn!(%agent_id, error = %e, "ledger could not parse a task event");
+                return;
+            }
+        };
+        let now = (self.clock)();
+        let mut inner = lock(&self.inner);
+        let Some(state) = inner.activity.get_mut(&agent_id) else {
+            return;
+        };
+        match event {
+            NormalizedEvent::TaskStarted {
+                task_id,
+                description,
+                tool_use_id,
+                ..
+            } if !state.open_tasks.iter().any(|task| task.task_id == task_id) => {
+                state.open_tasks.push(OpenTask {
+                    task_id,
+                    description,
+                    activity: None,
+                    tool_use_id,
+                    started: now,
+                });
+            }
+            NormalizedEvent::TaskProgress {
+                task_id, activity, ..
+            } if !activity.is_empty() => {
+                if let Some(task) = state
+                    .open_tasks
+                    .iter_mut()
+                    .find(|task| task.task_id == task_id)
+                {
+                    task.activity = Some(activity);
+                }
+            }
+            NormalizedEvent::TaskEnded { task_id, .. } => {
+                state.open_tasks.retain(|task| task.task_id != task_id);
+            }
+            _ => {}
+        }
     }
 
     fn on_content(&self, payload: &serde_json::Value) {
@@ -1806,6 +1958,31 @@ mod tests {
         json!({ "type": "tool_completed", "turn_id": turn_id, "tool_use_id": id, "output": "", "is_error": false })
     }
 
+    fn task_started(turn_id: TurnId, id: &str, description: &str) -> serde_json::Value {
+        json!({ "type": "task_started", "turn_id": turn_id, "task_id": id, "description": description })
+    }
+
+    fn task_started_by(
+        turn_id: TurnId,
+        id: &str,
+        description: &str,
+        tool_use_id: &str,
+    ) -> serde_json::Value {
+        json!({ "type": "task_started", "turn_id": turn_id, "task_id": id, "description": description, "tool_use_id": tool_use_id })
+    }
+
+    fn task_progress(turn_id: TurnId, id: &str, activity: &str) -> serde_json::Value {
+        json!({ "type": "task_progress", "turn_id": turn_id, "task_id": id, "activity": activity })
+    }
+
+    fn task_ended(turn_id: TurnId, id: &str) -> serde_json::Value {
+        json!({ "type": "task_ended", "turn_id": turn_id, "task_id": id })
+    }
+
+    fn background_tasks(ledger: &SendLedger, agent_id: AgentId) -> Vec<OpenBackgroundTask> {
+        ledger.activity(agent_id).unwrap().open_background_tasks
+    }
+
     #[test]
     fn silence_counts_only_the_turns_start_and_the_agents_own_output() {
         let (clock, now) = hand_clock();
@@ -1840,6 +2017,209 @@ mod tests {
             &json!({ "type": "liveness", "turn_id": turn_id }),
         );
         assert_eq!(ledger.activity(agent_id).unwrap().seconds_since_output, 0);
+    }
+
+    #[test]
+    fn background_tasks_open_report_their_activity_and_close_at_their_end() {
+        let (clock, now) = hand_clock();
+        let ledger = SendLedger::with_clock(clock);
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        let turn_id = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(message_id, turn_id, send_id),
+        );
+        ledger.observe(
+            &channel(agent_id),
+            &task_started(turn_id, "a1", "Review the parser"),
+        );
+        advance(&now, 30);
+        ledger.observe(
+            &channel(agent_id),
+            &task_started(turn_id, "b2", "Run the test suite"),
+        );
+        advance(&now, 10);
+        assert_eq!(
+            background_tasks(&ledger, agent_id),
+            [
+                OpenBackgroundTask {
+                    description: "Review the parser".to_owned(),
+                    activity: None,
+                    running_seconds: 40,
+                },
+                OpenBackgroundTask {
+                    description: "Run the test suite".to_owned(),
+                    activity: None,
+                    running_seconds: 10,
+                },
+            ],
+            "oldest first, with no activity before any progress"
+        );
+
+        ledger.observe(
+            &channel(agent_id),
+            &task_progress(turn_id, "a1", "Reading crates/core/Cargo.toml"),
+        );
+        assert_eq!(
+            background_tasks(&ledger, agent_id)[0].activity.as_deref(),
+            Some("Reading crates/core/Cargo.toml")
+        );
+        assert_eq!(
+            ledger.activity(agent_id).unwrap().seconds_since_output,
+            0,
+            "a task's progress restarts the silence, as a heartbeat does"
+        );
+
+        ledger.observe(&channel(agent_id), &task_ended(turn_id, "a1"));
+        assert_eq!(
+            background_tasks(&ledger, agent_id),
+            [OpenBackgroundTask {
+                description: "Run the test suite".to_owned(),
+                activity: None,
+                running_seconds: 10,
+            }],
+            "only the ended task closes"
+        );
+    }
+
+    /// At Claude 2.1.302 (2026-10-19) a sub-agent's task ended one event
+    /// before its `Agent` call closed. Both orders are covered, because the
+    /// report handles either and a newer CLI may flip it: the flip only shows
+    /// the sub-agent as background work for the instant between the two.
+    #[test]
+    fn a_sub_agent_the_agent_waits_on_is_its_open_call_whichever_ends_first() {
+        for task_ends_first in [true, false] {
+            let ledger = SendLedger::new();
+            let (_, send_id, agent_id, message_id) = registered(&ledger);
+            let turn_id = Uuid::now_v7();
+            ledger.observe(
+                &channel(agent_id),
+                &turn_start(message_id, turn_id, send_id),
+            );
+            ledger.observe(
+                &channel(agent_id),
+                &tool_started(turn_id, "toolu_A", "Agent"),
+            );
+            ledger.observe(
+                &channel(agent_id),
+                &task_started_by(turn_id, "a1", "Review the parser", "toolu_A"),
+            );
+            let activity = ledger.activity(agent_id).unwrap();
+            assert_eq!(activity.open_tool_calls.len(), 1);
+            assert_eq!(activity.open_tool_calls[0].activity, None, "no step yet");
+            assert_eq!(
+                activity.open_background_tasks,
+                [],
+                "the agent waits on it: not background work"
+            );
+            ledger.observe(
+                &channel(agent_id),
+                &task_progress(turn_id, "a1", "Reading parser.rs"),
+            );
+            let activity = ledger.activity(agent_id).unwrap();
+            assert_eq!(
+                activity.open_tool_calls[0].activity.as_deref(),
+                Some("Reading parser.rs"),
+                "the sub-agent's step shows on its call"
+            );
+            assert_eq!(activity.open_background_tasks, []);
+
+            let task_end = task_ended(turn_id, "a1");
+            let call_end = tool_completed(turn_id, "toolu_A");
+            let (first, second) = if task_ends_first {
+                (&task_end, &call_end)
+            } else {
+                (&call_end, &task_end)
+            };
+            ledger.observe(&channel(agent_id), first);
+            let between = ledger.activity(agent_id).unwrap();
+            if task_ends_first {
+                assert_eq!(between.open_tool_calls[0].activity, None);
+                assert_eq!(between.open_background_tasks, []);
+            } else {
+                assert_eq!(between.open_tool_calls, []);
+                assert_eq!(
+                    between.open_background_tasks.len(),
+                    1,
+                    "a task outliving its call runs apart from the agent"
+                );
+            }
+            ledger.observe(&channel(agent_id), second);
+            let after = ledger.activity(agent_id).unwrap();
+            assert_eq!(after.open_tool_calls, []);
+            assert_eq!(after.open_background_tasks, []);
+        }
+    }
+
+    #[test]
+    fn a_task_whose_call_closed_or_that_names_none_is_background_work() {
+        let ledger = SendLedger::new();
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        let turn_id = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(message_id, turn_id, send_id),
+        );
+        // A background launch: the call returns as soon as the task starts.
+        ledger.observe(
+            &channel(agent_id),
+            &tool_started(turn_id, "toolu_B", "Agent"),
+        );
+        ledger.observe(
+            &channel(agent_id),
+            &task_started_by(turn_id, "b1", "Ack test", "toolu_B"),
+        );
+        ledger.observe(&channel(agent_id), &tool_completed(turn_id, "toolu_B"));
+        ledger.observe(
+            &channel(agent_id),
+            &task_started(turn_id, "c1", "Sleep for 45 seconds"),
+        );
+        let activity = ledger.activity(agent_id).unwrap();
+        assert_eq!(activity.open_tool_calls, []);
+        assert_eq!(
+            activity
+                .open_background_tasks
+                .iter()
+                .map(|task| task.description.as_str())
+                .collect::<Vec<_>>(),
+            ["Ack test", "Sleep for 45 seconds"]
+        );
+    }
+
+    #[test]
+    fn a_turns_end_clears_its_open_tasks() {
+        let ledger = SendLedger::new();
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        let first = Uuid::now_v7();
+        ledger.observe(&channel(agent_id), &turn_start(message_id, first, send_id));
+        ledger.observe(
+            &channel(agent_id),
+            &task_started(first, "a1", "Sleep for 45 seconds"),
+        );
+        assert_eq!(background_tasks(&ledger, agent_id).len(), 1);
+        // The process exits without notifying the task's end.
+        ledger.observe(
+            &channel(agent_id),
+            &turn_end(first, &json!({ "status": "completed" })),
+        );
+        assert_eq!(ledger.activity(agent_id), None, "no turn runs");
+
+        let next = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(Uuid::now_v7(), next, Uuid::now_v7()),
+        );
+        assert_eq!(
+            background_tasks(&ledger, agent_id),
+            [],
+            "the ended turn's task is not the next turn's"
+        );
+        // A late event for a task the ledger never saw start opens nothing.
+        ledger.observe(
+            &channel(agent_id),
+            &task_progress(next, "a1", "Running Sleep"),
+        );
+        assert_eq!(background_tasks(&ledger, agent_id), []);
     }
 
     #[test]
@@ -1890,8 +2270,10 @@ mod tests {
                 seconds_since_output: 600,
                 open_tool_calls: vec![OpenToolCall {
                     name: "Bash".to_owned(),
+                    activity: None,
                     running_seconds: 600
                 }],
+                open_background_tasks: Vec::new(),
             },
             "a test suite running is silence with a tool call open"
         );
@@ -1900,7 +2282,8 @@ mod tests {
             ledger.activity(agent_id).unwrap(),
             AgentActivity {
                 seconds_since_output: 0,
-                open_tool_calls: Vec::new()
+                open_tool_calls: Vec::new(),
+                open_background_tasks: Vec::new(),
             }
         );
         ledger.observe(&channel(agent_id), &tool_started(turn_id, "t2", "Read"));
@@ -2149,6 +2532,37 @@ mod tests {
             Some(""),
             "the foreign turn's text did not land on the registered entry"
         );
+    }
+
+    #[test]
+    fn the_open_turn_names_its_send_even_one_the_ledger_never_registered() {
+        let ledger = SendLedger::new();
+        let agent_id = Uuid::now_v7();
+        assert_eq!(ledger.open_turn(agent_id), None, "no turn has run");
+        // A compose send the ledger never registered.
+        let typed = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(Uuid::now_v7(), turn_id, typed),
+        );
+        assert_eq!(ledger.open_turn(agent_id), Some(Some(typed)));
+        ledger.observe(
+            &channel(agent_id),
+            &turn_end(turn_id, &json!({ "status": "completed" })),
+        );
+        assert_eq!(ledger.open_turn(agent_id), None, "the turn ended");
+    }
+
+    #[test]
+    fn a_turn_whose_start_fails_to_parse_still_reads_as_open() {
+        let ledger = SendLedger::new();
+        let agent_id = Uuid::now_v7();
+        let mut start = turn_start(Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        start["send_id"] = json!("not a send id");
+        ledger.observe(&channel(agent_id), &start);
+        assert_eq!(ledger.open_turn(agent_id), Some(None));
+        assert!(ledger.activity(agent_id).is_some());
     }
 
     #[test]

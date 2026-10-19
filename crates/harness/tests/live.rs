@@ -149,6 +149,44 @@ async fn live_claude_background_agent_completes_as_one_turn() {
         matches!(events.last(), Some(AdapterEvent::TurnEnd { .. })),
         "the terminal arrives after all content"
     );
+
+    // Reporting a background sub-agent as work running apart from the agent
+    // rests on this, observed at 2.1.198: its task names the Agent call that
+    // launched it, and that call closes (the launch returns at once) before
+    // the task ends, inside the turn.
+    let agent_call = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::ToolStarted {
+                tool_use_id, name, ..
+            } if name == "Agent" => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no Agent call launched the sub-agent; events: {events:?}"));
+    let task = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::TaskStarted {
+                task_id,
+                tool_use_id,
+                ..
+            } if tool_use_id.as_deref() == Some(agent_call.as_str()) => Some(task_id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no task names the Agent call {agent_call}; events: {events:?}"));
+    let call_closed = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::ToolCompleted { tool_use_id, .. } if *tool_use_id == agent_call))
+        .unwrap_or_else(|| panic!("the Agent call {agent_call} never closed; events: {events:?}"));
+    let task_ended = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::TaskEnded { task_id, .. } if *task_id == task))
+        .unwrap_or_else(|| panic!("task {task} never ended; events: {events:?}"));
+    assert!(
+        call_closed < task_ended,
+        "a background launch closes its call before its task ends: call closed at event \
+         {call_closed}, task ended at event {task_ended}; events: {events:?}"
+    );
 }
 
 #[tokio::test]

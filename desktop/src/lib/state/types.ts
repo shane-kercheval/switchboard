@@ -202,6 +202,18 @@ export type ToolCall = {
   stop_reason?: "cancelled" | "failed";
 };
 
+/// One open task of the in-flight turn: what it was started to do, what it
+/// last reported doing (absent until its first progress event), and the tool
+/// call that started it. While that call is still running, the agent waits on
+/// the task (a sub-agent it delegated to); otherwise the task runs apart from
+/// it in the background.
+export type OpenTask = {
+  task_id: string;
+  description: string;
+  activity?: string;
+  tool_use_id?: string;
+};
+
 /// One optimistic send awaiting its `turn_start`. `user_turn_id` keys the
 /// optimistic user turn in the transcript (so a client-side IPC failure can
 /// prune the right entry wherever it sits in the list); `message_id` is the
@@ -362,6 +374,13 @@ export type AgentRuntime = {
   /// HEARTBEAT_TIMEOUT_MS` (the timer fired one threshold after the last
   /// activity).
   quiet_since?: string;
+  /// The in-flight turn's open tasks: sub-agents it delegated to (waited on
+  /// or in the background) and commands it runs in the background. Most
+  /// recently started or active last, so the footer names the latest thing
+  /// one of them did.
+  /// Reset at `turn_start` and cleared at `turn_end`, since a task never
+  /// outlives its turn. Absent or empty when none is open.
+  open_tasks?: OpenTask[];
   /// Runtime record of the last turn's failure (not rendered — failures surface
   /// in the transcript as a failed agent turn). Set on failed `TurnEnd` or a
   /// pre-start `message_failed`; cleared on the next successful turn. Does NOT

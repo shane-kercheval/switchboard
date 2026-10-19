@@ -33,6 +33,7 @@
     retryAgentSubscription,
     runtimes,
     transcripts,
+    type OpenTask,
     type Turn,
   } from "$lib/state/index.svelte";
   import {
@@ -841,6 +842,33 @@
   /// which formatDuration clamps to "0s".
   function turnElapsedMs(startedAt: string): number {
     return now - Date.parse(startedAt);
+  }
+
+  /// What a quiet turn is waiting on, for the live footer: first the
+  /// sub-agents it waits on (a task whose starting tool call is still running
+  /// in this turn), else the work it handed off to the background. The label
+  /// names the most recently active task of that kind; `count` is how many of
+  /// that kind are open. `undefined` when no task is open.
+  function quietWork(
+    turn: AgentTurn,
+    tasks: OpenTask[],
+  ): { label: string; count: number } | undefined {
+    const runningCalls = new Set(
+      turn.items.flatMap((item) =>
+        item.item_kind === "tool" &&
+        item.completed_at === undefined &&
+        item.stopped_at === undefined
+          ? [item.tool_use_id]
+          : [],
+      ),
+    );
+    const waitedOn = tasks.filter(
+      (task) => task.tool_use_id !== undefined && runningCalls.has(task.tool_use_id),
+    );
+    const [kind, group] = waitedOn.length > 0 ? ["Sub-agent", waitedOn] : ["Background", tasks];
+    const latest = group.at(-1);
+    if (latest === undefined) return undefined;
+    return { label: `${kind}: ${latest.activity ?? latest.description}`, count: group.length };
   }
 
   /// Elapsed silence for a quiet turn: the timer fired one full
@@ -1890,8 +1918,10 @@
     rt?.quiet_since !== undefined && rt?.in_flight_turn_id === turn.turn_id
       ? rt.quiet_since
       : undefined}
+  {@const work = quietSince !== undefined ? quietWork(turn, rt?.open_tasks ?? []) : undefined}
   <div
-    class="mt-2 flex items-center gap-2 text-xs {quietSince !== undefined
+    class="mt-2 flex min-w-0 items-center gap-2 text-xs {quietSince !== undefined &&
+    work === undefined
       ? 'text-warning'
       : 'text-muted'}"
     data-testid="turn-working"
@@ -1910,9 +1940,21 @@
          once silent past HEARTBEAT_TIMEOUT_MS the word swaps to "No response"
          and the number swaps to the silence counter — still alive on the
          backend, a soft caution, never a failure — and both revert the moment
-         activity resumes. The dots animate; the text never does (the words
-         being read must not fade). -->
-    {#if quietSince !== undefined}
+         activity resumes. A silent agent waiting on a sub-agent, or with work
+         handed off to the background, is not a caution: the word names what
+         the latest task did ("Sub-agent: …" or "Background: …") with how many
+         are open. The silence counter stays beside it, the one exception to a
+         single number, because a task left running (a dev server) cannot show
+         whether the agent itself has hung. The dots animate; the text never
+         does (the words being read must not fade). -->
+    {#if work !== undefined && quietSince !== undefined}
+      {@const label = `${work.label} (${work.count})`}
+      <span class="min-w-0 truncate" title={label} data-testid="turn-background">{label}</span>
+      <LoadingDots />
+      <span class="tabular-nums" data-testid="turn-quiet-elapsed"
+        >{formatDuration(quietElapsedMs(quietSince))}</span
+      >
+    {:else if quietSince !== undefined}
       <span>No response</span>
       <LoadingDots />
       <span class="tabular-nums" data-testid="turn-quiet-elapsed"

@@ -52,6 +52,9 @@ pub struct Script {
     /// Codex's stays open while it reads its rollout: the actor holds the
     /// agent's session meanwhile, though the reply is complete.
     pub drain: Option<Arc<Notify>>,
+    /// A task (its id and description) the turn starts after its text. It
+    /// names no starting call, so it is reported as background work.
+    pub background_task: Option<(String, String)>,
 }
 
 impl Script {
@@ -65,7 +68,34 @@ impl Script {
             context: None,
             hold_dispatch: None,
             drain: None,
+            background_task: None,
         }
+    }
+
+    pub fn with_background_task(self, task_id: &str, description: &str) -> Self {
+        Self {
+            background_task: Some((task_id.to_owned(), description.to_owned())),
+            ..self
+        }
+    }
+
+    /// What the turn streams before it parks or ends: its text, then the task
+    /// it starts, if any.
+    fn opening_events(&self, turn_id: TurnId) -> Vec<AdapterEvent> {
+        let mut events = vec![AdapterEvent::ContentChunk {
+            turn_id,
+            kind: ContentKind::Text,
+            text: self.text.clone(),
+        }];
+        if let Some((task_id, description)) = &self.background_task {
+            events.push(AdapterEvent::TaskStarted {
+                turn_id,
+                task_id: task_id.clone(),
+                description: description.clone(),
+                tool_use_id: None,
+            });
+        }
+        events
     }
 
     pub fn draining(self, gate: &Arc<Notify>) -> Self {
@@ -201,11 +231,9 @@ impl HarnessAdapter for ScriptedAdapter {
                 .key
                 .clone()
                 .unwrap_or_else(|| format!("msg-{turn_id}"));
-            let _ = tx.send(AdapterEvent::ContentChunk {
-                turn_id,
-                kind: ContentKind::Text,
-                text: script.text.clone(),
-            });
+            for event in script.opening_events(turn_id) {
+                let _ = tx.send(event);
+            }
             if let Some(gate) = &script.park {
                 if script.ignore_cancel {
                     gate.notified().await;
@@ -747,15 +775,10 @@ impl TestEnv {
         self.write_claude_session(project_id, agent_id, &claude_turn_lines(turns));
     }
 
-    /// Rewrite the agent's current Claude session file (the one its locator
-    /// names, without minting a new session) with these turns, through the
-    /// store rather than the loaded-project map, so it works after a restart.
-    pub fn overwrite_claude_turns(
-        &self,
-        project_id: ProjectId,
-        agent_id: AgentId,
-        turns: &[(&str, &str, &str, chrono::DateTime<Utc>)],
-    ) {
+    /// The agent's current Claude session file (the one its locator names,
+    /// without minting a new session), through the store rather than the
+    /// loaded-project map, so it works after a restart.
+    fn current_claude_session_path(&self, project_id: ProjectId, agent_id: AgentId) -> PathBuf {
         let project = super::read::project_readonly(&self.state, project_id).unwrap();
         let agent = project
             .list_agents()
@@ -766,16 +789,41 @@ impl TestEnv {
         let Some(SessionLocator::Uuid(session)) = agent.session_locator else {
             panic!("the agent has a Claude session");
         };
-        let path = switchboard_harness::claude_session_file_path(
+        switchboard_harness::claude_session_file_path(
             self.home.path(),
             &project.directory,
             &session,
-        );
+        )
+    }
+
+    /// Rewrite the agent's current Claude session file with these turns.
+    pub fn overwrite_claude_turns(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        turns: &[(&str, &str, &str, chrono::DateTime<Utc>)],
+    ) {
+        let path = self.current_claude_session_path(project_id, agent_id);
         let body: String = claude_turn_lines(turns)
             .iter()
             .map(|l| serde_json::to_string(l).unwrap() + "\n")
             .collect();
         std::fs::write(&path, body).unwrap();
+    }
+
+    /// Append one completed-looking turn (prompt, answer, message id `key`)
+    /// to the agent's current Claude session file, as Claude writes a reply's
+    /// first cycle, end-of-turn marker included, while the turn still runs.
+    pub fn append_claude_turn(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        prompt: &str,
+        text: &str,
+        key: &str,
+    ) {
+        let path = self.current_claude_session_path(project_id, agent_id);
+        append_claude_turn(&path, prompt, text, key);
     }
 
     /// Give the agent a Claude session file holding one completed turn that
@@ -1000,15 +1048,15 @@ pub fn claude_session_jsonl(prompt: &str, text: &str, key: &str) -> String {
 fn append_claude_turn(path: &Path, prompt: &str, text: &str, key: &str) {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).unwrap();
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-    {
-        let _ = file.write_all(claude_session_jsonl(prompt, text, key).as_bytes());
-    }
+        .unwrap()
+        .write_all(claude_session_jsonl(prompt, text, key).as_bytes())
+        .unwrap();
 }
 
 /// Poll until the agent's turn is running (a send is accepted before its

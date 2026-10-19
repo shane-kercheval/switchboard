@@ -4723,6 +4723,28 @@ async fn the_latest_answer_survives_an_orchestrators_compaction() {
     );
 }
 
+/// A compaction journals nothing, so no transcript turn pairs with its send:
+/// while one runs, the answer read from disk is the one before it.
+#[tokio::test]
+async fn a_running_compaction_leaves_the_latest_answer_on_disk_alone() {
+    let (env, project_id, agent_id) = compactable_agent();
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("compacting", &gate));
+    let compaction = compact_now(&env, compact_request(project_id, agent_id, None))
+        .await
+        .unwrap();
+    await_turn_running(&env.state, agent_id).await;
+
+    let output = read_latest_reply(&env.state, project_id, agent_id, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(output.status, LatestReplyStatus::Completed);
+    assert_eq!(output.text.as_deref(), Some("seeded"));
+    assert!(output.newer_turn_running);
+    gate.notify_one();
+    wait_done(&env, project_id, compaction.send_id).await;
+}
+
 #[tokio::test]
 async fn an_agent_of_another_project_is_not_a_recipient() {
     let mut env = TestEnv::new();
@@ -6793,6 +6815,291 @@ async fn the_latest_answer_says_when_a_newer_turn_is_running() {
     assert!(
         mid_turn.newer_turn_running,
         "and it says a newer turn is running"
+    );
+    gate.notify_one();
+}
+
+/// Claude writes a reply's first cycle, end-of-turn marker included, while
+/// the turn waits on background work, so the session file holds a
+/// complete-looking record for a send the ledger still shows as running. That
+/// record is not the latest answer: one send never reads as both completed
+/// and running.
+#[tokio::test]
+async fn a_running_send_already_on_disk_is_not_the_latest_answer() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let first = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "one"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, first.send_id).await;
+
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("two's answer", &gate));
+    let second = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "two"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    env.append_claude_turn(project_id, agents[0], "two", "two's answer so far", "m-two");
+    switchboard_core::journal::append_record(
+        &env.journal_path(project_id),
+        &JournalRecord::TurnLink {
+            send_id: second.send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: agents[0],
+            hydration_key: "m-two".to_owned(),
+            at: Utc::now(),
+        },
+    )
+    .unwrap();
+
+    let mid_turn = read_latest_reply(&env.state, project_id, agents[0], &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        mid_turn.text.as_deref(),
+        Some("ack: one"),
+        "the finished answer before the running send"
+    );
+    assert_eq!(mid_turn.send_id, Some(first.send_id));
+    assert_eq!(mid_turn.status, LatestReplyStatus::Completed);
+    assert!(mid_turn.newer_turn_running);
+    gate.notify_one();
+}
+
+/// The same record before Claude's early link lands: the running send pairs
+/// with it by position and is still left out.
+#[tokio::test]
+async fn a_running_send_paired_by_position_is_not_the_latest_answer() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let first = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "one"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, first.send_id).await;
+
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("two's answer", &gate));
+    send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "two"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    env.append_claude_turn(project_id, agents[0], "two", "two's answer so far", "m-two");
+
+    let mid_turn = read_latest_reply(&env.state, project_id, agents[0], &env.home())
+        .await
+        .unwrap();
+    assert_eq!(mid_turn.text.as_deref(), Some("ack: one"));
+    assert_eq!(mid_turn.send_id, Some(first.send_id));
+    assert!(mid_turn.newer_turn_running);
+    gate.notify_one();
+}
+
+/// A message the user typed in the window is never registered with the
+/// ledger, and its running reply is left out all the same.
+#[tokio::test]
+async fn a_running_reply_the_user_typed_is_not_the_latest_answer() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let first = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "one"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, first.send_id).await;
+
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("the user's answer", &gate));
+    let typed = Uuid::now_v7();
+    send_message_impl(&env.state, agents[0], "two", Vec::new(), typed, &env.home())
+        .await
+        .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    env.append_claude_turn(
+        project_id,
+        agents[0],
+        "two",
+        "the user's answer so far",
+        "m-two",
+    );
+    switchboard_core::journal::append_record(
+        &env.journal_path(project_id),
+        &JournalRecord::TurnLink {
+            send_id: typed,
+            turn_id: Uuid::now_v7(),
+            agent_id: agents[0],
+            hydration_key: "m-two".to_owned(),
+            at: Utc::now(),
+        },
+    )
+    .unwrap();
+
+    let mid_turn = read_latest_reply(&env.state, project_id, agents[0], &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        mid_turn.text.as_deref(),
+        Some("ack: one"),
+        "the finished answer before the user's running reply"
+    );
+    assert_eq!(mid_turn.send_id, Some(first.send_id));
+    assert_eq!(mid_turn.status, LatestReplyStatus::Completed);
+    assert!(mid_turn.newer_turn_running);
+    gate.notify_one();
+}
+
+/// An agent whose only reply is still running has no answer yet, even with
+/// that reply's first cycle on disk.
+#[tokio::test]
+async fn a_first_reply_still_running_is_no_answer_yet() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("one's answer", &gate));
+    send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "one"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    env.append_claude_turn(project_id, agents[0], "one", "one's answer so far", "m-one");
+
+    let mid_turn = read_latest_reply(&env.state, project_id, agents[0], &env.home())
+        .await
+        .unwrap();
+    assert_eq!(mid_turn.status, LatestReplyStatus::None);
+    assert_eq!(mid_turn.text, None);
+    assert!(mid_turn.newer_turn_running);
+    gate.notify_one();
+}
+
+/// A reply cancelled while it waited leaves a complete-looking record on
+/// disk. While the next reply runs, the latest answer is that cancellation,
+/// as it is once nothing runs, not the cancelled reply's partial text.
+#[tokio::test]
+async fn a_reply_cancelled_before_the_running_one_reads_as_cancelled() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let first_gate = Arc::new(Notify::new());
+    env.adapter
+        .push(Script::parked("one's answer so far", &first_gate));
+    let first = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "one"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+    cancel_send(&env.state, project_id, first.send_id, None).unwrap();
+    assert_eq!(
+        wait_done(&env, project_id, first.send_id).await.recipients[0].status,
+        SendStatus::Cancelled
+    );
+
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("two's answer", &gate));
+    send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "two"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+
+    let mid_turn = read_latest_reply(&env.state, project_id, agents[0], &env.home())
+        .await
+        .unwrap();
+    assert_eq!(mid_turn.status, LatestReplyStatus::Cancelled);
+    assert_eq!(mid_turn.send_id, Some(first.send_id));
+    assert!(mid_turn.newer_turn_running);
+    gate.notify_one();
+}
+
+/// A task that names no starting call is work handed off to the background:
+/// a wait reports it under the agent's open background tasks, so a caller can
+/// tell waiting on it from silence.
+#[tokio::test]
+async fn a_wait_reports_the_agents_open_background_task() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    env.adapter
+        .push(Script::parked("delegating", &gate).with_background_task("a1", "Review the parser"));
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "go"),
+    )
+    .await
+    .unwrap();
+    // The ledger notes the task as its event passes through.
+    let mut noted = false;
+    for _ in 0..500 {
+        if env
+            .state
+            .ledger
+            .activity(agents[0])
+            .is_some_and(|a| !a.open_background_tasks.is_empty())
+        {
+            noted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(noted, "the task never reached the ledger");
+
+    let waiting = wait_send(
+        &env.state,
+        project_id,
+        receipt.send_id,
+        &short(),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    let activity = serde_json::to_value(
+        waiting.recipients[0]
+            .activity
+            .as_ref()
+            .expect("a running turn's activity"),
+    )
+    .unwrap();
+    let tasks = &activity["open_background_tasks"];
+    assert_eq!(tasks.as_array().map(Vec::len), Some(1), "{activity}");
+    assert_eq!(tasks[0]["description"], "Review the parser", "{activity}");
+    assert!(tasks[0]["running_seconds"].is_u64(), "{activity}");
+    assert!(
+        tasks[0].get("activity").is_none(),
+        "no activity before the task reports progress: {activity}"
+    );
+
+    let agent = wait_agent(&env.state, project_id, agents[0], &short(), &env.home())
+        .await
+        .unwrap();
+    assert_eq!(agent.status, AgentWaitStatus::Running);
+    assert_eq!(
+        agent
+            .activity
+            .expect("a running turn's activity")
+            .open_background_tasks[0]
+            .description,
+        "Review the parser"
     );
     gate.notify_one();
 }

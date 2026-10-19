@@ -17,8 +17,11 @@
 //!   that cannot be probed without destroying developer state (auth, quota) are
 //!   exactly the ones not to cut over blind on, and `stream-json` is young —
 //!   1.1.18 was still fixing a dropped stream that reported a failed turn as a
-//!   clean success. Hence: a stream *failure* is authoritative, a stream
-//!   *success* only corroborates.
+//!   clean success. Hence, for the turn's verdict: a stream *failure* is
+//!   authoritative, a stream *success* only corroborates. A single tool step
+//!   is the other way round: the transcript's result settles it, and the
+//!   stream's report is used only when the transcript has none (see
+//!   `AntigravityParserState::close_pending_tools`).
 //! - **The stream is the fallback witness to a failed tool call.** agy 1.1.19
 //!   wrote **no transcript record at all** for a tool call rejected during
 //!   argument validation — the `step_index` sequence simply skipped it — so
@@ -701,11 +704,12 @@ async fn run_producer(ctx: ProducerCtx) {
                                     // no transcript record for one, so this
                                     // was its only trace; agy 1.4.2 also
                                     // writes a `status:"ERROR"` result, which
-                                    // settles the step first. Recorded, not
-                                    // paired: which tool it belongs to cannot
-                                    // be known until the transcript has caught
-                                    // up, so resolution happens at the final
-                                    // drain below.
+                                    // settles the step. Recorded, not paired:
+                                    // which tool it belongs to cannot be known
+                                    // until the transcript has caught up, so
+                                    // resolution happens at the final drain
+                                    // below, and the transcript's verdict
+                                    // stands whichever channel arrived first.
                                     parser_state
                                         .record_stream_tool_failure(step_index, message);
                                 }
@@ -1004,11 +1008,11 @@ async fn run_producer(ctx: ProducerCtx) {
     // is paired earlier. Emitting here means a failed tool flips from running
     // to failed at turn end rather than mid-turn; that latency is the price of
     // never showing the failure on the wrong tool.
-    let (closed, unattributed) = parser_state.close_pending_tools(turn_id);
-    for event in closed {
+    let closed = parser_state.close_pending_tools(turn_id);
+    for event in closed.events {
         let _ = tx.send(event);
     }
-    if !unattributed.is_empty() {
+    if !closed.unattributed.is_empty() {
         // Ambiguous attribution: the tools are still closed as failed above
         // (no spinner survives), but their harness messages could not be tied
         // to a specific call, so they are surfaced here rather than guessed
@@ -1016,7 +1020,7 @@ async fn run_producer(ctx: ProducerCtx) {
         tracing::warn!(
             %turn_id,
             agent_id = %agent_id,
-            messages = ?unattributed,
+            messages = ?closed.unattributed,
             "antigravity: stream reported tool failures that could not be attributed to a \
              specific tool call; affected tools closed as failed with authored copy"
         );
@@ -1031,15 +1035,14 @@ async fn run_producer(ctx: ProducerCtx) {
             "antigravity: transcript had tool result records that never matched a tool call"
         );
     }
-    let contradicted = parser_state.contradicted_stream_failures();
-    if !contradicted.is_empty() {
+    if !closed.contradicted.is_empty() {
         // Never observed: the transcript, which owns the displayed result,
         // recorded these steps as successes while the stream called them
         // failed. The transcript's verdict stands; this is the tripwire.
         tracing::warn!(
             %turn_id,
             agent_id = %agent_id,
-            failures = ?contradicted,
+            failures = ?closed.contradicted,
             "antigravity: stream reported tool failures for steps the transcript recorded as \
              successes; showing the transcript's result"
         );

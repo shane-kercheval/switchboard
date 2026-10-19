@@ -361,6 +361,18 @@ async fn live_antigravity_failing_command_completes_as_tool_error() {
          reworded it and `tool_result_content_is_error` needs the new wording. \
          Got: {completed:?}"
     );
+    // The command's own output proves the transcript's result settled the
+    // row, not the turn-end fallback that closes a call with no result as
+    // failed, which would satisfy the assertion above without this sentence
+    // being read at all.
+    assert!(
+        matches!(
+            completed,
+            Some(AdapterEvent::ToolCompleted { output, .. })
+                if output.contains("No such file or directory")
+        ),
+        "expected the command's output from the transcript; got: {completed:?}"
+    );
     assert!(
         events.iter().any(|event| matches!(
             event,

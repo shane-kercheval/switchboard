@@ -54,9 +54,11 @@ impl HarnessKind {
     /// any level for any model and silently degrades, `agy` validates
     /// client-side before dispatch: a model without an axis *rejects* one, and
     /// the valid set differs by model (GPT-OSS 120B takes only medium; the
-    /// Gemini and Claude models take low, medium and high). Switchboard always
-    /// sends a level for a model that has them, although `agy` has picked a
-    /// default for a bare one since 1.3.4. This flag only says the axis is
+    /// Gemini and Claude models take low, medium and high). The window's
+    /// pickers always store a level for a model that has them
+    /// (`effortIsRequired`); core does not enforce it, so an agent whose effort
+    /// was cleared through MCP dispatches a bare model, for which `agy` has
+    /// picked the model's default level since 1.3.4. This flag only says the axis is
     /// drivable; which levels a given model accepts is the picker's business — see
     /// `effortOptionsFor` in `desktop/src/lib/agentSelection.ts`.
     ///

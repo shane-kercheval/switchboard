@@ -96,8 +96,10 @@ impl TranscriptRecord {
         (self.source == "MODEL" && !self.is_planner_response()) || self.is_invalid_tool_call_error()
     }
 
-    /// Whether a tool result reports a failure. Each `agy` generation has
-    /// written a failed tool differently, and all of them are still read:
+    /// What a tool result says about failure, read before it is paired with
+    /// its call; [`ResultFailure::is_error_for`] turns it into the verdict.
+    /// Each `agy` generation has written a failed tool differently, and all of
+    /// them are still read:
     ///
     /// - 1.1.2: a rejected call as `SYSTEM` / `ERROR_MESSAGE` naming an
     ///   invalid tool call, with `status:"DONE"`.
@@ -111,13 +113,15 @@ impl TranscriptRecord {
     /// `status:"FAILED"` predates these captures and is kept. A command that
     /// ran and exited non-zero carries no structured signal in any version, so
     /// it is read from the record's prose by [`tool_result_content_is_error`].
-    pub(crate) fn tool_result_is_error(&self) -> bool {
-        self.is_invalid_tool_call_error()
-            || matches!(self.status.as_deref(), Some("FAILED" | "ERROR"))
-            || self
+    pub(crate) fn tool_result_failure(&self) -> ResultFailure {
+        ResultFailure {
+            structured: self.is_invalid_tool_call_error()
+                || matches!(self.status.as_deref(), Some("FAILED" | "ERROR")),
+            nonzero_exit_header: self
                 .content
                 .as_deref()
-                .is_some_and(tool_result_content_is_error)
+                .is_some_and(tool_result_content_is_error),
+        }
     }
 
     pub(crate) fn tool_result_output(&self) -> String {
@@ -151,6 +155,39 @@ impl TranscriptRecord {
     }
 }
 
+/// The one tool whose results report an exit code. **Failed-command detection
+/// is tied to this name:** at agy 1.4.2 every result record has
+/// `type:"GENERIC"`, so only the paired call says a result came from a
+/// command. If `agy` renamed it, failed commands would read as successes again
+/// (`live_antigravity_failing_command_completes_as_tool_error` fails on that).
+/// A command that ran in the background and whose exit is reported through a
+/// separate status tool is not covered; none has been observed.
+const COMMAND_TOOL: &str = "run_command";
+
+/// What a tool-result record says about failure, before it is paired with its
+/// call. A result can be read before the planner record that names its call,
+/// and part of the verdict depends on that call, so the record's two signals
+/// are kept apart until [`Self::is_error_for`] combines them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResultFailure {
+    /// A failure the record states whatever the tool: `status:"FAILED"` or
+    /// `"ERROR"`, or the 1.1.2 invalid-tool-call shape.
+    structured: bool,
+    /// The header says a command exited non-zero. A failure only for a
+    /// command call.
+    nonzero_exit_header: bool,
+}
+
+impl ResultFailure {
+    /// The verdict for this result once paired with a call named `tool_name`.
+    /// **The one place a tool result's failure is decided:** the live parser's
+    /// two pairing points and hydration's two all call it, so the live and
+    /// reopened views of a tool cannot disagree.
+    pub(crate) fn is_error_for(self, tool_name: &str) -> bool {
+        self.structured || (self.nonzero_exit_header && tool_name == COMMAND_TOOL)
+    }
+}
+
 /// Whether a command result's header says the command exited non-zero.
 ///
 /// **A substring match on `agy`'s prose**, because the record has no exit-code
@@ -163,9 +200,12 @@ impl TranscriptRecord {
 ///   The same sentence with code 0 is a success.
 ///
 /// Only the header is scanned: the loop stops at the `Output:` marker, so a
-/// command that prints one of these sentences is not misread. A third
-/// rewording would read as success again;
-/// `live_antigravity_failing_command_completes_as_tool_error` is the guard.
+/// command that prints one of these sentences is not misread. And the result
+/// counts as failed only when its call is [`COMMAND_TOOL`] (see
+/// [`ResultFailure::is_error_for`]), so a web page or MCP reply that quotes the
+/// sentence is not misread either. A third rewording would read as success
+/// again; `live_antigravity_failing_command_completes_as_tool_error` is the
+/// guard.
 fn tool_result_content_is_error(content: &str) -> bool {
     for line in content.lines() {
         let trimmed = line.trim();
@@ -210,13 +250,26 @@ pub struct AntigravityParserState {
     /// drain. Kept apart from `pending_tool_results` on purpose — see
     /// [`AntigravityParserState::record_stream_tool_failure`].
     stream_tool_failures: VecDeque<StreamToolFailure>,
-    /// Result steps a transcript record completed, with that record's
-    /// `is_error`. The final drain uses it to recognize a stream failure the
-    /// transcript already settled.
+    /// Result steps a transcript record completed, with the verdict shown for
+    /// that tool (after [`ResultFailure::is_error_for`]). The final drain uses
+    /// it to recognize a stream failure the transcript already settled.
     transcript_result_steps: BTreeMap<i64, bool>,
-    /// Stream failures for steps the transcript recorded as a success, kept
-    /// for diagnostics. See [`AntigravityParserState::close_pending_tools`].
-    contradicted_stream_failures: Vec<(i64, String)>,
+}
+
+/// What [`AntigravityParserState::close_pending_tools`] resolved at the final
+/// drain: the events to emit, and the two kinds of stream failure that close
+/// no tool, returned together so a caller cannot log one and miss the other.
+/// Each carries its `step_index`, the raw material for re-deriving the
+/// step→call invariant if agy's numbering ever shifts.
+#[derive(Debug)]
+pub(crate) struct ClosedTools {
+    pub(crate) events: Vec<AdapterEvent>,
+    /// Failures naming a step no pending tool expects and no transcript result
+    /// settled, with their message.
+    pub(crate) unattributed: Vec<(i64, String)>,
+    /// Failures on a step whose transcript result reported success. Never
+    /// observed; the transcript's result stands.
+    pub(crate) contradicted: Vec<(i64, Option<String>)>,
 }
 
 #[derive(Debug)]
@@ -228,6 +281,8 @@ struct StreamToolFailure {
 #[derive(Debug)]
 struct PendingToolStart {
     tool_use_id: String,
+    /// The call's tool name, which the result's verdict depends on.
+    tool_name: String,
     /// The transcript `step_index` this call's result will occupy, if it
     /// produces one: `planner_step + 1 + call_index`.
     ///
@@ -252,7 +307,7 @@ struct PendingToolStart {
 struct PendingToolResult {
     step_index: i64,
     output: String,
-    is_error: bool,
+    failure: ResultFailure,
 }
 
 /// Shown for a tool call that ended without a recorded result.
@@ -332,19 +387,12 @@ impl AntigravityParserState {
     /// reopened conversation can read: letting the stream override it would
     /// make the live row and the reopened row differ. A stream failure on a
     /// step the transcript recorded as a *success* is that disagreement, never
-    /// observed; it is kept in [`Self::contradicted_stream_failures`] so the
+    /// observed; it is returned in [`ClosedTools::contradicted`] so the
     /// producer can log it.
-    ///
-    /// Returns the events to emit plus any `(step_index, message)` pairs that
-    /// could not be attributed. The step index rides along because it is the
-    /// raw material for re-deriving the invariant if agy's numbering ever
-    /// shifts.
-    pub(crate) fn close_pending_tools(
-        &mut self,
-        turn_id: TurnId,
-    ) -> (Vec<AdapterEvent>, Vec<(i64, String)>) {
+    pub(crate) fn close_pending_tools(&mut self, turn_id: TurnId) -> ClosedTools {
         let mut events = Vec::new();
         let mut unattributed = Vec::new();
+        let mut contradicted = Vec::new();
 
         for failure in self.stream_tool_failures.drain(..) {
             match self
@@ -368,9 +416,7 @@ impl AntigravityParserState {
                 }
                 None => match self.transcript_result_steps.get(&failure.step_index) {
                     Some(true) => {}
-                    Some(false) => self
-                        .contradicted_stream_failures
-                        .push((failure.step_index, failure.message.unwrap_or_default())),
+                    Some(false) => contradicted.push((failure.step_index, failure.message)),
                     None => {
                         if let Some(message) = failure.message {
                             unattributed.push((failure.step_index, message));
@@ -390,13 +436,11 @@ impl AntigravityParserState {
                 is_error: true,
             });
         }
-        (events, unattributed)
-    }
-
-    /// Stream failures, collected by [`Self::close_pending_tools`], for steps
-    /// whose transcript result reported success.
-    pub(crate) fn contradicted_stream_failures(&self) -> &[(i64, String)] {
-        &self.contradicted_stream_failures
+        ClosedTools {
+            events,
+            unattributed,
+            contradicted,
+        }
     }
 
     pub fn unmatched_tool_result_steps(&self) -> Vec<i64> {
@@ -499,18 +543,20 @@ pub(crate) fn record_to_live_events_with_encoding(
             });
             let expected = expected_result_step(rec.step_index, call_index);
             if let Some(result) = take_result_for_step(&mut state.pending_tool_results, expected) {
+                let is_error = result.failure.is_error_for(&call.name);
                 state
                     .transcript_result_steps
-                    .insert(result.step_index, result.is_error);
+                    .insert(result.step_index, is_error);
                 out.push(AdapterEvent::ToolCompleted {
                     turn_id,
                     tool_use_id,
                     output: result.output,
-                    is_error: result.is_error,
+                    is_error,
                 });
             } else {
                 state.pending_tool_ids.push_back(PendingToolStart {
                     tool_use_id: tool_use_id.clone(),
+                    tool_name: call.name.clone(),
                     expected_result_step: expected,
                 });
             }
@@ -518,7 +564,7 @@ pub(crate) fn record_to_live_events_with_encoding(
     }
 
     if rec.is_tool_result() {
-        let is_error = rec.tool_result_is_error();
+        let failure = rec.tool_result_failure();
         let output = rec.tool_result_output();
         // Attach to the call that *expects* this step, never to whichever call
         // happens to be oldest. The old arrival-order rule ("first pending tool
@@ -537,6 +583,7 @@ pub(crate) fn record_to_live_events_with_encoding(
                 .pending_tool_ids
                 .remove(index)
                 .expect("index from position");
+            let is_error = failure.is_error_for(&pending.tool_name);
             state
                 .transcript_result_steps
                 .insert(rec.step_index, is_error);
@@ -553,7 +600,7 @@ pub(crate) fn record_to_live_events_with_encoding(
             state.pending_tool_results.push_back(PendingToolResult {
                 step_index: rec.step_index,
                 output,
-                is_error,
+                failure,
             });
         }
     }
@@ -1086,6 +1133,57 @@ mod tests {
         assert!(!completions[0].2, "{completions:?}");
     }
 
+    /// An MCP reply (1.4.2 writes it as a `GENERIC` result, like a command's)
+    /// that quotes the exit sentence on its own line, with no `Output:` marker
+    /// to stop the scan. Only a command's exit sentence means failure.
+    const MCP_REPLY_QUOTING_THE_EXIT_SENTENCE: [&str; 2] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"switchboard\"","ToolName":"\"read_reply\"","Arguments":"{\"agent\":\"builder\"}"}}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Created At: 2026-10-19T13:05:13-05:00\nCompleted At: 2026-10-19T13:05:13-05:00\nThe build agent replied:\nThe command exited with code 1.\nI'll fix the test next."}"#,
+    ];
+
+    #[test]
+    fn a_non_command_result_quoting_the_exit_sentence_is_not_a_failure() {
+        let mut state = AntigravityParserState::default();
+        let completions = completions_of(&MCP_REPLY_QUOTING_THE_EXIT_SENTENCE, &mut state);
+
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, "1:0:call_mcp_tool");
+        assert!(!completions[0].2, "{completions:?}");
+    }
+
+    /// The settled-steps map holds the verdict shown, not the record's raw
+    /// signals: a stream failure on that MCP step is a contradiction to log,
+    /// not a duplicate to drop.
+    #[test]
+    fn a_stream_failure_on_a_non_command_step_quoting_the_sentence_is_a_contradiction() {
+        let mut state = AntigravityParserState::default();
+        state.record_stream_tool_failure(2, Some("stream says the MCP call failed".to_owned()));
+        let _ = completions_of(&MCP_REPLY_QUOTING_THE_EXIT_SENTENCE, &mut state);
+        let closed = state.close_pending_tools(tid());
+
+        assert_eq!(
+            closed.contradicted,
+            vec![(2, Some("stream says the MCP call failed".to_owned()))]
+        );
+    }
+
+    #[test]
+    fn a_failed_command_result_read_before_its_call_still_fails() {
+        let mut state = AntigravityParserState::default();
+        let records = [
+            REJECTED_EDIT_THEN_FAILED_COMMAND[3],
+            REJECTED_EDIT_THEN_FAILED_COMMAND[2],
+        ];
+        let completions = completions_of(&records, &mut state);
+
+        assert_eq!(completions.len(), 1, "{completions:?}");
+        assert_eq!(completions[0].0, "3:0:run_command");
+        assert!(
+            completions[0].2,
+            "the buffered result is judged once its call is known"
+        );
+    }
+
     #[test]
     fn an_unparseable_exit_code_is_not_called_a_failure() {
         assert!(!tool_result_content_is_error(
@@ -1115,15 +1213,15 @@ mod tests {
             if !stream_first {
                 state.record_stream_tool_failure(2, Some(message.to_owned()));
             }
-            let (closed, unattributed) = state.close_pending_tools(tid());
+            let closed = state.close_pending_tools(tid());
 
             assert_eq!(completions.len(), 2, "stream_first={stream_first}");
-            assert!(closed.is_empty(), "stream_first={stream_first}: {closed:?}");
             assert!(
-                unattributed.is_empty(),
-                "stream_first={stream_first}: {unattributed:?}"
+                closed.events.is_empty()
+                    && closed.unattributed.is_empty()
+                    && closed.contradicted.is_empty(),
+                "stream_first={stream_first}: {closed:?}"
             );
-            assert!(state.contradicted_stream_failures().is_empty());
         }
     }
 
@@ -1135,14 +1233,14 @@ mod tests {
         let mut state = AntigravityParserState::default();
         state.record_stream_tool_failure(3, Some("stream says the echo failed".to_owned()));
         let completions = completions_of(&REJECTED_READ_BESIDE_A_SUCCESSFUL_COMMAND, &mut state);
-        let (closed, unattributed) = state.close_pending_tools(tid());
+        let closed = state.close_pending_tools(tid());
 
         assert!(!completions[1].2, "the transcript's success stands");
-        assert!(closed.is_empty());
-        assert!(unattributed.is_empty());
+        assert!(closed.events.is_empty(), "{closed:?}");
+        assert!(closed.unattributed.is_empty(), "{closed:?}");
         assert_eq!(
-            state.contradicted_stream_failures(),
-            &[(3, "stream says the echo failed".to_owned())]
+            closed.contradicted,
+            vec![(3, Some("stream says the echo failed".to_owned()))]
         );
     }
 
@@ -1254,7 +1352,11 @@ mod tests {
 
         // Final drain: B is the only tool left, and the only recorded failure,
         // so its message is attributable.
-        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        let ClosedTools {
+            events: closed,
+            unattributed,
+            ..
+        } = state.close_pending_tools(turn_id);
         assert!(unattributed.is_empty(), "{unattributed:?}");
         assert_eq!(closed.len(), 1);
         match &closed[0] {
@@ -1336,7 +1438,11 @@ mod tests {
         );
 
         // A closes at turn end with its own error — never B's output.
-        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        let ClosedTools {
+            events: closed,
+            unattributed,
+            ..
+        } = state.close_pending_tools(turn_id);
         assert!(unattributed.is_empty(), "{unattributed:?}");
         assert_eq!(closed.len(), 1);
         match &closed[0] {
@@ -1396,7 +1502,7 @@ mod tests {
             "step 4 belongs to call index 1, not index 0"
         );
 
-        let (closed, _) = state.close_pending_tools(turn_id);
+        let closed = state.close_pending_tools(turn_id).events;
         match &closed[0] {
             AdapterEvent::ToolCompleted {
                 tool_use_id,
@@ -1433,7 +1539,11 @@ mod tests {
         state.record_stream_tool_failure(3, Some("view_file blew up".to_owned()));
         state.record_stream_tool_failure(5, Some("run_command blew up".to_owned()));
 
-        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        let ClosedTools {
+            events: closed,
+            unattributed,
+            ..
+        } = state.close_pending_tools(turn_id);
         assert!(unattributed.is_empty(), "{unattributed:?}");
         let mut got: Vec<(String, String)> = closed
             .into_iter()
@@ -1481,7 +1591,11 @@ mod tests {
         // Expects step 3; the failure names 99.
         state.record_stream_tool_failure(99, Some("belongs to nothing here".to_owned()));
 
-        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        let ClosedTools {
+            events: closed,
+            unattributed,
+            ..
+        } = state.close_pending_tools(turn_id);
         assert_eq!(
             unattributed,
             vec![(99, "belongs to nothing here".to_owned())]
@@ -1517,7 +1631,11 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         state.record_stream_tool_failure(3, None);
-        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        let ClosedTools {
+            events: closed,
+            unattributed,
+            ..
+        } = state.close_pending_tools(turn_id);
         assert!(unattributed.is_empty());
         match &closed[0] {
             AdapterEvent::ToolCompleted { output, .. } => {
@@ -1544,7 +1662,11 @@ mod tests {
         }
         while rx.try_recv().is_ok() {}
 
-        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        let ClosedTools {
+            events: closed,
+            unattributed,
+            ..
+        } = state.close_pending_tools(turn_id);
         assert!(unattributed.is_empty(), "nothing was recorded to attribute");
         assert_eq!(closed.len(), 1, "the tool must not be left spinning");
         match &closed[0] {
@@ -1566,7 +1688,7 @@ mod tests {
     fn close_pending_tools_is_a_no_op_when_every_tool_resolved() {
         let turn_id = Uuid::now_v7();
         let mut state = AntigravityParserState::default();
-        assert_eq!(state.close_pending_tools(turn_id).0.len(), 0);
+        assert_eq!(state.close_pending_tools(turn_id).events.len(), 0);
     }
 
     #[test]

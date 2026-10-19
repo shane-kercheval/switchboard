@@ -14,18 +14,9 @@ import type { Preferences } from "$lib/types";
 
 // No model agy offers today lacks an effort axis, but the pickers still handle
 // one (agy 1.1.19 offered two), so these tests add one to the model table.
-vi.mock("$lib/antigravityModels.json", async (importOriginal) => {
-  const actual = await importOriginal<{ default: { models: unknown[] } }>();
-  return {
-    default: {
-      ...actual.default,
-      models: [
-        ...actual.default.models,
-        { value: "no-effort-model", label: "No Effort Model", efforts: null },
-      ],
-    },
-  };
-});
+vi.mock("$lib/antigravityModels.json", async (importOriginal) =>
+  (await import("../../../tests/fixtures/antigravityModels")).withStandIns(importOriginal),
+);
 
 // SettingsView embeds HarnessStatusList (probes install/auth on mount) and
 // McpServersSettings (loads providers on mount). Tests that override the mock
@@ -273,8 +264,8 @@ describe("SettingsView", () => {
   it("refuses an invalid Antigravity default before it can leak through another save", async () => {
     const stored = {
       ...DEFAULT_AGENT_SELECTIONS.antigravity,
-      model_choices: [...DEFAULT_AGENT_SELECTIONS.antigravity.model_choices, "gpt-oss-120b"],
-      default_model: "gpt-oss-120b",
+      model_choices: [...DEFAULT_AGENT_SELECTIONS.antigravity.model_choices, "medium-only-model"],
+      default_model: "medium-only-model",
       default_effort: "medium",
     };
     preferences.agent_defaults.antigravity = structuredClone(stored);
@@ -300,9 +291,9 @@ describe("SettingsView", () => {
 
   it("keeps an invalid Antigravity repair local until the default becomes valid", async () => {
     const storedDefaults = {
-      model_choices: ["gpt-oss-120b"],
+      model_choices: ["medium-only-model"],
       effort_choices: ["high"],
-      default_model: "gpt-oss-120b",
+      default_model: "medium-only-model",
       default_effort: "high",
     };
     preferences.agent_defaults.antigravity = structuredClone(storedDefaults);
@@ -360,9 +351,9 @@ describe("SettingsView", () => {
 
   it("discards an incomplete default repair when Settings is closed", async () => {
     preferences.agent_defaults.antigravity = {
-      model_choices: ["gpt-oss-120b"],
+      model_choices: ["medium-only-model"],
       effort_choices: ["high"],
-      default_model: "gpt-oss-120b",
+      default_model: "medium-only-model",
       default_effort: "high",
     };
     const view = render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
@@ -386,7 +377,7 @@ describe("SettingsView", () => {
 
   it("keeps the effort default independent when the default model has no effort axis", async () => {
     preferences.agent_defaults.antigravity = {
-      model_choices: ["no-effort-model", "gemini-3.8-flash"],
+      model_choices: ["no-effort-model", "three-level-model"],
       effort_choices: ["high", "medium"],
       default_model: "no-effort-model",
       default_effort: "high",
@@ -403,7 +394,7 @@ describe("SettingsView", () => {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             antigravity: {
-              model_choices: ["no-effort-model", "gemini-3.8-flash"],
+              model_choices: ["no-effort-model", "three-level-model"],
               effort_choices: ["high", "medium"],
               default_model: "no-effort-model",
               default_effort: "medium",

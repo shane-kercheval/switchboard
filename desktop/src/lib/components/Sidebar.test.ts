@@ -17,18 +17,9 @@ import Sidebar from "./Sidebar.svelte";
 
 // No model agy offers today lacks an effort axis, but the pickers still handle
 // one (agy 1.1.19 offered two), so these tests add one to the model table.
-vi.mock("$lib/antigravityModels.json", async (importOriginal) => {
-  const actual = await importOriginal<{ default: { models: unknown[] } }>();
-  return {
-    default: {
-      ...actual.default,
-      models: [
-        ...actual.default.models,
-        { value: "no-effort-model", label: "No Effort Model", efforts: null },
-      ],
-    },
-  };
-});
+vi.mock("$lib/antigravityModels.json", async (importOriginal) =>
+  (await import("../../../tests/fixtures/antigravityModels")).withStandIns(importOriginal),
+);
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => vi.fn()),
@@ -1190,7 +1181,7 @@ describe("Sidebar", () => {
 
     await openAgentActions();
     await fireEvent.click(await screen.findByTestId("agent-selection-settings"));
-    await fireEvent.click(screen.getByTestId("change-selection-model-choice-gemini-3.8-flash"));
+    await fireEvent.click(screen.getByTestId("change-selection-model-choice-three-level-model"));
 
     expect(screen.getByTestId("change-selection-invalid")).toHaveTextContent(
       "Choose a reasoning effort supported by the current model before saving.",
@@ -1400,20 +1391,20 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
-      model: "gemini-3.8-flash",
+      model: "three-level-model",
       effort: "high",
-      model_choices: ["gemini-3.8-flash", "gpt-oss-120b"],
+      model_choices: ["three-level-model", "medium-only-model"],
       effort_choices: ["high", "medium"],
     };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     const modelChip = screen.getByTestId("agent-model-chip");
-    expect(modelChip).toHaveAccessibleName(/Switch to GPT-OSS 120B — effort becomes Medium/);
+    expect(modelChip).toHaveAccessibleName(/Switch to Medium Only Model — effort becomes Medium/);
     await fireEvent.click(modelChip);
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "gpt-oss-120b",
+      model: "medium-only-model",
       effort: "medium",
     });
   });
@@ -1461,9 +1452,9 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
-      model: "gemini-3.8-flash",
+      model: "three-level-model",
       effort: "high",
-      model_choices: ["gemini-3.8-flash", "gpt-oss-120b"],
+      model_choices: ["three-level-model", "medium-only-model"],
       effort_choices: ["high"],
     };
     await state.registerAgent(agent);
@@ -1548,9 +1539,9 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
-      model: "gpt-oss-120b",
+      model: "medium-only-model",
       effort: "medium",
-      model_choices: ["gpt-oss-120b"],
+      model_choices: ["medium-only-model"],
       effort_choices: ["medium", "high"],
     };
     await state.registerAgent(agent);

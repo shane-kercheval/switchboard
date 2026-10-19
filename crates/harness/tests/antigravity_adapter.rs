@@ -540,6 +540,121 @@ async fn live_and_hydrated_views_agree_on_a_rejected_tool() {
     );
 }
 
+/// The agy 1.4.2 twin of the test above. A rejected call is now reported on
+/// both channels: the stream's `state:"ERROR"` step and a `status:"ERROR"`
+/// transcript result. A command that exits non-zero is reported only by its
+/// transcript header. What the user sees must be one failed row per tool,
+/// carrying the transcript's message, live and after reopening alike.
+///
+/// The stream's message is deliberately different from the transcript's, so
+/// the assertion proves which channel settled the row.
+#[tokio::test]
+async fn live_and_hydrated_views_agree_on_failures_agy_reports_on_both_channels() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    let transcript_error = "declaring permissions: cortex tool replace_file_content: convert tool call for permissions: model output error: invalid tool call error (invalid_args) /tmp/agyprobe/ABSENT_EDIT.txt does not exist in the current location.";
+    let records = [
+        json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-19T17:59:38Z","content":"<USER_REQUEST>\nedit then list\n</USER_REQUEST>"}),
+        json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:39Z","tool_calls":[{"name":"replace_file_content","args":{"TargetContent":"\"alpha\"","ReplacementContent":"\"beta\"","TargetFile":"\"/tmp/agyprobe/ABSENT_EDIT.txt\""}}]}),
+        json!({"step_index":2,"source":"MODEL","type":"GENERIC","status":"ERROR","created_at":"2026-10-19T17:59:42Z","error":transcript_error,"content":format!("Created At: 2026-10-19T12:59:42-05:00\nCompleted At: 2026-10-19T12:59:42-05:00\nEncountered error in step execution: {transcript_error}")}),
+        json!({"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:42Z","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"ls /definitely/not/here\"","Cwd":"\"/tmp/agyprobe/cwd\""}}]}),
+        json!({"step_index":4,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-10-19T17:59:44Z","content":"Created At: 2026-10-19T12:59:44-05:00\nCompleted At: 2026-10-19T12:59:44-05:00\n\nThe command exited with code 1.\nOutput:\nls: /definitely/not/here: No such file or directory\r\n\n"}),
+        json!({"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:44Z","content":"done"}),
+    ]
+    .iter()
+    .map(|record| json!({"json": record.to_string(), "delay_ms": 0}))
+    .collect::<Vec<Value>>();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "stream": [
+                init_event(uuid),
+                drip(
+                    &json!({
+                        "event": "step_update",
+                        "step_update": {
+                            "step_index": 2, "state": "ERROR", "step_type": "tool",
+                            "tool_name": "replace_file_content",
+                            "tool_info": {"error": {"type": "TOOL_ERROR", "message": "the stream's copy of the failure"}},
+                        },
+                    })
+                    .to_string(),
+                    0,
+                ),
+                result_event("SUCCESS", None),
+            ],
+            "records": records,
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "edit then list").await;
+    let live: Vec<(String, bool, String)> = events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => Some((tool_use_id.clone(), *is_error, output.clone())),
+            _ => None,
+        })
+        .collect();
+
+    let loaded =
+        load_antigravity_transcript(home.path(), cwd.path(), Some(uuid), agent.id).unwrap();
+    let Some(Turn::Agent { items, .. }) = loaded
+        .turns
+        .iter()
+        .find(|t| matches!(t, Turn::Agent { .. }))
+    else {
+        panic!("an agent turn; got: {loaded:?}")
+    };
+    let hydrated: Vec<(String, bool, String)> = items
+        .iter()
+        .filter_map(|item| match item {
+            TurnItem::Tool {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => Some((
+                tool_use_id.clone(),
+                is_error.unwrap_or(false),
+                output.clone().unwrap_or_default(),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        live.iter()
+            .map(|(id, is_error, _)| (id.as_str(), *is_error))
+            .collect::<Vec<_>>(),
+        vec![
+            ("1:0:replace_file_content", true),
+            ("3:0:run_command", true)
+        ],
+        "exactly one failed completion per tool; got: {events:?}"
+    );
+    assert_eq!(
+        live[0].2, transcript_error,
+        "the transcript's message, not the stream's"
+    );
+    assert!(live[1].2.contains("No such file or directory"), "{live:?}");
+    assert_eq!(
+        live, hydrated,
+        "reopening must show what the live view showed"
+    );
+}
+
 /// The timing half of the live/hydrated contract, asserted separately on each
 /// side because the two carry it differently: `AdapterEvent::ToolCompleted` has
 /// no timestamp field, so there is nothing to compare against hydration's

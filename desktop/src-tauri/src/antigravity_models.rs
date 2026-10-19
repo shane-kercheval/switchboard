@@ -70,10 +70,8 @@ struct CliModel {
 /// `agy` lists a model with effort levels once per level, the level folded
 /// into both the id and the label (`gemini-3.8-flash-high`,
 /// `Gemini 3.8 Flash (High)`), and a model without levels once, bare.
-fn cli_catalog(stdout: &str) -> Catalog {
-    let output: CliOutput = serde_json::from_str(stdout).unwrap_or_else(|e| {
-        panic!("agy's model list is not the JSON shape this test reads ({e}): {stdout}")
-    });
+fn cli_catalog(stdout: &str) -> Result<Catalog, serde_json::Error> {
+    let output: CliOutput = serde_json::from_str(stdout)?;
     let mut catalog = Catalog::new();
     for CliModel { id, label } in output.command.data.models {
         if let Some((base, level)) = folded_level(&id, &label) {
@@ -86,7 +84,7 @@ fn cli_catalog(stdout: &str) -> Catalog {
             catalog.entry(id).or_insert(None);
         }
     }
-    catalog
+    Ok(catalog)
 }
 
 /// The base model and level of a folded entry, or `None` for a bare one.
@@ -147,7 +145,7 @@ fn the_cli_model_list_groups_folded_levels_by_base_model() {
     ]}}}"#;
 
     assert_eq!(
-        cli_catalog(stdout),
+        cli_catalog(stdout).unwrap(),
         catalog(&[
             ("gemini-3.8-flash", Some(&["high", "low"])),
             ("gpt-oss-120b", Some(&["medium"])),
@@ -179,6 +177,22 @@ fn every_difference_names_the_model_and_what_changed() {
         ]
     );
     assert!(differences(&table, &table).is_empty());
+}
+
+/// The pickers key their buttons by model id, and [`table`] folds the file into
+/// a map, so a repeated id would pass the live comparison while breaking the
+/// window.
+#[test]
+fn each_model_id_appears_once_in_the_table() {
+    let table: Table = serde_json::from_str(TABLE).expect("antigravityModels.json parses");
+    let mut seen = BTreeSet::new();
+    for model in &table.models {
+        assert!(
+            seen.insert(model.value.as_str()),
+            "{} appears more than once in antigravityModels.json",
+            model.value
+        );
+    }
 }
 
 #[test]
@@ -220,15 +234,25 @@ fn live_antigravity_model_table_matches_the_cli_model_list() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let differences = differences(
-        &table(),
-        &cli_catalog(&String::from_utf8_lossy(&output.stdout)),
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let cli = cli_catalog(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "agy's model list is not the JSON shape this test reads ({e}); if agy is not \
+             signed in, run `agy` first. stdout: {stdout} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let differences = differences(&table(), &cli);
     assert!(
         differences.is_empty(),
-        "desktop/src/lib/antigravityModels.json no longer matches agy's model list. Update \
-         it, and any default that names a model agy dropped (DEFAULT_AGENT_SELECTIONS in \
-         agentSelection.ts, default_agent_defaults in preferences.rs), then record the \
+        "desktop/src/lib/antigravityModels.json no longer matches agy's model list for the \
+         signed-in account. Business and Google Cloud sign-ins can hide models, so before \
+         deleting a model reported missing, confirm it is gone: dispatch it bare with \
+         `agy -p ack --model <id>` and no `--effort` (it then reports `not recognized as a \
+         known model`; with `--effort` agy misreports an unknown model as `--effort is not \
+         supported`), or check from a second account. Then update the file, and any \
+         default that names a model agy dropped (DEFAULT_AGENT_SELECTIONS in \
+         agentSelection.ts, default_agent_defaults in preferences.rs), and record the \
          change in harness-behavior.md §3.3/§3.4:\n{}",
         differences.join("\n")
     );

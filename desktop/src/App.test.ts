@@ -19,18 +19,9 @@ import { DEFAULT_AGENT_SELECTIONS } from "$lib/agentSelection";
 
 // No model agy offers today lacks an effort axis, but the pickers still handle
 // one (agy 1.1.19 offered two), so these tests add one to the model table.
-vi.mock("$lib/antigravityModels.json", async (importOriginal) => {
-  const actual = await importOriginal<{ default: { models: unknown[] } }>();
-  return {
-    default: {
-      ...actual.default,
-      models: [
-        ...actual.default.models,
-        { value: "no-effort-model", label: "No Effort Model", efforts: null },
-      ],
-    },
-  };
-});
+vi.mock("$lib/antigravityModels.json", async (importOriginal) =>
+  (await import("../tests/fixtures/antigravityModels")).withStandIns(importOriginal),
+);
 import { shortcut } from "$lib/platform";
 // Static import so App.svelte's (large) component-tree transform happens at
 // module collection, not inside the first test that calls `mountApp`. `vi.mock`
@@ -893,7 +884,7 @@ describe("App", () => {
 
   it("new project: clears active effort but preserves choices for a no-effort default model", async () => {
     backend.agentDefaults.antigravity = {
-      model_choices: ["no-effort-model", "gemini-3.8-flash"],
+      model_choices: ["no-effort-model", "three-level-model"],
       effort_choices: ["high", "medium"],
       default_model: "no-effort-model",
       default_effort: "high",
@@ -911,7 +902,7 @@ describe("App", () => {
       selection: {
         model: "no-effort-model",
         effort: null,
-        model_choices: ["no-effort-model", "gemini-3.8-flash"],
+        model_choices: ["no-effort-model", "three-level-model"],
         effort_choices: ["high", "medium"],
       },
     });
@@ -919,9 +910,9 @@ describe("App", () => {
 
   it("new project: reports an Antigravity default with no compatible effort", async () => {
     backend.agentDefaults.antigravity = {
-      model_choices: ["gpt-oss-120b"],
+      model_choices: ["medium-only-model"],
       effort_choices: ["high"],
-      default_model: "gpt-oss-120b",
+      default_model: "medium-only-model",
       default_effort: "high",
     };
     await mountApp();

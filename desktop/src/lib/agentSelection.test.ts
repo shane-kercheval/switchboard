@@ -25,18 +25,9 @@ import type { AgentSelection } from "./types";
 
 // No model agy offers today lacks an effort axis, but the pickers still handle
 // one (agy 1.1.19 offered two), so these tests add one to the model table.
-vi.mock("./antigravityModels.json", async (importOriginal) => {
-  const actual = await importOriginal<{ default: { models: unknown[] } }>();
-  return {
-    default: {
-      ...actual.default,
-      models: [
-        ...actual.default.models,
-        { value: "no-effort-model", label: "No Effort Model", efforts: null },
-      ],
-    },
-  };
-});
+vi.mock("./antigravityModels.json", async (importOriginal) =>
+  (await import("../../tests/fixtures/antigravityModels")).withStandIns(importOriginal),
+);
 
 function selection(over: Partial<AgentSelection> = {}): AgentSelection {
   return {
@@ -115,8 +106,8 @@ describe("Antigravity effort support", () => {
     effortOptionsFor("antigravity", model).map(({ value }) => value);
 
   it("distinguishes known levels, explicit no-effort models, and unknown models", () => {
-    expect(values("gemini-3.8-flash")).toEqual(["low", "medium", "high"]);
-    expect(values("gpt-oss-120b")).toEqual(["medium"]);
+    expect(values("three-level-model")).toEqual(["low", "medium", "high"]);
+    expect(values("medium-only-model")).toEqual(["medium"]);
     expect(effortSupportFor("antigravity", "no-effort-model")).toEqual({ kind: "none" });
     expect(effortSupportFor("antigravity", "future-model").kind).toBe("unknown");
   });
@@ -136,7 +127,7 @@ describe("Antigravity effort support", () => {
   });
 
   it("requires effort only for known effort-bearing Antigravity models", () => {
-    expect(effortIsRequired("antigravity", "gpt-oss-120b")).toBe(true);
+    expect(effortIsRequired("antigravity", "medium-only-model")).toBe(true);
     expect(effortIsRequired("antigravity", "no-effort-model")).toBe(false);
     expect(effortIsRequired("antigravity", "future-model")).toBe(false);
     expect(effortIsRequired("codex", "gpt-5.6-sol")).toBe(false);
@@ -144,9 +135,9 @@ describe("Antigravity effort support", () => {
 
   it("keeps the configured presentation set while restricting activation", () => {
     const configured = selection({
-      model: "gpt-oss-120b",
+      model: "medium-only-model",
       effort: "medium",
-      model_choices: ["gpt-oss-120b"],
+      model_choices: ["medium-only-model"],
       effort_choices: ["medium", "high"],
     });
     expect(configured.effort_choices).toEqual(["medium", "high"]);
@@ -159,7 +150,7 @@ describe("selectionForNewAgent", () => {
     expect(
       selectionForNewAgent(
         {
-          model_choices: ["no-effort-model", "gemini-3.8-flash"],
+          model_choices: ["no-effort-model", "three-level-model"],
           effort_choices: ["high", "medium"],
           default_model: "no-effort-model",
           default_effort: "high",
@@ -171,7 +162,7 @@ describe("selectionForNewAgent", () => {
       selection: {
         model: "no-effort-model",
         effort: null,
-        model_choices: ["no-effort-model", "gemini-3.8-flash"],
+        model_choices: ["no-effort-model", "three-level-model"],
         effort_choices: ["high", "medium"],
       },
     });
@@ -181,9 +172,9 @@ describe("selectionForNewAgent", () => {
     expect(
       selectionForNewAgent(
         {
-          model_choices: ["gpt-oss-120b"],
+          model_choices: ["medium-only-model"],
           effort_choices: ["high", "medium"],
-          default_model: "gpt-oss-120b",
+          default_model: "medium-only-model",
           default_effort: "high",
         },
         "antigravity",
@@ -193,36 +184,36 @@ describe("selectionForNewAgent", () => {
     expect(
       selectionForNewAgent(
         {
-          model_choices: ["gpt-oss-120b"],
+          model_choices: ["medium-only-model"],
           effort_choices: ["high"],
-          default_model: "gpt-oss-120b",
+          default_model: "medium-only-model",
           default_effort: "high",
         },
         "antigravity",
       ),
     ).toMatchObject({
       ok: false,
-      selection: { model: "gpt-oss-120b", effort: "high" },
+      selection: { model: "medium-only-model", effort: "high" },
     });
   });
 });
 
 describe("resolveModelChange", () => {
   const configured = selection({
-    model: "gemini-3.8-flash",
+    model: "three-level-model",
     effort: "high",
-    model_choices: ["gemini-3.8-flash", "gpt-oss-120b"],
+    model_choices: ["three-level-model", "medium-only-model"],
     effort_choices: ["high", "medium", "low"],
   });
 
   it("preserves valid effort and otherwise chooses the first compatible configured effort", () => {
-    expect(resolveModelChange(configured, "antigravity", "gemini-4-argon")).toMatchObject({
+    expect(resolveModelChange(configured, "antigravity", "other-three-level-model")).toMatchObject({
       ok: true,
-      selection: { model: "gemini-4-argon", effort: "high" },
+      selection: { model: "other-three-level-model", effort: "high" },
     });
-    expect(resolveModelChange(configured, "antigravity", "gpt-oss-120b")).toMatchObject({
+    expect(resolveModelChange(configured, "antigravity", "medium-only-model")).toMatchObject({
       ok: true,
-      selection: { model: "gpt-oss-120b", effort: "medium" },
+      selection: { model: "medium-only-model", effort: "medium" },
     });
     // "First" is in level order, not quick-choice order: `low` before `high`.
     expect(
@@ -234,9 +225,9 @@ describe("resolveModelChange", () => {
           effort_choices: ["max", "high", "low"],
         },
         "antigravity",
-        "gemini-3.8-flash",
+        "three-level-model",
       ),
-    ).toMatchObject({ ok: true, selection: { model: "gemini-3.8-flash", effort: "low" } });
+    ).toMatchObject({ ok: true, selection: { model: "three-level-model", effort: "low" } });
   });
 
   it("clears effort only for an explicitly known no-effort model", () => {
@@ -255,7 +246,7 @@ describe("resolveModelChange", () => {
       resolveModelChange(
         { ...configured, effort: "high", effort_choices: ["high"] },
         "antigravity",
-        "gpt-oss-120b",
+        "medium-only-model",
       ),
     ).toEqual({
       ok: false,
@@ -265,7 +256,9 @@ describe("resolveModelChange", () => {
 
   it("validates known pairs without treating unknown models as invalid", () => {
     expect(selectionIsValid(configured, "antigravity")).toBe(true);
-    expect(selectionIsValid({ ...configured, model: "gpt-oss-120b" }, "antigravity")).toBe(false);
+    expect(selectionIsValid({ ...configured, model: "medium-only-model" }, "antigravity")).toBe(
+      false,
+    );
     expect(selectionIsValid({ ...configured, model: "future-model" }, "antigravity")).toBe(true);
   });
 });

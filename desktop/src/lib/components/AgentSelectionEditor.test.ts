@@ -6,18 +6,9 @@ import AgentSelectionEditor from "./AgentSelectionEditor.svelte";
 
 // No model agy offers today lacks an effort axis, but the pickers still handle
 // one (agy 1.1.19 offered two), so these tests add one to the model table.
-vi.mock("$lib/antigravityModels.json", async (importOriginal) => {
-  const actual = await importOriginal<{ default: { models: unknown[] } }>();
-  return {
-    default: {
-      ...actual.default,
-      models: [
-        ...actual.default.models,
-        { value: "no-effort-model", label: "No Effort Model", efforts: null },
-      ],
-    },
-  };
-});
+vi.mock("$lib/antigravityModels.json", async (importOriginal) =>
+  (await import("../../../tests/fixtures/antigravityModels")).withStandIns(importOriginal),
+);
 
 const BASE: AgentSelection = {
   model: "opus",
@@ -186,9 +177,9 @@ describe("AgentSelectionEditor", () => {
       props: {
         harness: "antigravity",
         selection: {
-          model: "gpt-oss-120b",
+          model: "medium-only-model",
           effort: "medium",
-          model_choices: ["retired-model", "gpt-oss-120b"],
+          model_choices: ["retired-model", "medium-only-model"],
           effort_choices: ["medium", "high"],
         },
         context: "current",
@@ -201,18 +192,18 @@ describe("AgentSelectionEditor", () => {
     expect(high).toBeEnabled();
     await fireEvent.click(high);
     expect(onChange).toHaveBeenCalledWith({
-      model: "gpt-oss-120b",
+      model: "medium-only-model",
       effort: "medium",
-      model_choices: ["retired-model", "gpt-oss-120b"],
+      model_choices: ["retired-model", "medium-only-model"],
       effort_choices: ["medium"],
     });
   });
 
   it("can configure an effort before switching to a model that requires it", async () => {
     let current: AgentSelection = {
-      model: "gemini-4-argon",
+      model: "other-three-level-model",
       effort: "high",
-      model_choices: ["gemini-4-argon"],
+      model_choices: ["other-three-level-model"],
       effort_choices: ["high"],
     };
     const onChange = vi.fn((next: AgentSelection) => {
@@ -230,16 +221,18 @@ describe("AgentSelectionEditor", () => {
       context: "current",
       onChange,
     });
-    await fireEvent.click(screen.getByTestId("agent-selection-model-choice-gpt-oss-120b"));
-    expect(current.model_choices).toEqual(["gemini-4-argon", "gpt-oss-120b"]);
+    await fireEvent.click(screen.getByTestId("agent-selection-model-choice-medium-only-model"));
+    expect(current.model_choices).toEqual(["other-three-level-model", "medium-only-model"]);
     await view.rerender({
       harness: "antigravity",
       selection: current,
       context: "current",
       onChange,
     });
-    await fireEvent.click(screen.getByTestId("agent-selection-model-choice-gemini-4-argon"));
-    expect(current).toMatchObject({ model: "gpt-oss-120b", effort: "medium" });
+    await fireEvent.click(
+      screen.getByTestId("agent-selection-model-choice-other-three-level-model"),
+    );
+    expect(current).toMatchObject({ model: "medium-only-model", effort: "medium" });
   });
 
   it("keeps effort membership available while a current model has no effort axis", async () => {
@@ -250,7 +243,7 @@ describe("AgentSelectionEditor", () => {
         selection: {
           model: "no-effort-model",
           effort: null,
-          model_choices: ["no-effort-model", "gemini-3.8-flash"],
+          model_choices: ["no-effort-model", "three-level-model"],
           effort_choices: ["high", "medium"],
         },
         context: "current",
@@ -290,9 +283,9 @@ describe("AgentSelectionEditor", () => {
       props: {
         harness: "antigravity",
         selection: {
-          model: "gemini-3.8-flash",
+          model: "three-level-model",
           effort: "high",
-          model_choices: ["gemini-3.8-flash", "gpt-oss-120b"],
+          model_choices: ["three-level-model", "medium-only-model"],
           effort_choices: ["high"],
         },
         context: "default",
@@ -301,7 +294,7 @@ describe("AgentSelectionEditor", () => {
     });
 
     await fireEvent.change(screen.getByTestId("agent-selection-model-current"), {
-      target: { value: "gpt-oss-120b" },
+      target: { value: "medium-only-model" },
     });
     expect(
       within(screen.getByTestId("agent-selection-model")).getByRole("status"),
@@ -318,7 +311,7 @@ describe("AgentSelectionEditor", () => {
         selection: {
           model: "no-effort-model",
           effort: "high",
-          model_choices: ["no-effort-model", "gemini-3.8-flash"],
+          model_choices: ["no-effort-model", "three-level-model"],
           effort_choices: ["high", "medium"],
         },
         context: "default",
@@ -338,9 +331,9 @@ describe("AgentSelectionEditor", () => {
       props: {
         harness: "antigravity",
         selection: {
-          model: "gemini-3.8-flash",
+          model: "three-level-model",
           effort: "high",
-          model_choices: ["gemini-3.8-flash", "no-effort-model"],
+          model_choices: ["three-level-model", "no-effort-model"],
           effort_choices: ["high", "medium"],
         },
         context: "default",

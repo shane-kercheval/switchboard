@@ -2081,9 +2081,10 @@ mod tests {
         );
     }
 
-    /// Where a sub-agent's task ends relative to its `Agent` call closing is
-    /// inferred, not recorded (the 2.1.149 notes show the task events during
-    /// a run, not their order against the call), so both orders are covered.
+    /// At Claude 2.1.302 (2026-10-19) a sub-agent's task ended one event
+    /// before its `Agent` call closed. Both orders are covered, because the
+    /// report handles either and a newer CLI may flip it: the flip only shows
+    /// the sub-agent as background work for the instant between the two.
     #[test]
     fn a_sub_agent_the_agent_waits_on_is_its_open_call_whichever_ends_first() {
         for task_ends_first in [true, false] {

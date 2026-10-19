@@ -412,9 +412,13 @@ fn collect_subagent_tool_use_ids(session_id: uuid::Uuid) -> Vec<String> {
 
 /// A sub-agent the agent waits on also reports a task that names its Agent
 /// call (seen at 2.1.149), which is what lets the activity report show it as
-/// that open call rather than as background work. Where the task's end falls
-/// against the call's close was never recorded, and the report handles either
-/// order, so either passes; the run prints which.
+/// that open call rather than as background work. That rests on the call
+/// staying open while the sub-agent works: its progress arrives, and none
+/// arrives after the call closes. A background launch fails this, since its
+/// call returns at once and progress follows. At 2.1.302 (2026-10-19) the
+/// task ended one event before its call closed; either order passes, because
+/// the report handles both and a flip only shows the sub-agent as background
+/// work for the instant between the two. The run prints which.
 fn assert_task_names_waited_on_call(events: &[AdapterEvent], agent_call_id: &str) {
     let task = events
         .iter()
@@ -441,9 +445,26 @@ fn assert_task_names_waited_on_call(events: &[AdapterEvent], agent_call_id: &str
     let turn_ended = position(&|e| matches!(e, AdapterEvent::TurnEnd { .. }))
         .expect("must observe a terminal TurnEnd");
     assert!(task_ended < turn_ended, "the task ends inside its turn");
+    let progress: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            matches!(e, AdapterEvent::BackgroundTaskProgress { task_id, .. } if *task_id == task)
+        })
+        .map(|(at, _)| at)
+        .collect();
+    assert!(
+        !progress.is_empty(),
+        "the sub-agent ran a shell command but reported no progress; events: {events:?}"
+    );
+    assert!(
+        progress.iter().all(|&at| at < call_closed),
+        "progress arrived after the Agent call closed (at event {call_closed}), as for a \
+         background launch: progress at events {progress:?}; events: {events:?}"
+    );
     eprintln!(
-        "foreground sub-agent: task ended at event {task_ended}, Agent call closed at event \
-         {call_closed} ({})",
+        "foreground sub-agent: progress at events {progress:?}, task ended at event \
+         {task_ended}, Agent call closed at event {call_closed} ({})",
         if task_ended < call_closed {
             "task ended first"
         } else {

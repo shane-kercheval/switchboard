@@ -52,6 +52,9 @@ pub struct Script {
     /// Codex's stays open while it reads its rollout: the actor holds the
     /// agent's session meanwhile, though the reply is complete.
     pub drain: Option<Arc<Notify>>,
+    /// A background task (its id and description) the turn starts after its
+    /// text, as Claude announces a sub-agent it delegated to.
+    pub background_task: Option<(String, String)>,
 }
 
 impl Script {
@@ -65,7 +68,33 @@ impl Script {
             context: None,
             hold_dispatch: None,
             drain: None,
+            background_task: None,
         }
+    }
+
+    pub fn with_background_task(self, task_id: &str, description: &str) -> Self {
+        Self {
+            background_task: Some((task_id.to_owned(), description.to_owned())),
+            ..self
+        }
+    }
+
+    /// What the turn streams before it parks or ends: its text, then the
+    /// background task it starts, if any.
+    fn opening_events(&self, turn_id: TurnId) -> Vec<AdapterEvent> {
+        let mut events = vec![AdapterEvent::ContentChunk {
+            turn_id,
+            kind: ContentKind::Text,
+            text: self.text.clone(),
+        }];
+        if let Some((task_id, description)) = &self.background_task {
+            events.push(AdapterEvent::BackgroundTaskStarted {
+                turn_id,
+                task_id: task_id.clone(),
+                description: description.clone(),
+            });
+        }
+        events
     }
 
     pub fn draining(self, gate: &Arc<Notify>) -> Self {
@@ -201,11 +230,9 @@ impl HarnessAdapter for ScriptedAdapter {
                 .key
                 .clone()
                 .unwrap_or_else(|| format!("msg-{turn_id}"));
-            let _ = tx.send(AdapterEvent::ContentChunk {
-                turn_id,
-                kind: ContentKind::Text,
-                text: script.text.clone(),
-            });
+            for event in script.opening_events(turn_id) {
+                let _ = tx.send(event);
+            }
             if let Some(gate) = &script.park {
                 if script.ignore_cancel {
                     gate.notified().await;

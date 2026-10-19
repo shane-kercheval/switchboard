@@ -250,10 +250,14 @@ tools! {
          Switchboard's next turn for it or the window's next reread. context_pending is true \
          while the agent's session file is still being read for it: call again. activity \
          describes the agent's running turn: seconds_since_output, since the turn started or \
-         the agent last wrote text or started or finished a tool call (what the window's \
-         \"No response\" counter measures), and open_tool_calls, each with its name and \
-         running_seconds. A tool call open is work in progress: a test suite produces \
-         nothing until it ends. Absent while the agent has no turn running.";
+         the agent last wrote text, started or finished a tool call, or heard from a \
+         background task (what the window's \"No response\" counter measures); \
+         open_tool_calls, each with its name and running_seconds; and open_background_tasks, \
+         each with its description, activity (what it last reported doing, absent until it \
+         reports), and running_seconds. A tool call open is work in progress: a test suite \
+         produces nothing until it ends. Work inside a sub-agent the agent delegated to, or a \
+         command it runs in the background, does not show as a tool call and is reported \
+         under open_background_tasks. Absent while the agent has no turn running.";
     GetUsage = "get_usage" (NoArgs) [Read, Look]
         "How much of each harness account's limits is used, for choosing a model and effort for \
          the work at hand. One entry per account the app has a reading for: {harness, \

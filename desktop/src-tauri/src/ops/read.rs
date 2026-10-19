@@ -117,9 +117,9 @@ pub struct AgentListing {
     pub context: Option<ContextFigures>,
     /// The agent's session file is still being read for `context`; call again.
     pub context_pending: bool,
-    /// Whether the agent is producing anything: seconds since its last output
-    /// and its open tool calls. `None` before any output since the app
-    /// started.
+    /// Whether the agent is producing anything: seconds since its last output,
+    /// its open tool calls, and its open background tasks. `None` before any
+    /// output since the app started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<AgentActivity>,
 }

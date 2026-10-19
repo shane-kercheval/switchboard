@@ -390,15 +390,30 @@ async fn background_agent_dispatch_completes_as_one_turn() {
         "terminal arrives after all content"
     );
 
-    // Task-lifecycle system events surface as Liveness (heartbeat stays armed
-    // through the background wait).
+    // The task lifecycle keeps the heartbeat armed through the background
+    // wait: the tracked subtypes as typed task events, the rest (task_updated,
+    // status, the intermediate result) as Liveness.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::BackgroundTaskStarted { task_id, .. } if task_id == "a5f72cb38c72f0202"
+        )),
+        "task_started surfaces as a background task"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::BackgroundTaskEnded { task_id, .. } if task_id == "a5f72cb38c72f0202"
+        )),
+        "task_notification ends it"
+    );
     let liveness_count = events
         .iter()
         .filter(|e| matches!(e, AdapterEvent::Liveness { .. }))
         .count();
     assert!(
         liveness_count >= 3,
-        "task_started/task_updated/task_notification (+ intermediate result) re-arm the heartbeat; got {liveness_count}"
+        "task_updated, status, and the intermediate result re-arm the heartbeat; got {liveness_count}"
     );
 
     // N init cycles → N SessionMeta events; consumers overwrite idempotently.
@@ -407,6 +422,58 @@ async fn background_agent_dispatch_completes_as_one_turn() {
         .filter(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
         .count();
     assert_eq!(session_metas, 2, "one SessionMeta per init cycle");
+}
+
+#[tokio::test]
+async fn background_tasks_surface_their_lifecycle_in_stream_order() {
+    // A real (sanitized) capture: a background sub-agent reports progress and
+    // starts a background command of its own, which the process tears down
+    // ("stopped") after the final result. Every task event arrives, in stream
+    // order, before the one terminal, which comes at the process's exit.
+    let agent = fake_agent();
+    let events = collect_events(&adapter(), &agent, &fixture("background-task-progress")).await;
+
+    let tasks: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::BackgroundTaskStarted {
+                task_id,
+                description,
+                ..
+            } => Some(format!("started {task_id}: {description}")),
+            AdapterEvent::BackgroundTaskProgress {
+                task_id, activity, ..
+            } => Some(format!("progress {task_id}: {activity}")),
+            AdapterEvent::BackgroundTaskEnded { task_id, .. } => Some(format!("ended {task_id}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tasks,
+        [
+            "started a7cb77a05059e4590: Sleep 45 then reply ok",
+            "progress a7cb77a05059e4590: Running Sleep for 45 seconds",
+            "progress a7cb77a05059e4590: Running Sleep for 45 seconds",
+            "started bzggpsjub: Sleep for 45 seconds",
+            "ended a7cb77a05059e4590",
+            "ended bzggpsjub",
+        ]
+    );
+    let terminals = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .count();
+    assert_eq!(terminals, 1, "one dispatch = one terminal");
+    assert!(
+        matches!(
+            events.last(),
+            Some(AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            })
+        ),
+        "the terminal follows the post-result task events"
+    );
 }
 
 #[tokio::test]

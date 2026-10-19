@@ -658,6 +658,81 @@ describe("UnifiedTranscript", () => {
     }
   });
 
+  it("names the open background work instead of 'No response' while a task is open", async () => {
+    // A Claude turn waiting on a sub-agent goes silent for minutes. With a
+    // task open the footer says what the task is doing, not "No response";
+    // once every task has ended, silence reads as "No response" again.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const state = await loadState();
+      await state.registerAgent(CLAUDE_AGENT);
+
+      render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+      const channel = `agent:${CLAUDE_AGENT.id}`;
+      fireTo(channel, {
+        type: "turn_start",
+        turn_id: "agent-1",
+        message_id: "00000000-0000-7000-8000-0000000000e2",
+        send_id: "00000000-0000-7000-8000-0000000000e2",
+        started_at: "2026-05-16T00:00:00Z",
+      });
+      fireTo(channel, {
+        type: "background_task_started",
+        turn_id: "agent-1",
+        task_id: "a1",
+        description: "Review the parser",
+      });
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
+
+      vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
+      await tick();
+      const footer = screen.getByTestId("turn-working");
+      expect(footer).toHaveTextContent("Background: Review the parser (1)");
+      expect(footer).not.toHaveTextContent("No response");
+      expect(footer).not.toHaveClass("text-warning");
+
+      // Progress is a sign of life; silent again, the footer names it.
+      fireTo(channel, {
+        type: "background_task_progress",
+        turn_id: "agent-1",
+        task_id: "a1",
+        activity: "Running Sleep for 45 seconds",
+      });
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
+      vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent(
+        "Background: Running Sleep for 45 seconds (1)",
+      );
+
+      // A second task counts, and is the latest thing to have happened.
+      fireTo(channel, {
+        type: "background_task_started",
+        turn_id: "agent-1",
+        task_id: "b2",
+        description: "Sleep for 45 seconds",
+      });
+      vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent(
+        "Background: Sleep for 45 seconds (2)",
+      );
+
+      for (const task_id of ["a1", "b2"]) {
+        fireTo(channel, { type: "background_task_ended", turn_id: "agent-1", task_id });
+      }
+      vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("No response");
+      expect(screen.queryByTestId("turn-background")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("live-streams an in-progress turn into the unified view", async () => {
     // Real listener path: register, fire turn_start, content_chunk, etc.
     // through the captured callback. The reducer + state-module + Svelte

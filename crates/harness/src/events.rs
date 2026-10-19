@@ -420,6 +420,29 @@ pub enum AdapterEvent {
     /// timer so a long silent-but-thinking turn is not falsely declared dead.
     /// Never becomes a transcript item.
     Liveness { turn_id: TurnId },
+    /// Work the turn handed off that runs apart from its own output: a
+    /// sub-agent it delegated to, or a command it ran in the background.
+    /// Claude announces each with `system/task_started` (see
+    /// `docs/harness-behavior.md` G20). Like `Liveness`, a content-free sign
+    /// of life that never becomes a transcript item; consumers track the task
+    /// until `BackgroundTaskEnded` or the turn's end, since a Claude turn ends
+    /// only when its process exits.
+    BackgroundTaskStarted {
+        turn_id: TurnId,
+        task_id: String,
+        description: String,
+    },
+    /// What a running background task is doing now (Claude's
+    /// `system/task_progress`, emitted repeatedly while a sub-agent works).
+    BackgroundTaskProgress {
+        turn_id: TurnId,
+        task_id: String,
+        activity: String,
+    },
+    /// A background task finished, whatever its status: Claude's
+    /// `system/task_notification` reports `completed`, `stopped` for a task
+    /// torn down at exit, and may grow others.
+    BackgroundTaskEnded { turn_id: TurnId, task_id: String },
     /// The turn's dedup identity, announced as soon as the adapter knows it:
     /// Claude emits it immediately from the first assistant `message.id`; the
     /// Codex adapter emits it on its **cancel path** from a session-file read
@@ -662,6 +685,23 @@ pub enum NormalizedEvent {
     /// Content-free liveness signal (see [`AdapterEvent::Liveness`]). The
     /// frontend re-arms its per-turn heartbeat on this and renders nothing.
     Liveness { turn_id: TurnId },
+    /// A background task the turn started (see
+    /// [`AdapterEvent::BackgroundTaskStarted`]). Re-arms the heartbeat as
+    /// `Liveness` does and renders nothing in the transcript.
+    BackgroundTaskStarted {
+        turn_id: TurnId,
+        task_id: String,
+        description: String,
+    },
+    /// A running background task's current activity (see
+    /// [`AdapterEvent::BackgroundTaskProgress`]).
+    BackgroundTaskProgress {
+        turn_id: TurnId,
+        task_id: String,
+        activity: String,
+    },
+    /// A background task finished (see [`AdapterEvent::BackgroundTaskEnded`]).
+    BackgroundTaskEnded { turn_id: TurnId, task_id: String },
     /// Early dedup identity for the live turn (see [`AdapterEvent::TurnIdentity`]).
     /// The frontend stamps `hydration_key` onto the in-flight turn so a
     /// concurrent disk re-read collapses against it instead of duplicating. The
@@ -828,6 +868,9 @@ impl AdapterEvent {
         match self {
             AdapterEvent::ContentChunk { .. }
             | AdapterEvent::Liveness { .. }
+            | AdapterEvent::BackgroundTaskStarted { .. }
+            | AdapterEvent::BackgroundTaskProgress { .. }
+            | AdapterEvent::BackgroundTaskEnded { .. }
             | AdapterEvent::TurnIdentity { .. }
             | AdapterEvent::ToolStarted { .. }
             | AdapterEvent::ToolCompleted { .. }
@@ -863,6 +906,27 @@ impl AdapterEvent {
                 text,
             },
             AdapterEvent::Liveness { turn_id } => NormalizedEvent::Liveness { turn_id },
+            AdapterEvent::BackgroundTaskStarted {
+                turn_id,
+                task_id,
+                description,
+            } => NormalizedEvent::BackgroundTaskStarted {
+                turn_id,
+                task_id,
+                description,
+            },
+            AdapterEvent::BackgroundTaskProgress {
+                turn_id,
+                task_id,
+                activity,
+            } => NormalizedEvent::BackgroundTaskProgress {
+                turn_id,
+                task_id,
+                activity,
+            },
+            AdapterEvent::BackgroundTaskEnded { turn_id, task_id } => {
+                NormalizedEvent::BackgroundTaskEnded { turn_id, task_id }
+            }
             AdapterEvent::TurnIdentity {
                 turn_id,
                 message_id,
@@ -1544,6 +1608,56 @@ mod tests {
             normalized,
             NormalizedEvent::Liveness { turn_id: t } if t == turn_id
         ));
+    }
+
+    #[test]
+    fn background_task_events_lift_to_their_wire_names() {
+        let turn_id = fresh_turn_id();
+        let task_id = || "a7cb77a05059e4590".to_owned();
+        let cases = [
+            (
+                AdapterEvent::BackgroundTaskStarted {
+                    turn_id,
+                    task_id: task_id(),
+                    description: "Sleep 45 then reply ok".to_owned(),
+                },
+                serde_json::json!({
+                    "type": "background_task_started",
+                    "turn_id": turn_id,
+                    "task_id": "a7cb77a05059e4590",
+                    "description": "Sleep 45 then reply ok",
+                }),
+            ),
+            (
+                AdapterEvent::BackgroundTaskProgress {
+                    turn_id,
+                    task_id: task_id(),
+                    activity: "Running Sleep for 45 seconds".to_owned(),
+                },
+                serde_json::json!({
+                    "type": "background_task_progress",
+                    "turn_id": turn_id,
+                    "task_id": "a7cb77a05059e4590",
+                    "activity": "Running Sleep for 45 seconds",
+                }),
+            ),
+            (
+                AdapterEvent::BackgroundTaskEnded {
+                    turn_id,
+                    task_id: task_id(),
+                },
+                serde_json::json!({
+                    "type": "background_task_ended",
+                    "turn_id": turn_id,
+                    "task_id": "a7cb77a05059e4590",
+                }),
+            ),
+        ];
+        for (event, wire) in cases {
+            assert!(event.is_turn_scoped(), "{event:?}");
+            let normalized = event.into_normalized().expect("has a wire form");
+            assert_eq!(serde_json::to_value(&normalized).unwrap(), wire);
+        }
     }
 
     #[test]

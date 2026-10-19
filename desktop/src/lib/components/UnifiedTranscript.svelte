@@ -1890,8 +1890,11 @@
     rt?.quiet_since !== undefined && rt?.in_flight_turn_id === turn.turn_id
       ? rt.quiet_since
       : undefined}
+  {@const backgroundTasks = quietSince !== undefined ? (rt?.background_tasks ?? []) : []}
+  {@const latestTask = backgroundTasks.at(-1)}
   <div
-    class="mt-2 flex items-center gap-2 text-xs {quietSince !== undefined
+    class="mt-2 flex min-w-0 items-center gap-2 text-xs {quietSince !== undefined &&
+    latestTask === undefined
       ? 'text-warning'
       : 'text-muted'}"
     data-testid="turn-working"
@@ -1910,9 +1913,15 @@
          once silent past HEARTBEAT_TIMEOUT_MS the word swaps to "No response"
          and the number swaps to the silence counter — still alive on the
          backend, a soft caution, never a failure — and both revert the moment
-         activity resumes. The dots animate; the text never does (the words
-         being read must not fade). -->
-    {#if quietSince !== undefined}
+         activity resumes. A silent agent waiting on background work (a
+         sub-agent, a background command) is not a caution: it names the latest
+         thing a task did and how many are open instead. The dots animate; the
+         text never does (the words being read must not fade). -->
+    {#if latestTask !== undefined}
+      {@const label = `Background: ${latestTask.activity ?? latestTask.description} (${backgroundTasks.length})`}
+      <span class="min-w-0 truncate" title={label} data-testid="turn-background">{label}</span>
+      <LoadingDots />
+    {:else if quietSince !== undefined}
       <span>No response</span>
       <LoadingDots />
       <span class="tabular-nums" data-testid="turn-quiet-elapsed"

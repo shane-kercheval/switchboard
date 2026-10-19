@@ -1242,9 +1242,13 @@ function manageHeartbeat(agentId: AgentId, event: NormalizedEvent): void {
     case "content_chunk":
     case "liveness":
     case "tool_started":
-    case "tool_completed": {
+    case "tool_completed":
+    case "background_task_started":
+    case "background_task_progress":
+    case "background_task_ended": {
       // Re-arm on any sign the harness is alive for the turn the heartbeat is
-      // watching. A long shell tool call legitimately produces zero
+      // watching. A background task's events count: a sub-agent's progress
+      // is the turn working. A long shell tool call legitimately produces zero
       // content_chunks for minutes (`Bash` running a test suite), and a long
       // redacted thinking block produces only `liveness` (Claude Opus 4.8's
       // redacted thinking deltas) — without re-arming on those, the heartbeat

@@ -1656,8 +1656,8 @@ pub enum AgentWaitStatus {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WaitAgentReply {
     pub agent_id: AgentId,
-    /// Whether the agent is producing anything: seconds since its last output
-    /// and its open tool calls.
+    /// Whether the agent is producing anything: seconds since its last output,
+    /// its open tool calls, and its open background tasks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<super::ledger::AgentActivity>,
     /// The wait was shortened to this many seconds: the client sent no

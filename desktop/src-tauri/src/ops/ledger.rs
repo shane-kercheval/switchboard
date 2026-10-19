@@ -188,8 +188,9 @@ pub struct RecipientSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<FailureKind>,
     /// What the agent is doing while this recipient's own turn runs: how long
-    /// since it last produced output, and the tool calls it has open. Absent
-    /// while the recipient waits in line behind another turn.
+    /// since it last produced output, and the tool calls and background tasks
+    /// it has open. Absent while the recipient waits in line behind another
+    /// turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<AgentActivity>,
     /// The end of what the agent has written in this turn so far, up to
@@ -230,15 +231,20 @@ pub const RECENT_TEXT_CHARS: usize = 500;
 /// What an agent's running turn is doing, for telling a stuck turn from a
 /// long one. Silence is measured as the window measures it for its "No
 /// response" label: the time since the turn started or the agent last wrote
-/// text, sent a heartbeat, or started or finished a tool call. A tool call
-/// left open (a test suite running) is reported with how long it has run,
-/// since it produces nothing until it ends. Reported only while a turn runs:
-/// an idle agent has nothing to be stuck on.
+/// text, sent a heartbeat, started or finished a tool call, or a background
+/// task started, reported progress, or ended. A tool call left open (a test
+/// suite running) is reported with how long it has run, since it produces
+/// nothing until it ends. Work the agent handed to a sub-agent or a
+/// background command is not a tool call of its own, so it is reported apart,
+/// under `open_background_tasks`. Reported only while a turn runs: an idle
+/// agent has nothing to be stuck on.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AgentActivity {
     pub seconds_since_output: u64,
     /// Oldest first.
     pub open_tool_calls: Vec<OpenToolCall>,
+    /// Oldest first.
+    pub open_background_tasks: Vec<OpenBackgroundTask>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -247,10 +253,22 @@ pub struct OpenToolCall {
     pub running_seconds: u64,
 }
 
-/// An agent's last output and its open tool calls, as the ledger tracks them.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OpenBackgroundTask {
+    /// What the task was started to do.
+    pub description: String,
+    /// What it reported doing most recently; absent before it reports any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    pub running_seconds: u64,
+}
+
+/// An agent's last output, its open tool calls, and its open background
+/// tasks, as the ledger tracks them.
 struct ActivityState {
     last_output: Instant,
     open_tools: Vec<OpenTool>,
+    open_tasks: Vec<OpenTask>,
     /// A turn has started and not ended.
     turn_open: bool,
     /// The send the open turn answers, from its typed start event, for any
@@ -266,6 +284,13 @@ struct OpenTool {
     started: Instant,
 }
 
+struct OpenTask {
+    task_id: String,
+    description: String,
+    activity: Option<String>,
+    started: Instant,
+}
+
 impl ActivityState {
     fn report(&self, now: Instant) -> AgentActivity {
         AgentActivity {
@@ -276,6 +301,15 @@ impl ActivityState {
                 .map(|tool| OpenToolCall {
                     name: tool.name.clone(),
                     running_seconds: now.saturating_duration_since(tool.started).as_secs(),
+                })
+                .collect(),
+            open_background_tasks: self
+                .open_tasks
+                .iter()
+                .map(|task| OpenBackgroundTask {
+                    description: task.description.clone(),
+                    activity: task.activity.clone(),
+                    running_seconds: now.saturating_duration_since(task.started).as_secs(),
                 })
                 .collect(),
         }
@@ -291,6 +325,9 @@ const OUTPUT_EVENTS: &[&str] = &[
     "turn_identity",
     "tool_started",
     "tool_completed",
+    "background_task_started",
+    "background_task_progress",
+    "background_task_ended",
 ];
 
 /// The ledger's clock for activity durations: monotonic, so a change to the
@@ -1157,6 +1194,7 @@ impl SendLedger {
         if !output {
             if let Some(state) = inner.activity.get_mut(&agent_id) {
                 state.open_tools.clear();
+                state.open_tasks.clear();
                 state.turn_open = false;
                 state.open_send = None;
             }
@@ -1168,6 +1206,7 @@ impl SendLedger {
             .or_insert_with(|| ActivityState {
                 last_output: now,
                 open_tools: Vec::new(),
+                open_tasks: Vec::new(),
                 turn_open: false,
                 open_send: None,
             });
@@ -1176,6 +1215,7 @@ impl SendLedger {
             state.turn_open = true;
             state.open_send = None;
             state.open_tools.clear();
+            state.open_tasks.clear();
         }
         let tool_use_id = payload
             .get("tool_use_id")
@@ -1280,6 +1320,12 @@ impl SendLedger {
                 self.on_content(payload);
                 return;
             }
+            // A background task changes only the agent's activity, never
+            // admission or a send's text: note it and wake nobody.
+            "background_task_started" | "background_task_progress" | "background_task_ended" => {
+                self.on_background_task(agent_id, payload);
+                return;
+            }
             "turn_start" | "turn_end" | "message_failed" | "message_cancelled" | "agent_idle" => {}
             _ => return,
         }
@@ -1348,6 +1394,54 @@ impl SendLedger {
             recipient.status = SendStatus::Running;
         }
         true
+    }
+
+    /// Track the agent's background tasks from their typed events: a start
+    /// opens one, progress records what it is doing now, and an end closes
+    /// it. A turn's start and end clear them all (`note_activity`), since a
+    /// task never outlives the turn that started it.
+    fn on_background_task(&self, agent_id: AgentId, payload: &serde_json::Value) {
+        let event = match serde_json::from_value::<NormalizedEvent>(payload.clone()) {
+            Ok(event) => event,
+            Err(e) => {
+                tracing::warn!(%agent_id, error = %e, "ledger could not parse a background task event");
+                return;
+            }
+        };
+        let now = (self.clock)();
+        let mut inner = lock(&self.inner);
+        let Some(state) = inner.activity.get_mut(&agent_id) else {
+            return;
+        };
+        match event {
+            NormalizedEvent::BackgroundTaskStarted {
+                task_id,
+                description,
+                ..
+            } if !state.open_tasks.iter().any(|task| task.task_id == task_id) => {
+                state.open_tasks.push(OpenTask {
+                    task_id,
+                    description,
+                    activity: None,
+                    started: now,
+                });
+            }
+            NormalizedEvent::BackgroundTaskProgress {
+                task_id, activity, ..
+            } if !activity.is_empty() => {
+                if let Some(task) = state
+                    .open_tasks
+                    .iter_mut()
+                    .find(|task| task.task_id == task_id)
+                {
+                    task.activity = Some(activity);
+                }
+            }
+            NormalizedEvent::BackgroundTaskEnded { task_id, .. } => {
+                state.open_tasks.retain(|task| task.task_id != task_id);
+            }
+            _ => {}
+        }
     }
 
     fn on_content(&self, payload: &serde_json::Value) {
@@ -1836,6 +1930,22 @@ mod tests {
         json!({ "type": "tool_completed", "turn_id": turn_id, "tool_use_id": id, "output": "", "is_error": false })
     }
 
+    fn task_started(turn_id: TurnId, id: &str, description: &str) -> serde_json::Value {
+        json!({ "type": "background_task_started", "turn_id": turn_id, "task_id": id, "description": description })
+    }
+
+    fn task_progress(turn_id: TurnId, id: &str, activity: &str) -> serde_json::Value {
+        json!({ "type": "background_task_progress", "turn_id": turn_id, "task_id": id, "activity": activity })
+    }
+
+    fn task_ended(turn_id: TurnId, id: &str) -> serde_json::Value {
+        json!({ "type": "background_task_ended", "turn_id": turn_id, "task_id": id })
+    }
+
+    fn open_tasks(ledger: &SendLedger, agent_id: AgentId) -> Vec<OpenBackgroundTask> {
+        ledger.activity(agent_id).unwrap().open_background_tasks
+    }
+
     #[test]
     fn silence_counts_only_the_turns_start_and_the_agents_own_output() {
         let (clock, now) = hand_clock();
@@ -1870,6 +1980,105 @@ mod tests {
             &json!({ "type": "liveness", "turn_id": turn_id }),
         );
         assert_eq!(ledger.activity(agent_id).unwrap().seconds_since_output, 0);
+    }
+
+    #[test]
+    fn background_tasks_open_report_their_activity_and_close_at_their_end() {
+        let (clock, now) = hand_clock();
+        let ledger = SendLedger::with_clock(clock);
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        let turn_id = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(message_id, turn_id, send_id),
+        );
+        ledger.observe(
+            &channel(agent_id),
+            &task_started(turn_id, "a1", "Review the parser"),
+        );
+        advance(&now, 30);
+        ledger.observe(
+            &channel(agent_id),
+            &task_started(turn_id, "b2", "Run the test suite"),
+        );
+        advance(&now, 10);
+        assert_eq!(
+            open_tasks(&ledger, agent_id),
+            [
+                OpenBackgroundTask {
+                    description: "Review the parser".to_owned(),
+                    activity: None,
+                    running_seconds: 40,
+                },
+                OpenBackgroundTask {
+                    description: "Run the test suite".to_owned(),
+                    activity: None,
+                    running_seconds: 10,
+                },
+            ],
+            "oldest first, with no activity before any progress"
+        );
+
+        ledger.observe(
+            &channel(agent_id),
+            &task_progress(turn_id, "a1", "Reading crates/core/Cargo.toml"),
+        );
+        assert_eq!(
+            open_tasks(&ledger, agent_id)[0].activity.as_deref(),
+            Some("Reading crates/core/Cargo.toml")
+        );
+        assert_eq!(
+            ledger.activity(agent_id).unwrap().seconds_since_output,
+            0,
+            "a task's progress restarts the silence, as a heartbeat does"
+        );
+
+        ledger.observe(&channel(agent_id), &task_ended(turn_id, "a1"));
+        assert_eq!(
+            open_tasks(&ledger, agent_id),
+            [OpenBackgroundTask {
+                description: "Run the test suite".to_owned(),
+                activity: None,
+                running_seconds: 10,
+            }],
+            "only the ended task closes"
+        );
+    }
+
+    #[test]
+    fn a_turns_end_clears_its_background_tasks() {
+        let ledger = SendLedger::new();
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        let first = Uuid::now_v7();
+        ledger.observe(&channel(agent_id), &turn_start(message_id, first, send_id));
+        ledger.observe(
+            &channel(agent_id),
+            &task_started(first, "a1", "Sleep for 45 seconds"),
+        );
+        assert_eq!(open_tasks(&ledger, agent_id).len(), 1);
+        // The process exits without notifying the task's end.
+        ledger.observe(
+            &channel(agent_id),
+            &turn_end(first, &json!({ "status": "completed" })),
+        );
+        assert_eq!(ledger.activity(agent_id), None, "no turn runs");
+
+        let next = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(Uuid::now_v7(), next, Uuid::now_v7()),
+        );
+        assert_eq!(
+            open_tasks(&ledger, agent_id),
+            [],
+            "the ended turn's task is not the next turn's"
+        );
+        // A late event for a task the ledger never saw start opens nothing.
+        ledger.observe(
+            &channel(agent_id),
+            &task_progress(next, "a1", "Running Sleep"),
+        );
+        assert_eq!(open_tasks(&ledger, agent_id), []);
     }
 
     #[test]
@@ -1922,6 +2131,7 @@ mod tests {
                     name: "Bash".to_owned(),
                     running_seconds: 600
                 }],
+                open_background_tasks: Vec::new(),
             },
             "a test suite running is silence with a tool call open"
         );
@@ -1930,7 +2140,8 @@ mod tests {
             ledger.activity(agent_id).unwrap(),
             AgentActivity {
                 seconds_since_output: 0,
-                open_tool_calls: Vec::new()
+                open_tool_calls: Vec::new(),
+                open_background_tasks: Vec::new(),
             }
         );
         ledger.observe(&channel(agent_id), &tool_started(turn_id, "t2", "Read"));

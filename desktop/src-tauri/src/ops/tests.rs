@@ -7032,6 +7032,78 @@ async fn a_reply_cancelled_before_the_running_one_reads_as_cancelled() {
     gate.notify_one();
 }
 
+/// A sub-agent the agent delegated to is no tool call of its own: a wait
+/// reports it under the agent's open background tasks, so a caller can tell
+/// waiting on it from silence.
+#[tokio::test]
+async fn a_wait_reports_the_agents_open_background_task() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    env.adapter
+        .push(Script::parked("delegating", &gate).with_background_task("a1", "Review the parser"));
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "go"),
+    )
+    .await
+    .unwrap();
+    // The ledger notes the task as its event passes through.
+    let mut noted = false;
+    for _ in 0..500 {
+        if env
+            .state
+            .ledger
+            .activity(agents[0])
+            .is_some_and(|a| !a.open_background_tasks.is_empty())
+        {
+            noted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(noted, "the task never reached the ledger");
+
+    let waiting = wait_send(
+        &env.state,
+        project_id,
+        receipt.send_id,
+        &short(),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    let activity = serde_json::to_value(
+        waiting.recipients[0]
+            .activity
+            .as_ref()
+            .expect("a running turn's activity"),
+    )
+    .unwrap();
+    let tasks = &activity["open_background_tasks"];
+    assert_eq!(tasks.as_array().map(Vec::len), Some(1), "{activity}");
+    assert_eq!(tasks[0]["description"], "Review the parser", "{activity}");
+    assert!(tasks[0]["running_seconds"].is_u64(), "{activity}");
+    assert!(
+        tasks[0].get("activity").is_none(),
+        "no activity before the task reports progress: {activity}"
+    );
+
+    let agent = wait_agent(&env.state, project_id, agents[0], &short(), &env.home())
+        .await
+        .unwrap();
+    assert_eq!(agent.status, AgentWaitStatus::Running);
+    assert_eq!(
+        agent
+            .activity
+            .expect("a running turn's activity")
+            .open_background_tasks[0]
+            .description,
+        "Review the parser"
+    );
+    gate.notify_one();
+}
+
 /// Wait until the ledger shows `agent`'s reply to `send_id` as `status`.
 async fn await_recipient_status(env: &TestEnv, send_id: Uuid, agent: AgentId, status: SendStatus) {
     let started = tokio::time::Instant::now();

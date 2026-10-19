@@ -166,7 +166,7 @@ async fn live_claude_background_agent_completes_as_one_turn() {
     let task = events
         .iter()
         .find_map(|e| match e {
-            AdapterEvent::BackgroundTaskStarted {
+            AdapterEvent::TaskStarted {
                 task_id,
                 tool_use_id,
                 ..
@@ -180,9 +180,7 @@ async fn live_claude_background_agent_completes_as_one_turn() {
         .unwrap_or_else(|| panic!("the Agent call {agent_call} never closed; events: {events:?}"));
     let task_ended = events
         .iter()
-        .position(
-            |e| matches!(e, AdapterEvent::BackgroundTaskEnded { task_id, .. } if *task_id == task),
-        )
+        .position(|e| matches!(e, AdapterEvent::TaskEnded { task_id, .. } if *task_id == task))
         .unwrap_or_else(|| panic!("task {task} never ended; events: {events:?}"));
     assert!(
         call_closed < task_ended,

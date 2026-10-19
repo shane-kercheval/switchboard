@@ -46,7 +46,7 @@ import type {
 } from "$lib/types";
 import type {
   AgentRuntime,
-  BackgroundTask,
+  OpenTask,
   ContextReportRequest,
   PendingSend,
   ToolCall,
@@ -695,17 +695,14 @@ function advanceContextReportRequest(runtime: AgentRuntime, input: ReducerInput)
 /// task's activity and moves it last, so the most recently active task is
 /// always last for the footer to name; an end removes the task. Progress for a
 /// task that never started opens nothing.
-function nextBackgroundTasks(
-  tasks: BackgroundTask[],
-  event: Extract<
-    NormalizedEvent,
-    { type: "background_task_started" | "background_task_progress" | "background_task_ended" }
-  >,
-): BackgroundTask[] {
+function nextOpenTasks(
+  tasks: OpenTask[],
+  event: Extract<NormalizedEvent, { type: "task_started" | "task_progress" | "task_ended" }>,
+): OpenTask[] {
   const others = tasks.filter((task) => task.task_id !== event.task_id);
   const existing = tasks.find((task) => task.task_id === event.task_id);
   switch (event.type) {
-    case "background_task_started":
+    case "task_started":
       return existing !== undefined
         ? tasks
         : [
@@ -716,10 +713,10 @@ function nextBackgroundTasks(
               ...(event.tool_use_id !== undefined ? { tool_use_id: event.tool_use_id } : {}),
             },
           ];
-    case "background_task_progress":
+    case "task_progress":
       if (existing === undefined || event.activity === "") return tasks;
       return [...others, { ...existing, activity: event.activity }];
-    case "background_task_ended":
+    case "task_ended":
       return others;
   }
 }
@@ -748,7 +745,7 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         in_flight_turn_id: input.turn_id,
         last_error: undefined,
         quiet_since: undefined,
-        background_tasks: undefined,
+        open_tasks: undefined,
         // Consume the pending-send entry this turn belongs to (by message_id,
         // else the front — see `pickPendingIndex`).
         pending_sends: removePending(
@@ -826,17 +823,17 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // A quota refusal is **not** recorded here: it is a fact about the harness
       // account rather than this agent, so the live-event boundary routes it to
       // the account-scoped store instead (`harnessUsage.svelte.ts`).
-      // A turn's background tasks end with it: a Claude turn ends only when
-      // its process exits.
+      // A turn's open tasks end with it: a Claude turn ends only when its
+      // process exits.
       if (input.outcome.status === "cancelled" || input.outcome.status === "completed") {
-        return runtime.quiet_since !== undefined || runtime.background_tasks !== undefined
-          ? { ...runtime, quiet_since: undefined, background_tasks: undefined }
+        return runtime.quiet_since !== undefined || runtime.open_tasks !== undefined
+          ? { ...runtime, quiet_since: undefined, open_tasks: undefined }
           : runtime;
       }
       return {
         ...runtime,
         quiet_since: undefined,
-        background_tasks: undefined,
+        open_tasks: undefined,
         last_error: {
           message: input.outcome.message,
           kind: input.outcome.kind,
@@ -862,7 +859,7 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         run_status: "idle",
         in_flight_turn_id: undefined,
         quiet_since: undefined,
-        background_tasks: undefined,
+        open_tasks: undefined,
       };
 
     case "heartbeat_timeout":
@@ -878,9 +875,9 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       }
       return { ...runtime, quiet_since: input.at };
 
-    case "background_task_started":
-    case "background_task_progress":
-    case "background_task_ended": {
+    case "task_started":
+    case "task_progress":
+    case "task_ended": {
       // A task event is a sign of life like `liveness` (clearing the quiet
       // marker) and also changes the in-flight turn's open tasks. Events for
       // another turn are stale and ignored.
@@ -888,7 +885,7 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       return {
         ...runtime,
         quiet_since: undefined,
-        background_tasks: nextBackgroundTasks(runtime.background_tasks ?? [], input),
+        open_tasks: nextOpenTasks(runtime.open_tasks ?? [], input),
       };
     }
 

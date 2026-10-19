@@ -52,8 +52,8 @@ pub struct Script {
     /// Codex's stays open while it reads its rollout: the actor holds the
     /// agent's session meanwhile, though the reply is complete.
     pub drain: Option<Arc<Notify>>,
-    /// A background task (its id and description) the turn starts after its
-    /// text, as Claude announces a sub-agent it delegated to.
+    /// A task (its id and description) the turn starts after its text. It
+    /// names no starting call, so it is reported as background work.
     pub background_task: Option<(String, String)>,
 }
 
@@ -79,8 +79,8 @@ impl Script {
         }
     }
 
-    /// What the turn streams before it parks or ends: its text, then the
-    /// background task it starts, if any.
+    /// What the turn streams before it parks or ends: its text, then the task
+    /// it starts, if any.
     fn opening_events(&self, turn_id: TurnId) -> Vec<AdapterEvent> {
         let mut events = vec![AdapterEvent::ContentChunk {
             turn_id,
@@ -88,7 +88,7 @@ impl Script {
             text: self.text.clone(),
         }];
         if let Some((task_id, description)) = &self.background_task {
-            events.push(AdapterEvent::BackgroundTaskStarted {
+            events.push(AdapterEvent::TaskStarted {
                 turn_id,
                 task_id: task_id.clone(),
                 description: description.clone(),

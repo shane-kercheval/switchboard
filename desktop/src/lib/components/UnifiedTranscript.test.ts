@@ -678,7 +678,7 @@ describe("UnifiedTranscript", () => {
         started_at: "2026-05-16T00:00:00Z",
       });
       fireTo(channel, {
-        type: "background_task_started",
+        type: "task_started",
         turn_id: "agent-1",
         task_id: "a1",
         description: "Review the parser",
@@ -698,7 +698,7 @@ describe("UnifiedTranscript", () => {
 
       // Progress is a sign of life; silent again, the footer names it.
       fireTo(channel, {
-        type: "background_task_progress",
+        type: "task_progress",
         turn_id: "agent-1",
         task_id: "a1",
         activity: "Running Sleep for 45 seconds",
@@ -713,7 +713,7 @@ describe("UnifiedTranscript", () => {
 
       // A second task counts, and is the latest thing to have happened.
       fireTo(channel, {
-        type: "background_task_started",
+        type: "task_started",
         turn_id: "agent-1",
         task_id: "b2",
         description: "Sleep for 45 seconds",
@@ -725,7 +725,7 @@ describe("UnifiedTranscript", () => {
       );
 
       for (const task_id of ["a1", "b2"]) {
-        fireTo(channel, { type: "background_task_ended", turn_id: "agent-1", task_id });
+        fireTo(channel, { type: "task_ended", turn_id: "agent-1", task_id });
       }
       vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
       await tick();
@@ -765,14 +765,14 @@ describe("UnifiedTranscript", () => {
         facet: { facet_kind: "other" },
       });
       fireTo(channel, {
-        type: "background_task_started",
+        type: "task_started",
         turn_id: "agent-1",
         task_id: "a1",
         description: "Review the parser",
         tool_use_id: "toolu_A",
       });
       fireTo(channel, {
-        type: "background_task_progress",
+        type: "task_progress",
         turn_id: "agent-1",
         task_id: "a1",
         activity: "Running cargo test",

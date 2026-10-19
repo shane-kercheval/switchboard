@@ -420,32 +420,32 @@ pub enum AdapterEvent {
     /// timer so a long silent-but-thinking turn is not falsely declared dead.
     /// Never becomes a transcript item.
     Liveness { turn_id: TurnId },
-    /// Work the turn handed off that runs apart from its own output: a
-    /// sub-agent it delegated to, or a command it ran in the background.
-    /// Claude announces each with `system/task_started` (see
+    /// A task the turn started: a sub-agent it delegated to, whether it waits
+    /// on it or runs it in the background, or a command it runs in the
+    /// background. Claude announces each with `system/task_started` (see
     /// `docs/harness-behavior.md` G20). Like `Liveness`, a content-free sign
     /// of life that never becomes a transcript item; consumers track the task
-    /// until `BackgroundTaskEnded` or the turn's end, since a Claude turn ends
-    /// only when its process exits. `tool_use_id` names the tool call that
-    /// started it: a sub-agent the turn waits on keeps that call open until
-    /// it returns, while a background launch closes it at once.
-    BackgroundTaskStarted {
+    /// until `TaskEnded` or the turn's end, since a Claude turn ends only
+    /// when its process exits. `tool_use_id` names the tool call that started
+    /// it: a sub-agent the turn waits on keeps that call open until it
+    /// returns, while a background launch closes it at once.
+    TaskStarted {
         turn_id: TurnId,
         task_id: String,
         description: String,
         tool_use_id: Option<String>,
     },
-    /// What a running background task is doing now (Claude's
-    /// `system/task_progress`, emitted repeatedly while a sub-agent works).
-    BackgroundTaskProgress {
+    /// What a running task is doing now (Claude's `system/task_progress`,
+    /// emitted repeatedly while a sub-agent works).
+    TaskProgress {
         turn_id: TurnId,
         task_id: String,
         activity: String,
     },
-    /// A background task finished, whatever its status: Claude's
+    /// A task finished, whatever its status: Claude's
     /// `system/task_notification` reports `completed`, `stopped` for a task
     /// torn down at exit, and may grow others.
-    BackgroundTaskEnded { turn_id: TurnId, task_id: String },
+    TaskEnded { turn_id: TurnId, task_id: String },
     /// The turn's dedup identity, announced as soon as the adapter knows it:
     /// Claude emits it immediately from the first assistant `message.id`; the
     /// Codex adapter emits it on its **cancel path** from a session-file read
@@ -688,25 +688,24 @@ pub enum NormalizedEvent {
     /// Content-free liveness signal (see [`AdapterEvent::Liveness`]). The
     /// frontend re-arms its per-turn heartbeat on this and renders nothing.
     Liveness { turn_id: TurnId },
-    /// A background task the turn started (see
-    /// [`AdapterEvent::BackgroundTaskStarted`]). Re-arms the heartbeat as
-    /// `Liveness` does and renders nothing in the transcript.
-    BackgroundTaskStarted {
+    /// A task the turn started (see [`AdapterEvent::TaskStarted`]). Re-arms
+    /// the heartbeat as `Liveness` does and renders nothing in the
+    /// transcript.
+    TaskStarted {
         turn_id: TurnId,
         task_id: String,
         description: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_use_id: Option<String>,
     },
-    /// A running background task's current activity (see
-    /// [`AdapterEvent::BackgroundTaskProgress`]).
-    BackgroundTaskProgress {
+    /// A running task's current activity (see [`AdapterEvent::TaskProgress`]).
+    TaskProgress {
         turn_id: TurnId,
         task_id: String,
         activity: String,
     },
-    /// A background task finished (see [`AdapterEvent::BackgroundTaskEnded`]).
-    BackgroundTaskEnded { turn_id: TurnId, task_id: String },
+    /// A task finished (see [`AdapterEvent::TaskEnded`]).
+    TaskEnded { turn_id: TurnId, task_id: String },
     /// Early dedup identity for the live turn (see [`AdapterEvent::TurnIdentity`]).
     /// The frontend stamps `hydration_key` onto the in-flight turn so a
     /// concurrent disk re-read collapses against it instead of duplicating. The
@@ -873,9 +872,9 @@ impl AdapterEvent {
         match self {
             AdapterEvent::ContentChunk { .. }
             | AdapterEvent::Liveness { .. }
-            | AdapterEvent::BackgroundTaskStarted { .. }
-            | AdapterEvent::BackgroundTaskProgress { .. }
-            | AdapterEvent::BackgroundTaskEnded { .. }
+            | AdapterEvent::TaskStarted { .. }
+            | AdapterEvent::TaskProgress { .. }
+            | AdapterEvent::TaskEnded { .. }
             | AdapterEvent::TurnIdentity { .. }
             | AdapterEvent::ToolStarted { .. }
             | AdapterEvent::ToolCompleted { .. }
@@ -911,28 +910,28 @@ impl AdapterEvent {
                 text,
             },
             AdapterEvent::Liveness { turn_id } => NormalizedEvent::Liveness { turn_id },
-            AdapterEvent::BackgroundTaskStarted {
+            AdapterEvent::TaskStarted {
                 turn_id,
                 task_id,
                 description,
                 tool_use_id,
-            } => NormalizedEvent::BackgroundTaskStarted {
+            } => NormalizedEvent::TaskStarted {
                 turn_id,
                 task_id,
                 description,
                 tool_use_id,
             },
-            AdapterEvent::BackgroundTaskProgress {
+            AdapterEvent::TaskProgress {
                 turn_id,
                 task_id,
                 activity,
-            } => NormalizedEvent::BackgroundTaskProgress {
+            } => NormalizedEvent::TaskProgress {
                 turn_id,
                 task_id,
                 activity,
             },
-            AdapterEvent::BackgroundTaskEnded { turn_id, task_id } => {
-                NormalizedEvent::BackgroundTaskEnded { turn_id, task_id }
+            AdapterEvent::TaskEnded { turn_id, task_id } => {
+                NormalizedEvent::TaskEnded { turn_id, task_id }
             }
             AdapterEvent::TurnIdentity {
                 turn_id,
@@ -1618,19 +1617,19 @@ mod tests {
     }
 
     #[test]
-    fn background_task_events_lift_to_their_wire_names() {
+    fn task_events_lift_to_their_wire_names() {
         let turn_id = fresh_turn_id();
         let task_id = || "a7cb77a05059e4590".to_owned();
         let cases = [
             (
-                AdapterEvent::BackgroundTaskStarted {
+                AdapterEvent::TaskStarted {
                     turn_id,
                     task_id: task_id(),
                     description: "Sleep 45 then reply ok".to_owned(),
                     tool_use_id: Some("toolu_01B1AN52bDdxfyrLDXQrrXJx".to_owned()),
                 },
                 serde_json::json!({
-                    "type": "background_task_started",
+                    "type": "task_started",
                     "turn_id": turn_id,
                     "task_id": "a7cb77a05059e4590",
                     "description": "Sleep 45 then reply ok",
@@ -1638,25 +1637,25 @@ mod tests {
                 }),
             ),
             (
-                AdapterEvent::BackgroundTaskProgress {
+                AdapterEvent::TaskProgress {
                     turn_id,
                     task_id: task_id(),
                     activity: "Running Sleep for 45 seconds".to_owned(),
                 },
                 serde_json::json!({
-                    "type": "background_task_progress",
+                    "type": "task_progress",
                     "turn_id": turn_id,
                     "task_id": "a7cb77a05059e4590",
                     "activity": "Running Sleep for 45 seconds",
                 }),
             ),
             (
-                AdapterEvent::BackgroundTaskEnded {
+                AdapterEvent::TaskEnded {
                     turn_id,
                     task_id: task_id(),
                 },
                 serde_json::json!({
-                    "type": "background_task_ended",
+                    "type": "task_ended",
                     "turn_id": turn_id,
                     "task_id": "a7cb77a05059e4590",
                 }),

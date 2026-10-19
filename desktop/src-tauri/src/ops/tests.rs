@@ -7032,9 +7032,9 @@ async fn a_reply_cancelled_before_the_running_one_reads_as_cancelled() {
     gate.notify_one();
 }
 
-/// A sub-agent the agent delegated to is no tool call of its own: a wait
-/// reports it under the agent's open background tasks, so a caller can tell
-/// waiting on it from silence.
+/// A task that names no starting call is work handed off to the background:
+/// a wait reports it under the agent's open background tasks, so a caller can
+/// tell waiting on it from silence.
 #[tokio::test]
 async fn a_wait_reports_the_agents_open_background_task() {
     let (env, project_id, agents) = project_with_agents(&["a"]);

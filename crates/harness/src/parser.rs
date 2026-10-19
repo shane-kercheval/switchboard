@@ -1199,7 +1199,7 @@ fn select_context_window(
 }
 
 /// Parse a `system` envelope. `init` carries session metadata, and the
-/// background-task lifecycle (`task_started`, `task_progress`,
+/// task lifecycle (`task_started`, `task_progress`,
 /// `task_notification`) becomes its typed events; **every other subtype maps
 /// to `Liveness`** — a denylist, deliberately. The non-init vocabulary is
 /// vendor-controlled and has already drifted across CLI versions
@@ -1229,7 +1229,7 @@ fn parse_system_event(
             _ => {}
         }
     }
-    if let Some(event) = background_task_event(subtype, obj, turn_id) {
+    if let Some(event) = task_event(subtype, obj, turn_id) {
         return ParseOutcome::Event(event);
     }
     if subtype != Some("init") {
@@ -1265,15 +1265,11 @@ fn parse_system_event(
     })
 }
 
-/// Claude's background-task lifecycle as typed events (G20). `task_progress`'s
+/// Claude's task lifecycle as typed events (G20). `task_progress`'s
 /// `description` is the task's current activity, not its name, and
 /// `task_started`'s `tool_use_id` is the call that started the task. A record
 /// with no task id stays plain `Liveness`, like any other non-init subtype.
-fn background_task_event(
-    subtype: Option<&str>,
-    obj: &Value,
-    turn_id: TurnId,
-) -> Option<AdapterEvent> {
+fn task_event(subtype: Option<&str>, obj: &Value, turn_id: TurnId) -> Option<AdapterEvent> {
     let task_id = obj.get("task_id").and_then(Value::as_str)?.to_owned();
     let description = || {
         obj.get("description")
@@ -1282,7 +1278,7 @@ fn background_task_event(
             .to_owned()
     };
     Some(match subtype? {
-        "task_started" => AdapterEvent::BackgroundTaskStarted {
+        "task_started" => AdapterEvent::TaskStarted {
             turn_id,
             task_id,
             description: description(),
@@ -1291,12 +1287,12 @@ fn background_task_event(
                 .and_then(Value::as_str)
                 .map(str::to_owned),
         },
-        "task_progress" => AdapterEvent::BackgroundTaskProgress {
+        "task_progress" => AdapterEvent::TaskProgress {
             turn_id,
             task_id,
             activity: description(),
         },
-        "task_notification" => AdapterEvent::BackgroundTaskEnded { turn_id, task_id },
+        "task_notification" => AdapterEvent::TaskEnded { turn_id, task_id },
         _ => return None,
     })
 }
@@ -2849,11 +2845,11 @@ mod tests {
     // (Claude 2.1.198).
 
     #[test]
-    fn task_started_yields_a_background_task_with_its_description() {
+    fn task_started_yields_a_task_with_its_description() {
         let turn = tid();
         let sub_agent = r#"{"type": "system", "subtype": "task_started", "task_id": "a7cb77a05059e4590", "tool_use_id": "toolu_01B1AN52bDdxfyrLDXQrrXJx", "description": "Sleep 45 then reply ok", "subagent_type": "general-purpose", "task_type": "local_agent", "prompt": "Run the shell command 'sleep 45' using Bash, then reply with the single word ok.", "uuid": "f46dcec8-0bf9-4a2c-b3b1-2d735fc66041", "session_id": "318648f6-7e6a-4ad0-a50f-2a0566a32a38"}"#;
         match parse_one(sub_agent, turn) {
-            ParseOutcome::Event(AdapterEvent::BackgroundTaskStarted {
+            ParseOutcome::Event(AdapterEvent::TaskStarted {
                 turn_id,
                 task_id,
                 description,
@@ -2868,12 +2864,12 @@ mod tests {
                     "the Agent call that started it"
                 );
             }
-            other => panic!("expected BackgroundTaskStarted, got {other:?}"),
+            other => panic!("expected TaskStarted, got {other:?}"),
         }
         // A background command is a task too, with no sub-agent fields.
         let command = r#"{"type": "system", "subtype": "task_started", "task_id": "bzggpsjub", "tool_use_id": "toolu_01755n1P4CQTutKzmDT4pj49", "description": "Sleep for 45 seconds", "task_type": "local_bash", "uuid": "7827ae64-8d60-453a-a6d5-58a2c2700a74", "session_id": "318648f6-7e6a-4ad0-a50f-2a0566a32a38"}"#;
         match parse_one(command, turn) {
-            ParseOutcome::Event(AdapterEvent::BackgroundTaskStarted {
+            ParseOutcome::Event(AdapterEvent::TaskStarted {
                 task_id,
                 description,
                 ..
@@ -2881,7 +2877,7 @@ mod tests {
                 assert_eq!(task_id, "bzggpsjub");
                 assert_eq!(description, "Sleep for 45 seconds");
             }
-            other => panic!("expected BackgroundTaskStarted, got {other:?}"),
+            other => panic!("expected TaskStarted, got {other:?}"),
         }
     }
 
@@ -2890,7 +2886,7 @@ mod tests {
         let turn = tid();
         let line = r#"{"type": "system", "subtype": "task_progress", "task_id": "a7cb77a05059e4590", "tool_use_id": "toolu_01B1AN52bDdxfyrLDXQrrXJx", "description": "Running Sleep for 45 seconds", "subagent_type": "general-purpose", "usage": {"total_tokens": 15321, "tool_uses": 1, "duration_ms": 2184}, "last_tool_name": "Bash", "uuid": "2320ba31-6d93-4b79-b7bf-c8e53dd0491e", "session_id": "318648f6-7e6a-4ad0-a50f-2a0566a32a38"}"#;
         match parse_one(line, turn) {
-            ParseOutcome::Event(AdapterEvent::BackgroundTaskProgress {
+            ParseOutcome::Event(AdapterEvent::TaskProgress {
                 turn_id,
                 task_id,
                 activity,
@@ -2899,7 +2895,7 @@ mod tests {
                 assert_eq!(task_id, "a7cb77a05059e4590");
                 assert_eq!(activity, "Running Sleep for 45 seconds");
             }
-            other => panic!("expected BackgroundTaskProgress, got {other:?}"),
+            other => panic!("expected TaskProgress, got {other:?}"),
         }
     }
 
@@ -2911,11 +2907,11 @@ mod tests {
         for (line, expected) in [(completed, "a7cb77a05059e4590"), (stopped, "bzggpsjub")] {
             let turn = tid();
             match parse_one(line, turn) {
-                ParseOutcome::Event(AdapterEvent::BackgroundTaskEnded { turn_id, task_id }) => {
+                ParseOutcome::Event(AdapterEvent::TaskEnded { turn_id, task_id }) => {
                     assert_eq!(turn_id, turn);
                     assert_eq!(task_id, expected);
                 }
-                other => panic!("expected BackgroundTaskEnded for {line}, got {other:?}"),
+                other => panic!("expected TaskEnded for {line}, got {other:?}"),
             }
         }
     }

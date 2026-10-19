@@ -33,7 +33,7 @@
     retryAgentSubscription,
     runtimes,
     transcripts,
-    type BackgroundTask,
+    type OpenTask,
     type Turn,
   } from "$lib/state/index.svelte";
   import {
@@ -851,7 +851,7 @@
   /// that kind are open. `undefined` when no task is open.
   function quietWork(
     turn: AgentTurn,
-    tasks: BackgroundTask[],
+    tasks: OpenTask[],
   ): { label: string; count: number } | undefined {
     const runningCalls = new Set(
       turn.items.flatMap((item) =>
@@ -1918,7 +1918,7 @@
     rt?.quiet_since !== undefined && rt?.in_flight_turn_id === turn.turn_id
       ? rt.quiet_since
       : undefined}
-  {@const work = quietSince !== undefined ? quietWork(turn, rt?.background_tasks ?? []) : undefined}
+  {@const work = quietSince !== undefined ? quietWork(turn, rt?.open_tasks ?? []) : undefined}
   <div
     class="mt-2 flex min-w-0 items-center gap-2 text-xs {quietSince !== undefined &&
     work === undefined

@@ -207,7 +207,7 @@ export type ToolCall = {
 /// call that started it. While that call is still running, the agent waits on
 /// the task (a sub-agent it delegated to); otherwise the task runs apart from
 /// it in the background.
-export type BackgroundTask = {
+export type OpenTask = {
   task_id: string;
   description: string;
   activity?: string;
@@ -380,7 +380,7 @@ export type AgentRuntime = {
   /// one of them did.
   /// Reset at `turn_start` and cleared at `turn_end`, since a task never
   /// outlives its turn. Absent or empty when none is open.
-  background_tasks?: BackgroundTask[];
+  open_tasks?: OpenTask[];
   /// Runtime record of the last turn's failure (not rendered — failures surface
   /// in the transcript as a failed agent turn). Set on failed `TurnEnd` or a
   /// pre-start `message_failed`; cleared on the next successful turn. Does NOT

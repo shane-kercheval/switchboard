@@ -231,8 +231,8 @@ pub const RECENT_TEXT_CHARS: usize = 500;
 /// What an agent's running turn is doing, for telling a stuck turn from a
 /// long one. Silence is measured as the window measures it for its "No
 /// response" label: the time since the turn started or the agent last wrote
-/// text, sent a heartbeat, started or finished a tool call, or a background
-/// task started, reported progress, or ended. A tool call left open (a test
+/// text, sent a heartbeat, started or finished a tool call, or heard from a
+/// sub-agent or a background command. A tool call left open (a test
 /// suite running) is reported with how long it has run, since it produces
 /// nothing until it ends. A sub-agent the agent waits on is its open `Agent`
 /// tool call, which carries what the sub-agent last reported doing. Work the
@@ -350,9 +350,9 @@ const OUTPUT_EVENTS: &[&str] = &[
     "turn_identity",
     "tool_started",
     "tool_completed",
-    "background_task_started",
-    "background_task_progress",
-    "background_task_ended",
+    "task_started",
+    "task_progress",
+    "task_ended",
 ];
 
 /// The ledger's clock for activity durations: monotonic, so a change to the
@@ -1195,8 +1195,9 @@ impl SendLedger {
     }
 
     /// `Some` while the agent has a turn running, whoever sent it, holding the
-    /// send it answers when its start event named one; `None` while no turn
-    /// runs. A send still waiting for the agent has no turn yet.
+    /// send it answers, or `None` inside when its start event failed to
+    /// parse; `None` while no turn runs. A send still waiting for the agent
+    /// has no turn yet.
     #[must_use]
     pub fn open_turn(&self, agent_id: AgentId) -> Option<Option<SendId>> {
         lock(&self.inner)
@@ -1345,10 +1346,10 @@ impl SendLedger {
                 self.on_content(payload);
                 return;
             }
-            // A background task changes only the agent's activity, never
-            // admission or a send's text: note it and wake nobody.
-            "background_task_started" | "background_task_progress" | "background_task_ended" => {
-                self.on_background_task(agent_id, payload);
+            // A task changes only the agent's activity, never admission or a
+            // send's text: note it and wake nobody.
+            "task_started" | "task_progress" | "task_ended" => {
+                self.on_task(agent_id, payload);
                 return;
             }
             "turn_start" | "turn_end" | "message_failed" | "message_cancelled" | "agent_idle" => {}
@@ -1421,15 +1422,15 @@ impl SendLedger {
         true
     }
 
-    /// Track the agent's background tasks from their typed events: a start
+    /// Track the agent's open tasks from their typed events: a start
     /// opens one, progress records what it is doing now, and an end closes
     /// it. A turn's start and end clear them all (`note_activity`), since a
     /// task never outlives the turn that started it.
-    fn on_background_task(&self, agent_id: AgentId, payload: &serde_json::Value) {
+    fn on_task(&self, agent_id: AgentId, payload: &serde_json::Value) {
         let event = match serde_json::from_value::<NormalizedEvent>(payload.clone()) {
             Ok(event) => event,
             Err(e) => {
-                tracing::warn!(%agent_id, error = %e, "ledger could not parse a background task event");
+                tracing::warn!(%agent_id, error = %e, "ledger could not parse a task event");
                 return;
             }
         };
@@ -1439,7 +1440,7 @@ impl SendLedger {
             return;
         };
         match event {
-            NormalizedEvent::BackgroundTaskStarted {
+            NormalizedEvent::TaskStarted {
                 task_id,
                 description,
                 tool_use_id,
@@ -1453,7 +1454,7 @@ impl SendLedger {
                     started: now,
                 });
             }
-            NormalizedEvent::BackgroundTaskProgress {
+            NormalizedEvent::TaskProgress {
                 task_id, activity, ..
             } if !activity.is_empty() => {
                 if let Some(task) = state
@@ -1464,7 +1465,7 @@ impl SendLedger {
                     task.activity = Some(activity);
                 }
             }
-            NormalizedEvent::BackgroundTaskEnded { task_id, .. } => {
+            NormalizedEvent::TaskEnded { task_id, .. } => {
                 state.open_tasks.retain(|task| task.task_id != task_id);
             }
             _ => {}
@@ -1958,7 +1959,7 @@ mod tests {
     }
 
     fn task_started(turn_id: TurnId, id: &str, description: &str) -> serde_json::Value {
-        json!({ "type": "background_task_started", "turn_id": turn_id, "task_id": id, "description": description })
+        json!({ "type": "task_started", "turn_id": turn_id, "task_id": id, "description": description })
     }
 
     fn task_started_by(
@@ -1967,18 +1968,18 @@ mod tests {
         description: &str,
         tool_use_id: &str,
     ) -> serde_json::Value {
-        json!({ "type": "background_task_started", "turn_id": turn_id, "task_id": id, "description": description, "tool_use_id": tool_use_id })
+        json!({ "type": "task_started", "turn_id": turn_id, "task_id": id, "description": description, "tool_use_id": tool_use_id })
     }
 
     fn task_progress(turn_id: TurnId, id: &str, activity: &str) -> serde_json::Value {
-        json!({ "type": "background_task_progress", "turn_id": turn_id, "task_id": id, "activity": activity })
+        json!({ "type": "task_progress", "turn_id": turn_id, "task_id": id, "activity": activity })
     }
 
     fn task_ended(turn_id: TurnId, id: &str) -> serde_json::Value {
-        json!({ "type": "background_task_ended", "turn_id": turn_id, "task_id": id })
+        json!({ "type": "task_ended", "turn_id": turn_id, "task_id": id })
     }
 
-    fn open_tasks(ledger: &SendLedger, agent_id: AgentId) -> Vec<OpenBackgroundTask> {
+    fn background_tasks(ledger: &SendLedger, agent_id: AgentId) -> Vec<OpenBackgroundTask> {
         ledger.activity(agent_id).unwrap().open_background_tasks
     }
 
@@ -2039,7 +2040,7 @@ mod tests {
         );
         advance(&now, 10);
         assert_eq!(
-            open_tasks(&ledger, agent_id),
+            background_tasks(&ledger, agent_id),
             [
                 OpenBackgroundTask {
                     description: "Review the parser".to_owned(),
@@ -2060,7 +2061,7 @@ mod tests {
             &task_progress(turn_id, "a1", "Reading crates/core/Cargo.toml"),
         );
         assert_eq!(
-            open_tasks(&ledger, agent_id)[0].activity.as_deref(),
+            background_tasks(&ledger, agent_id)[0].activity.as_deref(),
             Some("Reading crates/core/Cargo.toml")
         );
         assert_eq!(
@@ -2071,7 +2072,7 @@ mod tests {
 
         ledger.observe(&channel(agent_id), &task_ended(turn_id, "a1"));
         assert_eq!(
-            open_tasks(&ledger, agent_id),
+            background_tasks(&ledger, agent_id),
             [OpenBackgroundTask {
                 description: "Run the test suite".to_owned(),
                 activity: None,
@@ -2186,7 +2187,7 @@ mod tests {
     }
 
     #[test]
-    fn a_turns_end_clears_its_background_tasks() {
+    fn a_turns_end_clears_its_open_tasks() {
         let ledger = SendLedger::new();
         let (_, send_id, agent_id, message_id) = registered(&ledger);
         let first = Uuid::now_v7();
@@ -2195,7 +2196,7 @@ mod tests {
             &channel(agent_id),
             &task_started(first, "a1", "Sleep for 45 seconds"),
         );
-        assert_eq!(open_tasks(&ledger, agent_id).len(), 1);
+        assert_eq!(background_tasks(&ledger, agent_id).len(), 1);
         // The process exits without notifying the task's end.
         ledger.observe(
             &channel(agent_id),
@@ -2209,7 +2210,7 @@ mod tests {
             &turn_start(Uuid::now_v7(), next, Uuid::now_v7()),
         );
         assert_eq!(
-            open_tasks(&ledger, agent_id),
+            background_tasks(&ledger, agent_id),
             [],
             "the ended turn's task is not the next turn's"
         );
@@ -2218,7 +2219,7 @@ mod tests {
             &channel(agent_id),
             &task_progress(next, "a1", "Running Sleep"),
         );
-        assert_eq!(open_tasks(&ledger, agent_id), []);
+        assert_eq!(background_tasks(&ledger, agent_id), []);
     }
 
     #[test]

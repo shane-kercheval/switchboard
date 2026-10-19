@@ -313,23 +313,24 @@ export type NormalizedEvent =
   // produced no renderable content (e.g. Claude Opus 4.8's redacted thinking
   // deltas). Re-arms the per-turn heartbeat; renders nothing.
   | { type: "liveness"; turn_id: TurnId }
-  // Work the turn handed off that runs apart from its own output: a sub-agent
-  // it delegated to, or a command it runs in the background (Claude only).
-  // Each is a sign of life that re-arms the heartbeat like `liveness`; none
-  // renders in the transcript. The runtime tracks open tasks for the footer.
+  // A task the turn started (Claude only): a sub-agent it delegated to,
+  // whether it waits on it or runs it in the background, or a command it runs
+  // in the background. Each event is a sign of life that re-arms the heartbeat
+  // like `liveness`; none renders in the transcript. The runtime tracks open
+  // tasks for the footer.
   // `tool_use_id` names the tool call that started the task: a sub-agent the
   // agent waits on keeps that call running; a background launch closes it.
   | {
-      type: "background_task_started";
+      type: "task_started";
       turn_id: TurnId;
       task_id: string;
       description: string;
       tool_use_id?: string;
     }
   // What a running task is doing now (a sub-agent's current step).
-  | { type: "background_task_progress"; turn_id: TurnId; task_id: string; activity: string }
+  | { type: "task_progress"; turn_id: TurnId; task_id: string; activity: string }
   // A task finished, whatever its status.
-  | { type: "background_task_ended"; turn_id: TurnId; task_id: string }
+  | { type: "task_ended"; turn_id: TurnId; task_id: string }
   // Early dedup identity for the in-flight turn (Claude). The reducer stamps
   // `hydration_key` onto the live turn so a concurrent disk re-read collapses
   // against it instead of duplicating. `hydration_key` is the first assistant
@@ -1176,8 +1177,8 @@ export type DirectoryInfo = {
 
 export const HEARTBEAT_TIMEOUT_MS = 60_000;
 // Heartbeat re-arms on any per-turn sign of life for the tracked turn:
-// `content_chunk`, `liveness`, `tool_started`, `tool_completed`, and the
-// background task events. 1 minute of
+// `content_chunk`, `liveness`, `tool_started`, `tool_completed`, and the task
+// events. 1 minute of
 // total silence across all of these is the "stream is silent" threshold (kept
 // short because the indicator is harmless and the user can always cancel).
 // `liveness` and tool events are load-bearing: a long redacted thinking block

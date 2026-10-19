@@ -72,7 +72,7 @@ import {
 } from "./sendCompletion";
 import type {
   AgentRuntime,
-  BackgroundTask,
+  OpenTask,
   PendingSend,
   RuntimeMap,
   ToolCall,
@@ -1251,12 +1251,12 @@ function manageHeartbeat(agentId: AgentId, event: NormalizedEvent): void {
     case "liveness":
     case "tool_started":
     case "tool_completed":
-    case "background_task_started":
-    case "background_task_progress":
-    case "background_task_ended": {
+    case "task_started":
+    case "task_progress":
+    case "task_ended": {
       // Re-arm on any sign the harness is alive for the turn the heartbeat is
-      // watching. A background task's events count: a sub-agent's progress
-      // is the turn working. A long shell tool call legitimately produces zero
+      // watching. A task's events count: a sub-agent's progress is the turn
+      // working. A long shell tool call legitimately produces zero
       // content_chunks for minutes (`Bash` running a test suite), and a long
       // redacted thinking block produces only `liveness` (Claude Opus 4.8's
       // redacted thinking deltas) — without re-arming on those, the heartbeat
@@ -1365,4 +1365,4 @@ export const _testing = {
 
 // Re-export the state-shape types so consumers can import everything from
 // one path without reaching into `./types` directly.
-export type { AgentRuntime, BackgroundTask, RuntimeMap, ToolCall, TranscriptMap, Turn };
+export type { AgentRuntime, OpenTask, RuntimeMap, ToolCall, TranscriptMap, Turn };

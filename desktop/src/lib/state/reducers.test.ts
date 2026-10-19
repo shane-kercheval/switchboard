@@ -1698,77 +1698,77 @@ describe("runtimeReducer", () => {
     expect(r.in_flight_turn_id).toBeUndefined();
   });
 
-  it("background task events track the in-flight turn's open tasks, most recently active last", () => {
+  it("task events track the in-flight turn's open tasks, most recently active last", () => {
     let r = runtimeReducer(fresh(), turnStart(TURN_1));
     r = { ...r, quiet_since: "2026-05-16T00:01:00Z" };
     r = runtimeReducer(r, {
-      type: "background_task_started",
+      type: "task_started",
       turn_id: TURN_1,
       task_id: "a1",
       description: "Review the parser",
     });
     expect(r.quiet_since).toBeUndefined();
     r = runtimeReducer(r, {
-      type: "background_task_started",
+      type: "task_started",
       turn_id: TURN_1,
       task_id: "b2",
       description: "Run the tests",
     });
     r = runtimeReducer(r, {
-      type: "background_task_progress",
+      type: "task_progress",
       turn_id: TURN_1,
       task_id: "a1",
       activity: "Reading parser.rs",
     });
-    expect(r.background_tasks).toEqual([
+    expect(r.open_tasks).toEqual([
       { task_id: "b2", description: "Run the tests" },
       { task_id: "a1", description: "Review the parser", activity: "Reading parser.rs" },
     ]);
     // Progress for a task that never started opens nothing.
     r = runtimeReducer(r, {
-      type: "background_task_progress",
+      type: "task_progress",
       turn_id: TURN_1,
       task_id: "zz",
       activity: "stray",
     });
-    r = runtimeReducer(r, { type: "background_task_ended", turn_id: TURN_1, task_id: "a1" });
-    expect(r.background_tasks).toEqual([{ task_id: "b2", description: "Run the tests" }]);
+    r = runtimeReducer(r, { type: "task_ended", turn_id: TURN_1, task_id: "a1" });
+    expect(r.open_tasks).toEqual([{ task_id: "b2", description: "Run the tests" }]);
   });
 
   it("re-reading the agent's history mid-turn keeps the turn's open tasks", () => {
     let r = runtimeReducer(fresh(), turnStart(TURN_1));
     r = runtimeReducer(r, {
-      type: "background_task_started",
+      type: "task_started",
       turn_id: TURN_1,
       task_id: "a1",
       description: "Review the parser",
       tool_use_id: "toolu_A",
     });
-    const before = r.background_tasks;
+    const before = r.open_tasks;
     r = runtimeReducer(r, { type: "hydrate", agent_id: AGENT_A, turns: [] });
-    expect(r.background_tasks).toEqual(before);
-    expect(r.background_tasks).toEqual([
+    expect(r.open_tasks).toEqual(before);
+    expect(r.open_tasks).toEqual([
       { task_id: "a1", description: "Review the parser", tool_use_id: "toolu_A" },
     ]);
   });
 
-  it("a turn's end clears its background tasks, and another turn's task events are ignored", () => {
+  it("a turn's end clears its open tasks, and another turn's task events are ignored", () => {
     let r = runtimeReducer(fresh(), turnStart(TURN_1));
     r = runtimeReducer(r, {
-      type: "background_task_started",
+      type: "task_started",
       turn_id: "some-other-turn",
       task_id: "x",
       description: "stale",
     });
-    expect(r.background_tasks).toBeUndefined();
+    expect(r.open_tasks).toBeUndefined();
     r = runtimeReducer(r, {
-      type: "background_task_started",
+      type: "task_started",
       turn_id: TURN_1,
       task_id: "a1",
       description: "Sleep for 45 seconds",
     });
     r = runtimeReducer(r, turnEndCompleted(TURN_1));
-    expect(r.background_tasks).toBeUndefined();
+    expect(r.open_tasks).toBeUndefined();
   });
 
   it("agent_idle after failed turn preserves last_error (sendability ≠ health)", () => {

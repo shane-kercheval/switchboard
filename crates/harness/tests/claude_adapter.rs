@@ -396,14 +396,14 @@ async fn background_agent_dispatch_completes_as_one_turn() {
     assert!(
         events.iter().any(|e| matches!(
             e,
-            AdapterEvent::BackgroundTaskStarted { task_id, .. } if task_id == "a5f72cb38c72f0202"
+            AdapterEvent::TaskStarted { task_id, .. } if task_id == "a5f72cb38c72f0202"
         )),
-        "task_started surfaces as a background task"
+        "task_started surfaces as a task event"
     );
     assert!(
         events.iter().any(|e| matches!(
             e,
-            AdapterEvent::BackgroundTaskEnded { task_id, .. } if task_id == "a5f72cb38c72f0202"
+            AdapterEvent::TaskEnded { task_id, .. } if task_id == "a5f72cb38c72f0202"
         )),
         "task_notification ends it"
     );
@@ -425,7 +425,7 @@ async fn background_agent_dispatch_completes_as_one_turn() {
 }
 
 #[tokio::test]
-async fn background_tasks_surface_their_lifecycle_in_stream_order() {
+async fn tasks_surface_their_lifecycle_in_stream_order() {
     // A real (sanitized) capture: a background sub-agent reports progress and
     // starts a background command of its own, which the process tears down
     // ("stopped") after the final result. Every task event arrives, in stream
@@ -436,7 +436,7 @@ async fn background_tasks_surface_their_lifecycle_in_stream_order() {
     let tasks: Vec<String> = events
         .iter()
         .filter_map(|e| match e {
-            AdapterEvent::BackgroundTaskStarted {
+            AdapterEvent::TaskStarted {
                 task_id,
                 description,
                 tool_use_id,
@@ -445,10 +445,10 @@ async fn background_tasks_surface_their_lifecycle_in_stream_order() {
                 "started {task_id} by {}: {description}",
                 tool_use_id.as_deref().unwrap_or("-")
             )),
-            AdapterEvent::BackgroundTaskProgress {
+            AdapterEvent::TaskProgress {
                 task_id, activity, ..
             } => Some(format!("progress {task_id}: {activity}")),
-            AdapterEvent::BackgroundTaskEnded { task_id, .. } => Some(format!("ended {task_id}")),
+            AdapterEvent::TaskEnded { task_id, .. } => Some(format!("ended {task_id}")),
             _ => None,
         })
         .collect();
@@ -473,7 +473,7 @@ async fn background_tasks_surface_their_lifecycle_in_stream_order() {
         &|e| matches!(e, AdapterEvent::ToolCompleted { tool_use_id, .. } if tool_use_id == "toolu_01B1AN52bDdxfyrLDXQrrXJx"),
     );
     let task_ended = position(
-        &|e| matches!(e, AdapterEvent::BackgroundTaskEnded { task_id, .. } if task_id == "a7cb77a05059e4590"),
+        &|e| matches!(e, AdapterEvent::TaskEnded { task_id, .. } if task_id == "a7cb77a05059e4590"),
     );
     assert!(call_closed < task_ended, "the launch call closes first");
     let terminals = events

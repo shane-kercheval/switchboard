@@ -251,7 +251,8 @@ tools! {
          while the agent's session file is still being read for it: call again. activity \
          describes the agent's running turn: seconds_since_output, since the turn started or \
          the agent last wrote text, started or finished a tool call, or heard from a \
-         background task (what the window's \"No response\" counter measures); \
+         sub-agent or a background command (what the window's \"No response\" counter \
+         measures); \
          open_tool_calls, each with its name and running_seconds; and open_background_tasks, \
          each with its description, activity (what it last reported doing, absent until it \
          reports), and running_seconds. A tool call open is work in progress: a test suite \
@@ -292,13 +293,13 @@ tools! {
          so far), failed, or cancelled.";
     ReadLatestReply = "read_latest_reply" (ReadLatestReplyArgs) [Read, Look]
         "An agent's latest finished answer, including turns you did not send (the user's, a \
-         workflow's), or the reason its latest turn failed or was cancelled. Carries the send_id \
-         when known, so a long answer can be paged with read_reply, and the agent's context \
-         after its newest finished turn (as list_agents reports it). newer_turn_running is true \
-         when the agent has a turn running, or a send made through these tools is still to reach \
-         it: this answer is then not its newest. false does not prove it current (a message the \
-         user typed may be starting). To follow a message you sent, use wait_send; to wait for a \
-         running agent, wait_agent.";
+         workflow's), or the reason its latest finished turn failed or was cancelled. Carries \
+         the send_id when known, so a long answer can be paged with read_reply, and the agent's \
+         context after its newest finished turn (as list_agents reports it). \
+         newer_turn_running is true when the agent has a turn running, or a send made through \
+         these tools is still to reach it: this answer is then not its newest. false does not \
+         prove it current (a message the user typed may be starting). To follow a message you \
+         sent, use wait_send; to wait for a running agent, wait_agent.";
     ListPrompts = "list_prompts" (NoArgs) [Read, Look]
         "The user's saved prompts, local and from prompt servers: provider, name, description, \
          and arguments. They are the user's standing instructions (a code review, a security \

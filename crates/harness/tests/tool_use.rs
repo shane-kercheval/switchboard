@@ -423,7 +423,7 @@ fn assert_task_names_waited_on_call(events: &[AdapterEvent], agent_call_id: &str
     let task = events
         .iter()
         .find_map(|e| match e {
-            AdapterEvent::BackgroundTaskStarted {
+            AdapterEvent::TaskStarted {
                 task_id,
                 tool_use_id,
                 ..
@@ -438,19 +438,18 @@ fn assert_task_names_waited_on_call(events: &[AdapterEvent], agent_call_id: &str
         matches!(e, AdapterEvent::ToolCompleted { tool_use_id, .. } if tool_use_id == agent_call_id)
     })
     .expect("the Agent call closes");
-    let task_ended = position(
-        &|e| matches!(e, AdapterEvent::BackgroundTaskEnded { task_id, .. } if *task_id == task),
-    )
-    .unwrap_or_else(|| panic!("task {task} never ended; events: {events:?}"));
+    let task_ended =
+        position(&|e| matches!(e, AdapterEvent::TaskEnded { task_id, .. } if *task_id == task))
+            .unwrap_or_else(|| panic!("task {task} never ended; events: {events:?}"));
     let turn_ended = position(&|e| matches!(e, AdapterEvent::TurnEnd { .. }))
         .expect("must observe a terminal TurnEnd");
     assert!(task_ended < turn_ended, "the task ends inside its turn");
     let progress: Vec<usize> = events
         .iter()
         .enumerate()
-        .filter(|(_, e)| {
-            matches!(e, AdapterEvent::BackgroundTaskProgress { task_id, .. } if *task_id == task)
-        })
+        .filter(
+            |(_, e)| matches!(e, AdapterEvent::TaskProgress { task_id, .. } if *task_id == task),
+        )
         .map(|(at, _)| at)
         .collect();
     assert!(

@@ -1020,15 +1020,15 @@ pub fn claude_session_jsonl(prompt: &str, text: &str, key: &str) -> String {
 fn append_claude_turn(path: &Path, prompt: &str, text: &str, key: &str) {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).unwrap();
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-    {
-        let _ = file.write_all(claude_session_jsonl(prompt, text, key).as_bytes());
-    }
+        .unwrap()
+        .write_all(claude_session_jsonl(prompt, text, key).as_bytes())
+        .unwrap();
 }
 
 /// Poll until the agent's turn is running (a send is accepted before its

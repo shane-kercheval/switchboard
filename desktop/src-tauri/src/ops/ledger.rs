@@ -253,6 +253,11 @@ struct ActivityState {
     open_tools: Vec<OpenTool>,
     /// A turn has started and not ended.
     turn_open: bool,
+    /// The send the open turn answers, from its start event, for any turn:
+    /// one the user typed in the window included. Kept beside `turn_open`
+    /// rather than in its place, so a start event whose send cannot be read
+    /// still reads as a running turn.
+    open_send: Option<SendId>,
 }
 
 struct OpenTool {
@@ -1127,6 +1132,18 @@ impl SendLedger {
             .map(|state| state.report(now))
     }
 
+    /// `Some` while the agent has a turn running, whoever sent it, holding the
+    /// send it answers when its start event named one; `None` while no turn
+    /// runs. A send still waiting for the agent has no turn yet.
+    #[must_use]
+    pub fn open_turn(&self, agent_id: AgentId) -> Option<Option<SendId>> {
+        lock(&self.inner)
+            .activity
+            .get(&agent_id)
+            .filter(|state| state.turn_open)
+            .map(|state| state.open_send)
+    }
+
     /// Note an agent-channel event against the agent's activity: a turn's
     /// start or the agent's output restarts the silence, a tool call opens or
     /// closes, and a turn's end closes the turn and whatever it left open.
@@ -1141,6 +1158,7 @@ impl SendLedger {
             if let Some(state) = inner.activity.get_mut(&agent_id) {
                 state.open_tools.clear();
                 state.turn_open = false;
+                state.open_send = None;
             }
             return;
         }
@@ -1151,10 +1169,12 @@ impl SendLedger {
                 last_output: now,
                 open_tools: Vec::new(),
                 turn_open: false,
+                open_send: None,
             });
         state.last_output = now;
         if kind == "turn_start" {
             state.turn_open = true;
+            state.open_send = field_uuid(payload, "send_id");
             state.open_tools.clear();
         }
         let tool_use_id = payload
@@ -2149,6 +2169,37 @@ mod tests {
             Some(""),
             "the foreign turn's text did not land on the registered entry"
         );
+    }
+
+    #[test]
+    fn the_open_turn_names_its_send_even_one_the_ledger_never_registered() {
+        let ledger = SendLedger::new();
+        let agent_id = Uuid::now_v7();
+        assert_eq!(ledger.open_turn(agent_id), None, "no turn has run");
+        // A compose send the ledger never registered.
+        let typed = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(Uuid::now_v7(), turn_id, typed),
+        );
+        assert_eq!(ledger.open_turn(agent_id), Some(Some(typed)));
+        ledger.observe(
+            &channel(agent_id),
+            &turn_end(turn_id, &json!({ "status": "completed" })),
+        );
+        assert_eq!(ledger.open_turn(agent_id), None, "the turn ended");
+    }
+
+    #[test]
+    fn a_turn_whose_start_names_no_send_still_reads_as_open() {
+        let ledger = SendLedger::new();
+        let agent_id = Uuid::now_v7();
+        let mut start = turn_start(Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        start["send_id"] = json!("not a send id");
+        ledger.observe(&channel(agent_id), &start);
+        assert_eq!(ledger.open_turn(agent_id), Some(None));
+        assert!(ledger.activity(agent_id).is_some());
     }
 
     #[test]

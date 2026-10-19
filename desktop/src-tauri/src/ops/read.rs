@@ -729,7 +729,7 @@ pub enum LatestReplyStatus {
     /// resolver would send in its place.
     Failed,
     Cancelled,
-    /// The agent has no completed turn.
+    /// The agent has no completed turn other than one still running.
     None,
 }
 
@@ -771,7 +771,11 @@ pub(crate) fn known_context(state: &AppState, agent_id: AgentId) -> Option<Conte
 /// journal's typed outcome for a latest turn that failed or was cancelled
 /// (with the note the forward resolver would send in its place); otherwise
 /// the newest completed turn in the agent's own transcript, correlated to its
-/// send with the merge's per-agent classifier. A `send_id` is reported only
+/// send with the merge's per-agent classifier. A turn still running is left
+/// out, whoever sent it, and the answer is the one the agent would have had
+/// it not started: Claude writes a turn's first cycle, end-of-turn marker
+/// included, while the turn waits on background work, so the transcript can
+/// hold a running turn that looks complete. A `send_id` is reported only
 /// when that classifier assigns one: guessing from the last journaled send
 /// would name a newer turn that is still running. Carries the agent's context
 /// after its newest finished turn.
@@ -781,24 +785,30 @@ pub async fn read_latest_reply(
     agent_id: AgentId,
     home_dir: &Path,
 ) -> Result<LatestReply, AppError> {
-    let mut output = latest_reply_alone(state, project_id, agent_id, home_dir).await?;
+    // One reading of the running turn serves both the skip and the flag, so a
+    // turn that ends mid-read leaves the answer before it flagged as not the
+    // newest, never marked current. Taken from what the app already records,
+    // never by asking the agent's actor, which cannot answer while it prepares
+    // a turn.
+    let open_turn = state.ledger.open_turn(agent_id);
+    let mut output =
+        latest_reply_alone(state, project_id, agent_id, open_turn.flatten(), home_dir).await?;
     output.context = known_context(state, agent_id);
-    // From what the app already records, never by asking the agent's actor,
-    // which cannot answer while it prepares a turn.
     output.newer_turn_running =
-        state.ledger.activity(agent_id).is_some() || state.ledger.has_unfinished_send_to(agent_id);
+        open_turn.is_some() || state.ledger.has_unfinished_send_to(agent_id);
     Ok(output)
 }
 
+/// [`read_latest_reply`]'s answer, leaving out the turn answering `running`.
 async fn latest_reply_alone(
     state: &AppState,
     project_id: ProjectId,
     agent_id: AgentId,
+    running: Option<SendId>,
     home_dir: &Path,
 ) -> Result<LatestReply, AppError> {
     let agent = agent_in_project(state, project_id, agent_id)?;
-    let live = state.ledger.latest_turn(agent_id);
-    if let Some((send_id, latest)) = live.clone()
+    if let Some((send_id, latest)) = state.ledger.latest_turn(agent_id)
         && latest.status == SendStatus::Completed
     {
         return Ok(LatestReply {
@@ -812,7 +822,18 @@ async fn latest_reply_alone(
         });
     }
     let project = project_readonly(state, project_id)?;
-    let records = read_journal(&project).await?;
+    let mut records = read_journal(&project).await?;
+    // The view keeps the running send, so the transcript's turns still pair
+    // with their sends. The outcome check leaves it out, so a turn cancelled
+    // or failed just before it is reported as such, not read from disk.
+    let view = AgentJournalView::from_records(&records, agent_id);
+    records.retain(|record| {
+        !matches!(
+            record,
+            switchboard_core::JournalRecord::Send { send_id, agent_id: a, .. }
+                if *a == agent_id && Some(*send_id) == running
+        )
+    });
     if let Some((outcome, note)) =
         crate::commands::latest_turn_outcome(&records, agent_id, &agent.name)
     {
@@ -841,18 +862,12 @@ async fn latest_reply_alone(
             newer_turn_running: false,
         });
     }
-    let view = AgentJournalView::from_records(&records, agent_id);
     let correlated = correlate_turns(&project, &agent, &view, home_dir, &state.context).await?;
-    // A reply still running can already be on disk looking complete: Claude
-    // writes each cycle of a turn with an end-of-turn marker while the turn
-    // waits on background work. The ledger owns that send until it ends, so
-    // the latest answer is the finished one before it.
-    let running_send = live
-        .filter(|(_, latest)| !latest.status.is_terminal())
-        .map(|(send_id, _)| send_id);
+    // A compaction journals nothing, so no transcript turn pairs with its
+    // send: while one runs, nothing is left out.
     let latest = correlated.into_iter().rev().find(|turn| {
         turn.status == TurnStatus::Complete
-            && running_send.is_none_or(|running| turn.send_id != Some(running))
+            && running.is_none_or(|running| turn.send_id != Some(running))
     });
     Ok(match latest {
         Some(turn) => LatestReply {

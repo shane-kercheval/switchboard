@@ -786,10 +786,11 @@ pub async fn read_latest_reply(
     home_dir: &Path,
 ) -> Result<LatestReply, AppError> {
     // One reading of the running turn serves both the skip and the flag, so a
-    // turn that ends mid-read leaves the answer before it flagged as not the
-    // newest, never marked current. Taken from what the app already records,
-    // never by asking the agent's actor, which cannot answer while it prepares
-    // a turn.
+    // turn ending mid-read never leaves an older answer marked current. It can
+    // leave the flag set beside the answer before it, or beside its own when
+    // the ledger already holds it: stale, which costs the caller one more
+    // read. Taken from what the app already records, never by asking the
+    // agent's actor, which cannot answer while it prepares a turn.
     let open_turn = state.ledger.open_turn(agent_id);
     let mut output =
         latest_reply_alone(state, project_id, agent_id, open_turn.flatten(), home_dir).await?;
@@ -822,12 +823,14 @@ async fn latest_reply_alone(
         });
     }
     let project = project_readonly(state, project_id)?;
-    let mut records = read_journal(&project).await?;
-    // The view keeps the running send, so the transcript's turns still pair
-    // with their sends. The outcome check leaves it out, so a turn cancelled
-    // or failed just before it is reported as such, not read from disk.
+    let records = read_journal(&project).await?;
+    // The view pairs the transcript's turns with every send, the running one
+    // included. The outcome check reads the sends without it, so a turn
+    // cancelled or failed just before it is reported as such, not read from
+    // disk.
     let view = AgentJournalView::from_records(&records, agent_id);
-    records.retain(|record| {
+    let mut without_running = records;
+    without_running.retain(|record| {
         !matches!(
             record,
             switchboard_core::JournalRecord::Send { send_id, agent_id: a, .. }
@@ -835,9 +838,9 @@ async fn latest_reply_alone(
         )
     });
     if let Some((outcome, note)) =
-        crate::commands::latest_turn_outcome(&records, agent_id, &agent.name)
+        crate::commands::latest_turn_outcome(&without_running, agent_id, &agent.name)
     {
-        let latest_send = records
+        let latest_send = without_running
             .iter()
             .filter_map(|r| match r {
                 switchboard_core::JournalRecord::Send {

@@ -253,10 +253,10 @@ struct ActivityState {
     open_tools: Vec<OpenTool>,
     /// A turn has started and not ended.
     turn_open: bool,
-    /// The send the open turn answers, from its start event, for any turn:
-    /// one the user typed in the window included. Kept beside `turn_open`
-    /// rather than in its place, so a start event whose send cannot be read
-    /// still reads as a running turn.
+    /// The send the open turn answers, from its typed start event, for any
+    /// turn: one the user typed in the window included. Kept beside
+    /// `turn_open` rather than in its place, so a start event that fails to
+    /// parse still reads as a running turn.
     open_send: Option<SendId>,
 }
 
@@ -1174,7 +1174,7 @@ impl SendLedger {
         state.last_output = now;
         if kind == "turn_start" {
             state.turn_open = true;
-            state.open_send = field_uuid(payload, "send_id");
+            state.open_send = None;
             state.open_tools.clear();
         }
         let tool_use_id = payload
@@ -1287,8 +1287,9 @@ impl SendLedger {
             Ok(NormalizedEvent::TurnStart {
                 turn_id,
                 message_id,
+                send_id,
                 ..
-            }) => self.on_turn_start(agent_id, message_id, turn_id),
+            }) => self.on_turn_start(agent_id, message_id, send_id, turn_id),
             Ok(NormalizedEvent::TurnEnd {
                 turn_id, outcome, ..
             }) => self.on_turn_end(turn_id, &outcome),
@@ -1315,8 +1316,17 @@ impl SendLedger {
         }
     }
 
-    fn on_turn_start(&self, agent_id: AgentId, message_id: MessageId, turn_id: TurnId) -> bool {
+    fn on_turn_start(
+        &self,
+        agent_id: AgentId,
+        message_id: MessageId,
+        turn_send: SendId,
+        turn_id: TurnId,
+    ) -> bool {
         let mut inner = lock(&self.inner);
+        if let Some(state) = inner.activity.get_mut(&agent_id) {
+            state.open_send = Some(turn_send);
+        }
         let registered: LatestTurn = inner.by_message.get(&message_id).copied();
         // A compaction is not an answer: the agent's newest answer stays
         // whatever it was, as it does for a compaction the window ran.
@@ -2192,7 +2202,7 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_whose_start_names_no_send_still_reads_as_open() {
+    fn a_turn_whose_start_fails_to_parse_still_reads_as_open() {
         let ledger = SendLedger::new();
         let agent_id = Uuid::now_v7();
         let mut start = turn_start(Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());

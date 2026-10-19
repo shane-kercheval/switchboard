@@ -4723,6 +4723,28 @@ async fn the_latest_answer_survives_an_orchestrators_compaction() {
     );
 }
 
+/// A compaction journals nothing, so no transcript turn pairs with its send:
+/// while one runs, the answer read from disk is the one before it.
+#[tokio::test]
+async fn a_running_compaction_leaves_the_latest_answer_on_disk_alone() {
+    let (env, project_id, agent_id) = compactable_agent();
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("compacting", &gate));
+    let compaction = compact_now(&env, compact_request(project_id, agent_id, None))
+        .await
+        .unwrap();
+    await_turn_running(&env.state, agent_id).await;
+
+    let output = read_latest_reply(&env.state, project_id, agent_id, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(output.status, LatestReplyStatus::Completed);
+    assert_eq!(output.text.as_deref(), Some("seeded"));
+    assert!(output.newer_turn_running);
+    gate.notify_one();
+    wait_done(&env, project_id, compaction.send_id).await;
+}
+
 #[tokio::test]
 async fn an_agent_of_another_project_is_not_a_recipient() {
     let mut env = TestEnv::new();

@@ -117,7 +117,7 @@ fn default_agent_defaults() -> BTreeMap<HarnessKind, AgentDefaults> {
         (
             HarnessKind::Antigravity,
             AgentDefaults {
-                model_choices: vec!["gemini-3.8-flash".to_owned(), "gemini-3.1-pro".to_owned()],
+                model_choices: vec!["gemini-3.8-flash".to_owned(), "gemini-4-argon".to_owned()],
                 effort_choices: vec!["medium".to_owned(), "high".to_owned()],
                 default_model: Some("gemini-3.8-flash".to_owned()),
                 default_effort: Some("medium".to_owned()),
@@ -714,7 +714,7 @@ mod tests {
         assert_eq!(
             defaults.agent_defaults[&HarnessKind::Antigravity],
             AgentDefaults {
-                model_choices: vec!["gemini-3.8-flash".to_owned(), "gemini-3.1-pro".to_owned()],
+                model_choices: vec!["gemini-3.8-flash".to_owned(), "gemini-4-argon".to_owned()],
                 effort_choices: vec!["medium".to_owned(), "high".to_owned()],
                 default_model: Some("gemini-3.8-flash".to_owned()),
                 default_effort: Some("medium".to_owned()),

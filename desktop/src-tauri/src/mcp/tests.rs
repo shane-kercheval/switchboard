@@ -250,6 +250,22 @@ async fn the_tool_list_is_the_catalog_and_declares_the_result_size() {
             && input_source["properties"].get("send_id").is_none(),
         "a workflow input is filled from latest answers only: {input_source}"
     );
+    let selection = tools
+        .iter()
+        .find(|t| t.name == "set_agent_model_and_effort")
+        .unwrap();
+    assert_eq!(
+        selection.input_schema["required"],
+        json!(["project_id", "agent_id"]),
+        "model and effort can be left out"
+    );
+    for axis in ["model", "effort"] {
+        let property = &selection.input_schema["properties"][axis];
+        assert!(
+            property.is_object() && property.get("default").is_none(),
+            "leaving {axis} out keeps it and null resets it, so the schema declares no default: {property}"
+        );
+    }
     for tool in &tools {
         let meta = tool.meta.as_ref().unwrap();
         assert_eq!(

@@ -824,13 +824,21 @@ pub struct SetAgentModelAndEffortArgs {
     /// The model, in the harness's own naming. Omit to keep; null resets to
     /// the harness's default.
     #[serde(default)]
-    #[schemars(with = "Option<String>")]
+    #[schemars(with = "Option<String>", transform = without_default)]
     model: SelectionChange,
     /// The effort, in the harness's own naming. Omit to keep; null resets to
     /// the harness's default.
     #[serde(default)]
-    #[schemars(with = "Option<String>")]
+    #[schemars(with = "Option<String>", transform = without_default)]
     effort: SelectionChange,
+}
+
+/// Drops the `"default": null` that `#[serde(default)]` writes into a field's
+/// schema. Leaving a `SelectionChange` out keeps the current value while `null`
+/// resets it, so a declared `null` default would let a client that fills in
+/// defaults turn "keep" into "reset".
+fn without_default(schema: &mut rmcp::schemars::Schema) {
+    schema.remove("default");
 }
 
 #[derive(Deserialize, JsonSchema)]

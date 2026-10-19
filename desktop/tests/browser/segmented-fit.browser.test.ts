@@ -95,7 +95,7 @@ test("Antigravity's five model pills fit one row without clipping at the dialog 
     props: {
       width: DIALOG_INNER_WIDTH,
       options: MODEL_OPTIONS.antigravity,
-      value: "gemini-3.1-pro",
+      value: "gemini-4-argon",
     },
   });
   await expect.element(page.getByTestId("fit")).toBeInTheDocument();

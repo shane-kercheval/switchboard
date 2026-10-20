@@ -66,8 +66,8 @@
 //! silently. An unknown run status is ignored and logged (the run may still be
 //! going); an unknown turn outcome ends the turn as `failed`, because a turn
 //! end is always terminal and leaving the recipient `running` would make a wait
-//! never finish. Per-agent waiters are woken only by the events that can change
-//! admission, never by content chunks.
+//! never finish. Waiters are woken only by the events that can change
+//! admission or end a turn, never by content chunks.
 //!
 //! **Compactions.** A compaction another client asks for is a one-recipient
 //! entry of kind [`SendKind::Compaction`], so `wait_send`, `cancel_send`, and
@@ -612,7 +612,8 @@ struct Inner {
 
 pub struct SendLedger {
     inner: Mutex<Inner>,
-    /// Bumped on every change to a send or run; waits on either park here.
+    /// Bumped on every change to a send or run, and on every agent's
+    /// lifecycle event; waits on sends and runs park here.
     changed: watch::Sender<u64>,
     /// Bumped on any event on an agent's channel; `wait_agent` parks here.
     agent_signals: Mutex<HashMap<AgentId, watch::Sender<u64>>>,
@@ -1301,9 +1302,9 @@ impl SendLedger {
             .collect()
     }
 
-    /// Subscribe to the change signal for sends and runs. Subscribe **before**
-    /// reading the state a wait depends on, so a change between the read and
-    /// the park is not lost.
+    /// Subscribe to the change signal for sends and runs, which every agent's
+    /// lifecycle event also fires. Subscribe **before** reading the state a
+    /// wait depends on, so a change between the read and the park is not lost.
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
@@ -1368,7 +1369,7 @@ impl SendLedger {
             "turn_start" | "turn_end" | "message_failed" | "message_cancelled" | "agent_idle" => {}
             _ => return,
         }
-        let changed = match serde_json::from_value::<NormalizedEvent>(payload.clone()) {
+        match serde_json::from_value::<NormalizedEvent>(payload.clone()) {
             Ok(NormalizedEvent::TurnStart {
                 turn_id,
                 message_id,
@@ -1385,20 +1386,20 @@ impl SendLedger {
                 ..
             }) => self.on_message_failed(message_id, error, kind),
             Ok(NormalizedEvent::MessageCancelled { message_id, .. }) => {
-                self.on_message_cancelled(message_id)
+                self.on_message_cancelled(message_id);
             }
-            Ok(_) => false,
+            Ok(_) => {}
             Err(e) => {
                 tracing::warn!(%agent_id, kind, error = %e, "ledger could not parse a lifecycle event");
-                false
             }
-        };
+        }
         // Admission can change on every lifecycle event (an `agent_idle`
         // included), so the agent's waiters are woken after the state moved.
+        // So are the waits on sends and runs, whether or not the event moved
+        // one this ledger holds: a wait on a message the window sent ends
+        // when its agent's turn does, which only its channel announces.
         self.bump_agent(agent_id);
-        if changed {
-            self.bump();
-        }
+        self.bump();
     }
 
     fn on_turn_start(
@@ -1407,7 +1408,7 @@ impl SendLedger {
         message_id: MessageId,
         turn_send: SendId,
         turn_id: TurnId,
-    ) -> bool {
+    ) {
         let mut inner = lock(&self.inner);
         if let Some(state) = inner.activity.get_mut(&agent_id) {
             state.open_send = Some(turn_send);
@@ -1425,14 +1426,13 @@ impl SendLedger {
             inner.latest_turn.insert(agent_id, registered);
         }
         let Some((send_id, index)) = registered else {
-            return false;
+            return;
         };
         inner.by_turn.insert(turn_id, (send_id, index));
         if let Some(recipient) = recipient_mut(&mut inner, send_id, index) {
             recipient.turn_id = Some(turn_id);
             recipient.status = SendStatus::Running;
         }
-        true
     }
 
     /// Track the agent's open tasks from their typed events: a start
@@ -1502,13 +1502,13 @@ impl SendLedger {
         }
     }
 
-    fn on_turn_end(&self, turn_id: TurnId, outcome: &TurnOutcome) -> bool {
+    fn on_turn_end(&self, turn_id: TurnId, outcome: &TurnOutcome) {
         let mut inner = lock(&self.inner);
         let Some((send_id, index)) = inner.by_turn.get(&turn_id).copied() else {
-            return false;
+            return;
         };
         let Some(recipient) = recipient_mut(&mut inner, send_id, index) else {
-            return false;
+            return;
         };
         match outcome {
             TurnOutcome::Completed => {
@@ -1530,7 +1530,6 @@ impl SendLedger {
                 recipient.error = Some("the turn ended with an unrecognized outcome".to_owned());
             }
         }
-        true
     }
 
     fn on_message_failed(
@@ -1538,13 +1537,13 @@ impl SendLedger {
         message_id: MessageId,
         error: String,
         kind: Option<MessageFailureKind>,
-    ) -> bool {
+    ) {
         let mut inner = lock(&self.inner);
         let Some((send_id, index)) = inner.by_message.get(&message_id).copied() else {
-            return false;
+            return;
         };
         let Some(recipient) = recipient_mut(&mut inner, send_id, index) else {
-            return false;
+            return;
         };
         recipient.status = SendStatus::Failed;
         recipient.error = Some(error);
@@ -1552,19 +1551,17 @@ impl SendLedger {
             Some(MessageFailureKind::SessionInUse) => Some(error_code::AGENT_BUSY_ELSEWHERE),
             _ => None,
         };
-        true
     }
 
-    fn on_message_cancelled(&self, message_id: MessageId) -> bool {
+    fn on_message_cancelled(&self, message_id: MessageId) {
         let mut inner = lock(&self.inner);
         let Some((send_id, index)) = inner.by_message.get(&message_id).copied() else {
-            return false;
+            return;
         };
         let Some(recipient) = recipient_mut(&mut inner, send_id, index) else {
-            return false;
+            return;
         };
         recipient.status = SendStatus::Cancelled;
-        true
     }
 
     fn observe_run(&self, project_id: ProjectId, payload: &serde_json::Value) {

@@ -47,7 +47,7 @@
 //! and, if that ends first, reports `request_in_progress` with the send id,
 //! leaving the key claimed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -951,12 +951,13 @@ async fn named_reply(
         SendStatus::Rejected | SendStatus::NotDispatched => {
             Err(not_completed("never reached the agent"))
         }
-        // The journal could not tie a finished reply to this send: it may
-        // still be running (a message the window sent, which Switchboard
-        // follows only on disk), the app may have restarted while it ran, or
-        // its harness keeps no link from a reply to its send and Switchboard
-        // no longer holds the send. A reply matched by position is a guess,
-        // and a forward cannot mark it as one, so it is refused.
+        // The journal could not tie a finished reply to this send: the app
+        // may have restarted while it ran, or its harness keeps no link from
+        // a reply to its send (Antigravity never does) and Switchboard no
+        // longer holds the send. A reply matched by position is a guess, and
+        // a forward cannot mark it as one, so it is refused. A message the
+        // window sent whose turn runs reads `running` above, from the
+        // ledger's open turn.
         SendStatus::Started | SendStatus::Unknown => Err(AppError::ForwardReplyUnconfirmed {
             name: agent.name,
             send_id,
@@ -1280,7 +1281,9 @@ pub async fn wait_send(
 }
 
 /// Block until every recipient of the send is terminal or the budget ends,
-/// and return the current state either way.
+/// and return the current state either way. A send the ledger does not hold
+/// is waited on while any recipient's turn for it is not over
+/// ([`unfinished_recipients`]).
 async fn wait_send_unreported(
     state: &AppState,
     project_id: ProjectId,
@@ -1292,19 +1295,130 @@ async fn wait_send_unreported(
     let observed = wait_until(
         budget,
         signal,
-        || async move {
-            match held_send(state, project_id, send_id) {
-                Some(snapshot) if !snapshot.is_done() => Observed::NotYet(Some(snapshot)),
-                held => Observed::Done(held),
-            }
-        },
-        || None,
+        || async move { watch_send(state, project_id, send_id).await },
+        || Watched::Unheld(HashSet::new()),
     )
     .await;
     match observed {
-        Some(snapshot) => Ok(live_reply(send_id, snapshot)),
-        None => unheld_reply(state, project_id, send_id, budget, home_dir).await,
+        Watched::Held(snapshot) => Ok(live_reply(send_id, snapshot)),
+        Watched::Unheld(unfinished) => {
+            unheld_reply(state, project_id, send_id, &unfinished, budget, home_dir).await
+        }
     }
+}
+
+/// A send as a wait observes it: the ledger's snapshot of a send it holds,
+/// or, for one it does not hold, the recipients whose turns for it are not
+/// over yet.
+enum Watched {
+    Held(SendSnapshot),
+    Unheld(HashSet<AgentId>),
+}
+
+impl Watched {
+    fn is_done(&self) -> bool {
+        match self {
+            Self::Held(snapshot) => snapshot.is_done(),
+            Self::Unheld(unfinished) => unfinished.is_empty(),
+        }
+    }
+}
+
+/// One observation of a send for a wait.
+async fn watch_send(state: &AppState, project_id: ProjectId, send_id: SendId) -> Observed<Watched> {
+    let watched = match held_send(state, project_id, send_id) {
+        Some(snapshot) => Watched::Held(snapshot),
+        None => Watched::Unheld(unfinished_recipients(state, project_id, send_id).await),
+    };
+    if watched.is_done() {
+        Observed::Done(watched)
+    } else {
+        Observed::NotYet(watched)
+    }
+}
+
+/// The recipients of a send the ledger does not hold whose turns for it are
+/// not over, which a wait on the send waits for. Such a send is a message the
+/// user typed in the window, or one sent before the app restarted. Its
+/// recipients are the agents the journal recorded it for, each recorded as
+/// its turn started, so a recipient still waiting in line is not among them.
+///
+/// **When a turn is over.** While the agent's open turn answers this send, it
+/// runs. A later send journaled for the agent, or another send's turn open,
+/// means this one ended and wound down, since an agent runs one turn at a
+/// time. With no turn open, the turn is over only once the dispatcher holds
+/// no more work for the agent, for two reasons. Before a turn opens, the
+/// actor journals its send, then starts the harness, and only then opens the
+/// turn, so a turn about to open looks like one already over. After a turn
+/// ends, it winds down until the harness exits, and Codex may write its record
+/// of the turn's end to its own file only then (unmeasured:
+/// `docs/harness-behavior.md`, G50). A journaled outcome proves the turn
+/// over: the dispatcher journals a failure or cancellation before it
+/// announces the turn's end. A send the journal cannot be read for counts as
+/// over, so the reply that follows reports the error.
+///
+/// **Known limit.** An agent removed, moved to another folder, or deleted with
+/// its project during the wind-down is shut down without an event of its own,
+/// so the wait wakes only on another agent's lifecycle event anywhere in the
+/// app, or at its timeout, as `wait_agent` does across a shutdown. It then
+/// answers from what is left: a removed agent's message reads `started`, since
+/// the roster no longer holds the agent; a deleted project's wait returns an
+/// error; only after a folder change may it still read the reply. Removal goes
+/// through `Dispatcher::remove_agent`, not `shutdown_agent`, so a hook that
+/// wakes waits after a shutdown must cover removal explicitly.
+async fn unfinished_recipients(
+    state: &AppState,
+    project_id: ProjectId,
+    send_id: SendId,
+) -> HashSet<AgentId> {
+    let Ok(project) = project_readonly(state, project_id) else {
+        return HashSet::new();
+    };
+    let Ok(records) = read_journal(&project).await else {
+        return HashSet::new();
+    };
+    let mut recipients: Vec<AgentId> = Vec::new();
+    let mut later: HashSet<AgentId> = HashSet::new();
+    let mut ended: HashSet<AgentId> = HashSet::new();
+    for record in &records {
+        match record {
+            switchboard_core::JournalRecord::Send {
+                send_id: s,
+                agent_id,
+                ..
+            } if *s == send_id && !recipients.contains(agent_id) => recipients.push(*agent_id),
+            switchboard_core::JournalRecord::Send {
+                send_id: s,
+                agent_id,
+                ..
+            } if *s != send_id && recipients.contains(agent_id) => {
+                later.insert(*agent_id);
+            }
+            switchboard_core::JournalRecord::Outcome {
+                send_id: s,
+                agent_id,
+                ..
+            } if *s == send_id => {
+                ended.insert(*agent_id);
+            }
+            _ => {}
+        }
+    }
+    let mut unfinished = HashSet::new();
+    for agent_id in recipients {
+        if ended.contains(&agent_id) || later.contains(&agent_id) {
+            continue;
+        }
+        let over = match state.ledger.open_turn(agent_id) {
+            Some(Some(open)) if open == send_id => false,
+            Some(Some(_)) => true,
+            _ => !state.dispatcher.has_pending_work(agent_id).await,
+        };
+        if !over {
+            unfinished.insert(agent_id);
+        }
+    }
+    unfinished
 }
 
 /// Several sends waited on together, as [`wait_any_send`] reports them.
@@ -1356,35 +1470,41 @@ pub async fn wait_any_send(
         || {
             let ids = ids.clone();
             async move {
-                let held: Vec<Option<SendSnapshot>> = ids
-                    .iter()
-                    .map(|send_id| held_send(state, project_id, *send_id))
-                    .collect();
-                if held
-                    .iter()
-                    .any(|snapshot| snapshot.as_ref().is_none_or(SendSnapshot::is_done))
-                {
-                    Observed::Done(held)
+                let mut watched: Vec<Watched> = Vec::with_capacity(ids.len());
+                for send_id in ids {
+                    watched.push(match watch_send(state, project_id, send_id).await {
+                        Observed::Done(send) | Observed::NotYet(send) => send,
+                    });
+                }
+                if watched.iter().any(Watched::is_done) {
+                    Observed::Done(watched)
                 } else {
-                    Observed::NotYet(held)
+                    Observed::NotYet(watched)
                 }
             }
         },
-        || ids.iter().map(|_| None).collect(),
+        || {
+            ids.iter()
+                .map(|_| Watched::Unheld(HashSet::new()))
+                .collect()
+        },
     )
     .await;
-    let sends =
-        futures::future::join_all(ids.iter().zip(observed).map(|(&send_id, held)| async move {
-            let mut reply = match held {
-                Some(snapshot) => live_reply(send_id, snapshot),
-                None => unheld_reply(state, project_id, send_id, budget, home_dir).await?,
+    let sends = futures::future::join_all(ids.iter().zip(observed).map(
+        |(&send_id, watched)| async move {
+            let mut reply = match watched {
+                Watched::Held(snapshot) => live_reply(send_id, snapshot),
+                Watched::Unheld(unfinished) => {
+                    unheld_reply(state, project_id, send_id, &unfinished, budget, home_dir).await?
+                }
             };
             add_context(state, &mut reply);
             Ok::<_, AppError>(reply)
-        }))
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+        },
+    ))
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
     let any_done = sends.iter().any(|send| send.done);
     Ok(WaitAnySendReply {
         capped_to_seconds: budget.capped_to_seconds(),
@@ -1409,10 +1529,13 @@ pub(super) fn held_send(
 /// A send's recipients as they stand, without waiting: the ledger's snapshot
 /// while it holds the send, each completed recipient with its reply even while
 /// others still run; otherwise the journal's answer, as after a restart, where
-/// `started` means the outcome could not be confirmed. The same reading
-/// `wait_send` gives once it stops waiting; a forward naming a reply and
+/// a recipient whose turn for the send is open reads `running` and `started`
+/// means the outcome could not be confirmed. The same reading `wait_send`
+/// gives once it stops waiting; a forward naming a reply and
 /// `read_workflow_run` read sends through this, so all three agree on every
-/// status.
+/// status but one: while a recipient's turn winds down after its end,
+/// `wait_send` still reads it `running`, and these read the reply the session
+/// file holds.
 pub(super) async fn current_send(
     state: &AppState,
     project_id: ProjectId,
@@ -1433,7 +1556,7 @@ pub(super) async fn current_send(
         }),
         None => Ok(CurrentSend {
             handed_out: true,
-            reply: journal_fallback(state, project_id, send_id, home_dir).await?,
+            reply: journal_fallback(state, project_id, send_id, &HashSet::new(), home_dir).await?,
         }),
     }
 }
@@ -1480,16 +1603,21 @@ fn live_reply(send_id: SendId, snapshot: SendSnapshot) -> WaitSendReply {
 /// call's finishing allowance: the fallback reads the journal and
 /// transcripts, and a caller that cannot be kept alive must still get an
 /// answer before its client gives up. Unfinished, the reply is "not done"
-/// with no recipients, and the caller calls again.
+/// with no recipients, and the caller calls again. `unfinished` are the
+/// recipients the wait last found still in their turns for the send, which
+/// read `running`.
 async fn unheld_reply(
     state: &AppState,
     project_id: ProjectId,
     send_id: SendId,
+    unfinished: &HashSet<AgentId>,
     budget: &WaitBudget,
     home_dir: &Path,
 ) -> Result<WaitSendReply, AppError> {
     match budget
-        .run_with_grace(journal_fallback(state, project_id, send_id, home_dir))
+        .run_with_grace(journal_fallback(
+            state, project_id, send_id, unfinished, home_dir,
+        ))
         .await
     {
         Outcome::Done(reply) => reply,
@@ -1517,13 +1645,18 @@ fn add_context(state: &AppState, reply: &mut WaitSendReply) {
     }
 }
 
-/// After a restart the ledger is empty, so answer from what is durable: a
-/// failed or cancelled `Outcome` record wins over a link; an agent turn joined
-/// to the send by a **durable** link with a completed status is `completed`
-/// with its text; a `Send` record alone is `started`; nothing is `unknown`.
-/// Only a durable link counts, and only with a completed status, because the
-/// dispatcher writes links for failed turns too and positional correlation is
-/// a guess.
+/// A send the ledger does not hold (a message the user typed in the window, or
+/// one from before a restart) answered from what is durable: a failed or
+/// cancelled `Outcome` record wins over everything else; then a recipient
+/// whose turn for the send is open in the ledger, or in `unfinished`, is
+/// `running`, with its activity and no text, whatever its session file holds
+/// mid-turn (see `read::running_sends`, which reads the ledger the same way
+/// around the files); then an agent turn joined to the send by a **durable**
+/// link with a completed status is `completed` with its text; a `Send` record
+/// alone is `started`; nothing is `unknown`. Only a durable link counts, and
+/// only with a completed status, because the dispatcher writes links for
+/// failed turns too and positional correlation is a guess. The send is done
+/// once no recipient is running.
 ///
 /// Transcripts are read in parallel, one per recipient with no recorded
 /// outcome, and a read that fails leaves only that recipient `started`, with
@@ -1533,8 +1666,10 @@ async fn journal_fallback(
     state: &AppState,
     project_id: ProjectId,
     send_id: SendId,
+    unfinished: &HashSet<AgentId>,
     home_dir: &Path,
 ) -> Result<WaitSendReply, AppError> {
+    let open_before = state.ledger.open_turns();
     let project = project_readonly(state, project_id)?;
     let records = read_journal(&project).await?;
     let views = AgentJournalView::by_agent(&records);
@@ -1575,7 +1710,7 @@ async fn journal_fallback(
         });
     }
     let roster = list_project_agents_readonly_impl(state, project_id)?;
-    let recipients = futures::future::join_all(order.into_iter().map(|agent_id| {
+    let mut recipients = futures::future::join_all(order.into_iter().map(|agent_id| {
         let view = views.get(&agent_id);
         let agent = roster.iter().find(|a| a.id == agent_id);
         fallback_recipient(
@@ -1589,13 +1724,29 @@ async fn journal_fallback(
         )
     }))
     .await;
+    let answering: HashSet<AgentId> = open_before
+        .into_iter()
+        .chain(state.ledger.open_turns())
+        .filter(|(_, open)| *open == send_id)
+        .map(|(agent_id, _)| agent_id)
+        .chain(unfinished.iter().copied())
+        .collect();
+    for recipient in &mut recipients {
+        let ended = matches!(recipient.status, SendStatus::Failed | SendStatus::Cancelled);
+        if !ended && answering.contains(&recipient.agent_id) {
+            *recipient = RecipientSnapshot {
+                activity: state.ledger.activity(recipient.agent_id),
+                ..RecipientSnapshot::bare(recipient.agent_id, SendStatus::Running)
+            };
+        }
+    }
     Ok(WaitSendReply {
         send_id,
         capped_to_seconds: None,
         usage: None,
-        // Nothing more can arrive from a restart's journal; the caller decides
-        // what a lingering `started` means.
-        done: true,
+        // Nothing more can arrive for a recipient whose turn is over; the
+        // caller decides what a lingering `started` means.
+        done: recipients.iter().all(|r| r.status != SendStatus::Running),
         source: WaitSource::Journal,
         recipients,
     })

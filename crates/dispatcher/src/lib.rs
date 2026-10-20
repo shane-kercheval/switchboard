@@ -3277,12 +3277,18 @@ fn fire_completion(
     }
 }
 
-/// Emit a **dispatcher-synthesized** terminal `TurnEnd`, journal its outcome, and
+/// Journal a **dispatcher-synthesized** terminal's outcome, emit its `TurnEnd`, and
 /// fire the turn's awaiters — the three things every synthesized terminal must do
 /// together. Centralized so a new synthesized-terminal path (a future milestone)
 /// can't emit-or-journal-but-forget-to-fire: calling this does all three by
 /// construction. A synthesized terminal carries no harness usage/cost/model/effort
 /// and no `hydration_key` (there is no harness turn id behind it).
+///
+/// The outcome is journaled **before** the `TurnEnd` is emitted, in the order the
+/// actor gives a failure the harness reports: anything that reads the journal on
+/// hearing a turn's end (a wait on a message the window sent, a forward naming
+/// it, a conversation read) then finds the cancellation or failure already there,
+/// rather than reading the turn's partial reply as if it had finished.
 ///
 /// `journal` is `None` for work that is not part of the user's conversation (a
 /// compaction): the terminal is still emitted and the awaiters still fire, only
@@ -3306,6 +3312,9 @@ fn synthesize_terminal(
     text: &str,
 ) {
     let ended_at = Utc::now();
+    if let Some(journal) = journal {
+        journal.record_outcome(turn_id, agent_id, outcome, started_at, ended_at);
+    }
     emit_event(
         emitter,
         channel,
@@ -3321,9 +3330,6 @@ fn synthesize_terminal(
         },
         agent_id,
     );
-    if let Some(journal) = journal {
-        journal.record_outcome(turn_id, agent_id, outcome, started_at, ended_at);
-    }
     awaiters.fire(outcome, text);
 }
 

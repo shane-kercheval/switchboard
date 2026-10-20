@@ -178,9 +178,11 @@ pub enum AppError {
 
     /// A forward named a source's reply by `send_id` while that reply is
     /// still to be sent, waiting in line, or running. A named reply is never
-    /// waited for, so nothing was sent. Each of these states arises only for a
-    /// send Switchboard follows live, which `wait_send` follows to its end;
-    /// `wait_agent` would return at once for an agent the send has not reached.
+    /// waited for, so nothing was sent. Each of these states arises for a send
+    /// Switchboard follows live, and `running` also for a message the window
+    /// sent while its agent's turn for it is open; `wait_send` follows either
+    /// to its end, while `wait_agent` would return at once for an agent the
+    /// send has not reached.
     #[error(
         "{name}'s reply to send {send_id} is still {state}, so nothing was sent: wait for that send with wait_send, then forward again"
     )]
@@ -208,7 +210,7 @@ pub enum AppError {
     /// answer, so it is refused; the caller can read it, see how it was
     /// matched, and send its text itself. Nothing was sent.
     #[error(
-        "Switchboard cannot confirm a finished reply from {name} to send {send_id}, so nothing was sent. The reply may still be running, the app may have restarted while it ran, or Switchboard can't tell which turn answered that send. Read it with read_reply, which says how the reply was matched, and if it is the one you want, send its text with send"
+        "Switchboard cannot confirm a finished reply from {name} to send {send_id}, so nothing was sent. The app may have restarted while it ran, or Switchboard can't tell which turn answered that send (an Antigravity agent's replies carry no link to their sends). Read it with read_reply, which says how the reply was matched, and if it is the one you want, send its text with send"
     )]
     ForwardReplyUnconfirmed { name: String, send_id: SendId },
 

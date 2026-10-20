@@ -2805,6 +2805,90 @@ async fn cancelled_turn_journals_send_and_a_cancelled_outcome() {
     );
 }
 
+/// Records every event, and for each `turn_end` whether the journal already held
+/// that turn's outcome when the event arrived.
+struct JournalCheckingEmitter {
+    inner: Arc<RecordingEmitter>,
+    journal: Arc<RecordingJournal>,
+    outcome_journaled_at_turn_end: Mutex<Vec<bool>>,
+}
+
+impl EventEmitter for JournalCheckingEmitter {
+    fn emit(&self, name: &str, payload: serde_json::Value) {
+        if event_type(&payload) == "turn_end" {
+            let turn_id = extract_turn_id(&payload);
+            let journaled = self
+                .journal
+                .outcomes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(t, _)| *t == turn_id);
+            self.outcome_journaled_at_turn_end
+                .lock()
+                .unwrap()
+                .push(journaled);
+        }
+        self.inner.emit(name, payload);
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_turns_outcome_is_journaled_before_its_turn_end_is_emitted() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let recording = Arc::new(RecordingEmitter::new());
+    let journal = Arc::new(RecordingJournal::default());
+    let emitter = Arc::new(JournalCheckingEmitter {
+        inner: Arc::clone(&recording),
+        journal: Arc::clone(&journal),
+        outcome_journaled_at_turn_end: Mutex::new(Vec::new()),
+    });
+    let agent = agent_record();
+    let adapter: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::with_scenario(
+        MockScenario::AwaitCancellation,
+    ));
+    let factory = Arc::new(TestFactory {
+        refuse_at_start: None,
+        adapters: Mutex::new(std::collections::VecDeque::from([Arc::clone(&adapter)])),
+        last: adapter,
+        agent: agent.clone(),
+        emitter: Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+        journal: Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+        metadata: Arc::new(NoopMetadataCache),
+        locator_sink: Arc::new(NoopSessionLocatorSink),
+    });
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "long task",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &recording,
+        "turn_start (in flight)",
+        recording.wait_for_type("turn_start", 1),
+    )
+    .await;
+    dispatcher.cancel(agent.id, CancelSource::User);
+    within(
+        &recording,
+        "agent_idle",
+        recording.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    assert_eq!(
+        *emitter.outcome_journaled_at_turn_end.lock().unwrap(),
+        vec![true],
+        "a reader that hears the cancelled turn end finds its outcome journaled"
+    );
+}
+
 #[tokio::test]
 async fn failed_turn_journals_send_and_a_failed_outcome() {
     let dispatcher = Arc::new(Dispatcher::new());

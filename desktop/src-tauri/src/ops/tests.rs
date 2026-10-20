@@ -3619,17 +3619,19 @@ fn write_codex_rollout(env: &TestEnv, records: &[serde_json::Value]) {
     .unwrap();
 }
 
-/// Start a turn the way the window's compose bar does, and hold it running
-/// until `gate` fires. The ledger does not hold the window's sends, so every
-/// reader goes to the session file for this one. Returns the send's id.
-async fn send_from_the_window_and_hold(
+/// Send `prompt` to the agent the way the window's compose bar does, with
+/// `script` as the agent's turn: queued behind a turn already running, as the
+/// compose bar's sends are. The ledger does not hold the window's sends, so
+/// every reader goes to the journal and the session file for this one.
+/// Returns the send's id.
+async fn send_from_the_window(
     env: &TestEnv,
     project_id: ProjectId,
     agent_id: AgentId,
     prompt: &str,
-    gate: &Arc<Notify>,
+    script: Script,
 ) -> Uuid {
-    env.adapter.push_for(agent_id, Script::parked("", gate));
+    env.adapter.push_for(agent_id, script);
     crate::commands::open_project_impl(&env.state, project_id).unwrap();
     let send_id = Uuid::now_v7();
     send_message_impl(
@@ -3642,8 +3644,33 @@ async fn send_from_the_window_and_hold(
     )
     .await
     .unwrap();
+    send_id
+}
+
+/// [`send_from_the_window`] with a turn held running until `gate` fires.
+async fn send_from_the_window_and_hold(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    prompt: &str,
+    gate: &Arc<Notify>,
+) -> Uuid {
+    let send_id =
+        send_from_the_window(env, project_id, agent_id, prompt, Script::parked("", gate)).await;
     await_turn_running(&env.state, agent_id).await;
     send_id
+}
+
+/// Poll until the ledger has seen the agent's turn for `send_id` start, or
+/// panic.
+async fn await_open_turn(env: &TestEnv, agent_id: AgentId, send_id: Uuid) {
+    for _ in 0..500 {
+        if env.state.ledger.open_turn(agent_id) == Some(Some(send_id)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the turn for send {send_id} never started");
 }
 
 /// Journal the link Claude's first message gives a running turn, as the actor
@@ -3947,6 +3974,374 @@ async fn a_reply_whose_failure_is_journaled_while_still_open_in_the_ledger_reads
     .unwrap();
     assert_eq!(page.status, SendStatus::Failed, "the reply reader agrees");
     gate.notify_one();
+}
+
+/// What `wait_send` and `wait_any_send` say about `sent` under a one-second
+/// budget, and what forwarding `source`'s reply to it to `reader` does: the
+/// recipient's `(done, status, text)`, `any_done`, and the message the reader
+/// was sent or the forward's error code.
+async fn waits_and_a_forward_of(
+    env: &TestEnv,
+    project_id: ProjectId,
+    source: AgentId,
+    sent: Uuid,
+    reader: AgentId,
+) -> (
+    (bool, SendStatus, Option<String>),
+    bool,
+    Result<String, &'static str>,
+) {
+    let waited = wait_send(&env.state, project_id, sent, &short(), &env.home())
+        .await
+        .unwrap();
+    let any = wait_any_send(&env.state, project_id, vec![sent], &short(), &env.home())
+        .await
+        .unwrap();
+    let forwarded = match forward_at_once(
+        env,
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, source, sent)],
+            reader,
+            None,
+        ),
+    )
+    .await
+    {
+        Ok(receipt) => {
+            wait_done(env, project_id, receipt.send_id).await;
+            Ok(last_prompt(env))
+        }
+        Err(err) => Err(error_code(&err)),
+    };
+    (
+        (
+            waited.done,
+            waited.recipients[0].status,
+            waited.recipients[0].text.clone(),
+        ),
+        any.any_done,
+        forwarded,
+    )
+}
+
+#[tokio::test]
+async fn a_window_send_waiting_on_background_work_is_not_finished_to_the_waits_or_a_forward() {
+    let (env, project_id, agents) = project_with_agents(&["a", "reader"]);
+    let (a, reader) = (agents[0], agents[1]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, a, "go", &gate).await;
+    // Claude writes the turn's first cycle, end-of-turn marker included, while
+    // the turn waits on work it started in the background.
+    env.append_claude_turn(project_id, a, "go", "started the build", "m-go");
+    journal_early_link(&env, project_id, a, sent, "m-go");
+
+    assert_eq!(
+        waits_and_a_forward_of(&env, project_id, a, sent, reader).await,
+        (
+            (false, SendStatus::Running, None),
+            false,
+            Err(error_code::SOURCE_BUSY),
+        ),
+        "wait_send, wait_any_send, and the forward"
+    );
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_codex_window_send_still_being_written_is_not_finished_to_the_waits_or_a_forward() {
+    let (env, project_id, cx) = project_with_codex_agent();
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let reader = env.agent(project_id, "reader");
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, cx, "say ack", &gate).await;
+    // Through the answer's message: the turn's token count and its
+    // `task_complete` are still to be written, and Codex links its reply to
+    // its send only once the turn ends.
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 9, Utc::now()));
+
+    assert_eq!(
+        waits_and_a_forward_of(&env, project_id, cx, sent, reader).await,
+        (
+            (false, SendStatus::Running, None),
+            false,
+            Err(error_code::SOURCE_BUSY),
+        ),
+        "wait_send, wait_any_send, and the forward"
+    );
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_window_send_is_waited_on_until_its_turn_ends_and_then_reads_completed() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let mut script = Script::parked("the build passed", &gate);
+    script.key = Some("m-go".to_owned());
+    let sent = send_from_the_window(&env, project_id, agents[0], "go", script).await;
+    await_turn_running(&env.state, agents[0]).await;
+
+    let running = wait_send(&env.state, project_id, sent, &short(), &env.home())
+        .await
+        .unwrap();
+    assert!(!running.done, "not done while the turn runs: {running:?}");
+    gate.notify_one();
+    let ended = wait_send(
+        &env.state,
+        project_id,
+        sent,
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            ended.done,
+            ended.recipients[0].status,
+            ended.recipients[0].text.as_deref()
+        ),
+        (true, SendStatus::Completed, Some("the build passed")),
+        "{ended:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_window_send_still_running_when_the_wait_ends_reads_running_with_its_activity() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, agents[0], "go", &gate).await;
+    env.append_claude_turn(project_id, agents[0], "go", "started the build", "m-go");
+    journal_early_link(&env, project_id, agents[0], sent, "m-go");
+
+    let reply = wait_send(&env.state, project_id, sent, &short(), &env.home())
+        .await
+        .unwrap();
+    let recipient = &reply.recipients[0];
+    assert_eq!(
+        (
+            reply.done,
+            reply.source,
+            recipient.status,
+            recipient.text.as_deref(),
+            recipient.recent_text.as_deref(),
+            recipient.activity.is_some()
+        ),
+        (
+            false,
+            WaitSource::Journal,
+            SendStatus::Running,
+            None,
+            None,
+            true
+        ),
+        "running with the agent's activity, and no text: the ledger captures a turn's text only for a send it holds"
+    );
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_window_send_cancelled_while_waited_on_reads_cancelled() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let mut script = Script::parked("half a reply", &gate);
+    script.key = Some("m-go".to_owned());
+    let sent = send_from_the_window(&env, project_id, agents[0], "go", script).await;
+    await_turn_running(&env.state, agents[0]).await;
+    journal_early_link(&env, project_id, agents[0], sent, "m-go");
+    // The window's stop control on that reply. The turn leaves its partial
+    // reply on disk, looking finished, so only the journaled cancellation says
+    // it did not finish.
+    crate::commands::cancel_send_impl(&env.state, sent, &[agents[0]]);
+
+    let reply = wait_send(
+        &env.state,
+        project_id,
+        sent,
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (reply.done, reply.recipients[0].status),
+        (true, SendStatus::Cancelled),
+        "{reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_wait_on_the_first_of_two_queued_window_sends_returns_when_the_first_ends() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let a = agents[0];
+    let (first_gate, second_gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let mut first_script = Script::parked("one", &first_gate);
+    first_script.key = Some("m-one".to_owned());
+    let first = send_from_the_window(&env, project_id, a, "one", first_script).await;
+    await_open_turn(&env, a, first).await;
+    let second =
+        send_from_the_window(&env, project_id, a, "two", Script::parked("", &second_gate)).await;
+    // A wait already parked on the first when its turn ends and the agent
+    // moves on to the second. The short wait beside it runs a full second, by
+    // which time the long one has looked once and parked.
+    let (state, home) = (Arc::clone(&env.state), env.home());
+    let waiter = tokio::spawn(async move {
+        wait_send(
+            &state,
+            project_id,
+            first,
+            &WaitBudget::new(Some(30), false),
+            &home,
+        )
+        .await
+    });
+    let still_running = wait_send(&env.state, project_id, first, &short(), &env.home())
+        .await
+        .unwrap();
+    assert!(!still_running.done, "{still_running:?}");
+    first_gate.notify_one();
+    let first_reply = waiter.await.unwrap().unwrap();
+    await_open_turn(&env, a, second).await;
+    let second_reply = wait_send(&env.state, project_id, second, &short(), &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            (
+                first_reply.done,
+                first_reply.recipients[0].status,
+                first_reply.recipients[0].text.as_deref()
+            ),
+            (second_reply.done, second_reply.recipients[0].status)
+        ),
+        (
+            (true, SendStatus::Completed, Some("one")),
+            (false, SendStatus::Running)
+        ),
+        "the first is over once the agent has moved on to the second"
+    );
+    second_gate.notify_one();
+}
+
+/// Poll until the ledger shows no turn open on the agent, or panic.
+async fn await_no_open_turn(env: &TestEnv, agent_id: AgentId) {
+    for _ in 0..500 {
+        if env.state.ledger.open_turn(agent_id).is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("agent {agent_id}'s turn never ended");
+}
+
+#[tokio::test]
+async fn a_window_send_winding_down_after_its_turn_ends_is_not_done_until_it_has() {
+    let (env, project_id, cx) = project_with_codex_agent();
+    let (park, drain) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let mut script = Script::parked("", &park).draining(&drain);
+    script.key = Some(CODEX_TEXT_ONLY_TURN.to_owned());
+    let sent = send_from_the_window(&env, project_id, cx, "say ack", script).await;
+    await_open_turn(&env, cx, sent).await;
+    // This models the timing `docs/harness-behavior.md` records as unmeasured
+    // (G50), not observed Codex behaviour: the turn has ended and Codex is
+    // still exiting, and its rollout does not yet hold the turn's token count
+    // or `task_complete`.
+    let start = Utc::now();
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 9, start));
+    park.notify_one();
+    await_no_open_turn(&env, cx).await;
+
+    let winding_down = wait_send(&env.state, project_id, sent, &short(), &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        (winding_down.done, winding_down.recipients[0].status),
+        (false, SendStatus::Running),
+        "{winding_down:?}"
+    );
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 11, start));
+    drain.notify_one();
+    let ended = wait_send(
+        &env.state,
+        project_id,
+        sent,
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            ended.done,
+            ended.recipients[0].status,
+            ended.recipients[0].text.as_deref()
+        ),
+        (true, SendStatus::Completed, Some("ack")),
+        "{ended:?}"
+    );
+}
+
+#[tokio::test]
+async fn wait_any_send_waits_on_a_window_send_beside_one_it_holds() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b"]);
+    let (a, b) = (agents[0], agents[1]);
+    let (window_gate, held_gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let window = send_from_the_window_and_hold(&env, project_id, a, "go", &window_gate).await;
+    env.adapter
+        .push_for(b, Script::parked("b's answer", &held_gate));
+    let held = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![b], "hi"),
+    )
+    .await
+    .unwrap()
+    .send_id;
+    await_open_turn(&env, b, held).await;
+
+    let statuses = |reply: &super::send::WaitAnySendReply| -> (bool, Vec<(bool, SendStatus)>) {
+        (
+            reply.any_done,
+            reply
+                .sends
+                .iter()
+                .map(|send| (send.done, send.recipients[0].status))
+                .collect(),
+        )
+    };
+    let both_running = wait_any_send(
+        &env.state,
+        project_id,
+        vec![window, held],
+        &short(),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    held_gate.notify_one();
+    let one_done = wait_any_send(
+        &env.state,
+        project_id,
+        vec![window, held],
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (statuses(&both_running), statuses(&one_done)),
+        (
+            (
+                false,
+                vec![(false, SendStatus::Running), (false, SendStatus::Running)]
+            ),
+            (
+                true,
+                vec![(false, SendStatus::Running), (true, SendStatus::Completed)]
+            )
+        )
+    );
+    window_gate.notify_one();
 }
 
 #[tokio::test]

@@ -177,7 +177,18 @@ fn edit_facet(args: &Value, keys: [&str; 3], encoding: ArgumentEncoding) -> Tool
 }
 
 /// `[path, content]` argument names.
+///
+/// A write with `Append` set renders through the generic row. Both write tools
+/// offer it in the 1.4.3 binary (`write_file`: "append to an existing file
+/// when Append is true"; `write_to_file`: "append `CodeContent` to the end of
+/// `TargetFile`"), and a Write facet means the whole file: an append would draw
+/// its few added lines as a new file numbered from line 1. No model was seen to
+/// send it. `Overwrite` keeps the Write facet, since the content is then the
+/// whole file.
 fn write_facet(args: &Value, keys: [&str; 2], encoding: ArgumentEncoding) -> ToolFacet {
+    if is_true(args.get("Append")) {
+        return ToolFacet::Other;
+    }
     let [path_key, content_key] = keys;
     let (Some(path), Some(content)) = (
         arg_str(args, path_key, encoding),
@@ -190,6 +201,16 @@ fn write_facet(args: &Value, keys: [&str; 2], encoding: ArgumentEncoding) -> Too
         path,
         content: content_value,
         truncated: content.source_truncated || truncated,
+    }
+}
+
+/// A boolean argument in either encoding: `true` in `transcript_full.jsonl`,
+/// `"true"` in compact `transcript.jsonl`.
+fn is_true(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::String(text)) => text.trim() == "true",
+        _ => false,
     }
 }
 
@@ -669,6 +690,43 @@ mod tests {
                 ToolFacet::Other,
                 "{args}"
             );
+        }
+    }
+
+    /// An append would draw as a whole new file, so it renders generically,
+    /// for both write tools and both encodings; an overwrite keeps its Write
+    /// facet.
+    #[test]
+    fn an_append_write_renders_generically() {
+        for (name, path_key, content_key) in [
+            ("write_file", "Path", "Content"),
+            ("write_to_file", "TargetFile", "CodeContent"),
+        ] {
+            let compact = |extra: (&str, &str)| {
+                let mut args = json!({path_key: "\"/tmp/a.txt\"", content_key: "\"more\""});
+                args[extra.0] = json!(extra.1);
+                classify_antigravity_tool_facet(name, &args)
+            };
+            assert_eq!(compact(("Append", "true")), ToolFacet::Other, "{name}");
+            assert!(
+                matches!(compact(("Append", "false")), ToolFacet::Write { .. }),
+                "{name}"
+            );
+            assert!(
+                matches!(compact(("Overwrite", "true")), ToolFacet::Write { .. }),
+                "{name}"
+            );
+
+            let native = |append: bool| {
+                classify_antigravity_tool_with_encoding(
+                    name,
+                    &json!({path_key: "/tmp/a.txt", content_key: "more", "Append": append}),
+                    ArgumentEncoding::Native,
+                )
+                .1
+            };
+            assert_eq!(native(true), ToolFacet::Other, "{name}");
+            assert!(matches!(native(false), ToolFacet::Write { .. }), "{name}");
         }
     }
 

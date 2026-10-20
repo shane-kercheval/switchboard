@@ -203,25 +203,31 @@ impl ResultFailure {
 /// - `Command exited with code 1.`, then a blank line and `Command output:`
 ///   (1.4.3).
 ///
-/// So the match is loose rather than a fixed sentence: a header line in which
-/// `exit` is later followed by `code`, an optional colon and an integer. A
-/// non-zero code is a failure and `0` a success. A code that does not parse is
-/// not called a failure, because guessing would mark successes as failed.
+/// **Only those exact sentences count, and only at the start of a line.** A
+/// header can carry text a person typed: `agy`'s older output template writes
+/// `The user changed the command to be run to: <command>` above the exit line
+/// when a command was edited before it ran, and a multi-line command continues
+/// on the lines below. A looser match read `exit code 0` inside such a command
+/// as the status. A rewording `agy` has not written yet therefore reads as
+/// success; `live_antigravity_failing_command_completes_as_tool_error` is the
+/// guard. A code that does not parse is not called a failure, because guessing
+/// would mark successes as failed.
 ///
 /// **Only the header is read**, so text a command prints is never taken for
-/// its exit status. The header ends at the first line that is only words and a
-/// colon, the form of every heading `agy` puts before a command's output
-/// (`Output:`, `Stdout:`, `Command output:`, and `Output snapshot:` for a
-/// background command). A fixed list of headings stopped working when 1.4.3
-/// renamed `Output:`. The lines before the exit line @ 1.4.3 are `Created At:
-/// <time>` and `Completed At: <time>`, which carry text after the colon and so
-/// never end the header early.
+/// its exit status. The header ends at one of the headings `agy` has put
+/// before a command's output ([`OUTPUT_HEADINGS`]), matched whole, so a line
+/// of an edited command that merely looks like a heading (`Phase:`) does not
+/// end it early. A heading `agy` renames later stops ending the header; that
+/// matters only for a result with no exit line, whose output would then be
+/// scanned for one of the sentences above.
+///
+/// Still a format-sensitive fallback: an edited multi-line command that
+/// contains one of these exact sentences or headings on a line of its own
+/// (inside a here-document, say) can still mislead it.
 ///
 /// The result counts as failed only when its call is [`COMMAND_TOOL`] (see
 /// [`ResultFailure::is_error_for`]), so a web page or MCP reply that quotes the
-/// sentence is not misread either. A rewording this match misses reads as
-/// success again; `live_antigravity_failing_command_completes_as_tool_error`
-/// is the guard.
+/// sentence is not misread either.
 fn header_reports_nonzero_exit(content: &str) -> bool {
     for line in content.lines() {
         let line = line.trim();
@@ -235,31 +241,44 @@ fn header_reports_nonzero_exit(content: &str) -> bool {
     false
 }
 
-/// A line that is only words followed by a colon, such as `Command output:`.
+/// Each heading `agy` has put before a command's output, lowercased:
+/// `Output:` and `Stdout:`/`Stderr:` (to 1.4.2, and a subagent's commands @
+/// 1.4.3), `Command output:` (1.4.3), and `Output snapshot:` (a background
+/// command, in `agy`'s output template).
+const OUTPUT_HEADINGS: [&str; 5] = [
+    "output:",
+    "stdout:",
+    "stderr:",
+    "command output:",
+    "output snapshot:",
+];
+
 fn is_output_heading(line: &str) -> bool {
-    line.strip_suffix(':').is_some_and(|words| {
-        !words.trim().is_empty() && words.chars().all(|c| c.is_ascii_alphabetic() || c == ' ')
-    })
+    OUTPUT_HEADINGS.contains(&line.to_ascii_lowercase().as_str())
 }
 
-/// The exit code a header line reports: `exit` (as in `exited`), later
-/// `code`, then an optional colon and an integer (`… exited with code 1.` → 1,
-/// `… exit code: 127` → 127). `None` when the line is not shaped that way or
-/// the code does not parse.
+/// The start of each exit sentence `agy` has written, lowercased, up to the
+/// code.
+const EXIT_SENTENCES: [&str; 3] = [
+    "command exited with code ",
+    "the command exited with code ",
+    "the command failed with exit code:",
+];
+
+/// The exit code a header line reports, when the line opens with one of
+/// [`EXIT_SENTENCES`] (`Command exited with code 1.` → 1). `None` otherwise,
+/// or when the code does not parse.
 fn reported_exit_code(line: &str) -> Option<i64> {
     let lower = line.to_ascii_lowercase();
-    let after_exit = &lower[lower.find("exit")?..];
-    let after_code = &after_exit[after_exit.find("code")? + "code".len()..];
-    let after_code = after_code.trim_start();
-    let number = after_code
-        .strip_prefix(':')
-        .unwrap_or(after_code)
+    let rest = EXIT_SENTENCES
+        .iter()
+        .find_map(|sentence| lower.strip_prefix(sentence))?
         .trim_start();
-    let end = number
+    let end = rest
         .char_indices()
         .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && c == '-')))
-        .map_or(number.len(), |(i, _)| i);
-    number[..end].parse().ok()
+        .map_or(rest.len(), |(i, _)| i);
+    rest[..end].parse().ok()
 }
 
 /// Per-turn parser state. Tracks in-flight tool invocations and early tool
@@ -1251,13 +1270,88 @@ mod tests {
         assert!(!completions[0].2, "{completions:?}");
     }
 
+    /// Captured @ agy 1.4.3 (2026-10-20, Gemini 3.8 Flash, the adapter's
+    /// dispatch flags; only the scratch path is neutralized): an `edit_file`
+    /// whose target is not in the file, then a `write_file` onto a file that
+    /// exists. Both are written `status:"ERROR"`, so neither row draws a change
+    /// that did not happen.
+    const FAILED_EDIT_THEN_REFUSED_WRITE_1_4_3: [&str; 4] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-20T19:25:33Z","input_tokens":7727,"cache_read_tokens":0,"output_tokens":53,"tool_calls":[{"name":"edit_file","args":{"Path":"\"/tmp/agyprobe/ws/f.txt\"","Replacement":"\"x\"","Target":"\"zzz-not-present\""}}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"ERROR","error":"target content not found in the file; the Target must exactly match existing file text, including whitespace","created_at":"2026-10-20T19:25:35Z","content":"Created At: 2026-10-20T14:25:35-05:00\nCompleted At: 2026-10-20T14:25:35-05:00\nEncountered error in step execution: target content not found in the file; the Target must exactly match existing file text, including whitespace"}"#,
+        r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-20T19:25:35Z","input_tokens":7880,"cache_read_tokens":0,"output_tokens":43,"tool_calls":[{"name":"write_file","args":{"Content":"\"new\"","Path":"\"/tmp/agyprobe/ws/f.txt\""}}]}"#,
+        r#"{"step_index":4,"source":"MODEL","type":"GENERIC","status":"ERROR","error":"/tmp/agyprobe/ws/f.txt already exists. To overwrite it, retry with Overwrite=true. To edit it, view its contents first and use a code edit tool. Otherwise, choose a different file name","created_at":"2026-10-20T19:25:37Z","content":"Created At: 2026-10-20T14:25:37-05:00\nCompleted At: 2026-10-20T14:25:37-05:00\nEncountered error in step execution: /tmp/agyprobe/ws/f.txt already exists. To overwrite it, retry with Overwrite=true. To edit it, view its contents first and use a code edit tool. Otherwise, choose a different file name"}"#,
+    ];
+
+    #[test]
+    fn a_1_4_3_failed_edit_and_refused_write_complete_as_failed() {
+        let mut state = AntigravityParserState::default();
+        let turn = tid();
+        let events: Vec<AdapterEvent> = FAILED_EDIT_THEN_REFUSED_WRITE_1_4_3
+            .iter()
+            .flat_map(|line| record_to_live_events(&parse(line), turn, &mut state))
+            .collect();
+
+        let facets: Vec<(&str, &crate::facets::ToolFacet)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolStarted { name, facet, .. } => Some((name.as_str(), facet)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(
+                facets.as_slice(),
+                [
+                    ("edit_file", crate::facets::ToolFacet::Edit { .. }),
+                    ("write_file", crate::facets::ToolFacet::Write { .. }),
+                ]
+            ),
+            "{facets:?}"
+        );
+
+        let completions: Vec<(&str, &str, bool)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolCompleted {
+                    tool_use_id,
+                    output,
+                    is_error,
+                    ..
+                } => Some((tool_use_id.as_str(), output.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completions,
+            vec![
+                (
+                    "1:0:edit_file",
+                    "target content not found in the file; the Target must exactly match existing file text, including whitespace",
+                    true,
+                ),
+                (
+                    "3:0:write_file",
+                    "/tmp/agyprobe/ws/f.txt already exists. To overwrite it, retry with Overwrite=true. To edit it, view its contents first and use a code edit tool. Otherwise, choose a different file name",
+                    true,
+                ),
+            ]
+        );
+    }
+
     /// Each heading `agy` has put before a command's output ends the header,
     /// so an exit sentence the command printed is not read as its status.
-    /// `Output snapshot:` is the background-command heading in `agy`'s 1.4.3
-    /// output template (`Background command ID: <id>` above it, no exit line).
+    /// `Output snapshot:` is the background-command heading in the older output
+    /// template the 1.4.3 binary still holds (`Background command ID: <id>`
+    /// above it, no exit line).
     #[test]
     fn an_exit_sentence_after_any_output_heading_is_not_the_header() {
-        for heading in ["Output:", "Stdout:", "Command output:", "Output snapshot:"] {
+        for heading in [
+            "Output:",
+            "Stdout:",
+            "Stderr:",
+            "Command output:",
+            "Output snapshot:",
+        ] {
             for printed in [
                 "Command exited with code 1.",
                 "The command exited with code 1.",
@@ -1276,21 +1370,42 @@ mod tests {
         ));
     }
 
-    /// The 1.4.3 header lines before the exit line carry text after their
-    /// colon, so they do not end the header; neither does the line `agy`'s
-    /// template writes when the user edited the command before it ran.
+    /// The 1.4.3 header lines before the exit line do not end the header.
     #[test]
-    fn header_lines_with_text_after_the_colon_do_not_end_the_header() {
+    fn timestamp_lines_do_not_end_the_header() {
         assert!(header_reports_nonzero_exit(
             "Created At: 2026-10-20T13:35:50-05:00\nCompleted At: 2026-10-20T13:35:50-05:00\nCommand exited with code 1.\n\nCommand output:\n"
         ));
+    }
+
+    /// `agy`'s older output template writes a command the user edited before
+    /// it ran above the exit line, verbatim. Text in that command must not be
+    /// read as the status, whichever way it points. Built from the template;
+    /// not seen in a saved transcript.
+    #[test]
+    fn exit_wording_inside_an_edited_command_is_not_the_status() {
         assert!(header_reports_nonzero_exit(
-            "The user changed the command to be run to: ls -la\nThe command exited with code 2.\nOutput:\n"
+            "The user changed the command to be run to: printf 'exit code 0'; false\nThe command exited with code 1.\nOutput:\n"
+        ));
+        assert!(!header_reports_nonzero_exit(
+            "The user changed the command to be run to: echo 'exit code 1'\nThe command exited with code 0.\nOutput:\nexit code 1\n"
         ));
     }
 
-    /// Every known wording, plus small rewordings the loose match is meant to
-    /// survive (hypothetical: not seen from any `agy` build).
+    /// The lines of a multi-line edited command follow the edited-command
+    /// line. One that looks like a heading must not end the header, and one
+    /// that starts with the shell's `command` built-in must not be read as
+    /// the status.
+    #[test]
+    fn a_multi_line_edited_command_does_not_hide_the_exit_line() {
+        assert!(header_reports_nonzero_exit(
+            "The user changed the command to be run to: echo start\nPhase:\ncommand printf 'exit code 0'; false\nThe command exited with code 1.\nOutput:\nstart\n"
+        ));
+    }
+
+    /// Every wording `agy` has written. A trailing clause after the code is
+    /// still read (hypothetical: not seen from any `agy` build); a sentence
+    /// that does not open with one of those wordings is not.
     #[test]
     fn each_wording_of_the_exit_line_is_read() {
         for (line, failed) in [
@@ -1299,9 +1414,9 @@ mod tests {
             ("The command exited with code 0.", false),
             ("Command exited with code 1.", true),
             ("Command exited with code 0.", false),
-            ("Exit code: 3", true),
             ("Command exited with code 1 after 2s.", true),
-            ("command exited with exit code 0", false),
+            ("Exit code: 3", false),
+            ("Process exited with code 1.", false),
         ] {
             assert_eq!(
                 header_reports_nonzero_exit(&format!("{line}\nCommand output:\n")),

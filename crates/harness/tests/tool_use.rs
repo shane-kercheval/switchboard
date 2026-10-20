@@ -15,12 +15,14 @@
 //!
 //! Run with: `make test-live`. All tests are `#[ignore]`-gated.
 
+use std::path::Path;
+
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::antigravity::parser::MISSING_TOOL_RESULT_OUTPUT;
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
-    DispatchOptions, HarnessAdapter, TurnOutcome,
+    DispatchOptions, HarnessAdapter, ToolFacet, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -155,6 +157,23 @@ fn antigravity_agent() -> AgentRecord {
     }
 }
 
+/// Whether `recorded` names `requested`, a file that does not exist. macOS
+/// temp folders sit under `/var`, a link to `/private/var`, and `agy` may
+/// record either form, so the folders are compared after resolving links.
+fn names_missing_file(recorded: &str, requested: &Path) -> bool {
+    let recorded = Path::new(recorded);
+    if recorded.file_name() != requested.file_name() {
+        return false;
+    }
+    match (
+        recorded.parent().map(Path::canonicalize),
+        requested.parent().map(Path::canonicalize),
+    ) {
+        (Some(Ok(recorded_dir)), Some(Ok(requested_dir))) => recorded_dir == requested_dir,
+        _ => false,
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 #[serial_test::serial(antigravity)]
@@ -268,15 +287,31 @@ async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
         .expect("dispatch should succeed with real agy");
     let events: Vec<AdapterEvent> = stream.collect().await;
 
-    let started = events.iter().find(|event| match event {
-        AdapterEvent::ToolStarted { input, .. } => serde_json::to_string(input)
-            .is_ok_and(|text| text.contains("SWITCHBOARD_MISSING_FILE.txt")),
-        _ => false,
+    // The call must be a file read of the requested path. Selecting any call
+    // that mentions the file let a shell `cat` pass through the failed-command
+    // path instead, proving nothing about a failed read.
+    let started = events.iter().find(|event| {
+        matches!(
+            event,
+            AdapterEvent::ToolStarted {
+                facet: ToolFacet::Read { path },
+                ..
+            } if names_missing_file(path, &missing_path)
+        )
     });
     let AdapterEvent::ToolStarted {
         tool_use_id: started_id,
         ..
-    } = started.unwrap_or_else(|| panic!("expected missing-file tool start; got: {events:?}"))
+    } = started.unwrap_or_else(|| {
+        let calls: Vec<(&str, &ToolFacet)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolStarted { name, facet, .. } => Some((name.as_str(), facet)),
+                _ => None,
+            })
+            .collect();
+        panic!("expected a file read of {missing_path_text}; calls (tool, display): {calls:?}")
+    })
     else {
         unreachable!();
     };

@@ -579,6 +579,13 @@ enum Command {
     /// session handoff uses this to avoid starting a second process against a
     /// harness session Switchboard is still driving.
     PeekWorkPending { reply: oneshot::Sender<bool> },
+    /// Reply `true` while this actor owns work for `send_id`: its turn running
+    /// or draining after its terminal, or its item still queued. Work for
+    /// another send, a compaction included, answers `false`.
+    PeekSendPending {
+        send_id: SendId,
+        reply: oneshot::Sender<bool>,
+    },
     /// Reply `true` iff an `Enqueue` under `FailFast` arriving now would be
     /// accepted — see [`Dispatcher::accepts_now`]. Answered with the same
     /// predicate the `FailFast` admission arm uses, so the two cannot drift.
@@ -666,6 +673,12 @@ enum AgentSlot {
         /// becomes `Removed` instead of clearing, so nothing can start the
         /// agent in between. Never cleared once set.
         removed: bool,
+        /// The closing actor's command sender, for questions only: the actor
+        /// keeps answering while it drains its turn, and
+        /// [`Dispatcher::has_work_for_send`] asks it which send that turn
+        /// answers. Never used to start work. `None` when a removal found no
+        /// actor.
+        actor: Option<mpsc::UnboundedSender<Command>>,
     },
     Removed,
 }
@@ -678,9 +691,10 @@ enum AgentSlot {
 struct Closing {
     agents: Arc<Mutex<HashMap<AgentId, AgentSlot>>>,
     agent_id: AgentId,
-    /// The actor's command sender, held until it stops: the slot no longer
-    /// holds one, and an actor whose channel has no sender left sees it closed
-    /// while it is still finishing its turn.
+    /// The actor's command sender, held until it stops: an actor whose channel
+    /// has no sender left sees it closed while it is still finishing its turn,
+    /// and the slot's copy, kept only for questions, goes when the slot is
+    /// settled.
     sender: mpsc::UnboundedSender<Command>,
     /// The actor's `Shutdown` reply; `None` once received, or when the actor
     /// was already gone.
@@ -737,10 +751,10 @@ enum RemovalClaim {
 fn finish_closing(agents: &Mutex<HashMap<AgentId, AgentSlot>>, agent_id: AgentId) {
     let mut agents = lock(agents);
     match agents.get(&agent_id) {
-        Some(AgentSlot::Closing { removed: true }) => {
+        Some(AgentSlot::Closing { removed: true, .. }) => {
             agents.insert(agent_id, AgentSlot::Removed);
         }
-        Some(AgentSlot::Closing { removed: false }) => {
+        Some(AgentSlot::Closing { removed: false, .. }) => {
             agents.remove(&agent_id);
         }
         _ => {}
@@ -1879,6 +1893,41 @@ impl Dispatcher {
         rx.await.unwrap_or(true)
     }
 
+    /// Whether this agent's actor still owns work for `send_id`: the send's
+    /// turn running, or draining after its terminal until the harness's stream
+    /// ends, or its item queued. Unlike [`Self::has_pending_work`], work for
+    /// another send (a compaction, a `/context` report, the next message)
+    /// answers `false`, during a teardown too: a closing actor still answers
+    /// for the turn it drains. The actor answers no command while it starts a
+    /// turn, so a call made then returns once the turn is running.
+    ///
+    /// No actor, or one gone before it answers, owns no work: `false`. This
+    /// never starts an actor.
+    pub async fn has_work_for_send(&self, agent_id: AgentId, send_id: SendId) -> bool {
+        let commands = {
+            let agents = lock(&self.agents);
+            match agents.get(&agent_id) {
+                Some(
+                    AgentSlot::Active(tx)
+                    | AgentSlot::Closing {
+                        actor: Some(tx), ..
+                    },
+                ) => tx.clone(),
+                Some(AgentSlot::Closing { actor: None, .. } | AgentSlot::Removed) | None => {
+                    return false;
+                }
+            }
+        };
+        let (tx, rx) = oneshot::channel();
+        if commands
+            .send(Command::PeekSendPending { send_id, reply: tx })
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
+
     /// Close `agent_id`'s actor atomically: mark the slot `Closing` (so a racing
     /// send is rejected, not resurrected with a fresh actor), tell the actor to
     /// abandon its backlog + cancel any running turn + drain, await its reply,
@@ -1967,17 +2016,25 @@ impl Dispatcher {
     fn claim_for_removal(&self, agent_id: AgentId, source: CancelSource) -> RemovalClaim {
         let sender = {
             let mut agents = lock(&self.agents);
-            match agents.get_mut(&agent_id) {
-                Some(AgentSlot::Closing { removed }) => {
+            let actor = match agents.get_mut(&agent_id) {
+                Some(AgentSlot::Closing { removed, .. }) => {
                     *removed = true;
                     return RemovalClaim::Joined;
                 }
                 Some(AgentSlot::Removed) => return RemovalClaim::Joined,
-                Some(AgentSlot::Active(_)) | None => {}
-            }
-            match agents.insert(agent_id, AgentSlot::Closing { removed: false }) {
-                Some(AgentSlot::Active(tx)) => tx,
-                _ => return RemovalClaim::Owner(None),
+                Some(AgentSlot::Active(tx)) => Some(tx.clone()),
+                None => None,
+            };
+            agents.insert(
+                agent_id,
+                AgentSlot::Closing {
+                    removed: false,
+                    actor: actor.clone(),
+                },
+            );
+            match actor {
+                Some(tx) => tx,
+                None => return RemovalClaim::Owner(None),
             }
         };
         RemovalClaim::Owner(Some(self.shut_down(agent_id, sender, source)))
@@ -1989,15 +2046,18 @@ impl Dispatcher {
         let sender = {
             let mut agents = lock(&self.agents);
             match agents.get_mut(&agent_id) {
-                Some(slot) if matches!(slot, AgentSlot::Active(_)) => {
-                    let AgentSlot::Active(tx) =
-                        std::mem::replace(slot, AgentSlot::Closing { removed: false })
-                    else {
-                        unreachable!("matched Active above")
+                Some(slot) => {
+                    let AgentSlot::Active(tx) = slot else {
+                        return None;
+                    };
+                    let tx = tx.clone();
+                    *slot = AgentSlot::Closing {
+                        removed: false,
+                        actor: Some(tx.clone()),
                     };
                     tx
                 }
-                _ => return None,
+                None => return None,
             }
         };
         Some(self.shut_down(agent_id, sender, source))
@@ -2256,6 +2316,10 @@ fn apply_idle_command(
         }
         Command::PeekWorkPending { reply } => {
             let _ = reply.send(!backlog.is_empty());
+            IdleAfter::Continue
+        }
+        Command::PeekSendPending { send_id, reply } => {
+            let _ = reply.send(backlog.iter().any(|item| item.send_id == send_id));
             IdleAfter::Continue
         }
         // Idle ⇒ a FailFast send is accepted (the backlog is empty whenever the
@@ -3147,6 +3211,15 @@ async fn drain_turn(
                     Some(Command::PeekWorkPending { reply }) => {
                         let _ = reply.send(true);
                     }
+                    // This turn is the send's until the stream ends, through
+                    // the post-terminal drain: a harness may still be writing
+                    // the turn's record of its end then.
+                    Some(Command::PeekSendPending { send_id, reply }) => {
+                        let _ = reply.send(
+                            running_send_id == send_id
+                                || backlog.iter().any(|item| item.send_id == send_id),
+                        );
+                    }
                     // The same predicate as the `FailFast` enqueue arm above:
                     // free once this turn's terminal has passed and nothing is
                     // queued, busy otherwise.
@@ -3642,7 +3715,10 @@ mod fork_safety_tests {
         // public API, so the decision is pinned here instead. Reversing either
         // arm reopens the mid-teardown fork hazard.
         assert!(matches!(
-            fork_safety_from_slot(Some(&AgentSlot::Closing { removed: false })),
+            fork_safety_from_slot(Some(&AgentSlot::Closing {
+                removed: false,
+                actor: None,
+            })),
             SlotForkSafety::Decided(false)
         ));
         assert!(matches!(

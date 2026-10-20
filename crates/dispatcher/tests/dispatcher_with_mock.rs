@@ -3739,6 +3739,158 @@ async fn pending_work_covers_the_running_turn_and_its_queue() {
 }
 
 #[tokio::test]
+async fn work_for_a_send_lasts_through_its_drain_and_not_through_a_compactions() {
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let start_terminal = Arc::new(tokio::sync::Notify::new());
+    let end_stream = Arc::new(tokio::sync::Notify::new());
+    let (dispatcher, emitter, _journal, agent, factory) = maintenance_fixture([
+        MockScenario::CompletesThenHolds(Arc::clone(&hold)),
+        MockScenario::CompactionOnSignals {
+            start_terminal: Arc::clone(&start_terminal),
+            end_stream: Arc::clone(&end_stream),
+            fail: false,
+        },
+    ]);
+    let (send, compaction) = (SendId::now_v7(), SendId::now_v7());
+
+    assert!(!dispatcher.has_work_for_send(agent.id, send).await);
+    accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "hello",
+                vec![],
+                send,
+                Arc::clone(&factory),
+                OnBusy::Enqueue,
+            )
+            .await,
+    );
+    within(
+        &emitter,
+        "turn_end (send)",
+        emitter.wait_for_type("turn_end", 1),
+    )
+    .await;
+    dispatcher.compact_agent(agent.id, compaction, &factory);
+    assert_eq!(
+        (
+            dispatcher.has_work_for_send(agent.id, send).await,
+            dispatcher.has_work_for_send(agent.id, compaction).await,
+        ),
+        (true, true),
+        "the send's turn drains after its end, with the compaction queued behind it"
+    );
+
+    hold.notify_one();
+    within(
+        &emitter,
+        "turn_start (compaction)",
+        emitter.wait_for_type("turn_start", 2),
+    )
+    .await;
+    start_terminal.notify_one();
+    within(
+        &emitter,
+        "turn_end (compaction)",
+        emitter.wait_for_type("turn_end", 2),
+    )
+    .await;
+    assert_eq!(
+        (
+            dispatcher.has_work_for_send(agent.id, send).await,
+            dispatcher.has_work_for_send(agent.id, compaction).await,
+            dispatcher.has_pending_work(agent.id).await,
+        ),
+        (false, true, true),
+        "the compaction drains after its end: work, but not the send's"
+    );
+
+    end_stream.notify_one();
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    assert!(!dispatcher.has_work_for_send(agent.id, compaction).await);
+}
+
+#[tokio::test]
+async fn a_closing_actor_answers_for_the_turn_it_drains_and_not_for_a_finished_send() {
+    let start_terminal = Arc::new(tokio::sync::Notify::new());
+    let end_stream = Arc::new(tokio::sync::Notify::new());
+    let (dispatcher, emitter, _journal, agent, factory) = maintenance_fixture([
+        MockScenario::Streaming,
+        MockScenario::CompactionOnSignals {
+            start_terminal: Arc::clone(&start_terminal),
+            end_stream: Arc::clone(&end_stream),
+            fail: false,
+        },
+    ]);
+    let (send, compaction) = (SendId::now_v7(), SendId::now_v7());
+    accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "hello",
+                vec![],
+                send,
+                Arc::clone(&factory),
+                OnBusy::Enqueue,
+            )
+            .await,
+    );
+    within(
+        &emitter,
+        "agent_idle (send)",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    dispatcher.compact_agent(agent.id, compaction, &factory);
+    within(
+        &emitter,
+        "turn_start (compaction)",
+        emitter.wait_for_type("turn_start", 2),
+    )
+    .await;
+    start_terminal.notify_one();
+    within(
+        &emitter,
+        "turn_end (compaction)",
+        emitter.wait_for_type("turn_end", 2),
+    )
+    .await;
+    assert!(dispatcher.accepts_now(agent.id).await, "not yet closing");
+
+    // The removal's first poll takes the slot and tells the actor to shut
+    // down; the actor then drains the compaction, whose stream stays open.
+    let mut removal =
+        std::pin::pin!(dispatcher.remove_agent(agent.id, CancelSource::Shutdown, || (true, ())));
+    assert!(futures::poll!(removal.as_mut()).is_pending());
+    assert!(!dispatcher.accepts_now(agent.id).await, "closing");
+    assert_eq!(
+        (
+            dispatcher.has_work_for_send(agent.id, send).await,
+            dispatcher.has_work_for_send(agent.id, compaction).await,
+        ),
+        (false, true),
+        "the finished send has no work; the compaction the teardown drains does"
+    );
+
+    end_stream.notify_one();
+    removal.await;
+    assert_eq!(
+        (
+            dispatcher.has_work_for_send(agent.id, send).await,
+            dispatcher.has_work_for_send(agent.id, compaction).await,
+        ),
+        (false, false),
+        "a removed agent owns no work"
+    );
+}
+
+#[tokio::test]
 async fn remove_queued_message_prevents_dispatch_and_returns_payload() {
     // Enqueue behind a busy (AwaitCancellation) turn, remove the queued one →
     // it never dispatches; the removal returns its payload.

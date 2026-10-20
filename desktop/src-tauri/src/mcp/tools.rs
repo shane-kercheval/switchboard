@@ -1427,7 +1427,8 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
         ToolName::ReadWorkflowRun => {
             let a: ReadWorkflowRunArgs = parse(args)?;
             let replies =
-                workflow::read_workflow_run(state, a.project_id, a.run_id, cx.home()).await?;
+                workflow::read_workflow_run(state, a.project_id, a.run_id, cx.home(), &cx.cancel)
+                    .await?;
             Reply::fitted(
                 &replies,
                 workflow::read_workflow_run_budget(a.project_id, cx.result_chars(a.max_chars)),

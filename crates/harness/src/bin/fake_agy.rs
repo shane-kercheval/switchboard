@@ -46,10 +46,17 @@
 //!   "suppress_conversation_log": false, // omit the `Created conversation <uuid>` log
 //!                                    //   lines even when a brain dir is created, so a
 //!                                    //   test exercises the brain-dir correlation fallback.
-//!   "hang": false                    // true → after writing records/stdout, sleep
+//!   "hang": false,                   // true → after writing records/stdout, sleep
 //!                                    //   indefinitely instead of exiting, so a
 //!                                    //   cancellation test can fire the token while
 //!                                    //   the adapter is still polling. Stays killable.
+//!   "exit_delay_ms": 0,              // optional: wait this long after writing, then exit
+//!   "leftover": {                    // optional: first start a `sleep` that outlives
+//!     "seconds": 8,                  //   this process holding its outputs, as a
+//!     "holds": "both",               //   background command agy started might:
+//!     "own_group": false,            //   "both", "stdout" or "stderr"; own_group puts
+//!     "pid_file": "<path>"           //   it in a process group of its own; its pid is
+//!   }                                //   written to pid_file
 //! }
 //! ```
 //!
@@ -68,7 +75,10 @@
 
 use std::fmt::Write as _;
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -125,6 +135,55 @@ struct Script {
     /// killable (a sleeping process dies on SIGTERM/SIGKILL).
     #[serde(default)]
     hang: bool,
+    /// Wait this long after writing everything, then exit.
+    #[serde(default)]
+    exit_delay_ms: u64,
+    /// A process to start before anything is written, which outlives this one
+    /// and keeps its output pipes open.
+    #[serde(default)]
+    leftover: Option<Leftover>,
+}
+
+#[derive(Deserialize)]
+struct Leftover {
+    seconds: u64,
+    /// Which of this process's outputs it inherits: "both", "stdout" or
+    /// "stderr". The other goes to /dev/null.
+    holds: String,
+    /// Start it in a process group of its own, out of reach of a signal to
+    /// this process's group.
+    #[serde(default)]
+    own_group: bool,
+    /// Where its pid is written, so a test can check on it and clean it up.
+    pid_file: String,
+}
+
+/// Start `leftover`'s `sleep`, holding the outputs it names, and record its
+/// pid.
+#[expect(
+    clippy::zombie_processes,
+    reason = "the leftover is meant to outlive this process, which exits without waiting for it"
+)]
+fn start_leftover(leftover: &Leftover) {
+    let mut command = std::process::Command::new("sleep");
+    command
+        .arg(leftover.seconds.to_string())
+        .stdin(Stdio::null());
+    if leftover.holds == "stderr" {
+        command.stdout(Stdio::null());
+    }
+    if leftover.holds == "stdout" {
+        command.stderr(Stdio::null());
+    }
+    #[cfg(unix)]
+    if leftover.own_group {
+        command.process_group(0);
+    }
+    let child = command.spawn().unwrap_or_else(|e| {
+        eprintln!("fake_agy: cannot start the leftover: {e}");
+        std::process::exit(1);
+    });
+    let _ = std::fs::write(&leftover.pid_file, child.id().to_string());
 }
 
 #[derive(Deserialize)]
@@ -139,6 +198,32 @@ struct Drip {
 
 fn default_true() -> bool {
     true
+}
+
+/// Stage this dispatch's CLI log at the `--log-file` path. Real `agy`
+/// records the conversation id here and the adapter reads it back as its
+/// primary capture signal, so emit realistic id lines by default when a
+/// conversation is created. The adapter only reads them on first-turn
+/// capture / fork recapture (a normal resume ignores the log), so emitting
+/// them unconditionally is harmless. `log_file_content` (e.g. a staged
+/// `RESOURCE_EXHAUSTED` line) is appended for the no-answer-branch scan.
+fn stage_log(args: &[String], script: &Script) {
+    let Some(log_path) = arg_value(args, "--log-file") else {
+        return;
+    };
+    let mut log = String::new();
+    if script.create_brain_dir && !script.suppress_conversation_log {
+        let uuid = &script.conversation_uuid;
+        let _ = writeln!(log, "server.go:755] Created conversation {uuid}");
+        let _ = writeln!(
+            log,
+            "printmode.go:130] Print mode: conversation={uuid}, sending message"
+        );
+    }
+    log.push_str(&script.log_file_content);
+    if !log.is_empty() {
+        let _ = std::fs::write(&log_path, &log);
+    }
 }
 
 /// Return the value of `--flag <value>` from argv, or `None` if absent or
@@ -177,28 +262,11 @@ fn main() {
         let _ = writeln!(f, "{}", args[1..].join(" "));
     }
 
-    // Stage this dispatch's CLI log at the `--log-file` path. Real `agy`
-    // records the conversation id here and the adapter reads it back as its
-    // primary capture signal, so emit realistic id lines by default when a
-    // conversation is created. The adapter only reads them on first-turn
-    // capture / fork recapture (a normal resume ignores the log), so emitting
-    // them unconditionally is harmless. `log_file_content` (e.g. a staged
-    // RESOURCE_EXHAUSTED line) is appended for the no-answer-branch scan.
-    if let Some(log_path) = arg_value(&args, "--log-file") {
-        let mut log = String::new();
-        if script.create_brain_dir && !script.suppress_conversation_log {
-            let uuid = &script.conversation_uuid;
-            let _ = writeln!(log, "server.go:755] Created conversation {uuid}");
-            let _ = writeln!(
-                log,
-                "printmode.go:130] Print mode: conversation={uuid}, sending message"
-            );
-        }
-        log.push_str(&script.log_file_content);
-        if !log.is_empty() {
-            let _ = std::fs::write(&log_path, &log);
-        }
+    if let Some(leftover) = &script.leftover {
+        start_leftover(leftover);
     }
+
+    stage_log(&args, &script);
 
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {
         eprintln!("fake_agy: HOME unset");
@@ -286,5 +354,8 @@ fn main() {
         }
     }
 
+    if script.exit_delay_ms > 0 {
+        sleep(Duration::from_millis(script.exit_delay_ms));
+    }
     std::process::exit(script.exit_code);
 }

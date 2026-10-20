@@ -48,6 +48,9 @@ pub struct Script {
     /// fires: the agent's actor is then preparing the turn and answers no
     /// busy check.
     pub hold_dispatch: Option<Arc<Notify>>,
+    /// Fail `dispatch` once any hold above is released, as a harness that
+    /// cannot be started does: the turn never opens.
+    pub fail_dispatch: bool,
     /// Keep the stream open after the turn's end until the gate fires, as
     /// Codex's stays open while it reads its rollout: the actor holds the
     /// agent's session meanwhile, though the reply is complete.
@@ -67,6 +70,7 @@ impl Script {
             ignore_cancel: false,
             context: None,
             hold_dispatch: None,
+            fail_dispatch: false,
             drain: None,
             background_task: None,
         }
@@ -204,6 +208,9 @@ impl HarnessAdapter for ScriptedAdapter {
         if let Some(gate) = &script.hold_dispatch {
             gate.notified().await;
         }
+        if script.fail_dispatch {
+            return Err(DispatchError::BinaryNotFound);
+        }
         let session_file = match &agent.session_locator {
             Some(SessionLocator::Uuid(session)) => {
                 let path = switchboard_harness::claude_session_file_path(&self.home, cwd, session);
@@ -294,9 +301,10 @@ impl HarnessAdapter for ScriptedAdapter {
         ))
     }
 
-    /// A compaction: the next script decides whether it parks or fails, and
-    /// its end carries the compacted size (18,000 of 200,000), the figure the
-    /// mock harness reports. No content, no file write.
+    /// A compaction: the next script decides whether it parks, fails, or
+    /// holds its stream open after its end, and its end carries the compacted
+    /// size (18,000 of 200,000), the figure the mock harness reports. No
+    /// content, no file write.
     async fn compact(
         &self,
         agent: &AgentRecord,
@@ -346,6 +354,10 @@ impl HarnessAdapter for ScriptedAdapter {
                 model: None,
                 effort: None,
             });
+            if let Some(gate) = &script.drain {
+                gate.notified().await;
+            }
+            drop(tx);
         });
         Ok(Box::pin(
             tokio_stream::wrappers::UnboundedReceiverStream::new(rx),

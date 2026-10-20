@@ -1535,6 +1535,35 @@ pub fn kill_process_group(leader_pid: u32) {
     let _ = leader_pid;
 }
 
+/// [`terminate_then_kill`] for a group whose leader has already exited and
+/// been reaped, so `Child::id()` is `None` and the caller passes the pid it
+/// saved at spawn: SIGTERM the group, give it up to [`TERMINATE_GRACE`] to
+/// empty, then SIGKILL whatever is left. With no leader left to wait on, the
+/// grace ends as soon as no process remains in the group. Signalling a group
+/// whose leader was reaped carries the recycled-pid risk
+/// [`kill_process_group`] accepts.
+pub async fn terminate_then_kill_group(leader_pid: u32) {
+    #[cfg(unix)]
+    {
+        let group = nix::unistd::Pid::from_raw(leader_pid.cast_signed());
+        killpg_signal(group, nix::sys::signal::Signal::SIGTERM);
+        let grace_ends = tokio::time::Instant::now() + TERMINATE_GRACE;
+        while nix::sys::signal::killpg(group, None).is_ok()
+            && tokio::time::Instant::now() < grace_ends
+        {
+            tokio::time::sleep(GROUP_EXIT_POLL).await;
+        }
+        killpg_signal(group, nix::sys::signal::Signal::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = leader_pid;
+}
+
+/// How often [`terminate_then_kill_group`] checks whether the group has
+/// emptied during its grace.
+#[cfg(unix)]
+const GROUP_EXIT_POLL: Duration = Duration::from_millis(20);
+
 /// Signal a process group, ignoring `ESRCH` ("no such process" — the group
 /// already exited between the caller's check and this signal, which is a
 /// no-op success, not a failure).

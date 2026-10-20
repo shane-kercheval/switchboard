@@ -1,0 +1,99 @@
+name: relay-image
+
+# Builds the relay's container the way a developer does (`make relay-image`)
+# and smoke-tests it: no other gate builds the image, and its dockerignore is
+# a hand-kept list of what the Cargo workspace needs, so a new member or a
+# manifest change can break it silently. It also runs the relay's tests on
+# Linux, the platform the relay is deployed on. Runs only when something the
+# image is built from changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'desktop/src-tauri/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'Makefile'
+      - '.github/workflows/relay-image.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'desktop/src-tauri/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'Makefile'
+      - '.github/workflows/relay-image.yml'
+
+concurrency:
+  group: relay-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  relay-image:
+    name: Relay image build + smoke test (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Relay tests on Linux
+        run: CARGO_INCREMENTAL=0 cargo test -p switchboard-relay --all-features --locked
+
+      - name: make relay-image
+        run: make relay-image
+
+      - name: Start the relay
+        run: docker run -d --name relay -p 8080:8080 switchboard-relay
+
+      - name: /healthz answers ok
+        run: |
+          for _ in $(seq 1 50); do
+            body=$(curl -fsS http://127.0.0.1:8080/healthz) && break
+            sleep 0.2
+          done
+          echo "$body"
+          test "$body" = '{"status":"ok"}'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: docker stop closes a live connection cleanly
+        run: |
+          python -m pip install --quiet websockets==17.2
+          cat > probe.py <<'EOF'
+          import json, sys, time
+          from websockets.sync.client import connect
+          from websockets.exceptions import ConnectionClosedOK
+
+          with connect("ws://127.0.0.1:8080/connect") as ws:
+              challenge = json.loads(ws.recv(timeout=10))
+              assert challenge["type"] == "challenge", challenge
+              open("ready", "w").close()
+              start = time.monotonic()
+              try:
+                  ws.recv(timeout=30)
+                  sys.exit("expected a close frame, got a message")
+              except ConnectionClosedOK:
+                  elapsed = time.monotonic() - start
+          # Well inside the 10-second registration deadline, so the close
+          # came from the shutdown, not from the unanswered challenge.
+          if elapsed > 5:
+              sys.exit(f"the close took {elapsed:.1f}s")
+          print(f"closed with a close frame after {elapsed:.1f}s")
+          EOF
+          python probe.py & probe=$!
+          for _ in $(seq 1 50); do [ -f ready ] && break; sleep 0.2; done
+          test -f ready
+          docker stop relay
+          wait "$probe"
+          test "$(docker inspect -f '{{.State.ExitCode}}' relay)" = 0
+          docker logs relay
+
+      - name: Remove the container
+        if: always()
+        run: docker rm -f relay || true

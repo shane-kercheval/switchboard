@@ -36,6 +36,11 @@ tempfile = "3"
 tokio-stream = "0.1"
 tokio-util = "0.7"
 toml = "1.1.2"
+# Shared by `remote-crypto` and the relay, which must agree on device ids and
+# token hashes. `sha2` stays on 0.10 with `snow`'s (see `remote-crypto`).
+data-encoding = "2.11.1"
+getrandom = "0.3"
+sha2 = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

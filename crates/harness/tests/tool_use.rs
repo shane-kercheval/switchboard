@@ -403,10 +403,10 @@ async fn live_antigravity_failing_command_completes_as_tool_error() {
             completed,
             Some(AdapterEvent::ToolCompleted { is_error: true, .. })
         ),
-        "expected the failing command to complete as an error; if its output's \
-         header no longer has an `… exited with code <n>.` line before its \
-         output heading, agy has reworded it and `header_reports_nonzero_exit` \
-         needs the new wording. Got: {completed:?}"
+        "expected the failing command to complete as an error; if no line of \
+         its output's header starts with one of the sentences in \
+         `EXIT_SENTENCES` (`antigravity/parser.rs`), agy has reworded its exit \
+         line and the new wording needs adding there. Got: {completed:?}"
     );
     // The command's own output proves the transcript's result settled the
     // row, not the turn-end fallback that closes a call with no result as

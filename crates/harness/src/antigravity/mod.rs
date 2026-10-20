@@ -85,7 +85,6 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use chrono::Utc;
 use switchboard_core::{AgentId, AgentRecord, SessionLocator};
-use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -95,6 +94,7 @@ use crate::events::{
     AdapterEvent, FailureKind, McpServerStatus, SessionInventory, SessionMetaSource, SkillEntry,
     TurnId, TurnOutcome,
 };
+use crate::subprocess::DrainEnd;
 
 use parser::{
     AntigravityParserState, TranscriptRecord, first_error_line, is_auth_failure_line,
@@ -134,14 +134,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// exit.
 const POST_EXIT_LIMIT: Duration = Duration::from_secs(1);
 
-/// Past [`POST_EXIT_LIMIT`], at most this much more of stdout is read. What
-/// `agy` wrote before exiting fits in the pipe's buffer, which is far smaller,
-/// so anything past this is a leftover process's output.
+/// Past [`POST_EXIT_LIMIT`], at most this much more is read from each pipe,
+/// counting only what is read once the limit has passed. What `agy` wrote
+/// before exiting fits in the pipe's buffer, which is far smaller, so
+/// anything past this is a leftover process's output.
 const POST_EXIT_DRAIN_CAP: usize = 1 << 20;
-
-/// Turns the stderr reader gets, past [`POST_EXIT_LIMIT`], to take lines
-/// already in the pipe before it is stopped.
-const STDERR_SETTLE_TURNS: usize = 64;
 
 /// Post-exit drain attempts for the terminal answer. The in-loop poll already
 /// catches the common case (the answer record lands before `agy` exits); this
@@ -323,6 +320,8 @@ impl HarnessAdapter for AntigravityAdapter {
             prompt: prompt.to_owned(),
             log_file_path,
             cancel_token: options.cancel_token,
+            #[cfg(test)]
+            stderr_wait_begins: None,
         }));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
@@ -457,16 +456,12 @@ struct StderrSignals {
     auth_failed: std::sync::atomic::AtomicBool,
     /// First `Error:` line seen, kept for terminal classification.
     first_error: Mutex<Option<String>>,
-    /// Lines drained so far, so a wait for the drain can tell whether it is
-    /// still taking lines in.
-    lines: std::sync::atomic::AtomicUsize,
 }
 
 impl StderrSignals {
-    /// Per-line observer handed to the stderr drain. Runs on the drain task.
+    /// Per-line observer handed to the stderr drain. Runs on the drain task,
+    /// and on the producer for lines it takes after stopping that task.
     fn observe(&self, line: &str) {
-        self.lines
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if is_auth_failure_line(line) {
             self.auth_failed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -484,10 +479,6 @@ impl StderrSignals {
         self.auth_failed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn lines(&self) -> usize {
-        self.lines.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// A poisoned lock yields no line rather than propagating — stderr is a
     /// diagnostic channel and must never itself be what fails a turn.
     fn first_error(&self) -> Option<String> {
@@ -496,78 +487,74 @@ impl StderrSignals {
 }
 
 /// One read of `agy`'s stdout.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum StdoutRead {
     Line(String),
     /// The pipe reached its end, or reading it failed.
     Ended,
-    /// Past the post-exit limit, nothing more could be read without waiting.
-    WouldBlock,
+    /// Past the post-exit limit: every line ready, and why reading stopped.
+    Ready(crate::subprocess::ReadyLines),
 }
 
-/// The next line of stdout: waited for until the post-exit limit, and past
-/// it taken only when it can be read without waiting. Lines `agy` wrote
-/// before it exited are read however late this gets to them, and a process
-/// `agy` left behind holding the pipe cannot hold the turn open. Reading a
-/// line is cancel-safe, so a read dropped here loses nothing.
-///
-/// "Without waiting" is decided only after the runtime has polled the pipe:
-/// data that reached it while this task was starved reads as no data until
-/// then, so before giving up the read yields once and looks again.
-async fn read_stdout<R>(lines: &mut tokio::io::Lines<R>, past_limit: bool) -> StdoutRead
-where
-    R: tokio::io::AsyncBufRead + Unpin,
-{
-    let next = if past_limit {
-        let mut ready = futures::FutureExt::now_or_never(lines.next_line());
-        if ready.is_none() {
-            tokio::task::yield_now().await;
-            ready = futures::FutureExt::now_or_never(lines.next_line());
-        }
-        let Some(next) = ready else {
-            return StdoutRead::WouldBlock;
-        };
-        next
-    } else {
-        lines.next_line().await
-    };
-    match next {
+/// The next line of stdout, waited for until the post-exit limit; past it,
+/// every line that can be read without waiting, as the pipe's last read
+/// ([`crate::subprocess::PipeLines::drain_ready`]). Lines `agy` wrote before
+/// it exited are read however late this gets to them, and a process `agy`
+/// left behind holding the pipe cannot hold the turn open. Cancel-safe, so a
+/// read dropped here loses nothing.
+async fn read_stdout(
+    lines: &mut crate::subprocess::PipeLines<tokio::process::ChildStdout>,
+    past_limit: bool,
+) -> StdoutRead {
+    if past_limit {
+        return StdoutRead::Ready(lines.drain_ready(POST_EXIT_DRAIN_CAP));
+    }
+    match lines.next_line().await {
         Ok(Some(line)) => StdoutRead::Line(line),
         Ok(None) | Err(_) => StdoutRead::Ended,
     }
 }
 
+type AgyStderr = crate::subprocess::StderrDrain<tokio::process::ChildStderr>;
+
 /// Wait for the stderr drain until `deadline`, the post-exit limit. Past it,
-/// a process `agy` left behind holds the pipe: the drain first gets turns to
-/// take in lines already there, which a starved runtime may not have let it
-/// read yet, and is then stopped and joined, never left running with the
-/// pipe.
+/// a process `agy` left behind holds the pipe: the drain is stopped and
+/// joined, never left running with the pipe, and every line already in the
+/// pipe is then taken here, so none is lost to a drain the runtime had not
+/// yet let read it. `task` is cleared once joined, so a call dropped part-way
+/// (a Stop) can be made again.
 async fn finish_stderr(
-    task: &mut tokio::task::JoinHandle<()>,
-    signals: &StderrSignals,
+    task: &mut Option<tokio::task::JoinHandle<()>>,
+    stderr: &AgyStderr,
     deadline: tokio::time::Instant,
     turn_id: TurnId,
     agent_id: AgentId,
 ) {
-    if tokio::time::timeout_at(deadline, &mut *task).await.is_ok() {
-        return;
-    }
-    for _ in 0..STDERR_SETTLE_TURNS {
-        let seen = signals.lines();
-        tokio::task::yield_now().await;
-        if task.is_finished() || signals.lines() == seen {
-            break;
+    if let Some(handle) = task.as_mut() {
+        let joined = if let Ok(joined) = tokio::time::timeout_at(deadline, &mut *handle).await {
+            joined
+        } else {
+            handle.abort();
+            (&mut *handle).await
+        };
+        *task = None;
+        if joined.is_ok() {
+            return;
         }
     }
-    if !task.is_finished() {
-        tracing::warn!(
+    match stderr.drain_ready(POST_EXIT_DRAIN_CAP).await {
+        DrainEnd::PipeEnded | DrainEnd::Failed(_) => {}
+        DrainEnd::WouldBlock => tracing::warn!(
             %turn_id, agent_id = %agent_id,
             "antigravity: stderr was still open after agy exited, held by a process it left \
              behind; stopped reading it"
-        );
-        task.abort();
+        ),
+        DrainEnd::CapReached => tracing::warn!(
+            %turn_id, agent_id = %agent_id,
+            "antigravity: a process agy left behind kept writing to stderr after agy exited; \
+             stopped reading it"
+        ),
     }
-    let _ = task.await;
 }
 
 /// Stop `agy` and the processes it started. While `agy` runs, its group is
@@ -655,6 +642,10 @@ struct ProducerCtx {
     /// Fired by the dispatcher to cancel the turn. Watched as an arm of the
     /// producer's existing `select!`.
     cancel_token: CancellationToken,
+    /// Notified as the wait for stderr after the read loop begins, so a test
+    /// can Stop the turn there.
+    #[cfg(test)]
+    stderr_wait_begins: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Drive a single Antigravity turn to completion, emitting normalized
@@ -679,6 +670,8 @@ async fn run_producer(ctx: ProducerCtx) {
         prompt,
         log_file_path,
         cancel_token,
+        #[cfg(test)]
+        stderr_wait_begins,
     } = ctx;
     // Saved before anything can reap `agy`: once it is reaped `child.id()` is
     // `None`, and a Stop then reaches what `agy` left in its group only
@@ -689,17 +682,21 @@ async fn run_producer(ctx: ProducerCtx) {
         crate::subprocess::STDERR_TAIL_CAPACITY,
     )));
     let stderr_signals = Arc::new(StderrSignals::default());
-    let mut stderr_task = tokio::spawn({
-        let signals = Arc::clone(&stderr_signals);
-        crate::subprocess::drain_stderr_with_observer(
-            stderr,
-            agent_id,
-            turn_id,
-            Arc::clone(&stderr_tail),
-            "antigravity",
-            move |line| signals.observe(line),
-        )
-    });
+    let stderr = Arc::new(AgyStderr::new(
+        stderr,
+        agent_id,
+        turn_id,
+        Arc::clone(&stderr_tail),
+        "antigravity",
+        {
+            let signals = Arc::clone(&stderr_signals);
+            move |line| signals.observe(line)
+        },
+    ));
+    let mut stderr_task = Some(tokio::spawn({
+        let stderr = Arc::clone(&stderr);
+        async move { stderr.run().await }
+    }));
 
     let is_resume = resume_id.is_some();
     // A plain resume re-emits nothing: the locator already lives on the registry
@@ -718,7 +715,7 @@ async fn run_producer(ctx: ProducerCtx) {
         .map_or(0, paths::complete_line_count);
 
     let mut parser_state = AntigravityParserState::default();
-    let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
+    let mut stdout_lines = crate::subprocess::PipeLines::new(stdout);
     let mut stdout_buf: Vec<String> = Vec::new();
     // Seed the carry-forward model from prior turns so an unchanged resume's
     // live `TurnEnd.model` matches the hydrator (Antigravity re-announces only
@@ -757,132 +754,135 @@ async fn run_producer(ctx: ProducerCtx) {
     let mut cancelled = false;
     let mut exit_status: Option<std::process::ExitStatus> = None;
     // One deadline for reading both pipes, set when the exit is confirmed
-    // (see `POST_EXIT_LIMIT`), and how far stdout has been read past it.
+    // (see `POST_EXIT_LIMIT`).
     let mut exit_deadline: Option<tokio::time::Instant> = None;
     let mut past_limit = false;
-    let mut read_past_limit = 0usize;
 
     let mut poll = tokio::time::interval(POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    loop {
+    'turn: loop {
         tokio::select! {
-            maybe_line = read_stdout(&mut stdout_lines, past_limit), if !stdout_eof => {
-                match maybe_line {
-                    StdoutRead::Line(line) => {
-                        if past_limit {
-                            read_past_limit += line.len() + 1;
-                            if read_past_limit > POST_EXIT_DRAIN_CAP {
-                                tracing::warn!(
-                                    %turn_id, agent_id = %agent_id,
-                                    "antigravity: a process agy left behind kept writing to stdout \
-                                     after agy exited; stopped reading it"
-                                );
-                                stdout_eof = true;
-                                continue;
-                            }
-                        }
-                        if is_auth_failure_line(&line) {
-                            // Fast-fail: the OAuth fallback is mid-flight (browser
-                            // open, ~30s block ahead). Stop now and force-kill.
-                            // The same check runs against stderr on the poll tick
-                            // below — `agy` 1.1.x moved its diagnostics to stderr
-                            // and whether the auth line moved with them is
-                            // unverified (see the tick arm).
-                            auth_failed = true;
-                            break;
-                        }
-                        // Stream-json first; anything that is not a stream
-                        // line falls through to the plain-text handlers below.
-                        // That fallthrough is deliberate rather than vestigial:
-                        // whether `agy` still prints its auth line and bare
-                        // `Error:` lines alongside the stream is unverified
-                        // (reproducing the auth shape needs a logged-out CLI),
-                        // so the pre-stream signals stay wired.
-                        if let Some(event) = stream::parse_line(&line) {
-                            // Any parsed stream line proves the process is
-                            // producing structured output — the liveness
-                            // signal `classify_outcome` uses to tell
-                            // output-without-a-readable-answer from silence.
-                            saw_stdout_content = true;
-                            match event {
-                                stream::StreamEvent::Init { conversation_id: id } => {
-                                    // Primary capture. Contractual and
-                                    // immediate, where the log-line scrape is
-                                    // a Google-internal debug string; that and
-                                    // the filesystem watch remain as fallbacks
-                                    // if this ever stops arriving.
-                                    //
-                                    // A capture event is emitted **once**: on a
-                                    // resume the id is already known, and
-                                    // re-announcing it would read as a fork to
-                                    // the dispatcher sink. The id is still kept
-                                    // as a fork candidate — if a resume's
-                                    // conversation expired server-side, `agy`
-                                    // mints a fresh one, and this is the most
-                                    // direct evidence of the replacement.
-                                    // Whether a forked resume's `init` actually
-                                    // reports the *new* id is **unprobed**
-                                    // (forcing one needs a server-expired
-                                    // conversation), so the fork-heal path
-                                    // below only prefers this when it differs
-                                    // and otherwise falls through to the
-                                    // pre-existing log/filesystem correlation
-                                    // unchanged. Defensive, never depended on.
-                                    stream_conversation_id = Some(id);
-                                    if conversation_id.is_none() {
-                                        conversation_id = Some(id);
-                                        transcript_path =
-                                            Some(paths::preferred_transcript_path(&home_dir, id));
-                                        cursor = 0;
-                                        emit_locator_captured(&tx, id);
-                                    }
-                                }
-                                stream::StreamEvent::ToolFailed { step_index, message } => {
-                                    // A rejected tool call. agy 1.1.19 wrote
-                                    // no transcript record for one, so this
-                                    // was its only trace; agy 1.4.2 also
-                                    // writes a `status:"ERROR"` result, which
-                                    // settles the step. Recorded, not paired:
-                                    // which tool it belongs to cannot be known
-                                    // until the transcript has caught up, so
-                                    // resolution happens at the final drain
-                                    // below, and the transcript's verdict
-                                    // stands whichever channel arrived first.
-                                    parser_state
-                                        .record_stream_tool_failure(step_index, message);
-                                }
-                                stream::StreamEvent::Result(result) => {
-                                    stream_result = Some(result);
-                                }
-                                stream::StreamEvent::Ignored => {}
-                            }
-                            continue;
-                        }
-                        let trimmed = line.trim();
-                        if trimmed.starts_with("Error:") || trimmed.starts_with("Warning:") {
-                            stdout_buf.push(line);
-                        } else if !trimmed.is_empty() {
-                            // Normal drip text is **not** emitted as content: on a
-                            // resume turn `agy` replays the whole conversation's
-                            // prior answers to stdout, which would make each turn's
-                            // bubble accumulate every earlier answer. The answer
-                            // text comes from the transcript's per-turn
-                            // `PLANNER_RESPONSE` record instead (see
-                            // `record_to_live_events`). We still note that output
-                            // appeared — a "produced output" signal `classify_outcome`
-                            // uses to distinguish output-without-a-readable-answer
-                            // (fail loud) from no-output. It is **not** a success
-                            // signal: completion requires a transcript terminal answer.
-                            saw_stdout_content = true;
-                        }
+            read = read_stdout(&mut stdout_lines, past_limit), if !stdout_eof => {
+                let (lines, end) = match read {
+                    StdoutRead::Line(line) => (vec![line], None),
+                    StdoutRead::Ended => (Vec::new(), Some(DrainEnd::PipeEnded)),
+                    StdoutRead::Ready(ready) => (ready.lines, Some(ready.end)),
+                };
+                for line in lines {
+                    if is_auth_failure_line(&line) {
+                        // Fast-fail: the OAuth fallback is mid-flight (browser
+                        // open, ~30s block ahead). Stop now and force-kill.
+                        // The same check runs against stderr on the poll tick
+                        // below — `agy` 1.1.x moved its diagnostics to stderr
+                        // and whether the auth line moved with them is
+                        // unverified (see the tick arm).
+                        auth_failed = true;
+                        break 'turn;
                     }
-                    StdoutRead::Ended => stdout_eof = true,
-                    StdoutRead::WouldBlock => {
+                    // Stream-json first; anything that is not a stream
+                    // line falls through to the plain-text handlers below.
+                    // That fallthrough is deliberate rather than vestigial:
+                    // whether `agy` still prints its auth line and bare
+                    // `Error:` lines alongside the stream is unverified
+                    // (reproducing the auth shape needs a logged-out CLI),
+                    // so the pre-stream signals stay wired.
+                    if let Some(event) = stream::parse_line(&line) {
+                        // Any parsed stream line proves the process is
+                        // producing structured output — the liveness
+                        // signal `classify_outcome` uses to tell
+                        // output-without-a-readable-answer from silence.
+                        saw_stdout_content = true;
+                        match event {
+                            stream::StreamEvent::Init { conversation_id: id } => {
+                                // Primary capture. Contractual and
+                                // immediate, where the log-line scrape is
+                                // a Google-internal debug string; that and
+                                // the filesystem watch remain as fallbacks
+                                // if this ever stops arriving.
+                                //
+                                // A capture event is emitted **once**: on a
+                                // resume the id is already known, and
+                                // re-announcing it would read as a fork to
+                                // the dispatcher sink. The id is still kept
+                                // as a fork candidate — if a resume's
+                                // conversation expired server-side, `agy`
+                                // mints a fresh one, and this is the most
+                                // direct evidence of the replacement.
+                                // Whether a forked resume's `init` actually
+                                // reports the *new* id is **unprobed**
+                                // (forcing one needs a server-expired
+                                // conversation), so the fork-heal path
+                                // below only prefers this when it differs
+                                // and otherwise falls through to the
+                                // pre-existing log/filesystem correlation
+                                // unchanged. Defensive, never depended on.
+                                stream_conversation_id = Some(id);
+                                if conversation_id.is_none() {
+                                    conversation_id = Some(id);
+                                    transcript_path =
+                                        Some(paths::preferred_transcript_path(&home_dir, id));
+                                    cursor = 0;
+                                    emit_locator_captured(&tx, id);
+                                }
+                            }
+                            stream::StreamEvent::ToolFailed { step_index, message } => {
+                                // A rejected tool call. agy 1.1.19 wrote
+                                // no transcript record for one, so this
+                                // was its only trace; agy 1.4.2 also
+                                // writes a `status:"ERROR"` result, which
+                                // settles the step. Recorded, not paired:
+                                // which tool it belongs to cannot be known
+                                // until the transcript has caught up, so
+                                // resolution happens at the final drain
+                                // below, and the transcript's verdict
+                                // stands whichever channel arrived first.
+                                parser_state
+                                    .record_stream_tool_failure(step_index, message);
+                            }
+                            stream::StreamEvent::Result(result) => {
+                                stream_result = Some(result);
+                            }
+                            stream::StreamEvent::Ignored => {}
+                        }
+                        continue;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("Error:") || trimmed.starts_with("Warning:") {
+                        stdout_buf.push(line);
+                    } else if !trimmed.is_empty() {
+                        // Normal drip text is **not** emitted as content: on a
+                        // resume turn `agy` replays the whole conversation's
+                        // prior answers to stdout, which would make each turn's
+                        // bubble accumulate every earlier answer. The answer
+                        // text comes from the transcript's per-turn
+                        // `PLANNER_RESPONSE` record instead (see
+                        // `record_to_live_events`). We still note that output
+                        // appeared — a "produced output" signal `classify_outcome`
+                        // uses to distinguish output-without-a-readable-answer
+                        // (fail loud) from no-output. It is **not** a success
+                        // signal: completion requires a transcript terminal answer.
+                        saw_stdout_content = true;
+                    }
+                }
+                match end {
+                    None => {}
+                    Some(DrainEnd::PipeEnded | DrainEnd::Failed(_)) => {
+                        stdout_eof = true;
+                    }
+                    Some(DrainEnd::WouldBlock) => {
                         tracing::warn!(
                             %turn_id, agent_id = %agent_id, limit = ?POST_EXIT_LIMIT,
                             "antigravity: stdout was still open after agy exited, held by a \
                              process it left behind; stopped reading it"
+                        );
+                        stdout_eof = true;
+                    }
+                    Some(DrainEnd::CapReached) => {
+                        tracing::warn!(
+                            %turn_id, agent_id = %agent_id,
+                            "antigravity: a process agy left behind kept writing to stdout \
+                             after agy exited; stopped reading it"
                         );
                         stdout_eof = true;
                     }
@@ -1024,14 +1024,7 @@ async fn run_producer(ctx: ProducerCtx) {
         // holds stderr open.
         stop_process_tree(&mut child, leader).await;
         let deadline = *exit_deadline.get_or_insert(tokio::time::Instant::now() + POST_EXIT_LIMIT);
-        finish_stderr(
-            &mut stderr_task,
-            &stderr_signals,
-            deadline,
-            turn_id,
-            agent_id,
-        )
-        .await;
+        finish_stderr(&mut stderr_task, &stderr, deadline, turn_id, agent_id).await;
         let _ = std::fs::remove_file(&log_file_path);
         return;
     }
@@ -1046,21 +1039,18 @@ async fn run_producer(ctx: ProducerCtx) {
     // within the same deadline as stdout. A Stop that arrives meanwhile still
     // reaches the group, and ends the turn as cancelled, as in the loop.
     let deadline = *exit_deadline.get_or_insert(tokio::time::Instant::now() + POST_EXIT_LIMIT);
+    #[cfg(test)]
+    if let Some(begins) = &stderr_wait_begins {
+        begins.notify_one();
+    }
     let stopped = tokio::select! {
         biased;
         () = cancel_token.cancelled() => true,
-        () = finish_stderr(&mut stderr_task, &stderr_signals, deadline, turn_id, agent_id) => false,
+        () = finish_stderr(&mut stderr_task, &stderr, deadline, turn_id, agent_id) => false,
     };
     if stopped {
         stop_process_tree(&mut child, leader).await;
-        finish_stderr(
-            &mut stderr_task,
-            &stderr_signals,
-            deadline,
-            turn_id,
-            agent_id,
-        )
-        .await;
+        finish_stderr(&mut stderr_task, &stderr, deadline, turn_id, agent_id).await;
         let _ = std::fs::remove_file(&log_file_path);
         return;
     }
@@ -2083,56 +2073,146 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// `agy` exits with stdout closed, leaving a `sleep` in its process group
+    /// that holds stderr, and a Stop arrives while the turn waits for stderr
+    /// after its read loop has ended: the Stop ends the turn with no terminal
+    /// and kills the `sleep` through the group id saved at spawn.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn past_the_limit_stdout_reads_lines_that_reached_the_pipe_while_this_task_was_starved() {
-        use tokio::io::AsyncBufReadExt as _;
-
-        // A process that writes two lines and then holds the pipe open, as
-        // `agy` and a child it left behind would.
-        let mut agy = tokio::process::Command::new("sh")
-            .args(["-c", "printf 'init\\nresult\\n'; exec sleep 5"])
+    async fn a_stop_while_waiting_for_stderr_after_agy_exits_kills_what_holds_it() {
+        let home = TempDir::new().unwrap();
+        let pid_file = home.path().join("leftover.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(r#"exec 1>&-; sleep 10 >/dev/null & echo $! > "$0"; exit 0"#)
+            .arg(&pid_file)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel_token = CancellationToken::new();
+        let stderr_wait_begins = Arc::new(tokio::sync::Notify::new());
+        let turn_id = Uuid::now_v7();
+        let producer = tokio::spawn(run_producer(ProducerCtx {
+            child,
+            stdout,
+            stderr,
+            tx,
+            turn_id,
+            agent_id: Uuid::now_v7(),
+            home_dir: home.path().to_owned(),
+            resume_id: None,
+            harness_version: String::new(),
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            prompt: "hi".to_owned(),
+            log_file_path: build_log_file_path(turn_id),
+            cancel_token: cancel_token.clone(),
+            stderr_wait_begins: Some(Arc::clone(&stderr_wait_begins)),
+        }));
+
+        tokio::time::timeout(Duration::from_secs(10), stderr_wait_begins.notified())
+            .await
+            .expect("the turn waits for stderr once its read loop ends");
+        cancel_token.cancel();
+        tokio::time::timeout(Duration::from_secs(10), producer)
+            .await
+            .expect("the Stop ends the turn")
+            .unwrap();
+        let pid = nix::unistd::Pid::from_raw(
+            std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        );
+        let mut alive = true;
+        for _ in 0..200 {
+            alive = nix::sys::signal::kill(pid, None).is_ok();
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+            "a stopped turn ends with no terminal: {events:?}"
+        );
+        assert!(!alive, "the Stop killed the process holding stderr");
+    }
+
+    /// Lines reach stderr while the runtime is held past the post-exit limit,
+    /// as on a starved machine, so the drain task, waiting on an empty pipe,
+    /// never gets to read them before it is stopped; a `sleep` holds the pipe
+    /// open. The lines still reach the signals and the tail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finishing_stderr_takes_the_lines_its_drain_never_got_to_read() {
+        let dir = TempDir::new().unwrap();
+        let (go, written) = (dir.path().join("go"), dir.path().join("written"));
+        let mut agy = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                r#"while [ ! -e "$0" ]; do sleep 0.01; done
+printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec sleep 10"#,
+            )
+            .arg(&go)
+            .arg(&written)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let stdout = agy.stdout.take().unwrap();
-        // Hold the runtime while the lines arrive, so nothing polls the pipe.
-        std::thread::sleep(Duration::from_millis(300));
-        let mut lines = tokio::io::BufReader::new(stdout).lines();
-        assert_eq!(
-            read_stdout(&mut lines, true).await,
-            StdoutRead::Line("init".to_owned())
-        );
-        assert_eq!(
-            read_stdout(&mut lines, true).await,
-            StdoutRead::Line("result".to_owned())
-        );
-        assert_eq!(read_stdout(&mut lines, true).await, StdoutRead::WouldBlock);
-    }
+        let signals = Arc::new(StderrSignals::default());
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        let stderr = Arc::new(AgyStderr::new(
+            agy.stderr.take().unwrap(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Arc::clone(&tail),
+            "antigravity",
+            {
+                let signals = Arc::clone(&signals);
+                move |line| signals.observe(line)
+            },
+        ));
+        let mut task = Some(tokio::spawn({
+            let stderr = Arc::clone(&stderr);
+            async move { stderr.run().await }
+        }));
+        // The drain starts on the empty pipe, and the runtime's clock passes
+        // the limit, so finishing will not wait.
+        let limit = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::fs::write(&go, "").unwrap();
+        for _ in 0..2000 {
+            if written.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(written.exists(), "the lines were written");
 
-    #[tokio::test]
-    async fn past_the_limit_stdout_gives_up_only_the_lines_it_can_read_without_waiting() {
-        use tokio::io::AsyncBufReadExt as _;
-        use tokio::io::AsyncWriteExt as _;
-
-        let (mut agy, adapter_end) = tokio::io::duplex(1024);
-        agy.write_all(b"init\nresult\n").await.unwrap();
-        let mut lines = tokio::io::BufReader::new(adapter_end).lines();
+        finish_stderr(&mut task, &stderr, limit, Uuid::now_v7(), Uuid::now_v7()).await;
         assert_eq!(
-            read_stdout(&mut lines, true).await,
-            StdoutRead::Line("init".to_owned())
+            tail.lock().unwrap().iter().collect::<Vec<_>>(),
+            ["Warning: conversation \"x\" not found.", "Error: boom"]
         );
-        assert_eq!(
-            read_stdout(&mut lines, true).await,
-            StdoutRead::Line("result".to_owned())
-        );
-        assert_eq!(
-            read_stdout(&mut lines, true).await,
-            StdoutRead::WouldBlock,
-            "the pipe is still open, held by whatever agy left behind"
-        );
-        drop(agy);
-        assert_eq!(read_stdout(&mut lines, true).await, StdoutRead::Ended);
+        assert_eq!(signals.first_error().as_deref(), Some("Error: boom"));
     }
 
     struct DrainTestState {

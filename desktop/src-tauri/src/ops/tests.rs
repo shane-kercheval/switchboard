@@ -4404,6 +4404,90 @@ fn a_busy_forward_gives_each_source_the_wait_that_fits_it() {
 }
 
 #[tokio::test]
+async fn a_timed_out_forward_still_asks_every_source_when_one_cannot_answer() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b", "reader"]);
+    let (a, b, reader) = (agents[0], agents[1], agents[2]);
+    let mut script = Script::reply("the build passed");
+    script.key = Some("m-go".to_owned());
+    let finished = send_from_the_window(&env, project_id, b, "go", script).await;
+    assert!(wait_done(&env, project_id, finished).await.done);
+    let gate = Arc::new(Notify::new());
+    let starting = send_from_the_window_and_hold_its_start(&env, project_id, a, &gate).await;
+
+    // a's start-up stays held for the whole forward, so a never answers
+    // whether it still holds work for its send; b is idle, its reply done.
+    let forwarded = forward(
+        env.handle(),
+        env.home(),
+        forward_to(
+            project_id,
+            vec![
+                named_reply(project_id, a, starting),
+                named_reply(project_id, b, finished),
+            ],
+            reader,
+            None,
+        ),
+        WaitBudget::new(Some(1), false),
+    )
+    .await;
+    gate.notify_one();
+    let err = forwarded.expect_err("the forward is refused");
+    assert!(
+        matches!(err.root(), AppError::SourceBusy { name, replies }
+            if name.is_empty() && *replies == vec![BusyReply { name: "a".to_owned(), send_id: starting }]),
+        "busy, naming only the reply whose turn is starting: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_timed_out_forward_leaves_out_a_held_reply_whose_agent_is_winding_down() {
+    let (env, project_id, agents) = project_with_agents(&["a", "lead", "reader"]);
+    let (a, lead, reader) = (agents[0], agents[1], agents[2]);
+    let (drain, gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    env.adapter
+        .push_for(a, Script::reply("the build passed").draining(&drain));
+    let held = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![a], "go"),
+    )
+    .await
+    .unwrap()
+    .send_id;
+    await_recipient_status(&env, held, a, SendStatus::Completed).await;
+    assert!(
+        env.state.dispatcher.has_work_for_send(a, held).await,
+        "a's turn for the send is still winding down"
+    );
+    send_from_the_window_and_hold(&env, project_id, lead, "go", &gate).await;
+
+    let forwarded = forward(
+        env.handle(),
+        env.home(),
+        forward_to(
+            project_id,
+            vec![
+                named_reply(project_id, a, held),
+                latest_answer(project_id, lead),
+            ],
+            reader,
+            None,
+        ),
+        WaitBudget::new(Some(1), false),
+    )
+    .await;
+    gate.notify_one();
+    drain.notify_one();
+    let err = forwarded.expect_err("the forward is refused");
+    assert!(
+        matches!(err.root(), AppError::SourceBusy { name, replies }
+            if name == "lead" && replies.is_empty()),
+        "busy, naming only the source still mid-turn: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_forward_during_a_start_up_that_fails_reports_the_failure() {
     let (env, project_id, agents) = project_with_agents(&["a", "reader"]);
     let (a, reader) = (agents[0], agents[1]);
@@ -10610,6 +10694,57 @@ async fn read_workflow_run_reports_a_failed_steps_reply_as_failed() {
     assert!(run.reason.is_some());
     assert_eq!(run.sends.len(), 1, "the reviewers were never sent to");
     assert_eq!(run.sends[0].recipients[0].reply.status, SendStatus::Failed);
+}
+
+#[tokio::test]
+async fn read_workflow_run_stops_on_cancel_while_a_recipient_cannot_answer() {
+    let (env, project_id, agents) = workflow_env().await;
+    for (agent, text) in agents
+        .iter()
+        .zip(["greeting", "first review", "second review"])
+    {
+        env.adapter.push_for(*agent, Script::reply(text));
+    }
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    // Read from the journal, the coder's reply asks its actor whether it
+    // still holds work for the send; the seam holds that question unanswered,
+    // as an actor starting a turn leaves it.
+    let greeting = workflow_sends(&env, project_id, run_id, 2).await[0];
+    env.state.ledger.forget_send(greeting);
+    let question = env.seam(TestSeam::WorkQuestion);
+    let (home, cancel) = (env.home(), CancellationToken::new());
+
+    let read = tokio::time::timeout(
+        Duration::from_secs(10),
+        read_workflow_run(&env.state, project_id, run_id, &home, &cancel),
+    );
+    let stop = async {
+        tokio::time::timeout(Duration::from_secs(10), question.entered.notified())
+            .await
+            .expect("the read asks the coder's actor about its reply");
+        cancel.cancel();
+    };
+    let (read, ()) = tokio::join!(read, stop);
+    env.clear_seam(TestSeam::WorkQuestion);
+    assert!(
+        matches!(read, Ok(Err(AppError::Interrupted))),
+        "the read ends on the server's stop: {read:?}"
+    );
 }
 
 #[tokio::test]

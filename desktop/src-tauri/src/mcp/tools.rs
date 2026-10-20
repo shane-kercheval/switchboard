@@ -452,9 +452,9 @@ tools! {
              and nothing is sent: call wait_agent on the source, then retry. A source whose \
              latest turn failed or was cancelled is still forwarded, as a note saying so in \
              place of an answer: check a source's status first. A source with send_id sends its \
-             reply to that send instead, verbatim, whatever the agent has said since, and never \
-             waits: a reply still to be sent, waiting in line, or running refuses the forward \
-             at once (source_busy: wait_send on that send, then retry); one that failed, was \
+             reply to that send instead, verbatim, whatever the agent has said since: a reply \
+             still to be sent, waiting in line, or running refuses the forward (source_busy: \
+             wait_send on that send, then retry); one that failed, was \
              cancelled, or never reached the agent refuses it (invalid_argument), as does one \
              Switchboard cannot tie to the send (the app may have restarted, or it cannot \
              tell which turn answered, as for an Antigravity reply to a message the user \

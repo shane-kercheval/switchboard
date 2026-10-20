@@ -808,7 +808,9 @@ fn first_refusal(refusals: Vec<(AgentId, AppError)>, roster: &[AgentRecord]) -> 
 /// deadline the resolver's future is dropped, which releases its hold (its
 /// guard removes the cancel token), so nothing is left registered. A source
 /// that names a reply is read first ([`named_reply`]) and handed to the
-/// resolver as settled text, so it never waits.
+/// resolver as settled text: reading its status may wait while its agent
+/// starts a turn, within the call's budget, but a reply still to finish is
+/// refused, never waited for.
 async fn compose_forward(
     state: &AppState,
     home_dir: &Path,
@@ -975,18 +977,28 @@ async fn named_reply(
 /// busy would send the caller to wait on idle agents. A source forwarded by
 /// its latest answer is running while its agent has a turn running; one named
 /// by its send only while the agent still holds work for that send, so a
-/// later message on the agent does not make a finished named reply busy.
-/// Asked within the call's finishing allowance; a source that cannot answer
-/// in it is starting a turn, so it counts as running.
+/// later message on the agent does not make a finished named reply busy. A
+/// named reply the ledger holds is left out: it is read from the ledger
+/// without waiting, so it cannot be what held the compose up, though its agent
+/// may still be winding the turn down. The sources are asked together, each
+/// within the call's finishing allowance, so one that cannot answer does not
+/// use up the others' time; one that cannot answer in it is starting a turn,
+/// so it counts as running.
 async fn compose_timeout(
     state: &AppState,
     budget: &WaitBudget,
     sources: &[ForwardFrom],
 ) -> AppError {
-    let mut names = Vec::new();
-    let mut replies: Vec<BusyReply> = Vec::new();
-    for source in sources {
-        let running = match source.send_id {
+    let asked: Vec<&ForwardFrom> = sources
+        .iter()
+        .filter(|source| {
+            source
+                .send_id
+                .is_none_or(|send_id| held_send(state, source.project_id, send_id).is_none())
+        })
+        .collect();
+    let answers = futures::future::join_all(asked.iter().map(|source| async move {
+        match source.send_id {
             Some(send_id) => {
                 budget
                     .run_with_grace(state.dispatcher.has_work_for_send(source.agent_id, send_id))
@@ -1003,26 +1015,32 @@ async fn compose_timeout(
                     })
                     .await
             }
-        };
+        }
+    }))
+    .await;
+    let mut names = Vec::new();
+    let mut replies: Vec<BusyReply> = Vec::new();
+    for (source, running) in asked.into_iter().zip(answers) {
         let running = match running {
             Outcome::Done(running) => running,
             Outcome::Timeout | Outcome::Cancelled => true,
         };
-        if running {
-            let name = lock(&state.agents_by_id)
-                .get(&source.agent_id)
-                .map_or_else(|| source.agent_id.to_string(), |a| a.name.clone());
-            match source.send_id {
-                Some(send_id) => {
-                    let reply = BusyReply { name, send_id };
-                    if !replies.contains(&reply) {
-                        replies.push(reply);
-                    }
+        if !running {
+            continue;
+        }
+        let name = lock(&state.agents_by_id)
+            .get(&source.agent_id)
+            .map_or_else(|| source.agent_id.to_string(), |a| a.name.clone());
+        match source.send_id {
+            Some(send_id) => {
+                let reply = BusyReply { name, send_id };
+                if !replies.contains(&reply) {
+                    replies.push(reply);
                 }
-                None => {
-                    if !names.contains(&name) {
-                        names.push(name);
-                    }
+            }
+            None => {
+                if !names.contains(&name) {
+                    names.push(name);
                 }
             }
         }

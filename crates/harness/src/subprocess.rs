@@ -1359,13 +1359,23 @@ pub async fn drain_stderr_with_observer<F>(
     F: FnMut(&str) + Send,
 {
     if let Err(e) = drain_stderr_into_tail(stderr, tail, |line| {
-        tracing::debug!(agent_id = %agent_id, %turn_id, "{harness_name} stderr: {line}");
+        log_stderr_line(agent_id, turn_id, harness_name, line);
         observe(line);
     })
     .await
     {
-        tracing::warn!(agent_id = %agent_id, %turn_id, error = %e, "stderr read error");
+        log_stderr_read_error(agent_id, turn_id, &e);
     }
+}
+
+/// A turn's stderr line at `tracing::debug!`, so a `RUST_LOG=debug` run shows
+/// it inline with the rest of the trace.
+fn log_stderr_line(agent_id: AgentId, turn_id: TurnId, harness_name: &str, line: &str) {
+    tracing::debug!(agent_id = %agent_id, %turn_id, "{harness_name} stderr: {line}");
+}
+
+fn log_stderr_read_error(agent_id: AgentId, turn_id: TurnId, error: &std::io::Error) {
+    tracing::warn!(agent_id = %agent_id, %turn_id, error = %error, "stderr read error");
 }
 
 /// The stderr read loop itself, with **no per-turn identity attached**.
@@ -1406,21 +1416,248 @@ where
     let mut lines = tokio::io::BufReader::new(stderr).lines();
     loop {
         match lines.next_line().await {
-            Ok(Some(line)) => {
-                observe(&line);
-                if let Ok(mut buf) = tail.lock() {
-                    // Eviction policy: mirrored by the Antigravity adapter's
-                    // `stderr_of` test fixture. Changing it here means changing
-                    // it there, or its eviction guards test a stale model.
-                    if buf.len() >= STDERR_TAIL_CAPACITY {
-                        buf.pop_front();
-                    }
-                    buf.push_back(line);
-                }
-            }
+            Ok(Some(line)) => keep_stderr_line(&tail, line, &mut observe),
             Ok(None) => return Ok(()),
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// What every stderr drain does with a line it read: `observe` sees it, then
+/// the bounded tail keeps it.
+fn keep_stderr_line<F>(tail: &Mutex<VecDeque<String>>, line: String, observe: &mut F)
+where
+    F: FnMut(&str),
+{
+    observe(&line);
+    if let Ok(mut buf) = tail.lock() {
+        // Eviction policy: mirrored by the Antigravity adapter's
+        // `stderr_of` test fixture. Changing it here means changing
+        // it there, or its eviction guards test a stale model.
+        if buf.len() >= STDERR_TAIL_CAPACITY {
+            buf.pop_front();
+        }
+        buf.push_back(line);
+    }
+}
+
+/// A child's output pipe read a line at a time, which can also be read, as
+/// the pipe's last read, only as far as the kernel has data ready
+/// ([`Self::drain_ready`]).
+///
+/// A line loses its `\n` and a `\r` before it, and bytes that are not UTF-8
+/// are replaced rather than ending the read. A last line with no newline is
+/// returned when the pipe ends.
+pub struct PipeLines<R> {
+    reader: tokio::io::BufReader<R>,
+    /// The line being read. A read dropped part-way leaves what it took here
+    /// for the next.
+    line: Vec<u8>,
+}
+
+/// Why [`PipeLines::drain_ready`] stopped.
+#[derive(Debug)]
+pub enum DrainEnd {
+    /// The pipe reached its end: nothing holds it open any more.
+    PipeEnded,
+    /// The pipe has nothing more ready, and something still holds it open.
+    WouldBlock,
+    /// The cap on bytes read was reached.
+    CapReached,
+    Failed(std::io::Error),
+}
+
+/// What [`PipeLines::drain_ready`] read.
+#[derive(Debug)]
+pub struct ReadyLines {
+    pub lines: Vec<String>,
+    pub end: DrainEnd,
+}
+
+/// A pipe [`PipeLines::drain_ready`] can ask the kernel about: on unix, one
+/// with a file descriptor. Elsewhere only what is already buffered is ready.
+#[cfg(unix)]
+pub trait ReadyPipe: std::os::fd::AsFd {}
+#[cfg(unix)]
+impl<T: std::os::fd::AsFd> ReadyPipe for T {}
+#[cfg(not(unix))]
+pub trait ReadyPipe {}
+#[cfg(not(unix))]
+impl<T> ReadyPipe for T {}
+
+impl<R> PipeLines<R>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    pub fn new(pipe: R) -> Self {
+        Self {
+            reader: tokio::io::BufReader::new(pipe),
+            line: Vec::new(),
+        }
+    }
+
+    /// The next line, or `None` at the end of the pipe. Cancel-safe: a read
+    /// dropped part-way loses nothing.
+    ///
+    /// # Errors
+    ///
+    /// A failed read. What it read of the line stays for the next call.
+    pub async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        let read = self.reader.read_until(b'\n', &mut self.line).await?;
+        if read == 0 && self.line.is_empty() {
+            return Ok(None);
+        }
+        let line = decode_line(&self.line);
+        self.line.clear();
+        Ok(Some(line))
+    }
+}
+
+impl<R> PipeLines<R>
+where
+    R: tokio::io::AsyncRead + ReadyPipe + Unpin,
+{
+    /// Every line ready now, without waiting: the line in progress and what
+    /// is buffered, then what the kernel holds for the pipe, read until it
+    /// has nothing more ready, the pipe ends, or `cap` bytes have been read
+    /// from it. Meant for a pipe whose writer has exited, so whatever it
+    /// wrote is in the pipe however late this gets to it: the kernel is
+    /// asked, not the runtime, which may not yet have seen the data arrive.
+    /// The pipe must be non-blocking, as Tokio's child pipes are.
+    ///
+    /// A last line with no newline is returned too, since nothing will
+    /// complete it, except when the cap cut it: it stays unreturned.
+    pub fn drain_ready(&mut self, cap: usize) -> ReadyLines {
+        let mut bytes = std::mem::take(&mut self.line);
+        let buffered = self.reader.buffer();
+        bytes.extend_from_slice(buffered);
+        let buffered = buffered.len();
+        tokio::io::AsyncBufRead::consume(std::pin::Pin::new(&mut self.reader), buffered);
+        #[cfg(unix)]
+        let end = read_ready(self.reader.get_ref(), &mut bytes, cap);
+        #[cfg(not(unix))]
+        let end = {
+            let _ = cap;
+            DrainEnd::WouldBlock
+        };
+        let mut lines = Vec::new();
+        let mut rest = bytes.as_slice();
+        while let Some(newline) = rest.iter().position(|&b| b == b'\n') {
+            lines.push(decode_line(&rest[..newline]));
+            rest = &rest[newline + 1..];
+        }
+        if matches!(end, DrainEnd::CapReached) {
+            self.line = rest.to_vec();
+        } else if !rest.is_empty() {
+            lines.push(decode_line(rest));
+        }
+        ReadyLines { lines, end }
+    }
+}
+
+/// Read from `pipe` into `bytes` without waiting, until it has nothing ready,
+/// ends, or `cap` bytes have been read. An interrupted read is retried.
+#[cfg(unix)]
+fn read_ready(pipe: impl std::os::fd::AsFd, bytes: &mut Vec<u8>, cap: usize) -> DrainEnd {
+    let mut chunk = [0u8; 8192];
+    let mut read = 0;
+    loop {
+        if read >= cap {
+            return DrainEnd::CapReached;
+        }
+        let want = chunk.len().min(cap - read);
+        match nix::unistd::read(pipe.as_fd(), &mut chunk[..want]) {
+            Ok(0) => return DrainEnd::PipeEnded,
+            Ok(n) => {
+                read += n;
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(nix::errno::Errno::EAGAIN) => return DrainEnd::WouldBlock,
+            Err(errno) => return DrainEnd::Failed(errno.into()),
+        }
+    }
+}
+
+/// A line's text: without its `\n` and a `\r` before it, invalid UTF-8
+/// replaced.
+fn decode_line(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// A turn's stderr, drained by a task the caller can stop and then finish
+/// itself: [`Self::run`] reads it as [`drain_stderr_with_observer`] does,
+/// through a [`PipeLines`] kept here, so stopping the task loses nothing it
+/// had read, and [`Self::drain_ready`] then takes what is left in the pipe
+/// without waiting. For a harness whose stderr a leftover process can hold
+/// open after the harness exits.
+pub struct StderrDrain<R> {
+    lines: tokio::sync::Mutex<PipeLines<R>>,
+    agent_id: AgentId,
+    turn_id: TurnId,
+    tail: Arc<Mutex<VecDeque<String>>>,
+    harness_name: &'static str,
+    observe: Box<dyn Fn(&str) + Send + Sync>,
+}
+
+impl<R> StderrDrain<R>
+where
+    R: tokio::io::AsyncRead + ReadyPipe + Unpin,
+{
+    pub fn new(
+        stderr: R,
+        agent_id: AgentId,
+        turn_id: TurnId,
+        tail: Arc<Mutex<VecDeque<String>>>,
+        harness_name: &'static str,
+        observe: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            lines: tokio::sync::Mutex::new(PipeLines::new(stderr)),
+            agent_id,
+            turn_id,
+            tail,
+            harness_name,
+            observe: Box::new(observe),
+        }
+    }
+
+    /// Read every line until the pipe ends or a read fails.
+    pub async fn run(&self) {
+        let mut lines = self.lines.lock().await;
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => self.keep(line),
+                Ok(None) => return,
+                Err(e) => {
+                    log_stderr_read_error(self.agent_id, self.turn_id, &e);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Once the task running [`Self::run`] has been stopped and joined, take
+    /// every line ready now ([`PipeLines::drain_ready`]), and say why reading
+    /// stopped.
+    pub async fn drain_ready(&self, cap: usize) -> DrainEnd {
+        let ready = self.lines.lock().await.drain_ready(cap);
+        for line in ready.lines {
+            self.keep(line);
+        }
+        if let DrainEnd::Failed(e) = &ready.end {
+            log_stderr_read_error(self.agent_id, self.turn_id, e);
+        }
+        ready.end
+    }
+
+    fn keep(&self, line: String) {
+        keep_stderr_line(&self.tail, line, &mut |line: &str| {
+            log_stderr_line(self.agent_id, self.turn_id, self.harness_name, line);
+            (self.observe)(line);
+        });
     }
 }
 
@@ -2551,5 +2788,134 @@ mod tests {
         assert_eq!(parse_cli_version("v1.2.3").as_deref(), Some("1.2.3"));
         assert_eq!(parse_cli_version(""), None);
         assert_eq!(parse_cli_version("no version here"), None);
+    }
+
+    /// A pipe read through [`PipeLines`], and its other end.
+    #[cfg(unix)]
+    fn pipe_lines() -> (
+        PipeLines<tokio::net::unix::pipe::Receiver>,
+        tokio::net::unix::pipe::Sender,
+    ) {
+        let (writer, reader) = tokio::net::unix::pipe::pipe().unwrap();
+        (PipeLines::new(reader), writer)
+    }
+
+    /// Write straight to the kernel, as a child process's write does, and
+    /// not through the runtime.
+    #[cfg(unix)]
+    fn write(writer: &tokio::net::unix::pipe::Sender, bytes: &[u8]) {
+        assert_eq!(nix::unistd::write(writer, bytes).unwrap(), bytes.len());
+    }
+
+    /// The case the post-exit read exists for: lines reached the pipe while
+    /// nothing let the runtime look at it, so to the runtime the pipe still
+    /// reads as empty. The kernel is asked, so they are read anyway.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_ready_reads_lines_that_reached_the_pipe_while_the_runtime_was_held() {
+        use futures::FutureExt as _;
+
+        let (mut lines, writer) = pipe_lines();
+        assert!(lines.next_line().now_or_never().is_none(), "nothing yet");
+        write(&writer, b"init\nresult\n");
+        assert!(
+            lines.next_line().now_or_never().is_none(),
+            "the runtime has not seen the lines arrive"
+        );
+
+        let ready = lines.drain_ready(1 << 20);
+        assert_eq!(ready.lines, ["init", "result"]);
+        assert!(
+            matches!(ready.end, DrainEnd::WouldBlock),
+            "the writer still holds the pipe: {:?}",
+            ready.end
+        );
+    }
+
+    /// Read from a file, which has no writer to keep it open, because a pipe
+    /// this test closed can still be held by a process another test starts
+    /// at the same moment: macOS marks a new pipe close-on-exec only after
+    /// creating it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_ready_says_when_what_it_reads_has_ended() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, b"init\nresult").unwrap();
+        let mut lines = PipeLines::new(tokio::fs::File::open(&path).await.unwrap());
+
+        let ready = lines.drain_ready(1 << 20);
+        assert_eq!(ready.lines, ["init", "result"]);
+        assert!(matches!(ready.end, DrainEnd::PipeEnded), "{:?}", ready.end);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_ready_returns_a_line_already_buffered_before_it() {
+        let (mut lines, writer) = pipe_lines();
+        write(&writer, b"init\nresult\n");
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("init"));
+
+        // `result` is out of the kernel's pipe, in the reader's buffer.
+        let ready = lines.drain_ready(1 << 20);
+        assert_eq!(ready.lines, ["result"]);
+        assert!(matches!(ready.end, DrainEnd::WouldBlock), "{:?}", ready.end);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_line_begun_before_the_limit_is_completed_past_it() {
+        let (mut lines, writer) = pipe_lines();
+        write(&writer, b"{\"type\":\"res");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), lines.next_line())
+                .await
+                .is_err(),
+            "the line is not finished"
+        );
+        assert_eq!(
+            lines.line, b"{\"type\":\"res",
+            "the dropped read kept what it took"
+        );
+
+        write(&writer, b"ult\"}\nlast");
+        let ready = lines.drain_ready(1 << 20);
+        assert_eq!(
+            ready.lines,
+            ["{\"type\":\"result\"}", "last"],
+            "the record whole, then a last line no newline will finish"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_ready_stops_at_the_cap_counting_only_what_it_reads_itself() {
+        let (mut lines, writer) = pipe_lines();
+        write(&writer, b"first\na buffered line longer than the cap\n");
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("first"));
+        write(&writer, b"aaaa\nbbbbbbbbbbbb\ncc\n");
+
+        let ready = lines.drain_ready(8);
+        assert!(
+            matches!(ready.end, DrainEnd::CapReached),
+            "eight bytes were read from the pipe, and more were ready: {:?}",
+            ready.end
+        );
+        assert_eq!(
+            ready.lines,
+            ["a buffered line longer than the cap", "aaaa"],
+            "the buffered line counts for nothing against the cap, and the \
+             line the cap cut is not returned as if whole"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipe_lines_strip_carriage_returns_replace_bad_bytes_and_keep_a_last_line() {
+        let mut lines = PipeLines::new(&b"crlf\r\nbad \xff byte\ntail"[..]);
+        let mut read = Vec::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            read.push(line);
+        }
+        assert_eq!(read, ["crlf", "bad \u{FFFD} byte", "tail"]);
     }
 }

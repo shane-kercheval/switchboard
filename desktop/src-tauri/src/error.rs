@@ -178,11 +178,13 @@ pub enum AppError {
 
     /// A forward named a source's reply by `send_id` while that reply is
     /// still to be sent, waiting in line, or running. A named reply is never
-    /// waited for, so nothing was sent. Each of these states arises for a send
-    /// Switchboard follows live, and `running` also for a message the window
-    /// sent while its agent's turn for it is starting, open, or winding down;
-    /// `wait_send` follows either to its end, while `wait_agent` would return
-    /// at once for an agent the send has not reached.
+    /// waited for, so nothing was sent; reading its status may wait while its
+    /// agent starts a turn, within the call's budget. Each of these states
+    /// arises for a send Switchboard follows live, and `running` also for a
+    /// message the window sent while its agent's turn for it is starting,
+    /// open, or winding down; `wait_send` follows either to its end, while
+    /// `wait_agent` would return at once for an agent the send has not
+    /// reached.
     #[error(
         "{name}'s reply to send {send_id} is still {state}, so nothing was sent: wait for that send with wait_send, then forward again"
     )]

@@ -51,12 +51,14 @@
 //!                                    //   cancellation test can fire the token while
 //!                                    //   the adapter is still polling. Stays killable.
 //!   "exit_delay_ms": 0,              // optional: wait this long after writing, then exit
+//!   "pid_file_self": "<path>",       // optional: this process's own pid is written here
 //!   "leftover": {                    // optional: first start a `sleep` that outlives
 //!     "seconds": 8,                  //   this process holding its outputs, as a
 //!     "holds": "both",               //   background command agy started might:
 //!     "own_group": false,            //   "both", "stdout" or "stderr"; own_group puts
-//!     "pid_file": "<path>"           //   it in a process group of its own; its pid is
-//!   }                                //   written to pid_file
+//!     "ignore_term": false,          //   it in a process group of its own; ignore_term
+//!     "pid_file": "<path>"           //   makes it ignore SIGTERM; its pid is written to
+//!   }                                //   pid_file once it is set up
 //! }
 //! ```
 //!
@@ -138,6 +140,10 @@ struct Script {
     /// Wait this long after writing everything, then exit.
     #[serde(default)]
     exit_delay_ms: u64,
+    /// Where this process writes its own pid, so a test can tell when the
+    /// adapter has reaped it.
+    #[serde(default)]
+    pid_file_self: Option<String>,
     /// A process to start before anything is written, which outlives this one
     /// and keeps its output pipes open.
     #[serde(default)]
@@ -154,7 +160,12 @@ struct Leftover {
     /// this process's group.
     #[serde(default)]
     own_group: bool,
+    /// Ignore SIGTERM, so only a SIGKILL ends it.
+    #[serde(default)]
+    ignore_term: bool,
     /// Where its pid is written, so a test can check on it and clean it up.
+    /// With `ignore_term` the leftover writes it itself once SIGTERM is
+    /// ignored, so a test can wait for that.
     pid_file: String,
 }
 
@@ -165,10 +176,23 @@ struct Leftover {
     reason = "the leftover is meant to outlive this process, which exits without waiting for it"
 )]
 fn start_leftover(leftover: &Leftover) {
-    let mut command = std::process::Command::new("sleep");
-    command
-        .arg(leftover.seconds.to_string())
-        .stdin(Stdio::null());
+    let seconds = leftover.seconds.to_string();
+    let mut command = if leftover.ignore_term {
+        // An ignored signal stays ignored across `exec`.
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            r#"trap "" TERM; echo $$ > "$0.tmp" && mv "$0.tmp" "$0"; exec sleep "$1""#,
+            leftover.pid_file.as_str(),
+            seconds.as_str(),
+        ]);
+        command
+    } else {
+        let mut command = std::process::Command::new("sleep");
+        command.arg(&seconds);
+        command
+    };
+    command.stdin(Stdio::null());
     if leftover.holds == "stderr" {
         command.stdout(Stdio::null());
     }
@@ -183,7 +207,18 @@ fn start_leftover(leftover: &Leftover) {
         eprintln!("fake_agy: cannot start the leftover: {e}");
         std::process::exit(1);
     });
-    let _ = std::fs::write(&leftover.pid_file, child.id().to_string());
+    if !leftover.ignore_term {
+        write_pid(&leftover.pid_file, child.id());
+    }
+}
+
+/// Write `pid` to `path` whole, so a reader polling for the file never sees
+/// it half-written.
+fn write_pid(path: &str, pid: u32) {
+    let partial = format!("{path}.tmp");
+    if std::fs::write(&partial, pid.to_string()).is_ok() {
+        let _ = std::fs::rename(&partial, path);
+    }
 }
 
 #[derive(Deserialize)]
@@ -262,6 +297,9 @@ fn main() {
         let _ = writeln!(f, "{}", args[1..].join(" "));
     }
 
+    if let Some(path) = &script.pid_file_self {
+        write_pid(path, std::process::id());
+    }
     if let Some(leftover) = &script.leftover {
         start_leftover(leftover);
     }

@@ -328,8 +328,7 @@ pub async fn read_conversation(
 }
 
 /// The sends whose turns are running, as `(send, agent)`, from the ledger's
-/// open turns at two readings: one taken before the session files are read
-/// and one after.
+/// open turns, read before the session files are read and again after.
 ///
 /// **Why the ledger decides, not the file.** A session file read while its
 /// turn runs holds part of that turn, and the harness's parser can only guess
@@ -340,9 +339,12 @@ pub async fn read_conversation(
 /// on the agent's channel, the window's sends included. It is asked rather
 /// than the agent's actor, which cannot answer while it prepares a turn.
 ///
-/// **Why two readings.** A turn that ends during the read was running when
-/// its file was read, so the copy may be partial; a turn that starts during
-/// it may already be on disk.
+/// **The reading before does the work.** A turn that ends during the read was
+/// running when its file was read, so its copy may be partial, and only the
+/// reading taken first still holds it open. The reading after helps only in a
+/// window of microseconds: the journal is read before the session files, so a
+/// turn that starts during the read is paired with its send only when the
+/// actor journaled the send just before that journal read.
 fn running_sends(open_turns: impl IntoIterator<Item = (AgentId, SendId)>) -> HashSet<SendTo> {
     open_turns
         .into_iter()
@@ -359,7 +361,9 @@ fn answering(readings: [Option<SendId>; 2], send_id: SendId) -> bool {
 /// A running turn is reported `running`, with no reason, whatever its partial
 /// copy on disk says ([`running_sends`]), and so is every later turn of the
 /// same agent: a compaction part-way through a turn splits it on disk, and
-/// only the first piece carries the send.
+/// only the first piece carries the send. A journaled failure or cancellation
+/// wins over the ledger's reading, because it proves the turn ended: one that
+/// ends after the reading is reported as it ended, as `read_reply` reports it.
 fn digest(
     conversation: ProjectConversation,
     roster: &[AgentRecord],
@@ -394,15 +398,16 @@ fn digest(
                 started_at,
                 ..
             } => {
-                if send_id.is_some_and(|s| running.contains(&(s, agent_id))) {
+                let outcome = send_id.and_then(|s| outcomes.get(&(s, agent_id)));
+                if outcome.is_none() && send_id.is_some_and(|s| running.contains(&(s, agent_id))) {
                     still_answering.insert(agent_id);
                 }
-                let (status, reason, failure_kind) = if still_answering.contains(&agent_id) {
-                    (DigestTurnStatus::Running, None, None)
-                } else {
-                    let outcome = send_id.and_then(|s| outcomes.get(&(s, agent_id)));
-                    turn_status(status, outcome)
-                };
+                let (status, reason, failure_kind) =
+                    if outcome.is_none() && still_answering.contains(&agent_id) {
+                        (DigestTurnStatus::Running, None, None)
+                    } else {
+                        turn_status(status, outcome)
+                    };
                 Some(DigestItem::AgentTurn {
                     agent_id,
                     send_id,
@@ -635,7 +640,7 @@ pub async fn read_reply(
     // at all still pages (empty) rather than reading as unknown.
     let status = match (live_status, view.outcomes.get(&send_id), turn) {
         (Some(status), _, _) => status,
-        (None, None, _) if running && (turn.is_some() || journaled) => SendStatus::Running,
+        (None, None, _) if running && journaled => SendStatus::Running,
         (None, Some((OutcomeStatus::Cancelled, _)), _) => SendStatus::Cancelled,
         (None, Some((OutcomeStatus::Failed, _)), _) => SendStatus::Failed,
         (None, None, Some(turn)) => match turn.status {

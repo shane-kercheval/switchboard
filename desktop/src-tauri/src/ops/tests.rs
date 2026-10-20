@@ -3516,12 +3516,12 @@ const CLAUDE_TEXT_FIRST: &str = include_str!(concat!(
 /// which the actor journals as the turn's link while the turn runs.
 const CLAUDE_TEXT_FIRST_KEY: &str = "msg_011Cfow1q6Z1NgSnAfjzZPfJ";
 
-/// The first `records` lines of a recorded session file, each whole, with
-/// every timestamp moved by one amount so the first falls at `start`: the file
-/// as its harness had written it part-way through a turn that started then.
-/// The merge pairs a session's prompt with a journaled send only when the
-/// prompt is no earlier than the project's first send, so a recording keeps
-/// its spacing but not its date.
+/// The first `records` lines of a recorded session file, each whole, stamped
+/// one millisecond apart from `start`: the file as its harness had written it
+/// part-way through a turn that started then. A recording keeps its order but
+/// not its times, because the merge pairs a session's prompt with a journaled
+/// send only when the prompt is no earlier than the project's first send, and
+/// keeps a reply's link only when the reply ends before the agent's next send.
 fn recorded_prefix(
     recording: &str,
     records: usize,
@@ -3532,23 +3532,40 @@ fn recorded_prefix(
         .take(records)
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    let recorded_start: chrono::DateTime<Utc> =
-        lines[0]["timestamp"].as_str().unwrap().parse().unwrap();
-    let shift = start - recorded_start;
-    for line in &mut lines {
+    for (index, line) in lines.iter_mut().enumerate() {
+        let at = start + chrono::Duration::milliseconds(i64::try_from(index).unwrap());
+        let stamp = serde_json::json!(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
         for pointer in ["/timestamp", "/payload/timestamp"] {
-            if let Some(stamp) = line.pointer_mut(pointer)
-                && let Some(at) = stamp
-                    .as_str()
-                    .and_then(|at| at.parse::<chrono::DateTime<Utc>>().ok())
+            if let Some(field) = line.pointer_mut(pointer)
+                && field.is_string()
             {
-                *stamp = serde_json::json!(
-                    (at + shift).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                );
+                *field = stamp.clone();
             }
         }
     }
     lines
+}
+
+/// The turn the actor journaled `send_id` under, and when: the moment the turn
+/// started. The actor writes the send's link and outcome under the same turn.
+fn journaled_turn(
+    env: &TestEnv,
+    project_id: ProjectId,
+    send_id: Uuid,
+) -> (Uuid, chrono::DateTime<Utc>) {
+    switchboard_core::journal::read_records(&env.journal_path(project_id))
+        .unwrap()
+        .into_iter()
+        .find_map(|record| match record {
+            JournalRecord::Send {
+                send_id: s,
+                turn_id,
+                at,
+                ..
+            } if s == send_id => Some((turn_id, at)),
+            _ => None,
+        })
+        .expect("the send is journaled")
 }
 
 /// The prompt the recorded Claude turn answers.
@@ -3802,7 +3819,15 @@ async fn a_running_send_with_nothing_on_disk_leaves_the_previous_turn_complete()
     .await
     .unwrap();
     wait_done(&env, project_id, first.send_id).await;
-    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 11, Utc::now()));
+    // The whole first reply, written during its own turn: from the moment its
+    // send was journaled, and over before the next send starts, as the
+    // dispatcher's one turn at a time makes it.
+    let (_, first_at) = journaled_turn(&env, project_id, first.send_id);
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 11, first_at));
+    let first_ends = first_at + chrono::Duration::milliseconds(10);
+    while Utc::now() <= first_ends {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     let gate = Arc::new(Notify::new());
     let second = send_from_the_window_and_hold(&env, project_id, agent, "again", &gate).await;
 
@@ -3816,6 +3841,17 @@ async fn a_running_send_with_nothing_on_disk_leaves_the_previous_turn_complete()
         )),
         "the running send is journaled: {conversation:?}"
     );
+    assert!(
+        conversation.items.iter().any(|item| matches!(
+            item,
+            DigestItem::AgentTurn {
+                send_id: Some(s),
+                send_correlation: Some(crate::commands::SendCorrelation::DurableLink),
+                ..
+            } if *s == first.send_id
+        )),
+        "the first reply is paired with its send by its link: {conversation:?}"
+    );
     assert_eq!(
         agent_turns(&env, project_id, agent).await,
         vec![(
@@ -3826,6 +3862,90 @@ async fn a_running_send_with_nothing_on_disk_leaves_the_previous_turn_complete()
         )],
         "the running send claims no earlier reply"
     );
+    let page = read_reply(
+        &env.state,
+        project_id,
+        second,
+        agent,
+        0,
+        ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (page.status, page.text.as_str()),
+        (SendStatus::Running, ""),
+        "a running send with nothing written yet"
+    );
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_reply_whose_failure_is_journaled_while_still_open_in_the_ledger_reads_as_failed() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, agents[0], "go", &gate).await;
+    env.append_claude_turn(project_id, agents[0], "go", "half a reply", "m-go");
+    journal_early_link(&env, project_id, agents[0], sent, "m-go");
+    // When the harness reports a turn failed, the actor journals the failure
+    // before the turn's end reaches the ledger, so a read can find the failure
+    // while the ledger still holds the turn open.
+    let (turn_id, started_at) = journaled_turn(&env, project_id, sent);
+    switchboard_core::journal::append_record(
+        &env.journal_path(project_id),
+        &JournalRecord::Outcome {
+            send_id: sent,
+            turn_id,
+            agent_id: agents[0],
+            outcome: serde_json::to_value(TurnOutcome::Failed {
+                kind: switchboard_harness::FailureKind::HarnessError,
+                message: "the harness gave up".to_owned(),
+            })
+            .unwrap(),
+            started_at,
+            ended_at: Utc::now(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        agent_turns(&env, project_id, agents[0]).await,
+        vec![(
+            Some(sent),
+            DigestTurnStatus::Failed,
+            Some("the harness gave up".to_owned()),
+            "half a reply".to_owned()
+        )]
+    );
+    let conversation = read_conversation(&env.state, project_id, None, &env.home())
+        .await
+        .unwrap();
+    assert!(
+        conversation.items.iter().any(|item| matches!(
+            item,
+            DigestItem::AgentTurn {
+                send_id: Some(s),
+                failure_kind: Some(kind),
+                ..
+            } if *s == sent && kind == "harness_error"
+        )),
+        "the failure keeps its kind: {conversation:?}"
+    );
+    let page = read_reply(
+        &env.state,
+        project_id,
+        sent,
+        agents[0],
+        0,
+        ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.status, SendStatus::Failed, "the reply reader agrees");
     gate.notify_one();
 }
 

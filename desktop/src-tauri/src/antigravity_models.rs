@@ -222,6 +222,7 @@ fn the_built_in_antigravity_defaults_name_only_models_in_the_table() {
 /// `agy models --output-format json` is a usage error.
 #[test]
 #[ignore = "requires antigravity installed — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 fn live_antigravity_model_table_matches_the_cli_model_list() {
     let output = Command::new("agy")
         .args(["--output-format", "json", "models"])

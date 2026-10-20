@@ -109,6 +109,8 @@ impl TranscriptRecord {
     ///   steps" fix is the likely origin): a rejected call as an ordinary
     ///   `MODEL` result with `status:"ERROR"` and the reason in `error`, e.g.
     ///   a missing-file `view_file` or a missing-target `replace_file_content`.
+    ///   1.4.3 writes the same shape when a renamed tool fails while running
+    ///   (a missing-file `read_file`: `error:"file does not exist"`).
     ///
     /// `status:"FAILED"` predates these captures and is kept. A command that
     /// ran and exited non-zero carries no structured signal in any version, so
@@ -156,7 +158,7 @@ impl TranscriptRecord {
 }
 
 /// The one tool whose results report an exit code. **Failed-command detection
-/// is tied to this name:** at agy 1.4.2 every result record has
+/// is tied to this name:** at agy 1.4.2 and 1.4.3 every result record has
 /// `type:"GENERIC"`, so only the paired call says a result came from a
 /// command. If `agy` renamed it, failed commands would read as successes again
 /// (`live_antigravity_failing_command_completes_as_tool_error` fails on that).
@@ -190,48 +192,74 @@ impl ResultFailure {
 
 /// Whether a command result's header says the command exited non-zero.
 ///
-/// **A substring match on `agy`'s prose**, because the record has no exit-code
-/// field and the stream reports a failed command as `DONE`. Two wordings are
-/// known, and both are read so older builds keep working:
+/// **A match on `agy`'s prose**, because no exit code exists on either
+/// channel: the record has no exit-code field, and the stream reports a failed
+/// command as `DONE` with the same prose in `tool_info.output` (both probed @
+/// 1.4.3). The wording has changed twice, and all three forms are read:
 ///
 /// - `The command failed with exit code: 127` (captured @ 1.1.2).
-/// - `The command exited with code 1.` (captured @ 1.4.2; every non-zero
-///   result on the developer's machine since 2026-08-24, agy 1.1.19, uses it).
-///   The same sentence with code 0 is a success.
+/// - `The command exited with code 1.`, then `Output:` (1.1.19 to 1.4.2, and
+///   still written @ 1.4.3 for a command run by a subagent).
+/// - `Command exited with code 1.`, then a blank line and `Command output:`
+///   (1.4.3).
 ///
-/// Only the header is scanned: the loop stops at the `Output:` marker, so a
-/// command that prints one of these sentences is not misread. And the result
-/// counts as failed only when its call is [`COMMAND_TOOL`] (see
+/// So the match is loose rather than a fixed sentence: a header line in which
+/// `exit` is later followed by `code`, an optional colon and an integer. A
+/// non-zero code is a failure and `0` a success. A code that does not parse is
+/// not called a failure, because guessing would mark successes as failed.
+///
+/// **Only the header is read**, so text a command prints is never taken for
+/// its exit status. The header ends at the first line that is only words and a
+/// colon, the form of every heading `agy` puts before a command's output
+/// (`Output:`, `Stdout:`, `Command output:`, and `Output snapshot:` for a
+/// background command). A fixed list of headings stopped working when 1.4.3
+/// renamed `Output:`. The lines before the exit line @ 1.4.3 are `Created At:
+/// <time>` and `Completed At: <time>`, which carry text after the colon and so
+/// never end the header early.
+///
+/// The result counts as failed only when its call is [`COMMAND_TOOL`] (see
 /// [`ResultFailure::is_error_for`]), so a web page or MCP reply that quotes the
-/// sentence is not misread either. A third rewording would read as success
-/// again; `live_antigravity_failing_command_completes_as_tool_error` is the
-/// guard.
+/// sentence is not misread either. A rewording this match misses reads as
+/// success again; `live_antigravity_failing_command_completes_as_tool_error`
+/// is the guard.
 fn header_reports_nonzero_exit(content: &str) -> bool {
     for line in content.lines() {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if matches!(lower.as_str(), "output:" | "stdout:" | "stderr:") {
+        let line = line.trim();
+        if is_output_heading(line) {
             break;
         }
-        if lower.starts_with("the command failed with exit code:") {
-            return true;
-        }
-        if let Some(rest) = lower.strip_prefix("the command exited with code ") {
-            return exit_code_is_nonzero(rest);
+        if let Some(code) = reported_exit_code(line) {
+            return code != 0;
         }
     }
     false
 }
 
-/// Reads the exit code at the start of `rest` (`"1."` → 1). A code that does
-/// not parse is not called a failure: the sentence was recognized but its
-/// number was not, and guessing would mark successes as failed.
-fn exit_code_is_nonzero(rest: &str) -> bool {
-    let code: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '-')
-        .collect();
-    code.parse::<i64>().is_ok_and(|code| code != 0)
+/// A line that is only words followed by a colon, such as `Command output:`.
+fn is_output_heading(line: &str) -> bool {
+    line.strip_suffix(':').is_some_and(|words| {
+        !words.trim().is_empty() && words.chars().all(|c| c.is_ascii_alphabetic() || c == ' ')
+    })
+}
+
+/// The exit code a header line reports: `exit` (as in `exited`), later
+/// `code`, then an optional colon and an integer (`… exited with code 1.` → 1,
+/// `… exit code: 127` → 127). `None` when the line is not shaped that way or
+/// the code does not parse.
+fn reported_exit_code(line: &str) -> Option<i64> {
+    let lower = line.to_ascii_lowercase();
+    let after_exit = &lower[lower.find("exit")?..];
+    let after_code = &after_exit[after_exit.find("code")? + "code".len()..];
+    let after_code = after_code.trim_start();
+    let number = after_code
+        .strip_prefix(':')
+        .unwrap_or(after_code)
+        .trim_start();
+    let end = number
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && c == '-')))
+        .map_or(number.len(), |(i, _)| i);
+    number[..end].parse().ok()
 }
 
 /// Per-turn parser state. Tracks in-flight tool invocations and early tool
@@ -327,8 +355,9 @@ struct PendingToolResult {
 /// stream's per-tool message — it was never written to disk — so the reopen
 /// path shows this same text. Both paths referencing one constant is what keeps
 /// the two renderings of the same failure from drifting apart; do not author a
-/// second copy of this string.
-pub(crate) const MISSING_TOOL_RESULT_OUTPUT: &str =
+/// second copy of this string. Public so a live test can tell this authored
+/// line from a message `agy` wrote.
+pub const MISSING_TOOL_RESULT_OUTPUT: &str =
     "Antigravity did not record a result for this tool call.";
 
 impl AntigravityParserState {
@@ -1182,6 +1211,104 @@ mod tests {
             completions[0].2,
             "the buffered result is judged once its call is known"
         );
+    }
+
+    /// Captured @ agy 1.4.3 (2026-10-20, Gemini 4 Argon, the adapter's dispatch
+    /// flags, `live_antigravity_failing_command_completes_as_tool_error`):
+    /// the reworded exit line and the renamed `Command output:` heading.
+    const FAILED_COMMAND_1_4_3: [&str; 2] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-20T18:35:45Z","input_tokens":7824,"cache_read_tokens":0,"output_tokens":156,"tool_calls":[{"name":"run_command","args":{"CommandLine":"\"ls /var/folders/x3/bq9yxrhs4j99fm9xdclj38hw0000gn/T/agy-command-error-testIrcVYm/SWITCHBOARD_MISSING_DIR\"","WaitMsBeforeAsync":"5000","toolSummary":"\"List missing directory\""}}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-10-20T18:35:50Z","content":"Created At: 2026-10-20T13:35:50-05:00\nCompleted At: 2026-10-20T13:35:50-05:00\nCommand exited with code 1.\n\nCommand output:\nls: /var/folders/x3/bq9yxrhs4j99fm9xdclj38hw0000gn/T/agy-command-error-testIrcVYm/SWITCHBOARD_MISSING_DIR: No such file or directory\r\n"}"#,
+    ];
+
+    /// Captured @ agy 1.4.3 (2026-10-20, Gemini 4 Argon,
+    /// `live_antigravity_run_command_emits_shell_facet`): a success writes the
+    /// same line with code 0.
+    const SUCCEEDED_COMMAND_1_4_3: [&str; 2] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-20T18:33:44Z","input_tokens":7738,"cache_read_tokens":0,"output_tokens":77,"tool_calls":[{"name":"run_command","args":{"CommandLine":"\"echo switchboard-facet-probe\"","WaitMsBeforeAsync":"5000","toolSummary":"\"Run echo switchboard-facet-probe\""}}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-10-20T18:33:50Z","content":"Created At: 2026-10-20T13:33:50-05:00\nCompleted At: 2026-10-20T13:33:50-05:00\nCommand exited with code 0.\n\nCommand output:\nswitchboard-facet-probe\r\n"}"#,
+    ];
+
+    #[test]
+    fn a_1_4_3_command_that_exited_non_zero_completes_as_failed() {
+        let mut state = AntigravityParserState::default();
+        let completions = completions_of(&FAILED_COMMAND_1_4_3, &mut state);
+
+        assert_eq!(completions.len(), 1, "{completions:?}");
+        let (id, output, is_error) = &completions[0];
+        assert_eq!(id, "1:0:run_command");
+        assert!(*is_error, "`Command exited with code 1.` is a failure");
+        assert!(output.contains("No such file or directory"));
+    }
+
+    #[test]
+    fn a_1_4_3_command_that_exited_zero_completes_as_succeeded() {
+        let mut state = AntigravityParserState::default();
+        let completions = completions_of(&SUCCEEDED_COMMAND_1_4_3, &mut state);
+
+        assert_eq!(completions.len(), 1, "{completions:?}");
+        assert_eq!(completions[0].0, "1:0:run_command");
+        assert!(!completions[0].2, "{completions:?}");
+    }
+
+    /// Each heading `agy` has put before a command's output ends the header,
+    /// so an exit sentence the command printed is not read as its status.
+    /// `Output snapshot:` is the background-command heading in `agy`'s 1.4.3
+    /// output template (`Background command ID: <id>` above it, no exit line).
+    #[test]
+    fn an_exit_sentence_after_any_output_heading_is_not_the_header() {
+        for heading in ["Output:", "Stdout:", "Command output:", "Output snapshot:"] {
+            for printed in [
+                "Command exited with code 1.",
+                "The command exited with code 1.",
+            ] {
+                let content = format!(
+                    "Created At: 2026-10-20T13:35:50-05:00\nCompleted At: 2026-10-20T13:35:50-05:00\n\n{heading}\n{printed}\n"
+                );
+                assert!(
+                    !header_reports_nonzero_exit(&content),
+                    "{heading} then {printed}"
+                );
+            }
+        }
+        assert!(!header_reports_nonzero_exit(
+            "Background command ID: 7d1c\nOutput snapshot:\nCommand exited with code 1.\n"
+        ));
+    }
+
+    /// The 1.4.3 header lines before the exit line carry text after their
+    /// colon, so they do not end the header; neither does the line `agy`'s
+    /// template writes when the user edited the command before it ran.
+    #[test]
+    fn header_lines_with_text_after_the_colon_do_not_end_the_header() {
+        assert!(header_reports_nonzero_exit(
+            "Created At: 2026-10-20T13:35:50-05:00\nCompleted At: 2026-10-20T13:35:50-05:00\nCommand exited with code 1.\n\nCommand output:\n"
+        ));
+        assert!(header_reports_nonzero_exit(
+            "The user changed the command to be run to: ls -la\nThe command exited with code 2.\nOutput:\n"
+        ));
+    }
+
+    /// Every known wording, plus small rewordings the loose match is meant to
+    /// survive (hypothetical: not seen from any `agy` build).
+    #[test]
+    fn each_wording_of_the_exit_line_is_read() {
+        for (line, failed) in [
+            ("The command failed with exit code: 127", true),
+            ("The command exited with code 1.", true),
+            ("The command exited with code 0.", false),
+            ("Command exited with code 1.", true),
+            ("Command exited with code 0.", false),
+            ("Exit code: 3", true),
+            ("Command exited with code 1 after 2s.", true),
+            ("command exited with exit code 0", false),
+        ] {
+            assert_eq!(
+                header_reports_nonzero_exit(&format!("{line}\nCommand output:\n")),
+                failed,
+                "{line}"
+            );
+        }
     }
 
     #[test]

@@ -11,6 +11,12 @@
 //! full structured vocabulary with content and absolute paths, superseding
 //! the older shell-only capture.
 //!
+//! agy 1.4.3 renamed the file tools a main-conversation model calls, with new
+//! argument names: `read_file {Path}`, `edit_file {Path, Target,
+//! Replacement}`, `write_file {Path, Content}` (probed on Gemini 4 Argon,
+//! Gemini 3.8 Flash and Claude Sonnet 5.5; no changelog entry). A subagent's
+//! calls still use the 1.0.16 names, so both sets are classified.
+//!
 //! MCP calls were re-probed read-only @ agy 1.1.2 on 2026-07-14. The
 //! transcript records the raw dispatcher name `call_mcp_tool` with encoded
 //! `ServerName`, `ToolName`, and `Arguments` fields rather than exposing the
@@ -106,45 +112,27 @@ fn classify_antigravity_tool_facet_with_encoding(
             },
             None => ToolFacet::Other,
         },
-        "view_file" => match arg_str(args, "AbsolutePath", encoding) {
-            Some(path) => ToolFacet::Read { path },
-            None => ToolFacet::Other,
-        },
-        "replace_file_content" => {
-            let (Some(path), Some(old), Some(new)) = (
-                arg_str(args, "TargetFile", encoding),
-                content_arg(args, "TargetContent", encoding),
-                content_arg(args, "ReplacementContent", encoding),
-            ) else {
-                return ToolFacet::Other;
-            };
-            let source_truncated = old.source_truncated || new.source_truncated;
-            let (old, t1) = cap_content(&old.value);
-            let (new, t2) = cap_content(&new.value);
-            ToolFacet::Edit {
-                files: vec![EditedFile {
-                    path,
-                    change: EditChange::Modified,
-                    edits: vec![EditPair { old, new }],
-                    truncated: source_truncated || t1 || t2,
-                    moved_to: None,
-                }],
-            }
+        "view_file" => read_facet(args, "AbsolutePath", encoding),
+        "replace_file_content" => edit_facet(
+            args,
+            ["TargetFile", "TargetContent", "ReplacementContent"],
+            encoding,
+        ),
+        "write_to_file" => write_facet(args, ["TargetFile", "CodeContent"], encoding),
+        // The 1.4.3 names. Main-conversation models call these, while a
+        // subagent's calls still use the names above, so both sets stay.
+        "read_file" => read_facet(args, "Path", encoding),
+        // `edit_file` also accepts `Edits`, a list of `{Target, Replacement}`
+        // pairs, per its tool description in the 1.4.3 binary. No model was
+        // seen to send it, so its encoding is unverified: a call carrying it
+        // renders through the generic row rather than as a diff drawn from a
+        // guessed shape. `AllowMultiple` is ignored, as for
+        // `replace_file_content`: a single pair already replaces every
+        // occurrence (probed @ 1.4.3), and the diff shows the pair either way.
+        "edit_file" if args.get("Edits").is_none() => {
+            edit_facet(args, ["Path", "Target", "Replacement"], encoding)
         }
-        "write_to_file" => {
-            let (Some(path), Some(content)) = (
-                arg_str(args, "TargetFile", encoding),
-                content_arg(args, "CodeContent", encoding),
-            ) else {
-                return ToolFacet::Other;
-            };
-            let (content_value, truncated) = cap_content(&content.value);
-            ToolFacet::Write {
-                path,
-                content: content_value,
-                truncated: content.source_truncated || truncated,
-            }
-        }
+        "write_file" => write_facet(args, ["Path", "Content"], encoding),
         "grep_search" => match arg_str(args, "Query", encoding) {
             Some(pattern) => ToolFacet::Search {
                 pattern,
@@ -154,6 +142,54 @@ fn classify_antigravity_tool_facet_with_encoding(
         },
         // `list_dir` and anything unobserved render via the generic path.
         _ => ToolFacet::Other,
+    }
+}
+
+fn read_facet(args: &Value, path_key: &str, encoding: ArgumentEncoding) -> ToolFacet {
+    match arg_str(args, path_key, encoding) {
+        Some(path) => ToolFacet::Read { path },
+        None => ToolFacet::Other,
+    }
+}
+
+/// `[path, old text, new text]` argument names.
+fn edit_facet(args: &Value, keys: [&str; 3], encoding: ArgumentEncoding) -> ToolFacet {
+    let [path_key, old_key, new_key] = keys;
+    let (Some(path), Some(old), Some(new)) = (
+        arg_str(args, path_key, encoding),
+        content_arg(args, old_key, encoding),
+        content_arg(args, new_key, encoding),
+    ) else {
+        return ToolFacet::Other;
+    };
+    let source_truncated = old.source_truncated || new.source_truncated;
+    let (old, t1) = cap_content(&old.value);
+    let (new, t2) = cap_content(&new.value);
+    ToolFacet::Edit {
+        files: vec![EditedFile {
+            path,
+            change: EditChange::Modified,
+            edits: vec![EditPair { old, new }],
+            truncated: source_truncated || t1 || t2,
+            moved_to: None,
+        }],
+    }
+}
+
+/// `[path, content]` argument names.
+fn write_facet(args: &Value, keys: [&str; 2], encoding: ArgumentEncoding) -> ToolFacet {
+    let [path_key, content_key] = keys;
+    let (Some(path), Some(content)) = (
+        arg_str(args, path_key, encoding),
+        content_arg(args, content_key, encoding),
+    ) else {
+        return ToolFacet::Other;
+    };
+    let (content_value, truncated) = cap_content(&content.value);
+    ToolFacet::Write {
+        path,
+        content: content_value,
+        truncated: content.source_truncated || truncated,
     }
 }
 
@@ -515,6 +551,127 @@ mod tests {
         );
     }
 
+    // Argument shapes captured @ agy 1.4.3 (2026-10-20) from compact
+    // `transcript.jsonl` records; only the paths are neutralized.
+    #[test]
+    fn renamed_1_4_3_file_tools_map_like_their_old_names() {
+        assert_eq!(
+            classify_antigravity_tool_facet("read_file", &json!({"Path": "\"/tmp/f.txt\""})),
+            ToolFacet::Read {
+                path: "/tmp/f.txt".to_owned()
+            }
+        );
+        assert_eq!(
+            classify_antigravity_tool_facet(
+                "read_file",
+                &json!({"Path": "\"/tmp/f.txt\"", "StartLine": "1", "EndLine": "5"})
+            ),
+            ToolFacet::Read {
+                path: "/tmp/f.txt".to_owned()
+            }
+        );
+        assert_eq!(
+            classify_antigravity_tool_facet(
+                "edit_file",
+                &json!({"Path": "\"/tmp/f.txt\"", "Replacement": "\"ALPHA\\nBETA\"", "Target": "\"alpha\\nbeta\""})
+            ),
+            ToolFacet::Edit {
+                files: vec![EditedFile {
+                    path: "/tmp/f.txt".to_owned(),
+                    change: EditChange::Modified,
+                    edits: vec![EditPair {
+                        old: "alpha\nbeta".to_owned(),
+                        new: "ALPHA\nBETA".to_owned()
+                    }],
+                    truncated: false,
+                    moved_to: None,
+                }]
+            }
+        );
+        assert_eq!(
+            classify_antigravity_tool_facet(
+                "write_file",
+                &json!({"Content": "\"hi\"", "Path": "\"/tmp/a.txt\""})
+            ),
+            ToolFacet::Write {
+                path: "/tmp/a.txt".to_owned(),
+                content: "hi".to_owned(),
+                truncated: false
+            }
+        );
+    }
+
+    #[test]
+    fn renamed_1_4_3_file_tools_map_from_the_full_transcript() {
+        let native = |name: &str, args: Value| {
+            classify_antigravity_tool_with_encoding(name, &args, ArgumentEncoding::Native).1
+        };
+        assert_eq!(
+            native("read_file", json!({"Path": "/tmp/f.txt"})),
+            ToolFacet::Read {
+                path: "/tmp/f.txt".to_owned()
+            }
+        );
+        let ToolFacet::Edit { files } = native(
+            "edit_file",
+            json!({"Path": "/tmp/f.txt", "Replacement": "\"quoted\"", "Target": "alpha"}),
+        ) else {
+            panic!("expected Edit");
+        };
+        assert_eq!(files[0].edits[0].new, "\"quoted\"");
+        assert!(matches!(
+            native("write_file", json!({"Content": "hi", "Path": "/tmp/a.txt"})),
+            ToolFacet::Write { .. }
+        ));
+    }
+
+    /// `AllowMultiple` changes nothing the diff shows: one pair already
+    /// replaces every occurrence @ 1.4.3.
+    #[test]
+    fn an_edit_file_replacing_every_occurrence_still_draws_its_pair() {
+        let ToolFacet::Edit { files } = classify_antigravity_tool_facet(
+            "edit_file",
+            &json!({"Path": "\"/tmp/f.txt\"", "Target": "\"beta\"", "Replacement": "\"BETA\"", "AllowMultiple": "true"}),
+        ) else {
+            panic!("expected Edit");
+        };
+        assert_eq!(
+            files[0].edits,
+            vec![EditPair {
+                old: "beta".to_owned(),
+                new: "BETA".to_owned()
+            }]
+        );
+    }
+
+    /// `Edits` is described in the 1.4.3 binary but never observed, so a call
+    /// carrying it is not drawn as a diff in either encoding, even beside a
+    /// single pair.
+    #[test]
+    fn an_edit_file_with_an_edits_list_renders_generically() {
+        let edits = json!([{"Target": "alpha", "Replacement": "ALPHA"}, {"Target": "gamma", "Replacement": "GAMMA"}]);
+        for (args, encoding) in [
+            (
+                json!({"Path": "\"/tmp/f.txt\"", "Edits": edits.to_string()}),
+                ArgumentEncoding::CompactJsonStrings,
+            ),
+            (
+                json!({"Path": "/tmp/f.txt", "Edits": edits.clone()}),
+                ArgumentEncoding::Native,
+            ),
+            (
+                json!({"Path": "/tmp/f.txt", "Target": "alpha", "Replacement": "ALPHA", "Edits": edits.clone()}),
+                ArgumentEncoding::Native,
+            ),
+        ] {
+            assert_eq!(
+                classify_antigravity_tool_with_encoding("edit_file", &args, encoding).1,
+                ToolFacet::Other,
+                "{args}"
+            );
+        }
+    }
+
     #[test]
     fn list_dir_and_unknown_map_to_other() {
         assert_eq!(
@@ -544,6 +701,20 @@ mod tests {
             classify_antigravity_tool_facet("run_command", &Value::Null),
             ToolFacet::Other
         );
+        for (name, args) in [
+            ("read_file", json!({})),
+            (
+                "edit_file",
+                json!({"Path": "\"/tmp/a\"", "Target": "\"x\""}),
+            ),
+            ("write_file", json!({"Path": "\"/tmp/a\""})),
+        ] {
+            assert_eq!(
+                classify_antigravity_tool_facet(name, &args),
+                ToolFacet::Other,
+                "{name}"
+            );
+        }
     }
 
     // --- Fixture-driven coverage: recorded @ agy 1.0.16 (probe 2026-07-10) ---

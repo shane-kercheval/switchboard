@@ -512,6 +512,7 @@ async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
     // The full backend slice for Antigravity, exercising the capture→resume
     // path through the dispatcher: turn 1 captures the server-assigned UUID and
@@ -783,6 +784,7 @@ async fn live_codex_cancel_after_content_recovers_turn_identity() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_cancel_terminates_and_synthesizes_cancelled() {
     live_cancel_case(
         HarnessKind::Antigravity,
@@ -1106,6 +1108,7 @@ async fn live_codex_attachment_in_project_store_is_readable() {
 /// second `--add-dir` naming the staging directory.
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_attachment_in_project_store_is_readable() {
     live_attachment_case(
         HarnessKind::Antigravity,
@@ -1117,6 +1120,7 @@ async fn live_antigravity_attachment_in_project_store_is_readable() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_attachment_inside_cwd_is_readable() {
     live_attachment_case(
         HarnessKind::Antigravity,

@@ -769,6 +769,7 @@ fn assert_meta_structure(transcript: &switchboard_harness::LoadedTranscript) {
 /// silently reordered or merged history rather than an error.
 #[tokio::test]
 #[ignore = "requires agy installed — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_two_turns_hydrate_in_order() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let adapter = AntigravityAdapter::new();

@@ -3411,6 +3411,7 @@ fn antigravity_capture(events: &[AdapterEvent]) -> Option<Uuid> {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_basic_turn_completes() {
     // cwd is a tempdir so the sidecar lands in a clean location. Note: `agy`
     // also writes a `.antigravitycli/` dir into cwd as a side effect — fine
@@ -3508,6 +3509,7 @@ async fn live_antigravity_basic_turn_completes() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_cli_log_names_the_conversation() {
     // The adapter's PRIMARY conversation-id capture reads `agy`'s own
     // `--log-file` (a `Created conversation <uuid>` line) — deterministic and
@@ -3579,6 +3581,7 @@ async fn live_antigravity_cli_log_names_the_conversation() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_adversarial_prompt_still_completes() {
     // Guards the *fallback* capture's load-bearing assumption that `agy` echoes
     // the dispatched prompt verbatim into the transcript's `<USER_REQUEST>`
@@ -3637,6 +3640,7 @@ async fn live_antigravity_adversarial_prompt_still_completes() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_resume_reuses_session() {
     // Memorize-then-recall: proof that `--conversation <uuid>` (driven by the
     // registry-stored locator) restores the prior turn's server-side context.
@@ -3703,6 +3707,7 @@ async fn live_antigravity_resume_reuses_session() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_dash_leading_prompt_completes() {
     // Canary / drift tripwire: `agy` currently tolerates a `-`-leading `-p`
     // value (so the adapter passes the prompt unchanged), unlike claude/
@@ -3766,6 +3771,7 @@ async fn live_antigravity_dash_leading_prompt_completes() {
 /// `P + 1 + call_index` from a simple "next step" rule.
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_tool_result_steps_follow_the_call_index() {
     // Runs the scenario up to twice. See `MULTI_TOOL_PROMPT` for why one
     // attempt isn't enough and `is_benign_merge` for why the retry predicate
@@ -4042,6 +4048,7 @@ fn transcript_records(content: &str) -> impl Iterator<Item = serde_json::Value> 
 /// itself.
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_stream_json_init_and_result_shapes() {
     let tmp = tempfile::TempDir::new().unwrap();
     let log = tmp.path().join("agy.log");
@@ -4144,6 +4151,7 @@ async fn live_antigravity_stream_json_init_and_result_shapes() {
 /// model's exact words.
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_slash_and_flag_shaped_prompts_reach_the_model() {
     for prompt in [
         // Recognized command: bare `-p "/model"` prints a TSV row and mints no
@@ -4862,106 +4870,24 @@ async fn live_codex_compact_of_a_fork_keeps_its_inherited_context() {
     );
 }
 
-/// Restores `settings.json` from a byte-for-byte backup and deletes the backup
-/// on drop — covers normal completion AND assertion-panic unwinding. See the
-/// config-mutation protocol in `live_antigravity_model_change_announced_on_resume`.
-struct AntigravitySettingsGuard {
-    path: std::path::PathBuf,
-    backup: std::path::PathBuf,
-}
-
-impl Drop for AntigravitySettingsGuard {
-    fn drop(&mut self) {
-        if !self.backup.exists() {
-            return;
-        }
-        // Delete the backup ONLY after the restore is verified to have
-        // succeeded — otherwise a failed copy would leave settings.json mutated
-        // *and* destroy the pristine copy. On failure, keep the backup and shout
-        // both paths so the next run's self-heal (or the developer) can recover.
-        match std::fs::copy(&self.backup, &self.path) {
-            Ok(_) => {
-                let _ = std::fs::remove_file(&self.backup);
-            }
-            Err(e) => eprintln!(
-                "FAILED to restore {} from backup ({e}); backup KEPT at {} — \
-                 restore it manually (cp {} {}).",
-                self.path.display(),
-                self.backup.display(),
-                self.backup.display(),
-                self.path.display()
-            ),
-        }
-    }
-}
-
 #[tokio::test]
 #[ignore = "requires antigravity installed — run with: make test-live"]
-#[serial_test::serial]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_model_change_announced_on_resume() {
     // Antigravity's per-turn model history is a *carry-forward* of the
-    // `USER_SETTINGS_CHANGE` sentence, which `agy` emits only when the model
-    // changes. We can't set the model via a flag, so we change the **global**
-    // `~/.gemini/antigravity-cli/settings.json` `model` field between turns and
-    // assert our adapter's emitted per-turn model reflects the switch.
-    //
-    // Config-mutation safety protocol (this edits the real, harness-owned
-    // settings.json — the only workable home, since an isolated HOME re-prompts
-    // agy for OAuth): (1) byte-for-byte backup to a stable path; (2) self-heal —
-    // if the backup already exists from an interrupted run, restore from it and
-    // fail loud; (3) a `Drop` guard restores + deletes the backup on normal exit
-    // AND on assertion-panic unwind; (4) known gap — SIGKILL/crash bypasses Drop,
-    // but step 2 repairs on the next run and the pristine value survives in the
-    // backup; (5) `#[serial]` because the file is global. Mutating harness config
-    // *in a test* doesn't violate the production rule that the app never writes
-    // harness config — it's the only way to exercise the real contract.
-    let home = home_dir();
-    let settings = home.join(".gemini/antigravity-cli/settings.json");
-    let backup = home.join(".gemini/antigravity-cli/settings.json.switchboard-test-backup");
-    if !settings.exists() {
-        eprintln!("skipping: {settings:?} not present (Antigravity not configured)");
-        return;
-    }
-    // Self-heal from an interrupted prior run before doing anything else: if a
-    // backup exists, the previous run died with settings.json possibly still
-    // mutated — restore from the pristine backup, then fail loud.
-    if backup.exists() {
-        match std::fs::copy(&backup, &settings) {
-            Ok(_) => {
-                let _ = std::fs::remove_file(&backup);
-                panic!(
-                    "self-healed: a prior run was interrupted; restored {settings:?} from its \
-                     backup and removed the backup. Re-run."
-                );
-            }
-            Err(e) => panic!(
-                "a prior run was interrupted AND the self-heal restore failed ({e}). \
-                 The pristine value is in {backup:?}; restore it manually \
-                 (cp {backup:?} {settings:?}) and delete the backup, then re-run."
-            ),
-        }
-    }
-
-    let original = std::fs::read(&settings).expect("read settings.json");
-    std::fs::write(&backup, &original).expect("write backup");
-    let _guard = AntigravitySettingsGuard {
-        path: settings.clone(),
-        backup: backup.clone(),
-    };
-
-    let set_model = |display_name: &str| {
-        let mut v: serde_json::Value =
-            serde_json::from_slice(&original).expect("settings.json is JSON");
-        v["model"] = serde_json::Value::String(display_name.to_owned());
-        std::fs::write(&settings, serde_json::to_vec_pretty(&v).unwrap()).expect("write settings");
-    };
-
+    // `USER_SETTINGS_CHANGE` sentence, which `agy` writes on the first turn and
+    // whenever the model changes. Each turn passes its model with `--model`,
+    // the way Switchboard does; probed @ 1.4.3, a resume on a different model
+    // writes "from Gemini 3.8 Flash (Low) to Claude Sonnet 5.5 (Low)" and leaves
+    // `~/.gemini/antigravity-cli/settings.json` untouched. The test therefore
+    // never writes the developer's global `agy` settings.
     let cwd = tempfile::TempDir::new().unwrap();
     let adapter = AntigravityAdapter::new();
     let agent_id = Uuid::now_v7();
+    // Turn 1 on model X.
     let mut agent = AgentRecord {
-        model: None,
-        effort: None,
+        model: Some("gemini-3.8-flash".to_owned()),
+        effort: Some("low".to_owned()),
         model_choices: Vec::new(),
         effort_choices: Vec::new(),
         forked_from_session: None,
@@ -4973,8 +4899,6 @@ async fn live_antigravity_model_change_announced_on_resume() {
         created_at: chrono::Utc::now(),
     };
 
-    // Turn 1 on model X.
-    set_model("Gemini 3.8 Flash (Low)");
     let events1 = antigravity_live_turn(
         &adapter,
         &agent,
@@ -4993,9 +4917,10 @@ async fn live_antigravity_model_change_announced_on_resume() {
     );
     let conversation_id = antigravity_capture(&events1).expect("captured conversation id");
 
-    // Turn 2: switch the global model to Y, resume.
+    // Turn 2: resume on model Y.
     agent.session_locator = Some(SessionLocator::Uuid(conversation_id));
-    set_model("Claude Sonnet 5.5 (Low)");
+    agent.model = Some("claude-sonnet-5-5".to_owned());
+    agent.effort = Some("low".to_owned());
     let events2 = antigravity_live_turn(
         &adapter,
         &agent,
@@ -5017,8 +4942,9 @@ async fn live_antigravity_model_change_announced_on_resume() {
     );
 
     // Hydration reconstructs the carry-forward from the transcript.
-    let hydrated = load_antigravity_transcript(&home, cwd.path(), Some(conversation_id), agent_id)
-        .expect("hydrate");
+    let hydrated =
+        load_antigravity_transcript(&home_dir(), cwd.path(), Some(conversation_id), agent_id)
+            .expect("hydrate");
     let models = hydrated_turn_models(&hydrated);
     assert!(
         models
@@ -5333,6 +5259,7 @@ async fn live_codex_apply_patch_emits_edit_facet() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_run_command_emits_shell_facet() {
     let tmp = tempfile::TempDir::new().unwrap();
     let adapter = AntigravityAdapter::new();
@@ -5369,6 +5296,91 @@ async fn live_antigravity_run_command_emits_shell_facet() {
     assert!(
         !shell.is_empty() && !shell.starts_with('\"'),
         "CommandLine must decode transcript.jsonl's string-encoding, got {shell:?}"
+    );
+}
+
+/// agy 1.4.3 renamed the file tools a model calls (`read_file`, `edit_file`,
+/// `write_file`, with new argument names) and no changelog entry said so;
+/// their rows lost the file display and nothing failed. One turn drives all
+/// three, and each must carry its facet live and again on reopen.
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
+async fn live_antigravity_file_tools_emit_read_edit_and_write_facets() {
+    let tmp = tempfile::Builder::new()
+        .prefix("agy-file-tools")
+        .tempdir()
+        .unwrap();
+    std::fs::write(tmp.path().join("EDIT_ME.txt"), "alpha\n").unwrap();
+    let adapter = AntigravityAdapter::new();
+    let agent = live_antigravity_agent();
+
+    let events = antigravity_live_turn(
+        &adapter,
+        &agent,
+        tmp.path(),
+        "Use your file tools, not shell commands or subagents: create a new file NEW.txt containing the word hello, then change alpha to omega in EDIT_ME.txt, then read EDIT_ME.txt. Then reply with only the word done.",
+        Uuid::now_v7(),
+        // Not idempotent: a second attempt would find omega where it expects
+        // alpha, so the edit it measures would fail.
+        RetryPolicy::Never,
+    )
+    .await;
+
+    let live: Vec<ToolFacet> = tool_started_facets(&events)
+        .into_iter()
+        .map(|(_, _, facet)| facet)
+        .collect();
+    let calls = || {
+        tool_started_facets(&events)
+            .into_iter()
+            .map(|(_, name, facet)| (name, facet))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        live.iter().any(|f| matches!(
+            f,
+            ToolFacet::Write { path, content, .. }
+                if path.ends_with("NEW.txt") && content.contains("hello")
+        )),
+        "the file write must carry a Write facet; calls: {:?}",
+        calls()
+    );
+    assert!(
+        live.iter().any(|f| matches!(
+            f,
+            ToolFacet::Edit { files }
+                if files.iter().any(|file| file.path.ends_with("EDIT_ME.txt")
+                    && file.edits.iter().any(|e| e.old.contains("alpha") && e.new.contains("omega")))
+        )),
+        "the edit must carry an Edit facet with its before and after text; calls: {:?}",
+        calls()
+    );
+    assert!(
+        live.iter().any(|f| matches!(
+            f,
+            ToolFacet::Read { path } if path.ends_with("EDIT_ME.txt")
+        )),
+        "the read must carry a Read facet; calls: {:?}",
+        calls()
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("EDIT_ME.txt")).unwrap(),
+        "omega\n",
+        "the edit must have happened through the tools"
+    );
+
+    let conversation_id = antigravity_capture(&events).expect("captured conversation id");
+    let hydrated =
+        load_antigravity_transcript(&home_dir(), tmp.path(), Some(conversation_id), agent.id)
+            .expect("hydrate");
+    let reopened: Vec<ToolFacet> = hydrated_tool_facets(&hydrated)
+        .into_iter()
+        .map(|(_, facet)| facet)
+        .collect();
+    assert_eq!(
+        reopened, live,
+        "reopening must show the same file displays as the live turn"
     );
 }
 

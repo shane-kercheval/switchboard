@@ -65,6 +65,7 @@ rmcp = { version = "1.7.0", default-features = false, features = ["client", "tra
 reqwest = { version = "0.13", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 zstd = { version = "0.14.3", default-features = false }
+serial_test = "4.0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"

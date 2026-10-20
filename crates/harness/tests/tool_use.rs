@@ -15,11 +15,14 @@
 //!
 //! Run with: `make test-live`. All tests are `#[ignore]`-gated.
 
+use std::path::Path;
+
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
+use switchboard_harness::antigravity::parser::MISSING_TOOL_RESULT_OUTPUT;
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
-    DispatchOptions, HarnessAdapter, TurnOutcome,
+    DispatchOptions, HarnessAdapter, ToolFacet, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -154,8 +157,26 @@ fn antigravity_agent() -> AgentRecord {
     }
 }
 
+/// Whether `recorded` names `requested`, a file that does not exist. macOS
+/// temp folders sit under `/var`, a link to `/private/var`, and `agy` may
+/// record either form, so the folders are compared after resolving links.
+fn names_missing_file(recorded: &str, requested: &Path) -> bool {
+    let recorded = Path::new(recorded);
+    if recorded.file_name() != requested.file_name() {
+        return false;
+    }
+    match (
+        recorded.parent().map(Path::canonicalize),
+        requested.parent().map(Path::canonicalize),
+    ) {
+        (Some(Ok(recorded_dir)), Some(Ok(requested_dir))) => recorded_dir == requested_dir,
+        _ => false,
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_emits_tool_started_and_tool_completed_for_file_read() {
     // Antigravity's tool lifecycle AND answer text both come from tailing
     // `transcript.jsonl` (stdout replays the whole conversation on resume, so
@@ -238,6 +259,7 @@ async fn live_antigravity_emits_tool_started_and_tool_completed_for_file_read() 
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
     let tmp = tempfile::Builder::new()
         .prefix("agy-tool-error-test")
@@ -249,8 +271,9 @@ async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
     let adapter = AntigravityAdapter::new();
     let agent = antigravity_agent();
     let turn_id = Uuid::now_v7();
+    // The prompt names no tool: agy 1.4.3 renamed `view_file` to `read_file`.
     let prompt = format!(
-        "Use the view_file tool exactly once to read the absolute path {missing_path_text}. The file intentionally does not exist. After the tool fails, reply with only the word ack."
+        "Use your file-reading tool exactly once to read the absolute path {missing_path_text}. The file intentionally does not exist. After the tool fails, reply with only the word ack."
     );
     let stream = adapter
         .dispatch(
@@ -264,18 +287,39 @@ async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
         .expect("dispatch should succeed with real agy");
     let events: Vec<AdapterEvent> = stream.collect().await;
 
-    let started = events.iter().find(|event| match event {
-        AdapterEvent::ToolStarted { input, .. } => serde_json::to_string(input)
-            .is_ok_and(|text| text.contains("SWITCHBOARD_MISSING_FILE.txt")),
-        _ => false,
+    // The call must be a file read of the requested path. Selecting any call
+    // that mentions the file let a shell `cat` pass through the failed-command
+    // path instead, proving nothing about a failed read.
+    let started = events.iter().find(|event| {
+        matches!(
+            event,
+            AdapterEvent::ToolStarted {
+                facet: ToolFacet::Read { path },
+                ..
+            } if names_missing_file(path, &missing_path)
+        )
     });
     let AdapterEvent::ToolStarted {
         tool_use_id: started_id,
         ..
-    } = started.unwrap_or_else(|| panic!("expected missing-file tool start; got: {events:?}"))
+    } = started.unwrap_or_else(|| {
+        let calls: Vec<(&str, &ToolFacet)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolStarted { name, facet, .. } => Some((name.as_str(), facet)),
+                _ => None,
+            })
+            .collect();
+        panic!("expected a file read of {missing_path_text}; calls (tool, display): {calls:?}")
+    })
     else {
         unreachable!();
     };
+    // The failure must carry agy's own message, from the transcript record or
+    // the stream. The adapter authors exactly one line of its own for a failed
+    // tool, when agy reported none, so any other non-empty output is agy's.
+    // agy's wording is not asserted: it changed from 1.4.2's "invalid tool
+    // call" to 1.4.3's "file does not exist".
     assert!(
         events.iter().any(|event| matches!(
             event,
@@ -285,9 +329,10 @@ async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
                 is_error: true,
                 ..
             } if tool_use_id == started_id
-                && output.to_ascii_lowercase().contains("invalid tool call")
+                && !output.trim().is_empty()
+                && output != MISSING_TOOL_RESULT_OUTPUT
         )),
-        "expected the invalid file read to complete as an error; got: {events:?}"
+        "expected the invalid file read to complete as an error carrying agy's message; got: {events:?}"
     );
     assert!(
         events.iter().any(|event| matches!(
@@ -303,10 +348,12 @@ async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
 
 /// A command that exits non-zero must complete as a tool error. `agy` records
 /// no exit code as a field — only in the result's prose (`The command exited
-/// with code 1.` @ 1.4.2) — and the stream reports the step `DONE`, so the
-/// adapter reads that sentence. This test is what fails when `agy` rewords it.
+/// with code 1.` @ 1.4.2, `Command exited with code 1.` @ 1.4.3) — and the
+/// stream reports the step `DONE`, so the adapter reads that sentence. This
+/// test is what fails when `agy` rewords it beyond what the match accepts.
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_failing_command_completes_as_tool_error() {
     let tmp = tempfile::Builder::new()
         .prefix("agy-command-error-test")
@@ -356,10 +403,10 @@ async fn live_antigravity_failing_command_completes_as_tool_error() {
             completed,
             Some(AdapterEvent::ToolCompleted { is_error: true, .. })
         ),
-        "expected the failing command to complete as an error; if its output's \
-         header no longer reads `The command exited with code <n>.`, agy has \
-         reworded it and `header_reports_nonzero_exit` needs the new wording. \
-         Got: {completed:?}"
+        "expected the failing command to complete as an error; if no line of \
+         its output's header starts with one of the sentences in \
+         `EXIT_SENTENCES` (`antigravity/parser.rs`), agy has reworded its exit \
+         line and the new wording needs adding there. Got: {completed:?}"
     );
     // The command's own output proves the transcript's result settled the
     // row, not the turn-end fallback that closes a call with no result as

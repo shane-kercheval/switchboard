@@ -321,7 +321,7 @@ impl HarnessAdapter for AntigravityAdapter {
             log_file_path,
             cancel_token: options.cancel_token,
             #[cfg(test)]
-            stderr_wait_begins: None,
+            test_gates: TestGates::default(),
         }));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
@@ -518,7 +518,8 @@ async fn read_stdout(
 type AgyStderr = crate::subprocess::StderrDrain<tokio::process::ChildStderr>;
 
 /// Wait for the stderr drain until `deadline`, the post-exit limit. Past it,
-/// a process `agy` left behind holds the pipe: the drain is stopped and
+/// another process holds the pipe, one `agy` left behind or one that
+/// inherited the pipe when it was started: the drain is stopped and
 /// joined, never left running with the pipe, and every line already in the
 /// pipe is then taken here, so none is lost to a drain the runtime had not
 /// yet let read it. `task` is cleared once joined, so a call dropped part-way
@@ -546,8 +547,8 @@ async fn finish_stderr(
         DrainEnd::PipeEnded | DrainEnd::Failed(_) => {}
         DrainEnd::WouldBlock => tracing::warn!(
             %turn_id, agent_id = %agent_id,
-            "antigravity: stderr was still open after agy exited, held by a process it left \
-             behind; stopped reading it"
+            "antigravity: stderr still open after agy exited; another process holds it (one \
+             agy left behind, or one that inherited the pipe); stopped reading it"
         ),
         DrainEnd::CapReached => tracing::warn!(
             %turn_id, agent_id = %agent_id,
@@ -642,10 +643,41 @@ struct ProducerCtx {
     /// Fired by the dispatcher to cancel the turn. Watched as an arm of the
     /// producer's existing `select!`.
     cancel_token: CancellationToken,
-    /// Notified as the wait for stderr after the read loop begins, so a test
-    /// can Stop the turn there.
+    /// Points where a test holds the producer, so it can Stop the turn at
+    /// exactly that moment.
     #[cfg(test)]
-    stderr_wait_begins: Option<Arc<tokio::sync::Notify>>,
+    test_gates: TestGates,
+}
+
+/// Where a test can hold [`run_producer`]: each gate, when set, signals that
+/// the producer reached it and holds it there until the test releases it.
+#[cfg(test)]
+#[derive(Default)]
+struct TestGates {
+    /// Once `agy`'s exit is confirmed: it has been reaped, and the post-exit
+    /// limit has started.
+    exit_confirmed: Option<Arc<TestGate>>,
+    /// As the wait for stderr after the read loop begins.
+    stderr_wait: Option<Arc<TestGate>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestGate {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl TestGate {
+    /// `notify_one` on both sides, so neither half of the handshake is lost
+    /// to the other side not waiting yet.
+    async fn hold(gate: Option<&Arc<Self>>) {
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+    }
 }
 
 /// Drive a single Antigravity turn to completion, emitting normalized
@@ -671,7 +703,7 @@ async fn run_producer(ctx: ProducerCtx) {
         log_file_path,
         cancel_token,
         #[cfg(test)]
-        stderr_wait_begins,
+        test_gates,
     } = ctx;
     // Saved before anything can reap `agy`: once it is reaped `child.id()` is
     // `None`, and a Stop then reaches what `agy` left in its group only
@@ -873,8 +905,9 @@ async fn run_producer(ctx: ProducerCtx) {
                     Some(DrainEnd::WouldBlock) => {
                         tracing::warn!(
                             %turn_id, agent_id = %agent_id, limit = ?POST_EXIT_LIMIT,
-                            "antigravity: stdout was still open after agy exited, held by a \
-                             process it left behind; stopped reading it"
+                            "antigravity: stdout still open after agy exited; another process \
+                             holds it (one agy left behind, or one that inherited the pipe); \
+                             stopped reading it"
                         );
                         stdout_eof = true;
                     }
@@ -963,6 +996,8 @@ async fn run_producer(ctx: ProducerCtx) {
                 {
                     exit_status = Some(status);
                     exit_deadline = Some(tokio::time::Instant::now() + POST_EXIT_LIMIT);
+                    #[cfg(test)]
+                    TestGate::hold(test_gates.exit_confirmed.as_ref()).await;
                 }
             }
             () = tokio::time::sleep_until(exit_deadline.unwrap_or_else(tokio::time::Instant::now)),
@@ -1040,9 +1075,7 @@ async fn run_producer(ctx: ProducerCtx) {
     // reaches the group, and ends the turn as cancelled, as in the loop.
     let deadline = *exit_deadline.get_or_insert(tokio::time::Instant::now() + POST_EXIT_LIMIT);
     #[cfg(test)]
-    if let Some(begins) = &stderr_wait_begins {
-        begins.notify_one();
-    }
+    TestGate::hold(test_gates.stderr_wait.as_ref()).await;
     let stopped = tokio::select! {
         biased;
         () = cancel_token.cancelled() => true,
@@ -2073,6 +2106,184 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// How long a stopped turn may take to end: the two-second grace for a
+    /// process that ignores SIGTERM, and a wide margin for a loaded machine.
+    #[cfg(unix)]
+    const STOP_ENDS_SOON: Duration = Duration::from_secs(7);
+
+    /// A turn whose `agy` is `sh -c script`, spawned as the adapter spawns
+    /// `agy` (its own process group, both outputs piped), with the producer
+    /// held at `test_gates`.
+    #[cfg(unix)]
+    struct GatedTurn {
+        producer: tokio::task::JoinHandle<()>,
+        events: tokio::sync::mpsc::UnboundedReceiver<AdapterEvent>,
+        cancel: CancellationToken,
+    }
+
+    #[cfg(unix)]
+    impl GatedTurn {
+        /// `pid_file` is the script's `$0`, for it to write its leftover's
+        /// pid to; `home` is the turn's home directory.
+        fn start(script: &str, home: &Path, pid_file: &Path, test_gates: TestGates) -> Self {
+            let mut child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .arg(pid_file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let turn_id = Uuid::now_v7();
+            let producer = tokio::spawn(run_producer(ProducerCtx {
+                child,
+                stdout,
+                stderr,
+                tx,
+                turn_id,
+                agent_id: Uuid::now_v7(),
+                home_dir: home.to_owned(),
+                resume_id: None,
+                harness_version: String::new(),
+                mcp_servers: Vec::new(),
+                skills: Vec::new(),
+                prompt: "hi".to_owned(),
+                log_file_path: build_log_file_path(turn_id),
+                cancel_token: cancel.clone(),
+                test_gates,
+            }));
+            Self {
+                producer,
+                events,
+                cancel,
+            }
+        }
+
+        /// Wait for the producer to reach `gate`, Stop the turn while it is
+        /// held there, then let it go on. Returns the turn's events and how
+        /// long it took from the Stop to end.
+        async fn stop_at(mut self, gate: &TestGate) -> (Vec<AdapterEvent>, Duration) {
+            tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
+                .await
+                .expect("the turn reaches the gate");
+            let stopped = std::time::Instant::now();
+            self.cancel.cancel();
+            gate.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), self.producer)
+                .await
+                .expect("the Stop ends the turn")
+                .unwrap();
+            let took = stopped.elapsed();
+            let mut events = Vec::new();
+            while let Ok(event) = self.events.try_recv() {
+                events.push(event);
+            }
+            (events, took)
+        }
+    }
+
+    /// Whether the process whose pid is in `pid_file` is gone within a few
+    /// seconds, killing it if not: once killed, it lingers until the system
+    /// reaps it.
+    #[cfg(unix)]
+    async fn ends_soon(pid_file: &Path) -> bool {
+        let pid = nix::unistd::Pid::from_raw(
+            std::fs::read_to_string(pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        );
+        for _ in 0..300 {
+            if nix::sys::signal::kill(pid, None).is_err() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        false
+    }
+
+    #[cfg(unix)]
+    fn has_turn_end(events: &[AdapterEvent]) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+    }
+
+    /// `agy` exits leaving a `sleep` in its process group that holds both its
+    /// outputs, and a Stop arrives once the exit is confirmed: `agy` has been
+    /// reaped, so the adapter no longer knows its pid. The Stop ends the turn
+    /// with no terminal and kills the `sleep` through the group id saved at
+    /// spawn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_held_at_agys_confirmed_exit_kills_the_child_holding_its_outputs() {
+        let home = TempDir::new().unwrap();
+        let pid_file = home.path().join("leftover.pid");
+        let gate = Arc::new(TestGate::default());
+        let turn = GatedTurn::start(
+            r#"sleep 10 & echo $! > "$0"; exit 0"#,
+            home.path(),
+            &pid_file,
+            TestGates {
+                exit_confirmed: Some(Arc::clone(&gate)),
+                ..TestGates::default()
+            },
+        );
+
+        let (events, took) = turn.stop_at(&gate).await;
+        let ended = ends_soon(&pid_file).await;
+        assert!(
+            !has_turn_end(&events),
+            "a stopped turn ends with no terminal: {events:?}"
+        );
+        assert!(ended, "the Stop killed the child agy left behind");
+        assert!(took < STOP_ENDS_SOON, "took {took:?}");
+    }
+
+    /// The Stop's SIGTERM is not the end of it: a leftover that ignores
+    /// SIGTERM is killed once the grace for the group to empty runs out.
+    /// `agy` exits only after the leftover has set SIGTERM aside and written
+    /// its pid, so the leftover is ready by the time the exit is confirmed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_held_at_agys_confirmed_exit_kills_a_child_that_ignores_sigterm() {
+        let home = TempDir::new().unwrap();
+        let pid_file = home.path().join("leftover.pid");
+        let gate = Arc::new(TestGate::default());
+        let turn = GatedTurn::start(
+            r#"sh -c 'trap "" TERM; echo $$ > "$0.tmp" && mv "$0.tmp" "$0"; exec sleep 10' "$0" &
+while [ ! -e "$0" ]; do sleep 0.01; done; exit 0"#,
+            home.path(),
+            &pid_file,
+            TestGates {
+                exit_confirmed: Some(Arc::clone(&gate)),
+                ..TestGates::default()
+            },
+        );
+
+        let (events, took) = turn.stop_at(&gate).await;
+        let ended = ends_soon(&pid_file).await;
+        assert!(
+            !has_turn_end(&events),
+            "a stopped turn ends with no terminal: {events:?}"
+        );
+        assert!(ended, "the Stop killed the child that ignored SIGTERM");
+        assert!(
+            took >= crate::subprocess::TERMINATE_GRACE,
+            "the child outlived the SIGTERM, so the grace ran out: took {took:?}"
+        );
+        assert!(took < STOP_ENDS_SOON, "took {took:?}");
+    }
+
     /// `agy` exits with stdout closed, leaving a `sleep` in its process group
     /// that holds stderr, and a Stop arrives while the turn waits for stderr
     /// after its read loop has ended: the Stop ends the turn with no terminal
@@ -2082,76 +2293,25 @@ mod tests {
     async fn a_stop_while_waiting_for_stderr_after_agy_exits_kills_what_holds_it() {
         let home = TempDir::new().unwrap();
         let pid_file = home.path().join("leftover.pid");
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg(r#"exec 1>&-; sleep 10 >/dev/null & echo $! > "$0"; exit 0"#)
-            .arg(&pid_file)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
-        let mut child = command.spawn().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let cancel_token = CancellationToken::new();
-        let stderr_wait_begins = Arc::new(tokio::sync::Notify::new());
-        let turn_id = Uuid::now_v7();
-        let producer = tokio::spawn(run_producer(ProducerCtx {
-            child,
-            stdout,
-            stderr,
-            tx,
-            turn_id,
-            agent_id: Uuid::now_v7(),
-            home_dir: home.path().to_owned(),
-            resume_id: None,
-            harness_version: String::new(),
-            mcp_servers: Vec::new(),
-            skills: Vec::new(),
-            prompt: "hi".to_owned(),
-            log_file_path: build_log_file_path(turn_id),
-            cancel_token: cancel_token.clone(),
-            stderr_wait_begins: Some(Arc::clone(&stderr_wait_begins)),
-        }));
-
-        tokio::time::timeout(Duration::from_secs(10), stderr_wait_begins.notified())
-            .await
-            .expect("the turn waits for stderr once its read loop ends");
-        cancel_token.cancel();
-        tokio::time::timeout(Duration::from_secs(10), producer)
-            .await
-            .expect("the Stop ends the turn")
-            .unwrap();
-        let pid = nix::unistd::Pid::from_raw(
-            std::fs::read_to_string(&pid_file)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap(),
+        let gate = Arc::new(TestGate::default());
+        let turn = GatedTurn::start(
+            r#"exec 1>&-; sleep 10 >/dev/null & echo $! > "$0"; exit 0"#,
+            home.path(),
+            &pid_file,
+            TestGates {
+                stderr_wait: Some(Arc::clone(&gate)),
+                ..TestGates::default()
+            },
         );
-        let mut alive = true;
-        for _ in 0..200 {
-            alive = nix::sys::signal::kill(pid, None).is_ok();
-            if !alive {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
+
+        let (events, took) = turn.stop_at(&gate).await;
+        let ended = ends_soon(&pid_file).await;
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+            !has_turn_end(&events),
             "a stopped turn ends with no terminal: {events:?}"
         );
-        assert!(!alive, "the Stop killed the process holding stderr");
+        assert!(ended, "the Stop killed the process holding stderr");
+        assert!(took < STOP_ENDS_SOON, "took {took:?}");
     }
 
     /// Lines reach stderr while the runtime is held past the post-exit limit,

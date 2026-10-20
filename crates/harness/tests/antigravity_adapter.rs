@@ -1960,7 +1960,12 @@ async fn dispatch_timed(
 /// `agy_pid_file`, is gone: reaped by the adapter, the only process that
 /// waits for it, since an exited process that has not been reaped still
 /// answers a signal check. Polled tightly, so a Stop that follows lands well
-/// inside the post-exit limit. `false` if that never happened.
+/// inside the post-exit limit. `false` if that never happened. A runtime
+/// stalled for most of that limit can still put the Stop past it, and the
+/// turn then ends normally and the test fails: these tests depend on timing
+/// under extreme load, since the gate that removes it is test-only code an
+/// integration test cannot reach. The adapter's unit tests hold the producer
+/// at the exit instead.
 async fn once_reaped(agy_pid_file: &Path, leftover_pid_file: &Path) -> bool {
     for _ in 0..2000 {
         if leftover_pid_file.exists()

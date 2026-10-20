@@ -1207,6 +1207,19 @@ impl SendLedger {
             .map(|state| state.open_send)
     }
 
+    /// Every agent with a turn running, with the send the turn answers,
+    /// whoever sent it. An agent whose turn's start event failed to parse is
+    /// left out: nothing names its send.
+    #[must_use]
+    pub fn open_turns(&self) -> Vec<(AgentId, SendId)> {
+        lock(&self.inner)
+            .activity
+            .iter()
+            .filter(|(_, state)| state.turn_open)
+            .filter_map(|(agent_id, state)| state.open_send.map(|send_id| (*agent_id, send_id)))
+            .collect()
+    }
+
     /// Note an agent-channel event against the agent's activity: a turn's
     /// start or the agent's output restarts the silence, a tool call opens or
     /// closes, and a turn's end closes the turn and whatever it left open.

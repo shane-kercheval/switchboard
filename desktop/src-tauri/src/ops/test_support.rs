@@ -826,6 +826,24 @@ impl TestEnv {
         append_claude_turn(&path, prompt, text, key);
     }
 
+    /// Append these records to the agent's current Claude session file, as
+    /// Claude has written them so far.
+    pub fn append_claude_records(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        records: &[serde_json::Value],
+    ) {
+        let path = self.current_claude_session_path(project_id, agent_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut body = std::fs::read_to_string(&path).unwrap_or_default();
+        for record in records {
+            body.push_str(&serde_json::to_string(record).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(&path, body).unwrap();
+    }
+
     /// Give the agent a Claude session file holding one completed turn that
     /// edits a file `edits` times, each edit replacing 200 characters, before
     /// answering `answer`. The first message id, the hydration key, is `key`.

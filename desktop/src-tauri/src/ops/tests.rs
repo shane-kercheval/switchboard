@@ -3493,6 +3493,380 @@ async fn a_cancelled_or_failed_turn_carries_its_outcome_however_the_conversation
     }
 }
 
+// --- a reply still being written, as its session file holds it --------------
+
+/// A recorded Codex turn in codex-cli 0.149.0's rollout shape: a prompt
+/// answered in one message.
+const CODEX_TEXT_ONLY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../crates/harness/tests/fixtures/codex/paginated-text-only.session.jsonl"
+));
+const CODEX_TEXT_ONLY_THREAD: &str = "00000000-0000-7000-8000-0000000000a1";
+/// The recorded turn's own id, which Codex links its reply by when the turn
+/// ends.
+const CODEX_TEXT_ONLY_TURN: &str = "00000000-0000-7000-8000-000000000051";
+
+/// A recorded Claude turn: a sentence, a tool call and its result, then the
+/// answer.
+const CLAUDE_TEXT_FIRST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../crates/harness/tests/fixtures/claude/report-findings-text-first.session.jsonl"
+));
+/// The turn's first message id: the key Claude announces at that message,
+/// which the actor journals as the turn's link while the turn runs.
+const CLAUDE_TEXT_FIRST_KEY: &str = "msg_011Cfow1q6Z1NgSnAfjzZPfJ";
+
+/// The first `records` lines of a recorded session file, each whole, with
+/// every timestamp moved by one amount so the first falls at `start`: the file
+/// as its harness had written it part-way through a turn that started then.
+/// The merge pairs a session's prompt with a journaled send only when the
+/// prompt is no earlier than the project's first send, so a recording keeps
+/// its spacing but not its date.
+fn recorded_prefix(
+    recording: &str,
+    records: usize,
+    start: chrono::DateTime<Utc>,
+) -> Vec<serde_json::Value> {
+    let mut lines: Vec<serde_json::Value> = recording
+        .lines()
+        .take(records)
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let recorded_start: chrono::DateTime<Utc> =
+        lines[0]["timestamp"].as_str().unwrap().parse().unwrap();
+    let shift = start - recorded_start;
+    for line in &mut lines {
+        for pointer in ["/timestamp", "/payload/timestamp"] {
+            if let Some(stamp) = line.pointer_mut(pointer)
+                && let Some(at) = stamp
+                    .as_str()
+                    .and_then(|at| at.parse::<chrono::DateTime<Utc>>().ok())
+            {
+                *stamp = serde_json::json!(
+                    (at + shift).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                );
+            }
+        }
+    }
+    lines
+}
+
+/// The prompt the recorded Claude turn answers.
+fn claude_text_first_prompt() -> String {
+    let first: serde_json::Value =
+        serde_json::from_str(CLAUDE_TEXT_FIRST.lines().next().unwrap()).unwrap();
+    first["message"]["content"].as_str().unwrap().to_owned()
+}
+
+/// A Codex agent, in a project nobody has opened, whose rollout is the
+/// recorded thread's.
+fn project_with_codex_agent() -> (TestEnv, ProjectId, AgentId) {
+    let mut env = TestEnv::new();
+    let project_id = env.project("proj");
+    let agent = crate::commands::create_agent_in_project_impl(
+        &env.state,
+        project_id,
+        "cx",
+        switchboard_core::HarnessKind::Codex,
+        switchboard_core::AgentSelection::default(),
+    )
+    .unwrap()
+    .id;
+    crate::commands::set_agent_session_locator_impl(
+        &env.state,
+        agent,
+        SessionLocator::Codex {
+            thread_id: CODEX_TEXT_ONLY_THREAD.to_owned(),
+            partition_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 22).unwrap(),
+        },
+    )
+    .unwrap();
+    (env.restart(), project_id, agent)
+}
+
+/// Write `records` as the recorded thread's rollout under the env's home, in
+/// the folder of the day its locator names.
+fn write_codex_rollout(env: &TestEnv, records: &[serde_json::Value]) {
+    let folder = env.home().join(".codex/sessions/2026/08/22");
+    std::fs::create_dir_all(&folder).unwrap();
+    let body: String = records
+        .iter()
+        .map(|record| serde_json::to_string(record).unwrap() + "\n")
+        .collect();
+    std::fs::write(
+        folder.join(format!(
+            "rollout-2026-08-22T18-47-21-{CODEX_TEXT_ONLY_THREAD}.jsonl"
+        )),
+        body,
+    )
+    .unwrap();
+}
+
+/// Start a turn the way the window's compose bar does, and hold it running
+/// until `gate` fires. The ledger does not hold the window's sends, so every
+/// reader goes to the session file for this one. Returns the send's id.
+async fn send_from_the_window_and_hold(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    prompt: &str,
+    gate: &Arc<Notify>,
+) -> Uuid {
+    env.adapter.push_for(agent_id, Script::parked("", gate));
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let send_id = Uuid::now_v7();
+    send_message_impl(
+        &env.state,
+        agent_id,
+        prompt,
+        Vec::new(),
+        send_id,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agent_id).await;
+    send_id
+}
+
+/// Journal the link Claude's first message gives a running turn, as the actor
+/// does when Claude names its reply.
+fn journal_early_link(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    send_id: Uuid,
+    key: &str,
+) {
+    switchboard_core::journal::append_record(
+        &env.journal_path(project_id),
+        &JournalRecord::TurnLink {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id,
+            hydration_key: key.to_owned(),
+            at: Utc::now(),
+        },
+    )
+    .unwrap();
+}
+
+/// The agent's turns in the conversation, oldest first, as `(send, status,
+/// reason, text)`.
+async fn agent_turns(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent_id: AgentId,
+) -> Vec<(Option<Uuid>, DigestTurnStatus, Option<String>, String)> {
+    read_conversation(&env.state, project_id, None, &env.home())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            DigestItem::AgentTurn {
+                agent_id: a,
+                send_id,
+                status,
+                reason,
+                text,
+                ..
+            } if a == agent_id => Some((send_id, status, reason, text)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_codex_reply_still_being_written_reads_as_running_in_the_conversation() {
+    let (env, project_id, agent) = project_with_codex_agent();
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, agent, "say ack", &gate).await;
+    // Through the answer's message: the turn's token count and its
+    // `task_complete` are still to be written.
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 9, Utc::now()));
+
+    assert_eq!(
+        agent_turns(&env, project_id, agent).await,
+        vec![(
+            Some(sent),
+            DigestTurnStatus::Running,
+            None,
+            "ack".to_owned()
+        )]
+    );
+    let page = read_reply(
+        &env.state,
+        project_id,
+        sent,
+        agent,
+        0,
+        ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.status, SendStatus::Running, "the reply reader agrees");
+    let latest = read_latest_reply(&env.state, project_id, agent, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        latest.status,
+        LatestReplyStatus::None,
+        "a reply still running is not a finished answer"
+    );
+    assert!(latest.newer_turn_running);
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_claude_reply_still_being_written_reads_as_running_in_the_conversation() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(
+        &env,
+        project_id,
+        agents[0],
+        &claude_text_first_prompt(),
+        &gate,
+    )
+    .await;
+    // Through the turn's first sentence: the tool call after it, the call's
+    // result, and the answer are still to be written.
+    env.append_claude_records(
+        project_id,
+        agents[0],
+        &recorded_prefix(CLAUDE_TEXT_FIRST, 3, Utc::now()),
+    );
+    journal_early_link(&env, project_id, agents[0], sent, CLAUDE_TEXT_FIRST_KEY);
+
+    assert_eq!(
+        agent_turns(&env, project_id, agents[0]).await,
+        vec![(
+            Some(sent),
+            DigestTurnStatus::Running,
+            None,
+            "I'm starting the review now.".to_owned()
+        )]
+    );
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_claude_reply_waiting_on_background_work_reads_as_running_in_the_conversation() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, agents[0], "go", &gate).await;
+    // Claude writes the turn's first cycle, end-of-turn marker included, while
+    // the turn waits on work it started in the background.
+    env.append_claude_turn(project_id, agents[0], "go", "started the build", "m-go");
+    journal_early_link(&env, project_id, agents[0], sent, "m-go");
+
+    assert_eq!(
+        agent_turns(&env, project_id, agents[0]).await,
+        vec![(
+            Some(sent),
+            DigestTurnStatus::Running,
+            None,
+            "started the build".to_owned()
+        )]
+    );
+    let page = read_reply(
+        &env.state,
+        project_id,
+        sent,
+        agents[0],
+        0,
+        ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.status, SendStatus::Running, "the reply reader agrees");
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_running_send_with_nothing_on_disk_leaves_the_previous_turn_complete() {
+    let (env, project_id, agent) = project_with_codex_agent();
+    let mut script = Script::reply("ack");
+    script.key = Some(CODEX_TEXT_ONLY_TURN.to_owned());
+    env.adapter.push_for(agent, script);
+    let first = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agent], "say ack"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, first.send_id).await;
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 11, Utc::now()));
+    let gate = Arc::new(Notify::new());
+    let second = send_from_the_window_and_hold(&env, project_id, agent, "again", &gate).await;
+
+    let conversation = read_conversation(&env.state, project_id, None, &env.home())
+        .await
+        .unwrap();
+    assert!(
+        conversation.items.iter().any(|item| matches!(
+            item,
+            DigestItem::UserMessage { send_id: Some(s), .. } if *s == second
+        )),
+        "the running send is journaled: {conversation:?}"
+    );
+    assert_eq!(
+        agent_turns(&env, project_id, agent).await,
+        vec![(
+            Some(first.send_id),
+            DigestTurnStatus::Complete,
+            None,
+            "ack".to_owned()
+        )],
+        "the running send claims no earlier reply"
+    );
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_reply_compacted_part_way_reads_as_running_in_both_pieces() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, agents[0], "go", &gate).await;
+    // The harness compacted its context during the turn: the piece before,
+    // the summary, and the piece after, which carries no send.
+    env.append_claude_records(
+        project_id,
+        agents[0],
+        &split_by_compaction("before", "after"),
+    );
+    journal_early_link(&env, project_id, agents[0], sent, "m1");
+
+    assert_eq!(
+        agent_turns(&env, project_id, agents[0]).await,
+        vec![
+            (
+                Some(sent),
+                DigestTurnStatus::Running,
+                None,
+                "before".to_owned()
+            ),
+            (None, DigestTurnStatus::Running, None, "after".to_owned()),
+        ]
+    );
+    let latest = read_latest_reply(&env.state, project_id, agents[0], &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        (latest.status, latest.text),
+        (LatestReplyStatus::None, None),
+        "neither piece of the running reply is a finished answer"
+    );
+    assert!(latest.newer_turn_running);
+    gate.notify_one();
+}
+
 // --- The window round trip, through the production `WindowSync` ---
 
 fn ready(listening_agents: Vec<AgentId>) -> SyncAck {

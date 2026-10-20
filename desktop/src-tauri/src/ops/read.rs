@@ -313,9 +313,11 @@ pub async fn read_conversation(
     last_n_items: Option<usize>,
     home_dir: &Path,
 ) -> Result<ConversationDigest, AppError> {
+    let open_before = state.ledger.open_turns();
     let conversation = load_project_conversation_impl(state, project_id, home_dir).await?;
+    let running = running_sends(open_before.into_iter().chain(state.ledger.open_turns()));
     let roster = list_project_agents_readonly_impl(state, project_id)?;
-    let mut digest = digest(conversation, &roster);
+    let mut digest = digest(conversation, &roster, &running);
     if let Some(n) = last_n_items
         && digest.items.len() > n
     {
@@ -325,8 +327,46 @@ pub async fn read_conversation(
     Ok(digest)
 }
 
-fn digest(conversation: ProjectConversation, roster: &[AgentRecord]) -> ConversationDigest {
+/// The sends whose turns are running, as `(send, agent)`, from the ledger's
+/// open turns at two readings: one taken before the session files are read
+/// and one after.
+///
+/// **Why the ledger decides, not the file.** A session file read while its
+/// turn runs holds part of that turn, and the harness's parser can only guess
+/// whether the turn has ended: Codex and Antigravity close an unfinished last
+/// turn as failed, and Claude writes a turn's first cycle, end-of-turn marker
+/// included, while the turn waits on background work, so it reads as
+/// complete. The ledger has seen the turn start and not end, for every turn
+/// on the agent's channel, the window's sends included. It is asked rather
+/// than the agent's actor, which cannot answer while it prepares a turn.
+///
+/// **Why two readings.** A turn that ends during the read was running when
+/// its file was read, so the copy may be partial; a turn that starts during
+/// it may already be on disk.
+fn running_sends(open_turns: impl IntoIterator<Item = (AgentId, SendId)>) -> HashSet<SendTo> {
+    open_turns
+        .into_iter()
+        .map(|(agent_id, send_id)| (send_id, agent_id))
+        .collect()
+}
+
+/// Whether `send_id` was the send of one agent's open turn at either of two
+/// readings, taken around a session-file read (see [`running_sends`]).
+fn answering(readings: [Option<SendId>; 2], send_id: SendId) -> bool {
+    readings.contains(&Some(send_id))
+}
+
+/// A running turn is reported `running`, with no reason, whatever its partial
+/// copy on disk says ([`running_sends`]), and so is every later turn of the
+/// same agent: a compaction part-way through a turn splits it on disk, and
+/// only the first piece carries the send.
+fn digest(
+    conversation: ProjectConversation,
+    roster: &[AgentRecord],
+    running: &HashSet<SendTo>,
+) -> ConversationDigest {
     let (outcomes, answered) = journal_outcomes(&conversation.items);
+    let mut still_answering: HashSet<AgentId> = HashSet::new();
     let items = conversation
         .items
         .into_iter()
@@ -354,8 +394,15 @@ fn digest(conversation: ProjectConversation, roster: &[AgentRecord]) -> Conversa
                 started_at,
                 ..
             } => {
-                let outcome = send_id.and_then(|s| outcomes.get(&(s, agent_id)));
-                let (status, reason, failure_kind) = turn_status(status, outcome);
+                if send_id.is_some_and(|s| running.contains(&(s, agent_id))) {
+                    still_answering.insert(agent_id);
+                }
+                let (status, reason, failure_kind) = if still_answering.contains(&agent_id) {
+                    (DigestTurnStatus::Running, None, None)
+                } else {
+                    let outcome = send_id.and_then(|s| outcomes.get(&(s, agent_id)));
+                    turn_status(status, outcome)
+                };
                 Some(DigestItem::AgentTurn {
                     agent_id,
                     send_id,
@@ -538,6 +585,7 @@ pub async fn read_reply(
     page_chars: usize,
     home_dir: &Path,
 ) -> Result<OutputPage, AppError> {
+    let open_before = state.ledger.open_turn(agent_id);
     let live_status = match state.ledger.send(send_id) {
         Some(snapshot) if snapshot.project_id == project_id => {
             let recipient = snapshot
@@ -567,17 +615,27 @@ pub async fn read_reply(
     };
     let agent = agent_in_project(state, project_id, agent_id)?;
     let (view, correlated) = correlate_agent(state, project_id, &agent, home_dir).await?;
+    let running = answering(
+        [
+            open_before.flatten(),
+            state.ledger.open_turn(agent_id).flatten(),
+        ],
+        send_id,
+    );
     let turn = correlated
         .iter()
         .rev()
         .find(|turn| turn.send_id == Some(send_id));
-    // The ledger's status is the most current when it holds the send. Without
-    // it, the journal's recorded outcome wins over the transcript, as it does
-    // for `wait_send` after a restart: a failed or cancelled send with partial
-    // content on disk is not a completed answer, and one with no reply at all
-    // still pages (empty) rather than reading as unknown.
+    let journaled = view.sends.iter().any(|(s, _)| *s == send_id);
+    // The ledger's status is the most current when it holds the send, and its
+    // open turn says the send is running when it does not ([`running_sends`]).
+    // Otherwise the journal's recorded outcome wins over the transcript, as it
+    // does for `wait_send` after a restart: a failed or cancelled send with
+    // partial content on disk is not a completed answer, and one with no reply
+    // at all still pages (empty) rather than reading as unknown.
     let status = match (live_status, view.outcomes.get(&send_id), turn) {
         (Some(status), _, _) => status,
+        (None, None, _) if running && (turn.is_some() || journaled) => SendStatus::Running,
         (None, Some((OutcomeStatus::Cancelled, _)), _) => SendStatus::Cancelled,
         (None, Some((OutcomeStatus::Failed, _)), _) => SendStatus::Failed,
         (None, None, Some(turn)) => match turn.status {
@@ -585,7 +643,7 @@ pub async fn read_reply(
             TurnStatus::Streaming => SendStatus::Running,
             TurnStatus::Failed => SendStatus::Failed,
         },
-        (None, None, None) if view.sends.iter().any(|(s, _)| *s == send_id) => SendStatus::Started,
+        (None, None, None) if journaled => SendStatus::Started,
         (None, None, None) => return Err(AppError::SendUnknown(send_id)),
     };
     let source = match (turn.and_then(|t| t.correlation), live_status) {
@@ -785,22 +843,28 @@ pub async fn read_latest_reply(
     agent_id: AgentId,
     home_dir: &Path,
 ) -> Result<LatestReply, AppError> {
-    // One reading of the running turn serves both the skip and the flag, so a
-    // turn ending mid-read never leaves an older answer marked current. It can
-    // leave the flag set beside the answer before it, or beside its own when
-    // the ledger already holds it: stale, which costs the caller one more
-    // read. Taken from what the app already records, never by asking the
-    // agent's actor, which cannot answer while it prepares a turn.
-    let open_turn = state.ledger.open_turn(agent_id);
+    // The same readings of the running turn serve both the skip and the flag:
+    // the skip leaves out a send open at the reading before the transcript is
+    // read or the one after it ([`running_sends`]), and the flag is set when
+    // either found a turn open, so a turn ending or starting mid-read never
+    // leaves an older answer marked current. It can leave the flag set beside
+    // the answer before it, or beside its own when the ledger already holds
+    // it: stale, which costs the caller one more read. Taken from what the
+    // app already records, never by asking the agent's actor, which cannot
+    // answer while it prepares a turn.
+    let open_before = state.ledger.open_turn(agent_id);
     let mut output =
-        latest_reply_alone(state, project_id, agent_id, open_turn.flatten(), home_dir).await?;
+        latest_reply_alone(state, project_id, agent_id, open_before.flatten(), home_dir).await?;
     output.context = known_context(state, agent_id);
-    output.newer_turn_running =
-        open_turn.is_some() || state.ledger.has_unfinished_send_to(agent_id);
+    output.newer_turn_running |=
+        open_before.is_some() || state.ledger.has_unfinished_send_to(agent_id);
     Ok(output)
 }
 
-/// [`read_latest_reply`]'s answer, leaving out the turn answering `running`.
+/// [`read_latest_reply`]'s answer, leaving out the turn answering `running`
+/// (the open turn's send before the transcript is read) or the send open at a
+/// second reading taken once it is read, and every later turn of the agent.
+/// `newer_turn_running` is whether that second reading found a turn open.
 async fn latest_reply_alone(
     state: &AppState,
     project_id: ProjectId,
@@ -865,13 +929,23 @@ async fn latest_reply_alone(
             newer_turn_running: false,
         });
     }
-    let correlated = correlate_turns(&project, &agent, &view, home_dir, &state.context).await?;
-    // A compaction journals nothing, so no transcript turn pairs with its
-    // send: while one runs, nothing is left out.
-    let latest = correlated.into_iter().rev().find(|turn| {
-        turn.status == TurnStatus::Complete
-            && running.is_none_or(|running| turn.send_id != Some(running))
-    });
+    let mut correlated = correlate_turns(&project, &agent, &view, home_dir, &state.context).await?;
+    let open_after = state.ledger.open_turn(agent_id);
+    // The running turn and every later turn of the agent are left out: a
+    // compaction part-way through a turn splits it on disk, and only the first
+    // piece carries the send. A compaction journals nothing, so no transcript
+    // turn pairs with its send: while one runs, nothing is left out.
+    if let Some(first) = correlated.iter().position(|turn| {
+        turn.send_id
+            .is_some_and(|send_id| answering([running, open_after.flatten()], send_id))
+    }) {
+        correlated.truncate(first);
+    }
+    let latest = correlated
+        .into_iter()
+        .rev()
+        .find(|turn| turn.status == TurnStatus::Complete);
+    let newer_turn_running = open_after.is_some();
     Ok(match latest {
         Some(turn) => LatestReply {
             agent_id,
@@ -884,7 +958,7 @@ async fn latest_reply_alone(
                 _ => OutputSource::Uncorrelated,
             },
             context: None,
-            newer_turn_running: false,
+            newer_turn_running,
         },
         None => LatestReply {
             agent_id,
@@ -893,7 +967,7 @@ async fn latest_reply_alone(
             send_id: None,
             source: OutputSource::Uncorrelated,
             context: None,
-            newer_turn_running: false,
+            newer_turn_running,
         },
     })
 }

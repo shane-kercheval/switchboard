@@ -20,7 +20,7 @@ use crate::commands::{
     ForwardSourceRef, list_project_agents_readonly_impl, load_project_conversation_impl,
     send_message_impl,
 };
-use crate::error::AppError;
+use crate::error::{AppError, BusyReply};
 use crate::state::{TestSeam, lock};
 use crate::workflow::{DispatchEnd, DispatchFactoryProvider as _};
 use crate::workflow_commands::ProjectDispatchFactoryProvider;
@@ -998,8 +998,14 @@ async fn forward_with_a_mid_turn_source_past_the_budget_is_source_busy() {
     .await
     .unwrap_err();
     assert!(
-        matches!(err.root(), AppError::SourceBusy { name } if name == "src"),
+        matches!(err.root(), AppError::SourceBusy { name, replies } if name == "src" && replies.is_empty()),
         "{err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "src is still responding, so nothing was sent — wait for it with wait_agent, then forward again"
+        ),
+        "{err}"
     );
     assert_eq!(lock(&env.adapter.prompts).len(), 1, "nothing dispatched");
 
@@ -1768,7 +1774,8 @@ fn the_error_code_mapping_covers_the_cases_a_caller_acts_on() {
     );
     assert_eq!(
         error_code(&AppError::Shared(Arc::new(AppError::SourceBusy {
-            name: "x".to_owned()
+            name: "x".to_owned(),
+            replies: Vec::new(),
         }))),
         error_code::SOURCE_BUSY
     );
@@ -3491,6 +3498,1455 @@ async fn a_cancelled_or_failed_turn_carries_its_outcome_however_the_conversation
         }
         other => panic!("a send with no reply keeps its own marker: {other:?}"),
     }
+}
+
+// --- a reply still being written, as its session file holds it --------------
+
+/// A recorded Codex turn in codex-cli 0.149.0's rollout shape: a prompt
+/// answered in one message.
+const CODEX_TEXT_ONLY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../crates/harness/tests/fixtures/codex/paginated-text-only.session.jsonl"
+));
+const CODEX_TEXT_ONLY_THREAD: &str = "00000000-0000-7000-8000-0000000000a1";
+/// The recorded turn's own id, which Codex links its reply by when the turn
+/// ends.
+const CODEX_TEXT_ONLY_TURN: &str = "00000000-0000-7000-8000-000000000051";
+
+/// A recorded Claude turn: a sentence, a tool call and its result, then the
+/// answer.
+const CLAUDE_TEXT_FIRST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../crates/harness/tests/fixtures/claude/report-findings-text-first.session.jsonl"
+));
+/// The turn's first message id: the key Claude announces at that message,
+/// which the actor journals as the turn's link while the turn runs.
+const CLAUDE_TEXT_FIRST_KEY: &str = "msg_011Cfow1q6Z1NgSnAfjzZPfJ";
+
+/// The first `records` lines of a recorded session file, each whole, stamped
+/// one millisecond apart from `start`: the file as its harness had written it
+/// part-way through a turn that started then. A recording keeps its order but
+/// not its times, because the merge pairs a session's prompt with a journaled
+/// send only when the prompt is no earlier than the project's first send, and
+/// keeps a reply's link only when the reply ends before the agent's next send.
+fn recorded_prefix(
+    recording: &str,
+    records: usize,
+    start: chrono::DateTime<Utc>,
+) -> Vec<serde_json::Value> {
+    let mut lines: Vec<serde_json::Value> = recording
+        .lines()
+        .take(records)
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for (index, line) in lines.iter_mut().enumerate() {
+        let at = start + chrono::Duration::milliseconds(i64::try_from(index).unwrap());
+        let stamp = serde_json::json!(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        for pointer in ["/timestamp", "/payload/timestamp", "/created_at"] {
+            if let Some(field) = line.pointer_mut(pointer)
+                && field.is_string()
+            {
+                *field = stamp.clone();
+            }
+        }
+    }
+    lines
+}
+
+/// The turn the actor journaled `send_id` under, and when: the moment the turn
+/// started. The actor writes the send's link and outcome under the same turn.
+fn journaled_turn(
+    env: &TestEnv,
+    project_id: ProjectId,
+    send_id: Uuid,
+) -> (Uuid, chrono::DateTime<Utc>) {
+    switchboard_core::journal::read_records(&env.journal_path(project_id))
+        .unwrap()
+        .into_iter()
+        .find_map(|record| match record {
+            JournalRecord::Send {
+                send_id: s,
+                turn_id,
+                at,
+                ..
+            } if s == send_id => Some((turn_id, at)),
+            _ => None,
+        })
+        .expect("the send is journaled")
+}
+
+/// The prompt the recorded Claude turn answers.
+fn claude_text_first_prompt() -> String {
+    let first: serde_json::Value =
+        serde_json::from_str(CLAUDE_TEXT_FIRST.lines().next().unwrap()).unwrap();
+    first["message"]["content"].as_str().unwrap().to_owned()
+}
+
+/// A Codex agent, in a project nobody has opened, whose rollout is the
+/// recorded thread's.
+fn project_with_codex_agent() -> (TestEnv, ProjectId, AgentId) {
+    let mut env = TestEnv::new();
+    let project_id = env.project("proj");
+    let agent = crate::commands::create_agent_in_project_impl(
+        &env.state,
+        project_id,
+        "cx",
+        switchboard_core::HarnessKind::Codex,
+        switchboard_core::AgentSelection::default(),
+    )
+    .unwrap()
+    .id;
+    crate::commands::set_agent_session_locator_impl(
+        &env.state,
+        agent,
+        SessionLocator::Codex {
+            thread_id: CODEX_TEXT_ONLY_THREAD.to_owned(),
+            partition_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 22).unwrap(),
+        },
+    )
+    .unwrap();
+    (env.restart(), project_id, agent)
+}
+
+/// Write `records` as the recorded thread's rollout under the env's home, in
+/// the folder of the day its locator names.
+fn write_codex_rollout(env: &TestEnv, records: &[serde_json::Value]) {
+    let folder = env.home().join(".codex/sessions/2026/08/22");
+    std::fs::create_dir_all(&folder).unwrap();
+    let body: String = records
+        .iter()
+        .map(|record| serde_json::to_string(record).unwrap() + "\n")
+        .collect();
+    std::fs::write(
+        folder.join(format!(
+            "rollout-2026-08-22T18-47-21-{CODEX_TEXT_ONLY_THREAD}.jsonl"
+        )),
+        body,
+    )
+    .unwrap();
+}
+
+/// A recorded Antigravity conversation: one turn that runs a command and
+/// reads a file, then answers in its last record.
+const AGY_TOOL_USE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../crates/harness/tests/fixtures/antigravity/tool-use.transcript.jsonl"
+));
+/// The request the recorded Antigravity turn answers.
+const AGY_TOOL_USE_PROMPT: &str =
+    "Read the file MARKER.txt in current directory and reply with its contents only.";
+
+/// An Antigravity agent, in a project nobody has opened, whose locator names
+/// `conversation`. Its turns run on the scripted adapter, which writes
+/// nothing Antigravity reads: the test writes the transcript.
+fn project_with_antigravity_agent(conversation: Uuid) -> (TestEnv, ProjectId, AgentId) {
+    let mut env = TestEnv::new();
+    let project_id = env.project("proj");
+    let agent = crate::commands::create_agent_in_project_impl(
+        &env.state,
+        project_id,
+        "agy",
+        switchboard_core::HarnessKind::Antigravity,
+        switchboard_core::AgentSelection::default(),
+    )
+    .unwrap()
+    .id;
+    crate::commands::set_agent_session_locator_impl(
+        &env.state,
+        agent,
+        SessionLocator::Uuid(conversation),
+    )
+    .unwrap();
+    (env.restart(), project_id, agent)
+}
+
+/// Write `records` as `conversation`'s Antigravity transcript under the env's
+/// home.
+fn write_antigravity_transcript(env: &TestEnv, conversation: Uuid, records: &[serde_json::Value]) {
+    let path = switchboard_harness::antigravity::paths::transcript_path(&env.home(), conversation);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let body: String = records
+        .iter()
+        .map(|record| serde_json::to_string(record).unwrap() + "\n")
+        .collect();
+    std::fs::write(path, body).unwrap();
+}
+
+/// Send `prompt` to the agent the way the window's compose bar does, with
+/// `script` as the agent's turn: queued behind a turn already running, as the
+/// compose bar's sends are. The ledger does not hold the window's sends, so
+/// every reader goes to the journal and the session file for this one.
+/// Returns the send's id.
+async fn send_from_the_window(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    prompt: &str,
+    script: Script,
+) -> Uuid {
+    env.adapter.push_for(agent_id, script);
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let send_id = Uuid::now_v7();
+    send_message_impl(
+        &env.state,
+        agent_id,
+        prompt,
+        Vec::new(),
+        send_id,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    send_id
+}
+
+/// [`send_from_the_window`] with a turn held running until `gate` fires.
+async fn send_from_the_window_and_hold(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    prompt: &str,
+    gate: &Arc<Notify>,
+) -> Uuid {
+    let send_id =
+        send_from_the_window(env, project_id, agent_id, prompt, Script::parked("", gate)).await;
+    await_turn_running(&env.state, agent_id).await;
+    send_id
+}
+
+/// Poll until the ledger has seen the agent's turn for `send_id` start, or
+/// panic.
+async fn await_open_turn(env: &TestEnv, agent_id: AgentId, send_id: Uuid) {
+    for _ in 0..500 {
+        if env.state.ledger.open_turn(agent_id) == Some(Some(send_id)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the turn for send {send_id} never started");
+}
+
+/// Journal the link Claude's first message gives a running turn, as the actor
+/// does when Claude names its reply.
+fn journal_early_link(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    send_id: Uuid,
+    key: &str,
+) {
+    switchboard_core::journal::append_record(
+        &env.journal_path(project_id),
+        &JournalRecord::TurnLink {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id,
+            hydration_key: key.to_owned(),
+            at: Utc::now(),
+        },
+    )
+    .unwrap();
+}
+
+/// The agent's turns in the conversation, oldest first, as `(send, status,
+/// reason, text)`.
+async fn agent_turns(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent_id: AgentId,
+) -> Vec<(Option<Uuid>, DigestTurnStatus, Option<String>, String)> {
+    read_conversation(&env.state, project_id, None, &env.home())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            DigestItem::AgentTurn {
+                agent_id: a,
+                send_id,
+                status,
+                reason,
+                text,
+                ..
+            } if a == agent_id => Some((send_id, status, reason, text)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_codex_reply_still_being_written_reads_as_running_in_the_conversation() {
+    let (env, project_id, agent) = project_with_codex_agent();
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, agent, "say ack", &gate).await;
+    // Through the answer's message: the turn's token count and its
+    // `task_complete` are still to be written.
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 9, Utc::now()));
+
+    assert_eq!(
+        agent_turns(&env, project_id, agent).await,
+        vec![(
+            Some(sent),
+            DigestTurnStatus::Running,
+            None,
+            "ack".to_owned()
+        )]
+    );
+    let page = read_reply(
+        &env.state,
+        project_id,
+        sent,
+        agent,
+        0,
+        ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.status, SendStatus::Running, "the reply reader agrees");
+    let latest = read_latest_reply(&env.state, project_id, agent, &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        latest.status,
+        LatestReplyStatus::None,
+        "a reply still running is not a finished answer"
+    );
+    assert!(latest.newer_turn_running);
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_claude_reply_still_being_written_reads_as_running_in_the_conversation() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(
+        &env,
+        project_id,
+        agents[0],
+        &claude_text_first_prompt(),
+        &gate,
+    )
+    .await;
+    // Through the turn's first sentence: the tool call after it, the call's
+    // result, and the answer are still to be written.
+    env.append_claude_records(
+        project_id,
+        agents[0],
+        &recorded_prefix(CLAUDE_TEXT_FIRST, 3, Utc::now()),
+    );
+    journal_early_link(&env, project_id, agents[0], sent, CLAUDE_TEXT_FIRST_KEY);
+
+    assert_eq!(
+        agent_turns(&env, project_id, agents[0]).await,
+        vec![(
+            Some(sent),
+            DigestTurnStatus::Running,
+            None,
+            "I'm starting the review now.".to_owned()
+        )]
+    );
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_claude_reply_waiting_on_background_work_reads_as_running_in_the_conversation() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, agents[0], "go", &gate).await;
+    // Claude writes the turn's first cycle, end-of-turn marker included, while
+    // the turn waits on work it started in the background.
+    env.append_claude_turn(project_id, agents[0], "go", "started the build", "m-go");
+    journal_early_link(&env, project_id, agents[0], sent, "m-go");
+
+    assert_eq!(
+        agent_turns(&env, project_id, agents[0]).await,
+        vec![(
+            Some(sent),
+            DigestTurnStatus::Running,
+            None,
+            "started the build".to_owned()
+        )]
+    );
+    let page = read_reply(
+        &env.state,
+        project_id,
+        sent,
+        agents[0],
+        0,
+        ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.status, SendStatus::Running, "the reply reader agrees");
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_running_send_with_nothing_on_disk_leaves_the_previous_turn_complete() {
+    let (env, project_id, agent) = project_with_codex_agent();
+    let mut script = Script::reply("ack");
+    script.key = Some(CODEX_TEXT_ONLY_TURN.to_owned());
+    env.adapter.push_for(agent, script);
+    let first = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agent], "say ack"),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, first.send_id).await;
+    // The whole first reply, written during its own turn: from the moment its
+    // send was journaled, and over before the next send starts, as the
+    // dispatcher's one turn at a time makes it.
+    let (_, first_at) = journaled_turn(&env, project_id, first.send_id);
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 11, first_at));
+    let first_ends = first_at + chrono::Duration::milliseconds(10);
+    while Utc::now() <= first_ends {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let gate = Arc::new(Notify::new());
+    let second = send_from_the_window_and_hold(&env, project_id, agent, "again", &gate).await;
+
+    let conversation = read_conversation(&env.state, project_id, None, &env.home())
+        .await
+        .unwrap();
+    assert!(
+        conversation.items.iter().any(|item| matches!(
+            item,
+            DigestItem::UserMessage { send_id: Some(s), .. } if *s == second
+        )),
+        "the running send is journaled: {conversation:?}"
+    );
+    assert!(
+        conversation.items.iter().any(|item| matches!(
+            item,
+            DigestItem::AgentTurn {
+                send_id: Some(s),
+                send_correlation: Some(crate::commands::SendCorrelation::DurableLink),
+                ..
+            } if *s == first.send_id
+        )),
+        "the first reply is paired with its send by its link: {conversation:?}"
+    );
+    assert_eq!(
+        agent_turns(&env, project_id, agent).await,
+        vec![(
+            Some(first.send_id),
+            DigestTurnStatus::Complete,
+            None,
+            "ack".to_owned()
+        )],
+        "the running send claims no earlier reply"
+    );
+    let page = read_reply(
+        &env.state,
+        project_id,
+        second,
+        agent,
+        0,
+        ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (page.status, page.text.as_str()),
+        (SendStatus::Running, ""),
+        "a running send with nothing written yet"
+    );
+    gate.notify_one();
+}
+
+/// Antigravity's replies carry no link to their messages, so a finished one is
+/// paired with its message by its request's text or its position alone, and a
+/// message running with nothing on disk yet must not take it over.
+#[tokio::test]
+async fn an_antigravity_reply_stays_complete_while_the_next_message_runs_with_nothing_on_disk() {
+    let conversation = Uuid::new_v4();
+    let (env, project_id, agy) = project_with_antigravity_agent(conversation);
+    let first = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agy], AGY_TOOL_USE_PROMPT),
+    )
+    .await
+    .unwrap();
+    wait_done(&env, project_id, first.send_id).await;
+    // The whole recorded turn, written during its own turn and over before
+    // the next message starts.
+    let (_, first_at) = journaled_turn(&env, project_id, first.send_id);
+    write_antigravity_transcript(
+        &env,
+        conversation,
+        &recorded_prefix(AGY_TOOL_USE, 7, first_at),
+    );
+    let first_ends = first_at + chrono::Duration::milliseconds(10);
+    while Utc::now() <= first_ends {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let gate = Arc::new(Notify::new());
+    let second = send_from_the_window_and_hold(&env, project_id, agy, "again", &gate).await;
+
+    let turns = agent_turns(&env, project_id, agy).await;
+    let latest = read_latest_reply(&env.state, project_id, agy, &env.home())
+        .await
+        .unwrap();
+    gate.notify_one();
+    assert_ne!(first.send_id, second);
+    assert_eq!(
+        turns,
+        vec![(
+            Some(first.send_id),
+            DigestTurnStatus::Complete,
+            None,
+            "SWITCHBOARD_AGY_PROBE_42".to_owned()
+        )],
+        "the running message claims no earlier reply"
+    );
+    assert_eq!(
+        (
+            latest.send_id,
+            latest.text.as_deref(),
+            latest.newer_turn_running
+        ),
+        (Some(first.send_id), Some("SWITCHBOARD_AGY_PROBE_42"), true),
+        "{latest:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_reply_whose_failure_is_journaled_while_still_open_in_the_ledger_reads_as_failed() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, agents[0], "go", &gate).await;
+    env.append_claude_turn(project_id, agents[0], "go", "half a reply", "m-go");
+    journal_early_link(&env, project_id, agents[0], sent, "m-go");
+    // When the harness reports a turn failed, the actor journals the failure
+    // before the turn's end reaches the ledger, so a read can find the failure
+    // while the ledger still holds the turn open.
+    let (turn_id, started_at) = journaled_turn(&env, project_id, sent);
+    switchboard_core::journal::append_record(
+        &env.journal_path(project_id),
+        &JournalRecord::Outcome {
+            send_id: sent,
+            turn_id,
+            agent_id: agents[0],
+            outcome: serde_json::to_value(TurnOutcome::Failed {
+                kind: switchboard_harness::FailureKind::HarnessError,
+                message: "the harness gave up".to_owned(),
+            })
+            .unwrap(),
+            started_at,
+            ended_at: Utc::now(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        agent_turns(&env, project_id, agents[0]).await,
+        vec![(
+            Some(sent),
+            DigestTurnStatus::Failed,
+            Some("the harness gave up".to_owned()),
+            "half a reply".to_owned()
+        )]
+    );
+    let conversation = read_conversation(&env.state, project_id, None, &env.home())
+        .await
+        .unwrap();
+    assert!(
+        conversation.items.iter().any(|item| matches!(
+            item,
+            DigestItem::AgentTurn {
+                send_id: Some(s),
+                failure_kind: Some(kind),
+                ..
+            } if *s == sent && kind == "harness_error"
+        )),
+        "the failure keeps its kind: {conversation:?}"
+    );
+    let page = read_reply(
+        &env.state,
+        project_id,
+        sent,
+        agents[0],
+        0,
+        ReadFrom::Auto,
+        OUTPUT_PAGE_CHARS,
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.status, SendStatus::Failed, "the reply reader agrees");
+    gate.notify_one();
+}
+
+/// What `wait_send` and `wait_any_send` say about `sent` under a one-second
+/// budget, and what forwarding `source`'s reply to it to `reader` does: the
+/// recipient's `(done, status, text)`, `any_done`, and the message the reader
+/// was sent or the forward's error code.
+async fn waits_and_a_forward_of(
+    env: &TestEnv,
+    project_id: ProjectId,
+    source: AgentId,
+    sent: Uuid,
+    reader: AgentId,
+) -> (
+    (bool, SendStatus, Option<String>),
+    bool,
+    Result<String, &'static str>,
+) {
+    let waited = wait_send(&env.state, project_id, sent, &short(), &env.home())
+        .await
+        .unwrap();
+    let any = wait_any_send(&env.state, project_id, vec![sent], &short(), &env.home())
+        .await
+        .unwrap();
+    let forwarded = match forward_at_once(
+        env,
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, source, sent)],
+            reader,
+            None,
+        ),
+    )
+    .await
+    {
+        Ok(receipt) => {
+            wait_done(env, project_id, receipt.send_id).await;
+            Ok(last_prompt(env))
+        }
+        Err(err) => Err(error_code(&err)),
+    };
+    (
+        (
+            waited.done,
+            waited.recipients[0].status,
+            waited.recipients[0].text.clone(),
+        ),
+        any.any_done,
+        forwarded,
+    )
+}
+
+#[tokio::test]
+async fn a_window_send_waiting_on_background_work_is_not_finished_to_the_waits_or_a_forward() {
+    let (env, project_id, agents) = project_with_agents(&["a", "reader"]);
+    let (a, reader) = (agents[0], agents[1]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, a, "go", &gate).await;
+    // Claude writes the turn's first cycle, end-of-turn marker included, while
+    // the turn waits on work it started in the background.
+    env.append_claude_turn(project_id, a, "go", "started the build", "m-go");
+    journal_early_link(&env, project_id, a, sent, "m-go");
+
+    assert_eq!(
+        waits_and_a_forward_of(&env, project_id, a, sent, reader).await,
+        (
+            (false, SendStatus::Running, None),
+            false,
+            Err(error_code::SOURCE_BUSY),
+        ),
+        "wait_send, wait_any_send, and the forward"
+    );
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_codex_window_send_still_being_written_is_not_finished_to_the_waits_or_a_forward() {
+    let (env, project_id, cx) = project_with_codex_agent();
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let reader = env.agent(project_id, "reader");
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, cx, "say ack", &gate).await;
+    // Through the answer's message: the turn's token count and its
+    // `task_complete` are still to be written, and Codex links its reply to
+    // its send only once the turn ends.
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 9, Utc::now()));
+
+    assert_eq!(
+        waits_and_a_forward_of(&env, project_id, cx, sent, reader).await,
+        (
+            (false, SendStatus::Running, None),
+            false,
+            Err(error_code::SOURCE_BUSY),
+        ),
+        "wait_send, wait_any_send, and the forward"
+    );
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_window_send_is_waited_on_until_its_turn_ends_and_then_reads_completed() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let mut script = Script::parked("the build passed", &gate);
+    script.key = Some("m-go".to_owned());
+    let sent = send_from_the_window(&env, project_id, agents[0], "go", script).await;
+    await_turn_running(&env.state, agents[0]).await;
+
+    let running = wait_send(&env.state, project_id, sent, &short(), &env.home())
+        .await
+        .unwrap();
+    assert!(!running.done, "not done while the turn runs: {running:?}");
+    gate.notify_one();
+    let ended = wait_send(
+        &env.state,
+        project_id,
+        sent,
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            ended.done,
+            ended.recipients[0].status,
+            ended.recipients[0].text.as_deref()
+        ),
+        (true, SendStatus::Completed, Some("the build passed")),
+        "{ended:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_window_send_still_running_when_the_wait_ends_reads_running_with_its_activity() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, agents[0], "go", &gate).await;
+    env.append_claude_turn(project_id, agents[0], "go", "started the build", "m-go");
+    journal_early_link(&env, project_id, agents[0], sent, "m-go");
+
+    let reply = wait_send(&env.state, project_id, sent, &short(), &env.home())
+        .await
+        .unwrap();
+    let recipient = &reply.recipients[0];
+    assert_eq!(
+        (
+            reply.done,
+            reply.source,
+            recipient.status,
+            recipient.text.as_deref(),
+            recipient.recent_text.as_deref(),
+            recipient.activity.is_some()
+        ),
+        (
+            false,
+            WaitSource::Journal,
+            SendStatus::Running,
+            None,
+            None,
+            true
+        ),
+        "running with the agent's activity, and no text: the ledger captures a turn's text only for a send it holds"
+    );
+    gate.notify_one();
+}
+
+/// Poll until the journal records `send_id` for `agent_id`, as the actor does
+/// as the agent's turn for it starts, or panic.
+async fn await_journaled(env: &TestEnv, project_id: ProjectId, send_id: Uuid, agent_id: AgentId) {
+    for _ in 0..500 {
+        let journaled = switchboard_core::journal::read_records(&env.journal_path(project_id))
+            .is_ok_and(|records| {
+                records.iter().any(|record| {
+                    matches!(record, JournalRecord::Send { send_id: s, agent_id: a, .. }
+                        if *s == send_id && *a == agent_id)
+                })
+            });
+        if journaled {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("send {send_id} was never journaled for agent {agent_id}");
+}
+
+/// Send `prompt` from the window with a turn whose harness the adapter holds
+/// starting until `gate` fires, and return once the send is journaled: the
+/// actor is then inside `dispatch`, answering no question, with no turn open.
+async fn send_from_the_window_and_hold_its_start(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    gate: &Arc<Notify>,
+) -> Uuid {
+    let sent = send_from_the_window(
+        env,
+        project_id,
+        agent_id,
+        "go",
+        Script::reply("ack").holding_dispatch(gate),
+    )
+    .await;
+    await_journaled(env, project_id, sent, agent_id).await;
+    assert_eq!(env.state.ledger.open_turn(agent_id), None);
+    sent
+}
+
+/// Wait for a reading of a send the ledger does not hold to reach its
+/// dispatcher question (after its journal read), and take the seam down so
+/// nothing else stops there.
+async fn await_work_question(env: &TestEnv, question: &crate::state::MaintenanceBarrier) {
+    tokio::time::timeout(Duration::from_secs(10), question.entered.notified())
+        .await
+        .expect("the reading asks the dispatcher whether the agent still holds work");
+    env.clear_seam(TestSeam::WorkQuestion);
+}
+
+#[tokio::test]
+async fn a_wait_on_a_window_send_whose_harness_is_still_starting_does_not_read_done() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold_its_start(&env, project_id, agents[0], &gate).await;
+
+    // No time to wait at all: the wait's last look blocks on the busy check
+    // until its finishing deadline, and then has no time left to read.
+    let started = std::time::Instant::now();
+    let waited = wait_send(
+        &env.state,
+        project_id,
+        sent,
+        &WaitBudget::new(Some(0), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    let elapsed = started.elapsed();
+    gate.notify_one();
+    assert!(
+        elapsed >= FINAL_OBSERVATION_GRACE,
+        "the look blocked on the actor: {elapsed:?}"
+    );
+    assert_eq!(
+        (waited.done, waited.recipients.len()),
+        (false, 0),
+        "{waited:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_forward_of_a_window_send_whose_harness_is_still_starting_is_told_to_wait() {
+    let (env, project_id, agents) = project_with_agents(&["a", "reader"]);
+    let (a, reader) = (agents[0], agents[1]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold_its_start(&env, project_id, a, &gate).await;
+
+    // The start-up stays held for the whole forward, so its budget runs out
+    // while it waits for the dispatcher's answer.
+    let forwarded = forward(
+        env.handle(),
+        env.home(),
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, a, sent)],
+            reader,
+            None,
+        ),
+        WaitBudget::new(Some(1), false),
+    )
+    .await;
+    gate.notify_one();
+    let err = forwarded.expect_err("the forward is refused");
+    assert!(
+        matches!(err.root(), AppError::SourceBusy { name, replies }
+            if name.is_empty() && *replies == vec![BusyReply { name: "a".to_owned(), send_id: sent }]),
+        "busy, naming the reply whose turn is starting: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(&format!(
+            "a's reply to send {sent} is still running, so nothing was sent — wait for that send with wait_send, then forward again"
+        )),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_busy_forward_gives_each_source_the_wait_that_fits_it() {
+    let (first, second) = (Uuid::now_v7(), Uuid::now_v7());
+    let reply = |name: &str, send_id| BusyReply {
+        name: name.to_owned(),
+        send_id,
+    };
+    let message = |name: &str, replies: Vec<BusyReply>| {
+        AppError::SourceBusy {
+            name: name.to_owned(),
+            replies,
+        }
+        .to_string()
+    };
+    let retry = "then forward again; the retry sends to every recipient it names, including any you cancelled";
+    assert_eq!(
+        message("lead", Vec::new()),
+        format!(
+            "lead is still responding, so nothing was sent — wait for it with wait_agent, {retry}"
+        )
+    );
+    assert_eq!(
+        message("", vec![reply("coder", first)]),
+        format!(
+            "coder's reply to send {first} is still running, so nothing was sent — wait for that send with wait_send, {retry}"
+        )
+    );
+    assert_eq!(
+        message("lead", vec![reply("coder", first), reply("tester", second)]),
+        format!(
+            "lead is still responding and coder's reply to send {first} is still running and tester's reply to send {second} is still running, so nothing was sent — wait for lead with wait_agent and wait for send {first} with wait_send and wait for send {second} with wait_send, {retry}"
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_timed_out_forward_still_asks_every_source_when_one_cannot_answer() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b", "reader"]);
+    let (a, b, reader) = (agents[0], agents[1], agents[2]);
+    let mut script = Script::reply("the build passed");
+    script.key = Some("m-go".to_owned());
+    let finished = send_from_the_window(&env, project_id, b, "go", script).await;
+    assert!(wait_done(&env, project_id, finished).await.done);
+    let gate = Arc::new(Notify::new());
+    let starting = send_from_the_window_and_hold_its_start(&env, project_id, a, &gate).await;
+
+    // a's start-up stays held for the whole forward, so a never answers
+    // whether it still holds work for its send; b is idle, its reply done.
+    let forwarded = forward(
+        env.handle(),
+        env.home(),
+        forward_to(
+            project_id,
+            vec![
+                named_reply(project_id, a, starting),
+                named_reply(project_id, b, finished),
+            ],
+            reader,
+            None,
+        ),
+        WaitBudget::new(Some(1), false),
+    )
+    .await;
+    gate.notify_one();
+    let err = forwarded.expect_err("the forward is refused");
+    assert!(
+        matches!(err.root(), AppError::SourceBusy { name, replies }
+            if name.is_empty() && *replies == vec![BusyReply { name: "a".to_owned(), send_id: starting }]),
+        "busy, naming only the reply whose turn is starting: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_timed_out_forward_leaves_out_a_held_reply_whose_agent_is_winding_down() {
+    let (env, project_id, agents) = project_with_agents(&["a", "lead", "reader"]);
+    let (a, lead, reader) = (agents[0], agents[1], agents[2]);
+    let (drain, gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    env.adapter
+        .push_for(a, Script::reply("the build passed").draining(&drain));
+    let held = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![a], "go"),
+    )
+    .await
+    .unwrap()
+    .send_id;
+    await_recipient_status(&env, held, a, SendStatus::Completed).await;
+    assert!(
+        env.state.dispatcher.has_work_for_send(a, held).await,
+        "a's turn for the send is still winding down"
+    );
+    send_from_the_window_and_hold(&env, project_id, lead, "go", &gate).await;
+
+    let forwarded = forward(
+        env.handle(),
+        env.home(),
+        forward_to(
+            project_id,
+            vec![
+                named_reply(project_id, a, held),
+                latest_answer(project_id, lead),
+            ],
+            reader,
+            None,
+        ),
+        WaitBudget::new(Some(1), false),
+    )
+    .await;
+    gate.notify_one();
+    drain.notify_one();
+    let err = forwarded.expect_err("the forward is refused");
+    assert!(
+        matches!(err.root(), AppError::SourceBusy { name, replies }
+            if name == "lead" && replies.is_empty()),
+        "busy, naming only the source still mid-turn: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_forward_during_a_start_up_that_fails_reports_the_failure() {
+    let (env, project_id, agents) = project_with_agents(&["a", "reader"]);
+    let (a, reader) = (agents[0], agents[1]);
+    let gate = Arc::new(Notify::new());
+    let mut script = Script::reply("ack").holding_dispatch(&gate);
+    script.fail_dispatch = true;
+    let sent = send_from_the_window(&env, project_id, a, "go", script).await;
+    await_journaled(&env, project_id, sent, a).await;
+    let question = env.seam(TestSeam::WorkQuestion);
+
+    let forwarding = tokio::spawn(forward(
+        env.handle(),
+        env.home(),
+        forward_to(
+            project_id,
+            vec![named_reply(project_id, a, sent)],
+            reader,
+            None,
+        ),
+        WaitBudget::default_wait(),
+    ));
+    await_work_question(&env, &question).await;
+    question.release.notify_one();
+    // The start-up fails, and journals its failure, after the forward read
+    // the journal.
+    gate.notify_one();
+    let forwarded = forwarding.await.unwrap();
+    assert!(
+        matches!(
+            forwarded.as_ref().map_err(AppError::root),
+            Err(AppError::ForwardReplyNotCompleted { send_id, state: "failed", .. }) if *send_id == sent
+        ),
+        "the forward reports the failed start-up: {forwarded:?}"
+    );
+}
+
+/// A message the window sent to two agents reaches the second, busy one only
+/// after its earlier turn: its copy is journaled while a reading of the
+/// message waits on the first agent's failing start-up.
+#[tokio::test]
+async fn a_recipient_first_journaled_between_the_two_reads_reads_running() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b"]);
+    let (a, b) = (agents[0], agents[1]);
+    let earlier = Arc::new(Notify::new());
+    send_from_the_window_and_hold(&env, project_id, b, "earlier", &earlier).await;
+    let (a_start, b_start) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let mut a_script = Script::reply("ack").holding_dispatch(&a_start);
+    a_script.fail_dispatch = true;
+    env.adapter.push_for(a, a_script);
+    env.adapter
+        .push_for(b, Script::reply("b's answer").holding_dispatch(&b_start));
+    let sent = Uuid::now_v7();
+    for agent_id in [a, b] {
+        send_message_impl(&env.state, agent_id, "go", Vec::new(), sent, &env.home())
+            .await
+            .unwrap();
+    }
+    await_journaled(&env, project_id, sent, a).await;
+    let question = env.seam(TestSeam::WorkQuestion);
+
+    let reading = tokio::spawn({
+        let (state, home) = (Arc::clone(&env.state), env.home());
+        async move {
+            super::send::current_send(&state, project_id, sent, &home)
+                .await
+                .map(|current| current.reply)
+        }
+    });
+    await_work_question(&env, &question).await;
+    // While the reading waits on a's answer, b's earlier turn ends and b's
+    // turn for the message is journaled, its harness still starting.
+    earlier.notify_one();
+    await_journaled(&env, project_id, sent, b).await;
+    question.release.notify_one();
+    a_start.notify_one();
+    let reply = reading.await.unwrap().unwrap();
+    b_start.notify_one();
+    let statuses: Vec<(AgentId, SendStatus)> = reply
+        .recipients
+        .iter()
+        .map(|recipient| (recipient.agent_id, recipient.status))
+        .collect();
+    assert_eq!(
+        (reply.done, statuses),
+        (
+            false,
+            vec![(a, SendStatus::Failed), (b, SendStatus::Running)]
+        ),
+        "{reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_window_send_cancelled_while_waited_on_reads_cancelled() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let mut script = Script::parked("half a reply", &gate);
+    script.key = Some("m-go".to_owned());
+    let sent = send_from_the_window(&env, project_id, agents[0], "go", script).await;
+    await_turn_running(&env.state, agents[0]).await;
+    journal_early_link(&env, project_id, agents[0], sent, "m-go");
+    // The window's stop control on that reply. The turn leaves its partial
+    // reply on disk, looking finished, so only the journaled cancellation says
+    // it did not finish.
+    crate::commands::cancel_send_impl(&env.state, sent, &[agents[0]]);
+
+    let reply = wait_send(
+        &env.state,
+        project_id,
+        sent,
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (reply.done, reply.recipients[0].status),
+        (true, SendStatus::Cancelled),
+        "{reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_wait_on_the_first_of_two_queued_window_sends_returns_when_the_first_ends() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let a = agents[0];
+    let (first_gate, second_gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let mut first_script = Script::parked("one", &first_gate);
+    first_script.key = Some("m-one".to_owned());
+    let first = send_from_the_window(&env, project_id, a, "one", first_script).await;
+    await_open_turn(&env, a, first).await;
+    let second =
+        send_from_the_window(&env, project_id, a, "two", Script::parked("", &second_gate)).await;
+    // A wait already parked on the first when its turn ends and the agent
+    // moves on to the second. The short wait beside it runs a full second, by
+    // which time the long one has looked once and parked.
+    let (state, home) = (Arc::clone(&env.state), env.home());
+    let waiter = tokio::spawn(async move {
+        wait_send(
+            &state,
+            project_id,
+            first,
+            &WaitBudget::new(Some(30), false),
+            &home,
+        )
+        .await
+    });
+    let still_running = wait_send(&env.state, project_id, first, &short(), &env.home())
+        .await
+        .unwrap();
+    assert!(!still_running.done, "{still_running:?}");
+    first_gate.notify_one();
+    let first_reply = waiter.await.unwrap().unwrap();
+    await_open_turn(&env, a, second).await;
+    let second_reply = wait_send(&env.state, project_id, second, &short(), &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            (
+                first_reply.done,
+                first_reply.recipients[0].status,
+                first_reply.recipients[0].text.as_deref()
+            ),
+            (second_reply.done, second_reply.recipients[0].status)
+        ),
+        (
+            (true, SendStatus::Completed, Some("one")),
+            (false, SendStatus::Running)
+        ),
+        "the first is over once the agent has moved on to the second"
+    );
+    second_gate.notify_one();
+}
+
+/// Poll until the ledger shows no turn open on the agent, or panic.
+async fn await_no_open_turn(env: &TestEnv, agent_id: AgentId) {
+    for _ in 0..500 {
+        if env.state.ledger.open_turn(agent_id).is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("agent {agent_id}'s turn never ended");
+}
+
+#[tokio::test]
+async fn a_window_send_winding_down_after_its_turn_ends_is_not_done_until_it_has() {
+    let (env, project_id, cx) = project_with_codex_agent();
+    let (park, drain) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let mut script = Script::parked("", &park).draining(&drain);
+    script.key = Some(CODEX_TEXT_ONLY_TURN.to_owned());
+    let sent = send_from_the_window(&env, project_id, cx, "say ack", script).await;
+    await_open_turn(&env, cx, sent).await;
+    // This models the timing `docs/harness-behavior.md` records as unmeasured
+    // (G50), not observed Codex behaviour: the turn has ended and Codex is
+    // still exiting, and its rollout does not yet hold the turn's token count
+    // or `task_complete`.
+    let start = Utc::now();
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 9, start));
+    park.notify_one();
+    await_no_open_turn(&env, cx).await;
+
+    let winding_down = wait_send(&env.state, project_id, sent, &short(), &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        (winding_down.done, winding_down.recipients[0].status),
+        (false, SendStatus::Running),
+        "{winding_down:?}"
+    );
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 11, start));
+    drain.notify_one();
+    let ended = wait_send(
+        &env.state,
+        project_id,
+        sent,
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            ended.done,
+            ended.recipients[0].status,
+            ended.recipients[0].text.as_deref()
+        ),
+        (true, SendStatus::Completed, Some("ack")),
+        "{ended:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_forward_of_a_window_send_winding_down_is_told_to_wait_then_sends_the_reply() {
+    let (env, project_id, cx) = project_with_codex_agent();
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let reader = env.agent(project_id, "reader");
+    let (park, drain) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let mut script = Script::parked("", &park).draining(&drain);
+    script.key = Some(CODEX_TEXT_ONLY_TURN.to_owned());
+    let sent = send_from_the_window(&env, project_id, cx, "say ack", script).await;
+    await_open_turn(&env, cx, sent).await;
+    // The same unmeasured timing as the wait test above (G50): the turn has
+    // ended, Codex is still exiting, and its rollout lacks `task_complete`.
+    let start = Utc::now();
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 9, start));
+    park.notify_one();
+    await_no_open_turn(&env, cx).await;
+    let forward_the_reply = || {
+        forward_at_once(
+            &env,
+            forward_to(
+                project_id,
+                vec![named_reply(project_id, cx, sent)],
+                reader,
+                None,
+            ),
+        )
+    };
+
+    let winding_down = forward_the_reply().await;
+    assert_eq!(
+        winding_down.map(|_| ()).map_err(|err| error_code(&err)),
+        Err(error_code::SOURCE_BUSY),
+        "told to wait, not that the reply cannot be confirmed"
+    );
+    write_codex_rollout(&env, &recorded_prefix(CODEX_TEXT_ONLY, 11, start));
+    drain.notify_one();
+    wait_done(&env, project_id, sent).await;
+    let receipt = forward_the_reply().await.unwrap();
+    let delivered = wait_done(&env, project_id, receipt.send_id).await;
+    assert_eq!(
+        (delivered.done, delivered.recipients[0].status),
+        (true, SendStatus::Completed),
+        "{delivered:?}"
+    );
+    assert!(
+        last_prompt(&env)
+            .contains("=== START forwarded from cx ===\nack\n=== END forwarded from cx ==="),
+        "{}",
+        last_prompt(&env)
+    );
+}
+
+#[tokio::test]
+async fn a_finished_window_send_stays_done_while_its_agent_compacts() {
+    let (env, project_id, agent_id) = compactable_agent();
+    let mut script = Script::reply("the build passed");
+    script.key = Some("m-go".to_owned());
+    let sent = send_from_the_window(&env, project_id, agent_id, "go", script).await;
+    let finished = wait_done(&env, project_id, sent).await;
+    assert!(finished.done, "{finished:?}");
+    // A compaction whose harness is still exiting after its end: the agent
+    // has work, but none of it is the finished message's.
+    let drain = Arc::new(Notify::new());
+    env.adapter.push(Script::reply("").draining(&drain));
+    let compaction = compact_now(&env, compact_request(project_id, agent_id, None))
+        .await
+        .unwrap();
+    wait_done(&env, project_id, compaction.send_id).await;
+    assert!(env.state.dispatcher.has_pending_work(agent_id).await);
+
+    let reply = wait_send(&env.state, project_id, sent, &short(), &env.home())
+        .await
+        .unwrap();
+    drain.notify_one();
+    assert_eq!(
+        (
+            reply.done,
+            reply.recipients[0].status,
+            reply.recipients[0].text.as_deref()
+        ),
+        (true, SendStatus::Completed, Some("the build passed")),
+        "{reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_removed_or_moved_mid_turn_leaves_no_turn_open() {
+    let (env, project_id, agents) = project_with_agents(&["removed", "moved"]);
+    let (removed, moved) = (agents[0], agents[1]);
+    let gates = [Arc::new(Notify::new()), Arc::new(Notify::new())];
+    let to_removed =
+        send_from_the_window_and_hold(&env, project_id, removed, "go", &gates[0]).await;
+    let to_moved = send_from_the_window_and_hold(&env, project_id, moved, "go", &gates[1]).await;
+
+    // Removal goes through the dispatcher's `remove_agent`, a folder change
+    // through its `shutdown_agent`: each cancels the turn and drains it.
+    crate::commands::remove_agent_impl(&env.state, removed)
+        .await
+        .unwrap();
+    let folder = tempfile::TempDir::new().unwrap();
+    crate::commands::set_project_directory_impl(
+        &env.state,
+        project_id,
+        folder.path().to_str().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        (
+            env.state.ledger.open_turn(removed),
+            env.state.ledger.open_turn(moved)
+        ),
+        (None, None)
+    );
+    for sent in [to_removed, to_moved] {
+        let reply = wait_send(&env.state, project_id, sent, &short(), &env.home())
+            .await
+            .unwrap();
+        assert_eq!(
+            (reply.done, reply.recipients[0].status),
+            (true, SendStatus::Cancelled),
+            "{reply:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wait_any_send_waits_on_a_window_send_beside_one_it_holds() {
+    let (env, project_id, agents) = project_with_agents(&["a", "b"]);
+    let (a, b) = (agents[0], agents[1]);
+    let (window_gate, held_gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let window = send_from_the_window_and_hold(&env, project_id, a, "go", &window_gate).await;
+    env.adapter
+        .push_for(b, Script::parked("b's answer", &held_gate));
+    let held = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![b], "hi"),
+    )
+    .await
+    .unwrap()
+    .send_id;
+    await_open_turn(&env, b, held).await;
+
+    let statuses = |reply: &super::send::WaitAnySendReply| -> (bool, Vec<(bool, SendStatus)>) {
+        (
+            reply.any_done,
+            reply
+                .sends
+                .iter()
+                .map(|send| (send.done, send.recipients[0].status))
+                .collect(),
+        )
+    };
+    let both_running = wait_any_send(
+        &env.state,
+        project_id,
+        vec![window, held],
+        &short(),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    held_gate.notify_one();
+    let one_done = wait_any_send(
+        &env.state,
+        project_id,
+        vec![window, held],
+        &WaitBudget::new(Some(30), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (statuses(&both_running), statuses(&one_done)),
+        (
+            (
+                false,
+                vec![(false, SendStatus::Running), (false, SendStatus::Running)]
+            ),
+            (
+                true,
+                vec![(false, SendStatus::Running), (true, SendStatus::Completed)]
+            )
+        )
+    );
+    window_gate.notify_one();
+}
+
+#[tokio::test]
+async fn a_reply_compacted_part_way_reads_as_running_in_both_pieces() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let sent = send_from_the_window_and_hold(&env, project_id, agents[0], "go", &gate).await;
+    // The harness compacted its context during the turn: the piece before,
+    // the summary, and the piece after, which carries no send.
+    env.append_claude_records(
+        project_id,
+        agents[0],
+        &split_by_compaction("before", "after"),
+    );
+    journal_early_link(&env, project_id, agents[0], sent, "m1");
+
+    assert_eq!(
+        agent_turns(&env, project_id, agents[0]).await,
+        vec![
+            (
+                Some(sent),
+                DigestTurnStatus::Running,
+                None,
+                "before".to_owned()
+            ),
+            (None, DigestTurnStatus::Running, None, "after".to_owned()),
+        ]
+    );
+    let latest = read_latest_reply(&env.state, project_id, agents[0], &env.home())
+        .await
+        .unwrap();
+    assert_eq!(
+        (latest.status, latest.text),
+        (LatestReplyStatus::None, None),
+        "neither piece of the running reply is a finished answer"
+    );
+    assert!(latest.newer_turn_running);
+    gate.notify_one();
 }
 
 // --- The window round trip, through the production `WindowSync` ---
@@ -9087,9 +10543,15 @@ async fn read_workflow_run_returns_each_rounds_replies_under_its_own_step() {
     }
     let run_id = run_rounds(&env, project_id, &reviewers).await;
 
-    let run = read_workflow_run(&env.state, project_id, run_id, &env.home())
-        .await
-        .unwrap();
+    let run = read_workflow_run(
+        &env.state,
+        project_id,
+        run_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(run.status, WorkflowRunStatus::Completed);
     assert!(run.done);
     assert!(!run.sends_unavailable);
@@ -9156,9 +10618,15 @@ async fn read_workflow_run_on_a_running_run_reports_its_recipient_running_from_t
 
     let mut run = None;
     for _ in 0..100 {
-        let read = read_workflow_run(&env.state, project_id, run_id, &env.home())
-            .await
-            .unwrap();
+        let read = read_workflow_run(
+            &env.state,
+            project_id,
+            run_id,
+            &env.home(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         if read
             .sends
             .first()
@@ -9213,13 +10681,70 @@ async fn read_workflow_run_reports_a_failed_steps_reply_as_failed() {
     .await
     .unwrap();
 
-    let run = read_workflow_run(&env.state, project_id, run_id, &env.home())
-        .await
-        .unwrap();
+    let run = read_workflow_run(
+        &env.state,
+        project_id,
+        run_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(run.status, WorkflowRunStatus::Failed);
     assert!(run.reason.is_some());
     assert_eq!(run.sends.len(), 1, "the reviewers were never sent to");
     assert_eq!(run.sends[0].recipients[0].reply.status, SendStatus::Failed);
+}
+
+#[tokio::test]
+async fn read_workflow_run_stops_on_cancel_while_a_recipient_cannot_answer() {
+    let (env, project_id, agents) = workflow_env().await;
+    for (agent, text) in agents
+        .iter()
+        .zip(["greeting", "first review", "second review"])
+    {
+        env.adapter.push_for(*agent, Script::reply(text));
+    }
+    let run_id = run_workflow(
+        &env.state,
+        &env.home(),
+        pair_request(project_id, &agents),
+        &WaitBudget::default_wait(),
+    )
+    .await
+    .unwrap();
+    wait_workflow(
+        &env.state,
+        project_id,
+        run_id,
+        &WaitBudget::new(Some(30), false),
+    )
+    .await
+    .unwrap();
+    // Read from the journal, the coder's reply asks its actor whether it
+    // still holds work for the send; the seam holds that question unanswered,
+    // as an actor starting a turn leaves it.
+    let greeting = workflow_sends(&env, project_id, run_id, 2).await[0];
+    env.state.ledger.forget_send(greeting);
+    let question = env.seam(TestSeam::WorkQuestion);
+    let (home, cancel) = (env.home(), CancellationToken::new());
+
+    let read = tokio::time::timeout(
+        Duration::from_secs(10),
+        read_workflow_run(&env.state, project_id, run_id, &home, &cancel),
+    );
+    let stop = async {
+        tokio::time::timeout(Duration::from_secs(10), question.entered.notified())
+            .await
+            .expect("the read asks the coder's actor about its reply");
+        cancel.cancel();
+    };
+    let (read, ()) = tokio::join!(read, stop);
+    env.clear_seam(TestSeam::WorkQuestion);
+    assert!(
+        matches!(read, Ok(Err(AppError::Interrupted))),
+        "the read ends on the server's stop: {read:?}"
+    );
 }
 
 #[tokio::test]
@@ -9244,9 +10769,15 @@ async fn read_workflow_run_after_a_restart_knows_a_held_failed_run_but_not_its_s
     .unwrap();
     let env = env.restart();
 
-    let run = read_workflow_run(&env.state, project_id, failed, &env.home())
-        .await
-        .unwrap();
+    let run = read_workflow_run(
+        &env.state,
+        project_id,
+        failed,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(run.status, WorkflowRunStatus::Failed);
     assert!(run.sends_unavailable, "its sends are not known, not absent");
     assert!(run.sends.is_empty());
@@ -9257,9 +10788,15 @@ async fn read_workflow_run_after_a_restart_does_not_know_a_completed_run() {
     let (env, project_id, reviewers) = rounds_env();
     let run_id = run_rounds(&env, project_id, &reviewers).await;
     let env = env.restart();
-    let err = read_workflow_run(&env.state, project_id, run_id, &env.home())
-        .await
-        .unwrap_err();
+    let err = read_workflow_run(
+        &env.state,
+        project_id,
+        run_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error_code(&err), error_code::RUN_UNKNOWN, "{err:?}");
 }
 
@@ -9268,9 +10805,15 @@ async fn read_workflow_run_under_another_project_is_run_unknown() {
     let (mut env, project_id, reviewers) = rounds_env();
     let other = env.project("other");
     let run_id = run_rounds(&env, project_id, &reviewers).await;
-    let err = read_workflow_run(&env.state, other, run_id, &env.home())
-        .await
-        .unwrap_err();
+    let err = read_workflow_run(
+        &env.state,
+        other,
+        run_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error_code(&err), error_code::RUN_UNKNOWN, "{err:?}");
 }
 
@@ -9286,9 +10829,15 @@ async fn read_workflow_run_cuts_long_replies_evenly_and_each_cut_reads_on() {
         }
     }
     let run_id = run_rounds(&env, project_id, &reviewers).await;
-    let run = read_workflow_run(&env.state, project_id, run_id, &env.home())
-        .await
-        .unwrap();
+    let run = read_workflow_run(
+        &env.state,
+        project_id,
+        run_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     let budget = 45_000;
     let fitted = fit(
@@ -9373,9 +10922,15 @@ async fn read_workflow_run_reads_a_send_it_no_longer_holds_from_disk() {
     let review = ended.sends[1].send_id;
     wait_done(&env, project_id, review).await;
 
-    let live = read_workflow_run(&env.state, project_id, run_id, &env.home())
-        .await
-        .unwrap();
+    let live = read_workflow_run(
+        &env.state,
+        project_id,
+        run_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     let r2_live = &live.sends[1].recipients[1].reply;
     assert_eq!(r2_live.status, SendStatus::Rejected, "{r2_live:?}");
     assert!(r2_live.code.is_some(), "the ledger says why");
@@ -9383,9 +10938,15 @@ async fn read_workflow_run_reads_a_send_it_no_longer_holds_from_disk() {
     for send in &ended.sends {
         env.state.ledger.forget_send(send.send_id);
     }
-    let read = read_workflow_run(&env.state, project_id, run_id, &env.home())
-        .await
-        .unwrap();
+    let read = read_workflow_run(
+        &env.state,
+        project_id,
+        run_id,
+        &env.home(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert!(!read.sends_unavailable, "the run itself is still held");
     assert!(read.sends.iter().all(|s| s.source == WaitSource::Journal));
     assert_eq!(

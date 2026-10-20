@@ -452,12 +452,13 @@ tools! {
              and nothing is sent: call wait_agent on the source, then retry. A source whose \
              latest turn failed or was cancelled is still forwarded, as a note saying so in \
              place of an answer: check a source's status first. A source with send_id sends its \
-             reply to that send instead, verbatim, whatever the agent has said since, and never \
-             waits: a reply still to be sent, waiting in line, or running refuses the forward \
-             at once (source_busy: wait_send on that send, then retry); one that failed, was \
+             reply to that send instead, verbatim, whatever the agent has said since: a reply \
+             still to be sent, waiting in line, or running refuses the forward (source_busy: \
+             wait_send on that send, then retry); one that failed, was \
              cancelled, or never reached the agent refuses it (invalid_argument), as does one \
-             Switchboard cannot tie to the send (it may still be running, the app may have \
-             restarted, or it cannot tell which turn answered: read it with read_reply \
+             Switchboard cannot tie to the send (the app may have restarted, or it cannot \
+             tell which turn answered, as for an Antigravity reply to a message the user \
+             typed: read it with read_reply \
              and send its text yourself); a send the agent did not receive in the source's \
              project, or whose reply has not started, is send_unknown. A source with no answer text refuses the forward (invalid_argument). \
              A refused forward sends nothing. With a saved prompt, forward_args fills a prompt \
@@ -500,8 +501,13 @@ tools! {
          Switchboard's window is refused: tell the user instead.";
     WaitSend = "wait_send" (WaitSendArgs) [Read, Wait]
         format!(
-            "Wait for a send's replies: one you made, or one a workflow made (wait_workflow \
-             lists those). Returns when every recipient has finished or timeout_seconds passes, \
+            "Wait for a send's replies: one you made, one a workflow made (wait_workflow \
+             lists those), or a message the user typed in the window (read_conversation gives \
+             its send_id; its running recipients carry no recent_text). Such a message to \
+             several agents lists each only once its turn starts, so done can be true before \
+             one still waiting in line has started; one to an Antigravity agent ends started, \
+             since Antigravity links no reply to its send: read the reply with read_reply. \
+             Returns when every recipient has finished or timeout_seconds passes, \
              with the current state either way: call again until done is true. While not done, \
              recipients carry statuses, and each running one its activity (as list_agents \
              describes it) and recent_text: the last 500 characters it has written in this turn \
@@ -513,8 +519,8 @@ tools! {
              line), running, completed, failed, cancelled, rejected, not_dispatched; and only \
              with source journal, started: the send started but its outcome could not be \
              confirmed (often a restart cut the reply off), so ask the agent where it got to. \
-             source is live, journal (read after a restart, or for a send older than \
-             Switchboard's record of it), or unknown: this project has no record of the send, so \
+             source is live, journal (a message typed in the window, a send older than \
+             Switchboard's record of it, or after a restart), or unknown: this project has no record of the send, so \
              check project_id and send_id; a message still waiting in line when the app restarted \
              was never sent and reads this way too. Long replies share the result evenly, each cut \
              one listed in truncated with the read_reply call that reads on. When done, \
@@ -1421,7 +1427,8 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
         ToolName::ReadWorkflowRun => {
             let a: ReadWorkflowRunArgs = parse(args)?;
             let replies =
-                workflow::read_workflow_run(state, a.project_id, a.run_id, cx.home()).await?;
+                workflow::read_workflow_run(state, a.project_id, a.run_id, cx.home(), &cx.cancel)
+                    .await?;
             Reply::fitted(
                 &replies,
                 workflow::read_workflow_run_budget(a.project_id, cx.result_chars(a.max_chars)),

@@ -171,6 +171,11 @@ pub enum TestSeam {
     /// Inside the blocking copy of an attachment into the project. Holds it as
     /// a stalled drive would, so a test can prove a cancel stops the send.
     AttachmentCopy,
+    /// Inside a reading of a send the ledger does not hold, immediately before
+    /// it asks the dispatcher whether an agent still holds work for the send,
+    /// after the reading's journal read. Holds the reading there so a test can
+    /// change what the journal holds before the answer is built.
+    WorkQuestion,
 }
 
 /// Two-way handshake for a [`TestSeam`].

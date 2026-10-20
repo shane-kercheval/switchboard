@@ -7,6 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use switchboard_core::{ProjectId, SendId};
 use switchboard_workflow::InputValue;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::commands::{ForwardSourceRef, open_project_impl, resolve_workflow_forwards};
@@ -532,11 +533,17 @@ pub struct RunReply {
 /// or never offered because the step failed) reads `not_dispatched`: only the
 /// ledger recorded why, and the journal holds nothing for a recipient that was
 /// never sent the message.
+///
+/// Reading such a send can ask a recipient's actor whether it still holds work
+/// for it, and an actor answers nothing while it prepares a turn, so the read
+/// ends on `cancel` (the server's stop) with `Interrupted`, as `list_agents`
+/// does.
 pub async fn read_workflow_run(
     state: &AppState,
     project_id: ProjectId,
     run_id: Uuid,
     home_dir: &Path,
+    cancel: &CancellationToken,
 ) -> Result<WorkflowRunReplies, AppError> {
     let run = match observe_run(state, project_id, run_id) {
         Some(run) => run,
@@ -544,9 +551,12 @@ pub async fn read_workflow_run(
     };
     let mut sends = Vec::with_capacity(run.sends.len());
     for send in run.sends {
-        let current = current_send(state, project_id, send.send_id, home_dir)
-            .await?
-            .reply;
+        let current = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(AppError::Interrupted),
+            current = current_send(state, project_id, send.send_id, home_dir) => current?,
+        }
+        .reply;
         let recipients = send
             .recipients
             .iter()

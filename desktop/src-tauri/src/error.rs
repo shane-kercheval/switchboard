@@ -178,9 +178,13 @@ pub enum AppError {
 
     /// A forward named a source's reply by `send_id` while that reply is
     /// still to be sent, waiting in line, or running. A named reply is never
-    /// waited for, so nothing was sent. Each of these states arises only for a
-    /// send Switchboard follows live, which `wait_send` follows to its end;
-    /// `wait_agent` would return at once for an agent the send has not reached.
+    /// waited for, so nothing was sent; reading its status may wait while its
+    /// agent starts a turn, within the call's budget. Each of these states
+    /// arises for a send Switchboard follows live, and `running` also for a
+    /// message the window sent while its agent's turn for it is starting,
+    /// open, or winding down; `wait_send` follows either to its end, while
+    /// `wait_agent` would return at once for an agent the send has not
+    /// reached.
     #[error(
         "{name}'s reply to send {send_id} is still {state}, so nothing was sent: wait for that send with wait_send, then forward again"
     )]
@@ -208,7 +212,7 @@ pub enum AppError {
     /// answer, so it is refused; the caller can read it, see how it was
     /// matched, and send its text itself. Nothing was sent.
     #[error(
-        "Switchboard cannot confirm a finished reply from {name} to send {send_id}, so nothing was sent. The reply may still be running, the app may have restarted while it ran, or Switchboard can't tell which turn answered that send. Read it with read_reply, which says how the reply was matched, and if it is the one you want, send its text with send"
+        "Switchboard cannot confirm a finished reply from {name} to send {send_id}, so nothing was sent. The app may have restarted while it ran, or Switchboard can't tell which turn answered that send (an Antigravity agent's replies carry no link to their sends). Read it with read_reply, which says how the reply was matched, and if it is the one you want, send its text with send"
     )]
     ForwardReplyUnconfirmed { name: String, send_id: SendId },
 
@@ -695,12 +699,17 @@ pub enum AppError {
         message: String,
     },
 
-    /// A forward's source is still mid-turn past the caller's wait budget.
-    /// The compose was cancelled and nothing was dispatched.
-    #[error(
-        "{name} is still responding, so nothing was sent — wait for it with wait_agent, then forward again; the retry sends to every recipient it names, including any you cancelled"
-    )]
-    SourceBusy { name: String },
+    /// A forward's sources are still mid-turn past the caller's wait budget.
+    /// The compose was cancelled and nothing was dispatched. `name` lists the
+    /// sources forwarded by their latest answer, which `wait_agent` waits for,
+    /// empty when none of them is busy; `replies` the replies named by their
+    /// send, which `wait_send` on that send waits for. The message gives each
+    /// the wait that fits it ([`source_busy_message`]).
+    #[error("{}", source_busy_message(.name, .replies))]
+    SourceBusy {
+        name: String,
+        replies: Vec<BusyReply>,
+    },
 
     /// A caller-supplied argument is malformed or inconsistent, including a
     /// retry key reused for a different request.
@@ -799,6 +808,46 @@ fn too_large_message(read_with: Option<&'static str>) -> String {
         }
         None => "the result is too large to return".to_owned(),
     }
+}
+
+/// A reply a forward named by its send, still running when the forward gave
+/// up waiting: see [`AppError::SourceBusy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusyReply {
+    pub name: String,
+    pub send_id: SendId,
+}
+
+/// [`AppError::SourceBusy`]'s message: each busy source, then the wait that
+/// fits it. A source forwarded by its latest answer alone keeps the wording
+/// that predates named replies.
+fn source_busy_message(name: &str, replies: &[BusyReply]) -> String {
+    let mut busy: Vec<String> = Vec::new();
+    let mut waits: Vec<String> = Vec::new();
+    if !name.is_empty() {
+        busy.push(format!("{name} is still responding"));
+        waits.push(if replies.is_empty() {
+            "wait for it with wait_agent".to_owned()
+        } else {
+            format!("wait for {name} with wait_agent")
+        });
+    }
+    for reply in replies {
+        busy.push(format!(
+            "{}'s reply to send {} is still running",
+            reply.name, reply.send_id
+        ));
+        waits.push(if name.is_empty() && replies.len() == 1 {
+            "wait for that send with wait_send".to_owned()
+        } else {
+            format!("wait for send {} with wait_send", reply.send_id)
+        });
+    }
+    format!(
+        "{}, so nothing was sent — {}, then forward again; the retry sends to every recipient it names, including any you cancelled",
+        busy.join(" and "),
+        waits.join(" and ")
+    )
 }
 
 impl AppError {

@@ -223,6 +223,17 @@ pub(crate) async fn wait_at_ops_dispatch_seam(state: &AppState) {
 #[expect(clippy::unused_async, reason = "matches the cfg(test) signature")]
 pub(crate) async fn wait_at_ops_dispatch_seam(_state: &AppState) {}
 
+/// Hold a reading of a send the ledger does not hold at its dispatcher
+/// question when a test asks. See [`crate::state::TestSeam::WorkQuestion`].
+#[cfg(test)]
+pub(crate) async fn wait_at_work_question_seam(state: &AppState) {
+    wait_at_seam(test_seam(state, crate::state::TestSeam::WorkQuestion)).await;
+}
+
+#[cfg(not(test))]
+#[expect(clippy::unused_async, reason = "matches the cfg(test) signature")]
+pub(crate) async fn wait_at_work_question_seam(_state: &AppState) {}
+
 /// Hold [`capture_dispatch_snapshot`] open **between its two reads**, inside the
 /// `registry_write` guard, when a test asks. See [`crate::state::TestSeam::Capture`].
 ///

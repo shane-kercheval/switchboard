@@ -149,6 +149,44 @@ async fn live_claude_background_agent_completes_as_one_turn() {
         matches!(events.last(), Some(AdapterEvent::TurnEnd { .. })),
         "the terminal arrives after all content"
     );
+
+    // Reporting a background sub-agent as work running apart from the agent
+    // rests on this, observed at 2.1.198: its task names the Agent call that
+    // launched it, and that call closes (the launch returns at once) before
+    // the task ends, inside the turn.
+    let agent_call = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::ToolStarted {
+                tool_use_id, name, ..
+            } if name == "Agent" => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no Agent call launched the sub-agent; events: {events:?}"));
+    let task = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::TaskStarted {
+                task_id,
+                tool_use_id,
+                ..
+            } if tool_use_id.as_deref() == Some(agent_call.as_str()) => Some(task_id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no task names the Agent call {agent_call}; events: {events:?}"));
+    let call_closed = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::ToolCompleted { tool_use_id, .. } if *tool_use_id == agent_call))
+        .unwrap_or_else(|| panic!("the Agent call {agent_call} never closed; events: {events:?}"));
+    let task_ended = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::TaskEnded { task_id, .. } if *task_id == task))
+        .unwrap_or_else(|| panic!("task {task} never ended; events: {events:?}"));
+    assert!(
+        call_closed < task_ended,
+        "a background launch closes its call before its task ends: call closed at event \
+         {call_closed}, task ended at event {task_ended}; events: {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -2176,12 +2214,27 @@ async fn live_codex_world_state_yields_inventory() {
         .as_deref()
         .expect("`turn_context` + `world_state.environments` must still yield settings pairs");
     let labels: Vec<&str> = settings.iter().map(|p| p.label.as_str()).collect();
-    for expected in ["Sandbox", "Approval policy", "Shell", "Timezone"] {
+    for expected in [
+        "Sandbox",
+        "Approval policy",
+        "Personality",
+        "Shell",
+        "Timezone",
+    ] {
         assert!(
             labels.contains(&expected),
             "the settings line must still carry `{expected}`; got {labels:?}"
         );
     }
+    // Since Codex 0.163 the first turn writes its own `thread_settings_applied`,
+    // the only record that carries the personality, so the row shows the
+    // requested value from turn one.
+    assert!(
+        settings
+            .iter()
+            .any(|p| p.label == "Personality" && p.value == LIVE_CODEX_PERSONALITY),
+        "the first turn's settings must show the requested personality; got {settings:?}"
+    );
     assert!(
         inventory.approved_commands.is_some(),
         "`world_state.permissions.approved_command_prefixes` must still be reported — absent \
@@ -2230,20 +2283,27 @@ async fn live_codex_world_state_yields_inventory() {
             .is_some_and(|s| !s.is_empty()),
         "the resume turn's inventory must be read fresh from the rollout, not left empty"
     );
-    // Since Codex 0.162 the personality reaches the rollout only through the
-    // resumed turn's `thread_settings_applied`, so this is the one turn that
-    // can show it. Read the record straight from the file rather than through
-    // our parser, so a parser bug cannot agree with itself: its absence means
-    // Codex stopped writing it on resume, and a different value means the
-    // requested personality no longer reaches it.
+    // Since Codex 0.162 the personality reaches the rollout only through a
+    // `thread_settings_applied` record, which a resumed turn writes (and,
+    // since 0.163, the first turn too). Both turns request the same
+    // personality, so only a record written after the first turn's
+    // `task_complete` proves the resume wrote its own. It is read straight
+    // from the file rather than through our parser, so a parser bug cannot
+    // agree with itself: its absence means Codex stopped writing one on
+    // resume, and a different value means the requested personality no
+    // longer reaches it. The row check after it proves the card still shows
+    // the personality on a resumed turn; it cannot tell which turn's record
+    // supplied it.
     let rollout = switchboard_harness::codex::session_file::locate_session_file(
         &home_dir(),
         partition_date,
         &thread_id,
     )
     .expect("the resumed session's rollout must be on disk");
-    let recorded = last_thread_settings(&rollout)
-        .expect("the resumed turn must write a `thread_settings_applied` record");
+    let recorded = resumed_thread_settings(&rollout).expect(
+        "the resumed turn must write a `thread_settings_applied` record after the first turn's \
+         `task_complete`",
+    );
     assert_eq!(
         recorded["personality"], LIVE_CODEX_PERSONALITY,
         "the resumed turn's `thread_settings_applied` must carry the requested personality; \
@@ -2282,16 +2342,20 @@ fn codex_wrapper_requesting_personality(dir: &Path, personality: &str) -> std::p
 }
 
 /// The `thread_settings` object of the last `thread_settings_applied` record
-/// in a rollout, read as raw JSON. `None` when the rollout has no such record.
-fn last_thread_settings(rollout: &Path) -> Option<serde_json::Value> {
+/// written after the rollout's first `task_complete`, that is by a later turn,
+/// read as raw JSON. `None` when no later turn wrote one.
+fn resumed_thread_settings(rollout: &Path) -> Option<serde_json::Value> {
+    let is_event = |record: &serde_json::Value, kind: &str| {
+        record["type"] == "event_msg" && record["payload"]["type"] == kind
+    };
     let content = std::fs::read_to_string(rollout).unwrap();
     content
         .lines()
-        .rev()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|record| {
-            record["type"] == "event_msg" && record["payload"]["type"] == "thread_settings_applied"
-        })
+        .skip_while(|record| !is_event(record, "task_complete"))
+        .skip(1)
+        .filter(|record| is_event(record, "thread_settings_applied"))
+        .last()
         .map(|record| record["payload"]["thread_settings"].clone())
 }
 
@@ -2626,6 +2690,128 @@ async fn live_codex_resume_reuses_session() {
         codex_capture(&events2).is_none(),
         "a resume must not re-capture the locator"
     );
+}
+
+/// Compress a rollout as Codex does (zstd, same name plus `.zst`, plain file
+/// deleted). Does nothing when there is no plain file to compress.
+fn compress_rollout(plain: &Path, compressed: &Path) {
+    if let Ok(content) = std::fs::read(plain) {
+        std::fs::write(compressed, zstd::encode_all(content.as_slice(), 3).unwrap()).unwrap();
+        std::fs::remove_file(plain).unwrap();
+    }
+}
+
+/// The user prompts of a hydrated transcript, in order.
+fn user_texts(transcript: &switchboard_harness::LoadedTranscript) -> Vec<&str> {
+    transcript
+        .turns
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_compressed_rollout_loads_forks_and_resumes() {
+    // Codex compresses a rollout nobody has written to for a week and turns it
+    // back into plain `.jsonl` before appending to it. This compresses a
+    // throwaway session the same way, then checks: the loader reads the
+    // compressed file; Codex can fork it; a fork whose parent has since been
+    // compressed again (the parent going a week idle after the fork) shows the
+    // conversation it inherits; Codex still resumes the conversation from it;
+    // and after that turn the plain file is back and the compressed one gone,
+    // so the loader sees both turns. The fork is promptless, so it costs no
+    // model call.
+    const FIRST: &str = "Remember the word 'otter'. Reply with only 'ok'.";
+    const SECOND: &str = "What word did I ask you to remember? Reply with only that word.";
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = home_dir();
+    let adapter = CodexAdapter::new();
+    let mut agent = live_codex_agent();
+    agent.model = Some("gpt-6-luna".to_owned());
+    agent.effort = Some("low".to_owned());
+
+    let first = live_codex_turn(&adapter, &agent, tmp.path(), FIRST).await;
+    let (thread_id, partition_date) =
+        codex_capture(&first).expect("the first dispatch captures a locator");
+    agent.session_locator = Some(SessionLocator::Codex {
+        thread_id: thread_id.clone(),
+        partition_date,
+    });
+    let plain = switchboard_harness::codex::session_file::locate_session_file(
+        &home,
+        partition_date,
+        &thread_id,
+    )
+    .expect("the first turn's rollout must be on disk");
+    let mut compressed_name = plain.file_name().unwrap().to_os_string();
+    compressed_name.push(".zst");
+    let compressed = plain.with_file_name(compressed_name);
+    compress_rollout(&plain, &compressed);
+
+    let load = || {
+        load_codex_transcript(
+            &home,
+            tmp.path(),
+            &thread_id,
+            Some(partition_date),
+            agent.id,
+        )
+        .expect("the rollout must load")
+    };
+    assert_eq!(user_texts(&load()), [FIRST]);
+
+    let fork = fork_codex_session(
+        Path::new("codex"),
+        &home,
+        tmp.path(),
+        &thread_id,
+        &agent.selection(),
+        CODEX_FORK_TIMEOUT,
+    )
+    .await
+    .expect("forking a compressed session should succeed");
+    // Codex decompresses the parent to fork it (observed 2026-10-16 @ 0.162.1).
+    compress_rollout(&plain, &compressed);
+    assert!(compressed.exists() && !plain.exists());
+    let forked = load_codex_transcript(
+        &home,
+        tmp.path(),
+        &fork.thread_id,
+        Some(fork.partition_date),
+        Uuid::now_v7(),
+    )
+    .expect("the fork must load");
+    assert_eq!(
+        user_texts(&forked),
+        [FIRST],
+        "the fork must show the conversation it inherits from the compressed parent"
+    );
+
+    let second = live_codex_turn(&adapter, &agent, tmp.path(), SECOND).await;
+    let reply: String = second
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        reply.to_lowercase().contains("otter"),
+        "Codex must resume the conversation from the compressed rollout; reply was {reply:?}"
+    );
+    assert!(
+        plain.is_file(),
+        "Codex must write the plain rollout back before appending to it"
+    );
+    assert!(
+        !compressed.exists(),
+        "Codex must delete the compressed copy once the plain rollout is back"
+    );
+    assert_eq!(user_texts(&load()), [FIRST, SECOND]);
 }
 
 #[tokio::test]
@@ -3225,6 +3411,7 @@ fn antigravity_capture(events: &[AdapterEvent]) -> Option<Uuid> {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_basic_turn_completes() {
     // cwd is a tempdir so the sidecar lands in a clean location. Note: `agy`
     // also writes a `.antigravitycli/` dir into cwd as a side effect — fine
@@ -3322,6 +3509,7 @@ async fn live_antigravity_basic_turn_completes() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_cli_log_names_the_conversation() {
     // The adapter's PRIMARY conversation-id capture reads `agy`'s own
     // `--log-file` (a `Created conversation <uuid>` line) — deterministic and
@@ -3393,6 +3581,7 @@ async fn live_antigravity_cli_log_names_the_conversation() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_adversarial_prompt_still_completes() {
     // Guards the *fallback* capture's load-bearing assumption that `agy` echoes
     // the dispatched prompt verbatim into the transcript's `<USER_REQUEST>`
@@ -3451,6 +3640,7 @@ async fn live_antigravity_adversarial_prompt_still_completes() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_resume_reuses_session() {
     // Memorize-then-recall: proof that `--conversation <uuid>` (driven by the
     // registry-stored locator) restores the prior turn's server-side context.
@@ -3517,6 +3707,7 @@ async fn live_antigravity_resume_reuses_session() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_dash_leading_prompt_completes() {
     // Canary / drift tripwire: `agy` currently tolerates a `-`-leading `-p`
     // value (so the adapter passes the prompt unchanged), unlike claude/
@@ -3580,6 +3771,7 @@ async fn live_antigravity_dash_leading_prompt_completes() {
 /// `P + 1 + call_index` from a simple "next step" rule.
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_tool_result_steps_follow_the_call_index() {
     // Runs the scenario up to twice. See `MULTI_TOOL_PROMPT` for why one
     // attempt isn't enough and `is_benign_merge` for why the retry predicate
@@ -3617,12 +3809,14 @@ async fn live_antigravity_tool_result_steps_follow_the_call_index() {
 /// Whether a single-tool-call turn is the **known benign non-exercise**: the
 /// model completed the turn but did both requested jobs inside one shell call.
 ///
-/// This must be *proven*, not inferred from what's missing. G32 means agy
-/// writes **no transcript record at all** for a tool call it rejects — so
-/// "the model merged the two jobs" and "the file-reading tool failed and left
-/// no trace" produce a byte-identical transcript: one `run_command` entry and
-/// nothing else. Retrying on that shape alone would let this test absorb the
-/// exact class of upstream regression it exists to catch.
+/// This must be *proven*, not inferred from what's missing. Under G32 (agy
+/// 1.1.19) agy wrote **no transcript record at all** for a tool call it
+/// rejected, so "the model merged the two jobs" and "the file-reading tool
+/// failed and left no trace" produced a byte-identical transcript: one
+/// `run_command` entry and nothing else. agy 1.4.2 records a rejected call as a
+/// `status:"ERROR"` result, but a call that leaves no record is still possible
+/// in principle, and retrying on that shape alone would let this test absorb
+/// the exact class of upstream regression it exists to catch.
 ///
 /// So the bar is positive evidence on three counts: the turn `Completed`, the
 /// sole call is `run_command`, and its `CommandLine` contains **both**
@@ -3666,9 +3860,10 @@ const STEP_PROBE_FILE: &str = "STEP_PROBE.txt";
 /// exercised only by the live path it guards — the same reasoning that keeps
 /// `antigravity_transient_matcher_is_exact` in the default suite.
 ///
-/// The rejection cases are the point. Under G32 a failed tool leaves no
-/// transcript record, so a genuine upstream breakage is *shape-identical* to a
-/// benign merge; only the positive evidence below separates them.
+/// The rejection cases are the point. Under G32 (agy 1.1.19) a failed tool left
+/// no transcript record, so a genuine upstream breakage was *shape-identical* to
+/// a benign merge, and could be again if agy stopped recording one; only the
+/// positive evidence below separates them.
 #[test]
 fn benign_merge_requires_positive_evidence_of_both_jobs() {
     fn planner(tool_calls: &serde_json::Value) -> String {
@@ -3853,6 +4048,7 @@ fn transcript_records(content: &str) -> impl Iterator<Item = serde_json::Value> 
 /// itself.
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_stream_json_init_and_result_shapes() {
     let tmp = tempfile::TempDir::new().unwrap();
     let log = tmp.path().join("agy.log");
@@ -3955,6 +4151,7 @@ async fn live_antigravity_stream_json_init_and_result_shapes() {
 /// model's exact words.
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_slash_and_flag_shaped_prompts_reach_the_model() {
     for prompt in [
         // Recognized command: bare `-p "/model"` prints a TSV row and mints no
@@ -4673,106 +4870,24 @@ async fn live_codex_compact_of_a_fork_keeps_its_inherited_context() {
     );
 }
 
-/// Restores `settings.json` from a byte-for-byte backup and deletes the backup
-/// on drop — covers normal completion AND assertion-panic unwinding. See the
-/// config-mutation protocol in `live_antigravity_model_change_announced_on_resume`.
-struct AntigravitySettingsGuard {
-    path: std::path::PathBuf,
-    backup: std::path::PathBuf,
-}
-
-impl Drop for AntigravitySettingsGuard {
-    fn drop(&mut self) {
-        if !self.backup.exists() {
-            return;
-        }
-        // Delete the backup ONLY after the restore is verified to have
-        // succeeded — otherwise a failed copy would leave settings.json mutated
-        // *and* destroy the pristine copy. On failure, keep the backup and shout
-        // both paths so the next run's self-heal (or the developer) can recover.
-        match std::fs::copy(&self.backup, &self.path) {
-            Ok(_) => {
-                let _ = std::fs::remove_file(&self.backup);
-            }
-            Err(e) => eprintln!(
-                "FAILED to restore {} from backup ({e}); backup KEPT at {} — \
-                 restore it manually (cp {} {}).",
-                self.path.display(),
-                self.backup.display(),
-                self.backup.display(),
-                self.path.display()
-            ),
-        }
-    }
-}
-
 #[tokio::test]
 #[ignore = "requires antigravity installed — run with: make test-live"]
-#[serial_test::serial]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_model_change_announced_on_resume() {
     // Antigravity's per-turn model history is a *carry-forward* of the
-    // `USER_SETTINGS_CHANGE` sentence, which `agy` emits only when the model
-    // changes. We can't set the model via a flag, so we change the **global**
-    // `~/.gemini/antigravity-cli/settings.json` `model` field between turns and
-    // assert our adapter's emitted per-turn model reflects the switch.
-    //
-    // Config-mutation safety protocol (this edits the real, harness-owned
-    // settings.json — the only workable home, since an isolated HOME re-prompts
-    // agy for OAuth): (1) byte-for-byte backup to a stable path; (2) self-heal —
-    // if the backup already exists from an interrupted run, restore from it and
-    // fail loud; (3) a `Drop` guard restores + deletes the backup on normal exit
-    // AND on assertion-panic unwind; (4) known gap — SIGKILL/crash bypasses Drop,
-    // but step 2 repairs on the next run and the pristine value survives in the
-    // backup; (5) `#[serial]` because the file is global. Mutating harness config
-    // *in a test* doesn't violate the production rule that the app never writes
-    // harness config — it's the only way to exercise the real contract.
-    let home = home_dir();
-    let settings = home.join(".gemini/antigravity-cli/settings.json");
-    let backup = home.join(".gemini/antigravity-cli/settings.json.switchboard-test-backup");
-    if !settings.exists() {
-        eprintln!("skipping: {settings:?} not present (Antigravity not configured)");
-        return;
-    }
-    // Self-heal from an interrupted prior run before doing anything else: if a
-    // backup exists, the previous run died with settings.json possibly still
-    // mutated — restore from the pristine backup, then fail loud.
-    if backup.exists() {
-        match std::fs::copy(&backup, &settings) {
-            Ok(_) => {
-                let _ = std::fs::remove_file(&backup);
-                panic!(
-                    "self-healed: a prior run was interrupted; restored {settings:?} from its \
-                     backup and removed the backup. Re-run."
-                );
-            }
-            Err(e) => panic!(
-                "a prior run was interrupted AND the self-heal restore failed ({e}). \
-                 The pristine value is in {backup:?}; restore it manually \
-                 (cp {backup:?} {settings:?}) and delete the backup, then re-run."
-            ),
-        }
-    }
-
-    let original = std::fs::read(&settings).expect("read settings.json");
-    std::fs::write(&backup, &original).expect("write backup");
-    let _guard = AntigravitySettingsGuard {
-        path: settings.clone(),
-        backup: backup.clone(),
-    };
-
-    let set_model = |display_name: &str| {
-        let mut v: serde_json::Value =
-            serde_json::from_slice(&original).expect("settings.json is JSON");
-        v["model"] = serde_json::Value::String(display_name.to_owned());
-        std::fs::write(&settings, serde_json::to_vec_pretty(&v).unwrap()).expect("write settings");
-    };
-
+    // `USER_SETTINGS_CHANGE` sentence, which `agy` writes on the first turn and
+    // whenever the model changes. Each turn passes its model with `--model`,
+    // the way Switchboard does; probed @ 1.4.3, a resume on a different model
+    // writes "from Gemini 3.8 Flash (Low) to Claude Sonnet 5.5 (Low)" and leaves
+    // `~/.gemini/antigravity-cli/settings.json` untouched. The test therefore
+    // never writes the developer's global `agy` settings.
     let cwd = tempfile::TempDir::new().unwrap();
     let adapter = AntigravityAdapter::new();
     let agent_id = Uuid::now_v7();
+    // Turn 1 on model X.
     let mut agent = AgentRecord {
-        model: None,
-        effort: None,
+        model: Some("gemini-3.8-flash".to_owned()),
+        effort: Some("low".to_owned()),
         model_choices: Vec::new(),
         effort_choices: Vec::new(),
         forked_from_session: None,
@@ -4784,8 +4899,6 @@ async fn live_antigravity_model_change_announced_on_resume() {
         created_at: chrono::Utc::now(),
     };
 
-    // Turn 1 on model X.
-    set_model("Gemini 3.1 Pro (High)");
     let events1 = antigravity_live_turn(
         &adapter,
         &agent,
@@ -4798,14 +4911,16 @@ async fn live_antigravity_model_change_announced_on_resume() {
     .await;
     let (m1, _) = turn_end_model_effort(&events1).expect("turn 1 TurnEnd");
     assert!(
-        m1.as_deref().is_some_and(|m| m.contains("Gemini 3.1 Pro")),
-        "turn 1 per-turn model = Gemini 3.1 Pro; got {m1:?}"
+        m1.as_deref()
+            .is_some_and(|m| m.contains("Gemini 3.8 Flash")),
+        "turn 1 per-turn model = Gemini 3.8 Flash; got {m1:?}"
     );
     let conversation_id = antigravity_capture(&events1).expect("captured conversation id");
 
-    // Turn 2: switch the global model to Y, resume.
+    // Turn 2: resume on model Y.
     agent.session_locator = Some(SessionLocator::Uuid(conversation_id));
-    set_model("Claude Sonnet 4.6 (Thinking)");
+    agent.model = Some("claude-sonnet-5-5".to_owned());
+    agent.effort = Some("low".to_owned());
     let events2 = antigravity_live_turn(
         &adapter,
         &agent,
@@ -4822,27 +4937,28 @@ async fn live_antigravity_model_change_announced_on_resume() {
     let (m2, _) = turn_end_model_effort(&events2).expect("turn 2 TurnEnd");
     assert!(
         m2.as_deref()
-            .is_some_and(|m| m.contains("Claude Sonnet 4.6")),
-        "turn 2 per-turn model = Claude Sonnet 4.6; got {m2:?}"
+            .is_some_and(|m| m.contains("Claude Sonnet 5.5")),
+        "turn 2 per-turn model = Claude Sonnet 5.5; got {m2:?}"
     );
 
     // Hydration reconstructs the carry-forward from the transcript.
-    let hydrated = load_antigravity_transcript(&home, cwd.path(), Some(conversation_id), agent_id)
-        .expect("hydrate");
+    let hydrated =
+        load_antigravity_transcript(&home_dir(), cwd.path(), Some(conversation_id), agent_id)
+            .expect("hydrate");
     let models = hydrated_turn_models(&hydrated);
     assert!(
         models
             .first()
             .and_then(Option::as_deref)
-            .is_some_and(|m| m.contains("Gemini 3.1 Pro")),
-        "hydrated turn 1 = Gemini 3.1 Pro; got {models:?}"
+            .is_some_and(|m| m.contains("Gemini 3.8 Flash")),
+        "hydrated turn 1 = Gemini 3.8 Flash; got {models:?}"
     );
     assert!(
         models
             .last()
             .and_then(Option::as_deref)
-            .is_some_and(|m| m.contains("Claude Sonnet 4.6")),
-        "hydrated last turn = Claude Sonnet 4.6; got {models:?}"
+            .is_some_and(|m| m.contains("Claude Sonnet 5.5")),
+        "hydrated last turn = Claude Sonnet 5.5; got {models:?}"
     );
 }
 
@@ -5143,6 +5259,7 @@ async fn live_codex_apply_patch_emits_edit_facet() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_run_command_emits_shell_facet() {
     let tmp = tempfile::TempDir::new().unwrap();
     let adapter = AntigravityAdapter::new();
@@ -5179,6 +5296,91 @@ async fn live_antigravity_run_command_emits_shell_facet() {
     assert!(
         !shell.is_empty() && !shell.starts_with('\"'),
         "CommandLine must decode transcript.jsonl's string-encoding, got {shell:?}"
+    );
+}
+
+/// agy 1.4.3 renamed the file tools a model calls (`read_file`, `edit_file`,
+/// `write_file`, with new argument names) and no changelog entry said so;
+/// their rows lost the file display and nothing failed. One turn drives all
+/// three, and each must carry its facet live and again on reopen.
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
+async fn live_antigravity_file_tools_emit_read_edit_and_write_facets() {
+    let tmp = tempfile::Builder::new()
+        .prefix("agy-file-tools")
+        .tempdir()
+        .unwrap();
+    std::fs::write(tmp.path().join("EDIT_ME.txt"), "alpha\n").unwrap();
+    let adapter = AntigravityAdapter::new();
+    let agent = live_antigravity_agent();
+
+    let events = antigravity_live_turn(
+        &adapter,
+        &agent,
+        tmp.path(),
+        "Use your file tools, not shell commands or subagents: create a new file NEW.txt containing the word hello, then change alpha to omega in EDIT_ME.txt, then read EDIT_ME.txt. Then reply with only the word done.",
+        Uuid::now_v7(),
+        // Not idempotent: a second attempt would find omega where it expects
+        // alpha, so the edit it measures would fail.
+        RetryPolicy::Never,
+    )
+    .await;
+
+    let live: Vec<ToolFacet> = tool_started_facets(&events)
+        .into_iter()
+        .map(|(_, _, facet)| facet)
+        .collect();
+    let calls = || {
+        tool_started_facets(&events)
+            .into_iter()
+            .map(|(_, name, facet)| (name, facet))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        live.iter().any(|f| matches!(
+            f,
+            ToolFacet::Write { path, content, .. }
+                if path.ends_with("NEW.txt") && content.contains("hello")
+        )),
+        "the file write must carry a Write facet; calls: {:?}",
+        calls()
+    );
+    assert!(
+        live.iter().any(|f| matches!(
+            f,
+            ToolFacet::Edit { files }
+                if files.iter().any(|file| file.path.ends_with("EDIT_ME.txt")
+                    && file.edits.iter().any(|e| e.old.contains("alpha") && e.new.contains("omega")))
+        )),
+        "the edit must carry an Edit facet with its before and after text; calls: {:?}",
+        calls()
+    );
+    assert!(
+        live.iter().any(|f| matches!(
+            f,
+            ToolFacet::Read { path } if path.ends_with("EDIT_ME.txt")
+        )),
+        "the read must carry a Read facet; calls: {:?}",
+        calls()
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("EDIT_ME.txt")).unwrap(),
+        "omega\n",
+        "the edit must have happened through the tools"
+    );
+
+    let conversation_id = antigravity_capture(&events).expect("captured conversation id");
+    let hydrated =
+        load_antigravity_transcript(&home_dir(), tmp.path(), Some(conversation_id), agent.id)
+            .expect("hydrate");
+    let reopened: Vec<ToolFacet> = hydrated_tool_facets(&hydrated)
+        .into_iter()
+        .map(|(_, facet)| facet)
+        .collect();
+    assert_eq!(
+        reopened, live,
+        "reopening must show the same file displays as the live turn"
     );
 }
 

@@ -3,7 +3,7 @@ import "@testing-library/jest-dom/vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/svelte";
 import type {
   AgentRecord,
-  AgentSelection,
+  AgentSelectionChanges,
   ConversationItem,
   NormalizedEvent,
   ProjectListing,
@@ -15,6 +15,12 @@ import type { Turn } from "$lib/state/types";
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
 import Sidebar from "./Sidebar.svelte";
 
+// No model agy offers today lacks an effort axis, but the pickers still handle
+// one (agy 1.1.19 offered two), so these tests add one to the model table.
+vi.mock("$lib/antigravityModels.json", async (importOriginal) =>
+  (await import("../../../tests/fixtures/antigravityModels")).withStandIns(importOriginal),
+);
+
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => vi.fn()),
 }));
@@ -25,7 +31,8 @@ vi.mock("@tauri-apps/api/event", () => ({
 // mocks are orthogonal.
 const renameAgentMock = vi.fn<(id: string, name: string) => Promise<void>>();
 const removeAgentMock = vi.fn<(id: string) => Promise<void>>();
-const setAgentSelectionMock = vi.fn<(id: string, selection: AgentSelection) => Promise<void>>();
+const setAgentSelectionMock =
+  vi.fn<(id: string, changes: AgentSelectionChanges) => Promise<void>>();
 const reorderAgentsMock = vi.fn<(projectId: string, orderedIds: string[]) => Promise<void>>();
 const forkAgentWithoutSendingMock = vi.fn<(sourceId: string) => Promise<AgentRecord>>();
 const retryAgentHistoryMock = vi.fn<(agentId: string) => Promise<void>>();
@@ -41,8 +48,8 @@ vi.mock("$lib/state/workspace.svelte", async (importOriginal) => ({
     .conversations,
   renameAgent: (id: string, name: string) => renameAgentMock(id, name),
   removeAgent: (id: string) => removeAgentMock(id),
-  setAgentSelection: (id: string, selection: AgentSelection) =>
-    setAgentSelectionMock(id, selection),
+  setAgentSelection: (id: string, changes: AgentSelectionChanges) =>
+    setAgentSelectionMock(id, changes),
   reorderAgents: (projectId: string, orderedIds: string[]) =>
     reorderAgentsMock(projectId, orderedIds),
   forkAgentWithoutSending: (sourceId: string) => forkAgentWithoutSendingMock(sourceId),
@@ -59,8 +66,8 @@ const compactAgentMock = vi.fn<(agentId: string, sendId: string) => Promise<stri
 const contextReportAgentMock = vi.fn<(agentId: string, sendId: string) => Promise<string>>();
 vi.mock("$lib/api", () => ({
   agentSessionInfo: (id: string) => agentSessionInfoMock(id),
-  openSessionFile: async (id: string) => {
-    openSessionFileMock(id);
+  openSessionFile: async (id: string, asCopy: boolean) => {
+    await openSessionFileMock(id, asCopy);
   },
   resumeAgentInTerminal: (id: string) => resumeAgentInTerminalMock(id),
   cancelAgent: vi.fn(),
@@ -457,8 +464,11 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await openAgentActions();
-    await fireEvent.click(await screen.findByTestId("agent-action-open-session"));
-    expect(openSessionFileMock).toHaveBeenCalledWith(CLAUDE_AGENT.id);
+    expect(await screen.findByTestId("agent-action-open-session")).toHaveTextContent(
+      "Open session file",
+    );
+    await fireEvent.click(screen.getByTestId("agent-action-open-session"));
+    expect(openSessionFileMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, false);
 
     await openAgentActions();
     await fireEvent.click(screen.getByTestId("agent-action-resume"));
@@ -493,6 +503,52 @@ describe("Sidebar", () => {
       "Terminal automation was denied",
     );
     expect(screen.getByTestId("resume-panel")).toBeInTheDocument();
+  });
+
+  it("says a session file Codex has compressed opens as a copy", async () => {
+    // The editor gets a decompressed copy, which won't update as the agent
+    // keeps working, so the item mustn't promise the file itself.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    agentSessionInfoMock.mockResolvedValue({
+      session_file: "/sessions/rollout-x.jsonl.zst",
+      session_file_compressed: true,
+      resume_command: null,
+    });
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+    await openAgentActions();
+
+    expect(await screen.findByTestId("agent-action-open-session")).toHaveTextContent(
+      "Open copy of session file",
+    );
+    // The click asks for a copy outright, so a reply that has since restored
+    // the plain file can't turn this item into opening the live file.
+    await fireEvent.click(screen.getByTestId("agent-action-open-session"));
+    expect(openSessionFileMock).toHaveBeenCalledWith(CODEX_AGENT.id, true);
+  });
+
+  it("shows why a session file couldn't be opened", async () => {
+    // A compressed file that doesn't decode fails backend-side; without this
+    // the menu item would look like it did nothing.
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    agentSessionInfoMock.mockResolvedValue({
+      session_file: "/sessions/rollout-x.jsonl.zst",
+      session_file_compressed: true,
+      resume_command: null,
+    });
+    openSessionFileMock.mockRejectedValue(
+      new Error("reading /sessions/rollout-x.jsonl.zst: Unknown frame descriptor"),
+    );
+
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-action-open-session"));
+
+    expect(await screen.findByTestId("agent-open-session-error")).toHaveTextContent(
+      "Couldn't open session file: reading /sessions/rollout-x.jsonl.zst: Unknown frame descriptor",
+    );
   });
 
   it("does not let a closed dialog's pending launch affect another agent", async () => {
@@ -1065,7 +1121,7 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("agent-selection-settings")).not.toBeNull();
   });
 
-  it("model settings saves the complete independent selection atomically", async () => {
+  it("model settings saves only the settings the user changed", async () => {
     const state = await loadState();
     const agent = {
       ...CLAUDE_AGENT,
@@ -1088,9 +1144,7 @@ describe("Sidebar", () => {
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
       model: "sonnet",
-      effort: "high",
       model_choices: ["sonnet"],
-      effort_choices: ["high"],
     });
   });
 
@@ -1109,12 +1163,8 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("change-selection-effort-current")).toBeNull();
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: null,
-      effort: null,
-      model_choices: [],
-      effort_choices: [],
-    });
+    // Nothing changed, so nothing is sent that could pin a value.
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {});
   });
 
   it("requires a compatible effort before saving a newly configured attached Antigravity agent", async () => {
@@ -1131,7 +1181,7 @@ describe("Sidebar", () => {
 
     await openAgentActions();
     await fireEvent.click(await screen.findByTestId("agent-selection-settings"));
-    await fireEvent.click(screen.getByTestId("change-selection-model-choice-gemini-3.8-flash"));
+    await fireEvent.click(screen.getByTestId("change-selection-model-choice-three-level-model"));
 
     expect(screen.getByTestId("change-selection-invalid")).toHaveTextContent(
       "Choose a reasoning effort supported by the current model before saving.",
@@ -1156,9 +1206,7 @@ describe("Sidebar", () => {
     await fireEvent.click(screen.getByTestId("change-save"));
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: null,
       effort: "medium",
-      model_choices: [],
       effort_choices: ["medium"],
     });
   });
@@ -1180,12 +1228,9 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("change-selection-model-implicit")).toBeNull();
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "future-opus",
-      effort: null,
-      model_choices: ["future-opus"],
-      effort_choices: [],
-    });
+    // Untouched, so the unknown value is not sent back at all: the backend
+    // keeps it.
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {});
   });
 
   it("Change model uses the segmented toggle for an in-catalog model", async () => {
@@ -1243,8 +1288,6 @@ describe("Sidebar", () => {
     await fireEvent.click(screen.getByTestId("change-save"));
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "opus",
-      effort: "high",
       model_choices: ["opus", "sonnet"],
       effort_choices: ["high", "medium"],
     });
@@ -1266,11 +1309,36 @@ describe("Sidebar", () => {
     expect(modelChip).toHaveAccessibleName(/Current model: Opus.*Switch to Sonnet/);
     await fireEvent.click(modelChip);
 
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, { model: "sonnet" });
+  });
+
+  it("a settings save sends only the model the user changed, so another client's effort change survives", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...CLAUDE_AGENT,
+      model: "opus",
+      effort: "high",
+      model_choices: ["opus"],
+      effort_choices: ["high"],
+    };
+    await state.registerAgent(agent);
+    const { rerender } = render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    await openAgentActions();
+    await fireEvent.click(await screen.findByTestId("agent-selection-settings"));
+    await screen.findByTestId("change-selection-model");
+    // An orchestrator changes the effort while the editor is open.
+    await rerender({
+      projectId: PROJECT_ID,
+      agents: [{ ...agent, effort: "medium", effort_choices: ["high", "medium"] }],
+    });
+    await fireEvent.click(screen.getByTestId("change-selection-model-choice-sonnet"));
+    await fireEvent.click(screen.getByTestId("change-selection-model-choice-opus"));
+    await fireEvent.click(screen.getByTestId("change-save"));
+
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
       model: "sonnet",
-      effort: "high",
-      model_choices: ["opus", "sonnet"],
-      effort_choices: ["high", "medium"],
+      model_choices: ["sonnet"],
     });
   });
 
@@ -1298,12 +1366,7 @@ describe("Sidebar", () => {
     expect(screen.getByTestId("agent-model-option-sonnet")).toHaveTextContent("Sonnet");
     await fireEvent.click(await screen.findByTestId("agent-model-option-haiku"));
 
-    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "haiku",
-      effort: "high",
-      model_choices: ["opus", "sonnet", "haiku"],
-      effort_choices: ["high"],
-    });
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, { model: "haiku" });
   });
 
   it("opens a direct menu for three effort choices without changing the model", async () => {
@@ -1321,41 +1384,35 @@ describe("Sidebar", () => {
     await fireEvent.click(screen.getByTestId("agent-effort-chip"));
     await fireEvent.click(await screen.findByTestId("agent-effort-option-low"));
 
-    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "opus",
-      effort: "low",
-      model_choices: ["opus"],
-      effort_choices: ["high", "medium", "low"],
-    });
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, { effort: "low" });
   });
 
   it("announces and atomically applies an Antigravity model switch that adjusts effort", async () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
-      model: "gemini-3.8-flash",
-      effort: "medium",
-      model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
-      effort_choices: ["medium", "high"],
+      model: "three-level-model",
+      effort: "high",
+      model_choices: ["three-level-model", "medium-only-model"],
+      effort_choices: ["high", "medium"],
     };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     const modelChip = screen.getByTestId("agent-model-chip");
-    expect(modelChip).toHaveAccessibleName(/Switch to Gemini 3.1 Pro — effort becomes High/);
+    expect(modelChip).toHaveAccessibleName(/Switch to Medium Only Model — effort becomes Medium/);
     await fireEvent.click(modelChip);
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "gemini-3.1-pro",
-      effort: "high",
-      model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
-      effort_choices: ["medium", "high"],
+      model: "medium-only-model",
+      effort: "medium",
     });
   });
 
-  // `gemini-3.7-flash` is deliberately NOT updated to 3.8 here: it is a real
-  // model retired from the picker but still valid at dispatch, so this pins the
-  // promise that retiring an entry doesn't strand an agent already using it.
+  // `gemini-3.7-flash` is deliberately NOT updated: it is a real model the
+  // table no longer lists, as an agent created before its removal still
+  // carries, so this pins that the sidebar keeps working for such an agent.
+  // (Google has since retired it from `agy` too, so its turns now fail.)
   it("preserves effort when switching to an unknown Antigravity model", async () => {
     const state = await loadState();
     const agent: AgentRecord = {
@@ -1372,9 +1429,6 @@ describe("Sidebar", () => {
 
     expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
       model: "future-model",
-      effort: "medium",
-      model_choices: ["gemini-3.7-flash", "future-model"],
-      effort_choices: ["medium"],
     });
   });
 
@@ -1382,9 +1436,9 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
-      model: "claude-sonnet-4-6",
+      model: "no-effort-model",
       effort: null,
-      model_choices: ["claude-sonnet-4-6"],
+      model_choices: ["no-effort-model"],
       effort_choices: ["high"],
     };
     await state.registerAgent(agent);
@@ -1398,10 +1452,10 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
-      model: "gemini-3.8-flash",
-      effort: "medium",
-      model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
-      effort_choices: ["medium"],
+      model: "three-level-model",
+      effort: "high",
+      model_choices: ["three-level-model", "medium-only-model"],
+      effort_choices: ["high"],
     };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
@@ -1485,10 +1539,10 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent: AgentRecord = {
       ...ANTIGRAVITY_AGENT,
-      model: "gemini-3.1-pro",
-      effort: "high",
-      model_choices: ["gemini-3.1-pro"],
-      effort_choices: ["high", "medium"],
+      model: "medium-only-model",
+      effort: "medium",
+      model_choices: ["medium-only-model"],
+      effort_choices: ["medium", "high"],
     };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
@@ -1515,12 +1569,7 @@ describe("Sidebar", () => {
     expect(modelChip).toHaveAccessibleName(/Current model: Harness default.*Switch to Sonnet/);
     await fireEvent.click(modelChip);
 
-    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, {
-      model: "sonnet",
-      effort: null,
-      model_choices: ["sonnet"],
-      effort_choices: ["medium"],
-    });
+    expect(setAgentSelectionMock).toHaveBeenCalledExactlyOnceWith(agent.id, { model: "sonnet" });
   });
 
   it("keeps the quick switch usable and surfaces a persistence failure", async () => {

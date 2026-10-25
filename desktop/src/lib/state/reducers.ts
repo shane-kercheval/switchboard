@@ -46,12 +46,21 @@ import type {
 } from "$lib/types";
 import type {
   AgentRuntime,
+  OpenTask,
   ContextReportRequest,
   PendingSend,
   ToolCall,
   Turn,
   TurnItem,
 } from "./types";
+
+/// The id of the user row for a send the backend announces rather than the
+/// window making it optimistically: a workflow step's `user_message`, or a
+/// send another client made (`send_accepted`). One derivation, so a send that
+/// carries both events gets one row.
+export function backendUserTurnId(sendId: SendId, agentId: AgentId): TurnId {
+  return `user:${sendId}:${agentId}`;
+}
 
 export function transcriptReducer(
   turns: Turn[],
@@ -119,7 +128,9 @@ export function transcriptReducer(
       // A fan-out's recipients share `send_id`, so the unified view collapses
       // these per-recipient user turns into one user row (and groups the responses
       // into columns), matching a manual send and the reloaded journal view.
-      const turn_id = `user:${input.send_id}:${agentId}`;
+      const turn_id = backendUserTurnId(input.send_id, agentId);
+      // Also a no-op for a send announced at admission (`send_accepted`),
+      // whose row was created under this same id before its turn started.
       if (findTurn(turns, turn_id) !== undefined) return turns;
       return [
         ...turns,
@@ -130,6 +141,9 @@ export function transcriptReducer(
           send_id: input.send_id,
           started_at: input.at,
           text: input.text,
+          ...(input.attachments !== undefined && input.attachments.length > 0
+            ? { attachments: input.attachments }
+            : {}),
           pending: true,
         },
       ];
@@ -677,6 +691,36 @@ function advanceContextReportRequest(runtime: AgentRuntime, input: ReducerInput)
   }
 }
 
+/// The open tasks after one task event. A start appends; progress records the
+/// task's activity and moves it last, so the most recently active task is
+/// always last for the footer to name; an end removes the task. Progress for a
+/// task that never started opens nothing.
+function nextOpenTasks(
+  tasks: OpenTask[],
+  event: Extract<NormalizedEvent, { type: "task_started" | "task_progress" | "task_ended" }>,
+): OpenTask[] {
+  const others = tasks.filter((task) => task.task_id !== event.task_id);
+  const existing = tasks.find((task) => task.task_id === event.task_id);
+  switch (event.type) {
+    case "task_started":
+      return existing !== undefined
+        ? tasks
+        : [
+            ...tasks,
+            {
+              task_id: event.task_id,
+              description: event.description,
+              ...(event.tool_use_id !== undefined ? { tool_use_id: event.tool_use_id } : {}),
+            },
+          ];
+    case "task_progress":
+      if (existing === undefined || event.activity === "") return tasks;
+      return [...others, { ...existing, activity: event.activity }];
+    case "task_ended":
+      return others;
+  }
+}
+
 export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): AgentRuntime {
   runtime = advanceContextReportRequest(runtime, input);
   switch (input.type) {
@@ -701,6 +745,7 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         in_flight_turn_id: input.turn_id,
         last_error: undefined,
         quiet_since: undefined,
+        open_tasks: undefined,
         // Consume the pending-send entry this turn belongs to (by message_id,
         // else the front — see `pickPendingIndex`).
         pending_sends: removePending(
@@ -730,12 +775,16 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         message: input.error,
         kind: "adapter_failure",
       };
-      // Flip to idle only if this was the *starting* send. A queued send that
-      // fails pre-start (the agent is `processing` another turn) must not stomp
-      // the live turn — `AgentIdle` settles run_status when the backlog drains.
-      return runtime.run_status === "starting"
-        ? { ...runtime, run_status: "idle", pending_sends, last_error }
-        : { ...runtime, pending_sends, last_error };
+      // `starting` ends only when no queued entry is left
+      // (`runStatusAfterPendingRemoved`): a queued send that fails while
+      // another turn is `processing` must not stomp the live turn, and one
+      // that fails while another send is still queued leaves that one next.
+      return {
+        ...runtime,
+        run_status: runStatusAfterPendingRemoved(runtime, pending_sends),
+        pending_sends,
+        last_error,
+      };
     }
 
     case "message_cancelled": {
@@ -744,8 +793,9 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // races ahead of `recordSendAccepted`. Never infer by queue position: a
       // user may cancel any queued send. Cancellation is not an error, so no
       // `last_error`.
-      // Flip to idle only if this was the *starting* send (nothing is running);
-      // a queued send cancelled while another turn runs leaves run_status alone.
+      // `starting` ends only when the last queued entry goes
+      // (`runStatusAfterPendingRemoved`); a cancel while another turn runs, or
+      // while another send is still queued, leaves run_status alone.
       const exactMessageIdx =
         runtime.pending_sends?.findIndex((p) => p.message_id === input.message_id) ?? -1;
       const idx =
@@ -754,9 +804,11 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
           : (runtime.pending_sends?.findIndex((p) => p.send_id === input.send_id) ?? -1);
       if (idx < 0) return runtime;
       const pending_sends = removePending(runtime.pending_sends, idx);
-      return runtime.run_status === "starting" && idx === 0
-        ? { ...runtime, run_status: "idle", pending_sends }
-        : { ...runtime, pending_sends };
+      return {
+        ...runtime,
+        run_status: runStatusAfterPendingRemoved(runtime, pending_sends),
+        pending_sends,
+      };
     }
 
     case "turn_end":
@@ -771,12 +823,17 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // A quota refusal is **not** recorded here: it is a fact about the harness
       // account rather than this agent, so the live-event boundary routes it to
       // the account-scoped store instead (`harnessUsage.svelte.ts`).
+      // A turn's open tasks end with it: a Claude turn ends only when its
+      // process exits.
       if (input.outcome.status === "cancelled" || input.outcome.status === "completed") {
-        return runtime.quiet_since !== undefined ? { ...runtime, quiet_since: undefined } : runtime;
+        return runtime.quiet_since !== undefined || runtime.open_tasks !== undefined
+          ? { ...runtime, quiet_since: undefined, open_tasks: undefined }
+          : runtime;
       }
       return {
         ...runtime,
         quiet_since: undefined,
+        open_tasks: undefined,
         last_error: {
           message: input.outcome.message,
           kind: input.outcome.kind,
@@ -792,15 +849,17 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // `agent_idle` arriving while `run_status === "starting"` (out of
       // protocol; the dispatcher shouldn't emit `AgentIdle` for a turn
       // that never got a `TurnStart`) would race the sendability gate
-      // back open before the legitimate `TurnStart` arrived. The only
-      // legal path from `starting → idle` is `failSendStart`. See the
-      // state-machine docstring on `AgentRuntime.run_status`.
+      // back open before the legitimate `TurnStart` arrived. `starting`
+      // ends when its last queued entry is resolved (`turn_start`,
+      // `message_failed`, `message_cancelled`, or `failSendStart`), never
+      // here. See the state-machine docstring on `AgentRuntime.run_status`.
       if (runtime.run_status !== "processing") return runtime;
       return {
         ...runtime,
         run_status: "idle",
         in_flight_turn_id: undefined,
         quiet_since: undefined,
+        open_tasks: undefined,
       };
 
     case "heartbeat_timeout":
@@ -815,6 +874,20 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         return runtime;
       }
       return { ...runtime, quiet_since: input.at };
+
+    case "task_started":
+    case "task_progress":
+    case "task_ended": {
+      // A task event is a sign of life like `liveness` (clearing the quiet
+      // marker) and also changes the in-flight turn's open tasks. Events for
+      // another turn are stale and ignored.
+      if (input.turn_id !== runtime.in_flight_turn_id) return runtime;
+      return {
+        ...runtime,
+        quiet_since: undefined,
+        open_tasks: nextOpenTasks(runtime.open_tasks ?? [], input),
+      };
+    }
 
     case "content_chunk":
     case "liveness":
@@ -987,6 +1060,24 @@ function removePending(
   if (pending === undefined || index < 0 || index >= pending.length) return pending;
   const next = [...pending.slice(0, index), ...pending.slice(index + 1)];
   return next.length === 0 ? undefined : next;
+}
+
+/// The run status after a queued entry left `pending_sends` without its turn
+/// starting (it failed, was cancelled, or its IPC was rejected). `"starting"`
+/// means a queued entry is about to start and nothing is running, so it ends
+/// only when no entry is left: while one remains, that one is next. Short of a
+/// `turn_start` this is the only way out of `"starting"`, because `agent_idle`
+/// deliberately cannot end it, so the rule relies on every queued entry being
+/// resolved by exactly one of `turn_start`, `message_failed`,
+/// `message_cancelled`, or `failSendStart`. An entry none of them reaches
+/// would keep the agent `"starting"`.
+export function runStatusAfterPendingRemoved(
+  runtime: Pick<AgentRuntime, "run_status">,
+  remaining: PendingSend[] | undefined,
+): AgentRuntime["run_status"] {
+  return runtime.run_status === "starting" && (remaining?.length ?? 0) === 0
+    ? "idle"
+    : runtime.run_status;
 }
 
 function updateTurn(turns: Turn[], turnId: TurnId, next: Turn): Turn[] {

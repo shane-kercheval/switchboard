@@ -16,8 +16,9 @@ use switchboard_core::{
     SessionLocator, normalize_agent_selection,
 };
 use switchboard_dispatcher::{
-    CancelOutcome, CurrentTurnWait, DispatchContextFactory, Dispatcher, EventEmitter, OnBusy,
-    RemoveQueuedMessageError, RemovedQueuedMessage, SendOutcome, TurnKind,
+    CancelOutcome, CompactOptions, CurrentTurnWait, DispatchContextFactory, Dispatcher,
+    EventEmitter, OnBusy, RemoveQueuedMessageError, RemovedQueuedMessage, SendOptions, SendOutcome,
+    TurnKind,
 };
 use switchboard_harness::{
     CancelSource, ForwardedBlock, HarnessAdapter, MessageId, TurnOutcome,
@@ -141,7 +142,7 @@ fn conflicting_claim(
 /// The barrier a test installed at `seam`, if any. `None` in release builds
 /// (the map does not exist) and when unset.
 #[cfg(test)]
-fn test_seam(
+pub(crate) fn test_seam(
     state: &AppState,
     seam: crate::state::TestSeam,
 ) -> Option<Arc<crate::state::MaintenanceBarrier>> {
@@ -172,7 +173,7 @@ async fn wait_at_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>) {
 /// compromise: the caller is already on the blocking pool, which is what that
 /// pool is for, and the capture seam uses the same form for the same reason.
 #[cfg(test)]
-fn wait_at_blocking_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>) {
+pub(crate) fn wait_at_blocking_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>) {
     if let Some(barrier) = barrier {
         // `notify_one` on both sides — see `wait_at_seam`.
         barrier.entered.notify_one();
@@ -181,7 +182,25 @@ fn wait_at_blocking_seam(barrier: Option<Arc<crate::state::MaintenanceBarrier>>)
 }
 
 #[cfg(not(test))]
-fn wait_at_blocking_seam(_barrier: Option<()>) {}
+pub(crate) fn wait_at_blocking_seam(_barrier: Option<()>) {}
+
+#[cfg(test)]
+use crate::state::TestSeam::SelectionUpdate as SelectionSeam;
+#[cfg(not(test))]
+struct SelectionSeam;
+
+#[cfg(test)]
+fn test_seam_blocking(
+    state: &AppState,
+    seam: crate::state::TestSeam,
+) -> Option<Arc<crate::state::MaintenanceBarrier>> {
+    test_seam(state, seam)
+}
+
+#[cfg(not(test))]
+fn test_seam_blocking(_state: &AppState, _seam: SelectionSeam) -> Option<()> {
+    None
+}
 
 /// Hold the post-eviction, pre-drain window open when a test asks.
 #[cfg(test)]
@@ -192,6 +211,28 @@ async fn wait_at_maintenance_barrier(state: &AppState) {
 #[cfg(not(test))]
 #[expect(clippy::unused_async, reason = "matches the cfg(test) signature")]
 async fn wait_at_maintenance_barrier(_state: &AppState) {}
+
+/// Hold an `ops` send open immediately before a recipient's dispatch when a
+/// test asks. See [`crate::state::TestSeam::OpsDispatch`].
+#[cfg(test)]
+pub(crate) async fn wait_at_ops_dispatch_seam(state: &AppState) {
+    wait_at_seam(test_seam(state, crate::state::TestSeam::OpsDispatch)).await;
+}
+
+#[cfg(not(test))]
+#[expect(clippy::unused_async, reason = "matches the cfg(test) signature")]
+pub(crate) async fn wait_at_ops_dispatch_seam(_state: &AppState) {}
+
+/// Hold a reading of a send the ledger does not hold at its dispatcher
+/// question when a test asks. See [`crate::state::TestSeam::WorkQuestion`].
+#[cfg(test)]
+pub(crate) async fn wait_at_work_question_seam(state: &AppState) {
+    wait_at_seam(test_seam(state, crate::state::TestSeam::WorkQuestion)).await;
+}
+
+#[cfg(not(test))]
+#[expect(clippy::unused_async, reason = "matches the cfg(test) signature")]
+pub(crate) async fn wait_at_work_question_seam(_state: &AppState) {}
 
 /// Hold [`capture_dispatch_snapshot`] open **between its two reads**, inside the
 /// `registry_write` guard, when a test asks. See [`crate::state::TestSeam::Capture`].
@@ -1653,13 +1694,13 @@ pub fn set_preferences_impl(state: &AppState, prefs: &Preferences) -> Result<(),
 /// rather than breaking the listing.
 ///
 /// The read-only built-in library is dropped from the listing when the user's
-/// `show_builtins` preference is off. This is the **only** place built-ins are
+/// `show_builtin_prompts` preference is off. This is the **only** place built-ins are
 /// hidden — `PromptService` always lists and renders them — so the toggle
 /// governs picker visibility without unwiring a workflow already pointed at a
 /// built-in (resolution by id still succeeds).
 pub fn list_prompts_impl(state: &AppState) -> Vec<switchboard_prompts::Prompt> {
     let prompts = state.prompts.list();
-    if lock(&state.preferences).show_builtins {
+    if lock(&state.preferences).show_builtin_prompts {
         return prompts;
     }
     prompts
@@ -2425,8 +2466,25 @@ pub fn set_visible_project_impl(state: &AppState, project_id: Option<ProjectId>,
     lock(&state.visible_project).apply(project_id, seq);
 }
 
+/// Register a new agent in the **active** project — the window's create, which
+/// targets whatever project the user is in. A thin wrapper over
+/// [`create_agent_in_project_impl`] so the active-project resolution stays in a
+/// tested free function rather than the command shim.
 pub fn create_agent_impl(
     state: &AppState,
+    name: &str,
+    harness: HarnessKind,
+    selection: AgentSelection,
+) -> Result<AgentRecord, AppError> {
+    let active = lock(&state.active_project_id).ok_or(AppError::NoActiveProject)?;
+    create_agent_in_project_impl(state, active, name, harness, selection)
+}
+
+/// Register a new agent in `project_id`, which must be loaded. Callers that
+/// act on an explicit project (the `ops` layer) use this directly.
+pub fn create_agent_in_project_impl(
+    state: &AppState,
+    project_id: ProjectId,
     name: &str,
     harness: HarnessKind,
     selection: AgentSelection,
@@ -2441,11 +2499,10 @@ pub fn create_agent_impl(
     // an internal read-check-then-append window that two concurrent IPC
     // calls could race through.
     let _write = lock(&state.registry_write);
-    let active = lock(&state.active_project_id).ok_or(AppError::NoActiveProject)?;
     let project = lock(&state.projects)
-        .get(&active)
+        .get(&project_id)
         .cloned()
-        .ok_or(AppError::ProjectNotLoaded(active))?;
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
     let record = project.register_agent(name, harness, selection)?;
     cache_agent(state, record.clone())?;
     Ok(record)
@@ -2490,15 +2547,29 @@ pub async fn fork_agent_impl(
         source_agent_id,
         home_dir,
         codex_binary,
-        switchboard_harness::subprocess::ensure_path_settled(CODEX_FORK_PATH_WAIT),
+        fork_path_ready(),
     )
     .await
+}
+
+/// The PATH readiness a fork waits on. In tests the PATH counts as settled:
+/// the capture runs the machine's login shell, which no test may depend on,
+/// and the wait's own tests inject their readiness into `fork_agent_with`.
+#[cfg(not(test))]
+pub(crate) fn fork_path_ready() -> impl std::future::Future<Output = PathSource> {
+    switchboard_harness::subprocess::ensure_path_settled(CODEX_FORK_PATH_WAIT)
+}
+
+#[cfg(test)]
+pub(crate) fn fork_path_ready() -> impl std::future::Future<Output = PathSource> {
+    std::future::ready(PathSource::LoginShell)
 }
 
 /// How long a Codex fork waits for the login-shell PATH capture at launch.
 /// The same budget, and the same reason, as [`ACCOUNT_USAGE_PATH_WAIT`]:
 /// resolving `codex` against the provisional GUI PATH misses installs outside
 /// the fallback's well-known folders. Paid only while a capture is in flight.
+#[cfg_attr(test, allow(dead_code))]
 pub const CODEX_FORK_PATH_WAIT: std::time::Duration =
     switchboard_harness::subprocess::capture_attempt_budget();
 
@@ -2861,48 +2932,107 @@ fn check_selection_supported(
 /// Switchboard sidecars. Resolves the agent's *own* project from its id (never
 /// the active project), so it's free of the active-project coupling.
 ///
-/// **Two phases by necessity.** `shutdown_agent` is async and the registry
-/// mutation runs under the synchronous `registry_write` guard, which can't be
-/// held across an `.await` (the guard isn't `Send`).
+/// **One dispatcher step.** [`Dispatcher::remove_agent`] holds the agent's slot
+/// closed from before its actor shuts down until the record is deleted, then
+/// marks the agent removed for good. A send that found the record a moment
+/// earlier, from the window, a workflow, or an orchestrator, is refused rather
+/// than starting a fresh actor whose turn nothing could see or stop once the
+/// record is gone. The registry deletion runs inside that step, synchronously
+/// under `registry_write` (the guard can't be held across an `.await`).
 ///
-/// **Active agents are torn down, not rejected.** If a turn is in flight,
-/// `shutdown_agent` cancels it (surfaced as a `Cancelled` terminal, same as
-/// "Stop"), drains the harness subprocess, and drops the slot — the UI gates
-/// Remove on the active state; the backend just makes teardown robust whatever
-/// the state. This inherits `shutdown_agent`'s drain latency: a slow subprocess
-/// wind-down blocks the command for that duration (same path as remove-directory
-/// and quit).
+/// **Active agents are torn down, not rejected.** If a turn is in flight, it is
+/// cancelled (surfaced as a `Cancelled` terminal, same as "Stop") and the
+/// harness subprocess drained. Callers that must not cancel work check first:
+/// the agent-access removal refuses a busy agent before calling this. This
+/// inherits the shutdown's drain latency: a slow subprocess wind-down blocks
+/// the command for that duration (same path as remove-directory and quit).
 ///
-/// **Not atomic across the two phases.** Phase (a) is irreversible (it cancels
-/// any in-flight turn), but phase (b)'s registry write can fail (disk I/O). On
-/// that path the turn was already cancelled yet the record remains — so a failed
-/// remove can still have cancelled work; "remove errored" does not mean "nothing
-/// happened." It self-heals functionally (the next send re-spawns the actor),
-/// and registry-write failure is rare, so this is accepted rather than made
-/// transactional across an async cancel + a sync write.
+/// **Not atomic across the two phases.** The shutdown is irreversible (it
+/// cancels any in-flight turn), but the registry write can fail (disk I/O). On
+/// that path the turn was already cancelled — so a failed remove can still have
+/// cancelled work; "remove errored" does not mean "nothing happened." What the
+/// failure did to the record is read back from the registry ([`settle_deletion`]):
+/// still there, the agent is left usable (its slot is cleared, so the next
+/// send starts a fresh actor); gone, it stays removed and the error says the
+/// change may not survive a crash; unreadable, it stays blocked until restart
+/// and nothing else is deleted. Registry-write failure is rare, so this is
+/// accepted rather than made transactional across an async cancel + a sync
+/// write.
+///
+/// [`Dispatcher::remove_agent`]: switchboard_dispatcher::Dispatcher::remove_agent
 pub async fn remove_agent_impl(state: &AppState, agent_id: AgentId) -> Result<(), AppError> {
     // Resolve the agent's *own* project from its id (never the active project),
-    // before the irreversible phase (a) so a non-existent agent fails fast —
+    // before the irreversible shutdown so a non-existent agent fails fast —
     // nothing is torn down before we know the agent exists.
     let (project, _agent) = lookup_agent(state, agent_id)?;
-
-    // Phase (a) — no lock held.
     state
         .dispatcher
-        .shutdown_agent(agent_id, CancelSource::Shutdown)
-        .await;
+        .remove_agent(agent_id, CancelSource::Shutdown, || {
+            let _write = lock(&state.registry_write);
+            // Absent already counts as deleted: an overlapping removal deleted
+            // it first.
+            let deletion = settle_deletion(project.remove_agent(agent_id), || {
+                project
+                    .list_agents()
+                    .map(|agents| agents.iter().any(|a| a.id == agent_id))
+            });
+            let forget = || {
+                delete_agent_sidecars(&project, agent_id);
+                lock(&state.agents_by_id).remove(&agent_id);
+                *lock(&state.agent_removals)
+                    .deletions
+                    .entry(project.id)
+                    .or_insert(0) += 1;
+            };
+            match deletion {
+                Deletion::Deleted => {
+                    forget();
+                    (true, Ok(()))
+                }
+                Deletion::DeletedNotDurable(source) => {
+                    forget();
+                    (true, Err(AppError::AgentRemovalNotDurable { source }))
+                }
+                Deletion::Kept(source) => (false, Err(source.into())),
+                // Blocked, but nothing deleted: whether the record went is
+                // unknown, and the registry decides at the next start.
+                Deletion::Unconfirmed(source) => {
+                    (true, Err(AppError::AgentRemovalUnconfirmed { source }))
+                }
+            }
+        })
+        .await
+}
 
-    // No lock spans (a)→(b), so a concurrent `send_message` to this id can
-    // re-spawn an `Active` actor via `ensure_actor` between the teardown and the
-    // registry removal — leaving an idle orphan actor after phase (b) deletes the
-    // record. Tolerated: it's UI-gated (you can't send to an agent you're
-    // removing), self-limiting (the orphan is idle), and reaped on restart.
-    // Phase (b) — fully synchronous under `registry_write`, no `.await`.
-    let _write = lock(&state.registry_write);
-    project.remove_agent(agent_id)?;
-    delete_agent_sidecars(&project, agent_id);
-    lock(&state.agents_by_id).remove(&agent_id);
-    Ok(())
+/// What a removal's registry deletion did.
+#[derive(Debug)]
+enum Deletion {
+    /// The record is gone.
+    Deleted,
+    /// The record is gone, but saving failed afterwards.
+    DeletedNotDurable(switchboard_core::CoreError),
+    /// The record is still there: the save failed before it took effect.
+    Kept(switchboard_core::CoreError),
+    /// The save failed and the registry could not be read back.
+    Unconfirmed(switchboard_core::CoreError),
+}
+
+/// Decide what a registry deletion did from its result and, after an error,
+/// the registry read back. An error alone does not say: the writer replaces
+/// the file before syncing its folder, so the sync can fail after the record
+/// is already gone.
+fn settle_deletion(
+    deleted: Result<bool, switchboard_core::CoreError>,
+    still_listed: impl FnOnce() -> Result<bool, switchboard_core::CoreError>,
+) -> Deletion {
+    match deleted {
+        Ok(_) => Deletion::Deleted,
+        Err(error) => match still_listed() {
+            Ok(true) => Deletion::Kept(error),
+            Ok(false) => Deletion::DeletedNotDurable(error),
+            Err(_) => Deletion::Unconfirmed(error),
+        },
+    }
 }
 
 /// Best-effort deletion of an agent's Switchboard sidecar. A missing file is
@@ -2968,7 +3098,10 @@ pub fn set_agent_session_locator_impl(
     Ok(updated)
 }
 
-/// Atomically replace the complete selection configuration for an agent.
+/// Atomically replace the complete selection configuration for an agent. Only
+/// tests write a whole selection; every caller in the app sends the parts it
+/// changed through [`change_agent_selection_impl`].
+#[cfg(test)]
 pub fn set_agent_selection_impl(
     state: &AppState,
     agent_id: AgentId,
@@ -2979,6 +3112,39 @@ pub fn set_agent_selection_impl(
     let updated = project.set_agent_selection(agent_id, selection)?;
     cache_agent(state, updated.clone())?;
     Ok(updated)
+}
+
+/// Change part of an agent's selection **under one `registry_write`
+/// acquisition**: read the current record, let `merge` produce the full
+/// replacement, write it, refresh the cache. A caller that read the record
+/// first and then called [`set_agent_selection_impl`] would race any write
+/// landing between its read and its write — a window edit of the model
+/// between an MCP caller's read and its effort-only write would be undone.
+pub fn update_agent_selection_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    merge: impl FnOnce(&AgentRecord) -> AgentSelection,
+) -> Result<AgentRecord, AppError> {
+    let _write = lock(&state.registry_write);
+    let (project, current) = lookup_agent(state, agent_id)?;
+    // Between the read and the write, while the lock is held: a test parks
+    // here and issues a second write, which must wait for this one.
+    wait_at_blocking_seam(test_seam_blocking(state, SelectionSeam));
+    let selection = merge(&current);
+    let updated = project.set_agent_selection(agent_id, selection)?;
+    cache_agent(state, updated.clone())?;
+    Ok(updated)
+}
+
+/// The window's selection editor: apply only the parts the user changed, so
+/// a model or effort change another client made a moment earlier survives the
+/// user's change to the other setting.
+pub fn change_agent_selection_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    changes: &crate::ops::change::SelectionChanges,
+) -> Result<AgentRecord, AppError> {
+    update_agent_selection_impl(state, agent_id, |current| changes.apply(current))
 }
 
 /// Rewrite a project's registry in `agent_ids` order — the roster's canonical
@@ -3068,21 +3234,35 @@ pub fn attach_agent_impl(
     existing_session_id: &str,
     home_dir: &Path,
 ) -> Result<AgentRecord, AppError> {
-    let _write = lock(&state.registry_write);
     let active = lock(&state.active_project_id).ok_or(AppError::NoActiveProject)?;
+    attach_agent_in_project_impl(state, active, name, harness, existing_session_id, home_dir)
+}
+
+/// [`attach_agent_impl`] against an explicit, loaded project — the same shape
+/// as [`create_agent_in_project_impl`], so the two registration paths stay
+/// parallel even though only create is reachable over MCP.
+pub fn attach_agent_in_project_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    name: &str,
+    harness: HarnessKind,
+    existing_session_id: &str,
+    home_dir: &Path,
+) -> Result<AgentRecord, AppError> {
+    let _write = lock(&state.registry_write);
     let project = lock(&state.projects)
-        .get(&active)
+        .get(&project_id)
         .cloned()
-        .ok_or(AppError::ProjectNotLoaded(active))?;
-    // The active project's index row, for its working directory: the session
-    // file to attach lives under the harness's per-cwd tree, and the Claude
-    // collision scan is scoped to the projects sharing that folder.
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
+    // The project's index row, for its working directory: the session file to
+    // attach lives under the harness's per-cwd tree, and the Claude collision
+    // scan is scoped to the projects sharing that folder.
     let entry = state
         .store
         .list_projects()?
         .into_iter()
-        .find(|e| e.id == active)
-        .ok_or(AppError::ProjectNotLoaded(active))?;
+        .find(|e| e.id == project_id)
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
     let directory_path = entry.directory.clone();
 
     // Claude/Antigravity identify a session by a UUID, parsed per-arm
@@ -3157,7 +3337,7 @@ pub fn attach_agent_impl(
         _ => return Err(AppError::UnsupportedHarness),
     };
 
-    // Register-cache: the new attached agent's project is `active`,
+    // Register-cache: the new attached agent's project is `project_id`,
     // which is loaded (resolved above), so a subsequent `lookup_agent` hits
     // the cache without a disk scan.
     cache_agent(state, record.clone())?;
@@ -3657,12 +3837,19 @@ pub async fn stage_attachment_impl(
     let attachments_dir = project.attachments_dir();
     let source_path = source_path.to_path_buf();
     let source_display = source_path.to_string_lossy().into_owned();
-    tokio::task::spawn_blocking(move || stage_attachment_io(&attachments_dir, &source_path))
-        .await
-        .map_err(|join_err| AppError::AttachmentStage {
-            source_path: source_display,
-            source: std::io::Error::other(join_err.to_string()),
-        })?
+    #[cfg(test)]
+    let seam = test_seam(state, crate::state::TestSeam::AttachmentCopy);
+    #[cfg(not(test))]
+    let seam: Option<()> = None;
+    tokio::task::spawn_blocking(move || {
+        wait_at_blocking_seam(seam);
+        stage_attachment_io(&attachments_dir, &source_path)
+    })
+    .await
+    .map_err(|join_err| AppError::AttachmentStage {
+        source_path: source_display,
+        source: std::io::Error::other(join_err.to_string()),
+    })?
 }
 
 /// Narrow `paths` to the staged attachments that still exist on disk.
@@ -3734,6 +3921,35 @@ pub async fn send_message_impl(
     send_id: SendId,
     home_dir: &Path,
 ) -> Result<MessageId, AppError> {
+    dispatch_message_impl(
+        state,
+        agent_id,
+        prompt,
+        attachments,
+        send_id,
+        home_dir,
+        OnBusy::Enqueue,
+        SendOptions::default(),
+    )
+    .await
+}
+
+/// [`send_message_impl`] with the caller choosing the busy policy and the
+/// dispatcher's [`SendOptions`]. The compose bar keeps `send_message_impl`'s
+/// queue-and-mint defaults; the `ops` layer passes `FailFast` under `refuse`,
+/// a ledger-registered `message_id`, and a live user message. Under
+/// `FailFast` a busy agent is [`AppError::AgentBusy`] with nothing enqueued.
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_message_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    prompt: &str,
+    attachments: Vec<Attachment>,
+    send_id: SendId,
+    home_dir: &Path,
+    on_busy: OnBusy,
+    options: SendOptions,
+) -> Result<MessageId, AppError> {
     // Project, agent, and generation from one instant — see
     // `capture_dispatch_snapshot`. Read separately they can straddle a lifecycle
     // operation, and the generation then validates itself.
@@ -3797,19 +4013,20 @@ pub async fn send_message_impl(
     // trivially-grouped 1-element fan-out with its own id.
     match state
         .dispatcher
-        .send_message(
+        .send_message_with(
             agent_id,
             prompt,
             attachments,
             send_id,
             factory,
-            OnBusy::Enqueue,
+            on_busy,
+            options,
         )
         .await
     {
         SendOutcome::Accepted(message_id) => Ok(message_id),
-        // Unreachable on the Enqueue path; FailFast (workflow §7) is not used
-        // here yet. Map defensively so a future caller can't silently misread.
+        // Unreachable on the Enqueue path; under FailFast the agent was busy
+        // and nothing was enqueued.
         SendOutcome::Busy => Err(AppError::AgentBusy),
     }
 }
@@ -3842,8 +4059,26 @@ pub async fn compact_agent_impl(
     send_id: SendId,
     home_dir: &Path,
 ) -> Result<MessageId, AppError> {
+    compact_agent_with_impl(
+        state,
+        agent_id,
+        send_id,
+        home_dir,
+        CompactOptions::default(),
+    )
+    .await
+}
+
+/// The three gates in front of a compaction, on the agent record and the
+/// project folder alone, so a caller that must refuse before any other work
+/// (agent access, before its window round trip) can ask first. Returns the
+/// snapshot the compaction is then dispatched under.
+pub(crate) fn compaction_gates(
+    state: &AppState,
+    agent_id: AgentId,
+    home_dir: &Path,
+) -> Result<(Project, AgentRecord, u64), AppError> {
     let (project, agent, generation) = capture_dispatch_snapshot(state, agent_id)?;
-    let project_id = project.id;
     if !agent.harness.supports_manual_compaction() {
         return Err(AppError::CompactionUnsupported {
             harness: agent.harness,
@@ -3859,6 +4094,20 @@ pub async fn compact_agent_impl(
             name: agent.name.clone(),
         });
     }
+    Ok((project, agent, generation))
+}
+
+/// [`compact_agent_impl`] with the receipt's `message_id` chosen by the caller
+/// and the admission announced: the compaction another client asked for.
+pub async fn compact_agent_with_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    send_id: SendId,
+    home_dir: &Path,
+    options: CompactOptions,
+) -> Result<MessageId, AppError> {
+    let (project, agent, generation) = compaction_gates(state, agent_id, home_dir)?;
+    let project_id = project.id;
     let adapter = adapter_for(state, &agent)?;
     let factory: Arc<dyn DispatchContextFactory> = Arc::new(ProjectDispatchContextFactory::new(
         project,
@@ -3880,10 +4129,12 @@ pub async fn compact_agent_impl(
     // Same last-moment check as a send: refuse if the project moved under us
     // while the awaits above were pending.
     reject_if_generation_changed(state, project_id, generation)?;
-    // `send_id` is minted by the frontend so it can cancel the compaction while
+    // `send_id` is minted by the caller so it can cancel the compaction while
     // it is still queued, before any `TurnStart` carries the id back. Unlike a
     // send's it groups nothing — a compaction is never a fan-out.
-    Ok(state.dispatcher.compact_agent(agent_id, send_id, &factory))
+    Ok(state
+        .dispatcher
+        .compact_agent_with(agent_id, send_id, &factory, options))
 }
 
 /// Ask `agent_id`'s harness what is occupying its context window, and return the
@@ -4088,6 +4339,27 @@ pub async fn forward_message_impl(
     home_dir: &Path,
     recipient_project: ProjectId,
 ) -> Result<ForwardOutcome, AppError> {
+    forward_message_inputs(
+        state,
+        body,
+        sources.into_iter().map(ForwardInput::latest).collect(),
+        forward_id,
+        home_dir,
+        recipient_project,
+    )
+    .await
+}
+
+/// [`forward_message_impl`] over [`ForwardInput`]s, so a caller can forward a
+/// reply it already read in place of a source's latest answer.
+pub(crate) async fn forward_message_inputs(
+    state: &AppState,
+    body: String,
+    sources: Vec<ForwardInput>,
+    forward_id: Uuid,
+    home_dir: &Path,
+    recipient_project: ProjectId,
+) -> Result<ForwardOutcome, AppError> {
     // A forward with no sources is malformed (a frontend bug or a direct IPC
     // call) — there is nothing to forward. Reject at the boundary.
     if sources.is_empty() {
@@ -4097,7 +4369,7 @@ pub async fn forward_message_impl(
     // Open each source's declared project (idempotent) and verify ownership
     // before the hold is registered — a bad reference must fail fast, not after
     // the user waits out a hold.
-    let sources = resolve_source_refs(state, &sources)?;
+    let sources = resolve_source_inputs(state, sources)?;
 
     let token = CancellationToken::new();
     lock(&state.forwards).insert(forward_id, token.clone());
@@ -4133,7 +4405,7 @@ impl Drop for ForwardGuard<'_> {
 async fn forward_resolve(
     state: &AppState,
     body: String,
-    sources: Vec<AgentId>,
+    sources: Vec<ResolvedInput>,
     token: &CancellationToken,
     home_dir: &Path,
     recipient_project: ProjectId,
@@ -4202,7 +4474,7 @@ async fn forward_resolve(
 /// the loaded record's own `project_id` against it. A mismatch means the draft
 /// names an agent that has since moved or been re-created, and is refused rather
 /// than silently resolved against the wrong project.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ForwardSourceRef {
     pub agent_id: AgentId,
     pub project_id: ProjectId,
@@ -4213,7 +4485,10 @@ pub struct ForwardSourceRef {
 /// backend with a foreign agent** — a chip picked this session, one restored
 /// after a restart, or a direct IPC call — so no frontend surface has to
 /// pre-open anything.
-fn resolve_source_ref(state: &AppState, source: ForwardSourceRef) -> Result<AgentId, AppError> {
+pub(crate) fn resolve_source_ref(
+    state: &AppState,
+    source: ForwardSourceRef,
+) -> Result<AgentId, AppError> {
     // Idempotent: a no-op when already loaded, a real open (with its lock) when
     // not. This is the *activation* path — deliberately distinct from the
     // read-only roster read the pickers browse with.
@@ -4237,6 +4512,53 @@ fn resolve_source_refs(
     sources
         .iter()
         .map(|&s| resolve_source_ref(state, s))
+        .collect()
+}
+
+/// One source of a manual forward as the resolver takes it: the agent, and
+/// the text to forward for it when the caller has already read it.
+///
+/// `settled_text` is a specific earlier reply the caller chose (the agent
+/// tools' `forward` with a `send_id`). A finished reply cannot change, so the
+/// resolver forwards it as given, under the same label, without waiting on
+/// the agent's current turn or reading its latest answer. The window's
+/// forwards always forward the latest answer and never set it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForwardInput {
+    pub source: ForwardSourceRef,
+    pub settled_text: Option<String>,
+}
+
+impl ForwardInput {
+    /// The source's latest answer, waiting for a turn in flight.
+    #[must_use]
+    pub(crate) fn latest(source: ForwardSourceRef) -> Self {
+        Self {
+            source,
+            settled_text: None,
+        }
+    }
+}
+
+/// A [`ForwardInput`] whose project has been opened and ownership verified.
+struct ResolvedInput {
+    agent_id: AgentId,
+    settled_text: Option<String>,
+}
+
+/// [`resolve_source_refs`] for inputs, keeping each one's settled text.
+fn resolve_source_inputs(
+    state: &AppState,
+    inputs: Vec<ForwardInput>,
+) -> Result<Vec<ResolvedInput>, AppError> {
+    inputs
+        .into_iter()
+        .map(|input| {
+            Ok(ResolvedInput {
+                agent_id: resolve_source_ref(state, input.source)?,
+                settled_text: input.settled_text,
+            })
+        })
         .collect()
 }
 
@@ -4421,14 +4743,22 @@ async fn resolve_source_completed_only(
 /// later sources only after earlier ones resolve, would miss).
 async fn resolve_all_sources(
     state: &AppState,
-    sources: &[AgentId],
+    sources: &[ResolvedInput],
     home_dir: &Path,
     recipient_project: ProjectId,
 ) -> Result<Vec<SourceResolution>, AppError> {
     // One journal read per distinct owning project — `latest_turn_failure_note`
     // consults it for each idle source, and sources may span projects. See
-    // [`SourceJournals`].
-    let journals = SourceJournals::read(state, sources.iter().copied())?;
+    // [`SourceJournals`]. A source with settled text needs no journal, so its
+    // project's is not read: a damaged line there must not block forwarding a
+    // reply already in hand.
+    let journals = SourceJournals::read(
+        state,
+        sources
+            .iter()
+            .filter(|s| s.settled_text.is_none())
+            .map(|s| s.agent_id),
+    )?;
     // `try_join_all` polls every source on the first poll (so all waits register
     // up front, before any can settle) and preserves declared order; a source's
     // *turn* failing is an `Ok(Invalidated)` it collects, while a genuine error
@@ -4436,7 +4766,7 @@ async fn resolve_all_sources(
     futures::future::try_join_all(
         sources
             .iter()
-            .map(|&s| resolve_source(state, s, home_dir, &journals, recipient_project)),
+            .map(|s| resolve_source(state, s, home_dir, &journals, recipient_project)),
     )
     .await
 }
@@ -4467,11 +4797,26 @@ async fn resolve_all_sources(
 /// reports the failure. Closing that would require ordering journal outcomes
 /// against harness-file turns by timestamp — a systemic change (the transcript
 /// merge has the same blind spot), out of scope for the forward resolver.
-fn latest_turn_failure_note(
+pub(crate) fn latest_turn_failure_note(
     records: &[switchboard_core::JournalRecord],
     agent_id: AgentId,
     agent_name: &str,
 ) -> Option<String> {
+    latest_turn_outcome(records, agent_id, agent_name).map(|(_, note)| note)
+}
+
+/// The agent's most recent journaled turn's non-completed outcome, typed, with
+/// the note [`latest_turn_failure_note`] forwards for it. `None` when that
+/// turn completed or the agent has no journaled turns. The outcome is `None`
+/// when the record's payload could not be parsed (the note still says the turn
+/// did not complete). Readers that must tell failed from cancelled use this
+/// rather than searching the note's text, which embeds the harness's own error
+/// message and can contain any words.
+pub(crate) fn latest_turn_outcome(
+    records: &[switchboard_core::JournalRecord],
+    agent_id: AgentId,
+    agent_name: &str,
+) -> Option<(Option<TurnOutcome>, String)> {
     use switchboard_core::JournalRecord;
     let latest_turn = records
         .iter()
@@ -4498,21 +4843,22 @@ fn latest_turn_failure_note(
         } if *a == agent_id && *turn_id == latest_turn => Some(outcome),
         _ => None,
     })?;
-    let note = match serde_json::from_value::<TurnOutcome>(outcome.clone()) {
-        Ok(TurnOutcome::Failed { message, .. }) => format!(
+    let parsed = serde_json::from_value::<TurnOutcome>(outcome.clone()).ok();
+    let note = match &parsed {
+        Some(TurnOutcome::Failed { message, .. }) => format!(
             "⚠️ {agent_name}'s most recent turn failed and produced no output to forward.\n\nError: {message}"
         ),
-        Ok(TurnOutcome::Cancelled { .. }) => format!(
+        Some(TurnOutcome::Cancelled { .. }) => format!(
             "⚠️ {agent_name}'s most recent turn was cancelled before producing output to forward."
         ),
         // The journal never writes a `Completed` `Outcome` (contract); if one
         // somehow appears, treat it as no-failure and let the caller read disk.
-        Ok(TurnOutcome::Completed) => return None,
+        Some(TurnOutcome::Completed) => return None,
         // A future non-completed variant, or an unparseable payload: we still know
         // (from the `Outcome`'s presence) the turn didn't complete.
-        Ok(_) | Err(_) => format!("⚠️ {agent_name}'s most recent turn did not complete."),
+        Some(_) | None => format!("⚠️ {agent_name}'s most recent turn did not complete."),
     };
-    Some(note)
+    Some((parsed, note))
 }
 
 /// Resolve one forward source: await its current in-flight turn's terminal (the
@@ -4523,19 +4869,28 @@ fn latest_turn_failure_note(
 /// invalidates the source (the held forward aborts — see system-design §7); a
 /// source whose most recent turn *already* failed before we forwarded resolves to
 /// a failure note (so the recipient learns it failed instead of a stale answer).
+/// A source with settled text resolves to that text at once, under the same
+/// label: the caller chose a finished reply, which no turn can change.
 async fn resolve_source(
     state: &AppState,
-    agent_id: AgentId,
+    source: &ResolvedInput,
     home_dir: &Path,
     journals: &SourceJournals,
     recipient_project: ProjectId,
 ) -> Result<SourceResolution, AppError> {
+    let agent_id = source.agent_id;
     let (project, agent) = lookup_agent(state, agent_id)?;
-    let journal = journals.for_project(project.id)?;
     let agent = AgentRecord {
         name: qualified_source_name(&agent.name, &project, recipient_project),
         ..agent
     };
+    if let Some(text) = &source.settled_text {
+        return Ok(SourceResolution::Resolved {
+            name: agent.name,
+            text: text.clone(),
+        });
+    }
+    let journal = journals.for_project(project.id)?;
     match state.dispatcher.wait_for_current_turn(agent_id).await {
         CurrentTurnWait::Terminal { outcome, .. } if !matches!(outcome, TurnOutcome::Completed) => {
             Ok(SourceResolution::Invalidated {
@@ -4584,6 +4939,24 @@ pub struct ForwardArg {
     pub required: bool,
 }
 
+/// A [`ForwardArg`] whose sources may carry settled text ([`ForwardInput`]).
+#[derive(Debug, Clone)]
+pub(crate) struct ForwardArgInputs {
+    pub name: String,
+    pub sources: Vec<ForwardInput>,
+    pub required: bool,
+}
+
+impl From<ForwardArg> for ForwardArgInputs {
+    fn from(arg: ForwardArg) -> Self {
+        Self {
+            name: arg.name,
+            sources: arg.sources.into_iter().map(ForwardInput::latest).collect(),
+            required: arg.required,
+        }
+    }
+}
+
 /// Manual forward into a prompt's arguments (the prompt-composer analogue of
 /// [`forward_message_impl`], and the manual precursor of the workflow `send`
 /// with `prompt` + `template_vars` — the workflow `send` reuses this resolve →
@@ -4606,6 +4979,42 @@ pub async fn forward_prompt_impl(
     forward_args: Vec<ForwardArg>,
     appended_text: String,
     appended_sources: Vec<ForwardSourceRef>,
+    forward_id: Uuid,
+    home_dir: &Path,
+    recipient_project: ProjectId,
+) -> Result<ForwardOutcome, AppError> {
+    forward_prompt_inputs(
+        state,
+        provider,
+        name,
+        typed_args,
+        forward_args
+            .into_iter()
+            .map(ForwardArgInputs::from)
+            .collect(),
+        appended_text,
+        appended_sources
+            .into_iter()
+            .map(ForwardInput::latest)
+            .collect(),
+        forward_id,
+        home_dir,
+        recipient_project,
+    )
+    .await
+}
+
+/// [`forward_prompt_impl`] over [`ForwardInput`]s, so a caller can forward a
+/// reply it already read in place of a source's latest answer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_prompt_inputs(
+    state: &AppState,
+    provider: String,
+    name: String,
+    typed_args: std::collections::BTreeMap<String, String>,
+    forward_args: Vec<ForwardArgInputs>,
+    appended_text: String,
+    appended_sources: Vec<ForwardInput>,
     forward_id: Uuid,
     home_dir: &Path,
     recipient_project: ProjectId,
@@ -4716,9 +5125,9 @@ async fn forward_prompt_resolve(
     provider: &str,
     name: &str,
     mut args: std::collections::BTreeMap<String, String>,
-    forward_args: &[ForwardArg],
+    forward_args: &[ForwardArgInputs],
     appended_text: &str,
-    appended_sources: &[ForwardSourceRef],
+    appended_sources: &[ForwardInput],
     token: &CancellationToken,
     home_dir: &Path,
     recipient_project: ProjectId,
@@ -4728,12 +5137,12 @@ async fn forward_prompt_resolve(
     // cross-source invalidation guarantee *across fields*, not just within one —
     // then regroup per field below. Each ref's declared project is opened and
     // verified here, before any wait registers.
-    let flat_refs: Vec<ForwardSourceRef> = forward_args
+    let flat_inputs: Vec<ForwardInput> = forward_args
         .iter()
-        .flat_map(|a| a.sources.iter().copied())
-        .chain(appended_sources.iter().copied())
+        .flat_map(|a| a.sources.iter().cloned())
+        .chain(appended_sources.iter().cloned())
         .collect();
-    let flat: Vec<AgentId> = resolve_source_refs(state, &flat_refs)?;
+    let flat = resolve_source_inputs(state, flat_inputs)?;
     let resolved = tokio::select! {
         biased;
         () = token.cancelled() => return Ok(ForwardOutcome::Cancelled),
@@ -4810,15 +5219,23 @@ async fn forward_prompt_resolve(
     let appended = compose_resolutions(&resolved[cursor..], appended_text);
 
     let rendered = state.prompts.render(provider, name, &args).await?;
-    // Combine like the frontend's `combinePromptMessage`: the rendered prompt,
-    // then (when non-empty) a blank line and the composed appended tail.
-    let trimmed_appended = appended.trim();
-    let body = if trimmed_appended.is_empty() {
-        rendered.text
+    Ok(ForwardOutcome::Resolved {
+        body: combine_prompt_message(&rendered.text, &appended),
+    })
+}
+
+/// A rendered prompt followed, when non-empty, by a blank line and the
+/// trimmed appended text — the one rule for combining the two, shared with the
+/// frontend's `combinePromptMessage` and with every backend send that takes a
+/// saved prompt plus typed text.
+#[must_use]
+pub(crate) fn combine_prompt_message(rendered: &str, appended: &str) -> String {
+    let trimmed = appended.trim();
+    if trimmed.is_empty() {
+        rendered.to_owned()
     } else {
-        format!("{}\n\n{trimmed_appended}", rendered.text)
-    };
-    Ok(ForwardOutcome::Resolved { body })
+        format!("{rendered}\n\n{trimmed}")
+    }
 }
 
 /// Cancel a held manual forward by `forward_id`: fire the registered hold token
@@ -4858,14 +5275,14 @@ pub async fn drain_agents_then_release_locks(
 }
 
 /// Load one agent's prior conversation from its harness session file, for the
-/// project-level conversation loader, which loads every agent through it.
-/// Lookup failures and recorded history that cannot be recovered safely
+/// project-level conversation loader, which loads every agent through it, and
+/// for the one-agent reads in `ops::read`. Lookup failures and recorded history that cannot be recovered safely
 /// surface as errors; per-line parse damage remains a successful best-effort
 /// load in `LoadedTranscript.warnings`, and genuinely absent or never-started
 /// sessions remain successful empty loads. Session identity is read from the
 /// agent's registry record (`session_locator`), so there's no per-agent
 /// session-link sidecar to corrupt.
-fn load_agent_transcript(
+pub(crate) fn load_agent_transcript(
     project: &Project,
     agent: &AgentRecord,
     home_dir: &Path,
@@ -5133,6 +5550,10 @@ fn load_agent_transcript_raw(
 pub struct AgentSessionInfo {
     /// Absolute path of the harness session file, present only if it exists.
     pub session_file: Option<String>,
+    /// Whether that file is one Codex has compressed. The text editor then
+    /// gets a decompressed copy rather than the file ([`session_file_for_editor`]),
+    /// so the sidebar says so.
+    pub session_file_compressed: bool,
     /// Full copy-ready resume command (`cd '<dir>' && <harness> …`), present
     /// only if the session can be resumed.
     pub resume_command: Option<String>,
@@ -5301,9 +5722,47 @@ pub fn agent_session_info_impl(
         });
 
     Ok(AgentSessionInfo {
+        session_file_compressed: session_file
+            .as_deref()
+            .is_some_and(switchboard_harness::codex::session_file::is_compressed_session_file),
         session_file: session_file.map(|p| p.to_string_lossy().into_owned()),
         resume_command,
     })
+}
+
+/// What "Open session file" hands the text editor.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionFileForEditor {
+    /// The session file itself.
+    File(PathBuf),
+    /// The session file's text, which the editor opens as a copy.
+    Text(String),
+}
+
+/// Resolve what "Open session file" opens for the session file at `path`.
+///
+/// `as_copy` is the choice the user clicked: "Open copy of session file" is
+/// offered when the sidebar last saw the file compressed, and that answer can
+/// be stale (a reply makes Codex restore the plain file). So a copy request
+/// always gets a copy, never the live file the user may then edit. A file
+/// Codex has compressed always opens as a copy too, because an editor would
+/// show its compressed bytes. Reading a long conversation takes a moment, so
+/// the command runs this on a blocking worker.
+///
+/// # Errors
+///
+/// [`AppError::SessionFileRead`] when the file to copy can't be read or, if
+/// compressed, doesn't decode.
+pub fn session_file_for_editor(
+    path: PathBuf,
+    as_copy: bool,
+) -> Result<SessionFileForEditor, AppError> {
+    if !as_copy && !switchboard_harness::codex::session_file::is_compressed_session_file(&path) {
+        return Ok(SessionFileForEditor::File(path));
+    }
+    switchboard_harness::codex::session_file::read_session_file(&path)
+        .map(SessionFileForEditor::Text)
+        .map_err(|source| AppError::SessionFileRead { path, source })
 }
 
 /// Validate an interactive-session handoff and build the selected terminal's
@@ -5587,7 +6046,7 @@ type UserMessageGroup = (
 /// (rendered but deliberately not correlated to any send), or nothing (a
 /// journaled prompt the journal already renders).
 #[derive(Clone, Copy)]
-enum TurnRender {
+pub(crate) enum TurnRender {
     Agent {
         send_id: Option<SendId>,
         correlation: Option<SendCorrelation>,
@@ -5964,7 +6423,7 @@ fn classify_turns_by_count(
 /// turns), and the window guard below declines any link naming a send this agent
 /// never received. Do not "flatten" the per-agent link maps into one, and do not
 /// relax the missing-send arm into a permissive default.
-fn classify_agent_turns(
+pub(crate) fn classify_agent_turns(
     turns: &[switchboard_harness::Turn],
     all_sends: &[(SendId, chrono::DateTime<chrono::Utc>)],
     links: &HashMap<String, SendId>,
@@ -6367,6 +6826,186 @@ fn commit_identity_join(
 // One linear pass over the journal + one over the transcripts; splitting it
 // would scatter the user-message grouping, outcome collection, and order-zip
 // correlation that are read together.
+/// Apply one `TurnLink` to an agent's link map under the poison rule.
+///
+/// A `hydration_key` is per-turn-unique, so in normal data each key
+/// maps to exactly one send. Enforce that invariant defensively
+/// rather than trusting it: if a key ever appears with a
+/// **conflicting** `send_id` — a stale/duplicate link (e.g. an
+/// enrichment read that raced the session-file flush, a future field
+/// reshape, a corrupt journal) — **poison** it: drop it so BOTH turns
+/// fall to positional, bounding any anomaly to "no worse than
+/// positional" rather than a silent mis-group (a last-write-wins
+/// `insert` would confidently reassign a turn to the wrong send). An
+/// idempotent same-key-same-send re-write is fine and never poisons;
+/// a poisoned key stays out even if it reappears later.
+///
+/// NOTE: this catches a stale link whose key collides with a
+/// legitimately-linked turn. The complementary cases — a stale key
+/// matching a turn with **no** link of its own (no collision fires), a
+/// link naming a foreign/missing send, or two keys naming one send — are
+/// caught by the window guard + claim-once in `classify_agent_turns` (a
+/// link is trusted only when the turn ran within that send's dispatch
+/// window and the send isn't already claimed). Together they bound any
+/// stale/corrupt link to "no worse than positional."
+///
+/// **Load-bearing axiom:** all of this presupposes a `hydration_key`
+/// identifies exactly ONE turn per agent. Key *reuse* across two turns
+/// (a harness that repeats an id, or a resumed/forked session that
+/// replays one) would defeat both layers — a link internally consistent
+/// for one turn would mis-group the other. Fresh Claude `message.id`s
+/// and Codex `turn_context.turn_id`s satisfy it today; a key-reusing
+/// harness must not be given a `TurnLink` without revisiting this.
+fn record_turn_link(
+    links: &mut HashMap<String, SendId>,
+    poison: &mut HashSet<String>,
+    agent_id: AgentId,
+    hydration_key: String,
+    send_id: SendId,
+) {
+    if poison.contains(&hydration_key) {
+        return;
+    }
+    match links.get(&hydration_key) {
+        Some(&existing) if existing != send_id => {
+            // Breadcrumb: two `TurnLink`s claim one key for different sends. No
+            // legitimate trigger (per-turn keys are unique), so any firing is a
+            // stale/corrupt link — surface it. Ids only.
+            tracing::warn!(
+                hydration_key = %hydration_key,
+                existing_send = %existing,
+                conflicting_send = %send_id,
+                %agent_id,
+                "conflicting TurnLink records for one hydration_key — poisoning the key (both turns fall back to positional)",
+            );
+            links.remove(&hydration_key);
+            poison.insert(hydration_key);
+        }
+        Some(_) => {} // same key, same send — idempotent, keep it
+        None => {
+            links.insert(hydration_key, send_id);
+        }
+    }
+}
+
+/// One agent's side of the journal: its sends in dispatch order — **all** of
+/// them, completed and not (a send cancelled or failed after the agent wrote
+/// content leaves a partial harness turn that must be paired) — the instant its
+/// journaled history begins (the boundary between imported pre-journaling turns
+/// and Switchboard-dispatched ones), its trusted durable links (under the
+/// poison rule in [`record_turn_link`]), its sends' prompts, and each send's
+/// recorded non-completed outcome.
+///
+/// **The one derivation.** The project merge and the single-agent readers
+/// (`ops::read`) both correlate an agent's transcript through this view, built
+/// by [`Self::by_agent`] in one pass, so a reply's `send_id` reported to one
+/// caller pages the same reply for every other. The prompt is the agent's own
+/// record's: every recipient of a fan-out receives identical text today, and
+/// if per-recipient prompts ever differ, the agent's own is the text its
+/// transcript echoes.
+#[derive(Default)]
+pub(crate) struct AgentJournalView {
+    pub sends: Vec<(SendId, chrono::DateTime<chrono::Utc>)>,
+    pub journal_start: Option<chrono::DateTime<chrono::Utc>>,
+    pub links: HashMap<String, SendId>,
+    pub send_prompts: HashMap<SendId, (String, Vec<Attachment>)>,
+    /// The non-completed outcome the journal recorded for a send, with its
+    /// reason. Absent for a completed send (the journal writes no outcome for
+    /// one) and for one still running.
+    pub outcomes: HashMap<SendId, (OutcomeStatus, Option<String>)>,
+    poison: HashSet<String>,
+}
+
+impl AgentJournalView {
+    /// Every agent's view, in one pass over the journal.
+    pub(crate) fn by_agent(
+        records: &[switchboard_core::JournalRecord],
+    ) -> HashMap<AgentId, AgentJournalView> {
+        Self::build(records, None)
+    }
+
+    /// One agent's view. Other agents' records are skipped, not indexed.
+    pub(crate) fn from_records(
+        records: &[switchboard_core::JournalRecord],
+        agent_id: AgentId,
+    ) -> Self {
+        Self::build(records, Some(agent_id))
+            .remove(&agent_id)
+            .unwrap_or_default()
+    }
+
+    /// The one per-record step behind both constructors: every agent's view,
+    /// or only `only`'s.
+    fn build(
+        records: &[switchboard_core::JournalRecord],
+        only: Option<AgentId>,
+    ) -> HashMap<AgentId, AgentJournalView> {
+        let wanted = |agent_id: &AgentId| only.is_none_or(|only| only == *agent_id);
+        let mut views: HashMap<AgentId, AgentJournalView> = HashMap::new();
+        for record in records {
+            match record {
+                switchboard_core::JournalRecord::Send {
+                    send_id,
+                    agent_id,
+                    prompt,
+                    attachments,
+                    at,
+                    ..
+                } if wanted(agent_id) => {
+                    let view = views.entry(*agent_id).or_default();
+                    view.sends.push((*send_id, *at));
+                    view.journal_start = Some(view.journal_start.map_or(*at, |s| s.min(*at)));
+                    view.send_prompts
+                        .entry(*send_id)
+                        .or_insert_with(|| (prompt.clone(), attachments.clone()));
+                }
+                switchboard_core::JournalRecord::TurnLink {
+                    send_id,
+                    agent_id,
+                    hydration_key,
+                    ..
+                } if wanted(agent_id) => {
+                    let view = views.entry(*agent_id).or_default();
+                    record_turn_link(
+                        &mut view.links,
+                        &mut view.poison,
+                        *agent_id,
+                        hydration_key.clone(),
+                        *send_id,
+                    );
+                }
+                switchboard_core::JournalRecord::Outcome {
+                    send_id,
+                    agent_id,
+                    outcome,
+                    ..
+                } if wanted(agent_id) => {
+                    let (status, reason, _) = parse_outcome(outcome);
+                    views
+                        .entry(*agent_id)
+                        .or_default()
+                        .outcomes
+                        .insert(*send_id, (status, reason));
+                }
+                _ => {}
+            }
+        }
+        views
+    }
+
+    /// Correlate `turns` (this agent's transcript) to its sends exactly as the
+    /// merged conversation does.
+    pub(crate) fn classify(&self, turns: &[switchboard_harness::Turn]) -> Vec<TurnRender> {
+        classify_agent_turns(
+            turns,
+            &self.sends,
+            &self.links,
+            &self.send_prompts,
+            self.journal_start,
+        )
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn merge_project_conversation(
     journal: Vec<switchboard_core::JournalRecord>,
@@ -6386,31 +7025,13 @@ fn merge_project_conversation(
     let mut index_of: HashMap<SendId, usize> = HashMap::new();
     let mut user_messages: Vec<UserMessageGroup> = Vec::new();
     // The journal's `turn_id` is the dispatcher's, distinct from the harness
-    // session file's own turn ids, so they can't be joined directly. Instead we
-    // correlate each agent's harness turns to its sends by ORDER: the Nth harness
-    // agent turn answers the Nth send dispatched to it (the dispatcher runs an
-    // agent's turns FIFO and journals in that order). `agent_sends` is each
-    // agent's sends in dispatch order — **all** of them, completed and not: a
-    // send cancelled/failed *after* the agent wrote content leaves a partial
-    // harness turn that must be paired (excluding non-completed sends here is the
-    // bug that double-rendered the prompt). A non-completed send's cancelled/failed
-    // badge comes from its Outcome marker, which renders alongside the turn
-    // (`ProjectConversation` render-both contract).
-    let mut agent_sends: HashMap<AgentId, Vec<(SendId, chrono::DateTime<chrono::Utc>)>> =
-        HashMap::new();
-    // Each agent's earliest journaled-send instant — the boundary between its
-    // pre-journaling history (attached/imported turns, older than this) and its
-    // Switchboard-dispatched turns. Used to count an agent's leading imported
-    // turns by timestamp rather than by `min(turns, sends)`, which can't tell a
-    // leading imported turn from a trailing in-flight send when both are present.
-    let mut journal_start: HashMap<AgentId, chrono::DateTime<chrono::Utc>> = HashMap::new();
-    // Durable send↔turn links (`hydration_key → send_id`), per agent, from
-    // `TurnLink` records. The key-join uses these to match content-bearing turns
-    // to their sends exactly, before the positional fallback runs. `agent_link_poison`
-    // holds keys seen with conflicting sends (see the `TurnLink` arm) — a poisoned
-    // key is excluded from the join so the anomaly degrades to positional.
-    let mut agent_links: HashMap<AgentId, HashMap<String, SendId>> = HashMap::new();
-    let mut agent_link_poison: HashMap<AgentId, HashSet<String>> = HashMap::new();
+    // session file's own turn ids, so they can't be joined directly. Each agent's
+    // harness turns are correlated to its sends through its `AgentJournalView`
+    // (durable links first, then order: the Nth harness agent turn answers the Nth
+    // send dispatched to it, since the dispatcher runs an agent's turns FIFO and
+    // journals in that order). Built once, before the records are consumed below,
+    // by the same builder the single-agent readers use.
+    let mut views = AgentJournalView::by_agent(&journal);
     for record in journal {
         match record {
             switchboard_core::JournalRecord::Send {
@@ -6421,15 +7042,6 @@ fn merge_project_conversation(
                 attachments,
                 at,
             } => {
-                agent_sends.entry(agent_id).or_default().push((send_id, at));
-                journal_start
-                    .entry(agent_id)
-                    .and_modify(|earliest| {
-                        if at < *earliest {
-                            *earliest = at;
-                        }
-                    })
-                    .or_insert(at);
                 if let Some(&i) = index_of.get(&send_id) {
                     let entry = &mut user_messages[i];
                     if !entry.1.contains(&agent_id) {
@@ -6467,80 +7079,13 @@ fn merge_project_conversation(
                     at: started_at,
                 });
             }
-            switchboard_core::JournalRecord::TurnLink {
-                send_id,
-                agent_id,
-                hydration_key,
-                ..
-            } => {
-                // A `hydration_key` is per-turn-unique, so in normal data each key
-                // maps to exactly one send. Enforce that invariant defensively
-                // rather than trusting it: if a key ever appears with a
-                // **conflicting** send_id — a stale/duplicate link (e.g. an
-                // enrichment read that raced the session-file flush, a future field
-                // reshape, a corrupt journal) — **poison** it: drop it so BOTH turns
-                // fall to positional, bounding any anomaly to "no worse than
-                // positional" rather than a silent mis-group (a last-write-wins
-                // `insert` would confidently reassign a turn to the wrong send). An
-                // idempotent same-key-same-send re-write is fine and never poisons;
-                // a poisoned key stays out even if it reappears later.
-                //
-                // NOTE: this catches a stale link whose key collides with a
-                // legitimately-linked turn. The complementary cases — a stale key
-                // matching a turn with **no** link of its own (no collision fires), a
-                // link naming a foreign/missing send, or two keys naming one send — are
-                // caught by the window guard + claim-once in `classify_agent_turns` (a
-                // link is trusted only when the turn ran within that send's dispatch
-                // window and the send isn't already claimed). Together they bound any
-                // stale/corrupt link to "no worse than positional."
-                //
-                // **Load-bearing axiom:** all of this presupposes a `hydration_key`
-                // identifies exactly ONE turn per agent. Key *reuse* across two turns
-                // (a harness that repeats an id, or a resumed/forked session that
-                // replays one) would defeat both layers — a link internally consistent
-                // for one turn would mis-group the other. Fresh Claude `message.id`s
-                // and Codex `turn_context.turn_id`s satisfy it today; a key-reusing
-                // harness must not be given a `TurnLink` without revisiting this.
-                let poison = agent_link_poison.entry(agent_id).or_default();
-                if poison.contains(&hydration_key) {
-                    continue;
-                }
-                let links = agent_links.entry(agent_id).or_default();
-                match links.get(&hydration_key) {
-                    Some(&existing) if existing != send_id => {
-                        // Breadcrumb: two `TurnLink`s claim one key for different
-                        // sends. No legitimate trigger (per-turn keys are unique), so
-                        // any firing is a stale/corrupt link — surface it. Ids only.
-                        tracing::warn!(
-                            hydration_key = %hydration_key,
-                            existing_send = %existing,
-                            conflicting_send = %send_id,
-                            %agent_id,
-                            "conflicting TurnLink records for one hydration_key — poisoning the key (both turns fall back to positional)",
-                        );
-                        links.remove(&hydration_key);
-                        poison.insert(hydration_key);
-                    }
-                    Some(_) => {} // same key, same send — idempotent, keep it
-                    None => {
-                        links.insert(hydration_key, send_id);
-                    }
-                }
-            }
-            // A future journal-record kind we don't yet render — degrade by
-            // skipping it rather than failing the whole load.
+            // `TurnLink`s are applied by `AgentJournalView::by_agent` above,
+            // under the poison rule documented on `record_turn_link`. A future
+            // journal-record kind we don't yet render degrades by being skipped
+            // rather than failing the whole load.
             _ => {}
         }
     }
-    // Each send's journaled prompt + attachments — the two halves the surplus
-    // arm of `classify_turns_by_provenance` reconstructs the dispatched text
-    // from. Taken before the grouped messages are consumed below.
-    let send_prompts: HashMap<SendId, (String, Vec<Attachment>)> = user_messages
-        .iter()
-        .map(|(send_id, _, prompt, attachments, _)| {
-            (*send_id, (prompt.clone(), attachments.clone()))
-        })
-        .collect();
     for (send_id, agent_ids, text, attachments, at) in user_messages {
         items.push(ConversationItem::UserMessage {
             id: send_id,
@@ -6573,8 +7118,6 @@ fn merge_project_conversation(
         // bare-CLI-on-a-driven-session pattern and pinned by characterization
         // tests — live in those helpers' docs. The key-join dissolves it for any
         // turn that carries a link the reader still emits.
-        let all_sends = agent_sends.get(&agent_id).map_or(&[][..], Vec::as_slice);
-        let journal_start_at = journal_start.get(&agent_id).copied();
         // Durable key-join first (authoritative), positional fallback for the
         // residual. `classify_agent_turns` matches each content-bearing turn to its
         // send by `hydration_key` (suppressing the harness-echoed prompt via the
@@ -6582,10 +7125,7 @@ fn merge_project_conversation(
         // positionally — recomputing `turn_offset`/`dangling`/provenance-vs-count
         // from that residual view. All the front-offset / dangling / straddling
         // rationale lives in those helpers' docs now.
-        let empty_links = HashMap::new();
-        let links = agent_links.get(&agent_id).unwrap_or(&empty_links);
-        let renders =
-            classify_agent_turns(&turns, all_sends, links, &send_prompts, journal_start_at);
+        let renders = views.remove(&agent_id).unwrap_or_default().classify(&turns);
         for (turn, render) in turns.into_iter().zip(renders) {
             match (turn, render) {
                 (
@@ -6833,10 +7373,12 @@ fn gc_unreferenced_attachments(attachments_dir: &Path, referenced: &HashSet<Path
 ///    would otherwise reclaim attachments belonging to work still queued here.
 ///
 /// Both rest on a further assumption worth tripping over rather than
-/// rediscovering: backend-originated sends (workflow steps) carry no staged
-/// attachments, so nothing can enqueue an attachment-bearing send without the
-/// frontend. If that changes, or if a send path stops requiring an opened
-/// project, this boundary has to be rebuilt.
+/// rediscovering: a backend-originated send stages its attachments only after
+/// the window reports the project loaded. Workflow steps carry none; a send over
+/// MCP copies its files in after `ensure_ready` returns (`ops::attach`), by
+/// which time this pass has run and cannot run again in this process. If a
+/// backend path ever stages before the window has loaded the project, or a send
+/// path stops requiring an opened project, this boundary has to be rebuilt.
 ///
 /// Reclaiming is opportunistic — a pure function of on-disk state, re-run on the
 /// next process start — so a skipped pass costs only disk.
@@ -6958,21 +7500,25 @@ pub async fn load_project_conversation_impl(
         let home_dir = home_dir.to_path_buf();
         async move {
             let agent_id = agent.id;
-            let result = tokio::task::spawn_blocking(move || {
-                load_agent_transcript(&project, &agent, &home_dir)
-            })
-            .await;
+            // Through the context store, which captures the agent's live
+            // generation before the parse so a reply that lands during a long
+            // parse keeps its figures over the file's (see `ops::context`).
+            let result = state
+                .context
+                .parse_recording(agent_id, async move {
+                    tokio::task::spawn_blocking(move || {
+                        load_agent_transcript(&project, &agent, &home_dir)
+                    })
+                    .await
+                    .map_err(|e| AppError::Internal(format!("transcript load task failed: {e}")))?
+                })
+                .await;
             match result {
-                Ok(Ok(transcript)) => (agent_id, transcript, None),
-                Ok(Err(err)) => (
+                Ok(transcript) => (agent_id, transcript, None),
+                Err(err) => (
                     agent_id,
                     switchboard_harness::LoadedTranscript::default(),
                     Some(err.to_string()),
-                ),
-                Err(join_err) => (
-                    agent_id,
-                    switchboard_harness::LoadedTranscript::default(),
-                    Some(join_err.to_string()),
                 ),
             }
         }
@@ -7530,7 +8076,10 @@ pub fn install_status_for_adapter(adapter: Option<&dyn HarnessAdapter>) -> Harne
 /// typed error (`DirectoryNotFound` / `AmbiguousDirectory`) rather than
 /// `ProjectNotLoaded`: the project exists, and saying otherwise would point the
 /// user at the wrong repair.
-fn open_project_from_store(state: &AppState, project_id: ProjectId) -> Result<Project, AppError> {
+pub(crate) fn open_project_from_store(
+    state: &AppState,
+    project_id: ProjectId,
+) -> Result<Project, AppError> {
     // Gated: this is the fallback ordinary reads take when a project isn't
     // loaded, which is exactly what a lifecycle operation makes true. Two of its
     // callers resolve harness session files through `project.directory`, so
@@ -7546,7 +8095,10 @@ fn open_project_from_store(state: &AppState, project_id: ProjectId) -> Result<Pr
     state.store.open_project(project_id).map_err(AppError::from)
 }
 
-fn lookup_agent(state: &AppState, agent_id: AgentId) -> Result<(Project, AgentRecord), AppError> {
+pub(crate) fn lookup_agent(
+    state: &AppState,
+    agent_id: AgentId,
+) -> Result<(Project, AgentRecord), AppError> {
     // Register-cache hit: the cached `AgentRecord` carries its `project_id`, so
     // we resolve the owning project without scanning every loaded project's
     // `registry.jsonl` from disk. **The project is always loaded when its agents
@@ -9138,7 +9690,10 @@ mod tests {
     ) -> Result<switchboard_dispatcher::TurnPermit, String> {
         let factory = factory_for(state, project_id, agent_id, home);
         let context = factory.build(SendId::now_v7());
-        factory.preflight(&context.agent).await
+        factory
+            .preflight(&context.agent)
+            .await
+            .map_err(|refusal| refusal.message)
     }
 
     /// The session-lock key for an agent's own session, as the other
@@ -9444,8 +9999,10 @@ mod tests {
             .await
             .expect_err("a project that moved between the read and the build must not dispatch");
         assert!(
-            refusal.contains("changed before the turn could start"),
-            "got: {refusal}"
+            refusal
+                .message
+                .contains("changed before the turn could start"),
+            "got: {refusal:?}"
         );
     }
 
@@ -9853,8 +10410,10 @@ mod tests {
             .await
             .expect_err("a factory built before the operation must not dispatch after it");
         assert!(
-            refusal.contains("changed before the turn could start"),
-            "got: {refusal}"
+            refusal
+                .message
+                .contains("changed before the turn could start"),
+            "got: {refusal:?}"
         );
     }
 
@@ -15714,6 +16273,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_session_info_says_when_codex_has_compressed_the_session_file() {
+        // The sidebar labels "Open session file" as a copy only then.
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
+        let agent = create_agent_impl(
+            &state,
+            "codex_three",
+            HarnessKind::Codex,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        set_agent_session_locator_impl(
+            &state,
+            agent.id,
+            SessionLocator::Codex {
+                thread_id: "sess-zst".to_owned(),
+                partition_date: date,
+            },
+        )
+        .unwrap();
+        let plain = stage_codex_session_file(tmp_home.path(), date, "sess-zst");
+
+        let info = agent_session_info_impl(&state, agent.id, tmp_home.path()).unwrap();
+        assert!(!info.session_file_compressed);
+
+        let compressed = plain.with_extension("jsonl.zst");
+        std::fs::write(&compressed, zstd::encode_all(&b"{}\n"[..], 3).unwrap()).unwrap();
+        std::fs::remove_file(&plain).unwrap();
+        let info = agent_session_info_impl(&state, agent.id, tmp_home.path()).unwrap();
+        assert_eq!(
+            info.session_file.as_deref(),
+            Some(compressed.to_string_lossy().as_ref())
+        );
+        assert!(info.session_file_compressed);
+    }
+
+    #[test]
+    fn session_file_for_editor_opens_a_plain_file_itself() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x-sess.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+
+        assert_eq!(
+            session_file_for_editor(path.clone(), false).unwrap(),
+            SessionFileForEditor::File(path)
+        );
+    }
+
+    #[test]
+    fn session_file_for_editor_opens_a_requested_copy_even_of_a_plain_file() {
+        // The sidebar offered "Open copy" from a stale answer: a reply has
+        // since made Codex restore the plain file. The user must still get a
+        // copy, not the live file they may edit.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x-sess.jsonl");
+        std::fs::write(&path, "{\"a\":1}\n").unwrap();
+
+        assert_eq!(
+            session_file_for_editor(path, true).unwrap(),
+            SessionFileForEditor::Text("{\"a\":1}\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn session_file_for_editor_decompresses_a_file_codex_has_compressed() {
+        // A text editor would show the compressed bytes.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x-sess.jsonl.zst");
+        std::fs::write(&path, zstd::encode_all(&b"{\"a\":1}\n{}\n"[..], 3).unwrap()).unwrap();
+
+        assert_eq!(
+            session_file_for_editor(path, false).unwrap(),
+            SessionFileForEditor::Text("{\"a\":1}\n{}\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn session_file_for_editor_names_a_compressed_file_that_does_not_decode() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout-x-sess.jsonl.zst");
+        std::fs::write(&path, "not really zstd").unwrap();
+
+        let error = session_file_for_editor(path.clone(), true).unwrap_err();
+        assert!(
+            matches!(&error, AppError::SessionFileRead { path: failed, .. } if *failed == path),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("rollout-x-sess.jsonl.zst"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn load_agent_transcript_for_codex_agent_without_sidecar_returns_meta_only_empty() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha");
         // Create a Codex agent the normal way (no sidecar — no first dispatch).
@@ -16140,6 +16793,49 @@ mod tests {
     }
 
     // --- remove_agent / rename_agent ---
+
+    fn disk_error() -> switchboard_core::CoreError {
+        switchboard_core::CoreError::Io {
+            path: PathBuf::from("/store/registry.jsonl"),
+            source: std::io::Error::other("disk failed"),
+        }
+    }
+
+    #[test]
+    fn a_deletion_is_settled_by_what_the_registry_holds_after_an_error() {
+        assert!(matches!(
+            settle_deletion(Ok(true), || panic!("no read-back without an error")),
+            Deletion::Deleted
+        ));
+        assert!(
+            matches!(
+                settle_deletion(Ok(false), || panic!("no read-back")),
+                Deletion::Deleted
+            ),
+            "already absent: an overlapping removal deleted it"
+        );
+        assert!(
+            matches!(
+                settle_deletion(Err(disk_error()), || Ok(false)),
+                Deletion::DeletedNotDurable(_)
+            ),
+            "the file was replaced, then its folder failed to sync"
+        );
+        assert!(
+            matches!(
+                settle_deletion(Err(disk_error()), || Ok(true)),
+                Deletion::Kept(_)
+            ),
+            "the save failed before the record went"
+        );
+        assert!(
+            matches!(
+                settle_deletion(Err(disk_error()), || Err(disk_error())),
+                Deletion::Unconfirmed(_)
+            ),
+            "the registry could not be read back"
+        );
+    }
     // Fixture-level only — no live test: these commands don't change how we talk
     // to a real CLI, just registry/sidecar/in-memory state.
 
@@ -25051,7 +25747,8 @@ mod tests {
             editor_command: Some("zed".to_owned()),
             terminal_app: "iTerm".to_owned(),
             diff_style: preferences::DiffStyle::Unified,
-            show_builtins: false,
+            show_builtin_prompts: false,
+            show_builtin_workflows: false,
             claude_chrome_enabled: true,
             auto_reading_mode: true,
             notify_on_completion: true,
@@ -25080,7 +25777,8 @@ mod tests {
                 editor_command: Some("  ".to_owned()),
                 terminal_app: String::new(),
                 diff_style: preferences::DiffStyle::SideBySide,
-                show_builtins: true,
+                show_builtin_prompts: true,
+                show_builtin_workflows: true,
                 claude_chrome_enabled: false,
                 auto_reading_mode: false,
                 notify_on_completion: true,
@@ -25106,7 +25804,8 @@ mod tests {
             editor_command: Some("code".to_owned()),
             terminal_app: "Terminal".to_owned(),
             diff_style: preferences::DiffStyle::SideBySide,
-            show_builtins: true,
+            show_builtin_prompts: true,
+            show_builtin_workflows: true,
             claude_chrome_enabled: false,
             auto_reading_mode: false,
             notify_on_completion: true,
@@ -25171,7 +25870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn show_builtins_off_hides_built_ins_but_keeps_resolution() {
+    async fn hide_builtin_prompts_keeps_workflows_and_prompt_resolution() {
         // The toggle is visibility-only: built-ins drop out of the listing, yet a
         // render-by-id still resolves (so a workflow wired to one never breaks).
         let (tmp, state) = state_with_prompts();
@@ -25181,7 +25880,7 @@ mod tests {
         set_preferences_impl(
             &state,
             &Preferences {
-                show_builtins: false,
+                show_builtin_prompts: false,
                 notify_on_completion: true,
                 notify_while_focused: false,
                 ..Preferences::default()
@@ -25189,6 +25888,7 @@ mod tests {
         )
         .unwrap();
 
+        assert!(list_workflows_impl(&state).iter().any(|w| w.is_builtin));
         let prompts = list_prompts_impl(&state);
         assert!(
             prompts
@@ -26341,13 +27041,19 @@ mod tests {
         set_preferences_impl(
             &state,
             &Preferences {
-                show_builtins: false,
+                show_builtin_workflows: false,
                 notify_on_completion: true,
                 notify_while_focused: false,
                 ..Preferences::default()
             },
         )
         .unwrap();
+        state.prompts.sync().await;
+        assert!(
+            list_prompts_impl(&state)
+                .iter()
+                .any(|p| p.provider == switchboard_prompts::BUILTIN_PROVIDER)
+        );
         let listed = list_workflows_impl(&state);
         assert!(
             listed.iter().all(|w| !w.is_builtin),
@@ -26530,6 +27236,8 @@ mod tests {
                     current_step: 0,
                 },
                 steps: Vec::new(),
+                resolved: std::collections::BTreeMap::new(),
+                through_agent_access: false,
                 done: std::sync::Arc::new(tokio::sync::Notify::new()),
             },
         );

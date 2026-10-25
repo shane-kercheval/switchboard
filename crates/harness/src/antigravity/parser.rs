@@ -27,7 +27,7 @@
 //! See `docs/research/archive/antigravity-cli-observed.md` for the ground-truth
 //! shapes these types mirror.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -87,22 +87,43 @@ impl TranscriptRecord {
     }
 
     /// A `MODEL` record that is not a planner response is a normal tool result
-    /// (`RUN_COMMAND`, `VIEW_FILE`, `CortexStep*`...). Antigravity instead
-    /// writes invalid tool invocations as `SYSTEM` / `ERROR_MESSAGE` records;
-    /// those are tool results only when their payload explicitly identifies an
-    /// invalid tool call. Other system errors, such as quota exhaustion, are
-    /// turn-level and must not consume a pending tool id.
+    /// (`RUN_COMMAND`, `VIEW_FILE`, `GENERIC`, `CortexStep*`...). agy 1.1.2
+    /// instead wrote invalid tool invocations as `SYSTEM` / `ERROR_MESSAGE`
+    /// records; those are tool results only when their payload explicitly
+    /// identifies an invalid tool call. Other system errors, such as quota
+    /// exhaustion, are turn-level and must not consume a pending tool id.
     pub(crate) fn is_tool_result(&self) -> bool {
         (self.source == "MODEL" && !self.is_planner_response()) || self.is_invalid_tool_call_error()
     }
 
-    pub(crate) fn tool_result_is_error(&self) -> bool {
-        self.is_invalid_tool_call_error()
-            || self.status.as_deref() == Some("FAILED")
-            || self
+    /// What a tool result says about failure, read before it is paired with
+    /// its call; [`ResultFailure::is_error_for`] turns it into the verdict.
+    /// Each `agy` generation has written a failed tool differently, and all of
+    /// them are still read:
+    ///
+    /// - 1.1.2: a rejected call as `SYSTEM` / `ERROR_MESSAGE` naming an
+    ///   invalid tool call, with `status:"DONE"`.
+    /// - 1.1.19: a rejected call wrote no record at all; only the stream
+    ///   reported it (see [`AntigravityParserState::close_pending_tools`]).
+    /// - 1.4.2 (probed 2026-10-19; the 1.2.4 changelog's "terminal `ERROR`
+    ///   steps" fix is the likely origin): a rejected call as an ordinary
+    ///   `MODEL` result with `status:"ERROR"` and the reason in `error`, e.g.
+    ///   a missing-file `view_file` or a missing-target `replace_file_content`.
+    ///   1.4.3 writes the same shape when a renamed tool fails while running
+    ///   (a missing-file `read_file`: `error:"file does not exist"`).
+    ///
+    /// `status:"FAILED"` predates these captures and is kept. A command that
+    /// ran and exited non-zero carries no structured signal in any version, so
+    /// it is read from the record's prose by [`header_reports_nonzero_exit`].
+    pub(crate) fn tool_result_failure(&self) -> ResultFailure {
+        ResultFailure {
+            structured: self.is_invalid_tool_call_error()
+                || matches!(self.status.as_deref(), Some("FAILED" | "ERROR")),
+            nonzero_exit_header: self
                 .content
                 .as_deref()
-                .is_some_and(tool_result_content_is_error)
+                .is_some_and(header_reports_nonzero_exit),
+        }
     }
 
     pub(crate) fn tool_result_output(&self) -> String {
@@ -136,18 +157,128 @@ impl TranscriptRecord {
     }
 }
 
-fn tool_result_content_is_error(content: &str) -> bool {
+/// The one tool whose results report an exit code. **Failed-command detection
+/// is tied to this name:** at agy 1.4.2 and 1.4.3 every result record has
+/// `type:"GENERIC"`, so only the paired call says a result came from a
+/// command. If `agy` renamed it, failed commands would read as successes again
+/// (`live_antigravity_failing_command_completes_as_tool_error` fails on that).
+/// A command that ran in the background and whose exit is reported through a
+/// separate status tool is not covered; none has been observed.
+const COMMAND_TOOL: &str = "run_command";
+
+/// What a tool-result record says about failure, before it is paired with its
+/// call. A result can be read before the planner record that names its call,
+/// and part of the verdict depends on that call, so the record's two signals
+/// are kept apart until [`Self::is_error_for`] combines them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResultFailure {
+    /// A failure the record states whatever the tool: `status:"FAILED"` or
+    /// `"ERROR"`, or the 1.1.2 invalid-tool-call shape.
+    structured: bool,
+    /// The header says a command exited non-zero. A failure only for a
+    /// command call.
+    nonzero_exit_header: bool,
+}
+
+impl ResultFailure {
+    /// The verdict for this result once paired with a call named `tool_name`.
+    /// **The one place a tool result's failure is decided:** the live parser's
+    /// two pairing points and hydration's two all call it, so the live and
+    /// reopened views of a tool cannot disagree.
+    pub(crate) fn is_error_for(self, tool_name: &str) -> bool {
+        self.structured || (self.nonzero_exit_header && tool_name == COMMAND_TOOL)
+    }
+}
+
+/// Whether a command result's header says the command exited non-zero.
+///
+/// **A match on `agy`'s prose**, because no exit code exists on either
+/// channel: the record has no exit-code field, and the stream reports a failed
+/// command as `DONE` with the same prose in `tool_info.output` (both probed @
+/// 1.4.3). The wording has changed twice, and all three forms are read:
+///
+/// - `The command failed with exit code: 127` (captured @ 1.1.2).
+/// - `The command exited with code 1.`, then `Output:` (1.1.19 to 1.4.2, and
+///   still written @ 1.4.3 for a command run by a subagent).
+/// - `Command exited with code 1.`, then a blank line and `Command output:`
+///   (1.4.3).
+///
+/// **Only those exact sentences count, and only at the start of a line.** A
+/// header can carry text a person typed: `agy`'s older output template writes
+/// `The user changed the command to be run to: <command>` above the exit line
+/// when a command was edited before it ran, and a multi-line command continues
+/// on the lines below. A looser match read `exit code 0` inside such a command
+/// as the status. A rewording `agy` has not written yet therefore reads as
+/// success; `live_antigravity_failing_command_completes_as_tool_error` is the
+/// guard. A code that does not parse is not called a failure, because guessing
+/// would mark successes as failed.
+///
+/// **Only the header is read**, so text a command prints is never taken for
+/// its exit status. The header ends at one of the headings `agy` has put
+/// before a command's output ([`OUTPUT_HEADINGS`]), matched whole, so a line
+/// of an edited command that merely looks like a heading (`Phase:`) does not
+/// end it early. A heading `agy` renames later stops ending the header; that
+/// matters only for a result with no exit line, whose output would then be
+/// scanned for one of the sentences above.
+///
+/// Still a format-sensitive fallback: an edited multi-line command that
+/// contains one of these exact sentences or headings on a line of its own
+/// (inside a here-document, say) can still mislead it.
+///
+/// The result counts as failed only when its call is [`COMMAND_TOOL`] (see
+/// [`ResultFailure::is_error_for`]), so a web page or MCP reply that quotes the
+/// sentence is not misread either.
+fn header_reports_nonzero_exit(content: &str) -> bool {
     for line in content.lines() {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if matches!(lower.as_str(), "output:" | "stdout:" | "stderr:") {
+        let line = line.trim();
+        if is_output_heading(line) {
             break;
         }
-        if lower.starts_with("the command failed with exit code:") {
-            return true;
+        if let Some(code) = reported_exit_code(line) {
+            return code != 0;
         }
     }
     false
+}
+
+/// Each heading `agy` has put before a command's output, lowercased:
+/// `Output:` and `Stdout:`/`Stderr:` (to 1.4.2, and a subagent's commands @
+/// 1.4.3), `Command output:` (1.4.3), and `Output snapshot:` (a background
+/// command, in `agy`'s output template).
+const OUTPUT_HEADINGS: [&str; 5] = [
+    "output:",
+    "stdout:",
+    "stderr:",
+    "command output:",
+    "output snapshot:",
+];
+
+fn is_output_heading(line: &str) -> bool {
+    OUTPUT_HEADINGS.contains(&line.to_ascii_lowercase().as_str())
+}
+
+/// The start of each exit sentence `agy` has written, lowercased, up to the
+/// code.
+const EXIT_SENTENCES: [&str; 3] = [
+    "command exited with code ",
+    "the command exited with code ",
+    "the command failed with exit code:",
+];
+
+/// The exit code a header line reports, when the line opens with one of
+/// [`EXIT_SENTENCES`] (`Command exited with code 1.` → 1). `None` otherwise,
+/// or when the code does not parse.
+fn reported_exit_code(line: &str) -> Option<i64> {
+    let lower = line.to_ascii_lowercase();
+    let rest = EXIT_SENTENCES
+        .iter()
+        .find_map(|sentence| lower.strip_prefix(sentence))?
+        .trim_start();
+    let end = rest
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && c == '-')))
+        .map_or(rest.len(), |(i, _)| i);
+    rest[..end].parse().ok()
 }
 
 /// Per-turn parser state. Tracks in-flight tool invocations and early tool
@@ -166,6 +297,26 @@ pub struct AntigravityParserState {
     /// drain. Kept apart from `pending_tool_results` on purpose — see
     /// [`AntigravityParserState::record_stream_tool_failure`].
     stream_tool_failures: VecDeque<StreamToolFailure>,
+    /// Result steps a transcript record completed, with the verdict shown for
+    /// that tool (after [`ResultFailure::is_error_for`]). The final drain uses
+    /// it to recognize a stream failure the transcript already settled.
+    transcript_result_steps: BTreeMap<i64, bool>,
+}
+
+/// What [`AntigravityParserState::close_pending_tools`] resolved at the final
+/// drain: the events to emit, and the two kinds of stream failure that close
+/// no tool, returned together so a caller cannot log one and miss the other.
+/// Each carries its `step_index`, the raw material for re-deriving the
+/// step→call invariant if agy's numbering ever shifts.
+#[derive(Debug)]
+pub(crate) struct ClosedTools {
+    pub(crate) events: Vec<AdapterEvent>,
+    /// Failures naming a step no pending tool expects and no transcript result
+    /// settled, with their message.
+    pub(crate) unattributed: Vec<(i64, String)>,
+    /// Failures on a step whose transcript result reported success. Never
+    /// observed; the transcript's result stands.
+    pub(crate) contradicted: Vec<(i64, Option<String>)>,
 }
 
 #[derive(Debug)]
@@ -177,6 +328,8 @@ struct StreamToolFailure {
 #[derive(Debug)]
 struct PendingToolStart {
     tool_use_id: String,
+    /// The call's tool name, which the result's verdict depends on.
+    tool_name: String,
     /// The transcript `step_index` this call's result will occupy, if it
     /// produces one: `planner_step + 1 + call_index`.
     ///
@@ -201,7 +354,7 @@ struct PendingToolStart {
 struct PendingToolResult {
     step_index: i64,
     output: String,
-    is_error: bool,
+    failure: ResultFailure,
 }
 
 /// Shown for a tool call that ended without a recorded result.
@@ -221,8 +374,9 @@ struct PendingToolResult {
 /// stream's per-tool message — it was never written to disk — so the reopen
 /// path shows this same text. Both paths referencing one constant is what keeps
 /// the two renderings of the same failure from drifting apart; do not author a
-/// second copy of this string.
-pub(crate) const MISSING_TOOL_RESULT_OUTPUT: &str =
+/// second copy of this string. Public so a live test can tell this authored
+/// line from a message `agy` wrote.
+pub const MISSING_TOOL_RESULT_OUTPUT: &str =
     "Antigravity did not record a result for this tool call.";
 
 impl AntigravityParserState {
@@ -270,16 +424,23 @@ impl AntigravityParserState {
     /// **not** guessed onto anything; it is returned for diagnostics, and any
     /// tool left without a message closes with [`MISSING_TOOL_RESULT_OUTPUT`].
     ///
-    /// Returns the events to emit plus any `(step_index, message)` pairs that
-    /// could not be attributed. The step index rides along because it is the
-    /// raw material for re-deriving the invariant if agy's numbering ever
-    /// shifts.
-    pub(crate) fn close_pending_tools(
-        &mut self,
-        turn_id: TurnId,
-    ) -> (Vec<AdapterEvent>, Vec<(i64, String)>) {
+    /// **The transcript settles a step it has a result for.** Since agy 1.4.2
+    /// a rejected call is reported twice: as a `status:"ERROR"` transcript
+    /// result and as a stream `state:"ERROR"` step. The transcript record
+    /// completes the call as soon as it is tailed, whichever channel arrived
+    /// first, so by this drain the stream's report for that step has no call
+    /// left to close and is dropped here rather than logged as unattributed. The
+    /// transcript wins even if the two ever disagree, because it owns the
+    /// agents' side of the conversation (system-design §3) and is all a
+    /// reopened conversation can read: letting the stream override it would
+    /// make the live row and the reopened row differ. A stream failure on a
+    /// step the transcript recorded as a *success* is that disagreement, never
+    /// observed; it is returned in [`ClosedTools::contradicted`] so the
+    /// producer can log it.
+    pub(crate) fn close_pending_tools(&mut self, turn_id: TurnId) -> ClosedTools {
         let mut events = Vec::new();
         let mut unattributed = Vec::new();
+        let mut contradicted = Vec::new();
 
         for failure in self.stream_tool_failures.drain(..) {
             match self
@@ -301,11 +462,15 @@ impl AntigravityParserState {
                         is_error: true,
                     });
                 }
-                None => {
-                    if let Some(message) = failure.message {
-                        unattributed.push((failure.step_index, message));
+                None => match self.transcript_result_steps.get(&failure.step_index) {
+                    Some(true) => {}
+                    Some(false) => contradicted.push((failure.step_index, failure.message)),
+                    None => {
+                        if let Some(message) = failure.message {
+                            unattributed.push((failure.step_index, message));
+                        }
                     }
-                }
+                },
             }
         }
 
@@ -319,7 +484,11 @@ impl AntigravityParserState {
                 is_error: true,
             });
         }
-        (events, unattributed)
+        ClosedTools {
+            events,
+            unattributed,
+            contradicted,
+        }
     }
 
     pub fn unmatched_tool_result_steps(&self) -> Vec<i64> {
@@ -422,15 +591,20 @@ pub(crate) fn record_to_live_events_with_encoding(
             });
             let expected = expected_result_step(rec.step_index, call_index);
             if let Some(result) = take_result_for_step(&mut state.pending_tool_results, expected) {
+                let is_error = result.failure.is_error_for(&call.name);
+                state
+                    .transcript_result_steps
+                    .insert(result.step_index, is_error);
                 out.push(AdapterEvent::ToolCompleted {
                     turn_id,
                     tool_use_id,
                     output: result.output,
-                    is_error: result.is_error,
+                    is_error,
                 });
             } else {
                 state.pending_tool_ids.push_back(PendingToolStart {
                     tool_use_id: tool_use_id.clone(),
+                    tool_name: call.name.clone(),
                     expected_result_step: expected,
                 });
             }
@@ -438,7 +612,7 @@ pub(crate) fn record_to_live_events_with_encoding(
     }
 
     if rec.is_tool_result() {
-        let is_error = rec.tool_result_is_error();
+        let failure = rec.tool_result_failure();
         let output = rec.tool_result_output();
         // Attach to the call that *expects* this step, never to whichever call
         // happens to be oldest. The old arrival-order rule ("first pending tool
@@ -457,6 +631,10 @@ pub(crate) fn record_to_live_events_with_encoding(
                 .pending_tool_ids
                 .remove(index)
                 .expect("index from position");
+            let is_error = failure.is_error_for(&pending.tool_name);
+            state
+                .transcript_result_steps
+                .insert(rec.step_index, is_error);
             out.push(AdapterEvent::ToolCompleted {
                 turn_id,
                 tool_use_id: pending.tool_use_id,
@@ -470,7 +648,7 @@ pub(crate) fn record_to_live_events_with_encoding(
             state.pending_tool_results.push_back(PendingToolResult {
                 step_index: rec.step_index,
                 output,
-                is_error,
+                failure,
             });
         }
     }
@@ -909,6 +1087,405 @@ mod tests {
         ));
     }
 
+    /// Captured @ agy 1.4.2 (2026-10-19, Claude Sonnet 5.5, the adapter's
+    /// dispatch flags): a rejected edit, then a command that exits 1. The edit
+    /// is written as an ordinary result with `status:"ERROR"`; the command as
+    /// `status:"DONE"` with the 1.4.2 wording. Both read as successes before.
+    const REJECTED_EDIT_THEN_FAILED_COMMAND: [&str; 4] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:39Z","input_tokens":6629,"cache_read_tokens":14046,"output_tokens":337,"tool_calls":[{"name":"replace_file_content","args":{"AllowMultiple":"false","Description":"\"Replace alpha with beta\"","EndLine":"1","Instruction":"\"Replace alpha with beta\"","ReplacementContent":"\"beta\"","StartLine":"1","TargetContent":"\"alpha\"","TargetFile":"\"/tmp/agyprobe/ABSENT_EDIT.txt\"","toolAction":"\"Editing file\"","toolSummary":"\"Editing absent file\""}}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"ERROR","error":"declaring permissions: cortex tool replace_file_content: convert tool call for permissions: model output error: invalid tool call error (invalid_args) /tmp/agyprobe/ABSENT_EDIT.txt does not exist in the current location. Make sure the file path correct. In addition, the user may have moved, renamed, or deleted file.","created_at":"2026-10-19T17:59:42Z","content":"Created At: 2026-10-19T12:59:42-05:00\nCompleted At: 2026-10-19T12:59:42-05:00\nEncountered error in step execution: declaring permissions: cortex tool replace_file_content: convert tool call for permissions: model output error: invalid tool call error (invalid_args) /tmp/agyprobe/ABSENT_EDIT.txt does not exist in the current location. Make sure the file path correct. In addition, the user may have moved, renamed, or deleted file."}"#,
+        r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:42Z","input_tokens":937,"cache_read_tokens":20267,"output_tokens":210,"tool_calls":[{"name":"run_command","args":{"CommandLine":"\"ls /definitely/not/here\"","Cwd":"\"/tmp/agyprobe/cwd\"","WaitMsBeforeAsync":"3000","toolAction":"\"Running command\"","toolSummary":"\"Listing missing dir\""}}]}"#,
+        r#"{"step_index":4,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-10-19T17:59:44Z","content":"Created At: 2026-10-19T12:59:44-05:00\nCompleted At: 2026-10-19T12:59:44-05:00\n\nThe command exited with code 1.\nOutput:\nls: /definitely/not/here: No such file or directory\r\n\n"}"#,
+    ];
+
+    /// Captured @ agy 1.4.2 (2026-10-19, Gemini 3.8 Flash): one planner step
+    /// with a rejected `view_file` and a successful `run_command`.
+    const REJECTED_READ_BESIDE_A_SUCCESSFUL_COMMAND: [&str; 3] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:39Z","input_tokens":13294,"cache_read_tokens":0,"output_tokens":131,"tool_calls":[{"name":"view_file","args":{"AbsolutePath":"\"/tmp/agyprobe/ABSENT.txt\"","toolAction":"\"Viewing absent file\"","toolSummary":"\"File view probe\""}},{"name":"run_command","args":{"CommandLine":"\"echo PROBE_B\"","Cwd":"\"/tmp/agyprobe/cwd\"","WaitMsBeforeAsync":"5000","toolAction":"\"Echoing probe message\"","toolSummary":"\"Echo probe\""}}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"ERROR","error":"declaring permissions: cortex tool view_file: convert tool call for permissions: model output error: invalid tool call error (invalid_args) failed to read file: stat /tmp/agyprobe/ABSENT.txt: no such file or directory","created_at":"2026-10-19T17:59:41Z","content":"Created At: 2026-10-19T12:59:41-05:00\nCompleted At: 2026-10-19T12:59:41-05:00\nEncountered error in step execution: declaring permissions: cortex tool view_file: convert tool call for permissions: model output error: invalid tool call error (invalid_args) failed to read file: stat /tmp/agyprobe/ABSENT.txt: no such file or directory"}"#,
+        r#"{"step_index":3,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-10-19T17:59:41Z","content":"Created At: 2026-10-19T12:59:41-05:00\nCompleted At: 2026-10-19T12:59:41-05:00\n\nThe command exited with code 0.\nOutput:\nPROBE_B\r\n\n"}"#,
+    ];
+
+    fn completions_of(
+        records: &[&str],
+        state: &mut AntigravityParserState,
+    ) -> Vec<(String, String, bool)> {
+        let turn = tid();
+        records
+            .iter()
+            .flat_map(|line| record_to_live_events(&parse(line), turn, state))
+            .filter_map(|event| match event {
+                AdapterEvent::ToolCompleted {
+                    tool_use_id,
+                    output,
+                    is_error,
+                    ..
+                } => Some((tool_use_id, output, is_error)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_rejected_call_written_with_status_error_completes_as_failed() {
+        let mut state = AntigravityParserState::default();
+        let completions = completions_of(&REJECTED_EDIT_THEN_FAILED_COMMAND, &mut state);
+
+        let (id, output, is_error) = &completions[0];
+        assert_eq!(id, "1:0:replace_file_content");
+        assert!(*is_error, "a status:ERROR result is a failure");
+        assert!(
+            output.starts_with("declaring permissions:") && output.contains("does not exist"),
+            "the top-level error is shown, not the timestamped content: {output}"
+        );
+    }
+
+    #[test]
+    fn a_command_that_exited_non_zero_completes_as_failed() {
+        let mut state = AntigravityParserState::default();
+        let completions = completions_of(&REJECTED_EDIT_THEN_FAILED_COMMAND, &mut state);
+
+        assert_eq!(completions.len(), 2);
+        let (id, output, is_error) = &completions[1];
+        assert_eq!(id, "3:0:run_command");
+        assert!(*is_error, "`The command exited with code 1.` is a failure");
+        assert!(output.contains("No such file or directory"));
+        assert!(state.pending_tool_ids.is_empty());
+    }
+
+    #[test]
+    fn a_rejected_read_fails_without_failing_the_command_beside_it() {
+        let mut state = AntigravityParserState::default();
+        let completions = completions_of(&REJECTED_READ_BESIDE_A_SUCCESSFUL_COMMAND, &mut state);
+
+        assert_eq!(
+            completions
+                .iter()
+                .map(|(id, _, is_error)| (id.as_str(), *is_error))
+                .collect::<Vec<_>>(),
+            vec![("1:0:view_file", true), ("1:1:run_command", false)],
+            "exit code 0 in the same sentence is a success: {completions:?}"
+        );
+    }
+
+    #[test]
+    fn the_exit_code_sentence_inside_output_is_not_read_as_the_header() {
+        let mut state = AntigravityParserState::default();
+        let completions = completions_of(
+            &[
+                r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"cat log.txt\""}}]}"#,
+                r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Created At: now\nCompleted At: now\n\nThe command exited with code 0.\nOutput:\nThe command exited with code 1.\n"}"#,
+            ],
+            &mut state,
+        );
+        assert!(!completions[0].2, "{completions:?}");
+    }
+
+    /// An MCP reply (1.4.2 writes it as a `GENERIC` result, like a command's)
+    /// that quotes the exit sentence on its own line, with no `Output:` marker
+    /// to stop the scan. Only a command's exit sentence means failure.
+    const MCP_REPLY_QUOTING_THE_EXIT_SENTENCE: [&str; 2] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"call_mcp_tool","args":{"ServerName":"\"switchboard\"","ToolName":"\"read_reply\"","Arguments":"{\"agent\":\"builder\"}"}}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Created At: 2026-10-19T13:05:13-05:00\nCompleted At: 2026-10-19T13:05:13-05:00\nThe build agent replied:\nThe command exited with code 1.\nI'll fix the test next."}"#,
+    ];
+
+    #[test]
+    fn a_non_command_result_quoting_the_exit_sentence_is_not_a_failure() {
+        let mut state = AntigravityParserState::default();
+        let completions = completions_of(&MCP_REPLY_QUOTING_THE_EXIT_SENTENCE, &mut state);
+
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, "1:0:call_mcp_tool");
+        assert!(!completions[0].2, "{completions:?}");
+    }
+
+    /// The settled-steps map holds the verdict shown, not the record's raw
+    /// signals: a stream failure on that MCP step is a contradiction to log,
+    /// not a duplicate to drop.
+    #[test]
+    fn a_stream_failure_on_a_non_command_step_quoting_the_sentence_is_a_contradiction() {
+        let mut state = AntigravityParserState::default();
+        state.record_stream_tool_failure(2, Some("stream says the MCP call failed".to_owned()));
+        let _ = completions_of(&MCP_REPLY_QUOTING_THE_EXIT_SENTENCE, &mut state);
+        let closed = state.close_pending_tools(tid());
+
+        assert_eq!(
+            closed.contradicted,
+            vec![(2, Some("stream says the MCP call failed".to_owned()))]
+        );
+    }
+
+    #[test]
+    fn a_failed_command_result_read_before_its_call_still_fails() {
+        let mut state = AntigravityParserState::default();
+        let records = [
+            REJECTED_EDIT_THEN_FAILED_COMMAND[3],
+            REJECTED_EDIT_THEN_FAILED_COMMAND[2],
+        ];
+        let completions = completions_of(&records, &mut state);
+
+        assert_eq!(completions.len(), 1, "{completions:?}");
+        assert_eq!(completions[0].0, "3:0:run_command");
+        assert!(
+            completions[0].2,
+            "the buffered result is judged once its call is known"
+        );
+    }
+
+    /// Captured @ agy 1.4.3 (2026-10-20, Gemini 4 Argon, the adapter's dispatch
+    /// flags, `live_antigravity_failing_command_completes_as_tool_error`):
+    /// the reworded exit line and the renamed `Command output:` heading.
+    const FAILED_COMMAND_1_4_3: [&str; 2] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-20T18:35:45Z","input_tokens":7824,"cache_read_tokens":0,"output_tokens":156,"tool_calls":[{"name":"run_command","args":{"CommandLine":"\"ls /var/folders/x3/bq9yxrhs4j99fm9xdclj38hw0000gn/T/agy-command-error-testIrcVYm/SWITCHBOARD_MISSING_DIR\"","WaitMsBeforeAsync":"5000","toolSummary":"\"List missing directory\""}}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-10-20T18:35:50Z","content":"Created At: 2026-10-20T13:35:50-05:00\nCompleted At: 2026-10-20T13:35:50-05:00\nCommand exited with code 1.\n\nCommand output:\nls: /var/folders/x3/bq9yxrhs4j99fm9xdclj38hw0000gn/T/agy-command-error-testIrcVYm/SWITCHBOARD_MISSING_DIR: No such file or directory\r\n"}"#,
+    ];
+
+    /// Captured @ agy 1.4.3 (2026-10-20, Gemini 4 Argon,
+    /// `live_antigravity_run_command_emits_shell_facet`): a success writes the
+    /// same line with code 0.
+    const SUCCEEDED_COMMAND_1_4_3: [&str; 2] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-20T18:33:44Z","input_tokens":7738,"cache_read_tokens":0,"output_tokens":77,"tool_calls":[{"name":"run_command","args":{"CommandLine":"\"echo switchboard-facet-probe\"","WaitMsBeforeAsync":"5000","toolSummary":"\"Run echo switchboard-facet-probe\""}}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-10-20T18:33:50Z","content":"Created At: 2026-10-20T13:33:50-05:00\nCompleted At: 2026-10-20T13:33:50-05:00\nCommand exited with code 0.\n\nCommand output:\nswitchboard-facet-probe\r\n"}"#,
+    ];
+
+    #[test]
+    fn a_1_4_3_command_that_exited_non_zero_completes_as_failed() {
+        let mut state = AntigravityParserState::default();
+        let completions = completions_of(&FAILED_COMMAND_1_4_3, &mut state);
+
+        assert_eq!(completions.len(), 1, "{completions:?}");
+        let (id, output, is_error) = &completions[0];
+        assert_eq!(id, "1:0:run_command");
+        assert!(*is_error, "`Command exited with code 1.` is a failure");
+        assert!(output.contains("No such file or directory"));
+    }
+
+    #[test]
+    fn a_1_4_3_command_that_exited_zero_completes_as_succeeded() {
+        let mut state = AntigravityParserState::default();
+        let completions = completions_of(&SUCCEEDED_COMMAND_1_4_3, &mut state);
+
+        assert_eq!(completions.len(), 1, "{completions:?}");
+        assert_eq!(completions[0].0, "1:0:run_command");
+        assert!(!completions[0].2, "{completions:?}");
+    }
+
+    /// Captured @ agy 1.4.3 (2026-10-20, Gemini 3.8 Flash, the adapter's
+    /// dispatch flags; only the scratch path is neutralized): an `edit_file`
+    /// whose target is not in the file, then a `write_file` onto a file that
+    /// exists. Both are written `status:"ERROR"`, so neither row draws a change
+    /// that did not happen.
+    const FAILED_EDIT_THEN_REFUSED_WRITE_1_4_3: [&str; 4] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-20T19:25:33Z","input_tokens":7727,"cache_read_tokens":0,"output_tokens":53,"tool_calls":[{"name":"edit_file","args":{"Path":"\"/tmp/agyprobe/ws/f.txt\"","Replacement":"\"x\"","Target":"\"zzz-not-present\""}}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"ERROR","error":"target content not found in the file; the Target must exactly match existing file text, including whitespace","created_at":"2026-10-20T19:25:35Z","content":"Created At: 2026-10-20T14:25:35-05:00\nCompleted At: 2026-10-20T14:25:35-05:00\nEncountered error in step execution: target content not found in the file; the Target must exactly match existing file text, including whitespace"}"#,
+        r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-20T19:25:35Z","input_tokens":7880,"cache_read_tokens":0,"output_tokens":43,"tool_calls":[{"name":"write_file","args":{"Content":"\"new\"","Path":"\"/tmp/agyprobe/ws/f.txt\""}}]}"#,
+        r#"{"step_index":4,"source":"MODEL","type":"GENERIC","status":"ERROR","error":"/tmp/agyprobe/ws/f.txt already exists. To overwrite it, retry with Overwrite=true. To edit it, view its contents first and use a code edit tool. Otherwise, choose a different file name","created_at":"2026-10-20T19:25:37Z","content":"Created At: 2026-10-20T14:25:37-05:00\nCompleted At: 2026-10-20T14:25:37-05:00\nEncountered error in step execution: /tmp/agyprobe/ws/f.txt already exists. To overwrite it, retry with Overwrite=true. To edit it, view its contents first and use a code edit tool. Otherwise, choose a different file name"}"#,
+    ];
+
+    #[test]
+    fn a_1_4_3_failed_edit_and_refused_write_complete_as_failed() {
+        let mut state = AntigravityParserState::default();
+        let turn = tid();
+        let events: Vec<AdapterEvent> = FAILED_EDIT_THEN_REFUSED_WRITE_1_4_3
+            .iter()
+            .flat_map(|line| record_to_live_events(&parse(line), turn, &mut state))
+            .collect();
+
+        let facets: Vec<(&str, &crate::facets::ToolFacet)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolStarted { name, facet, .. } => Some((name.as_str(), facet)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(
+                facets.as_slice(),
+                [
+                    ("edit_file", crate::facets::ToolFacet::Edit { .. }),
+                    ("write_file", crate::facets::ToolFacet::Write { .. }),
+                ]
+            ),
+            "{facets:?}"
+        );
+
+        let completions: Vec<(&str, &str, bool)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolCompleted {
+                    tool_use_id,
+                    output,
+                    is_error,
+                    ..
+                } => Some((tool_use_id.as_str(), output.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completions,
+            vec![
+                (
+                    "1:0:edit_file",
+                    "target content not found in the file; the Target must exactly match existing file text, including whitespace",
+                    true,
+                ),
+                (
+                    "3:0:write_file",
+                    "/tmp/agyprobe/ws/f.txt already exists. To overwrite it, retry with Overwrite=true. To edit it, view its contents first and use a code edit tool. Otherwise, choose a different file name",
+                    true,
+                ),
+            ]
+        );
+    }
+
+    /// Each heading `agy` has put before a command's output ends the header,
+    /// so an exit sentence the command printed is not read as its status.
+    /// `Output snapshot:` is the background-command heading in the older output
+    /// template the 1.4.3 binary still holds (`Background command ID: <id>`
+    /// above it, no exit line).
+    #[test]
+    fn an_exit_sentence_after_any_output_heading_is_not_the_header() {
+        for heading in [
+            "Output:",
+            "Stdout:",
+            "Stderr:",
+            "Command output:",
+            "Output snapshot:",
+        ] {
+            for printed in [
+                "Command exited with code 1.",
+                "The command exited with code 1.",
+            ] {
+                let content = format!(
+                    "Created At: 2026-10-20T13:35:50-05:00\nCompleted At: 2026-10-20T13:35:50-05:00\n\n{heading}\n{printed}\n"
+                );
+                assert!(
+                    !header_reports_nonzero_exit(&content),
+                    "{heading} then {printed}"
+                );
+            }
+        }
+        assert!(!header_reports_nonzero_exit(
+            "Background command ID: 7d1c\nOutput snapshot:\nCommand exited with code 1.\n"
+        ));
+    }
+
+    /// The 1.4.3 header lines before the exit line do not end the header.
+    #[test]
+    fn timestamp_lines_do_not_end_the_header() {
+        assert!(header_reports_nonzero_exit(
+            "Created At: 2026-10-20T13:35:50-05:00\nCompleted At: 2026-10-20T13:35:50-05:00\nCommand exited with code 1.\n\nCommand output:\n"
+        ));
+    }
+
+    /// `agy`'s older output template writes a command the user edited before
+    /// it ran above the exit line, verbatim. Text in that command must not be
+    /// read as the status, whichever way it points. Built from the template;
+    /// not seen in a saved transcript.
+    #[test]
+    fn exit_wording_inside_an_edited_command_is_not_the_status() {
+        assert!(header_reports_nonzero_exit(
+            "The user changed the command to be run to: printf 'exit code 0'; false\nThe command exited with code 1.\nOutput:\n"
+        ));
+        assert!(!header_reports_nonzero_exit(
+            "The user changed the command to be run to: echo 'exit code 1'\nThe command exited with code 0.\nOutput:\nexit code 1\n"
+        ));
+    }
+
+    /// The lines of a multi-line edited command follow the edited-command
+    /// line. One that looks like a heading must not end the header, and one
+    /// that starts with the shell's `command` built-in must not be read as
+    /// the status.
+    #[test]
+    fn a_multi_line_edited_command_does_not_hide_the_exit_line() {
+        assert!(header_reports_nonzero_exit(
+            "The user changed the command to be run to: echo start\nPhase:\ncommand printf 'exit code 0'; false\nThe command exited with code 1.\nOutput:\nstart\n"
+        ));
+    }
+
+    /// Every wording `agy` has written. A trailing clause after the code is
+    /// still read (hypothetical: not seen from any `agy` build); a sentence
+    /// that does not open with one of those wordings is not.
+    #[test]
+    fn each_wording_of_the_exit_line_is_read() {
+        for (line, failed) in [
+            ("The command failed with exit code: 127", true),
+            ("The command exited with code 1.", true),
+            ("The command exited with code 0.", false),
+            ("Command exited with code 1.", true),
+            ("Command exited with code 0.", false),
+            ("Command exited with code 1 after 2s.", true),
+            ("Exit code: 3", false),
+            ("Process exited with code 1.", false),
+        ] {
+            assert_eq!(
+                header_reports_nonzero_exit(&format!("{line}\nCommand output:\n")),
+                failed,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_exit_code_is_not_called_a_failure() {
+        assert!(!header_reports_nonzero_exit(
+            "The command exited with code unknown.\nOutput:\n"
+        ));
+        assert!(header_reports_nonzero_exit(
+            "The command exited with code -1.\nOutput:\n"
+        ));
+        assert!(header_reports_nonzero_exit(
+            "The command exited with code 137.\nOutput:\n"
+        ));
+    }
+
+    /// The double report the fix removes: the stream's `state:"ERROR"` for a
+    /// step whose transcript result already said it failed. Either arrival
+    /// order must leave exactly one failed completion and nothing to warn about.
+    #[test]
+    fn a_stream_failure_the_transcript_already_settled_is_dropped() {
+        let message = "declaring permissions: cortex tool view_file: … no such file or directory";
+        for stream_first in [true, false] {
+            let mut state = AntigravityParserState::default();
+            if stream_first {
+                state.record_stream_tool_failure(2, Some(message.to_owned()));
+            }
+            let completions =
+                completions_of(&REJECTED_READ_BESIDE_A_SUCCESSFUL_COMMAND, &mut state);
+            if !stream_first {
+                state.record_stream_tool_failure(2, Some(message.to_owned()));
+            }
+            let closed = state.close_pending_tools(tid());
+
+            assert_eq!(completions.len(), 2, "stream_first={stream_first}");
+            assert!(
+                closed.events.is_empty()
+                    && closed.unattributed.is_empty()
+                    && closed.contradicted.is_empty(),
+                "stream_first={stream_first}: {closed:?}"
+            );
+        }
+    }
+
+    /// Never observed: the stream calls a step failed that the transcript
+    /// recorded as a success. The transcript owns the displayed result, so it
+    /// stands, and the disagreement is kept for the producer to log.
+    #[test]
+    fn a_stream_failure_on_a_step_the_transcript_called_a_success_is_kept_for_diagnostics() {
+        let mut state = AntigravityParserState::default();
+        state.record_stream_tool_failure(3, Some("stream says the echo failed".to_owned()));
+        let completions = completions_of(&REJECTED_READ_BESIDE_A_SUCCESSFUL_COMMAND, &mut state);
+        let closed = state.close_pending_tools(tid());
+
+        assert!(!completions[1].2, "the transcript's success stands");
+        assert!(closed.events.is_empty(), "{closed:?}");
+        assert!(closed.unattributed.is_empty(), "{closed:?}");
+        assert_eq!(
+            closed.contradicted,
+            vec![(3, Some("stream says the echo failed".to_owned()))]
+        );
+    }
+
     #[test]
     fn user_input_record_emits_nothing_live() {
         let rec = parse(
@@ -1017,7 +1594,11 @@ mod tests {
 
         // Final drain: B is the only tool left, and the only recorded failure,
         // so its message is attributable.
-        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        let ClosedTools {
+            events: closed,
+            unattributed,
+            ..
+        } = state.close_pending_tools(turn_id);
         assert!(unattributed.is_empty(), "{unattributed:?}");
         assert_eq!(closed.len(), 1);
         match &closed[0] {
@@ -1099,7 +1680,11 @@ mod tests {
         );
 
         // A closes at turn end with its own error — never B's output.
-        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        let ClosedTools {
+            events: closed,
+            unattributed,
+            ..
+        } = state.close_pending_tools(turn_id);
         assert!(unattributed.is_empty(), "{unattributed:?}");
         assert_eq!(closed.len(), 1);
         match &closed[0] {
@@ -1159,7 +1744,7 @@ mod tests {
             "step 4 belongs to call index 1, not index 0"
         );
 
-        let (closed, _) = state.close_pending_tools(turn_id);
+        let closed = state.close_pending_tools(turn_id).events;
         match &closed[0] {
             AdapterEvent::ToolCompleted {
                 tool_use_id,
@@ -1196,7 +1781,11 @@ mod tests {
         state.record_stream_tool_failure(3, Some("view_file blew up".to_owned()));
         state.record_stream_tool_failure(5, Some("run_command blew up".to_owned()));
 
-        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        let ClosedTools {
+            events: closed,
+            unattributed,
+            ..
+        } = state.close_pending_tools(turn_id);
         assert!(unattributed.is_empty(), "{unattributed:?}");
         let mut got: Vec<(String, String)> = closed
             .into_iter()
@@ -1244,7 +1833,11 @@ mod tests {
         // Expects step 3; the failure names 99.
         state.record_stream_tool_failure(99, Some("belongs to nothing here".to_owned()));
 
-        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        let ClosedTools {
+            events: closed,
+            unattributed,
+            ..
+        } = state.close_pending_tools(turn_id);
         assert_eq!(
             unattributed,
             vec![(99, "belongs to nothing here".to_owned())]
@@ -1280,7 +1873,11 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         state.record_stream_tool_failure(3, None);
-        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        let ClosedTools {
+            events: closed,
+            unattributed,
+            ..
+        } = state.close_pending_tools(turn_id);
         assert!(unattributed.is_empty());
         match &closed[0] {
             AdapterEvent::ToolCompleted { output, .. } => {
@@ -1307,7 +1904,11 @@ mod tests {
         }
         while rx.try_recv().is_ok() {}
 
-        let (closed, unattributed) = state.close_pending_tools(turn_id);
+        let ClosedTools {
+            events: closed,
+            unattributed,
+            ..
+        } = state.close_pending_tools(turn_id);
         assert!(unattributed.is_empty(), "nothing was recorded to attribute");
         assert_eq!(closed.len(), 1, "the tool must not be left spinning");
         match &closed[0] {
@@ -1329,7 +1930,7 @@ mod tests {
     fn close_pending_tools_is_a_no_op_when_every_tool_resolved() {
         let turn_id = Uuid::now_v7();
         let mut state = AntigravityParserState::default();
-        assert_eq!(state.close_pending_tools(turn_id).0.len(), 0);
+        assert_eq!(state.close_pending_tools(turn_id).events.len(), 0);
     }
 
     #[test]

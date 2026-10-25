@@ -1,8 +1,10 @@
 name: review-and-reconcile
-description: Reviewers review in parallel, a worker distills their feedback into a decision-ready verdict, the reviewers respond to it, and the worker gives a final recommendation.
+description: Reviewers review in parallel, a worker distills their feedback into a decision-ready verdict, the reviewers respond to it, and the worker gives a final recommendation. The reviewers' pushback round suits a new or contested change. For a follow-up or small change, use review-and-recommend.
 # Both prompts are hardcoded: `builtin:code-review` for the reviewers and
 # `builtin:analyze-ai-reviews` for the worker's analysis. code-review's `context`
 # argument is auto-derived from the prompt and offered as a user-fillable field;
+# it reaches only the first step's reviewers, who keep it in their conversations
+# for the pushback round, while the worker sees only their scoped reviews;
 # analyze-ai-reviews's required `review` argument is a computed binding (filled
 # from the reviewers' aggregated responses) and never shown to the user.
 #
@@ -15,7 +17,7 @@ inputs:
     description: The agents that review in parallel, then respond to the worker's analysis.
   worker:
     type: agent
-    description: The agent that distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
+    description: Usually the agent that made the change, since it carries out the decisions. It distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
 steps:
   - label: Code review
     description: Each reviewer independently reviews the current changes in parallel.
@@ -59,7 +61,7 @@ steps:
 
         Weigh their responses and settle every finding — where a reviewer changed your mind, say so plainly and name what changed it; where you stand firm, keep the refuting evidence.
 
-        Then write ONE final response, addressed to the human who decides what happens next. They have read nothing else — not the reviews, not your analysis, not the responses — and this workflow does not send your reply back to the reviewers. Write for the human only, and do not reuse the per-finding template from your earlier analysis message.
+        Then write ONE final response, addressed to the human who decides what happens next. They have read nothing else — not the reviews, not your analysis, not the responses — and this workflow does not send your reply back to the reviewers. Write for the human only, and do not reuse the per-finding template from your earlier analysis message. Do not change any files in this reply: the fixes come after this run.
 
         - Open with the bottom line, one or two sentences: the overall disposition in aggregate ("implementing N, rejecting M, one decision needed from you"), naming individually only what the human must act on. The bullets that follow carry the specifics — the opening is what they'd get if they stopped reading there.
         - Then one group per issue that matters: a bolded one-sentence claim stating the issue in plain language, followed by two to four sub-bullets — what it means for the system or the user, and what you are doing about it. A paragraph with a bolded first sentence is NOT a bullet group and is the failure mode here; if a sub-bullet runs past about two sentences, it is holding more than one fact and should be split. Two banned shapes, both of which gesture at content instead of being it: headline-fragment style ("Login flow: broken, not misconfigured") — write the sentence that explains it; and narrating your own disclosure ("one residual is named rather than buried", "with its dependency recorded") — just state the caveat.

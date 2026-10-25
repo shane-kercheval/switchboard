@@ -540,6 +540,121 @@ async fn live_and_hydrated_views_agree_on_a_rejected_tool() {
     );
 }
 
+/// The agy 1.4.2 twin of the test above. A rejected call is now reported on
+/// both channels: the stream's `state:"ERROR"` step and a `status:"ERROR"`
+/// transcript result. A command that exits non-zero is reported only by its
+/// transcript header. What the user sees must be one failed row per tool,
+/// carrying the transcript's message, live and after reopening alike.
+///
+/// The stream's message is deliberately different from the transcript's, so
+/// the assertion proves which channel settled the row.
+#[tokio::test]
+async fn live_and_hydrated_views_agree_on_failures_agy_reports_on_both_channels() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    let transcript_error = "declaring permissions: cortex tool replace_file_content: convert tool call for permissions: model output error: invalid tool call error (invalid_args) /tmp/agyprobe/ABSENT_EDIT.txt does not exist in the current location.";
+    let records = [
+        json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-19T17:59:38Z","content":"<USER_REQUEST>\nedit then list\n</USER_REQUEST>"}),
+        json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:39Z","tool_calls":[{"name":"replace_file_content","args":{"TargetContent":"\"alpha\"","ReplacementContent":"\"beta\"","TargetFile":"\"/tmp/agyprobe/ABSENT_EDIT.txt\""}}]}),
+        json!({"step_index":2,"source":"MODEL","type":"GENERIC","status":"ERROR","created_at":"2026-10-19T17:59:42Z","error":transcript_error,"content":format!("Created At: 2026-10-19T12:59:42-05:00\nCompleted At: 2026-10-19T12:59:42-05:00\nEncountered error in step execution: {transcript_error}")}),
+        json!({"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:42Z","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"ls /definitely/not/here\"","Cwd":"\"/tmp/agyprobe/cwd\""}}]}),
+        json!({"step_index":4,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-10-19T17:59:44Z","content":"Created At: 2026-10-19T12:59:44-05:00\nCompleted At: 2026-10-19T12:59:44-05:00\n\nThe command exited with code 1.\nOutput:\nls: /definitely/not/here: No such file or directory\r\n\n"}),
+        json!({"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-19T17:59:44Z","content":"done"}),
+    ]
+    .iter()
+    .map(|record| json!({"json": record.to_string(), "delay_ms": 0}))
+    .collect::<Vec<Value>>();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "stream": [
+                init_event(uuid),
+                drip(
+                    &json!({
+                        "event": "step_update",
+                        "step_update": {
+                            "step_index": 2, "state": "ERROR", "step_type": "tool",
+                            "tool_name": "replace_file_content",
+                            "tool_info": {"error": {"type": "TOOL_ERROR", "message": "the stream's copy of the failure"}},
+                        },
+                    })
+                    .to_string(),
+                    0,
+                ),
+                result_event("SUCCESS", None),
+            ],
+            "records": records,
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "edit then list").await;
+    let live: Vec<(String, bool, String)> = events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => Some((tool_use_id.clone(), *is_error, output.clone())),
+            _ => None,
+        })
+        .collect();
+
+    let loaded =
+        load_antigravity_transcript(home.path(), cwd.path(), Some(uuid), agent.id).unwrap();
+    let Some(Turn::Agent { items, .. }) = loaded
+        .turns
+        .iter()
+        .find(|t| matches!(t, Turn::Agent { .. }))
+    else {
+        panic!("an agent turn; got: {loaded:?}")
+    };
+    let hydrated: Vec<(String, bool, String)> = items
+        .iter()
+        .filter_map(|item| match item {
+            TurnItem::Tool {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => Some((
+                tool_use_id.clone(),
+                is_error.unwrap_or(false),
+                output.clone().unwrap_or_default(),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        live.iter()
+            .map(|(id, is_error, _)| (id.as_str(), *is_error))
+            .collect::<Vec<_>>(),
+        vec![
+            ("1:0:replace_file_content", true),
+            ("3:0:run_command", true)
+        ],
+        "exactly one failed completion per tool; got: {events:?}"
+    );
+    assert_eq!(
+        live[0].2, transcript_error,
+        "the transcript's message, not the stream's"
+    );
+    assert!(live[1].2.contains("No such file or directory"), "{live:?}");
+    assert_eq!(
+        live, hydrated,
+        "reopening must show what the live view showed"
+    );
+}
+
 /// The timing half of the live/hydrated contract, asserted separately on each
 /// side because the two carry it differently: `AdapterEvent::ToolCompleted` has
 /// no timestamp field, so there is nothing to compare against hydration's
@@ -1753,4 +1868,441 @@ async fn context_report_is_refused_as_an_unsupported_operation() {
         ),
         "expected UnsupportedOperation, got {err:?}"
     );
+}
+
+// --- a process agy leaves behind holding its outputs ------------------------
+
+/// How long the leftover `sleep` lives: far past [`ENDS_SOON_AFTER_EXIT`], so
+/// a turn that waits for it fails that bound.
+const LEFTOVER_SECONDS: u64 = 10;
+
+/// The longest a turn may take to end once `agy` has exited and left a process
+/// holding its outputs: `agy`'s 0.3 s run, the adapter's one-second post-exit
+/// limit, a Stop's two-second grace for a process that ignores SIGTERM, and a
+/// wide margin for a loaded machine. Far short of [`LEFTOVER_SECONDS`].
+const ENDS_SOON_AFTER_EXIT: std::time::Duration = std::time::Duration::from_secs(7);
+
+/// A `leftover` for the script: a `sleep` holding `holds` ("both", "stdout"
+/// or "stderr"), its pid written to `pid_file`.
+fn leftover(holds: &str, own_group: bool, pid_file: &Path) -> Value {
+    json!({
+        "seconds": LEFTOVER_SECONDS,
+        "holds": holds,
+        "own_group": own_group,
+        "pid_file": pid_file.to_str().unwrap(),
+    })
+}
+
+/// A script that runs 0.3 s and exits after writing `stream` and a terminal
+/// answer, leaving `leftover` behind, its own pid written to `agy.pid` in
+/// `cwd`. No log line and no prompt-matching transcript record: the stream is
+/// the only source of the conversation id.
+fn leaving_behind(cwd: &Path, uuid: Uuid, stream: &[Value], leftover: &Value) -> Value {
+    json!({
+        "conversation_uuid": uuid.to_string(),
+        "suppress_conversation_log": true,
+        "stream": stream,
+        "records": [
+            {"json": terminal_record("2026-05-19T19:00:01Z", "ack"), "delay_ms": 0},
+        ],
+        "exit_delay_ms": 300,
+        "exit_code": 0,
+        "pid_file_self": agy_pid_file(cwd).to_str().unwrap(),
+        "leftover": leftover,
+    })
+}
+
+fn agy_pid_file(cwd: &Path) -> std::path::PathBuf {
+    cwd.join("agy.pid")
+}
+
+/// Dispatch, firing a Stop when `stop_once_reaped` is given: the moment the
+/// adapter has reaped `agy`, with the leftover whose pid file it names set
+/// up. Returns the events and how long the turn took to end.
+async fn dispatch_timed(
+    adapter: &AntigravityAdapter,
+    agent: &AgentRecord,
+    cwd: &Path,
+    stop_once_reaped: Option<&Path>,
+) -> (Vec<AdapterEvent>, std::time::Duration) {
+    let token = tokio_util::sync::CancellationToken::new();
+    let options = DispatchOptions {
+        cancel_token: token.clone(),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let stream = adapter
+        .dispatch(agent, cwd, "hi", Uuid::now_v7(), options)
+        .await
+        .expect("dispatch should succeed");
+    let stopper = stop_once_reaped.map(|leftover_pid_file| {
+        let (agy, leftover) = (agy_pid_file(cwd), leftover_pid_file.to_owned());
+        tokio::spawn(async move {
+            let reaped = once_reaped(&agy, &leftover).await;
+            token.cancel();
+            reaped
+        })
+    });
+    let events = tokio::time::timeout(std::time::Duration::from_secs(30), stream.collect())
+        .await
+        .expect("the turn ended within 30 s");
+    let took = started.elapsed();
+    if let Some(stopper) = stopper {
+        assert!(
+            stopper.await.unwrap(),
+            "the Stop came once agy was reaped, with the leftover set up"
+        );
+    }
+    (events, took)
+}
+
+/// Wait until the leftover has written its pid and `agy`, whose pid is in
+/// `agy_pid_file`, is gone: reaped by the adapter, the only process that
+/// waits for it, since an exited process that has not been reaped still
+/// answers a signal check. Polled tightly, so a Stop that follows lands well
+/// inside the post-exit limit. `false` if that never happened. A runtime
+/// stalled for most of that limit can still put the Stop past it, and the
+/// turn then ends normally and the test fails: these tests depend on timing
+/// under extreme load, since the gate that removes it is test-only code an
+/// integration test cannot reach. The adapter's unit tests hold the producer
+/// at the exit instead.
+async fn once_reaped(agy_pid_file: &Path, leftover_pid_file: &Path) -> bool {
+    for _ in 0..2000 {
+        if leftover_pid_file.exists()
+            && let Some(agy) = read_pid(agy_pid_file)
+            && nix::sys::signal::kill(agy, None).is_err()
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    false
+}
+
+fn read_pid(pid_file: &Path) -> Option<nix::unistd::Pid> {
+    let pid = std::fs::read_to_string(pid_file).ok()?;
+    Some(nix::unistd::Pid::from_raw(pid.trim().parse().ok()?))
+}
+
+/// Whether the leftover whose pid is in `pid_file` is still running.
+fn leftover_alive(pid_file: &Path) -> bool {
+    let pid = read_pid(pid_file).expect("the leftover wrote its pid");
+    nix::sys::signal::kill(pid, None).is_ok()
+}
+
+/// Whether the leftover is still running half a second from now. A check
+/// made once cannot tell: a killed leftover answers it until the system
+/// reaps it.
+async fn leftover_keeps_running(pid_file: &Path) -> bool {
+    for _ in 0..50 {
+        if !leftover_alive(pid_file) {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    true
+}
+
+/// Whether the leftover is gone within a few seconds: once killed it lingers
+/// until the system reaps it, having outlived the process that started it.
+async fn leftover_ends(pid_file: &Path) -> bool {
+    for _ in 0..300 {
+        if !leftover_alive(pid_file) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    false
+}
+
+/// Kill the leftover if it is still running: the test started it.
+fn end_leftover(pid_file: &Path) {
+    if let Ok(pid) = std::fs::read_to_string(pid_file) {
+        let pid = nix::unistd::Pid::from_raw(pid.trim().parse().unwrap());
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    }
+}
+
+fn has_turn_end(events: &[AdapterEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, AdapterEvent::TurnEnd { .. }))
+}
+
+#[tokio::test]
+async fn a_first_turn_ends_soon_after_agy_exits_though_a_child_holds_its_outputs() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let pid_file = cwd.path().join("leftover.pid");
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let uuid = Uuid::new_v4();
+    write_script(
+        cwd.path(),
+        &leaving_behind(
+            cwd.path(),
+            uuid,
+            &[init_event(uuid), result_event("SUCCESS", None)],
+            &leftover("both", false, &pid_file),
+        ),
+    );
+
+    let (events, took) = dispatch_timed(&adapter, &agy_agent(), cwd.path(), None).await;
+    let alive = leftover_keeps_running(&pid_file).await;
+    end_leftover(&pid_file);
+    assert_eq!(captured_uuid(&events), Some(uuid));
+    assert!(matches!(outcome(&events), TurnOutcome::Completed));
+    assert!(took < ENDS_SOON_AFTER_EXIT, "took {took:?}");
+    assert!(
+        alive,
+        "a normal exit leaves what agy started running, in its group too"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_turn_ends_soon_after_agy_exits_though_a_child_holds_its_outputs() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let pid_file = cwd.path().join("leftover.pid");
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let uuid = Uuid::new_v4();
+    write_script(
+        cwd.path(),
+        &leaving_behind(
+            cwd.path(),
+            uuid,
+            &[init_event(uuid), result_event("SUCCESS", None)],
+            &leftover("both", false, &pid_file),
+        ),
+    );
+
+    let (events, took) =
+        dispatch_timed(&adapter, &agy_agent_resuming(uuid), cwd.path(), None).await;
+    end_leftover(&pid_file);
+    assert_eq!(
+        captured_uuid(&events),
+        None,
+        "a plain resume re-emits nothing"
+    );
+    assert!(matches!(outcome(&events), TurnOutcome::Completed));
+    assert!(took < ENDS_SOON_AFTER_EXIT, "took {took:?}");
+}
+
+#[tokio::test]
+async fn a_first_turn_without_an_id_fails_soon_after_agy_exits_though_a_child_holds_stdout() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let pid_file = cwd.path().join("leftover.pid");
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let uuid = Uuid::new_v4();
+    // No `init`: nothing names the conversation.
+    write_script(
+        cwd.path(),
+        &leaving_behind(
+            cwd.path(),
+            uuid,
+            &[result_event("SUCCESS", None)],
+            &leftover("stdout", false, &pid_file),
+        ),
+    );
+
+    let (events, took) = dispatch_timed(&adapter, &agy_agent(), cwd.path(), None).await;
+    end_leftover(&pid_file);
+    match outcome(&events) {
+        TurnOutcome::Failed { message, .. } => {
+            assert!(message.contains("cannot be resumed"), "{message}");
+        }
+        other => panic!("expected the unresumable failure, got {other:?}"),
+    }
+    assert!(took < ENDS_SOON_AFTER_EXIT, "took {took:?}");
+}
+
+#[tokio::test]
+async fn a_stop_after_agy_exits_kills_the_child_holding_its_outputs() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let pid_file = cwd.path().join("leftover.pid");
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let uuid = Uuid::new_v4();
+    write_script(
+        cwd.path(),
+        &leaving_behind(
+            cwd.path(),
+            uuid,
+            &[init_event(uuid), result_event("SUCCESS", None)],
+            &leftover("both", false, &pid_file),
+        ),
+    );
+
+    // Once `agy` is reaped the adapter no longer knows its pid, and the
+    // leftover still holds stdout, so the read loop is waiting on it.
+    let (events, took) = dispatch_timed(&adapter, &agy_agent(), cwd.path(), Some(&pid_file)).await;
+    let ended = leftover_ends(&pid_file).await;
+    end_leftover(&pid_file);
+    assert!(
+        !has_turn_end(&events),
+        "a stopped turn ends with no terminal"
+    );
+    assert!(ended, "the Stop killed the child agy left behind");
+    assert!(took < ENDS_SOON_AFTER_EXIT, "took {took:?}");
+}
+
+/// The Stop's SIGTERM is not the end of it: a leftover that ignores SIGTERM
+/// is killed once the grace for the group to empty runs out. Logs one
+/// warning that stderr was still held, harmless: by the time the adapter
+/// looks again the SIGKILL has closed it.
+#[tokio::test]
+async fn a_stop_after_agy_exits_kills_a_child_that_ignores_sigterm() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let pid_file = cwd.path().join("leftover.pid");
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let uuid = Uuid::new_v4();
+    let mut stubborn = leftover("both", false, &pid_file);
+    stubborn["ignore_term"] = json!(true);
+    write_script(
+        cwd.path(),
+        &leaving_behind(
+            cwd.path(),
+            uuid,
+            &[init_event(uuid), result_event("SUCCESS", None)],
+            &stubborn,
+        ),
+    );
+
+    let (events, took) = dispatch_timed(&adapter, &agy_agent(), cwd.path(), Some(&pid_file)).await;
+    let ended = leftover_ends(&pid_file).await;
+    end_leftover(&pid_file);
+    assert!(
+        !has_turn_end(&events),
+        "a stopped turn ends with no terminal"
+    );
+    assert!(ended, "the Stop killed the child that ignored SIGTERM");
+    assert!(
+        took >= switchboard_harness::subprocess::TERMINATE_GRACE,
+        "the child outlived the SIGTERM, so the grace ran out: took {took:?}"
+    );
+    assert!(took < ENDS_SOON_AFTER_EXIT, "took {took:?}");
+}
+
+#[tokio::test]
+async fn a_child_that_left_agys_process_group_still_cannot_hold_the_turn_open() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let pid_file = cwd.path().join("leftover.pid");
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let uuid = Uuid::new_v4();
+    write_script(
+        cwd.path(),
+        &leaving_behind(
+            cwd.path(),
+            uuid,
+            &[init_event(uuid), result_event("SUCCESS", None)],
+            &leftover("both", true, &pid_file),
+        ),
+    );
+
+    let (events, took) = dispatch_timed(&adapter, &agy_agent(), cwd.path(), None).await;
+    let alive = leftover_alive(&pid_file);
+    end_leftover(&pid_file);
+    assert!(matches!(outcome(&events), TurnOutcome::Completed));
+    assert!(took < ENDS_SOON_AFTER_EXIT, "took {took:?}");
+    assert!(alive, "a normal exit leaves what agy started running");
+}
+
+/// Stress coverage, not proof: `agy` writes its stream and exits while the
+/// read loop gets no time to read: this test holds its single-threaded
+/// runtime still meanwhile, as a starved machine would. When it lets go, the
+/// lines and the poll tick that sees the exit are ready at once, so in a share
+/// of rounds the exit is seen first. The lines must survive that order, as
+/// they did not when a first turn with no conversation id yet stopped reading
+/// at the exit. Which order a round takes is up to the runtime; the reader's
+/// unit tests in `subprocess.rs` pin the reads themselves.
+#[tokio::test]
+async fn lines_written_just_before_exit_survive_an_exit_seen_before_they_are_read() {
+    for round in 0..20 {
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = tempfile::TempDir::new().unwrap();
+        let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+        let uuid = Uuid::new_v4();
+        write_script(
+            cwd.path(),
+            &json!({
+                "conversation_uuid": uuid.to_string(),
+                "suppress_conversation_log": true,
+                "stream": [
+                    {"json": init_event(uuid)["json"], "delay_ms": 150},
+                    result_event("SUCCESS", None),
+                ],
+                "records": [
+                    {"json": terminal_record("2026-05-19T19:00:01Z", "ack"), "delay_ms": 0},
+                ],
+                "exit_code": 0,
+            }),
+        );
+
+        let stream = adapter
+            .dispatch(
+                &agy_agent(),
+                cwd.path(),
+                "hi",
+                Uuid::now_v7(),
+                DispatchOptions::default(),
+            )
+            .await
+            .expect("dispatch should succeed");
+        // Let the read loop start and wait on the pipe, then hold the runtime
+        // while `agy` writes and exits.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let events: Vec<AdapterEvent> =
+            tokio::time::timeout(std::time::Duration::from_secs(30), stream.collect())
+                .await
+                .expect("the turn ended within 30 s");
+        assert_eq!(captured_uuid(&events), Some(uuid), "round {round}");
+        assert!(
+            matches!(outcome(&events), TurnOutcome::Completed),
+            "round {round}: {:?}",
+            outcome(&events)
+        );
+    }
+}
+
+/// A wiring check, not proof of the post-exit read: a resume whose
+/// conversation expired, with a child left holding stderr. The fork's
+/// "conversation not found" line is read from stderr long before the
+/// post-exit limit, so this passes whether or not the limit's last read
+/// works; `finishing_stderr_takes_the_lines_its_drain_never_got_to_read` in
+/// the adapter's unit tests covers that read. This shows the adapter's stderr
+/// still reaches the fork-and-heal check through the drain it now owns.
+#[tokio::test]
+async fn a_forked_resume_heals_though_a_child_holds_stderr() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let pid_file = cwd.path().join("leftover.pid");
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let stale = Uuid::new_v4();
+    let forked = Uuid::new_v4();
+    let mut script = leaving_behind(
+        cwd.path(),
+        forked,
+        &[init_event(forked), result_event("SUCCESS", None)],
+        &leftover("stderr", false, &pid_file),
+    );
+    script["warning_not_found"] = json!(stale.to_string());
+    write_script(cwd.path(), &script);
+
+    let (events, took) =
+        dispatch_timed(&adapter, &agy_agent_resuming(stale), cwd.path(), None).await;
+    end_leftover(&pid_file);
+    assert_eq!(
+        captured_uuid(&events),
+        Some(forked),
+        "the locator heals to the forked conversation"
+    );
+    assert!(
+        matches!(outcome(&events), TurnOutcome::Completed),
+        "{:?}",
+        outcome(&events)
+    );
+    assert!(took < ENDS_SOON_AFTER_EXIT, "took {took:?}");
 }

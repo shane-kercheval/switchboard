@@ -434,7 +434,8 @@ impl PromptService {
 
     /// The raw, **unrendered** template body of a `builtin` or `local` prompt
     /// (frontmatter stripped, `MiniJinja` placeholders intact), for a **read-only
-    /// preview** in the UI. Synchronous and offline.
+    /// preview**: the window's, and an orchestrating agent's through the app's
+    /// `read_prompt` tool. Synchronous and offline.
     ///
     /// Returns `None` for an MCP provider: the MCP protocol exposes only rendered
     /// output (`prompts/get`), never the un-rendered template, so a server-side
@@ -442,8 +443,8 @@ impl PromptService {
     /// (description + arguments). Also `None` for a prompt that doesn't resolve.
     ///
     /// Deliberately exposes the template, unlike [`render`](Self::render): the
-    /// body is shown to the *user* as a preview, never sent to an agent (agents
-    /// only ever receive rendered text). Built-ins resolve regardless of the
+    /// body is shown to whoever is choosing a prompt, never sent as a message
+    /// (an agent that is sent a prompt only ever receives rendered text). Built-ins resolve regardless of the
     /// app's "show built-ins" toggle, matching [`get`](Self::get)/`render`.
     #[must_use]
     pub fn source(&self, provider: &str, name: &str) -> Option<PromptSource> {
@@ -1364,10 +1365,18 @@ impl PromptService {
     /// Build the local provider from current config, or `None` when this service
     /// has no resolved prompt store (disabled).
     fn local_provider(&self) -> Option<LocalProvider> {
-        let default_dir = self.default_prompt_dir.as_deref()?;
-        let config = self.load_local_config();
-        let dirs = resolve_local_dirs(&config, default_dir, self.home.as_deref());
-        Some(LocalProvider::new(dirs))
+        self.default_prompt_dir.as_ref()?;
+        Some(LocalProvider::new(self.local_prompt_dirs()))
+    }
+
+    /// Effective local prompt directories in lookup order. The first is the
+    /// creation destination so new prompts take precedence over later folders.
+    #[must_use]
+    pub fn local_prompt_dirs(&self) -> Vec<PathBuf> {
+        let Some(default_dir) = self.default_prompt_dir.as_deref() else {
+            return Vec::new();
+        };
+        resolve_local_dirs(&self.load_local_config(), default_dir, self.home.as_deref())
     }
 
     /// Read the user-global config's local section. A missing file is the common

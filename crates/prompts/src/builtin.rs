@@ -183,10 +183,26 @@ mod tests {
             .await
             .unwrap();
         assert!(with.contains("focus on the auth path"));
-        // The base review target is ALWAYS present — context supplements, never
-        // replaces it (a focus note must not become the entire review subject).
+        // The base review target is ALWAYS present: a focus note must not become
+        // the entire review subject. Context replaces the default target only
+        // when it says to review something else, not when it merely points at a
+        // file for focus, and the rendered prompt says so.
         assert!(with.contains("Uncommitted changes in the current directory"));
         assert!(with.contains("Additional context and focus"));
+        assert!(with.contains(
+            "If it says to review something other than the default (a diff base, a commit range, or a set of files), review that instead of the default above"
+        ));
+        assert!(with.contains("don't review that again"));
+        assert!(with.contains(
+            "In every case, concentrate where it points and don't flag anything it rules out of scope"
+        ));
+        // A named target replaces the default, so the prompt must not also say
+        // the context never replaces it: a reviewer handed a commit range would
+        // review the uncommitted changes as well.
+        assert!(
+            !(with.contains("instead of the default") && with.contains("does not replace it")),
+            "the closing paragraph contradicts itself: {with}"
+        );
 
         let without = provider.render("code-review", &args(&[])).await.unwrap();
         assert!(without.contains("Uncommitted changes in the current directory"));

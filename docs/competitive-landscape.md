@@ -9,7 +9,7 @@ The multi-agent coding tool space is crowded at both ends of a spectrum, with a 
 - **Fully autonomous** — give a goal, the system decomposes and runs with it. Human-in-the-loop is minimal or post-hoc.
 - **Passive session managers** — dashboards and TUIs that help you watch and manually control multiple agent terminals. No workflow automation.
 
-Switchboard occupies the middle: **human-directed, workflow-file-driven, with explicit pause-and-interjection primitives**. Nothing currently in the landscape clearly occupies that space.
+Switchboard occupies the middle: **directed by you or by an agent of your choice, on the same workflow files and the same window, with explicit pause-and-interjection primitives**. Nothing currently in the landscape clearly occupies that space.
 
 ---
 
@@ -161,7 +161,7 @@ Mapping the features of the tools above against Switchboard's core capabilities:
 | Explicit mid-workflow human pause primitive | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Prompt library (local + MCP) across harnesses | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Works across Claude Code + Codex uniformly | ✓ | ✓ | ✓ | partial | ✗ | ✗ |
-| Human-directed (not AI-directed) orchestration | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ |
+| Director is your choice (you, or your own agent over MCP) | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ |
 
 **The specific features no existing tool has:**
 
@@ -181,7 +181,7 @@ Mapping the features of the tools above against Switchboard's core capabilities:
 |---|---|---|
 | Desktop app for managing multiple Claude Code / Codex sessions | Nimbalyst | No inter-agent routing; no workflow files |
 | Terminal-based multi-agent session manager | Claude Squad | TUI only; no automation |
-| Autonomous multi-agent coding loop | Intent (Augment) | AI-directed, not human-directed |
+| Autonomous multi-agent coding loop | Intent (Augment) | Its own planner; no manual mode or workflow files |
 | Scripted fan-out/fan-in | DIY shell scripts | Not reusable, not portable, no UI |
 | Prompt library across agents | — | Nothing |
 | Workflow files + human pause points | — | Nothing |

@@ -16,6 +16,12 @@ import type {
 } from "$lib/types";
 import { ALL_HARNESSES } from "$lib/harnessDisplay";
 import { DEFAULT_AGENT_SELECTIONS } from "$lib/agentSelection";
+
+// No model agy offers today lacks an effort axis, but the pickers still handle
+// one (agy 1.1.19 offered two), so these tests add one to the model table.
+vi.mock("$lib/antigravityModels.json", async (importOriginal) =>
+  (await import("../tests/fixtures/antigravityModels")).withStandIns(importOriginal),
+);
 import { shortcut } from "$lib/platform";
 // Static import so App.svelte's (large) component-tree transform happens at
 // module collection, not inside the first test that calls `mountApp`. `vi.mock`
@@ -104,6 +110,9 @@ type Backend = {
   failOpenFor: Map<string, unknown>;
   failRelocateFor: Map<string, { message: string; applied: boolean }>;
   failDeleteFor: Map<string, string>;
+  // When set, `remove_agent` deletes the agent from its roster and then
+  // rejects with this message, as a save that failed after the record went.
+  failRemoveAfterDeleting: string | null;
   failConvoFor: Set<string>;
   failPickFor: Set<string>;
   // Git-view tracked repos returned by `list_tracked_repos` / `read_tracked_repo`.
@@ -144,6 +153,7 @@ function freshBackend(): Backend {
     failOpenFor: new Map(),
     failRelocateFor: new Map(),
     failDeleteFor: new Map(),
+    failRemoveAfterDeleting: null,
     failConvoFor: new Set(),
     failPickFor: new Set(),
     trackedRepos: [],
@@ -322,7 +332,8 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
         editor_command: null,
         terminal_app: "Terminal",
         diff_style: "side_by_side",
-        show_builtins: true,
+        show_builtin_prompts: true,
+        show_builtin_workflows: true,
         claude_chrome_enabled: false,
         agent_defaults: backend.agentDefaults,
       };
@@ -401,6 +412,16 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     // reading-mode tests) but otherwise inert — the suppression policy they feed
     // lives in Rust and is tested there.
     case "remove_agent":
+      if (backend.failRemoveAfterDeleting !== null) {
+        for (const [pid, roster] of backend.rosters) {
+          backend.rosters.set(
+            pid,
+            roster.filter((a) => a.id !== args?.agentId),
+          );
+        }
+        throw new Error(backend.failRemoveAfterDeleting);
+      }
+      return null;
     case "set_visible_project":
       return null;
     case "notify":
@@ -826,7 +847,7 @@ describe("App", () => {
         selection: {
           model: "gemini-3.8-flash",
           effort: "medium",
-          model_choices: ["gemini-3.8-flash", "gemini-3.1-pro"],
+          model_choices: ["gemini-3.8-flash", "gemini-4-argon"],
           effort_choices: ["medium", "high"],
         },
       },
@@ -863,9 +884,9 @@ describe("App", () => {
 
   it("new project: clears active effort but preserves choices for a no-effort default model", async () => {
     backend.agentDefaults.antigravity = {
-      model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
+      model_choices: ["no-effort-model", "three-level-model"],
       effort_choices: ["high", "medium"],
-      default_model: "claude-sonnet-4-6",
+      default_model: "no-effort-model",
       default_effort: "high",
     };
     await mountApp();
@@ -879,9 +900,9 @@ describe("App", () => {
       name: "antigravity",
       harness: "antigravity",
       selection: {
-        model: "claude-sonnet-4-6",
+        model: "no-effort-model",
         effort: null,
-        model_choices: ["claude-sonnet-4-6", "gemini-3.8-flash"],
+        model_choices: ["no-effort-model", "three-level-model"],
         effort_choices: ["high", "medium"],
       },
     });
@@ -889,10 +910,10 @@ describe("App", () => {
 
   it("new project: reports an Antigravity default with no compatible effort", async () => {
     backend.agentDefaults.antigravity = {
-      model_choices: ["gemini-3.1-pro"],
-      effort_choices: ["medium"],
-      default_model: "gemini-3.1-pro",
-      default_effort: "medium",
+      model_choices: ["medium-only-model"],
+      effort_choices: ["high"],
+      default_model: "medium-only-model",
+      default_effort: "high",
     };
     await mountApp();
     await createNewProjectViaDialog("invalid-antigravity-default");
@@ -2702,32 +2723,46 @@ describe("App", () => {
     await fireEvent.click(screen.getByText("alpha"));
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
     expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
+    await fireEvent.input(screen.getByRole("textbox", { name: "Search projects" }), {
+      target: { value: "alpha" },
+    });
 
     await fireEvent.click(
       within(screen.getByTestId("projects-sidebar")).getByTestId("settings-button"),
     );
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+    expect(screen.getByTestId("projects-sidebar")).not.toBeVisible();
     expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
+    expect(screen.getByTestId("settings-sidebar")).toBeVisible();
     expect(screen.getByText("Theme")).toBeInTheDocument();
-    expect(screen.getByText("Shortcuts")).toBeInTheDocument();
-
-    await fireEvent.click(
-      within(screen.getByTestId("projects-sidebar")).getByTestId("settings-button"),
+    expect(screen.getByText("Shortcuts")).not.toBeVisible();
+    const settingsNav = within(screen.getByRole("navigation", { name: "Settings categories" }));
+    await fireEvent.click(settingsNav.getByRole("button", { name: "Notifications" }));
+    expect(screen.getByTestId("notify-toggle")).toBeVisible();
+    expect(screen.getByText("Theme")).not.toBeVisible();
+    expect(settingsNav.getByRole("button", { name: "Notifications" })).toHaveAttribute(
+      "aria-current",
+      "page",
     );
+
+    await fireEvent.click(screen.getByTestId("settings-back"));
     await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
     expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Search projects" })).toHaveValue("alpha");
 
     await fireEvent.click(
       within(screen.getByTestId("projects-sidebar")).getByTestId("settings-button"),
     );
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Notifications");
     await fireEvent.click(screen.getByTestId("settings-close"));
     await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
     expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
     expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Search projects" })).toHaveValue("alpha");
   });
 
-  it("settings button label reflects open/closed state for assistive technology", async () => {
+  it("settings navigation exposes the current page and a named return action", async () => {
     seedProject({
       projectId: "p-a",
       directory: DIR_A,
@@ -2744,11 +2779,12 @@ describe("App", () => {
 
     await fireEvent.click(settingsBtn);
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
-    expect(settingsBtn).toHaveAttribute("aria-label", "Close settings");
+    expect(screen.getByRole("button", { name: "General" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("button", { name: "Back to projects" })).toBeVisible();
 
-    await fireEvent.click(settingsBtn);
+    await fireEvent.click(screen.getByTestId("settings-back"));
     await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
-    expect(settingsBtn).toHaveAttribute("aria-label", "Open settings");
+    expect(screen.getByTestId("settings-button")).toHaveAttribute("aria-label", "Open settings");
   });
 
   it("settings is reachable from the title bar when the projects sidebar is collapsed", async () => {
@@ -2773,10 +2809,13 @@ describe("App", () => {
     // Opening and closing works from the title bar.
     await fireEvent.click(titleBarBtn);
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
-    expect(titleBarBtn).toHaveAttribute("aria-label", "Close settings");
+    expect(screen.getByTestId("settings-sidebar")).toBeVisible();
+    expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument();
 
-    await fireEvent.click(titleBarBtn);
+    await fireEvent.click(screen.getByTestId("settings-back"));
     await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
+    expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument();
+    expect(screen.getByTestId("settings-button")).toHaveAttribute("aria-label", "Open settings");
   });
 
   it("global shortcuts toggle sidebars and open settings", async () => {
@@ -2805,7 +2844,9 @@ describe("App", () => {
 
     await fireEvent.keyDown(window, { key: ",", metaKey: true });
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+    expect(screen.getByTestId("projects-sidebar")).not.toBeVisible();
     expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
+    expect(screen.getByTestId("settings-sidebar")).toBeVisible();
 
     await fireEvent.keyDown(window, { key: ",", metaKey: true });
     await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
@@ -4189,6 +4230,8 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
     expect(screen.getByTestId("prompt-settings-section")).toHaveTextContent("Prompt servers (MCP)");
+    expect(screen.getByTestId("prompt-settings-section")).toBeVisible();
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Prompts");
   });
 
   it("global shortcuts are suppressed inside non-composer editable elements", async () => {
@@ -4768,6 +4811,54 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toHaveFocus());
   });
 
+  it("keeps the warning of a removal that deleted the agent but failed to save", async () => {
+    // The sidebar shows a removal error inside the agent's card, and the
+    // re-read that follows a failed removal drops the card when the agent is
+    // gone. The warning must outlive the card.
+    //
+    // jsdom has no Web Animations API, and the agent's actions menu asks for
+    // its running animations as the card it belongs to unmounts. Supplied for
+    // this test only: across the suite it changes how menus close in tests
+    // that depend on today's jsdom behavior.
+    const prototype = Element.prototype as { getAnimations?: () => Animation[] };
+    const hadGetAnimations = prototype.getAnimations !== undefined;
+    if (!hadGetAnimations) prototype.getAnimations = () => [];
+    try {
+      seedProject({
+        projectId: "p-a",
+        directory: DIR_A,
+        name: "alpha",
+        agents: [
+          agent({ id: "ag-1", project_id: "p-a", name: "assistant" }),
+          agent({ id: "ag-2", project_id: "p-a", name: "reviewer" }),
+        ],
+      });
+      await mountApp();
+      await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+      await fireEvent.click(screen.getByText("alpha"));
+      await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(2));
+      backend.failRemoveAfterDeleting =
+        "the agent was removed, but saving the change failed, so it may reappear after a crash";
+
+      const triggers = await screen.findAllByTestId("agent-actions-trigger");
+      await fireEvent.click(triggers[1]!);
+      await fireEvent.click(await screen.findByTestId("agent-action-remove"));
+      await fireEvent.click(screen.getByTestId("agent-remove-confirm"));
+
+      const banner = await screen.findByTestId("banner-agent-remove-warning-ag-2");
+      expect(banner).toHaveTextContent(
+        "reviewer: the agent was removed, but saving the change failed",
+      );
+      await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(1));
+      expect(screen.queryByTestId("agent-remove-error")).not.toBeInTheDocument();
+
+      await fireEvent.click(screen.getByTestId("banner-agent-remove-warning-ag-2-dismiss"));
+      expect(screen.queryByTestId("banner-agent-remove-warning-ag-2")).not.toBeInTheDocument();
+    } finally {
+      if (!hadGetAnimations) delete prototype.getAnimations;
+    }
+  });
+
   it("keeps the way out of reading mode when the project's last agent is removed", async () => {
     // The mode outlives the roster, so anything gating its exit must be
     // transient-by-navigation. A roster condition is not: with reading mode on
@@ -4805,6 +4896,109 @@ describe("App", () => {
         /Also notify me about other projects/,
       ),
     );
+
+    // With notifications off altogether, the hint names the quick ways back on
+    // rather than sending the user to Settings.
+    const prefs = await import("$lib/preferences.svelte");
+    await waitFor(() => expect(prefs.preferenceLoadState.ready).toBe(true));
+    await fireEvent.keyDown(window, { key: "M", code: "KeyM", metaKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("reading-mode-hint")).toHaveTextContent(/crossed-out bell/),
+    );
+  });
+
+  it("opens Notifications from the reading-mode hint after visiting another settings page", async (): Promise<void> => {
+    await openProjectAlpha();
+    await fireEvent.click(screen.getByTestId("settings-button"));
+    await fireEvent.click(screen.getByRole("button", { name: "Prompts" }));
+    await fireEvent.click(screen.getByTestId("settings-close"));
+    await fireEvent.click(screen.getByTestId("reading-mode-toggle"));
+    const hint = await screen.findByTestId("reading-mode-hint");
+    await fireEvent.click(within(hint).getByRole("button", { name: "Open settings" }));
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Notifications");
+    expect(screen.getByTestId("notify-while-focused-toggle")).toBeVisible();
+  });
+
+  // --- notifications toggle ---
+
+  /// The `notify_on_completion` value of the latest preference save, or
+  /// undefined when none has been issued.
+  function lastSavedNotifyPreference(): boolean | undefined {
+    const call = invokeMock.mock.calls.filter(([c]) => c === "set_preferences").at(-1);
+    const saved = call?.[1]?.preferences as { notify_on_completion?: boolean } | undefined;
+    return saved?.notify_on_completion;
+  }
+
+  it("⌘⇧M turns notifications off and on, with a crossed-out bell in the header while they are off", async () => {
+    const prefs = await import("$lib/preferences.svelte");
+    await openProjectAlpha();
+    await waitFor(() => expect(prefs.preferenceLoadState.ready).toBe(true));
+    expect(screen.queryByTestId("notifications-off-button")).toBeNull();
+
+    await fireEvent.keyDown(window, { key: "M", code: "KeyM", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("notifications-off-button")).toBeInTheDocument());
+    expect(prefs.preferences.notify_on_completion).toBe(false);
+    await waitFor(() => expect(lastSavedNotifyPreference()).toBe(false));
+
+    // The bell is the way back on.
+    await fireEvent.click(screen.getByTestId("notifications-off-button"));
+    await waitFor(() => expect(screen.queryByTestId("notifications-off-button")).toBeNull());
+    expect(prefs.preferences.notify_on_completion).toBe(true);
+    await waitFor(() => expect(lastSavedNotifyPreference()).toBe(true));
+  });
+
+  it("⌘⇧M works from a text field, where other chords are held back", async () => {
+    // A Settings field is where a user is most likely to reach for it, and the
+    // chord types nothing a field could need.
+    const prefs = await import("$lib/preferences.svelte");
+    await openProjectAlpha();
+    await waitFor(() => expect(prefs.preferenceLoadState.ready).toBe(true));
+    await fireEvent.keyDown(window, { key: ",", metaKey: true });
+    await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+
+    const field = screen.getByTestId("external-editor-command");
+    field.focus();
+    await fireEvent.keyDown(field, { key: "M", code: "KeyM", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("notifications-off-button")).toBeInTheDocument());
+    expect(prefs.preferences.notify_on_completion).toBe(false);
+  });
+
+  it("the palette lists the notifications toggle, titled by the current state", async () => {
+    await openProjectAlpha();
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+    const option = screen.getByTestId("command-option-nav.toggle-notifications");
+    expect(option).toHaveTextContent("Turn off notifications");
+    await fireEvent.click(option);
+    await waitFor(() => expect(screen.queryByTestId("command-palette")).toBeNull());
+    await waitFor(() => expect(screen.getByTestId("notifications-off-button")).toBeInTheDocument());
+
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("command-option-nav.toggle-notifications")).toHaveTextContent(
+        "Turn on notifications",
+      ),
+    );
+  });
+
+  it("the chord waits for preferences to load, so it never flips a value it has not seen", async () => {
+    // Before the saved preferences arrive the store holds the default (on). A
+    // flip computed from that could land as "off" for a user whose saved value
+    // was already off, the opposite of what they pressed for.
+    const prefs = await import("$lib/preferences.svelte");
+    const gate = deferred<void>();
+    backend.preferencesGate = gate.promise;
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
+
+    await fireEvent.keyDown(window, { key: "M", code: "KeyM", metaKey: true, shiftKey: true });
+    expect(prefs.preferences.notify_on_completion).toBe(true);
+    expect(lastSavedNotifyPreference()).toBeUndefined();
+
+    gate.resolve();
+    await waitFor(() => expect(prefs.preferenceLoadState.ready).toBe(true));
+    await fireEvent.keyDown(window, { key: "M", code: "KeyM", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(prefs.preferences.notify_on_completion).toBe(false));
   });
 
   describe("unavailable project directory", () => {
@@ -5060,6 +5254,30 @@ describe("App", () => {
       });
 
       await screen.findByTestId("banner-project-directory-unavailable");
+    });
+  });
+
+  describe("changes another client makes", () => {
+    it("shows an agent another client created in the open project's sidebar without a reload", async () => {
+      seedProject({
+        projectId: "p-a",
+        agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+      });
+      await mountApp();
+      await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+      await fireEvent.click(screen.getByText("alpha"));
+      await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(1));
+
+      backend.rosters.set("p-a", [
+        ...(backend.rosters.get("p-a") ?? []),
+        agent({ id: "ag-2", project_id: "p-a", name: "helper" }),
+      ]);
+      fireTo("desktop_roster_changed", { project_id: "p-a" } as unknown as NormalizedEvent);
+
+      await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(2));
+      expect(
+        within(screen.getAllByTestId("sidebar-agent")[1]!).getByText("helper"),
+      ).toBeInTheDocument();
     });
   });
 });

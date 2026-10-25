@@ -59,8 +59,10 @@
 // `flushIfReady`.
 //
 // **Workflow runs are folded in, but workflow *steps* are still excluded
-// structurally.** Only sends the frontend dispatches are ever registered, so a
-// workflow's per-step sends (which the backend originates) cannot notify. What
+// structurally.** Only sends the frontend dispatches and sends another client
+// made (announced by the dispatcher as it admits each recipient, and registered
+// here one recipient at a time) are ever registered, so a workflow's per-step
+// sends (which the backend originates and never announces) cannot notify. What
 // this module does own is the run's *terminal*, reported through
 // `recordWorkflowTerminal` — previously a separate backend notification that
 // fired at run-end regardless of whether the project was still busy, producing
@@ -186,6 +188,35 @@ export function registerSend(
   });
   project.sends.add(sendId);
   for (const recipient of recipients) project.recipients.set(recipient.id, recipient.name);
+}
+
+/// Register one recipient of a send another client made (an orchestrator over
+/// agent access), so the project's quiet-down notification covers it as it
+/// covers the window's own sends. The dispatcher announces such a send on each
+/// recipient's channel as it admits that recipient, so the recipient set grows
+/// one announcement at a time rather than arriving whole as `registerSend`'s
+/// does: the first announcement creates the entry, later ones add to it, and a
+/// repeat for a recipient already present changes nothing. The project name is
+/// left to the observer's push, which names every project it evaluates.
+///
+/// Only for an announcement that admits a new pending entry. A send the window
+/// already holds a row for has already started, so its recipient would never be
+/// marked started or settled, and one unsettled recipient holds back every
+/// notification for the project.
+export function registerAnnouncedRecipient(
+  sendId: SendId,
+  projectId: ProjectId,
+  recipient: { id: AgentId; name: string },
+): void {
+  const project = ensureActivity(projectId);
+  let send = tracked.get(sendId);
+  if (send === undefined) {
+    send = { projectId, recipients: new Map(), outcomes: new Map() };
+    tracked.set(sendId, send);
+  }
+  send.recipients.set(recipient.id, recipient.name);
+  project.sends.add(sendId);
+  project.recipients.set(recipient.id, recipient.name);
 }
 
 /// Record that a recipient's turn actually started. The project's notification

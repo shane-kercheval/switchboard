@@ -111,6 +111,16 @@ codex_surface() {
   methods=$(jq -r '.oneOf[].properties.method.enum[]' "$work/schema/ClientRequest.json" | sort -u) ||
     fail "could not read app-server methods from ClientRequest.json"
   print_table "codex app-server methods (ClientRequest)" "$methods"
+  # The default schema leaves out the methods Codex marks experimental, and a
+  # new app-server method can arrive there first. List those separately, so a
+  # method that becomes stable shows as moving from one table to the other.
+  local all_methods experimental
+  codex app-server generate-json-schema --experimental --out "$work/schema-experimental" >/dev/null 2>&1 ||
+    fail "'codex app-server generate-json-schema --experimental' failed"
+  all_methods=$(jq -r '.oneOf[].properties.method.enum[]' "$work/schema-experimental/ClientRequest.json" | sort -u) ||
+    fail "could not read experimental app-server methods from ClientRequest.json"
+  experimental=$(comm -13 <(echo "$methods") <(echo "$all_methods"))
+  print_table "codex app-server methods (ClientRequest, experimental only)" "$experimental"
 }
 
 claude_surface() {

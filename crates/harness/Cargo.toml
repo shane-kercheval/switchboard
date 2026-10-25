@@ -26,10 +26,12 @@ futures = { workspace = true }
 which = { workspace = true }
 toml = { workspace = true }
 tokio-util = { workspace = true }
+zstd = { version = "0.14.3", default-features = false }
 
 # `nix` is unix-only and used by:
 # - `subprocess.rs`: process-group signalling (`signal`) and switching a child's
-#   stdout pipe to non-blocking so the reader thread can honor a deadline (`fs`).
+#   stdout pipe to non-blocking so the reader thread can honor a deadline (`fs`),
+#   and reading a pipe only as far as the kernel has data ready (no feature).
 # - the `fake_claude` test binary (`src/bin/fake_claude.rs`) to write its own
 #   pgid to a file so the integration test can verify process-group spawn
 #   actually flows through ClaudeCodeAdapter::dispatch.
@@ -41,4 +43,4 @@ nix = { version = "0.31.3", default-features = false, features = ["fs", "process
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
-serial_test = "3.5.0"
+serial_test = "4.0.1"

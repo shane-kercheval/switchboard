@@ -6,7 +6,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, Store};
+use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId, Store};
 use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
 use switchboard_prompts::PromptService;
@@ -17,6 +17,11 @@ use uuid::Uuid;
 use crate::git_registry::{self, GitRegistry};
 use crate::harness_usage::{self, HarnessUsage};
 use crate::notification::{Notifier, NullNotifier};
+use crate::ops::context::ContextStore;
+use crate::ops::desktop_sync::{DesktopSync, NoopDesktopSync};
+use crate::ops::handle::AppStateHandle;
+use crate::ops::ledger::{OpsLedgerEmitter, SendLedger};
+use crate::ops::usage::CodexUsageReader;
 use crate::preferences::{self, Preferences};
 use crate::wake_lock::WakeLock;
 use crate::workspace::{self, Workspace};
@@ -44,12 +49,49 @@ pub struct ActiveRun {
     /// agents. Disk-sourced runs instead reconstruct *declared* steps from the run
     /// file; this resolved copy exists only for the in-flight run.
     pub steps: Vec<WorkflowStepInfo>,
+    /// Each step's agents and send as the engine resolved them, by step
+    /// index, filled as steps run.
+    pub resolved: std::collections::BTreeMap<usize, crate::workflow::StepResolution>,
+    /// Started through the agent tools rather than from the window. An
+    /// orchestrator may cancel only such a run, or a reply inside one: a run
+    /// the user started is the user's to stop.
+    pub through_agent_access: bool,
     /// Notified once when the run reaches a terminal status. Teardown collects a
     /// clone **before** firing cancel, then awaits it — so the wait can't be
     /// stranded by the owning task removing its own registry entry. `notify_one`
     /// stores a permit if the terminal beats the waiter, so the wakeup is never
     /// lost regardless of ordering.
     pub done: Arc<tokio::sync::Notify>,
+}
+
+/// Who started the workflow that made a send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowSendOrigin {
+    pub project_id: ProjectId,
+    /// Started through the agent tools rather than from the window.
+    pub through_agent_access: bool,
+}
+
+/// Agent removals as workflow starts see them, per project.
+#[derive(Debug, Default)]
+pub struct AgentRemovals {
+    /// Removals over agent access under way, counted because two can
+    /// overlap. Taken and checked while `workflow_runs` is held, so a
+    /// removal's "no run here" check and a run's registration cannot
+    /// interleave.
+    pub in_progress: HashMap<ProjectId, usize>,
+    /// Agents deleted so far, by either removal path. Advanced under
+    /// `registry_write` when a record is confirmed gone, and read under it with
+    /// the roster a run binds to, so a run whose roster predates a deletion is
+    /// refused at registration.
+    pub deletions: HashMap<ProjectId, u64>,
+}
+
+impl AgentRemovals {
+    #[must_use]
+    pub fn deletions(&self, project_id: ProjectId) -> u64 {
+        self.deletions.get(&project_id).copied().unwrap_or(0)
+    }
 }
 
 /// A live run's step progress. A run is only in the registry while running, so
@@ -101,6 +143,17 @@ pub enum TestSeam {
     /// indistinguishable from the broken form. The wait is a blocking one because
     /// the capture is synchronous and holds a `std` mutex.
     Capture,
+    /// Inside an `ops` send, immediately before each recipient's dispatch.
+    /// Holds the gap between the up-front busy check and the actor's own
+    /// admission open, so a test can make a recipient busy in between and
+    /// prove the partial-dispatch rule; and holds a send task mid-fan-out so a
+    /// test can drop the caller and prove the task finishes anyway.
+    OpsDispatch,
+    /// Inside `update_agent_selection_impl`, between its read of the record
+    /// and its write, **while it holds `registry_write`**. Holds the first of
+    /// two concurrent selection changes open so a test can prove the second
+    /// waits for it and merges onto its result rather than a stale read.
+    SelectionUpdate,
     /// Inside the attachment-reclaim worker, before it scans. Holds the worker
     /// open so a test can prove a second caller — a reloaded page — waits for
     /// the worker to stop rather than being released on "already claimed", and
@@ -111,6 +164,18 @@ pub enum TestSeam {
     /// test start a project deletion at exactly the moment a slow fork
     /// creation would let one in.
     ForkRegistration,
+    /// Inside the blocking work that opens a send's attachments to check them.
+    /// Holds it as a file that never opens would, so a test can prove the send
+    /// stops waiting at its deadline or on a cancel while the work is stuck.
+    AttachmentCheck,
+    /// Inside the blocking copy of an attachment into the project. Holds it as
+    /// a stalled drive would, so a test can prove a cancel stops the send.
+    AttachmentCopy,
+    /// Inside a reading of a send the ledger does not hold, immediately before
+    /// it asks the dispatcher whether an agent still holds work for the send,
+    /// after the reading's journal read. Holds the reading there so a test can
+    /// change what the journal holds before the answer is built.
+    WorkQuestion,
 }
 
 /// Two-way handshake for a [`TestSeam`].
@@ -221,7 +286,20 @@ pub struct AppState {
     pub codex_adapter: Arc<dyn HarnessAdapter>,
     /// Adapter for `HarnessKind::Antigravity` agents.
     pub antigravity_adapter: Arc<dyn HarnessAdapter>,
+    /// The app's event sink, with the send ledger's decorator outermost: every
+    /// event the dispatcher emits passes through [`OpsLedgerEmitter`] before
+    /// reaching whatever sink the constructor was given, so the ledger sees
+    /// the same stream the window does.
     pub emitter: Arc<dyn EventEmitter>,
+    /// Per-send and per-run outcomes fed by the event stream, for callers that
+    /// are not the window (MCP tools). A tail-leaf mutex: taken alone, briefly,
+    /// never across an `.await`.
+    pub ledger: Arc<SendLedger>,
+    /// The window half of the sync round trip a turn-starting operation runs
+    /// before dispatching. Defaults to an implementation that reports ready at
+    /// once; production injects the real one via
+    /// [`AppState::with_desktop_sync`].
+    pub desktop_sync: Arc<dyn DesktopSync>,
     /// Set of `agent_id`s whose next dispatch must run with
     /// `DispatchOptions::is_first_dispatch_after_attach = true`. Populated by
     /// `attach_agent_impl` (Codex-only — see below); read (not drained) by
@@ -498,6 +576,22 @@ pub struct AppState {
     /// updates a run's step snapshot, the task removes the entry on terminal.
     pub workflow_runs: Arc<Mutex<HashMap<Uuid, ActiveRun>>>,
 
+    /// Who started the workflow behind each workflow send: through the agent
+    /// tools or from the window. Recorded when a send step starts, before its
+    /// send's ledger entry, and
+    /// kept until the app quits, one small entry per send, because a reply can
+    /// outlive its run: a failed run ends at once while its sent replies keep
+    /// going, and an orchestrator may still cancel those it started. A leaf in
+    /// the lock order, taken after `workflow_runs`.
+    pub workflow_send_origins: Arc<Mutex<HashMap<SendId, WorkflowSendOrigin>>>,
+
+    /// What a workflow start checks about agent removals, so a run cannot
+    /// start with an agent that is being or has just been removed: it could
+    /// run its first steps and then fail at that agent's. See
+    /// [`AgentRemovals`]. A leaf in the lock order: nothing is acquired while
+    /// holding it.
+    pub agent_removals: Mutex<AgentRemovals>,
+
     /// Fires OS notifications on a workflow run's completion/failure (suppressed
     /// when the window is focused). Defaults to a no-op; production injects the
     /// gated notifier via [`AppState::with_notifier`].
@@ -527,6 +621,10 @@ pub struct AppState {
     /// second copy of that decision is one that can silently disagree with the
     /// first.
     pub spawns_real_harnesses: bool,
+    /// The Codex program a fork runs (`codex exec fork`), resolved on the
+    /// login-shell PATH as every harness call is. A path so a test can point
+    /// it at a stand-in; production keeps the default.
+    pub codex_binary: PathBuf,
     /// The *kind* of the last account-usage failure, so a persistent one is
     /// logged on change rather than on repeat.
     ///
@@ -542,6 +640,30 @@ pub struct AppState {
     /// something. `None` is "nothing has failed since startup", which is why
     /// recovery logs too.
     pub last_account_usage_failure: Mutex<Option<&'static str>>,
+
+    /// Each agent's context fullness as the read tier reports it, fed by the
+    /// emitter decorator and by every transcript parse (`ops::context`).
+    pub context: Arc<ContextStore>,
+    /// Agent access's own Codex account reads, one in flight, never written
+    /// to `harness_usage` (`ops::usage`).
+    pub codex_usage_reader: Arc<CodexUsageReader>,
+}
+
+/// The production Codex account read, the same one the window's meter refreshes
+/// with: `codex` resolved on the login-shell PATH, under the read's own bound.
+fn production_codex_read(
+    handle: Arc<dyn AppStateHandle>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Option<switchboard_harness::CodexAccountUsage>> + Send>,
+> {
+    Box::pin(async move {
+        crate::commands::read_codex_account_usage_impl(
+            handle.app_state(),
+            std::path::Path::new("codex"),
+            switchboard_harness::ACCOUNT_USAGE_TIMEOUT,
+        )
+        .await
+    })
 }
 
 impl AppState {
@@ -553,7 +675,16 @@ impl AppState {
         store: Store,
         lock_root: PathBuf,
     ) -> Self {
+        let ledger = Arc::new(SendLedger::new());
+        let context = Arc::new(ContextStore::new());
+        let emitter: Arc<dyn EventEmitter> = Arc::new(OpsLedgerEmitter::new(
+            emitter,
+            Arc::clone(&ledger),
+            Arc::clone(&context),
+        ));
         Self {
+            ledger,
+            desktop_sync: Arc::new(NoopDesktopSync),
             store,
             maintenance: Mutex::new(HashSet::new()),
             project_generation: Arc::new(Mutex::new(HashMap::new())),
@@ -588,6 +719,8 @@ impl AppState {
             prompts: PromptService::disabled(),
             forwards: Mutex::new(HashMap::new()),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
+            agent_removals: Mutex::new(AgentRemovals::default()),
+            workflow_send_origins: Arc::new(Mutex::new(HashMap::new())),
             notifier: Arc::new(NullNotifier),
             wake_lock: WakeLock::inert(),
             notification_gate: Arc::new(crate::notification::AuthorizationGate::new(Arc::new(
@@ -597,7 +730,10 @@ impl AppState {
             // Tests construct state directly and never spawn a real CLI
             // through this seam; production overrides it in `run`.
             spawns_real_harnesses: false,
+            codex_binary: PathBuf::from("codex"),
             last_account_usage_failure: Mutex::new(None),
+            context,
+            codex_usage_reader: Arc::new(CodexUsageReader::new(Arc::new(production_codex_read))),
         }
     }
 
@@ -666,6 +802,13 @@ impl AppState {
         self
     }
 
+    /// Builder step that injects the window half of the sync round trip.
+    #[must_use]
+    pub fn with_desktop_sync(mut self, desktop_sync: Arc<dyn DesktopSync>) -> Self {
+        self.desktop_sync = desktop_sync;
+        self
+    }
+
     /// Builder step that injects the production wake lock — the same one the
     /// base emitter's `WakeLockEmitter` feeds, so turns and workflow leases count
     /// together.
@@ -681,6 +824,14 @@ impl AppState {
     #[must_use]
     pub fn with_real_harnesses(mut self, spawns_real_harnesses: bool) -> Self {
         self.spawns_real_harnesses = spawns_real_harnesses;
+        self
+    }
+
+    /// Builder step pointing forks at a Codex stand-in. Tests only: production
+    /// resolves `codex` on PATH.
+    #[must_use]
+    pub fn with_codex_binary(mut self, binary: PathBuf) -> Self {
+        self.codex_binary = binary;
         self
     }
 

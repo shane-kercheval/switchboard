@@ -20,7 +20,7 @@
     X,
   } from "@lucide/svelte";
   import { flip } from "svelte/animate";
-  import type { AgentSelection, AgentRecord, AgentId, ProjectId, TurnUsage } from "$lib/types";
+  import type { AgentSelection, AgentRecord, AgentId, ProjectId } from "$lib/types";
   import {
     dispatchCompaction,
     dispatchContextReport,
@@ -46,7 +46,7 @@
   import { DRAG_SLOP_PX, dropIndexForPointer, movedOrder } from "$lib/agentReorder";
   import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
-  import { effortSupportFor, selectionIsValid } from "$lib/agentSelection";
+  import { effortSupportFor, selectionChanges, selectionIsValid } from "$lib/agentSelection";
   import { preferences } from "$lib/preferences.svelte";
   import {
     AGENTS_SIDEBAR_DEFAULT_WIDTH,
@@ -67,6 +67,11 @@
   } from "$lib/api";
   import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
   import { cn, formatTokens, isIsoTimestampAfter } from "$lib/utils";
+  import {
+    contextOccupancy as occupancyFrom,
+    type CompactedReading,
+    type ContextOccupancy,
+  } from "$lib/contextOccupancy";
   import ResizeHandle from "$lib/components/ui/ResizeHandle.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
@@ -184,9 +189,12 @@
   /// still being created is read from the project's compose claim instead, so
   /// it survives this sidebar being closed and reopened.
   let forkError = $state<{ agentId: AgentId; message: string } | null>(null);
+  let openSessionError = $state<{ agentId: AgentId; message: string } | null>(null);
 
-  /// Selection writes replace the complete configuration. One agent-level busy
-  /// flag prevents independently rendered controls from submitting stale peers.
+  /// Selection writes send only the parts the user changed, measured against
+  /// what they started from, so another client's change to a different setting
+  /// survives. One agent-level busy flag still keeps two controls of the same
+  /// card from saving at once.
   let selectionEditingAgentId = $state<AgentId | null>(null);
   let editSelection = $state<AgentSelection>({
     model: null,
@@ -194,6 +202,13 @@
     model_choices: [],
     effort_choices: [],
   });
+  /// The selection the editor opened with: what a save is measured against.
+  let editBaseline: AgentSelection = {
+    model: null,
+    effort: null,
+    model_choices: [],
+    effort_choices: [],
+  };
   let editBusy = $state<boolean>(false);
   let editError = $state<string | null>(null);
   let selectionSaving = $state<Record<AgentId, boolean>>({});
@@ -223,6 +238,7 @@
 
   function openSelectionSettings(agent: AgentRecord): void {
     selectionEditingAgentId = agent.id;
+    editBaseline = $state.snapshot(selectionForAgent(agent));
     editSelection = selectionForAgent(agent);
     editError = null;
     editBusy = false;
@@ -242,7 +258,10 @@
     selectionSaving[agentId] = true;
     editError = null;
     try {
-      await setAgentSelection(agentId, $state.snapshot(editSelection));
+      await setAgentSelection(
+        agentId,
+        selectionChanges(editBaseline, $state.snapshot(editSelection)),
+      );
       delete selectionSaveErrors[agentId];
       if (selectionEditingAgentId === agentId) closeChange();
     } catch (err) {
@@ -260,7 +279,7 @@
     selectionSaving[agent.id] = true;
     delete selectionSaveErrors[agent.id];
     try {
-      await setAgentSelection(agent.id, selection);
+      await setAgentSelection(agent.id, selectionChanges(selectionForAgent(agent), selection));
     } catch (err) {
       selectionSaveErrors[agent.id] = err instanceof Error ? err.message : String(err);
     } finally {
@@ -351,6 +370,7 @@
     if (compactConfirmAgentId !== null && !ids.has(compactConfirmAgentId))
       compactConfirmAgentId = null;
     if (forkError !== null && !ids.has(forkError.agentId)) forkError = null;
+    if (openSessionError !== null && !ids.has(openSessionError.agentId)) openSessionError = null;
     if (resumeAgentId !== null && !ids.has(resumeAgentId)) {
       resumeAgentId = null;
       resumeOpen = false;
@@ -367,11 +387,20 @@
     if (hoveredAgentId !== null && !ids.has(hoveredAgentId)) hoveredAgentId = null;
   });
 
-  function openSessionFile(agent: AgentRecord): void {
-    if (!sessionInfoByAgent[agent.id]?.session_file) return;
-    void apiOpenSessionFile(agent.id).catch((err: unknown) => {
-      console.error("[switchboard] open session file failed", err);
-    });
+  async function openSessionFile(agent: AgentRecord): Promise<void> {
+    const info = sessionInfoByAgent[agent.id];
+    if (!info?.session_file) return;
+    openSessionError = null;
+    try {
+      // The same cached answer that chose the label, so a click on "Open copy"
+      // always asks for a copy even if the file has changed since.
+      await apiOpenSessionFile(agent.id, info.session_file_compressed === true);
+    } catch (err) {
+      openSessionError = {
+        agentId: agent.id,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
 
   function startRemove(agent: AgentRecord): void {
@@ -855,9 +884,6 @@
     await dispatchContextReport(agentId, crypto.randomUUID());
   }
 
-  type ContextOccupancy = { usedTokens: number; windowTokens: number; fraction: number };
-  type CompactedReading = { at: string; tokens: number; window: number | null };
-
   /// Each agent's newest compaction marker that recorded the compacted
   /// context's size. Markers live in the project's merged conversation, not in
   /// the agent's turn list, and that conversation changes only when history
@@ -918,70 +944,10 @@
     if (compactAllArmed && compactibleAgentIds.length === 0) disarmCompactAll();
   });
 
-  /// Context occupancy — `context_tokens_after_turn` over `context_window`
-  /// from the most recent completed agent turn, or the size a compaction newer
-  /// than that turn left behind. Forward-looking signal ("how full will the
-  /// next turn's context be"). The raw operands come back beside the fraction
-  /// because the meter shows both, and rescanning the transcript for them
-  /// could disagree with the fraction on a mid-render update.
-  ///
-  /// `context_input_tokens` is the harness-reconciled input-side occupancy
-  /// (see `TurnUsage`): for Claude it sums the disjoint cache fields (cached +
-  /// cache-creation, which `input_tokens` alone excludes — the cause of the
-  /// near-0% bug), for Codex the adapter substitutes the session file's
-  /// per-turn `last_token_usage` because the stream reports thread-cumulative
-  /// totals (the cause of the >900% bug). Consuming the pre-reconciled
-  /// value keeps this formula harness-agnostic — do not re-add per-harness
-  /// token summation here. `context_tokens_after_turn` also keeps Claude's
-  /// whole-dispatch billing output separate from the final parent call's
-  /// occupancy. Both it and `context_window` must be present; otherwise the bar
-  /// is hidden. An impossible occupancy is hidden rather than clamped, so bad
-  /// telemetry never masquerades as a plausible 100%.
-  ///
-  /// A compaction marker newer than that turn supersedes it. Live, a completed
-  /// compaction is itself a turn with usage, so this matters after a reopen,
-  /// when the marker is the compaction's only trace and the newest turn is the
-  /// reply before it: without the marker the bar would show the pre-compaction
-  /// size until the agent's next reply. A marker's own window is the one the
-  /// compaction ran with: Codex records it in the session file, and for Claude
-  /// the loader reattaches the window saved at compaction time. A marker with
-  /// none (a Claude compaction run outside Switchboard, or before that window
-  /// was saved) borrows the superseded turn's, which is wrong only if the
-  /// model's window changed between that reply and the compaction, and only
-  /// until the next reply.
+  /// The context bar's figure for one agent: the rule lives in
+  /// `$lib/contextOccupancy`, shared with agent access's copy.
   function contextOccupancy(agentId: AgentId): ContextOccupancy | undefined {
-    const turns = transcripts[agentId] ?? [];
-    let latest: { at: string; usage: TurnUsage } | undefined;
-    for (let i = turns.length - 1; i >= 0; i--) {
-      const turn = turns[i];
-      // A streaming turn has no terminal usage yet, so keep showing the last
-      // completed state while it runs. Once a terminal usage record exists it
-      // is authoritative: missing/invalid operands clean-hide rather than
-      // falling back to an older, stale percentage.
-      if (turn?.role !== "agent" || turn.status === "streaming" || turn.usage === undefined)
-        continue;
-      latest = { at: turn.ended_at ?? turn.started_at, usage: turn.usage };
-      break;
-    }
-    const compacted = latestCompactedContexts.get(agentId);
-    if (
-      compacted !== undefined &&
-      (latest === undefined || isIsoTimestampAfter(compacted.at, latest.at))
-    ) {
-      return occupancyOf(compacted.tokens, compacted.window ?? latest?.usage.context_window);
-    }
-    if (latest === undefined) return undefined;
-    return occupancyOf(latest.usage.context_tokens_after_turn, latest.usage.context_window);
-  }
-
-  function occupancyOf(
-    occupancy: number | null | undefined,
-    window: number | null | undefined,
-  ): ContextOccupancy | undefined {
-    if (window === undefined || window === null || window === 0) return undefined;
-    if (occupancy === undefined || occupancy === null) return undefined;
-    if (occupancy > window) return undefined;
-    return { usedTokens: occupancy, windowTokens: window, fraction: occupancy / window };
+    return occupancyFrom(transcripts[agentId] ?? [], latestCompactedContexts.get(agentId));
   }
 
   function toggleCollapsed(agentId: AgentId): void {
@@ -1574,7 +1540,7 @@
                     {/if}
                     {#if sessionInfo?.session_file}
                       <DropdownMenuItem
-                        onSelect={() => openSessionFile(agent)}
+                        onSelect={() => void openSessionFile(agent)}
                         class="gap-2"
                         data-testid="agent-action-open-session"
                       >
@@ -1584,7 +1550,11 @@
                           class="text-muted shrink-0"
                           aria-hidden="true"
                         />
-                        Open session file
+                        <!-- Codex compresses a file nobody has used for a week; the
+                             editor then gets a decompressed copy, which won't update. -->
+                        {sessionInfo.session_file_compressed
+                          ? "Open copy of session file"
+                          : "Open session file"}
                       </DropdownMenuItem>
                     {/if}
                     {#if canConfigureSelection(agent)}
@@ -1935,6 +1905,11 @@
           {#if forkError?.agentId === agent.id}
             <div class="text-status-failed mt-1 text-xs" data-testid="agent-fork-error">
               Couldn't fork {agent.name}: {forkError.message}
+            </div>
+          {/if}
+          {#if openSessionError?.agentId === agent.id}
+            <div class="text-status-failed mt-1 text-xs" data-testid="agent-open-session-error">
+              Couldn't open session file: {openSessionError.message}
             </div>
           {/if}
           {#if removeError?.agentId === agent.id}

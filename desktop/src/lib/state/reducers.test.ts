@@ -1698,6 +1698,79 @@ describe("runtimeReducer", () => {
     expect(r.in_flight_turn_id).toBeUndefined();
   });
 
+  it("task events track the in-flight turn's open tasks, most recently active last", () => {
+    let r = runtimeReducer(fresh(), turnStart(TURN_1));
+    r = { ...r, quiet_since: "2026-05-16T00:01:00Z" };
+    r = runtimeReducer(r, {
+      type: "task_started",
+      turn_id: TURN_1,
+      task_id: "a1",
+      description: "Review the parser",
+    });
+    expect(r.quiet_since).toBeUndefined();
+    r = runtimeReducer(r, {
+      type: "task_started",
+      turn_id: TURN_1,
+      task_id: "b2",
+      description: "Run the tests",
+    });
+    r = runtimeReducer(r, {
+      type: "task_progress",
+      turn_id: TURN_1,
+      task_id: "a1",
+      activity: "Reading parser.rs",
+    });
+    expect(r.open_tasks).toEqual([
+      { task_id: "b2", description: "Run the tests" },
+      { task_id: "a1", description: "Review the parser", activity: "Reading parser.rs" },
+    ]);
+    // Progress for a task that never started opens nothing.
+    r = runtimeReducer(r, {
+      type: "task_progress",
+      turn_id: TURN_1,
+      task_id: "zz",
+      activity: "stray",
+    });
+    r = runtimeReducer(r, { type: "task_ended", turn_id: TURN_1, task_id: "a1" });
+    expect(r.open_tasks).toEqual([{ task_id: "b2", description: "Run the tests" }]);
+  });
+
+  it("re-reading the agent's history mid-turn keeps the turn's open tasks", () => {
+    let r = runtimeReducer(fresh(), turnStart(TURN_1));
+    r = runtimeReducer(r, {
+      type: "task_started",
+      turn_id: TURN_1,
+      task_id: "a1",
+      description: "Review the parser",
+      tool_use_id: "toolu_A",
+    });
+    const before = r.open_tasks;
+    r = runtimeReducer(r, { type: "hydrate", agent_id: AGENT_A, turns: [] });
+    expect(r.open_tasks).toEqual(before);
+    expect(r.open_tasks).toEqual([
+      { task_id: "a1", description: "Review the parser", tool_use_id: "toolu_A" },
+    ]);
+  });
+
+  it("a turn's end clears its open tasks, and another turn's task events are ignored", () => {
+    let r = runtimeReducer(fresh(), turnStart(TURN_1));
+    r = runtimeReducer(r, {
+      type: "task_started",
+      turn_id: "some-other-turn",
+      task_id: "x",
+      description: "stale",
+    });
+    expect(r.open_tasks).toBeUndefined();
+    r = runtimeReducer(r, {
+      type: "task_started",
+      turn_id: TURN_1,
+      task_id: "a1",
+      description: "Sleep for 45 seconds",
+    });
+    r = runtimeReducer(r, turnEndCompleted(TURN_1));
+    expect(r.open_tasks).toBeUndefined();
+  });
+
   it("agent_idle after failed turn preserves last_error (sendability ≠ health)", () => {
     let r = runtimeReducer(fresh(), turnStart(TURN_1));
     r = runtimeReducer(r, turnEndFailed(TURN_1, "boom"));
@@ -1744,6 +1817,77 @@ describe("runtimeReducer", () => {
     expect(r.run_status).toBe("idle");
     expect(r.pending_sends).toBeUndefined();
     expect(r.last_error).toEqual({ message: "journal write failed", kind: "adapter_failure" });
+  });
+
+  it("message_failed for the front entry while another is queued stays starting", () => {
+    // The remaining entry is next to start, so the agent is not idle.
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_sends: [
+        { send_id: "send-1", user_turn_id: "user-1", message_id: MESSAGE_1 },
+        { send_id: "send-2", user_turn_id: "user-2", message_id: MESSAGE_2 },
+      ],
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      send_id: "send-1",
+      agent_id: AGENT_A,
+      error: "journal write failed",
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("starting");
+    expect(r.pending_sends).toEqual([
+      { send_id: "send-2", user_turn_id: "user-2", message_id: MESSAGE_2 },
+    ]);
+    expect(r.last_error).toEqual({ message: "journal write failed", kind: "adapter_failure" });
+  });
+
+  it("message_failed for a queued entry behind the starting one stays starting", () => {
+    // The front entry has no receipt yet (its IPC is in flight); the one
+    // behind it, named by the event, fails.
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_sends: [
+        { send_id: "send-1", user_turn_id: "user-1" },
+        { send_id: "send-2", user_turn_id: "user-2", message_id: MESSAGE_2 },
+      ],
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_failed",
+      message_id: MESSAGE_2,
+      send_id: null,
+      agent_id: AGENT_A,
+      error: "agent is shutting down",
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("starting");
+    expect(r.pending_sends).toEqual([{ send_id: "send-1", user_turn_id: "user-1" }]);
+  });
+
+  it("message_cancelled for the front entry while another is queued stays starting", () => {
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_sends: [
+        { send_id: "send-1", user_turn_id: "user-1", message_id: MESSAGE_1 },
+        { send_id: "send-2", user_turn_id: "user-2", message_id: MESSAGE_2 },
+      ],
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_cancelled",
+      message_id: MESSAGE_1,
+      send_id: "send-1",
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("starting");
+    expect(r.pending_sends).toEqual([
+      { send_id: "send-2", user_turn_id: "user-2", message_id: MESSAGE_2 },
+    ]);
+    expect(r.last_error).toBeUndefined();
   });
 
   it("message_failed for a different message_id is a no-op (correlation guard)", () => {
@@ -2262,6 +2406,26 @@ describe("workflow user_message events", () => {
     // Re-delivery (same send_id + agent) does not append a duplicate.
     const again = transcriptReducer(turns, userMessage("do the thing"), AGENT_A, RECEIVED_AT);
     expect(again).toHaveLength(1);
+  });
+
+  it("carries the send's attachments onto the user turn, and none when there are none", () => {
+    const attachments = [
+      {
+        label: "text-1",
+        kind: "text" as const,
+        path: "/store/projects/p/attachments/0__run.log",
+        original_name: "run.log",
+      },
+    ];
+    const withFiles = transcriptReducer(
+      [],
+      { ...userMessage("read this"), attachments } as NormalizedEvent,
+      AGENT_A,
+      RECEIVED_AT,
+    );
+    expect(withFiles[0]).toMatchObject({ role: "user", attachments });
+    const without = transcriptReducer([], userMessage("read this"), AGENT_A, RECEIVED_AT);
+    expect(without[0]).not.toHaveProperty("attachments");
   });
 
   it("does not double a single-recipient send present both live and in the journal overlay", () => {

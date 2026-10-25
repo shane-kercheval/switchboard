@@ -1198,17 +1198,20 @@ fn select_context_window(
     })
 }
 
-/// Parse a `system` envelope. `init` carries session metadata; **every other
-/// subtype maps to `Liveness`** — a denylist, deliberately. The non-init
-/// vocabulary is vendor-controlled and has already drifted across CLI
-/// versions (`task_started`/`task_progress`/`task_notification` documented at
-/// 2.1.170; 2.1.198 added `task_updated` and `thinking_tokens`, plus
+/// Parse a `system` envelope. `init` carries session metadata, and the
+/// task lifecycle (`task_started`, `task_progress`,
+/// `task_notification`) becomes its typed events; **every other subtype maps
+/// to `Liveness`** — a denylist, deliberately. The non-init vocabulary is
+/// vendor-controlled and has already drifted across CLI versions
+/// (`task_started`/`task_progress`/`task_notification` documented at 2.1.170;
+/// 2.1.198 added `task_updated` and `thinking_tokens`, plus
 /// `status`/`hook_*`), so a fixed allowlist of names silently stops re-arming
 /// the heartbeat on the next rename — flagging a healthy multi-minute
 /// background-agent wait as "gone quiet." An unknown system event is still
 /// evidence the process is alive; `Liveness` renders nothing, so
 /// misclassifying a future content-bearing subtype degrades to exactly the
-/// old silent skip, never worse.
+/// old silent skip, never worse. The task events are signs of life too, so a
+/// renamed task subtype degrades to `Liveness`, not silence.
 fn parse_system_event(
     obj: &Value,
     turn_id: TurnId,
@@ -1225,6 +1228,9 @@ fn parse_system_event(
             Some("compact_boundary") => record_compaction_occupancy(obj, state),
             _ => {}
         }
+    }
+    if let Some(event) = task_event(subtype, obj, turn_id) {
+        return ParseOutcome::Event(event);
     }
     if subtype != Some("init") {
         return ParseOutcome::Event(AdapterEvent::Liveness { turn_id });
@@ -1256,6 +1262,38 @@ fn parse_system_event(
         // on-disk analog in the session file (class C) — so the dispatcher
         // caches it for restart continuity.
         source: SessionMetaSource::StreamOnly,
+    })
+}
+
+/// Claude's task lifecycle as typed events (G20). `task_progress`'s
+/// `description` is the task's current activity, not its name, and
+/// `task_started`'s `tool_use_id` is the call that started the task. A record
+/// with no task id stays plain `Liveness`, like any other non-init subtype.
+fn task_event(subtype: Option<&str>, obj: &Value, turn_id: TurnId) -> Option<AdapterEvent> {
+    let task_id = obj.get("task_id").and_then(Value::as_str)?.to_owned();
+    let description = || {
+        obj.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    Some(match subtype? {
+        "task_started" => AdapterEvent::TaskStarted {
+            turn_id,
+            task_id,
+            description: description(),
+            tool_use_id: obj
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        },
+        "task_progress" => AdapterEvent::TaskProgress {
+            turn_id,
+            task_id,
+            activity: description(),
+        },
+        "task_notification" => AdapterEvent::TaskEnded { turn_id, task_id },
+        _ => return None,
     })
 }
 
@@ -2776,17 +2814,20 @@ mod tests {
 
     #[test]
     fn system_non_init_subtypes_yield_liveness() {
-        // Denylist posture: `init` is the only system subtype with a semantic
-        // event; everything else — including subtypes that don't exist yet —
-        // is proof the process is alive. The task-lifecycle vocabulary has
+        // Denylist posture: `init` and the tracked task lifecycle are the only
+        // system subtypes with a semantic event; everything else — including
+        // subtypes that don't exist yet — is proof the process is alive. The
+        // task-lifecycle vocabulary has
         // already drifted across CLI versions (`task_updated` appeared at
         // 2.1.198), so an allowlist would silently stop re-arming the
         // heartbeat on the next rename.
         for line in [
             r#"{"type":"system","subtype":"compact_boundary","data":{}}"#,
-            r#"{"type":"system","subtype":"task_started","task_id":"a1","description":"work"}"#,
             r#"{"type":"system","subtype":"task_updated","task_id":"a1"}"#,
-            r#"{"type":"system","subtype":"task_notification","task_id":"a1","status":"completed"}"#,
+            // A task record without its id cannot be tracked, so it is only
+            // proof of life.
+            r#"{"type":"system","subtype":"task_started","description":"work"}"#,
+            r#"{"type":"system","subtype":"task_notification","status":"completed"}"#,
             r#"{"type":"system","subtype":"totally_new_future_subtype"}"#,
         ] {
             let turn = tid();
@@ -2795,6 +2836,82 @@ mod tests {
                     assert_eq!(turn_id, turn);
                 }
                 other => panic!("expected Liveness for {line}, got {other:?}"),
+            }
+        }
+    }
+
+    // Records below are copied from
+    // docs/research/archive/claude-background-agent-abandoned-task-stream-probe.jsonl
+    // (Claude 2.1.198).
+
+    #[test]
+    fn task_started_yields_a_task_with_its_description() {
+        let turn = tid();
+        let sub_agent = r#"{"type": "system", "subtype": "task_started", "task_id": "a7cb77a05059e4590", "tool_use_id": "toolu_01B1AN52bDdxfyrLDXQrrXJx", "description": "Sleep 45 then reply ok", "subagent_type": "general-purpose", "task_type": "local_agent", "prompt": "Run the shell command 'sleep 45' using Bash, then reply with the single word ok.", "uuid": "f46dcec8-0bf9-4a2c-b3b1-2d735fc66041", "session_id": "318648f6-7e6a-4ad0-a50f-2a0566a32a38"}"#;
+        match parse_one(sub_agent, turn) {
+            ParseOutcome::Event(AdapterEvent::TaskStarted {
+                turn_id,
+                task_id,
+                description,
+                tool_use_id,
+            }) => {
+                assert_eq!(turn_id, turn);
+                assert_eq!(task_id, "a7cb77a05059e4590");
+                assert_eq!(description, "Sleep 45 then reply ok");
+                assert_eq!(
+                    tool_use_id.as_deref(),
+                    Some("toolu_01B1AN52bDdxfyrLDXQrrXJx"),
+                    "the Agent call that started it"
+                );
+            }
+            other => panic!("expected TaskStarted, got {other:?}"),
+        }
+        // A background command is a task too, with no sub-agent fields.
+        let command = r#"{"type": "system", "subtype": "task_started", "task_id": "bzggpsjub", "tool_use_id": "toolu_01755n1P4CQTutKzmDT4pj49", "description": "Sleep for 45 seconds", "task_type": "local_bash", "uuid": "7827ae64-8d60-453a-a6d5-58a2c2700a74", "session_id": "318648f6-7e6a-4ad0-a50f-2a0566a32a38"}"#;
+        match parse_one(command, turn) {
+            ParseOutcome::Event(AdapterEvent::TaskStarted {
+                task_id,
+                description,
+                ..
+            }) => {
+                assert_eq!(task_id, "bzggpsjub");
+                assert_eq!(description, "Sleep for 45 seconds");
+            }
+            other => panic!("expected TaskStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_progress_yields_the_tasks_current_activity() {
+        let turn = tid();
+        let line = r#"{"type": "system", "subtype": "task_progress", "task_id": "a7cb77a05059e4590", "tool_use_id": "toolu_01B1AN52bDdxfyrLDXQrrXJx", "description": "Running Sleep for 45 seconds", "subagent_type": "general-purpose", "usage": {"total_tokens": 15321, "tool_uses": 1, "duration_ms": 2184}, "last_tool_name": "Bash", "uuid": "2320ba31-6d93-4b79-b7bf-c8e53dd0491e", "session_id": "318648f6-7e6a-4ad0-a50f-2a0566a32a38"}"#;
+        match parse_one(line, turn) {
+            ParseOutcome::Event(AdapterEvent::TaskProgress {
+                turn_id,
+                task_id,
+                activity,
+            }) => {
+                assert_eq!(turn_id, turn);
+                assert_eq!(task_id, "a7cb77a05059e4590");
+                assert_eq!(activity, "Running Sleep for 45 seconds");
+            }
+            other => panic!("expected TaskProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_notification_ends_the_task_whatever_its_status() {
+        let completed = r#"{"type": "system", "subtype": "task_notification", "task_id": "a7cb77a05059e4590", "tool_use_id": "toolu_01B1AN52bDdxfyrLDXQrrXJx", "status": "completed", "output_file": "/private/tmp/claude-501/-private-tmp-sb-probe-nowait/318648f6-7e6a-4ad0-a50f-2a0566a32a38/tasks/a7cb77a05059e4590.output", "summary": "ok", "usage": {"total_tokens": 18779, "tool_uses": 2, "duration_ms": 7792}, "uuid": "b8ae771d-15c6-4495-8a79-cbb211f53ad3", "session_id": "318648f6-7e6a-4ad0-a50f-2a0566a32a38"}"#;
+        // Torn down at the process's exit.
+        let stopped = r#"{"type": "system", "subtype": "task_notification", "task_id": "bzggpsjub", "tool_use_id": "toolu_01755n1P4CQTutKzmDT4pj49", "status": "stopped", "output_file": "/private/tmp/claude-501/-private-tmp-sb-probe-nowait/318648f6-7e6a-4ad0-a50f-2a0566a32a38/tasks/bzggpsjub.output", "summary": "Sleep for 45 seconds", "uuid": "1e4537f2-5731-4e87-8825-b2aa1cc03fcf", "session_id": "318648f6-7e6a-4ad0-a50f-2a0566a32a38"}"#;
+        for (line, expected) in [(completed, "a7cb77a05059e4590"), (stopped, "bzggpsjub")] {
+            let turn = tid();
+            match parse_one(line, turn) {
+                ParseOutcome::Event(AdapterEvent::TaskEnded { turn_id, task_id }) => {
+                    assert_eq!(turn_id, turn);
+                    assert_eq!(task_id, expected);
+                }
+                other => panic!("expected TaskEnded for {line}, got {other:?}"),
             }
         }
     }

@@ -13,10 +13,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use switchboard_core::name::canonicalize_for_uniqueness;
-use switchboard_core::{AgentId, AgentRecord, Project, ProjectId};
+use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId};
 use switchboard_dispatcher::{DispatchContextFactory, Dispatcher, EventEmitter};
+use switchboard_harness::MessageId;
 use switchboard_prompts::{
     PromptArgument, PromptId, PromptResolutionSnapshot, PromptService, ProviderStatus,
 };
@@ -31,8 +32,12 @@ use uuid::Uuid;
 use crate::commands::adapter_for;
 use crate::dispatch_context::ProjectDispatchContextFactory;
 use crate::error::AppError;
-use crate::state::{ActiveRun, AppState, RunSnapshot, lock};
-use crate::workflow::{DispatchFactoryProvider, ProgressSink, WorkflowProgress, WorkflowRun};
+use crate::ops::ledger::SendLedger;
+use crate::state::{ActiveRun, AppState, RunSnapshot, WorkflowSendOrigin, lock};
+use crate::workflow::{
+    DispatchEnd, DispatchFactoryProvider, ProgressSink, ResolvedRecipient, StepResolution,
+    WorkflowProgress, WorkflowRun,
+};
 
 /// The project-scoped progress channel name. The frontend subscribes once per
 /// loaded project (not per run); the payload's `run_id` disambiguates a project's
@@ -62,6 +67,19 @@ pub struct ProjectDispatchFactoryProvider {
     roster: Vec<AgentRecord>,
     agents_by_id: Arc<Mutex<HashMap<AgentId, AgentRecord>>>,
     home_dir: PathBuf,
+    /// Agents the window reported it cannot listen to. A step resolving to
+    /// one is refused at dispatch — the authoritative point, because a step
+    /// may name its agent through any template expression (`{{ worker |
+    /// lower }}`), which only the interpreter resolves.
+    unheard: Vec<AgentId>,
+    /// Where each send step is recorded before it dispatches, so `wait_send`,
+    /// `read_reply`, and `cancel_send` follow a workflow's sends as they
+    /// do the agent tools' own.
+    ledger: Arc<SendLedger>,
+    /// Who started the run, recorded per send as it starts: the cancel tools
+    /// refuse a reply in a run the user started from the window.
+    send_origins: Arc<Mutex<HashMap<SendId, WorkflowSendOrigin>>>,
+    through_agent_access: bool,
 }
 
 impl ProjectDispatchFactoryProvider {
@@ -121,7 +139,26 @@ impl ProjectDispatchFactoryProvider {
             roster: roster.to_vec(),
             agents_by_id: Arc::clone(&state.agents_by_id),
             home_dir: home_dir.to_path_buf(),
+            unheard: Vec::new(),
+            ledger: Arc::clone(&state.ledger),
+            send_origins: Arc::clone(&state.workflow_send_origins),
+            through_agent_access: false,
         }
+    }
+
+    /// Refuse dispatch to these agents (see [`Self::unheard`]).
+    #[must_use]
+    pub fn with_unheard(mut self, unheard: Vec<AgentId>) -> Self {
+        self.unheard = unheard;
+        self
+    }
+
+    /// The run was started through the agent tools, so an orchestrator may
+    /// cancel its replies.
+    #[must_use]
+    pub fn with_agent_access(mut self, through_agent_access: bool) -> Self {
+        self.through_agent_access = through_agent_access;
+        self
     }
 }
 
@@ -141,6 +178,13 @@ impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
                 // Not a bound agent of this run; `factory_for` reports it.
                 return Ok(());
             };
+            if self.unheard.contains(&agent_id) {
+                return Err(format!(
+                    "the desktop window cannot listen to {}'s events, so this step was not \
+                     sent — it would have run where nobody could see it",
+                    agent.name
+                ));
+            }
             // One shared policy, not a second copy — the two used to be written
             // independently and their refusal text had already drifted apart.
             match crate::commands::busy_fork_source(
@@ -161,21 +205,121 @@ impl DispatchFactoryProvider for ProjectDispatchFactoryProvider {
     fn factory_for(&self, agent_id: AgentId) -> Option<Arc<dyn DispatchContextFactory>> {
         self.factories.get(&agent_id).cloned()
     }
+
+    /// Record the send's owner, then its ledger entry, every recipient not yet
+    /// offered: the owner first, so a cancel that finds the entry also finds
+    /// whose run it is.
+    fn send_starting(&self, send_id: SendId, recipients: &[AgentId]) {
+        lock(&self.send_origins).insert(
+            send_id,
+            WorkflowSendOrigin {
+                project_id: self.project.id,
+                through_agent_access: self.through_agent_access,
+            },
+        );
+        self.ledger.register_send(
+            send_id,
+            self.project.id,
+            recipients,
+            CancellationToken::new(),
+        );
+    }
+
+    /// The ledger mints the id and marks the recipient accepted before the
+    /// dispatcher sees it, so the turn's first event finds the entry. Once
+    /// `cancel_send` has stopped the send, or any one of its replies (which
+    /// ends the run), nobody else is offered it; [`Self::send_finished`] marks
+    /// those left cancelled. An entry the ledger no longer holds is no reason to
+    /// stop the step: the message goes out under a fresh id, unfollowed.
+    fn admit(&self, send_id: SendId, agent_id: AgentId) -> Option<MessageId> {
+        if self.ledger.any_cancel_requested(send_id) {
+            return None;
+        }
+        Some(
+            self.ledger
+                .mark_accepted(send_id, agent_id)
+                .unwrap_or_else(Uuid::now_v7),
+        )
+    }
+
+    /// A busy agent is recorded as refused.
+    fn offered(&self, send_id: SendId, agent_id: AgentId, accepted: bool) {
+        if !accepted {
+            self.ledger.mark_rejected(
+                send_id,
+                agent_id,
+                crate::ops::error_code::AGENT_BUSY,
+                "the agent was busy: workflow steps fail fast on contention",
+            );
+        }
+    }
+
+    /// A cancel of the send, or of any of its replies, as the ledger recorded
+    /// it from `cancel_send`.
+    fn send_cancelled(&self, send_id: SendId) -> bool {
+        self.ledger.any_cancel_requested(send_id)
+    }
+
+    /// Recipients never offered the message, by the engine's one decision
+    /// about why the step stopped: refused with the reason when it could not
+    /// get the message ready; cancelled when a cancel stopped it; otherwise
+    /// `not_dispatched`, since an earlier recipient was busy.
+    fn send_finished(&self, send_id: SendId, end: DispatchEnd<'_>) {
+        match end {
+            DispatchEnd::NotReady(reason) => self.ledger.reject_undispatched(
+                send_id,
+                crate::ops::error_code::WORKFLOW_STEP_FAILED,
+                reason,
+            ),
+            DispatchEnd::Cancelled => self.ledger.cancel_undispatched(send_id),
+            DispatchEnd::Ran => {}
+        }
+        self.ledger.settle(send_id);
+    }
 }
 
 /// The `workflow:<project-id>` event payload. Carries orchestration state only —
 /// **no agent output text** (§3); the turns stream on `agent:<id>` and render in
 /// the transcript. `step` is the zero-based index of the step in progress.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowProgressPayload {
     pub run_id: String,
     pub workflow: String,
     pub step: usize,
     pub total: usize,
-    /// `"running"` while live; `"complete"` / `"cancelled"` / `"failed"` at terminal.
-    pub status: &'static str,
+    /// `running` while live; a terminal status at the end. Typed so the
+    /// in-process reader of this channel (the send ledger) and the writer
+    /// share one vocabulary.
+    pub status: WorkflowProgressStatus,
     /// The failure reason on a failed terminal, else `None`.
     pub reason: Option<String>,
+    /// The step's label, from the run's step info.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The step's agents as the engine resolved them, once it has, so a
+    /// reader knows whose reply to read without the workflow's definition.
+    #[serde(default)]
+    pub recipients: Vec<ResolvedRecipient>,
+    /// The send a send step made, once it has dispatched.
+    #[serde(default)]
+    pub send_id: Option<uuid::Uuid>,
+}
+
+/// A step's label from the run's step info; `None` for an unknown step.
+#[must_use]
+pub fn step_label(steps: &[WorkflowStepInfo], step: usize) -> Option<String> {
+    steps.get(step).map(|info| info.label.clone())
+}
+
+/// The run's state as the progress channel carries it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkflowProgressStatus {
+    Running,
+    Complete,
+    Cancelled,
+    Failed,
 }
 
 /// The production [`ProgressSink`]: mirrors the interpreter's live progress onto
@@ -217,12 +361,28 @@ impl ProgressSink for ChannelProgressSink {
         // events; the entry is still present at terminal (the owning task removes
         // it only after `execute()` returns). Tail-leaf lock, no await held.
         let (step, status, reason) = match event {
-            WorkflowProgress::Started { .. } => (0, "running", None),
+            WorkflowProgress::Started { .. } => (0, WorkflowProgressStatus::Running, None),
             WorkflowProgress::StepStarted { step_index } => {
                 if let Some(run) = lock(&self.workflow_runs).get_mut(&self.run_id) {
                     run.snapshot.current_step = step_index;
                 }
-                (step_index, "running", None)
+                (step_index, WorkflowProgressStatus::Running, None)
+            }
+            WorkflowProgress::StepResolved {
+                step_index,
+                recipients,
+                send_id,
+            } => {
+                if let Some(run) = lock(&self.workflow_runs).get_mut(&self.run_id) {
+                    run.resolved.insert(
+                        step_index,
+                        StepResolution {
+                            recipients,
+                            send_id,
+                        },
+                    );
+                }
+                (step_index, WorkflowProgressStatus::Running, None)
             }
             // Report the actual terminal step so the live indicator matches what
             // `list_workflow_runs` reports after a refresh: the failing step on a
@@ -242,6 +402,16 @@ impl ProgressSink for ChannelProgressSink {
                 (step, terminal_status_str(status), reason)
             }
         };
+        let (label, resolution) = {
+            let runs = lock(&self.workflow_runs);
+            runs.get(&self.run_id).map_or((None, None), |run| {
+                (
+                    step_label(&run.steps, step),
+                    run.resolved.get(&step).cloned(),
+                )
+            })
+        };
+        let resolution = resolution.unwrap_or_default();
         let payload = WorkflowProgressPayload {
             run_id: self.run_id.to_string(),
             workflow: self.workflow.clone(),
@@ -249,6 +419,9 @@ impl ProgressSink for ChannelProgressSink {
             total: self.total_steps,
             status,
             reason,
+            label,
+            recipients: resolution.recipients,
+            send_id: resolution.send_id,
         };
         self.emitter.emit(
             &progress_channel(self.project_id),
@@ -257,13 +430,13 @@ impl ProgressSink for ChannelProgressSink {
     }
 }
 
-fn terminal_status_str(status: TerminalStatus) -> &'static str {
+fn terminal_status_str(status: TerminalStatus) -> WorkflowProgressStatus {
     match status {
-        TerminalStatus::Complete => "complete",
-        TerminalStatus::Cancelled => "cancelled",
-        // `Failed` and the `#[non_exhaustive]` catch-all both degrade to "failed"
+        TerminalStatus::Complete => WorkflowProgressStatus::Complete,
+        TerminalStatus::Cancelled => WorkflowProgressStatus::Cancelled,
+        // `Failed` and the `#[non_exhaustive]` catch-all both degrade to failed
         // rather than failing the build on a future variant.
-        _ => "failed",
+        _ => WorkflowProgressStatus::Failed,
     }
 }
 
@@ -387,14 +560,14 @@ fn builtin_listing(workflow: &Workflow) -> WorkflowListing {
 
 // --- list --------------------------------------------------------------------
 
-/// All workflows: the read-only built-in library (governed by the `show_builtins`
+/// All workflows: the read-only built-in library (governed by the `show_builtin_workflows`
 /// preference) merged with the user-global workflows folder's own `*.{yaml,yml}`
 /// files. User-global — the same set is available from every project. A malformed
 /// file surfaces its parse error in place rather than failing the whole list;
 /// built-ins, being baked-in, never produce a parse error.
 pub fn list_workflows_impl(state: &AppState) -> Vec<WorkflowListing> {
     let mut out = Vec::new();
-    if lock(&state.preferences).show_builtins {
+    if lock(&state.preferences).show_builtin_workflows {
         out.extend(builtin_workflows().iter().map(builtin_listing));
     }
     if let Some(dir) = state.workflows_dir.as_deref() {
@@ -492,15 +665,26 @@ fn roster_for_project(state: &AppState, project_id: ProjectId) -> Vec<AgentRecor
 fn capture_run_snapshot(
     state: &AppState,
     project_id: ProjectId,
-) -> Result<(Project, u64, Vec<AgentRecord>), AppError> {
+) -> Result<RunSnapshotCapture, AppError> {
     let _write = lock(&state.registry_write);
     let project = lock(&state.projects)
         .get(&project_id)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(project_id))?;
     let generation = crate::commands::project_generation(state, project_id);
-    Ok((project, generation, roster_for_project(state, project_id)))
+    let deletions = lock(&state.agent_removals).deletions(project_id);
+    Ok((
+        project,
+        generation,
+        roster_for_project(state, project_id),
+        deletions,
+    ))
 }
+
+/// A run's view of its project from one instant under `registry_write`: the
+/// project, its generation, its roster, and the count of agents deleted from
+/// it as of that roster (registration refuses the run if the count has moved).
+type RunSnapshotCapture = (Project, u64, Vec<AgentRecord>, u64);
 
 /// The user-global workflows directory, or a clear error if no config dir was
 /// resolved (an exotic host with no home).
@@ -513,10 +697,33 @@ fn workflows_dir(state: &AppState) -> Result<&Path, AppError> {
 
 /// Re-read and parse the named workflow snapshot: a built-in from the library, or
 /// a user-global directory file (re-read once at invoke, never per step).
-fn snapshot_workflow(state: &AppState, name: &str, is_builtin: bool) -> Result<Workflow, AppError> {
+pub(crate) fn snapshot_workflow(
+    state: &AppState,
+    name: &str,
+    is_builtin: bool,
+) -> Result<Workflow, AppError> {
+    // A name, never a path: joined to the workflows folder below, "../x" or
+    // an absolute path would read any YAML file on the Mac as a workflow.
+    let mut parts = Path::new(name).components();
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) {
+        return Err(AppError::InvalidArgument(format!(
+            "{name:?} is not a workflow name: list_workflows shows the names"
+        )));
+    }
     if is_builtin {
-        return builtin_workflow(name).ok_or_else(|| AppError::WorkflowNotFound {
-            name: name.to_owned(),
+        return builtin_workflow(name).ok_or_else(|| {
+            if user_workflow_exists(state, name) {
+                AppError::InvalidArgument(format!(
+                    "{name:?} is not a built-in workflow but one of the user's: pass is_builtin false"
+                ))
+            } else {
+                AppError::WorkflowNotFound {
+                    name: name.to_owned(),
+                }
+            }
         });
     }
     let dir = workflows_dir(state)?;
@@ -531,8 +738,22 @@ fn snapshot_workflow(state: &AppState, name: &str, is_builtin: bool) -> Result<W
             return Ok(parse_workflow(name, &content)?);
         }
     }
+    if builtin_workflow(name).is_some() {
+        return Err(AppError::InvalidArgument(format!(
+            "{name:?} is a built-in workflow: pass is_builtin true"
+        )));
+    }
     Err(AppError::WorkflowNotFound {
         name: name.to_owned(),
+    })
+}
+
+/// Whether the user's workflows folder holds `name`.
+fn user_workflow_exists(state: &AppState, name: &str) -> bool {
+    workflows_dir(state).is_ok_and(|dir| {
+        ["yaml", "yml"]
+            .iter()
+            .any(|ext| dir.join(format!("{name}.{ext}")).exists())
     })
 }
 
@@ -1201,16 +1422,29 @@ pub fn validate_workflow_invocation_impl(
 ///
 /// Enforces one run per project **atomically** under the registry lock: the
 /// existing-run check and the insert happen under one acquisition, so two
-/// concurrent invokes cannot both pass.
+/// concurrent invokes cannot both pass. Refuses, under the same acquisition, a
+/// project where an agent is being removed over agent access, or where an
+/// agent was deleted since the run read its roster (`deletions_seen`), so a
+/// run never starts bound to an agent that is going or gone (see
+/// [`AppState::agent_removals`]).
 fn register_live_run(
     state: &AppState,
     project_id: ProjectId,
+    deletions_seen: u64,
     run_id: uuid::Uuid,
     run: ActiveRun,
 ) -> Result<(), AppError> {
     let mut runs = lock(&state.workflow_runs);
     if runs.values().any(|r| r.project_id == project_id) {
         return Err(AppError::WorkflowAlreadyRunning { project_id });
+    }
+    {
+        let removals = lock(&state.agent_removals);
+        if removals.in_progress.contains_key(&project_id)
+            || removals.deletions(project_id) != deletions_seen
+        {
+            return Err(AppError::WorkflowBlockedByAgentRemoval { project_id });
+        }
     }
     runs.insert(run_id, run);
     Ok(())
@@ -1227,13 +1461,60 @@ pub fn invoke_workflow_impl(
     inputs: &BTreeMap<String, InputValue>,
     home_dir: &Path,
 ) -> Result<Uuid, AppError> {
+    invoke_workflow_with(
+        state,
+        project_id,
+        name,
+        is_builtin,
+        inputs,
+        home_dir,
+        &InvokeOptions::default(),
+    )
+}
+
+/// What a caller that is not the window asks of an invocation beyond its
+/// inputs.
+#[derive(Default)]
+pub struct InvokeOptions {
+    /// Agent-typed inputs carry agent **ids** rather than names. They are
+    /// converted to names against the very roster the run binds with — never
+    /// an earlier read — so a rename and name reuse between two reads cannot
+    /// run the wrong agent.
+    pub agent_inputs_are_ids: bool,
+    /// The agents the window reported it is listening to. A run whose steps
+    /// resolve to any other agent is refused rather than running invisibly,
+    /// the same rule a send applies per recipient. Checked against the roster
+    /// this run binds with, which can be newer than the window's.
+    pub hearing: crate::ops::desktop_sync::Hearing,
+    /// Started through the agent tools: recorded on the live run, which an
+    /// orchestrator may then cancel.
+    pub through_agent_access: bool,
+}
+
+/// [`invoke_workflow_impl`] with [`InvokeOptions`].
+pub fn invoke_workflow_with(
+    state: &AppState,
+    project_id: ProjectId,
+    name: &str,
+    is_builtin: bool,
+    inputs: &BTreeMap<String, InputValue>,
+    home_dir: &Path,
+    options: &InvokeOptions,
+) -> Result<Uuid, AppError> {
     let workflow = snapshot_workflow(state, name, is_builtin)?;
     if workflow.gated_step_kind().is_some() {
         return Err(AppError::WorkflowStepUnsupported);
     }
 
-    let (project, generation, roster) = capture_run_snapshot(state, project_id)?;
+    let (project, generation, roster, deletions) = capture_run_snapshot(state, project_id)?;
     let names: Vec<String> = roster.iter().map(|r| r.name.clone()).collect();
+    let converted;
+    let inputs = if options.agent_inputs_are_ids {
+        converted = agent_ids_to_names(&workflow, inputs, &roster, project_id)?;
+        &converted
+    } else {
+        inputs
+    };
 
     // Partition the flat payload: declared inputs go through `validate_invocation`
     // + `bind_invocation`; derived prompt args through the classification +
@@ -1263,10 +1544,13 @@ pub fn invoke_workflow_impl(
         .iter()
         .map(|r| (canonicalize_for_uniqueness(&r.name), r.id))
         .collect();
+    let unheard = options.hearing.unheard(roster.iter().map(|r| r.id));
 
-    let provider = Arc::new(ProjectDispatchFactoryProvider::new(
-        state, &project, &roster, home_dir, generation,
-    ));
+    let provider = Arc::new(
+        ProjectDispatchFactoryProvider::new(state, &project, &roster, home_dir, generation)
+            .with_unheard(unheard.clone())
+            .with_agent_access(options.through_agent_access),
+    );
 
     let run_id = Uuid::now_v7();
     let run_path = project.run_path(run_id);
@@ -1278,6 +1562,7 @@ pub fn invoke_workflow_impl(
 
     // Live-view step snapshot with recipients resolved to the bound agent names.
     let resolved_steps = resolve_step_display(&step_display(&workflow), &bound);
+    refuse_unheard_recipients(&resolved_steps, &roster, &unheard)?;
 
     let sink = Arc::new(ChannelProgressSink::new(
         run_id,
@@ -1300,6 +1585,7 @@ pub fn invoke_workflow_impl(
     register_live_run(
         state,
         project_id,
+        deletions,
         run_id,
         ActiveRun {
             cancel: cancel.clone(),
@@ -1310,6 +1596,8 @@ pub fn invoke_workflow_impl(
                 current_step: 0,
             },
             steps: resolved_steps,
+            resolved: BTreeMap::new(),
+            through_agent_access: options.through_agent_access,
             done: Arc::clone(&done),
         },
     )?;
@@ -1356,6 +1644,67 @@ pub fn invoke_workflow_impl(
     });
 
     Ok(run_id)
+}
+
+/// Refuse a run whose steps resolve to an agent the window cannot listen to —
+/// slots and literal names alike, since a step may name an agent directly.
+fn refuse_unheard_recipients(
+    resolved_steps: &[WorkflowStepInfo],
+    roster: &[AgentRecord],
+    unsubscribed: &[AgentId],
+) -> Result<(), AppError> {
+    if unsubscribed.is_empty() {
+        return Ok(());
+    }
+    let unheard = resolved_steps
+        .iter()
+        .flat_map(|step| step.recipients.iter())
+        .filter_map(|r| match r {
+            RecipientRef::Literal { name } => roster
+                .iter()
+                .find(|a| canonicalize_for_uniqueness(&a.name) == canonicalize_for_uniqueness(name))
+                .map(|a| a.id),
+            RecipientRef::Slot { .. } => None,
+        })
+        .find(|id| unsubscribed.contains(id));
+    match unheard {
+        Some(agent_id) => Err(AppError::DesktopUnavailable { agent_id }),
+        None => Ok(()),
+    }
+}
+
+/// Convert the agent-typed inputs from ids to the names the workflow engine
+/// validates against, using the roster the invocation captured.
+fn agent_ids_to_names(
+    workflow: &Workflow,
+    inputs: &BTreeMap<String, InputValue>,
+    roster: &[AgentRecord],
+    project_id: ProjectId,
+) -> Result<BTreeMap<String, InputValue>, AppError> {
+    let to_name = |id: &str| -> Result<String, AppError> {
+        let agent_id: AgentId = id.parse().map_err(|e| AppError::invalid_uuid(id, e))?;
+        roster
+            .iter()
+            .find(|a| a.id == agent_id)
+            .map(|a| a.name.clone())
+            .ok_or(AppError::UnknownRecipient {
+                project_id,
+                agent_id,
+            })
+    };
+    let mut converted = inputs.clone();
+    for decl in workflow.inputs.iter().filter(|d| d.ty.is_agent()) {
+        let Some(value) = converted.get_mut(&decl.name) else {
+            continue;
+        };
+        *value = match value {
+            InputValue::Text(id) => InputValue::Text(to_name(id)?),
+            InputValue::List(ids) => {
+                InputValue::List(ids.iter().map(|id| to_name(id)).collect::<Result<_, _>>()?)
+            }
+        };
+    }
+    Ok(converted)
 }
 
 /// Retention keyed off the returned status: prune a `Complete`/`Cancelled` run
@@ -1467,7 +1816,7 @@ pub fn list_workflow_runs_impl(state: &AppState, project_id: ProjectId) -> Vec<W
 }
 
 /// `(run_id, records)` for every parseable `*.jsonl` in `runs_dir`.
-fn read_run_files(runs_dir: &Path) -> Vec<(Uuid, Vec<RunRecord>)> {
+pub(crate) fn read_run_files(runs_dir: &Path) -> Vec<(Uuid, Vec<RunRecord>)> {
     let Ok(entries) = std::fs::read_dir(runs_dir) else {
         return Vec::new();
     };
@@ -1486,7 +1835,7 @@ fn read_run_files(runs_dir: &Path) -> Vec<(Uuid, Vec<RunRecord>)> {
 /// Classify a run file (not in the live registry) into the run info the indicator
 /// shows, or `None` if it is a pruned/complete/cancelled terminal that shouldn't
 /// surface.
-fn classify_run_file(run_id: Uuid, records: &[RunRecord]) -> Option<WorkflowRunInfo> {
+pub(crate) fn classify_run_file(run_id: Uuid, records: &[RunRecord]) -> Option<WorkflowRunInfo> {
     let mut workflow = String::new();
     let mut total = 0usize;
     let mut completed = 0usize;
@@ -1694,9 +2043,92 @@ mod tests {
                     current_step,
                 },
                 steps: Vec::new(),
+                resolved: BTreeMap::new(),
+                through_agent_access: false,
                 done: Arc::new(tokio::sync::Notify::new()),
             },
         );
+    }
+
+    fn idle_run(project_id: ProjectId) -> ActiveRun {
+        ActiveRun {
+            cancel: CancellationToken::new(),
+            project_id,
+            workflow: "w".to_owned(),
+            snapshot: RunSnapshot {
+                total_steps: 1,
+                current_step: 0,
+            },
+            steps: Vec::new(),
+            resolved: BTreeMap::new(),
+            through_agent_access: false,
+            done: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[test]
+    fn a_workflow_name_is_a_name_never_a_path() {
+        let env = crate::ops::test_support::TestEnv::new().with_prompts_and_workflows();
+        let outside = env.workflows_dir().parent().unwrap().join("outside.yaml");
+        std::fs::write(&outside, "name: outside\nsteps: []\n").unwrap();
+        for name in ["../outside", "/etc/hosts", "a/b", ".."] {
+            let refused = snapshot_workflow(&env.state, name, false);
+            assert!(
+                matches!(&refused, Err(AppError::InvalidArgument(m)) if m.contains("not a workflow name")),
+                "{name}: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_built_in_named_without_is_builtin_says_so() {
+        let env = crate::ops::test_support::TestEnv::new().with_prompts_and_workflows();
+        let refused = snapshot_workflow(&env.state, "review-and-reconcile", false);
+        assert!(
+            matches!(&refused, Err(AppError::InvalidArgument(m)) if m.contains("is_builtin true")),
+            "{refused:?}"
+        );
+        assert!(snapshot_workflow(&env.state, "review-and-reconcile", true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_roster_predates_an_agent_deletion_is_refused_at_registration() {
+        let mut env = crate::ops::test_support::TestEnv::new();
+        let project_id = env.project("p");
+        let removed = env.agent(project_id, "removed");
+        env.agent(project_id, "kept");
+        crate::commands::open_project_impl(&env.state, project_id).unwrap();
+
+        // The run reads its roster, then the agent is deleted before it
+        // registers.
+        let (_, _, roster, deletions) = capture_run_snapshot(&env.state, project_id).unwrap();
+        assert!(roster.iter().any(|agent| agent.id == removed));
+        crate::commands::remove_agent_impl(&env.state, removed)
+            .await
+            .unwrap();
+        let refused = register_live_run(
+            &env.state,
+            project_id,
+            deletions,
+            Uuid::now_v7(),
+            idle_run(project_id),
+        );
+        assert!(
+            matches!(refused, Err(AppError::WorkflowBlockedByAgentRemoval { .. })),
+            "{refused:?}"
+        );
+
+        // Read again, the roster no longer holds the agent, and the run starts.
+        let (_, _, roster, deletions) = capture_run_snapshot(&env.state, project_id).unwrap();
+        assert!(roster.iter().all(|agent| agent.id != removed));
+        register_live_run(
+            &env.state,
+            project_id,
+            deletions,
+            Uuid::now_v7(),
+            idle_run(project_id),
+        )
+        .unwrap();
     }
 
     #[test]

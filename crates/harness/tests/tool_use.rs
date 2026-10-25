@@ -15,11 +15,14 @@
 //!
 //! Run with: `make test-live`. All tests are `#[ignore]`-gated.
 
+use std::path::Path;
+
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
+use switchboard_harness::antigravity::parser::MISSING_TOOL_RESULT_OUTPUT;
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
-    DispatchOptions, HarnessAdapter, TurnOutcome,
+    DispatchOptions, HarnessAdapter, ToolFacet, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -154,8 +157,26 @@ fn antigravity_agent() -> AgentRecord {
     }
 }
 
+/// Whether `recorded` names `requested`, a file that does not exist. macOS
+/// temp folders sit under `/var`, a link to `/private/var`, and `agy` may
+/// record either form, so the folders are compared after resolving links.
+fn names_missing_file(recorded: &str, requested: &Path) -> bool {
+    let recorded = Path::new(recorded);
+    if recorded.file_name() != requested.file_name() {
+        return false;
+    }
+    match (
+        recorded.parent().map(Path::canonicalize),
+        requested.parent().map(Path::canonicalize),
+    ) {
+        (Some(Ok(recorded_dir)), Some(Ok(requested_dir))) => recorded_dir == requested_dir,
+        _ => false,
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_emits_tool_started_and_tool_completed_for_file_read() {
     // Antigravity's tool lifecycle AND answer text both come from tailing
     // `transcript.jsonl` (stdout replays the whole conversation on resume, so
@@ -238,6 +259,7 @@ async fn live_antigravity_emits_tool_started_and_tool_completed_for_file_read() 
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
 async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
     let tmp = tempfile::Builder::new()
         .prefix("agy-tool-error-test")
@@ -249,8 +271,102 @@ async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
     let adapter = AntigravityAdapter::new();
     let agent = antigravity_agent();
     let turn_id = Uuid::now_v7();
+    // The prompt names no tool: agy 1.4.3 renamed `view_file` to `read_file`.
     let prompt = format!(
-        "Use the view_file tool exactly once to read the absolute path {missing_path_text}. The file intentionally does not exist. After the tool fails, reply with only the word ack."
+        "Use your file-reading tool exactly once to read the absolute path {missing_path_text}. The file intentionally does not exist. After the tool fails, reply with only the word ack."
+    );
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            &prompt,
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real agy");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    // The call must be a file read of the requested path. Selecting any call
+    // that mentions the file let a shell `cat` pass through the failed-command
+    // path instead, proving nothing about a failed read.
+    let started = events.iter().find(|event| {
+        matches!(
+            event,
+            AdapterEvent::ToolStarted {
+                facet: ToolFacet::Read { path },
+                ..
+            } if names_missing_file(path, &missing_path)
+        )
+    });
+    let AdapterEvent::ToolStarted {
+        tool_use_id: started_id,
+        ..
+    } = started.unwrap_or_else(|| {
+        let calls: Vec<(&str, &ToolFacet)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolStarted { name, facet, .. } => Some((name.as_str(), facet)),
+                _ => None,
+            })
+            .collect();
+        panic!("expected a file read of {missing_path_text}; calls (tool, display): {calls:?}")
+    })
+    else {
+        unreachable!();
+    };
+    // The failure must carry agy's own message, from the transcript record or
+    // the stream. The adapter authors exactly one line of its own for a failed
+    // tool, when agy reported none, so any other non-empty output is agy's.
+    // agy's wording is not asserted: it changed from 1.4.2's "invalid tool
+    // call" to 1.4.3's "file does not exist".
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::ToolCompleted {
+                tool_use_id,
+                output,
+                is_error: true,
+                ..
+            } if tool_use_id == started_id
+                && !output.trim().is_empty()
+                && output != MISSING_TOOL_RESULT_OUTPUT
+        )),
+        "expected the invalid file read to complete as an error carrying agy's message; got: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "expected the agent to recover and complete the turn; got: {events:?}"
+    );
+}
+
+/// A command that exits non-zero must complete as a tool error. `agy` records
+/// no exit code as a field — only in the result's prose (`The command exited
+/// with code 1.` @ 1.4.2, `Command exited with code 1.` @ 1.4.3) — and the
+/// stream reports the step `DONE`, so the adapter reads that sentence. This
+/// test is what fails when `agy` rewords it beyond what the match accepts.
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
+async fn live_antigravity_failing_command_completes_as_tool_error() {
+    let tmp = tempfile::Builder::new()
+        .prefix("agy-command-error-test")
+        .tempdir()
+        .expect("tempdir");
+    let missing_dir = tmp.path().join("SWITCHBOARD_MISSING_DIR");
+    let missing_dir_text = missing_dir.display().to_string();
+
+    let adapter = AntigravityAdapter::new();
+    let agent = antigravity_agent();
+    let turn_id = Uuid::now_v7();
+    let prompt = format!(
+        "Use the run_command tool exactly once to run `ls {missing_dir_text}`. The directory intentionally does not exist, so the command will exit with an error. After it fails, reply with only the word ack."
     );
     let stream = adapter
         .dispatch(
@@ -265,29 +381,44 @@ async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
     let events: Vec<AdapterEvent> = stream.collect().await;
 
     let started = events.iter().find(|event| match event {
-        AdapterEvent::ToolStarted { input, .. } => serde_json::to_string(input)
-            .is_ok_and(|text| text.contains("SWITCHBOARD_MISSING_FILE.txt")),
+        AdapterEvent::ToolStarted { name, input, .. } => {
+            name == "run_command"
+                && serde_json::to_string(input)
+                    .is_ok_and(|text| text.contains("SWITCHBOARD_MISSING_DIR"))
+        }
         _ => false,
     });
     let AdapterEvent::ToolStarted {
         tool_use_id: started_id,
         ..
-    } = started.unwrap_or_else(|| panic!("expected missing-file tool start; got: {events:?}"))
+    } = started.unwrap_or_else(|| panic!("expected the failing command's start; got: {events:?}"))
     else {
         unreachable!();
     };
+    let completed = events.iter().find(|event| {
+        matches!(event, AdapterEvent::ToolCompleted { tool_use_id, .. } if tool_use_id == started_id)
+    });
     assert!(
-        events.iter().any(|event| matches!(
-            event,
-            AdapterEvent::ToolCompleted {
-                tool_use_id,
-                output,
-                is_error: true,
-                ..
-            } if tool_use_id == started_id
-                && output.to_ascii_lowercase().contains("invalid tool call")
-        )),
-        "expected the invalid file read to complete as an error; got: {events:?}"
+        matches!(
+            completed,
+            Some(AdapterEvent::ToolCompleted { is_error: true, .. })
+        ),
+        "expected the failing command to complete as an error; if no line of \
+         its output's header starts with one of the sentences in \
+         `EXIT_SENTENCES` (`antigravity/parser.rs`), agy has reworded its exit \
+         line and the new wording needs adding there. Got: {completed:?}"
+    );
+    // The command's own output proves the transcript's result settled the
+    // row, not the turn-end fallback that closes a call with no result as
+    // failed, which would satisfy the assertion above without this sentence
+    // being read at all.
+    assert!(
+        matches!(
+            completed,
+            Some(AdapterEvent::ToolCompleted { output, .. })
+                if output.contains("No such file or directory")
+        ),
+        "expected the command's output from the transcript; got: {completed:?}"
     );
     assert!(
         events.iter().any(|event| matches!(
@@ -410,6 +541,68 @@ fn collect_subagent_tool_use_ids(session_id: uuid::Uuid) -> Vec<String> {
     ids
 }
 
+/// A sub-agent the agent waits on also reports a task that names its Agent
+/// call (seen at 2.1.149), which is what lets the activity report show it as
+/// that open call rather than as background work. That rests on the call
+/// staying open while the sub-agent works: its progress arrives, and none
+/// arrives after the call closes. A background launch fails this, since its
+/// call returns at once and progress follows. At 2.1.302 (2026-10-19) the
+/// task ended one event before its call closed; either order passes, because
+/// the report handles both and a flip only shows the sub-agent as background
+/// work for the instant between the two. The run prints which.
+fn assert_task_names_waited_on_call(events: &[AdapterEvent], agent_call_id: &str) {
+    let task = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::TaskStarted {
+                task_id,
+                tool_use_id,
+                ..
+            } if tool_use_id.as_deref() == Some(agent_call_id) => Some(task_id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("no task names the Agent call {agent_call_id}; events: {events:?}")
+        });
+    let position = |wanted: &dyn Fn(&AdapterEvent) -> bool| events.iter().position(wanted);
+    let call_closed = position(&|e| {
+        matches!(e, AdapterEvent::ToolCompleted { tool_use_id, .. } if tool_use_id == agent_call_id)
+    })
+    .expect("the Agent call closes");
+    let task_ended =
+        position(&|e| matches!(e, AdapterEvent::TaskEnded { task_id, .. } if *task_id == task))
+            .unwrap_or_else(|| panic!("task {task} never ended; events: {events:?}"));
+    let turn_ended = position(&|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("must observe a terminal TurnEnd");
+    assert!(task_ended < turn_ended, "the task ends inside its turn");
+    let progress: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(
+            |(_, e)| matches!(e, AdapterEvent::TaskProgress { task_id, .. } if *task_id == task),
+        )
+        .map(|(at, _)| at)
+        .collect();
+    assert!(
+        !progress.is_empty(),
+        "the sub-agent ran a shell command but reported no progress; events: {events:?}"
+    );
+    assert!(
+        progress.iter().all(|&at| at < call_closed),
+        "progress arrived after the Agent call closed (at event {call_closed}), as for a \
+         background launch: progress at events {progress:?}; events: {events:?}"
+    );
+    eprintln!(
+        "foreground sub-agent: progress at events {progress:?}, task ended at event \
+         {task_ended}, Agent call closed at event {call_closed} ({})",
+        if task_ended < call_closed {
+            "task ended first"
+        } else {
+            "call closed first"
+        }
+    );
+}
+
 /// Probes the `parent_tool_use_id` short-circuit in `parser.rs`: when a
 /// Claude turn delegates via the `Agent` tool, the parent stream carries
 /// subagent-internal `tool_use` / `tool_result` records tagged with
@@ -500,6 +693,9 @@ async fn live_claude_subagent_collapses_to_parent_tool_call() {
         agent_completed.is_some(),
         "Agent ToolStarted ({agent_call_id}) had no matching ToolCompleted. Events: {events:?}",
     );
+
+    // (1b) The task this delegation reports names its Agent call.
+    assert_task_names_waited_on_call(&events, agent_call_id);
 
     // (2) No parent-stream ToolStarted/ToolCompleted may carry a tool_use_id
     // that was emitted inside a subagent. A match here is the subagent-leak bug —

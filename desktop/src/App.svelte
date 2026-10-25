@@ -9,6 +9,8 @@
   import CreateProjectForm from "$lib/components/CreateProjectForm.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import ProjectsSidebar from "$lib/components/ProjectsSidebar.svelte";
+  import SettingsSidebar from "$lib/components/SettingsSidebar.svelte";
+  import type { SettingsSection } from "$lib/settingsSections";
   import SettingsView from "$lib/components/SettingsView.svelte";
   import Sidebar from "$lib/components/Sidebar.svelte";
   import PinsSidebar from "$lib/components/PinsSidebar.svelte";
@@ -26,6 +28,7 @@
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import SettingsButton from "$lib/components/ui/SettingsButton.svelte";
   import CommandPaletteButton from "$lib/components/ui/CommandPaletteButton.svelte";
+  import NotificationsOffButton from "$lib/components/ui/NotificationsOffButton.svelte";
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
@@ -69,11 +72,13 @@
     activateProject,
     addAgentToProjectRoster,
     agentCreationFailures,
+    agentRemovalWarnings,
     agentsByProject,
     conversations,
     deleteProject,
     dismissProjectDeletionError,
     dismissAgentCreationFailure,
+    dismissAgentRemovalWarning,
     dismissSeedPathUnresolved,
     loadAttachedAgentHistory,
     loadWorkspace,
@@ -82,6 +87,7 @@
     projectDeletions,
     dismissProjectRelocationError,
     installRegistryStalenessRefresh,
+    installDesktopSync,
     projectRelocations,
     refreshProjectRegistry,
     setProjectDirectory,
@@ -105,7 +111,12 @@
   import { pickDirectory } from "$lib/native";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
-  import { loadPreferences, preferences } from "$lib/preferences.svelte";
+  import {
+    loadPreferences,
+    preferenceLoadState,
+    preferences,
+    updatePreferences,
+  } from "$lib/preferences.svelte";
   import { loadPersistedUsage } from "$lib/state/harnessUsage.svelte";
   import { isReadingMode, toggleReadingMode } from "$lib/state/readingMode.svelte";
   import GitView from "$lib/components/GitView.svelte";
@@ -141,7 +152,7 @@
 
   let dirError = $state<string | null>(null);
   let settingsOpen = $state<boolean>(false);
-  let settingsInitialSection = $state<"prompts" | null>(null);
+  let settingsSection = $state<SettingsSection>("general");
   let editorShortcutError = $state<string | null>(null);
   let editorShortcutSeq = 0;
   let commandError = $state<string | null>(null);
@@ -209,6 +220,22 @@
     // The open navigator is a focus-trapped modal; suppress other window chords
     // while it owns the keyboard, mirroring the palette above.
     if (navigatorState.open) return;
+
+    // ⌘⇧M flips the master notification switch (M for mute). Handled before the
+    // editable-target guard, like the palette: the chord inserts nothing, so no
+    // field needs it, and muting is wanted while typing somewhere else, in a
+    // Settings field most of all. The header shows a crossed-out bell while
+    // notifications are off, since the flip is otherwise invisible.
+    if (
+      (event.metaKey || event.ctrlKey) &&
+      event.shiftKey &&
+      !event.altKey &&
+      event.key.toLowerCase() === "m"
+    ) {
+      event.preventDefault();
+      toggleNotifications();
+      return;
+    }
 
     if (isEditableShortcutTarget(event.target) && !isComposerShortcutTarget(event.target)) return;
 
@@ -364,18 +391,16 @@
   }
 
   function openSettings(): void {
-    settingsInitialSection = null;
     settingsOpen = true;
   }
 
-  function openPromptSettings(): void {
-    settingsInitialSection = "prompts";
+  function openSettingsAt(section: SettingsSection): void {
+    settingsSection = section;
     settingsOpen = true;
   }
 
   function closeSettings(): void {
     settingsOpen = false;
-    settingsInitialSection = null;
   }
 
   function toggleSettings(): void {
@@ -457,6 +482,13 @@
     // so its inherited history has to be read back afterwards. No-op for every
     // non-fork agent.
     installForkHistoryRefresh();
+    // What other clients (an orchestrator over MCP) do: the backend asks the
+    // window to get a project ready before their turns start, and tells it
+    // about agents and projects they change.
+    const desktopSync = installDesktopSync().catch((err: unknown) => {
+      console.warn("[switchboard] could not listen for other clients' changes", err);
+      return () => {};
+    });
     // The startup probe races the backend's PATH capture, so its answer can be
     // provisional; the store awaits its own completion-listener registration
     // before issuing any probe, and arms its own backstop for a lost event.
@@ -504,6 +536,7 @@
       document.removeEventListener("visibilitychange", refreshWhenVisible);
       uninstallStalenessRefresh();
       removeDevSeed();
+      void desktopSync.then((uninstall) => uninstall());
     };
   });
 
@@ -666,6 +699,15 @@
     if (selection.activeProjectId === null) return;
     toggleReadingMode(selection.activeProjectId);
   }
+  /// Flip the master notification switch, the preference Settings shows as
+  /// "Notify me when agents finish". Inert until preferences have loaded, as
+  /// the Settings switch is: before that the in-memory value is the default, so
+  /// a flip computed from it could land as the opposite of what the user meant
+  /// once their saved value arrives.
+  function toggleNotifications(): void {
+    if (!preferenceLoadState.ready) return;
+    void updatePreferences({ notify_on_completion: !preferences.notify_on_completion });
+  }
   // Reading mode's whole point is being notified about the project you're
   // watching, and that rides on a preference which defaults *off* — so a user on
   // defaults who turns reading mode on would get nothing and reasonably conclude
@@ -676,7 +718,7 @@
     !readingModeActive
       ? null
       : !preferences.notify_on_completion
-        ? "Notifications are turned off, so nothing will alert you while you read. Turn them on in Settings."
+        ? `Notifications are turned off, so nothing will alert you while you read. Press ${shortcut("mod", "shift", "M")} or click the crossed-out bell in the header to turn them on.`
         : !preferences.notify_while_focused
           ? "To be alerted about this project while you read it, turn on “Also notify me about other projects while I'm using Switchboard” in Settings."
           : null,
@@ -1116,6 +1158,15 @@
       run: () => toggleSettings(),
     });
     cmds.push({
+      id: "nav.toggle-notifications",
+      title: preferences.notify_on_completion ? "Turn off notifications" : "Turn on notifications",
+      group: "Navigation",
+      shortcut: ["mod", "shift", "M"],
+      keywords: "notify mute silence alerts finish",
+      disabled: !preferenceLoadState.ready,
+      run: () => toggleNotifications(),
+    });
+    cmds.push({
       id: "nav.toggle-projects-sidebar",
       title: layout.projectsSidebarOpen ? "Hide projects sidebar" : "Show projects sidebar",
       group: "Navigation",
@@ -1270,15 +1321,29 @@
 <main class="bg-surface text-fg flex h-full flex-col">
   <AppShell centerTestid="workspace-main">
     {#snippet left()}
-      {#if projectsSidebarVisible}
-        <ProjectsSidebar
-          onAddProject={openProjectDialog}
-          onOpenSettings={toggleSettings}
-          onProjectSelect={() => (settingsOpen = false)}
-          onToggleSidebar={() => (layout.projectsSidebarOpen = false)}
-          onLocateFolder={(project) => void locateProjectFolder(project)}
-          {settingsOpen}
+      {#if settingsOpen}
+        <SettingsSidebar
+          section={settingsSection}
+          onSelect={(section) => (settingsSection = section)}
+          onClose={closeSettings}
+          returnLabel={view.mode === "git"
+            ? "Back to Git"
+            : activeProject
+              ? "Back to project"
+              : "Back to projects"}
         />
+      {/if}
+      {#if projectsSidebarVisible}
+        <!-- Keep the project filter and scroll position when returning from settings. -->
+        <div hidden={settingsOpen} class:flex={!settingsOpen} class="min-h-0 shrink-0">
+          <ProjectsSidebar
+            onAddProject={openProjectDialog}
+            onOpenSettings={toggleSettings}
+            onProjectSelect={() => (settingsOpen = false)}
+            onToggleSidebar={() => (layout.projectsSidebarOpen = false)}
+            onLocateFolder={(project) => void locateProjectFolder(project)}
+          />
+        </div>
       {/if}
     {/snippet}
 
@@ -1292,7 +1357,8 @@
         sync if that position changes.
       -->
       <div
-        class="border-border/80 bg-raised flex h-11 shrink-0 items-center gap-2 border-b pr-3 {projectsSidebarVisible
+        class="border-border/80 bg-raised flex h-11 shrink-0 items-center gap-2 border-b pr-3 {settingsOpen ||
+        projectsSidebarVisible
           ? 'pl-4'
           : 'pl-20'}"
         data-tauri-drag-region
@@ -1306,12 +1372,8 @@
         <!-- Title-bar Settings + re-open toggle appear only when the sidebar
              has content but is collapsed. In the no-project state there's no
              sidebar at all, so neither shows — the welcome screen stays clean. -->
-        {#if projectsSidebarHasContent && !layout.projectsSidebarOpen}
-          <SettingsButton
-            pressed={settingsOpen}
-            testid="settings-button"
-            onclick={toggleSettings}
-          />
+        {#if !settingsOpen && projectsSidebarHasContent && !layout.projectsSidebarOpen}
+          <SettingsButton testid="settings-button" onclick={toggleSettings} />
           <SidebarToggleButton
             side="left"
             expanded={false}
@@ -1538,6 +1600,12 @@
             data-testid="right-sidebar-command-divider"
           ></div>
         {/if}
+        {#if preferenceLoadState.ready && !preferences.notify_on_completion}
+          <NotificationsOffButton
+            testid="notifications-off-button"
+            onclick={() => toggleNotifications()}
+          />
+        {/if}
         <CommandPaletteButton testid="command-palette-button" onclick={() => togglePalette()} />
         <!-- Top-level Projects / Git view switch. Icon-only is an intentional
              compact-header trial; tooltips and accessible names keep both
@@ -1604,7 +1672,7 @@
 
       {#if seedPathUnresolved.value}
         <Banner
-          message="Couldn't finish detecting your installed CLIs, so this project may be missing an agent. Use + to add one, or open Settings → Supported CLIs and press Refresh."
+          message="Couldn't finish detecting your installed CLIs, so this project may be missing an agent. Use + to add one, or open Settings → Agents → Supported CLIs and press Refresh."
           testid="banner-seed-path-unresolved"
           onDismiss={dismissSeedPathUnresolved}
         />
@@ -1614,6 +1682,13 @@
           message={`Couldn't create the ${HARNESS_LABEL[failure.harness]} agent: ${failure.error}`}
           testid={`banner-agent-create-failed-${failure.harness}`}
           onDismiss={() => dismissAgentCreationFailure(failure.harness)}
+        />
+      {/each}
+      {#each agentRemovalWarnings as warning (warning.agentId)}
+        <Banner
+          message={`${warning.name}: ${warning.message}`}
+          testid={`banner-agent-remove-warning-${warning.agentId}`}
+          onDismiss={() => dismissAgentRemovalWarning(warning.agentId)}
         />
       {/each}
       {#if editorShortcutError !== null}
@@ -1674,7 +1749,7 @@
 
       <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
         {#if settingsOpen}
-          <SettingsView onClose={closeSettings} initialSection={settingsInitialSection} />
+          <SettingsView onClose={closeSettings} section={settingsSection} />
         {:else if view.mode === "git"}
           {#if gitViewResumePending}
             <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -1862,7 +1937,7 @@
                   agents={activeAgents}
                   focusOnMount={true}
                   focusRequest={composeFocusRequest}
-                  onConfigurePrompts={openPromptSettings}
+                  onConfigurePrompts={() => openSettingsAt("prompts")}
                 />
               {/key}
               {#if readingModeNotifyHint !== null}
@@ -1875,7 +1950,7 @@
                     <button
                       type="button"
                       class="text-accent hover:underline"
-                      onclick={openSettings}
+                      onclick={() => openSettingsAt("notifications")}
                     >
                       Open settings
                     </button>

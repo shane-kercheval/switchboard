@@ -658,6 +658,151 @@ describe("UnifiedTranscript", () => {
     }
   });
 
+  it("names the open background work instead of 'No response' while a task is open", async () => {
+    // A Claude turn waiting on a sub-agent goes silent for minutes. With a
+    // task open the footer says what the task is doing, not "No response";
+    // once every task has ended, silence reads as "No response" again.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const state = await loadState();
+      await state.registerAgent(CLAUDE_AGENT);
+
+      render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+      const channel = `agent:${CLAUDE_AGENT.id}`;
+      fireTo(channel, {
+        type: "turn_start",
+        turn_id: "agent-1",
+        message_id: "00000000-0000-7000-8000-0000000000e2",
+        send_id: "00000000-0000-7000-8000-0000000000e2",
+        started_at: "2026-05-16T00:00:00Z",
+      });
+      fireTo(channel, {
+        type: "task_started",
+        turn_id: "agent-1",
+        task_id: "a1",
+        description: "Review the parser",
+      });
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
+
+      vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
+      await tick();
+      const footer = screen.getByTestId("turn-working");
+      expect(footer).toHaveTextContent("Background: Review the parser (1)");
+      expect(footer).not.toHaveTextContent("No response");
+      expect(footer).not.toHaveClass("text-warning");
+      // How long the agent has been silent stays on screen: a task left
+      // running cannot show whether the agent itself has hung.
+      expect(screen.getByTestId("turn-quiet-elapsed")).toBeInTheDocument();
+
+      // Progress is a sign of life; silent again, the footer names it.
+      fireTo(channel, {
+        type: "task_progress",
+        turn_id: "agent-1",
+        task_id: "a1",
+        activity: "Running Sleep for 45 seconds",
+      });
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working");
+      vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent(
+        "Background: Running Sleep for 45 seconds (1)",
+      );
+
+      // A second task counts, and is the latest thing to have happened.
+      fireTo(channel, {
+        type: "task_started",
+        turn_id: "agent-1",
+        task_id: "b2",
+        description: "Sleep for 45 seconds",
+      });
+      vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent(
+        "Background: Sleep for 45 seconds (2)",
+      );
+
+      for (const task_id of ["a1", "b2"]) {
+        fireTo(channel, { type: "task_ended", turn_id: "agent-1", task_id });
+      }
+      vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("No response");
+      expect(screen.queryByTestId("turn-background")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("names a quiet sub-agent the agent is waiting on, and calls it background once its call returns", async () => {
+    // A task whose starting tool call is still running is a sub-agent the
+    // agent waits on: "Sub-agent: …". If the call returns while the task
+    // runs on, the task is background work.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const state = await loadState();
+      await state.registerAgent(CLAUDE_AGENT);
+
+      render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+      const channel = `agent:${CLAUDE_AGENT.id}`;
+      fireTo(channel, {
+        type: "turn_start",
+        turn_id: "agent-1",
+        message_id: "00000000-0000-7000-8000-0000000000e3",
+        send_id: "00000000-0000-7000-8000-0000000000e3",
+        started_at: "2026-05-16T00:00:00Z",
+      });
+      fireTo(channel, {
+        type: "tool_started",
+        turn_id: "agent-1",
+        tool_use_id: "toolu_A",
+        kind: "builtin",
+        name: "Agent",
+        input: {},
+        facet: { facet_kind: "other" },
+      });
+      fireTo(channel, {
+        type: "task_started",
+        turn_id: "agent-1",
+        task_id: "a1",
+        description: "Review the parser",
+        tool_use_id: "toolu_A",
+      });
+      fireTo(channel, {
+        type: "task_progress",
+        turn_id: "agent-1",
+        task_id: "a1",
+        activity: "Running cargo test",
+      });
+
+      vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
+      await tick();
+      const footer = screen.getByTestId("turn-working");
+      expect(footer).toHaveTextContent("Sub-agent: Running cargo test (1)");
+      expect(footer).not.toHaveTextContent("Background");
+      expect(footer).not.toHaveClass("text-warning");
+      expect(screen.getByTestId("turn-quiet-elapsed")).toBeInTheDocument();
+
+      fireTo(channel, {
+        type: "tool_completed",
+        turn_id: "agent-1",
+        tool_use_id: "toolu_A",
+        output: "",
+        is_error: false,
+      });
+      vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent(
+        "Background: Running cargo test (1)",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("live-streams an in-progress turn into the unified view", async () => {
     // Real listener path: register, fire turn_start, content_chunk, etc.
     // through the captured callback. The reducer + state-module + Svelte
@@ -4334,35 +4479,6 @@ describe("UnifiedTranscript compact mode", () => {
     expect(screen.queryByTestId("inherited-history-session")).toBeNull();
   });
 
-  it("words a compressed parent differently from a missing one", async () => {
-    // A compressed parent doesn't stop the agent: Codex still reads it. The
-    // marker must not tell the user their working fork is broken.
-    const state = await loadState();
-    await state.registerAgent(CODEX_AGENT);
-    const overlay: ConversationItem[] = [
-      {
-        kind: "system_marker",
-        id: "marker-1",
-        agent_id: CODEX_AGENT.id,
-        marker: {
-          marker_kind: "inherited_history_unavailable",
-          reason: "compressed",
-          rollout_id: "01a12c22-a3f8-71e2-b51e-ca72562cfabb",
-        },
-        at: "2026-05-16T00:00:05Z",
-      },
-    ];
-
-    render(UnifiedTranscript, {
-      props: { projectId: PROJECT_ID, agents: [CODEX_AGENT], overlay },
-    });
-
-    const marker = screen.getByTestId("inherited-history-marker");
-    expect(marker).toHaveTextContent("Earlier conversation not shown");
-    expect(marker).toHaveTextContent("still has the earlier conversation");
-    expect(marker).not.toHaveTextContent("can't continue");
-  });
-
   it("hides tool calls and thinking widgets in a compact completed response", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
@@ -6812,5 +6928,84 @@ describe("UnifiedTranscript — code review cards", () => {
     expect(within(older).queryByTestId("finding-toggle")).toBeNull();
     expect(within(older).getByText("Listed above.")).toBeInTheDocument();
     expect(within(older).getByTestId("hidden-items-indicator")).toHaveTextContent("1 tool call");
+  });
+});
+
+describe("a send another client made", () => {
+  const ORCHESTRATOR_SEND = "00000000-0000-7000-8000-0000000000c1";
+  const ORCHESTRATOR_MESSAGE = "00000000-0000-7000-8000-0000000000c2";
+  const channel = `agent:${CLAUDE_AGENT.id}`;
+
+  it("queued behind a running turn shows as queued, cancels like the user's own, and clears", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    fireTo(channel, {
+      type: "turn_start",
+      turn_id: "turn-running",
+      message_id: "msg-running",
+      send_id: SEND_1,
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(channel, {
+      type: "send_accepted",
+      message_id: ORCHESTRATOR_MESSAGE,
+      send_id: ORCHESTRATOR_SEND,
+      text: "from the orchestrator",
+      at: "2026-05-16T00:00:01Z",
+    });
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByText("from the orchestrator")).toBeInTheDocument();
+    const queued = screen.getByTestId("turn-queued");
+    expect(queued).toHaveTextContent("Queued");
+    await fireEvent.click(within(queued).getByTestId("turn-live-control"));
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_send",
+      expect.objectContaining({ sendId: ORCHESTRATOR_SEND, recipients: [CLAUDE_AGENT.id] }),
+    );
+
+    fireTo(channel, {
+      type: "message_cancelled",
+      message_id: ORCHESTRATOR_MESSAGE,
+      send_id: ORCHESTRATOR_SEND,
+      agent_id: CLAUDE_AGENT.id,
+      at: "2026-05-16T00:00:02Z",
+    });
+    await tick();
+    expect(screen.queryByTestId("turn-queued")).toBeNull();
+    expect(screen.getAllByText("from the orchestrator")).toHaveLength(1);
+  });
+
+  it("renders one user row when its user_message and turn_start follow", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    fireTo(channel, {
+      type: "send_accepted",
+      message_id: ORCHESTRATOR_MESSAGE,
+      send_id: ORCHESTRATOR_SEND,
+      text: "from the orchestrator",
+      at: "2026-05-16T00:00:01Z",
+    });
+    fireTo(channel, {
+      type: "user_message",
+      send_id: ORCHESTRATOR_SEND,
+      text: "from the orchestrator",
+      at: "2026-05-16T00:00:02Z",
+    });
+    fireTo(channel, {
+      type: "turn_start",
+      turn_id: "turn-orchestrated",
+      message_id: ORCHESTRATOR_MESSAGE,
+      send_id: ORCHESTRATOR_SEND,
+      started_at: "2026-05-16T00:00:02Z",
+    });
+    await tick();
+
+    expect(screen.getAllByText("from the orchestrator")).toHaveLength(1);
+    expect(screen.queryByTestId("turn-queued")).toBeNull();
+    expect(screen.getByTestId("turn-working")).toBeInTheDocument();
   });
 });

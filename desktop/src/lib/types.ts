@@ -283,12 +283,54 @@ export type NormalizedEvent =
   // has no optimistic user turn for a backend-originated send). The reducer turns
   // it into a user turn; a fan-out's recipients share `send_id` so they group into
   // one user row + per-recipient columns. Manual sends don't use this.
-  | { type: "user_message"; send_id: SendId; text: string; at: string }
+  // `attachments` is absent for a send without any.
+  | {
+      type: "user_message";
+      send_id: SendId;
+      text: string;
+      at: string;
+      attachments?: Attachment[];
+    }
+  // A send another client made (an orchestrator over MCP) was accepted into
+  // this agent's queue. Arrives before the send's `turn_start`, idle or busy;
+  // the window turns it into the same pending entry and queued row it creates
+  // for its own sends. The window's own sends never carry it.
+  // `kind` says what was admitted when it is not a message: a compaction
+  // another client asked for, shown as the compaction row the Compact button
+  // makes, with no user row. Absent for a message.
+  | {
+      type: "send_accepted";
+      message_id: MessageId;
+      send_id: SendId;
+      text: string;
+      at: string;
+      kind?: "compaction";
+      // The files attached to the send; absent when there are none.
+      attachments?: Attachment[];
+    }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
   // Content-free liveness signal: the harness is still alive mid-turn but
   // produced no renderable content (e.g. Claude Opus 4.8's redacted thinking
   // deltas). Re-arms the per-turn heartbeat; renders nothing.
   | { type: "liveness"; turn_id: TurnId }
+  // A task the turn started (Claude only): a sub-agent it delegated to,
+  // whether it waits on it or runs it in the background, or a command it runs
+  // in the background. Each event is a sign of life that re-arms the heartbeat
+  // like `liveness`; none renders in the transcript. The runtime tracks open
+  // tasks for the footer.
+  // `tool_use_id` names the tool call that started the task: a sub-agent the
+  // agent waits on keeps that call running; a background launch closes it.
+  | {
+      type: "task_started";
+      turn_id: TurnId;
+      task_id: string;
+      description: string;
+      tool_use_id?: string;
+    }
+  // What a running task is doing now (a sub-agent's current step).
+  | { type: "task_progress"; turn_id: TurnId; task_id: string; activity: string }
+  // A task finished, whatever its status.
+  | { type: "task_ended"; turn_id: TurnId; task_id: string }
   // Early dedup identity for the in-flight turn (Claude). The reducer stamps
   // `hydration_key` onto the live turn so a concurrent disk re-read collapses
   // against it instead of duplicating. `hydration_key` is the first assistant
@@ -385,6 +427,10 @@ export type NormalizedEvent =
       send_id: SendId | null;
       agent_id: AgentId;
       error: string;
+      // The typed cause when the failure is one a caller should act on
+      // rather than retry (the harness session held by another process).
+      // Absent for every other failure.
+      kind?: "session_in_use";
       at: string;
     }
   // A queued send was cancelled before it started (its backlog item was dropped
@@ -585,6 +631,31 @@ export type AgentSelection = {
   effort: string | null;
   model_choices: string[];
   effort_choices: string[];
+};
+
+/// The parts of an agent's selection the user changed. An absent key leaves
+/// that part as it is, so another client's change to a different setting
+/// survives the save; `null` resets the model or effort to the harness default.
+export type AgentSelectionChanges = Partial<AgentSelection>;
+
+/// The window's answer to the backend's request to get a project ready for a
+/// turn another client is about to start.
+export type DesktopSyncAck =
+  | { status: "ready"; listening_agents: AgentId[] }
+  | { status: "failed"; message: string };
+
+/// A fork the backend's readiness request carries: another client branched
+/// `source_agent_id` into `fork_id` and is about to send the fork its first
+/// message, so the window places the fork and reads its earlier conversation
+/// before it answers.
+export type DesktopSyncFork = { fork_id: AgentId; source_agent_id: AgentId };
+
+/// The backend's request to get a project ready for a turn another client is
+/// about to start, as the event and the waiting-requests fetch carry it.
+export type DesktopSyncRequest = {
+  request_id: string;
+  project_id: ProjectId;
+  fork?: DesktopSyncFork;
 };
 
 // Mirror of `crates/core::AgentRecord`. `session_locator` is `null` for
@@ -841,8 +912,8 @@ export type DiffStyle = "side_by_side" | "unified";
 // Mirror of Rust `Preferences` (`desktop/src-tauri/src/preferences.rs`) — backend-owned
 // `config.yaml`. `editor_command` defaults to "code"; null → OS default
 // folder-open. `terminal_app` defaults to "Terminal"; `diff_style` defaults to
-// "unified". `show_builtins` defaults to true (the read-only built-in prompts &
-// workflows appear in the pickers; off → only the user's own content).
+// "unified". `show_builtin_prompts` and `show_builtin_workflows` default to true
+// and independently control whether examples appear in their respective pickers.
 // `claude_chrome_enabled` defaults to false (Claude agents get browser tools via
 // the Claude in Chrome extension; Claude-only, since Codex's equivalent is
 // configured in the ChatGPT desktop app).
@@ -853,7 +924,8 @@ export type Preferences = {
   editor_command: string | null;
   terminal_app: string;
   diff_style: DiffStyle;
-  show_builtins: boolean;
+  show_builtin_prompts: boolean;
+  show_builtin_workflows: boolean;
   claude_chrome_enabled: boolean;
   auto_reading_mode: boolean;
   notify_on_completion: boolean;
@@ -998,13 +1070,7 @@ export type SystemMarker =
 // Mirror of Rust `InheritedHistoryGap` (`crates/harness/src/transcript.rs`). A
 // reason this build doesn't know still renders, with general wording
 // (`inheritedHistoryNotice`).
-export type InheritedHistoryGap =
-  | "not_found"
-  | "compressed"
-  | "changed"
-  | "ambiguous"
-  | "cycle"
-  | "too_deep";
+export type InheritedHistoryGap = "not_found" | "changed" | "ambiguous" | "cycle" | "too_deep";
 
 // Mirror of Rust `ContextReport` (`crates/harness/src/context_report.rs`).
 //
@@ -1111,7 +1177,8 @@ export type DirectoryInfo = {
 
 export const HEARTBEAT_TIMEOUT_MS = 60_000;
 // Heartbeat re-arms on any per-turn sign of life for the tracked turn:
-// `content_chunk`, `liveness`, `tool_started`, `tool_completed`. 1 minute of
+// `content_chunk`, `liveness`, `tool_started`, `tool_completed`, and the task
+// events. 1 minute of
 // total silence across all of these is the "stream is silent" threshold (kept
 // short because the indicator is harmless and the user can always cancel).
 // `liveness` and tool events are load-bearing: a long redacted thinking block
@@ -1135,6 +1202,22 @@ export type ProviderStatus =
   | { state: "store_unavailable" }
   | { state: "needs_auth" }
   | { state: "unknown" };
+
+// Mirror of Rust `AgentAccessStatus` (`desktop/src-tauri/src/mcp/mod.rs`):
+// the MCP server other agents connect to, as Settings shows it.
+export type AgentAccessStatus = {
+  /// The user's setting: on means the app listens whenever it runs.
+  enabled: boolean;
+  port: number;
+  /// Listening right now.
+  listening: boolean;
+  /// Why it is on but not listening (the port is taken).
+  error: string | null;
+  /// The token clients present; null until agent access is first turned on.
+  token: string | null;
+  /// The URL clients connect to.
+  url: string;
+};
 
 // Mirrors the Rust `McpAuth` (`#[serde(tag = "type", rename_all =
 // "snake_case")]`, `#[non_exhaustive]`). `scopes` is the optional per-provider
@@ -1348,6 +1431,11 @@ export type WorkflowProgressPayload = {
   total: number;
   status: WorkflowProgressStatus;
   reason: string | null;
+  // The step's label, its agents as the engine resolved them, and the send a
+  // send step made, for readers outside the window.
+  label?: string | null;
+  recipients?: { agent_id: string; name: string; dispatched?: boolean }[];
+  send_id?: string | null;
 };
 
 // An input value supplied at invocation. A scalar (agent/prompt_id/text) is a

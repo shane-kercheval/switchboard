@@ -33,9 +33,10 @@ use tokio_util::task::TaskTracker;
 use crate::config::Config;
 use crate::outbox::Outbox;
 use crate::protocol::{
-    ClientMessage, DeviceId, ErrorCode, NONCE_LEN, RELAY_PROTOCOL, Register, Role, ServerMessage,
+    ClientMessage, DeviceId, NONCE_LEN, RELAY_PROTOCOL, Register, Role, ServerMessage,
+    claimed_relay_protocol,
 };
-use crate::state::{Refusal, Relay};
+use crate::state::{MAX_HELD_SETS, Refusal, Relay};
 
 /// How long a closing connection's queued messages may take to go out.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -51,6 +52,11 @@ pub(crate) const HTTP_HEADROOM: usize = 16;
 /// The longest request head read, and so the most a socket's HTTP buffers
 /// hold before it upgrades.
 const MAX_REQUEST_HEAD: usize = 16 * 1024;
+
+/// A generous estimate of what one device id costs in the routing table: its
+/// text, its `String`, and its slot in a hash set or map, with the value
+/// beside it.
+const TABLE_ID_BYTES: usize = 128;
 
 struct Shared {
     config: Config,
@@ -91,8 +97,11 @@ fn validate(config: Config) -> io::Result<Config> {
 /// The most memory connections' queues and message buffers can hold: each
 /// WebSocket's queue budget and one message being read — its text, the copy
 /// decoding an internally tagged message makes, and one record decoded —
-/// and every socket's request head, read and answered, before it upgrades.
-/// A bound on what clients can make the relay hold, not on the process.
+/// and every socket's request head, read and answered, before it upgrades —
+/// and the routing table's sets: one for every Mac connected or held after
+/// it left, and beside each the Mac's own entries and the phone bound to its
+/// pairing window. A bound on what clients can make the relay hold, not on
+/// the process.
 fn memory_ceiling(config: &Config) -> usize {
     let message = config
         .max_frame_bytes
@@ -105,7 +114,11 @@ fn memory_ceiling(config: &Config) -> usize {
         .max_connections
         .saturating_add(HTTP_HEADROOM)
         .saturating_mul(2 * MAX_REQUEST_HEAD);
-    websockets.saturating_add(heads)
+    let sets = MAX_HELD_SETS
+        .saturating_add(config.max_connections)
+        .saturating_mul(config.max_devices_per_mac.saturating_add(4))
+        .saturating_mul(TABLE_ID_BYTES);
+    websockets.saturating_add(heads).saturating_add(sets)
 }
 
 /// Accepts sockets itself rather than through `axum::serve`, so that every
@@ -360,8 +373,13 @@ async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     });
     if flushed.await.is_err() {
         writer.abort();
+        // An aborted task drops its half of the socket when it next runs,
+        // not when it is aborted.
+        let _ = writer.await;
     }
-    // Only now is the socket gone, so only now is its admission returned.
+    drop(stream);
+    // Only now are both halves of the socket gone, and with them its share
+    // of the socket limit, so only now is its admission returned.
     drop(permit);
 }
 
@@ -425,7 +443,7 @@ impl Connection {
                 }
             }
             Incoming::Message(_) => {
-                self.refuse(ErrorCode::BadMessage, "register first");
+                self.refuse(Refusal::bad_message("register first"));
                 return;
             }
             Incoming::End => return,
@@ -441,34 +459,29 @@ impl Connection {
     /// Registers the connection, or queues the refusal and returns false.
     fn register(&mut self, nonce: &[u8; NONCE_LEN], claim: Register) -> bool {
         if claim.relay_protocol != RELAY_PROTOCOL {
-            self.refuse(
-                ErrorCode::ProtocolMismatch,
-                &format!("this relay speaks relay protocol {RELAY_PROTOCOL}"),
-            );
+            self.refuse(Refusal::protocol_mismatch());
             return false;
         }
         let Ok(key) = VerifyingKey::from_bytes(&claim.identity_public_key) else {
-            self.refuse(ErrorCode::RegistrationRefused, "not an Ed25519 public key");
+            self.refuse(Refusal::registration_refused("not an Ed25519 public key"));
             return false;
         };
         let id = claim.device_id;
         if DeviceId::from_identity_key(&key) != id {
-            self.refuse(
-                ErrorCode::RegistrationRefused,
+            self.refuse(Refusal::registration_refused(
                 "the device id is not this key's",
-            );
+            ));
             return false;
         }
         if verify_relay_challenge(&key, nonce, &Signature::from_bytes(&claim.signature)).is_err() {
-            self.refuse(
-                ErrorCode::RegistrationRefused,
+            self.refuse(Refusal::registration_refused(
                 "the signature does not answer the challenge",
-            );
+            ));
             return false;
         }
         if self.shared.config.deny_device_ids.contains(&id) {
             tracing::info!(device_id = %id, "refused a denied device");
-            self.refuse(ErrorCode::RegistrationRefused, "this device is denied");
+            self.refuse(Refusal::registration_refused("this device is denied"));
             return false;
         }
         let (phone_of, set) = match &claim.role {
@@ -493,7 +506,7 @@ impl Connection {
                 true
             }
             Err(refusal) => {
-                self.send(refusal.into_message());
+                self.refuse(refusal);
                 false
             }
         }
@@ -547,7 +560,7 @@ impl Connection {
             Ok(()) => true,
             Err(refusal) => {
                 let ends = refusal.ends_connection();
-                self.send(refusal.into_message());
+                self.refuse(refusal);
                 !ends
             }
         }
@@ -585,7 +598,7 @@ impl Connection {
             let (len, text) = match message {
                 Message::Close(_) => return Incoming::End,
                 Message::Binary(_) => {
-                    self.refuse(ErrorCode::BadMessage, "messages are JSON text");
+                    self.refuse(Refusal::bad_message("messages are JSON text"));
                     return Incoming::End;
                 }
                 Message::Text(text) => (text.len(), Some(text)),
@@ -611,7 +624,10 @@ impl Connection {
             if let Ok(message) = serde_json::from_str(text.as_str()) {
                 return Incoming::Message(message);
             }
-            self.refuse(ErrorCode::BadMessage, "not a relay message");
+            self.refuse(match claimed_relay_protocol(text.as_str()) {
+                Some(theirs) if theirs != RELAY_PROTOCOL => Refusal::protocol_mismatch(),
+                _ => Refusal::bad_message("not a relay message"),
+            });
             return Incoming::End;
         }
     }
@@ -620,14 +636,9 @@ impl Connection {
         self.outbox.deliver(message);
     }
 
-    /// Queues an error for a refusal that ends the connection.
-    fn refuse(&self, code: ErrorCode, message: &str) {
-        self.send(ServerMessage::Error {
-            code,
-            message: message.to_owned(),
-            device_id: None,
-            last_seen: None,
-        });
+    /// Queues the error for a refusal.
+    fn refuse(&self, refusal: Refusal) {
+        self.send(refusal.into_message());
     }
 }
 
@@ -744,12 +755,15 @@ mod tests {
     }
 
     #[test]
-    fn the_default_memory_ceiling_is_about_791_mib() {
+    fn the_default_memory_ceiling_is_about_792_mib() {
         // 64 queues of 12 MiB, each with a 128 KiB message read twice and a
-        // decoded record, and 80 request heads of 32 KiB.
+        // decoded record, 80 request heads of 32 KiB, and 1,088 Macs' sets
+        // of 8 phones.
         assert_eq!(
             memory_ceiling(&Config::default()),
-            64 * (12 * 1024 * 1024 + 2 * 131_072 + MAX_FRAME_LEN) + 80 * 32 * 1024
+            64 * (12 * 1024 * 1024 + 2 * 131_072 + MAX_FRAME_LEN)
+                + 80 * 32 * 1024
+                + 1088 * (8 + 4) * 128
         );
     }
 

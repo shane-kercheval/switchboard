@@ -121,6 +121,25 @@ impl Refusal {
         )
     }
 
+    /// A `register` naming another relay protocol, whatever else it holds.
+    pub fn protocol_mismatch() -> Self {
+        Self {
+            code: ErrorCode::ProtocolMismatch,
+            message: "this relay speaks only the relay protocol its challenge names",
+            device_id: None,
+            last_seen: None,
+        }
+    }
+
+    pub fn registration_refused(message: &'static str) -> Self {
+        Self {
+            code: ErrorCode::RegistrationRefused,
+            message,
+            device_id: None,
+            last_seen: None,
+        }
+    }
+
     fn mac_only() -> Self {
         Self::bad_message("only a Mac may send this")
     }
@@ -378,6 +397,9 @@ impl Relay {
     /// Forgets the longest disconnected Macs until at most `MAX_HELD_SETS`
     /// disconnected ones are held. Connected Macs are never forgotten.
     fn prune_held_sets(&mut self) {
+        if self.held_sets.len() <= MAX_HELD_SETS {
+            return;
+        }
         loop {
             let disconnected = self.held_sets.keys().filter(|id| {
                 !self
@@ -404,7 +426,8 @@ impl Relay {
     /// it may not pass. A recipient with no room for it is closed, and this
     /// frame and any that reach it while it closes are refused as
     /// `recipient_full`. A frame for a recipient closing for another reason
-    /// is dropped: its sender hears of that through `peer_disconnected`.
+    /// is dropped: its sender hears of that through `peer_disconnected`. So
+    /// is one from a replaced connection, which is closing itself.
     pub fn forward(
         &mut self,
         from: &DeviceId,
@@ -414,7 +437,9 @@ impl Relay {
         pairing_token: Option<[u8; PAIRING_TOKEN_LEN]>,
         now: Instant,
     ) -> Result<(), Refusal> {
-        let outbox = self.route(from, generation, to, pairing_token.as_ref(), now)?;
+        let Some(outbox) = self.route(from, generation, to, pairing_token.as_ref(), now)? else {
+            return Ok(());
+        };
         let cost = frame_cost(record.len());
         let frame = ServerMessage::Frame {
             to: to.clone(),
@@ -428,7 +453,8 @@ impl Relay {
         }
     }
 
-    /// Where a frame from `from` to `to` goes, or why it may not. A phone
+    /// Where a frame from `from` to `to` goes, nowhere if `generation` is not
+    /// `from`'s current registration, or why it may not. A phone
     /// reaches only the Mac it names, and only if that Mac's set holds it
     /// or it presents that Mac's open pairing token. A Mac reaches only a
     /// phone in its set or bound to its token, and only if that phone names
@@ -441,17 +467,19 @@ impl Relay {
         to: &DeviceId,
         pairing_token: Option<&[u8; PAIRING_TOKEN_LEN]>,
         now: Instant,
-    ) -> Result<&Outbox, Refusal> {
+    ) -> Result<Option<&Outbox>, Refusal> {
         let Some(sender) = self
             .registered
             .get(from)
             .filter(|peer| peer.generation == generation)
         else {
-            return Err(Refusal::not_paired(to));
+            return Ok(None);
         };
         match &sender.kind {
-            Kind::Mac => self.route_from_mac(from, to, now),
-            Kind::Phone { mac } if mac == to => self.route_from_phone(from, to, pairing_token, now),
+            Kind::Mac => self.route_from_mac(from, to, now).map(Some),
+            Kind::Phone { mac } if mac == to => self
+                .route_from_phone(from, to, pairing_token, now)
+                .map(Some),
             Kind::Phone { .. } => Err(Refusal::not_paired(to)),
         }
     }
@@ -992,10 +1020,9 @@ mod tests {
                 now,
             )
             .unwrap();
-        assert_eq!(
-            code(send(&mut relay, &old_mac, &phone.id, &[1], None, now)),
-            ErrorCode::NotPaired
-        );
+        // Its frame is dropped, not refused: a refusal would claim something
+        // false about a pairing the new registration holds.
+        send(&mut relay, &old_mac, &phone.id, &[1], None, now).unwrap();
 
         // The new registration's set and pairing window are as it left them.
         send(&mut relay, &new_mac, &phone.id, &[2], None, now).unwrap();

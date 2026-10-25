@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** in progress: M1 complete 2026-10-10 in #118, #119, #120, #121, and #123; M2 in progress · **Revision:** 25 · **Created:** 2026-09-29 · **Revised:** 2026-10-15
+**Status:** in progress: M1 complete 2026-10-10 in #118, #119, #120, #121, and #123; M2 in progress · **Revision:** 25 · **Created:** 2026-09-29 · **Revised:** 2026-10-25
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -37,12 +37,17 @@ shared Rust cryptography are in one tree.
     10.8 MiB as frames, fits whole. With 4 MiB, a phone reading slower than its Mac sends
     would be closed by any reply over the budget, and again each time it reconnected and asked
     for the same window. What clients can make the relay hold rises from about 279 MiB to
-    about 791 MiB at the defaults.
+    about 792 MiB at the defaults, now counting the routing table's sets as well.
   - A recipient that stops reading and is sent nothing stops answering the relay's pings and
     is closed at the idle timeout. The relay still pings every 25 seconds from the writer, now
     as a keepalive for the client rather than to reach a reader held by a wait. On
     `recipient_full` for a phone, the Mac treats that phone as disconnected until it registers
     again (§5.6).
+  - A frame from a replaced connection is dropped unanswered; it was answered `not_paired`,
+    which is false of the newer registration's pairing. A `register` naming another
+    `relay_protocol` is answered `protocol_mismatch` whatever else it holds, since a newer
+    protocol may change its shape. The relay's binary is built under its own Cargo profile,
+    which unwinds on panic, so a panic ends one connection's task rather than the relay.
 - **Revision 24 (2026-10-12)** — the relay, settled while building it and in two reviews of
   it (§2, §4, §5.1, §5.2, §5.6, §6, §7.2, §7.3, §9).
   - **Every relay message is a WebSocket text message holding JSON**, tagged by `type`, with
@@ -1300,7 +1305,9 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   phones), `MAX_DEVICES_PER_MAC` (default 8, at most 1,024), `MAX_CONNECTIONS` (global,
   default 64, since registration is open to any key), `DENY_DEVICE_IDS` (comma-separated). A
   setting past its cap is refused at startup, before anything is sized by it. The queue
-  budget (12 MiB) and the timeouts are fixed in code. `crates/relay/Dockerfile`; TLS terminated by the host so clients
+  budget (12 MiB) and the timeouts are fixed in code. `crates/relay/Dockerfile`, which builds
+  under the `relay` Cargo profile: it unwinds on panic, so a panic ends one connection's task
+  rather than every connection; TLS terminated by the host so clients
   use `wss://`. Locally: `make relay`; the image: `make relay-image`, which passes the Rust
   version from `rust-toolchain.toml` as the required `RUST_VERSION` build argument. The
   WebSocket is at `/connect`.
@@ -1326,7 +1333,8 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   signature, role }`, the signature from `DeviceKeys::sign_relay_challenge` over the nonce;
   anything else first is `bad_message`. `role` is `mac { paired_devices }`, the Mac's full set
   of paired phones, or `phone { mac }`, the one Mac the phone is paired with or pairing with.
-  The relay refuses an unsupported `relay_protocol` with `protocol_mismatch`; with
+  The relay refuses an unsupported `relay_protocol` with `protocol_mismatch`, reading it
+  before the rest of `register`, whose shape another protocol may change; with
   `registration_refused` a key that does not hash to the claimed `device_id`, a signature that
   does not verify, and an id in `DENY_DEVICE_IDS`; and a Mac's set above
   `MAX_DEVICES_PER_MAC` with `limit_exceeded`. Each closes the connection. On success it
@@ -1395,7 +1403,7 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   session table still holds that generation for the id. The same check covers everything a
   connection asks of the session table, so a replaced connection acting on a message it read
   before the replacement can neither forward a frame nor change the newer registration's set
-  or pairing window. A frame is routed and queued under the same lock registrations change
+  or pairing window; its frame is dropped unanswered. A frame is routed and queued under the same lock registrations change
   under, so a frame from a replaced connection never follows the notice of its end.
 - **Last seen**: per Mac id, the time of its last disconnect, in memory; documented as
   observational and absent after a relay restart.
@@ -1439,8 +1447,9 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   and a head may be at most 16 KiB. What clients can make the relay hold is bounded by
   `MAX_CONNECTIONS` times the queue budget and one message being read — its text, the copy
   decoding makes, and one decoded record, since a byte field longer than its type allows is
-  refused before it is decoded — plus every socket's request buffers, about 791 MiB at the
-  defaults, logged at startup. At most 1,024 held sets of disconnected
+  refused before it is decoded — plus every socket's request buffers and the routing table's
+  sets, at most 1,024 held and one per connected Mac, about 792 MiB at the defaults, logged
+  at startup. At most 1,024 held sets of disconnected
   Macs are kept, the longest disconnected forgotten first, whenever a set is added or a Mac
   disconnects; its phones are then answered `mac_offline` as after a restart. A Mac's set is
   measured before duplicates are dropped. One client can take every connection slot with

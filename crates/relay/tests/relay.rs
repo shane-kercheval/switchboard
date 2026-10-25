@@ -344,6 +344,35 @@ async fn registration_refuses_an_unsupported_relay_protocol() {
 }
 
 #[tokio::test]
+async fn a_register_in_another_protocols_shape_is_a_protocol_mismatch() {
+    let relay = start_default().await;
+    let newer = serde_json::json!({
+        "type": "register",
+        "relay_protocol": RELAY_PROTOCOL + 1,
+        "identity": { "kind": "a shape this relay does not know" },
+    });
+    let (mut socket, _) = open(&relay.url()).await;
+    send_text(&mut socket, &newer.to_string()).await;
+    assert_eq!(
+        codes(&until_closed(&mut socket).await),
+        vec![ErrorCode::ProtocolMismatch]
+    );
+
+    // In this protocol's number, the same shape is just malformed.
+    let current = serde_json::json!({
+        "type": "register",
+        "relay_protocol": RELAY_PROTOCOL,
+        "identity": { "kind": "a shape this relay does not know" },
+    });
+    let (mut socket, _) = open(&relay.url()).await;
+    send_text(&mut socket, &current.to_string()).await;
+    assert_eq!(
+        codes(&until_closed(&mut socket).await),
+        vec![ErrorCode::BadMessage]
+    );
+}
+
+#[tokio::test]
 async fn registration_refuses_a_denied_device() {
     let keys = new_keys();
     let config = Config {

@@ -96,6 +96,19 @@ pub(crate) fn longest_client_message(max_devices_per_mac: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// The `relay_protocol` a `register` names, read without the rest of it, so
+/// one from a client speaking another protocol, whose shape may differ, is
+/// still recognized as one. `None` for anything that is not a `register`.
+pub(crate) fn claimed_relay_protocol(text: &str) -> Option<u32> {
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Claim {
+        Register { relay_protocol: u32 },
+    }
+    let Claim::Register { relay_protocol } = serde_json::from_str(text).ok()?;
+    Some(relay_protocol)
+}
+
 /// A client's messages to the relay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

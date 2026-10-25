@@ -81,3 +81,11 @@ strip = true
 [profile.ios]
 inherits = "release"
 panic = "unwind"
+
+# The relay's server binary (`crates/relay/Dockerfile`). Under `panic = "abort"`
+# a panic in one connection's task would end the process and every other
+# connection with it; unwinding ends only that task. Built for speed, not size.
+[profile.relay]
+inherits = "release"
+opt-level = 3
+panic = "unwind"

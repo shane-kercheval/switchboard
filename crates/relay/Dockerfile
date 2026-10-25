@@ -21,8 +21,8 @@ WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p switchboard-relay \
-    && cp target/release/switchboard-relay /usr/local/bin/
+    cargo build --profile relay --locked -p switchboard-relay \
+    && cp target/relay/switchboard-relay /usr/local/bin/
 
 FROM debian:trixie-slim
 RUN useradd --system --no-create-home relay

@@ -50,8 +50,9 @@ pub struct Config {
     /// How long a new connection has to answer the challenge.
     pub register_timeout: Duration,
     /// Bytes of frames queued for one connection at most. A frame for a
-    /// connection with no room left is refused as `recipient_full`, and the
-    /// connection closed. The default holds the longest message whole.
+    /// connection with no room left is refused as `recipient_full`, and a
+    /// phone's connection closed. The default holds the longest message
+    /// whole.
     pub queue_bytes: usize,
 }
 
@@ -121,7 +122,10 @@ impl Config {
     /// any connection that sends it, and a byte rate below it would hold
     /// such a message for longer than a second. A queue budget smaller than
     /// one frame of the longest record could never admit that frame, and
-    /// its recipient would be closed by the first one it was sent.
+    /// its recipient would be closed by the first one it was sent. An idle
+    /// timeout no longer than the ping interval would close a client that
+    /// only answers the relay's pings before a ping could draw its answer,
+    /// and a registration window of zero would close every connection.
     pub fn validated(self) -> Result<Self, ConfigError> {
         if self.max_devices_per_mac > MAX_DEVICES_PER_MAC_CAP {
             return Err(ConfigError::Inconsistent(
@@ -148,6 +152,16 @@ impl Config {
         }
         if self.ping_interval.is_zero() {
             return Err(ConfigError::Inconsistent("ping_interval must be positive"));
+        }
+        if self.idle_timeout <= self.ping_interval {
+            return Err(ConfigError::Inconsistent(
+                "idle_timeout must be longer than ping_interval",
+            ));
+        }
+        if self.register_timeout.is_zero() {
+            return Err(ConfigError::Inconsistent(
+                "register_timeout must be positive",
+            ));
         }
         if self.max_frame_bytes < longest_client_message(self.max_devices_per_mac) {
             return Err(ConfigError::Inconsistent(
@@ -305,6 +319,18 @@ mod tests {
                 ping_interval: Duration::ZERO,
                 ..Config::default()
             },
+            Config {
+                idle_timeout: Duration::ZERO,
+                ..Config::default()
+            },
+            Config {
+                idle_timeout: Config::default().ping_interval,
+                ..Config::default()
+            },
+            Config {
+                register_timeout: Duration::ZERO,
+                ..Config::default()
+            },
         ] {
             assert!(
                 matches!(
@@ -331,7 +357,7 @@ mod tests {
         const CLIENT_SILENCE: Duration = Duration::from_secs(50);
         let config = Config::default();
         assert!(config.ping_interval * 2 <= CLIENT_SILENCE);
-        assert!(config.ping_interval < config.idle_timeout);
+        assert!(config.validated().is_ok());
     }
 
     #[test]

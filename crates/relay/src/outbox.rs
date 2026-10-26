@@ -1,14 +1,15 @@
 //! A connection's outbound queue. Frames from other devices are bounded by
 //! bytes, and a frame for a recipient with no room left is refused, never
-//! waited on: the recipient is closed and the sender told, so a sender's
-//! reader never blocks on a slow recipient. The relay's own messages —
-//! `registered`, notices, errors — hold no budget, and are bounded only by
-//! the queue's count of messages; a connection that leaves that many unread
-//! is closed.
+//! waited on, and the sender told, so a sender's reader never blocks on a
+//! slow recipient. The relay's own messages — `registered`, notices,
+//! errors — hold no budget, and are bounded only by the queue's count of
+//! messages; a connection that leaves that many unread is closed.
 //!
-//! A recipient closed for want of room has lost a frame its sender sent, and
-//! anything it was sent after that would arrive past the gap. Closing it
-//! makes the gap a reconnect, after which it catches up.
+//! A refused frame leaves a gap in the one session it belonged to, which
+//! that session's ends recover from by starting a new one. A phone with no
+//! room is closed, since its one session is broken anyway: closing it makes
+//! the gap a reconnect, after which it catches up. A Mac with no room is
+//! kept, since closing it would end its sessions with every other phone.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,10 +56,20 @@ pub(crate) fn longest_message_cost() -> usize {
     MAX_MESSAGE_FRAMES * frame_cost(MAX_FRAME_LEN)
 }
 
+/// What a recipient with no room for a frame does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WhenFull {
+    /// Closes, and refuses every frame that reaches it while it closes.
+    Close,
+    /// Stays open, refusing only the frames it has no room for.
+    Refuse,
+}
+
 /// Why a frame was not queued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotQueued {
-    /// The recipient had no room for it, now or earlier, and is closed.
+    /// The recipient had no room for it, or was closed earlier for having
+    /// none.
     Full,
     /// The recipient is closing for another reason.
     Closed,
@@ -126,9 +137,15 @@ impl Outbox {
         }
     }
 
-    /// Queues a frame of `cost` without waiting. A connection with no room
-    /// for it is closed, and it and every frame after it refused as `Full`.
-    pub fn queue_frame(&self, message: ServerMessage, cost: usize) -> Result<(), NotQueued> {
+    /// Queues a frame of `cost` without waiting, or refuses it as `Full` if
+    /// the connection has no room for it, and then closes the connection if
+    /// `when_full` says to.
+    pub fn queue_frame(
+        &self,
+        message: ServerMessage,
+        cost: usize,
+        when_full: WhenFull,
+    ) -> Result<(), NotQueued> {
         if self.full.load(Ordering::Relaxed) {
             return Err(NotQueued::Full);
         }
@@ -137,14 +154,14 @@ impl Outbox {
         }
         let permits = u32::try_from(cost.min(self.capacity)).unwrap_or(u32::MAX);
         let Ok(permit) = Arc::clone(&self.budget).try_acquire_many_owned(permits) else {
-            return Err(self.close_as_full());
+            return Err(self.full(when_full));
         };
         match self.queue.try_send(Outbound {
             message,
             _permit: Some(permit),
         }) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(self.close_as_full()),
+            Err(TrySendError::Full(_)) => Err(self.full(when_full)),
             Err(TrySendError::Closed(_)) => {
                 self.closed.cancel();
                 Err(NotQueued::Closed)
@@ -152,10 +169,12 @@ impl Outbox {
         }
     }
 
-    fn close_as_full(&self) -> NotQueued {
-        tracing::debug!("closing a connection with no room for a frame");
-        self.full.store(true, Ordering::Relaxed);
-        self.closed.cancel();
+    fn full(&self, when_full: WhenFull) -> NotQueued {
+        if when_full == WhenFull::Close {
+            tracing::debug!("closing a connection with no room for a frame");
+            self.full.store(true, Ordering::Relaxed);
+            self.closed.cancel();
+        }
         NotQueued::Full
     }
 }
@@ -248,7 +267,13 @@ mod tests {
         }
 
         fn send(&self, n: u8) -> Result<(), NotQueued> {
-            self.outbox.queue_frame(frame(n), MIN_FRAME_COST)
+            self.outbox
+                .queue_frame(frame(n), MIN_FRAME_COST, WhenFull::Close)
+        }
+
+        fn send_kept(&self, n: u8) -> Result<(), NotQueued> {
+            self.outbox
+                .queue_frame(frame(n), MIN_FRAME_COST, WhenFull::Refuse)
         }
 
         fn fill(&self) {
@@ -284,6 +309,23 @@ mod tests {
         // Room has come back, but the recipient has lost a frame.
         while recipient.writer.try_recv().is_some() {}
         assert_eq!(recipient.send(5), Err(NotQueued::Full));
+    }
+
+    #[test]
+    fn a_recipient_kept_when_full_refuses_only_the_frames_it_has_no_room_for() {
+        let mut recipient = Recipient::new();
+        recipient.fill();
+        assert_eq!(recipient.send_kept(4), Err(NotQueued::Full));
+        assert!(!recipient.closed.is_cancelled());
+        assert_eq!(
+            recipient.writer.try_recv().map(|message| record(&message)),
+            Some(0)
+        );
+        assert_eq!(recipient.send_kept(5), Ok(()));
+        let queued: Vec<u8> = std::iter::from_fn(|| recipient.writer.try_recv())
+            .map(|message| record(&message))
+            .collect();
+        assert_eq!(queued, vec![1, 2, 3, 5]);
     }
 
     #[test]

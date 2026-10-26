@@ -38,7 +38,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      # The rustup shim reads `rust-toolchain.toml`; resolving it first lets
+      # the cache key on the pinned compiler.
+      - name: Resolve pinned Rust toolchain
+        run: rustc --version --verbose
+
+      # The relay's dependencies for the test step. The image's build below
+      # has its own cache mounts, which a fresh runner starts empty. Pinned,
+      # as in hygiene.yml, because its key derivation decides which caches
+      # stay reachable.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: relay
 
       - name: Relay tests on Linux
         run: CARGO_INCREMENTAL=0 cargo test -p switchboard-relay --all-features --locked

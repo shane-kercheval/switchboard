@@ -703,10 +703,11 @@ async fn a_refused_client_that_never_answers_the_close_keeps_its_slot_only_brief
 async fn a_silent_client_is_closed_and_a_pinging_one_is_not() {
     // Pings every 100 ms against a 2 s timeout, for longer than the timeout:
     // a twenty-fold margin, so a loaded machine cannot close the pinging one.
-    // The relay's own pings, 25 s apart, come too late to draw a pong from
-    // the silent one.
+    // The relay's own pings draw no pong from the silent one, which reads
+    // nothing.
     let relay = start(Config {
         idle_timeout: Duration::from_secs(2),
+        ping_interval: Duration::from_secs(1),
         ..Config::default()
     })
     .await;
@@ -719,7 +720,13 @@ async fn a_silent_client_is_closed_and_a_pinging_one_is_not() {
             .send(Message::Ping(b"keepalive".to_vec().into()))
             .await
             .unwrap();
-        let pong = tokio::time::timeout(WAIT, pinging.socket.next()).await;
+        // Past the relay's own pings, which the client answers as it reads.
+        let pong = loop {
+            let read = tokio::time::timeout(WAIT, pinging.socket.next()).await;
+            if !matches!(read, Ok(Some(Ok(Message::Ping(_))))) {
+                break read;
+            }
+        };
         assert!(matches!(pong, Ok(Some(Ok(Message::Pong(_))))), "{pong:?}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -924,17 +931,48 @@ async fn a_phone_with_no_room_is_closed_and_the_macs_other_phone_gets_every_fram
 }
 
 #[tokio::test]
-async fn a_mac_with_no_room_is_closed_and_its_phone_told_and_kept() {
+async fn a_mac_with_no_room_refuses_the_frame_and_stays_connected_to_every_phone() {
     let relay = start(small_budget()).await;
-    let (mut mac, mut phone) = paired(&relay).await;
-    let mac_id = mac.id.clone();
+    let mac_keys = new_keys();
+    let mac_id = id_of(&mac_keys);
+    let mut sending = Client::phone(&relay, new_keys(), &mac_id).await;
+    let mut other = Client::phone(&relay, new_keys(), &mac_id).await;
+    let mut mac = Client::mac(&relay, mac_keys, &[&sending.id, &other.id]).await;
+    let record = large_record();
 
-    let said = send_until_full(&mut phone, &mac_id).await;
+    let mut queued = 0;
+    let said = loop {
+        assert!(
+            queued < 2_000,
+            "a Mac that read nothing never ran out of room"
+        );
+        sending.frame(&mac_id, &record).await;
+        let said = sending.sync().await;
+        if !said.is_empty() {
+            break said;
+        }
+        queued += 1;
+    };
+    // Refused, with no notice: the Mac is still connected.
+    assert_eq!(said.len(), 1, "{said:?}");
     assert!(is_recipient_full(&said[0], &mac_id), "{said:?}");
-    assert_eq!(said[1], notice(&mac_id));
-    phone.frame(&mac_id, b"after").await;
-    assert_eq!(error_code(&phone.next().await), ErrorCode::MacOffline);
-    assert!(closes_with_a_close_frame(&mut mac.socket).await);
+    assert_eq!(sending.sync().await, vec![]);
+
+    // The Mac gets every frame queued before the refused one, and then the
+    // other phone's.
+    let delivered = mac.sync().await;
+    assert_eq!(delivered.len(), queued);
+    assert!(
+        delivered
+            .iter()
+            .all(|frame| *frame == frame_from(&sending.id, &mac_id, &record))
+    );
+    other.frame(&mac_id, b"still here").await;
+    assert_eq!(
+        mac.next().await,
+        frame_from(&other.id, &mac_id, b"still here")
+    );
+    assert_eq!(other.sync().await, vec![]);
 }
 
 #[tokio::test]

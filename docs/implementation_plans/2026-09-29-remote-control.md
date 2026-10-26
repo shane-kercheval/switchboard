@@ -17,11 +17,13 @@ shared Rust cryptography are in one tree.
 
 ## Changelog
 
-- **Revision 25 (2026-10-15)** — a full recipient is closed and its sender told (§4, §5.1,
-  §5.6, §6, §9).
-  - **A frame for a recipient with no room is refused, not waited on.** The relay closes the
-    recipient and answers the sender `error { recipient_full, device_id }` naming it; the
-    frame is dropped and the sender's connection stays open. Each frame's cost and the
+- **Revision 25 (2026-10-15)** — a frame for a full recipient is refused and its sender told;
+  a full phone is closed (§4, §5.1, §5.6, §6, §7.2, §9).
+  - **A frame for a recipient with no room is refused, not waited on.** The relay answers the
+    sender `error { recipient_full, device_id }` naming the recipient; the frame is dropped and
+    the sender's connection stays open. A phone with no room is also closed; a Mac with no room
+    is kept, since closing it would end its sessions with every other phone for a gap in one
+    phone's, and that phone starts a new session. Each frame's cost and the
     relay's own messages are unchanged. **Replaces** revision 24's wait for room,
     and with it the stall timeout, the room timeout, the per-socket limit on unsent bytes, and
     the check of a waited frame before it is queued.
@@ -47,7 +49,10 @@ shared Rust cryptography are in one tree.
     which is false of the newer registration's pairing. A `register` naming another
     `relay_protocol` is answered `protocol_mismatch` whatever else it holds, since a newer
     protocol may change its shape. The relay's binary is built under its own Cargo profile,
-    which unwinds on panic, so a panic ends one connection's task rather than the relay.
+    which unwinds on panic, so a panic ends one connection's task rather than the relay; a
+    connection whose task panics closes and ends its registration as it would have anyway.
+    The relay refuses at startup an idle timeout no longer than its ping interval and a zero
+    registration window.
 - **Revision 24 (2026-10-12)** — the relay, settled while building it and in two reviews of
   it (§2, §4, §5.1, §5.2, §5.6, §6, §7.2, §7.3, §9).
   - **Every relay message is a WebSocket text message holding JSON**, tagged by `type`, with
@@ -865,8 +870,8 @@ project: `AppError::ProjectLocked`), `project_load_timeout`, `protocol_mismatch`
 side to update; also returned by the relay for an unsupported `relay_protocol`, §6),
 `unknown_recipient`, and `internal`, with the error's text as `message`. The relay's own
 errors on its connection also include `registration_refused`, `bad_message`,
-`limit_exceeded`, and `recipient_full`, which names a recipient the relay closed for having no
-room for a frame (§6); a full relay answers HTTP 503 before the upgrade, or closes the socket
+`limit_exceeded`, and `recipient_full`, which names a recipient that had no room for a frame,
+dropped; a phone recipient is also closed (§6); a full relay answers HTTP 503 before the upgrade, or closes the socket
 at once when even its HTTP headroom is taken, and clients treat either as "relay
 unavailable". `internal` covers
 every `AppError` without its own code, such as `ProjectUnderMaintenance`, and a reply that
@@ -1413,25 +1418,28 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   between reading a frame and queueing or refusing it. Each connection's queue holds at most
   12 MiB of frames, each charged its encoded size (its record as base64 and 256 bytes of JSON)
   and at least 4 KiB, returned once the frame is sent. A frame for a recipient with no room
-  for it is not waited on: the relay closes the recipient, sending what is already queued to
-  it for up to 2 seconds, and answers the sender `error { recipient_full, device_id }` naming
-  the recipient. The frame is dropped and the sender's connection stays open. Any frame that
-  reaches the recipient while it closes is refused the same way, and its registration ends
-  as any other does, so its peers get `peer_disconnected` once. Routing and queueing happen
-  under one lock, so two senders racing to one full recipient each get their own error and
-  the recipient is closed once. The relay's own messages (`registered`, notices, errors)
+  for it is not waited on: the relay answers the sender `error { recipient_full, device_id }`
+  naming the recipient. The frame is dropped and the sender's connection stays open. A phone
+  with no room is also closed, sending what is already queued to it for up to 2 seconds; any
+  frame that reaches it while it closes is refused the same way, and its registration ends as
+  any other does, so its Mac gets `peer_disconnected` once. A Mac with no room is kept and
+  refuses only the frames it has no room for: closing it would end its sessions with every
+  other phone, for a gap in one phone's session, which that phone's `recipient_full` tells it
+  to replace (§7.2). Routing and queueing happen under one lock, so senders racing to a full
+  recipient each get their own error, and a phone is closed once. The relay's own messages (`registered`, notices, errors)
   never wait and hold no byte budget; they are bounded only by the queue's count of
   messages, about 3,200 at the default budget, and a client that leaves that many unread,
   which is one not reading its own errors, is closed. Frames a recipient receives arrive in
-  the order their sender sent them. A refused frame leaves a gap, which is why the recipient
-  is closed rather than kept: its session would close at the gap anyway (§3), and on
-  reconnect it catches up through the live-turn snapshot (§5.7) and idempotent sends (§5.5).
+  the order their sender sent them. A refused frame leaves a gap, which is why a phone
+  recipient is closed rather than kept: its one session would close at the gap anyway (§3),
+  and on reconnect it catches up through the live-turn snapshot (§5.7) and idempotent sends
+  (§5.5).
   A recipient that stops reading and is sent nothing never fills its queue; it stops
   answering the relay's pings and is closed at the idle timeout. A send that fails closes its
   connection, so its peers are told.
 
   A slow phone costs only itself: the Mac's frames to its other phones are never held behind
-  it. The budget holds the longest message whole, 8 MiB and about 10.8 MiB as encoded frames,
+  it. A phone that outruns its Mac's link costs only its own session. The budget holds the longest message whole, 8 MiB and about 10.8 MiB as encoded frames,
   so no single reply closes a phone however slow its link; a unit test holds the default to
   that. A phone is closed only when the Mac sends it more than the budget ahead of what it
   has taken in, which takes several large replies or a long run of events back to back.
@@ -1486,9 +1494,11 @@ Deliberately dumb; never sees plaintext; holds no conversation state.
   delivered whole; a phone with no room closed with a close frame, its Mac answered
   `recipient_full` and then told of its end, and the Mac's connection kept; the Mac's other
   phone receiving every frame in order, those sent after the first phone was closed
-  included; a Mac with no room closed, and its phone answered `recipient_full`, told of its
-  end, and then answered `mac_offline`; two senders racing to one full recipient each
-  refused, and the recipient's end announced once (in the routing table's unit tests); a
+  included; a Mac with no room kept, its phone answered `recipient_full` with no notice, and
+  the frames queued before and the other phone's after delivered; two phones racing to a
+  full Mac each refused, and a full phone's end announced once (in the routing table's unit
+  tests); a connection whose reader panics closed, its end announced, and the relay serving
+  the rest; an idle timeout no longer than the ping interval refused at startup; a
   phone that stops reading and is sent nothing closed at the idle timeout; a client that
   never reads its errors closed; frame and record limits; settings
   past their caps refused; held sets pruned after mass disconnects; a socket past the
@@ -1538,7 +1548,8 @@ though the phone cannot send attachments.
   one that drops during the grace period stays down until the app returns, because the keys
   the handshake needs are readable only while the phone is unlocked (§2). On
   `peer_disconnected` for the paired Mac it discards the session and retries the handshake
-  with the same backoff. A session that has opened no record within 10 seconds of its
+  with the same backoff, and on `recipient_full` naming the Mac likewise: the Mac had no room
+  for one of its frames, so the session has a gap and would break at it. A session that has opened no record within 10 seconds of its
   handshake is discarded and the handshake retried, since a lost `hello` or a lost answer to
   it would otherwise leave it waiting. The deadline waits for any record to open, not for a
   particular envelope; the Mac answers `hello` at once (§4), so a live, idle session always

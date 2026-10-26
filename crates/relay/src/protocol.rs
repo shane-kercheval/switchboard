@@ -247,9 +247,10 @@ pub enum ErrorCode {
     /// The pairing token is unknown, expired, closed, or bound to another
     /// device.
     PairingExpired,
-    /// The recipient, named by `device_id`, had no room for this frame and
-    /// has been closed. The frame was not delivered; the sender's connection
-    /// stays open.
+    /// The recipient, named by `device_id`, had no room for this frame,
+    /// which was not delivered; the sender's connection stays open. A phone
+    /// recipient has been closed. A Mac recipient is kept, and the phone that
+    /// sent the frame starts a new session, since its current one has a gap.
     RecipientFull,
     #[serde(other)]
     Unknown,

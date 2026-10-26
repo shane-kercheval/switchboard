@@ -3,6 +3,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
@@ -15,8 +16,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use chrono::Utc;
-use futures::StreamExt;
 use futures::stream::SplitStream;
+use futures::{FutureExt, StreamExt};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde_json::json;
@@ -329,7 +330,16 @@ async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     let (sink, stream) = socket.split();
     let closed = shared.shutdown.child_token();
     let (outbox, writer) = Outbox::new(shared.config.queue_bytes, closed.clone());
-    let mut writer = tokio::spawn(writer.run(sink, shared.config.ping_interval));
+    let ping_interval = shared.config.ping_interval;
+    let writer_closed = closed.clone();
+    let mut writer = tokio::spawn(async move {
+        // The reader is watching for the connection to close; a writer that
+        // died without closing it would leave its registration swallowing
+        // frames, as a failed send would.
+        if unwinding(writer.run(sink, ping_interval)).await.is_none() {
+            writer_closed.cancel();
+        }
+    });
     let mut connection = Connection {
         limiter: RateLimiter::new(&shared.config, Instant::now()),
         shared: Arc::clone(&shared),
@@ -339,7 +349,7 @@ async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
         registration: None,
         heard: Instant::now(),
     };
-    connection.run().await;
+    unwinding(connection.run()).await;
     // Frames routed here before the registration ends below are dropped,
     // not queued. The writer does not watch it, so what is queued still
     // goes out.
@@ -381,6 +391,18 @@ async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     // Only now are both halves of the socket gone, and with them its share
     // of the socket limit, so only now is its admission returned.
     drop(permit);
+}
+
+/// Runs `task` to its end, or until it panics, which is logged. Either way
+/// what follows runs: a panic in one connection's task ends that
+/// connection, which closes as it would have anyway, rather than leaving its
+/// registration in the routing table with no one to end it.
+async fn unwinding<T>(task: impl Future<Output = T>) -> Option<T> {
+    let output = AssertUnwindSafe(task).catch_unwind().await.ok();
+    if output.is_none() {
+        tracing::error!("a connection's task panicked; closing the connection");
+    }
+    output
 }
 
 struct Registration {
@@ -484,24 +506,24 @@ impl Connection {
             self.refuse(Refusal::registration_refused("this device is denied"));
             return false;
         }
-        let (phone_of, set) = match &claim.role {
-            Role::Mac { paired_devices } => (None, set_for_log(paired_devices)),
-            Role::Phone { mac } => (Some(mac.clone()), None),
-        };
         let registered = self.shared.relay().register(
             id.clone(),
-            claim.role,
+            &claim.role,
             self.outbox.clone(),
             Utc::now(),
             table_now(),
         );
         match registered {
             Ok(generation) => {
-                match phone_of {
-                    None => tracing::info!(device_id = %id, "registered a Mac"),
-                    Some(mac) => tracing::info!(device_id = %id, %mac, "registered a phone"),
+                match &claim.role {
+                    Role::Mac { paired_devices } => {
+                        tracing::info!(device_id = %id, "registered a Mac");
+                        log_set(&id, paired_devices);
+                    }
+                    Role::Phone { mac } => {
+                        tracing::info!(device_id = %id, %mac, "registered a phone");
+                    }
                 }
-                log_set(&id, set);
                 self.registration = Some(Registration { id, generation });
                 true
             }
@@ -525,6 +547,8 @@ impl Connection {
                 record,
                 pairing_token,
             } => {
+                #[cfg(test)]
+                assert_ne!(record, tests::PANIC_RECORD, "a test's panic");
                 // A record longer than any frame does not decode, so it
                 // never gets here: it is `bad_message` as not a relay message.
                 self.shared
@@ -532,13 +556,12 @@ impl Connection {
                     .forward(id, generation, &to, record, pairing_token, table_now())
             }
             ClientMessage::PairedDevices { device_ids } => {
-                let set = set_for_log(&device_ids);
                 let changed = self
                     .shared
                     .relay()
-                    .set_paired_devices(id, generation, device_ids);
+                    .set_paired_devices(id, generation, &device_ids);
                 if changed == Ok(true) {
-                    log_set(id, set);
+                    log_set(id, &device_ids);
                 }
                 changed.map(|_| ())
             }
@@ -648,20 +671,10 @@ fn table_now() -> std::time::Instant {
     Instant::now().into_std()
 }
 
-/// A Mac's set, written out only when debug logging is on: a client may
-/// send its set as often as its rate allows, so it is logged at debug, and
-/// costs nothing otherwise.
-fn set_for_log(paired_devices: &[DeviceId]) -> Option<String> {
-    tracing::enabled!(tracing::Level::DEBUG).then(|| {
-        let ids: Vec<&str> = paired_devices.iter().map(DeviceId::as_str).collect();
-        format!("{ids:?}")
-    })
-}
-
-fn log_set(id: &DeviceId, set: Option<String>) {
-    if let Some(set) = set {
-        tracing::debug!(device_id = %id, paired_devices = %set, "paired devices");
-    }
+/// A Mac's set, at debug: a client may send its set as often as its rate
+/// allows. `tracing` formats it only when debug logging is on.
+fn log_set(id: &DeviceId, paired_devices: &[DeviceId]) {
+    tracing::debug!(device_id = %id, ?paired_devices, "paired devices");
 }
 
 /// Two token buckets, messages and bytes, each refilling at its rate. A
@@ -725,7 +738,124 @@ impl Bucket {
 
 #[cfg(test)]
 mod tests {
+    use futures::SinkExt;
+    use switchboard_remote_crypto::DeviceKeys;
+    use tokio_tungstenite::tungstenite;
+
     use super::*;
+    use crate::protocol::ErrorCode;
+
+    /// A frame carrying this record panics the reader that handles it.
+    pub(super) const PANIC_RECORD: &[u8] = b"panic";
+
+    type Socket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn next(socket: &mut Socket) -> Option<ServerMessage> {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("the relay said nothing")
+            {
+                Some(Ok(tungstenite::Message::Text(text))) => {
+                    return Some(serde_json::from_str(&text).unwrap());
+                }
+                Some(Ok(tungstenite::Message::Close(_)) | Err(_)) | None => return None,
+                Some(Ok(_)) => {}
+            }
+        }
+    }
+
+    async fn send(socket: &mut Socket, message: &ClientMessage) {
+        let text = serde_json::to_string(message).unwrap();
+        socket
+            .send(tungstenite::Message::Text(text.into()))
+            .await
+            .unwrap();
+    }
+
+    async fn connect(relay: &RelayHandle, keys: &DeviceKeys, role: Role) -> Socket {
+        let (mut socket, _) = tokio_tungstenite::connect_async(relay.url()).await.unwrap();
+        let Some(ServerMessage::Challenge { nonce, .. }) = next(&mut socket).await else {
+            panic!("no challenge");
+        };
+        let register = Register {
+            relay_protocol: RELAY_PROTOCOL,
+            device_id: DeviceId::from_identity_key(&keys.identity_public_key()),
+            identity_public_key: keys.identity_public_key().to_bytes(),
+            signature: keys.sign_relay_challenge(&nonce).to_bytes(),
+            role,
+        };
+        send(&mut socket, &ClientMessage::Register(register)).await;
+        assert_eq!(next(&mut socket).await, Some(ServerMessage::Registered));
+        socket
+    }
+
+    fn frame(to: &DeviceId, record: &[u8]) -> ClientMessage {
+        ClientMessage::Frame {
+            to: to.clone(),
+            record: record.to_vec(),
+            pairing_token: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_whose_reader_panics_is_closed_and_its_end_announced() {
+        let relay = RelayHandle::start(SocketAddr::from(([127, 0, 0, 1], 0)), Config::default())
+            .await
+            .unwrap();
+        let (mac_keys, phone_keys, other_keys) = (
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+        );
+        let id_of = |keys: &DeviceKeys| DeviceId::from_identity_key(&keys.identity_public_key());
+        let (mac_id, phone_id, other_id) =
+            (id_of(&mac_keys), id_of(&phone_keys), id_of(&other_keys));
+        let mac_of = || Role::Phone {
+            mac: mac_id.clone(),
+        };
+        let mut phone = connect(&relay, &phone_keys, mac_of()).await;
+        let mut other = connect(&relay, &other_keys, mac_of()).await;
+        let mut mac = connect(
+            &relay,
+            &mac_keys,
+            Role::Mac {
+                paired_devices: vec![phone_id.clone(), other_id.clone()],
+            },
+        )
+        .await;
+
+        send(&mut phone, &frame(&mac_id, PANIC_RECORD)).await;
+        assert_eq!(next(&mut phone).await, None);
+        assert_eq!(
+            next(&mut mac).await,
+            Some(ServerMessage::PeerDisconnected {
+                device_id: phone_id.clone()
+            })
+        );
+        // The relay goes on serving everyone else.
+        send(&mut other, &frame(&mac_id, b"still here")).await;
+        assert_eq!(
+            next(&mut mac).await,
+            Some(ServerMessage::Frame {
+                to: mac_id.clone(),
+                from: other_id,
+                record: b"still here".to_vec(),
+                pairing_token: None,
+            })
+        );
+        send(&mut mac, &frame(&phone_id, b"gone")).await;
+        assert!(matches!(
+            next(&mut mac).await,
+            Some(ServerMessage::Error {
+                code: ErrorCode::PhoneOffline,
+                ..
+            })
+        ));
+        relay.shutdown().await.unwrap();
+    }
 
     fn limiter(
         rate_limit: u32,

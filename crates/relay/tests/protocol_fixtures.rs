@@ -267,7 +267,13 @@ fn every_fixture_file_is_checked() {
     for dir in ["to_relay", "from_relay"] {
         for entry in std::fs::read_dir(fixture_dir().join(dir)).unwrap() {
             let name = entry.unwrap().file_name().into_string().unwrap();
-            found.insert(format!("{dir}/{name}"));
+            // Only fixtures: Finder leaves a `.DS_Store` in any folder it opens.
+            if Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext == "json")
+            {
+                found.insert(format!("{dir}/{name}"));
+            }
         }
     }
     assert_eq!(

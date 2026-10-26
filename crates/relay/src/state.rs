@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
-use crate::outbox::{NotQueued, Outbox, frame_cost};
+use crate::outbox::{NotQueued, Outbox, WhenFull, frame_cost};
 use crate::protocol::{
     DeviceId, ErrorCode, PAIRING_TOKEN_LEN, Role, ServerMessage, TOKEN_HASH_LEN, token_hash,
 };
@@ -112,13 +112,15 @@ impl Refusal {
         }
     }
 
-    /// The recipient had no room for a frame and has been closed.
-    fn recipient_full(recipient: &DeviceId) -> Self {
-        Self::about(
-            ErrorCode::RecipientFull,
-            "that device had no room for the frame and has been disconnected",
-            recipient,
-        )
+    /// The recipient had no room for a frame, which is dropped, and has
+    /// been closed if `closed`.
+    fn recipient_full(recipient: &DeviceId, closed: bool) -> Self {
+        let message = if closed {
+            "that device had no room for the frame and has been disconnected"
+        } else {
+            "that device had no room for the frame, which was dropped"
+        };
+        Self::about(ErrorCode::RecipientFull, message, recipient)
     }
 
     /// A `register` naming another relay protocol, whatever else it holds.
@@ -195,7 +197,7 @@ impl Relay {
     pub fn register(
         &mut self,
         id: DeviceId,
-        role: Role,
+        role: &Role,
         outbox: Outbox,
         wall: DateTime<Utc>,
         now: Instant,
@@ -207,9 +209,9 @@ impl Relay {
                 if paired_devices.len() > self.max_devices_per_mac {
                     return Err(Refusal::too_many_devices());
                 }
-                (Kind::Mac, Some(paired_devices.into_iter().collect()))
+                (Kind::Mac, Some(paired_devices.iter().cloned().collect()))
             }
-            Role::Phone { mac } => (Kind::Phone { mac }, None),
+            Role::Phone { mac } => (Kind::Phone { mac: mac.clone() }, None),
         };
         if let Some(old) = self.registered.remove(&id) {
             old.outbox.close();
@@ -338,7 +340,7 @@ impl Relay {
         &mut self,
         mac: &DeviceId,
         generation: u64,
-        device_ids: Vec<DeviceId>,
+        device_ids: &[DeviceId],
     ) -> Result<bool, Refusal> {
         if !self.acting_mac(mac, generation)? {
             return Ok(false);
@@ -349,7 +351,7 @@ impl Relay {
                 ..Refusal::too_many_devices()
             });
         }
-        let phones: HashSet<DeviceId> = device_ids.into_iter().collect();
+        let phones: HashSet<DeviceId> = device_ids.iter().cloned().collect();
         if self
             .pairings
             .get(mac)
@@ -423,11 +425,14 @@ impl Relay {
     }
 
     /// Queues a frame from `from` for `to`, without waiting, or returns why
-    /// it may not pass. A recipient with no room for it is closed, and this
-    /// frame and any that reach it while it closes are refused as
-    /// `recipient_full`. A frame for a recipient closing for another reason
-    /// is dropped: its sender hears of that through `peer_disconnected`. So
-    /// is one from a replaced connection, which is closing itself.
+    /// it may not pass. A frame for a recipient with no room for it is
+    /// refused as `recipient_full`. A phone with no room is closed, and any
+    /// frame that reaches it while it closes is refused the same way. A Mac
+    /// with no room is kept: closing it would end its sessions with every
+    /// other phone, for a gap in one phone's. A frame for a recipient closing
+    /// for another reason is dropped: its sender hears of that through
+    /// `peer_disconnected`. So is one from a replaced connection, which is
+    /// closing itself.
     pub fn forward(
         &mut self,
         from: &DeviceId,
@@ -437,6 +442,12 @@ impl Relay {
         pairing_token: Option<[u8; PAIRING_TOKEN_LEN]>,
         now: Instant,
     ) -> Result<(), Refusal> {
+        let when_full = match self.registered.get(to) {
+            Some(Peer {
+                kind: Kind::Mac, ..
+            }) => WhenFull::Refuse,
+            _ => WhenFull::Close,
+        };
         let Some(outbox) = self.route(from, generation, to, pairing_token.as_ref(), now)? else {
             return Ok(());
         };
@@ -447,9 +458,9 @@ impl Relay {
             record,
             pairing_token,
         };
-        match outbox.queue_frame(frame, cost) {
+        match outbox.queue_frame(frame, cost, when_full) {
             Ok(()) | Err(NotQueued::Closed) => Ok(()),
-            Err(NotQueued::Full) => Err(Refusal::recipient_full(to)),
+            Err(NotQueued::Full) => Err(Refusal::recipient_full(to, when_full == WhenFull::Close)),
         }
     }
 
@@ -623,11 +634,12 @@ mod tests {
         register_with_budget(relay, n, role, 64 * MIN_FRAME_COST)
     }
 
+    #[allow(clippy::needless_pass_by_value)] // Callers build the role inline.
     fn register_with_budget(relay: &mut Relay, n: u16, role: Role, queue_bytes: usize) -> Device {
         let closed = CancellationToken::new();
         let (outbox, writer) = Outbox::new(queue_bytes, closed.clone());
         let generation = relay
-            .register(id(n), role, outbox, wall(0), Instant::now())
+            .register(id(n), &role, outbox, wall(0), Instant::now())
             .unwrap();
         let mut device = Device {
             id: id(n),
@@ -750,7 +762,7 @@ mod tests {
         let mut stranger = register(&mut relay, 2, phone_role(MAC));
         let mut elsewhere = register(&mut relay, 4, phone_role(3));
         relay
-            .set_paired_devices(&mac.id, mac.generation, vec![id(1), elsewhere.id.clone()])
+            .set_paired_devices(&mac.id, mac.generation, &[id(1), elsewhere.id.clone()])
             .unwrap();
         let now = Instant::now();
         assert_eq!(
@@ -826,7 +838,7 @@ mod tests {
         let (mut relay, mac, phone) = paired();
         let new = register(&mut relay, 2, phone_role(MAC));
         relay
-            .set_paired_devices(&mac.id, mac.generation, vec![new.id.clone()])
+            .set_paired_devices(&mac.id, mac.generation, std::slice::from_ref(&new.id))
             .unwrap();
         let now = Instant::now();
         assert_eq!(
@@ -846,7 +858,7 @@ mod tests {
             let refusal = relay
                 .register(
                     id(MAC),
-                    Role::Mac {
+                    &Role::Mac {
                         paired_devices: too_many.clone(),
                     },
                     outbox,
@@ -862,7 +874,7 @@ mod tests {
             let mac = register(&mut relay, MAC, mac_role(&[&phone]));
             assert_eq!(
                 relay
-                    .set_paired_devices(&mac.id, mac.generation, too_many)
+                    .set_paired_devices(&mac.id, mac.generation, &too_many)
                     .unwrap_err()
                     .code,
                 ErrorCode::LimitExceeded
@@ -876,7 +888,7 @@ mod tests {
         let (mut relay, mac, phone) = paired();
         let mut update = |ids: Vec<DeviceId>| {
             relay
-                .set_paired_devices(&mac.id, mac.generation, ids)
+                .set_paired_devices(&mac.id, mac.generation, &ids)
                 .unwrap()
         };
         assert!(!update(vec![phone.id.clone()]));
@@ -891,7 +903,7 @@ mod tests {
         let (mut relay, _mac, phone) = paired();
         let refusals = [
             relay
-                .set_paired_devices(&phone.id, phone.generation, vec![])
+                .set_paired_devices(&phone.id, phone.generation, &[])
                 .map(|_| ()),
             relay.open_pairing(
                 &phone.id,
@@ -1006,7 +1018,7 @@ mod tests {
             .unwrap();
 
         relay
-            .set_paired_devices(&old_mac.id, old_mac.generation, vec![])
+            .set_paired_devices(&old_mac.id, old_mac.generation, &[])
             .unwrap();
         relay
             .close_pairing(&old_mac.id, old_mac.generation)
@@ -1108,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn frames_racing_to_a_full_recipient_are_each_refused_and_it_is_closed_once() {
+    fn a_full_mac_refuses_each_frame_it_has_no_room_for_and_is_kept() {
         let mut relay = Relay::new(8);
         let mut first = register(&mut relay, 1, phone_role(MAC));
         let mut second = register(&mut relay, 2, phone_role(MAC));
@@ -1124,34 +1136,53 @@ mod tests {
 
         for phone in [&first, &second] {
             let refusal = send(&mut relay, phone, &mac.id, &[3], None, now).unwrap_err();
-            assert_eq!(refusal, Refusal::recipient_full(&mac.id));
+            assert_eq!(refusal, Refusal::recipient_full(&mac.id, false));
             assert!(!refusal.ends_connection());
         }
-        assert!(mac.closed.is_cancelled());
+        assert!(!mac.closed.is_cancelled());
         assert_eq!(
             mac.frames(),
             vec![(first.id.clone(), vec![1]), (second.id.clone(), vec![2])]
         );
-        // Room has come back, but the Mac has lost frames: it is still full.
+
+        // With room again, either phone's next frame reaches it.
+        send(&mut relay, &second, &mac.id, &[4], None, now).unwrap();
+        assert_eq!(mac.frames(), vec![(second.id.clone(), vec![4])]);
+        for phone in [&mut first, &mut second] {
+            assert_eq!(phone.received(), vec![]);
+        }
+    }
+
+    #[test]
+    fn a_full_phone_is_closed_and_refuses_every_later_frame_and_its_end_is_announced_once() {
+        let mut relay = Relay::new(8);
+        let mut phone = register_with_budget(&mut relay, 1, phone_role(MAC), 2 * MIN_FRAME_COST);
+        let mut mac = register(&mut relay, MAC, mac_role(&[&phone]));
+        let now = Instant::now();
+        send(&mut relay, &mac, &phone.id, &[1], None, now).unwrap();
+        send(&mut relay, &mac, &phone.id, &[2], None, now).unwrap();
+
+        let refusal = send(&mut relay, &mac, &phone.id, &[3], None, now).unwrap_err();
+        assert_eq!(refusal, Refusal::recipient_full(&phone.id, true));
+        assert!(!refusal.ends_connection());
+        assert!(phone.closed.is_cancelled());
         assert_eq!(
-            code(send(&mut relay, &first, &mac.id, &[4], None, now)),
+            phone.frames(),
+            vec![(mac.id.clone(), vec![1]), (mac.id.clone(), vec![2])]
+        );
+        // Room has come back, but the phone has lost a frame: it is still full.
+        assert_eq!(
+            code(send(&mut relay, &mac, &phone.id, &[4], None, now)),
             ErrorCode::RecipientFull
         );
 
-        // Its connection ends once, however many senders found it full.
-        assert!(relay.unregister(&mac.id, mac.generation, wall(1), now));
-        assert!(!relay.unregister(&mac.id, mac.generation, wall(2), now));
-        for phone in [&mut first, &mut second] {
-            assert_eq!(
-                phone.received(),
-                vec![ServerMessage::PeerDisconnected {
-                    device_id: mac.id.clone()
-                }]
-            );
-        }
+        assert!(relay.unregister(&phone.id, phone.generation, wall(1), now));
+        assert!(!relay.unregister(&phone.id, phone.generation, wall(2), now));
         assert_eq!(
-            code(send(&mut relay, &first, &mac.id, &[5], None, now)),
-            ErrorCode::MacOffline
+            mac.received(),
+            vec![ServerMessage::PeerDisconnected {
+                device_id: phone.id.clone()
+            }]
         );
     }
 
@@ -1260,18 +1291,18 @@ mod tests {
 
         open(&mut relay, &mac);
         relay
-            .set_paired_devices(&mac.id, mac.generation, vec![id(5)])
+            .set_paired_devices(&mac.id, mac.generation, &[id(5)])
             .unwrap();
         assert!(
             !refused(&mut relay, &mac),
             "a set without the candidate keeps the window"
         );
         relay
-            .set_paired_devices(&mac.id, mac.generation, vec![candidate.id.clone()])
+            .set_paired_devices(&mac.id, mac.generation, std::slice::from_ref(&candidate.id))
             .unwrap();
         send(&mut relay, &candidate, &mac.id, &[], None, now).unwrap();
         relay
-            .set_paired_devices(&mac.id, mac.generation, vec![])
+            .set_paired_devices(&mac.id, mac.generation, &[])
             .unwrap();
         assert!(refused(&mut relay, &mac), "confirmation ended the window");
 

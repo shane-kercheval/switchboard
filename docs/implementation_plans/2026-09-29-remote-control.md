@@ -1298,7 +1298,10 @@ It forwards everything unchanged, then:
 
 ## 6. Relay server — `crates/relay/` (separate binary)
 
-Deliberately dumb; never sees plaintext; holds no conversation state.
+Deliberately dumb; never sees plaintext; holds no conversation state. A Mac's set of paired
+devices is for one owner's devices and the handover between them (a phone and a tablet, a
+replaced phone, the candidate being paired), not for independent users; fairness between a
+Mac's phones is not a goal.
 
 - **Stack**: axum + `tokio-tungstenite`. Env config: `PORT`, `RATE_LIMIT` (messages a second
   per connection, sustained, with bursts of the same size; pings and pongs count; default 256),

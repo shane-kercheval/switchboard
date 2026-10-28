@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use chrono::Utc;
 use futures::stream::SplitStream;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde_json::json;
@@ -332,7 +332,7 @@ async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     let (outbox, writer) = Outbox::new(shared.config.queue_bytes, closed.clone());
     let ping_interval = shared.config.ping_interval;
     let writer_closed = closed.clone();
-    let mut writer = tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         // The reader is watching for the connection to close; a writer that
         // died without closing it would leave its registration swallowing
         // frames, as a failed send would.
@@ -364,12 +364,23 @@ async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     {
         tracing::info!(device_id = %registration.id, "disconnected");
     }
-    // Dropping the outbox, the queue's last sender, lets the writer flush
-    // and send its close. Reading on until the client answers that close
-    // matters: closing a socket with the client's messages still unread
-    // resets the connection, and the reset can discard the error just sent.
-    // The reading is bounded by count and time, and nothing read is acted on.
-    let mut stream = connection.into_stream();
+    finish(connection.into_stream(), writer).await;
+    // Only now are both halves of the socket gone, and with them its share
+    // of the socket limit, so only now is its admission returned.
+    drop(permit);
+}
+
+/// Lets the writer flush and send its close, the outbox, the queue's last
+/// sender, having been dropped, then drops the socket's reading half.
+/// Reading on until the client answers that close matters: closing a socket
+/// with the client's messages still unread resets the connection, and the
+/// reset can discard the error just sent. The reading is bounded by count
+/// and time, and nothing read is acted on. Returns once both halves of the
+/// socket are dropped.
+async fn finish<T, E>(
+    mut stream: impl Stream<Item = Result<T, E>> + Unpin,
+    mut writer: JoinHandle<()>,
+) {
     let drain = async {
         let mut read = 0;
         while read < DRAIN_LIMIT
@@ -381,16 +392,15 @@ async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     let flushed = tokio::time::timeout(FLUSH_TIMEOUT, async {
         let ((), _) = tokio::join!(drain, &mut writer);
     });
-    if flushed.await.is_err() {
+    // A writer that finished while the drain went on has had its result
+    // taken by the join, and a second wait for it would panic.
+    if flushed.await.is_err() && !writer.is_finished() {
         writer.abort();
         // An aborted task drops its half of the socket when it next runs,
         // not when it is aborted.
         let _ = writer.await;
     }
     drop(stream);
-    // Only now are both halves of the socket gone, and with them its share
-    // of the socket limit, so only now is its admission returned.
-    drop(permit);
 }
 
 /// Runs `task` to its end, or until it panics, which is logged. Either way
@@ -798,6 +808,25 @@ mod tests {
             record: record.to_vec(),
             pairing_token: None,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn teardown_ends_a_writer_that_finished_while_the_client_never_answered() {
+        let writer = tokio::spawn(async {});
+        let watched = writer.abort_handle();
+        // A panic here fails the test.
+        finish(futures::stream::pending::<Result<(), ()>>(), writer).await;
+        assert!(watched.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn teardown_aborts_a_writer_still_sending_once_the_client_never_answered() {
+        let writer = tokio::spawn(std::future::pending::<()>());
+        let watched = writer.abort_handle();
+        let started = Instant::now();
+        finish(futures::stream::pending::<Result<(), ()>>(), writer).await;
+        assert_eq!(started.elapsed(), FLUSH_TIMEOUT);
+        assert!(watched.is_finished());
     }
 
     #[tokio::test]

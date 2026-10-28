@@ -52,7 +52,12 @@ case "$*" in
     printf '\nOptions:\n  -h, --help  width=%s\n' "${COLUMNS:-unset}"
     ;;
   "help exec") printf 'Usage: codex exec\n\nCommands:\n  fork  Fork a session\n' ;;
-  "help exec fork") echo "Usage: codex exec fork <SESSION_ID>" ;;
+  # A flag whose default is the temp directory, which Codex reads from
+  # TMPDIR, else /tmp (`codex migrate-nfs-db --staging-dir`).
+  "help exec fork")
+    printf 'Usage: codex exec fork <SESSION_ID>\n\n  --staging-dir <DIR>\n'
+    printf '          [default: %s]\n' "${TMPDIR:-/tmp}"
+    ;;
   "help plugin") echo "Usage: codex plugin" ;;
   "app-server generate-json-schema --out "*) schema "$4" ;;
   "app-server generate-json-schema --experimental --out "*) schema "$5" experimental ;;
@@ -195,6 +200,31 @@ if expect_success "$name" codex; then
   expected=$(printf 'thread/items/read\nthread/readState/update')
   if [[ $table == "$expected" ]]; then pass "$name"; else fail_test "$name" "got: $table"; fi
 fi
+
+# Regex characters in the path, which a pattern-based replacement would
+# misread.
+name="codex: a temp-directory default is printed as <TMPDIR>, not this machine's path"
+machine_tmp="$tmp/T+[1].x/"
+mkdir "$machine_tmp"
+if TMPDIR="$machine_tmp" expect_success "$name" codex; then
+  if has_line "          [default: <TMPDIR>]" && ! grep -qF "$machine_tmp" "$out"; then
+    pass "$name"
+  else
+    fail_test "$name" "the temp directory default was not replaced"
+  fi
+fi
+
+name="codex: with TMPDIR unset, the /tmp default is printed as <TMPDIR>"
+had_tmpdir=${TMPDIR+yes} saved_tmpdir=${TMPDIR-}
+unset TMPDIR
+if expect_success "$name" codex; then
+  if has_line "          [default: <TMPDIR>]" && ! grep -qF "[default: /tmp" "$out"; then
+    pass "$name"
+  else
+    fail_test "$name" "the /tmp default was not replaced"
+  fi
+fi
+if [[ -n $had_tmpdir ]]; then export TMPDIR=$saved_tmpdir; fi
 
 FAKE_FAIL_ARGS="help exec fork" expect_failure \
   "codex: a failed nested help call stops the script and names it" \

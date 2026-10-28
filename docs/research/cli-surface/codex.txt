@@ -1,4 +1,4 @@
-version: codex-cli 0.163.0
+version: codex-cli 0.165.0
 
 ===== codex --help
 Codex CLI
@@ -32,6 +32,7 @@ Commands:
   archive           Archive a saved session by id or session name
   delete            Permanently delete a saved session by id or session name
   migrate-rollouts  Inspect or migrate legacy local sessions to paginated thread history
+  migrate-nfs-db    [experimental] Migrate configured SQLite databases to DELETE mode in place
   unarchive         Unarchive a saved session by id or session name
   fork              Fork a previous interactive session (picker by default; use --last to fork the
                     most recent)
@@ -1234,11 +1235,23 @@ Options:
           Examples: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
           shell_environment_policy.inherit=all`
 
+      --startup-sign-out
+          Sign out using the managed auth path before loading fresh startup requirements
+
       --enable <FEATURE>
           Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
 
+      --print-startup-config
+          Validate configuration and print requirements as JSON without starting the app server
+
       --disable <FEATURE>
           Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
+
+      --startup-client-info <STARTUP_CLIENT_INFO>
+          ClientInfo JSON used for configuration/auth request identity
+
+      --cloud-skills-snapshot <PATH>
+          Load frozen cloud skills from a JSON snapshot instead of a live skill service
 
       --code-mode-host <URL>
           Connect to a remote code-mode host instead of starting a local host
@@ -2502,6 +2515,39 @@ Options:
   -h, --help
           Print help (see a summary with '-h')
 
+===== codex migrate-nfs-db --help
+[experimental] Migrate configured SQLite databases to DELETE mode in place
+
+Usage: codex migrate-nfs-db [OPTIONS]
+
+Options:
+  -c, --config <key=value>
+          Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`.
+          Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed
+          as TOML. If it fails to parse as TOML, the raw string is used as a literal.
+          
+          Examples: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
+          shell_environment_policy.inherit=all`
+
+      --staging-dir <STAGING_DIR>
+          Use a local directory with space for the database and WAL files. The default is the system
+          temporary directory
+          
+          [default: <TMPDIR>]
+
+      --enable <FEATURE>
+          Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
+
+      --disable <FEATURE>
+          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Stop SQLite clients on every host and keep them stopped through cutover.
+The NFS mount must support cross-client POSIX locks (no nolock/local_lock=all).
+This command replaces configured databases in place and retains their WAL backups.
+
 ===== codex unarchive --help
 Unarchive a saved session by id or session name
 
@@ -2983,6 +3029,9 @@ Options:
       --use-agent-identity-auth
           Use Agent Identity auth from CODEX_ACCESS_TOKEN for remote registration
 
+      --executor-credential-stdin
+          Read rotating executor credentials from stdin; exit when the pipe closes
+
       --aws-sigv4
           Sign Direct registration and WebSocket handshake requests with AWS SigV4
 
@@ -3062,6 +3111,9 @@ Options:
 
       --use-agent-identity-auth
           Use Agent Identity auth from CODEX_ACCESS_TOKEN for remote registration
+
+      --executor-credential-stdin
+          Read rotating executor credentials from stdin; exit when the pipe closes
 
       --aws-sigv4
           Sign Direct registration and WebSocket handshake requests with AWS SigV4
@@ -3222,6 +3274,7 @@ externalAgentConfig/detect
 externalAgentConfig/import
 externalAgentConfig/import/readHistories
 externalAgentConfig/import/recordHistory
+feedback/save
 feedback/upload
 fs/copy
 fs/createDirectory
@@ -3341,6 +3394,7 @@ thread/backgroundTerminals/terminate
 thread/decrement_elicitation
 thread/increment_elicitation
 thread/items/read
+thread/memory/read
 thread/memoryMode/set
 thread/prediction/request
 thread/queue/add
@@ -3356,6 +3410,8 @@ thread/realtime/appendText
 thread/realtime/listVoices
 thread/realtime/start
 thread/realtime/stop
+thread/sample
+thread/sample/cancel
 thread/search
 thread/searchOccurrences
 thread/settings/update

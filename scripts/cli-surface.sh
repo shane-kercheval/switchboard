@@ -54,6 +54,24 @@ section() {
   printf '\n===== %s\n' "$1"
 }
 
+# Copy stdin to stdout with this machine's temp directory replaced by
+# `<TMPDIR>` where help text shows it as a flag's default (`codex
+# migrate-nfs-db --staging-dir`), so the snapshot is the same on every
+# machine. The CLIs take it from `TMPDIR`, else `/tmp`, as Rust's
+# `std::env::temp_dir` does. A plain string match, so a path with regex
+# characters needs no escaping.
+hide_temp_dir() {
+  awk -v from="[default: ${TMPDIR:-/tmp}" -v to="[default: <TMPDIR>" '{
+    rest = $0
+    out = ""
+    while ((i = index(rest, from)) > 0) {
+      out = out substr(rest, 1, i - 1) to
+      rest = substr(rest, i + length(from))
+    }
+    print out rest
+  }'
+}
+
 print_version() {
   local version
   version=$(run_help "$@" --version) || fail "'$* --version' failed"
@@ -195,10 +213,12 @@ agy_surface() {
   print_table "agy slash commands (/help)" "$commands"
 }
 
+# A pipeline rather than `$(...)`, because bash turns off `set -e` inside a
+# command substitution; `pipefail` passes a failed capture's status on.
 case "$harness" in
-  codex) codex_surface ;;
-  claude) claude_surface ;;
-  agy) agy_surface ;;
+  codex) codex_surface | hide_temp_dir ;;
+  claude) claude_surface | hide_temp_dir ;;
+  agy) agy_surface | hide_temp_dir ;;
   *)
     echo "unknown harness: $harness (expected codex, claude or agy)" >&2
     exit 2

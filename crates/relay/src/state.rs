@@ -8,6 +8,10 @@
 //! registration after the relay started, connected or not, and routes only
 //! between a Mac and the phones that both name it and are in its set (or the
 //! phone it is pairing).
+//!
+//! Every method runs under the relay's lock and must not panic partway
+//! through a change: a panic poisons the table, and the relay then shuts
+//! down rather than route by it (see `Shared::relay`).
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -442,13 +446,9 @@ impl Relay {
         pairing_token: Option<[u8; PAIRING_TOKEN_LEN]>,
         now: Instant,
     ) -> Result<(), Refusal> {
-        let when_full = match self.registered.get(to) {
-            Some(Peer {
-                kind: Kind::Mac, ..
-            }) => WhenFull::Refuse,
-            _ => WhenFull::Close,
-        };
-        let Some(outbox) = self.route(from, generation, to, pairing_token.as_ref(), now)? else {
+        let Some((outbox, when_full)) =
+            self.route(from, generation, to, pairing_token.as_ref(), now)?
+        else {
             return Ok(());
         };
         let cost = frame_cost(record.len());
@@ -464,8 +464,9 @@ impl Relay {
         }
     }
 
-    /// Where a frame from `from` to `to` goes, nowhere if `generation` is not
-    /// `from`'s current registration, or why it may not. A phone
+    /// Where a frame from `from` to `to` goes and what its recipient does
+    /// with no room for it, nowhere if `generation` is not `from`'s current
+    /// registration, or why it may not. A phone
     /// reaches only the Mac it names, and only if that Mac's set holds it
     /// or it presents that Mac's open pairing token. A Mac reaches only a
     /// phone in its set or bound to its token, and only if that phone names
@@ -478,7 +479,7 @@ impl Relay {
         to: &DeviceId,
         pairing_token: Option<&[u8; PAIRING_TOKEN_LEN]>,
         now: Instant,
-    ) -> Result<Option<&Outbox>, Refusal> {
+    ) -> Result<Option<(&Outbox, WhenFull)>, Refusal> {
         let Some(sender) = self
             .registered
             .get(from)
@@ -487,15 +488,17 @@ impl Relay {
             return Ok(None);
         };
         match &sender.kind {
-            Kind::Mac => self.route_from_mac(from, to, now).map(Some),
+            Kind::Mac => self
+                .route_from_mac(from, to, now)
+                .map(|outbox| Some((outbox, WhenFull::Close))),
             Kind::Phone { mac } if mac == to => self
                 .route_from_phone(from, to, pairing_token, now)
-                .map(Some),
+                .map(|outbox| Some((outbox, WhenFull::Refuse))),
             Kind::Phone { .. } => Err(Refusal::not_paired(to)),
         }
     }
 
-    /// From `phone` to `to`, the Mac it names.
+    /// From `phone` to `to`, the Mac it names. A Mac with no room is kept.
     fn route_from_phone(
         &mut self,
         phone: &DeviceId,
@@ -548,6 +551,7 @@ impl Relay {
         }
     }
 
+    /// From `mac` to `to`, a phone. A phone with no room is closed.
     fn route_from_mac(
         &self,
         mac: &DeviceId,

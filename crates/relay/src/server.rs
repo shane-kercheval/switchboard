@@ -5,7 +5,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::pin::{Pin, pin};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use chrono::Utc;
 use futures::stream::SplitStream;
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{FutureExt, Sink, Stream, StreamExt};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde_json::json;
@@ -32,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
-use crate::outbox::Outbox;
+use crate::outbox::{Outbox, Writer};
 use crate::protocol::{
     ClientMessage, DeviceId, NONCE_LEN, RELAY_PROTOCOL, Register, Role, ServerMessage,
     claimed_relay_protocol,
@@ -69,24 +70,41 @@ struct Shared {
     /// Every accepted socket and every upgraded connection, so shutdown can
     /// wait for them.
     connections: TaskTracker,
+    /// Set once a panic is found to have poisoned the routing table.
+    poisoned: AtomicBool,
 }
 
 impl Shared {
-    fn relay(&self) -> MutexGuard<'_, Relay> {
-        self.relay.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The routing table, or `None` once a panic has poisoned it. Every
+    /// `Relay` method, and everything it calls while the lock is held, the
+    /// outboxes it queues on included, must not panic partway through a
+    /// change: a table left half-changed could route between devices that
+    /// are not paired. If one does, the table is never used again. The relay
+    /// shuts down, its connections close without touching the table, and
+    /// `serve` returns an error, so the host restarts it with an empty table
+    /// that clients refill as they reconnect.
+    fn relay(&self) -> Option<MutexGuard<'_, Relay>> {
+        let Ok(relay) = self.relay.lock() else {
+            if !self.poisoned.swap(true, Ordering::Relaxed) {
+                tracing::error!("a panic poisoned the routing table; shutting down");
+                self.shutdown.cancel();
+            }
+            return None;
+        };
+        Some(relay)
     }
 }
 
 /// Serves until `shutdown` is cancelled, then closes every connection and
 /// waits, for a bounded time, for each to finish closing. A connection still
-/// being upgraded when shutdown begins is not waited for.
+/// being upgraded when shutdown begins is not waited for. Also shuts down,
+/// and then returns an error, if a panic poisons the routing table.
 pub async fn serve(
     listener: TcpListener,
     config: Config,
     shutdown: CancellationToken,
 ) -> io::Result<()> {
-    serve_validated(listener, validate(config)?, shutdown).await;
-    Ok(())
+    serve_validated(listener, validate(config)?, shutdown).await
 }
 
 fn validate(config: Config) -> io::Result<Config> {
@@ -125,7 +143,11 @@ fn memory_ceiling(config: &Config) -> usize {
 /// Accepts sockets itself rather than through `axum::serve`, so that every
 /// socket counts against a limit, not only upgraded ones, and a socket that
 /// has not upgraded is closed once a request head is overdue.
-async fn serve_validated(listener: TcpListener, config: Config, shutdown: CancellationToken) {
+async fn serve_validated(
+    listener: TcpListener,
+    config: Config,
+    shutdown: CancellationToken,
+) -> io::Result<()> {
     tracing::info!(
         memory_ceiling_bytes = memory_ceiling(&config),
         "queues and message buffers are bounded"
@@ -138,6 +160,7 @@ async fn serve_validated(listener: TcpListener, config: Config, shutdown: Cancel
         config,
         shutdown: shutdown.clone(),
         connections: TaskTracker::new(),
+        poisoned: AtomicBool::new(false),
     });
     let app = Router::new()
         .route("/connect", get(connect))
@@ -181,6 +204,12 @@ async fn serve_validated(listener: TcpListener, config: Config, shutdown: Cancel
     {
         tracing::warn!("connections still closing at shutdown were abandoned");
     }
+    if shared.poisoned.load(Ordering::Relaxed) {
+        return Err(io::Error::other(
+            "a panic poisoned the routing table; restart the relay",
+        ));
+    }
+    Ok(())
 }
 
 /// Whether an `accept` error is one connection's, gone before it was
@@ -269,7 +298,7 @@ impl AsyncWrite for Admitted {
 pub struct RelayHandle {
     addr: SocketAddr,
     shutdown: CancellationToken,
-    task: JoinHandle<()>,
+    task: JoinHandle<io::Result<()>>,
 }
 
 impl RelayHandle {
@@ -296,9 +325,10 @@ impl RelayHandle {
 
     /// Closes every connection, waits for them to finish closing, and stops
     /// listening. Everything the relay held is gone, as after a restart.
+    /// An error if a panic poisoned the routing table.
     pub async fn shutdown(self) -> io::Result<()> {
         self.shutdown.cancel();
-        self.task.await.map_err(io::Error::other)
+        self.task.await.map_err(io::Error::other)?
     }
 }
 
@@ -330,16 +360,7 @@ async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     let (sink, stream) = socket.split();
     let closed = shared.shutdown.child_token();
     let (outbox, writer) = Outbox::new(shared.config.queue_bytes, closed.clone());
-    let ping_interval = shared.config.ping_interval;
-    let writer_closed = closed.clone();
-    let writer = tokio::spawn(async move {
-        // The reader is watching for the connection to close; a writer that
-        // died without closing it would leave its registration swallowing
-        // frames, as a failed send would.
-        if unwinding(writer.run(sink, ping_interval)).await.is_none() {
-            writer_closed.cancel();
-        }
-    });
+    let writer = spawn_writer(writer, sink, shared.config.ping_interval, closed.clone());
     let mut connection = Connection {
         limiter: RateLimiter::new(&shared.config, Instant::now()),
         shared: Arc::clone(&shared),
@@ -349,13 +370,21 @@ async fn run_connection(socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
         registration: None,
         heard: Instant::now(),
     };
-    unwinding(connection.run()).await;
+    if unwinding(connection.run()).await.is_none() {
+        let registration = connection.registration.as_ref();
+        tracing::error!(
+            device_id = registration.map(|registration| registration.id.as_str()),
+            generation = registration.map(|registration| registration.generation),
+            "closing a connection whose reader panicked"
+        );
+    }
     // Frames routed here before the registration ends below are dropped,
     // not queued. The writer does not watch it, so what is queued still
     // goes out.
     connection.closed.cancel();
     if let Some(registration) = connection.registration.take()
-        && shared.relay().unregister(
+        && let Some(mut relay) = shared.relay()
+        && relay.unregister(
             &registration.id,
             registration.generation,
             Utc::now(),
@@ -403,16 +432,31 @@ async fn finish<T, E>(
     drop(stream);
 }
 
-/// Runs `task` to its end, or until it panics, which is logged. Either way
+/// Runs `task` to its end, or until it panics, and then `None`. Either way
 /// what follows runs: a panic in one connection's task ends that
 /// connection, which closes as it would have anyway, rather than leaving its
-/// registration in the routing table with no one to end it.
+/// registration in the routing table with no one to end it. The panic
+/// itself is logged by the hook `main` installs.
 async fn unwinding<T>(task: impl Future<Output = T>) -> Option<T> {
-    let output = AssertUnwindSafe(task).catch_unwind().await.ok();
-    if output.is_none() {
-        tracing::error!("a connection's task panicked; closing the connection");
-    }
-    output
+    AssertUnwindSafe(task).catch_unwind().await.ok()
+}
+
+/// Runs the connection's writer. One that panics closes the connection: the
+/// reader is waiting for it to close, and a dead writer would otherwise
+/// leave its registration swallowing frames until the idle timeout, as a
+/// failed send would.
+fn spawn_writer(
+    writer: Writer,
+    sink: impl Sink<Message> + Unpin + Send + 'static,
+    ping_interval: Duration,
+    closed: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if unwinding(writer.run(sink, ping_interval)).await.is_none() {
+            tracing::error!("closing a connection whose writer panicked");
+            closed.cancel();
+        }
+    })
 }
 
 struct Registration {
@@ -425,8 +469,8 @@ struct Connection {
     stream: SplitStream<WebSocket>,
     outbox: Outbox,
     /// Cancelled when the relay shuts down, when a newer registration
-    /// replaces this one, when a frame for this connection finds no room in
-    /// its queue, or when it ends.
+    /// replaces this one, when a frame finds no room in a phone's queue, when
+    /// its writer fails, or when it ends.
     closed: CancellationToken,
     limiter: RateLimiter,
     registration: Option<Registration>,
@@ -516,13 +560,17 @@ impl Connection {
             self.refuse(Refusal::registration_refused("this device is denied"));
             return false;
         }
-        let registered = self.shared.relay().register(
+        let Some(mut relay) = self.shared.relay() else {
+            return false;
+        };
+        let registered = relay.register(
             id.clone(),
             &claim.role,
             self.outbox.clone(),
             Utc::now(),
             table_now(),
         );
+        drop(relay);
         match registered {
             Ok(generation) => {
                 match &claim.role {
@@ -551,25 +599,23 @@ impl Connection {
             return false;
         };
         let (id, generation) = (id, *generation);
+        #[cfg(test)]
+        tests::panic_on(&message, tests::PANIC_RECORD);
+        let Some(mut relay) = self.shared.relay() else {
+            return false;
+        };
+        #[cfg(test)]
+        tests::panic_on(&message, tests::POISON_RECORD);
         let refusal = match message {
+            // A record longer than any frame does not decode, so it never
+            // gets here: it is `bad_message` as not a relay message.
             ClientMessage::Frame {
                 to,
                 record,
                 pairing_token,
-            } => {
-                #[cfg(test)]
-                assert_ne!(record, tests::PANIC_RECORD, "a test's panic");
-                // A record longer than any frame does not decode, so it
-                // never gets here: it is `bad_message` as not a relay message.
-                self.shared
-                    .relay()
-                    .forward(id, generation, &to, record, pairing_token, table_now())
-            }
+            } => relay.forward(id, generation, &to, record, pairing_token, table_now()),
             ClientMessage::PairedDevices { device_ids } => {
-                let changed = self
-                    .shared
-                    .relay()
-                    .set_paired_devices(id, generation, &device_ids);
+                let changed = relay.set_paired_devices(id, generation, &device_ids);
                 if changed == Ok(true) {
                     log_set(id, &device_ids);
                 }
@@ -578,17 +624,12 @@ impl Connection {
             ClientMessage::PairingOpen {
                 token_hash,
                 expires_in,
-            } => self.shared.relay().open_pairing(
-                id,
-                generation,
-                token_hash,
-                expires_in,
-                table_now(),
-            ),
-            ClientMessage::PairingClose => self.shared.relay().close_pairing(id, generation),
+            } => relay.open_pairing(id, generation, token_hash, expires_in, table_now()),
+            ClientMessage::PairingClose => relay.close_pairing(id, generation),
             ClientMessage::Register(_) => Err(Refusal::bad_message("already registered")),
             ClientMessage::Unknown => Ok(()),
         };
+        drop(relay);
         match refusal {
             Ok(()) => true,
             Err(refusal) => {
@@ -755,8 +796,46 @@ mod tests {
     use super::*;
     use crate::protocol::ErrorCode;
 
-    /// A frame carrying this record panics the reader that handles it.
+    // The hooks below are `cfg(test)`, so only this crate's unit tests can
+    // reach them; that is why these tests repeat `tests/relay.rs`'s socket
+    // helpers rather than share them through a feature, which would ship a
+    // crash trigger in the library.
+
+    /// A frame carrying this record panics the reader that handles it,
+    /// before it takes the routing table's lock.
     pub(super) const PANIC_RECORD: &[u8] = b"panic";
+    /// A frame carrying this record panics the reader that handles it while
+    /// it holds the routing table's lock, poisoning the table.
+    pub(super) const POISON_RECORD: &[u8] = b"poison";
+
+    pub(super) fn panic_on(message: &ClientMessage, trigger: &[u8]) {
+        if let ClientMessage::Frame { record, .. } = message {
+            assert_ne!(record.as_slice(), trigger, "a test's panic");
+        }
+    }
+
+    /// Panics as soon as it is asked to take a message.
+    struct PanickingSink;
+
+    impl Sink<Message> for PanickingSink {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            panic!("a test's panic in the writer");
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     type Socket = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -808,6 +887,43 @@ mod tests {
             record: record.to_vec(),
             pairing_token: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_writer_that_panics_closes_its_connection_at_once() {
+        let closed = CancellationToken::new();
+        let (outbox, writer) = Outbox::new(Config::default().queue_bytes, closed.clone());
+        let task = spawn_writer(
+            writer,
+            PanickingSink,
+            Duration::from_secs(25),
+            closed.clone(),
+        );
+        outbox.deliver(ServerMessage::Registered);
+        tokio::time::timeout(Duration::from_secs(5), closed.cancelled())
+            .await
+            .expect("the connection was not closed");
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn a_poisoned_table_is_never_used_again_and_shuts_the_relay_down() {
+        let shared = Shared {
+            config: Config::default(),
+            relay: Mutex::new(Relay::new(8)),
+            admission: Arc::new(Semaphore::new(1)),
+            shutdown: CancellationToken::new(),
+            connections: TaskTracker::new(),
+            poisoned: AtomicBool::new(false),
+        };
+        assert!(shared.relay().is_some());
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _held = shared.relay.lock();
+            panic!("a test's panic under the lock");
+        }));
+        assert!(shared.relay().is_none());
+        assert!(shared.shutdown.is_cancelled());
+        assert!(shared.relay().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -884,6 +1000,44 @@ mod tests {
             })
         ));
         relay.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_panic_under_the_tables_lock_shuts_the_relay_down_without_routing_again() {
+        let relay = RelayHandle::start(SocketAddr::from(([127, 0, 0, 1], 0)), Config::default())
+            .await
+            .unwrap();
+        let (mac_keys, phone_keys, other_keys) = (
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+        );
+        let id_of = |keys: &DeviceKeys| DeviceId::from_identity_key(&keys.identity_public_key());
+        let (mac_id, phone_id, other_id) =
+            (id_of(&mac_keys), id_of(&phone_keys), id_of(&other_keys));
+        let mac_of = || Role::Phone {
+            mac: mac_id.clone(),
+        };
+        let mut phone = connect(&relay, &phone_keys, mac_of()).await;
+        let mut other = connect(&relay, &other_keys, mac_of()).await;
+        let mut mac = connect(
+            &relay,
+            &mac_keys,
+            Role::Mac {
+                paired_devices: vec![phone_id, other_id],
+            },
+        )
+        .await;
+
+        send(&mut phone, &frame(&mac_id, POISON_RECORD)).await;
+        assert_eq!(next(&mut phone).await, None);
+        // The other phone's frame is not routed, and no one is told of the
+        // first phone's end: the table is not touched again.
+        let text = serde_json::to_string(&frame(&mac_id, b"after")).unwrap();
+        let _ = other.send(tungstenite::Message::Text(text.into())).await;
+        assert_eq!(next(&mut mac).await, None);
+        assert_eq!(next(&mut other).await, None);
+        assert!(relay.shutdown().await.is_err());
     }
 
     fn limiter(

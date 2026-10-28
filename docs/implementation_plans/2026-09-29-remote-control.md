@@ -1,6 +1,6 @@
 # Remote control: an iPhone app for Switchboard
 
-**Status:** in progress: M1 complete 2026-10-10 in #118, #119, #120, #121, and #123; M2 in progress · **Revision:** 25 · **Created:** 2026-09-29 · **Revised:** 2026-10-25
+**Status:** in progress: M1 complete 2026-10-10 in #118, #119, #120, #121, and #123; M2 in progress · **Revision:** 25 · **Created:** 2026-09-29 · **Revised:** 2026-10-28
 
 An iPhone app that lists Switchboard's projects, shows a live transcript, and lets the user
 continue work already in progress — send a message, cancel a turn. The Mac stays the only
@@ -18,7 +18,7 @@ shared Rust cryptography are in one tree.
 ## Changelog
 
 - **Revision 25 (2026-10-15)** — a frame for a full recipient is refused and its sender told;
-  a full phone is closed (§4, §5.1, §5.6, §6, §7.2, §9).
+  a full phone is closed (§2, §4, §5.1, §5.6, §6, §7.2, §9, M5).
   - **A frame for a recipient with no room is refused, not waited on.** The relay answers the
     sender `error { recipient_full, device_id }` naming the recipient; the frame is dropped and
     the sender's connection stays open. A phone with no room is also closed; a Mac with no room
@@ -53,6 +53,10 @@ shared Rust cryptography are in one tree.
     connection whose task panics closes and ends its registration as it would have anyway.
     The relay refuses at startup an idle timeout no longer than its ping interval and a zero
     registration window.
+  - A panic while the routing table's lock is held shuts the relay down and makes it exit with
+    an error rather than route by a half-changed table; the M5 deployment restarts it (§2, §6,
+    M5). The relay's binary refuses to compile under `panic = "abort"`, and panics are logged
+    through `tracing` with their message, location, and the connection's device.
 - **Revision 24 (2026-10-12)** — the relay, settled while building it and in two reviews of
   it (§2, §4, §5.1, §5.2, §5.6, §6, §7.2, §7.3, §9).
   - **Every relay message is a WebSocket text message holding JSON**, tagged by `type`, with
@@ -577,6 +581,7 @@ making sure only the right phone, held by the right person, can do it.
 | Stolen unlocked phone | Partly | Device-owner authentication before each send. Viewing and cancelling are not gated. The remedy is revoking on the Mac. Away from the Mac, the relay operator can deny the phone's id (§6) |
 | Compromised Mac | No | Out of scope; the Mac is the trusted end. If its keys may have leaked, **Reset remote identity** (§5.9) replaces them |
 | Relay denial of service | Partly | Rate and frame-size limits, byte-bounded queues, a global connection limit; worst outcome is loss of remote access, not compromise. One client can take every connection slot with about 80 idle TCP connections renewed every 10 seconds, no identity needed, until a per-source limit lands at the trusted proxy with the deployment; no build goes beyond the two developers before it does (M5) |
+| A relay bug panics while it holds the routing table's lock | Partly | The relay shuts down rather than route by a half-changed table, so pairing is never misapplied; every client loses remote access until the host restarts it, which needs a restart-on-failure policy (M5). The table's code holds no `unwrap`, indexing, or other panic site |
 | Traffic analysis | No | Inherent to a relay; accepted |
 
 **Where trust is enforced.** Every trust decision is made on the Mac. The Mac completes a
@@ -1301,7 +1306,9 @@ It forwards everything unchanged, then:
 Deliberately dumb; never sees plaintext; holds no conversation state. A Mac's set of paired
 devices is for one owner's devices and the handover between them (a phone and a tablet, a
 replaced phone, the candidate being paired), not for independent users; fairness between a
-Mac's phones is not a goal.
+Mac's phones is not a goal: a phone that fills the Mac's queue gets the other phones' frames
+refused too until the Mac drains it, and each refused phone starts a new session, where closing
+the Mac would have ended every session at once.
 
 - **Stack**: axum + `tokio-tungstenite`. Env config: `PORT`, `RATE_LIMIT` (messages a second
   per connection, sustained, with bursts of the same size; pings and pongs count; default 256),
@@ -1315,7 +1322,8 @@ Mac's phones is not a goal.
   setting past its cap is refused at startup, before anything is sized by it. The queue
   budget (12 MiB) and the timeouts are fixed in code. `crates/relay/Dockerfile`, which builds
   under the `relay` Cargo profile: it unwinds on panic, so a panic ends one connection's task
-  rather than every connection; TLS terminated by the host so clients
+  rather than every connection, and the binary refuses to compile under `panic = "abort"`;
+  TLS terminated by the host so clients
   use `wss://`. Locally: `make relay`; the image: `make relay-image`, which passes the Rust
   version from `rust-toolchain.toml` as the required `RUST_VERSION` build argument. The
   WebSocket is at `/connect`.
@@ -1431,8 +1439,10 @@ Mac's phones is not a goal.
   to replace (§7.2). Routing and queueing happen under one lock, so senders racing to a full
   recipient each get their own error, and a phone is closed once. The relay's own messages (`registered`, notices, errors)
   never wait and hold no byte budget; they are bounded only by the queue's count of
-  messages, about 3,200 at the default budget, and a client that leaves that many unread,
-  which is one not reading its own errors, is closed. Frames a recipient receives arrive in
+  messages, about 3,200 at the default budget with no frames queued, and a client that leaves
+  that many unread, which is one not reading its own errors, is closed. While frames fill a
+  connection's budget at least 64 remain, the fewest when the frames are all small, so a kept
+  Mac that far behind is closed once it leaves that many unread. Frames a recipient receives arrive in
   the order their sender sent them. A refused frame leaves a gap, which is why a phone
   recipient is closed rather than kept: its one session would close at the gap anyway (§3),
   and on reconnect it catches up through the live-turn snapshot (§5.7) and idempotent sends
@@ -1470,6 +1480,13 @@ Mac's phones is not a goal.
 - **Shutdown**: on SIGTERM or SIGINT the relay stops accepting, closes every connection with a
   close frame, and waits up to 3 seconds for them to finish closing. Clients reconnect after
   any close, clean or not, and draw no conclusion from which it was.
+- **Panics**: a panic in a connection's reader or writer closes that connection, which ends its
+  registration as any close does, and is logged with its message and location (and backtrace
+  when `RUST_BACKTRACE` asks), the reader's with the device id. A panic while the routing
+  table's lock is held would leave the table half-changed, so the relay never uses a poisoned
+  table: it shuts down as on SIGTERM, without touching the table, and exits with an error for
+  the host to restart it with an empty one, which clients refill as they reconnect. The table
+  and the queues it calls into under the lock must not panic partway through a change.
 - **Observability**: `tracing` logs: each registration with its role and each disconnect at
   info; a Mac's set, at registration and whenever it changes, at debug, since a client may
   resend it as often as its rate allows. `/healthz` answers only `{"status":"ok"}`, since counts
@@ -1854,8 +1871,9 @@ window has been closed for 30 minutes.
 Keep-awake through `WakeLease` with `PowerSource` and the connected-session condition, which
 rests on M2's session end; launch
 at login, starting hidden; README and system-design documentation; the pilot relay deployment
-(separately approved), with its host, domain, log retention, `/healthz` alert recipient, and
-denylist procedure written down; the App Store Connect export-compliance answer
+(separately approved), with its host, domain, log retention, `/healthz` alert recipient,
+denylist procedure, and a restart-on-failure policy (the relay exits with an error when a panic
+poisons its routing table, §6) written down; the App Store Connect export-compliance answer
 (`ITSAppUsesNonExemptEncryption`), decided and recorded; the relay's edge-abuse policy for the
 chosen host — a per-source connection limit at the trusted proxy, in place before the relay's
 address reaches any build beyond the two developers, which proxy headers are trusted, how shared

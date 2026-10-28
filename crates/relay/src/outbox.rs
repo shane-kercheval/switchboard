@@ -10,6 +10,9 @@
 //! room is closed, since its one session is broken anyway: closing it makes
 //! the gap a reconnect, after which it catches up. A Mac with no room is
 //! kept, since closing it would end its sessions with every other phone.
+//!
+//! `Outbox` is called under the routing table's lock, so, like the table, it
+//! must not panic (see `Shared::relay`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,7 +38,9 @@ pub(crate) const MIN_FRAME_COST: usize = 4096;
 /// messages hold no budget, so they may take the room frames leave too: a
 /// connection with no frames queued is closed once it leaves
 /// `queue_bytes / MIN_FRAME_COST + CONTROL_HEADROOM` of them unread, about
-/// 3,200 at the default budget. One that does is not reading its own errors.
+/// 3,200 at the default budget. While frames fill the budget, at least this
+/// many remain, the fewest when the frames are all of the least cost; a
+/// kept Mac that far behind is closed once it leaves that many unread.
 pub(crate) const CONTROL_HEADROOM: usize = 64;
 /// A frame's JSON around its base64 record: type, ids, an optional token.
 const FRAME_OVERHEAD: usize = 256;
@@ -89,8 +94,9 @@ pub(crate) struct Outbox {
     capacity: usize,
     /// Cancelled to close the connection.
     closed: CancellationToken,
-    /// Set when a frame found no room, so frames that reach the connection
-    /// while it closes are refused the same way.
+    /// Set when a frame found no room and the connection is closed for it,
+    /// so frames that reach it while it closes are refused the same way. A
+    /// kept Mac never sets it.
     full: Arc<AtomicBool>,
 }
 

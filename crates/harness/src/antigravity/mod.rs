@@ -1251,9 +1251,10 @@ async fn run_producer(ctx: ProducerCtx) {
         // A failed tool step is reported on both channels: the stream's
         // `state:"ERROR"` and the transcript's result record. The transcript
         // owns the displayed result, so when it reads as a success here the
-        // row shows a success and this warning is the only trace. It means
-        // `agy` wrote the failure in a shape
-        // `TranscriptRecord::tool_result_failure` does not read yet.
+        // row shows a success and this warning is the only trace. It most
+        // likely means `agy` wrote the failure in a shape
+        // `TranscriptRecord::tool_result_failure` does not read; the other
+        // cause is the two channels numbering steps differently.
         tracing::warn!(
             %turn_id,
             agent_id = %agent_id,

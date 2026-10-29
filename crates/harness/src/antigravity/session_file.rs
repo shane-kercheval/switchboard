@@ -988,6 +988,43 @@ mod tests {
         );
     }
 
+    /// Synthetic: a failure whose status the parser does not list (`REJECTED`
+    /// is not among the binary's step statuses @ 1.4.9 or 1.4.10). Reopening
+    /// must show it as failed on its `error` alone, as the live view does.
+    #[test]
+    fn a_result_with_an_unlisted_status_and_an_error_reopens_as_failed() {
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-28T22:28:47Z","content":"<USER_REQUEST>\ncall frobnicate_widget\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:47Z","tool_calls":[{"name":"frobnicate_widget","args":{"x":"1"}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"REJECTED","error":"the tool call was rejected","created_at":"2026-10-28T22:28:57Z","content":"Created At: 2026-10-28T16:28:57-06:00\nCompleted At: 2026-10-28T16:28:57-06:00\nthe tool call was rejected"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:58Z","content":"ack"}"#,
+            "\n",
+        );
+        let transcript = parse_antigravity_transcript_content(content, agent_id());
+        let tools: Vec<(&str, &str, bool)> = agent_items(&transcript.turns[1])
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Tool {
+                    name,
+                    output: Some(output),
+                    is_error: Some(is_error),
+                    completed_at: Some(_),
+                    ..
+                } => Some((name.as_str(), output.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            tools,
+            vec![("frobnicate_widget", "the tool call was rejected", true)]
+        );
+        assert!(transcript.warnings.is_empty(), "{:?}", transcript.warnings);
+    }
+
     /// Reopen applies the same command-only rule as the live parser: an MCP
     /// reply quoting the exit sentence stays a success, and a failed command
     /// whose result was written before its planner record still fails.

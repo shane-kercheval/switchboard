@@ -1025,6 +1025,45 @@ mod tests {
         assert!(transcript.warnings.is_empty(), "{:?}", transcript.warnings);
     }
 
+    /// Synthetic, a shape no transcript has shown: each listed failure status
+    /// with no reason (`error` missing, empty or blank). Reopening must show
+    /// it as failed on the status alone, as the live view does.
+    #[test]
+    fn a_listed_failure_status_without_an_error_reopens_as_failed() {
+        let user_input = r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-28T22:28:47Z","content":"<USER_REQUEST>\ncall frobnicate_widget\n</USER_REQUEST>"}"#;
+        let planner = r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:47Z","tool_calls":[{"name":"frobnicate_widget","args":{"x":"1"}}]}"#;
+        let answer = r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:58Z","content":"ack"}"#;
+        let mut verdicts = Vec::new();
+        for status in ["FAILED", "ERROR", "INVALID"] {
+            for error in [None, Some(""), Some("  ")] {
+                let error_field = match error {
+                    Some(text) => format!(r#","error":"{text}""#),
+                    None => String::new(),
+                };
+                let result = format!(
+                    r#"{{"step_index":2,"source":"MODEL","type":"GENERIC","status":"{status}"{error_field},"created_at":"2026-10-28T22:28:57Z","content":"Created At: 2026-10-28T16:28:57-06:00"}}"#
+                );
+                let content = [user_input, planner, result.as_str(), answer].join("\n") + "\n";
+                let transcript = parse_antigravity_transcript_content(&content, agent_id());
+                let is_error = agent_items(&transcript.turns[1])
+                    .iter()
+                    .find_map(|item| match item {
+                        TurnItem::Tool { is_error, .. } => Some(*is_error),
+                        _ => None,
+                    })
+                    .flatten();
+                verdicts.push((status, error, is_error));
+            }
+        }
+
+        assert!(
+            verdicts
+                .iter()
+                .all(|(_, _, is_error)| *is_error == Some(true)),
+            "{verdicts:?}"
+        );
+    }
+
     /// Reopen applies the same command-only rule as the live parser: an MCP
     /// reply quoting the exit sentence stays a success, and a failed command
     /// whose result was written before its planner record still fails.

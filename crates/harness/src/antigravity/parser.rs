@@ -123,13 +123,15 @@ impl TranscriptRecord {
     ///
     /// **A non-empty `error` is a failure whatever the status**, so a failure
     /// status `agy` adds later still reads as failed when it gives a reason;
-    /// in every saved transcript `error` is set on each failure and on no
-    /// success. Not "every status but `DONE`": a command `agy` moves to the
-    /// background is written once as `status:"RUNNING"` with no `error`, and
-    /// that call has not failed. `status:"FAILED"` predates these captures and
-    /// is kept. A command that ran and exited non-zero carries no structured
-    /// signal in any version, so it is read from the record's prose by
-    /// [`header_reports_nonzero_exit`].
+    /// in the saved transcripts every `ERROR` and `INVALID` result carries an
+    /// `error` and no `DONE` or `RUNNING` result does. Not "every status but
+    /// `DONE`": a command `agy` moves to the background is written once as
+    /// `status:"RUNNING"` with no `error`, and that call has not failed.
+    /// `status:"FAILED"` predates these captures and is kept.
+    ///
+    /// A command that ran and exited non-zero is written `status:"DONE"` with
+    /// no `error` in every version observed, so it is read from the record's
+    /// prose by [`header_reports_nonzero_exit`].
     pub(crate) fn tool_result_failure(&self) -> ResultFailure {
         ResultFailure {
             structured: self.is_invalid_tool_call_error()
@@ -181,8 +183,11 @@ impl TranscriptRecord {
 /// `type:"GENERIC"`, so only the paired call says a result came from a
 /// command. If `agy` renamed it, failed commands would read as successes again
 /// (`live_antigravity_failing_command_completes_as_tool_error` fails on that).
-/// A command that ran in the background and whose exit is reported through a
-/// separate status tool is not covered; none has been observed.
+/// A command `agy` moves to the background is written once as
+/// `status:"RUNNING"` and never updated (observed @ 1.4.9 and 1.4.10); its
+/// completion arrives later as a `SYSTEM` message that is not paired with the
+/// call, so one that later exits non-zero keeps its success mark, live and on
+/// reopen.
 const COMMAND_TOOL: &str = "run_command";
 
 /// What a tool-result record says about failure, before it is paired with its
@@ -1413,6 +1418,38 @@ mod tests {
                 true,
             )],
             "an error is failure evidence whatever the status"
+        );
+    }
+
+    /// Synthetic, a shape no transcript has shown: each listed failure status
+    /// with no reason (`error` missing, empty or blank). The status alone must
+    /// make it a failure, so a rule that read only `error` fails here.
+    #[test]
+    fn a_listed_failure_status_without_an_error_completes_as_failed() {
+        let mut verdicts = Vec::new();
+        for status in ["FAILED", "ERROR", "INVALID"] {
+            for error in [None, Some(""), Some("  ")] {
+                let error_field = match error {
+                    Some(text) => format!(r#","error":"{text}""#),
+                    None => String::new(),
+                };
+                let result = format!(
+                    r#"{{"step_index":2,"source":"MODEL","type":"GENERIC","status":"{status}"{error_field},"content":"Created At: 2026-10-28T16:28:57-06:00"}}"#
+                );
+                let completions = completions_of(
+                    &[UNKNOWN_TOOL_1_4_9[0], result.as_str()],
+                    &mut AntigravityParserState::default(),
+                );
+                let is_error = completions.first().map(|(_, _, is_error)| *is_error);
+                verdicts.push((status, error, is_error));
+            }
+        }
+
+        assert!(
+            verdicts
+                .iter()
+                .all(|(_, _, is_error)| *is_error == Some(true)),
+            "{verdicts:?}"
         );
     }
 

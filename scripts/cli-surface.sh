@@ -54,16 +54,20 @@ section() {
   printf '\n===== %s\n' "$1"
 }
 
-# Copy stdin to stdout with this machine's temp directory replaced by
-# `<TMPDIR>` where help text shows it as a flag's default (`codex
-# migrate-nfs-db --staging-dir`), so the snapshot is the same on every
-# machine. The CLIs take it from `TMPDIR`, else `/tmp`, and quote it when it
-# contains a space. It reaches awk through ENVIRON, which keeps backslashes,
-# and is matched as a plain string. Not replaced: a default wrapped onto a
-# second line, and (untested) a path with whitespace plus a backslash or
-# double quote, which clap escapes inside the quotes.
+# Copy stdin to stdout with `TMPDIR` replaced by `<TMPDIR>` where help text
+# shows it as a flag's default (`codex migrate-nfs-db --staging-dir`), so the
+# snapshot is the same on every machine. Codex quotes it when it contains a
+# space. It reaches awk through ENVIRON, which keeps backslashes, and is
+# matched as a plain string. Not replaced: the default printed when `TMPDIR`
+# is unset or empty, which depends on the operating system; a default
+# wrapped onto a second line; and (untested) a path with whitespace plus a
+# backslash or double quote, which clap escapes inside the quotes.
 hide_temp_dir() {
-  TEMP_DIR_TO_HIDE="${TMPDIR:-/tmp}" awk '
+  if [[ -z ${TMPDIR:-} ]]; then
+    cat
+    return
+  fi
+  TEMP_DIR_TO_HIDE="$TMPDIR" awk '
     function replace_all(text, from, to, out, i) {
       out = ""
       while ((i = index(text, from)) > 0) {

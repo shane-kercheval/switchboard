@@ -493,9 +493,8 @@ pub enum LoadTranscriptError {
 /// from `.mcp.json` would draw servers on the card that the agent cannot call.
 ///
 /// Both loader arguments are themselves optional so a harness with no registry
-/// of that kind (Claude has no on-disk skills status; Codex has no tool
-/// inventory at all) passes `None` rather than an empty list that would read as
-/// an authoritative zero.
+/// of that kind (Claude has no on-disk skills status) passes `None` rather than
+/// an empty list that would read as an authoritative zero.
 #[must_use]
 pub fn merge_meta_with_loaders(
     parser_meta: Option<SessionMetaInfo>,

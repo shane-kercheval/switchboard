@@ -52,12 +52,11 @@ case "$*" in
     printf '\nOptions:\n  -h, --help  width=%s\n' "${COLUMNS:-unset}"
     ;;
   "help exec") printf 'Usage: codex exec\n\nCommands:\n  fork  Fork a session\n' ;;
-  # A flag whose default is the temp directory, which Codex reads from
-  # TMPDIR, else /tmp, and quotes when it contains whitespace (`codex
-  # migrate-nfs-db --staging-dir`).
+  # A flag whose default is TMPDIR, which Codex quotes when it contains
+  # whitespace (`codex migrate-nfs-db --staging-dir`).
   "help exec fork")
     printf 'Usage: codex exec fork <SESSION_ID>\n\n  --staging-dir <DIR>\n'
-    dir=${TMPDIR:-/tmp}
+    dir=${TMPDIR-}
     case $dir in *[[:space:]]*) dir="\"$dir\"" ;; esac
     printf '          [default: %s]\n' "$dir"
     ;;
@@ -224,18 +223,6 @@ expect_temp_dir_hidden "codex: a quoted temp-directory default (a path with a sp
   "$tmp/with space/"
 expect_temp_dir_hidden "codex: a temp-directory default with a backslash is printed as <TMPDIR>" \
   "$tmp/back\\slash/"
-
-name="codex: with TMPDIR unset, the /tmp default is printed as <TMPDIR>"
-had_tmpdir=${TMPDIR+yes} saved_tmpdir=${TMPDIR-}
-unset TMPDIR
-if expect_success "$name" codex; then
-  if has_line "          [default: <TMPDIR>]" && ! grep -qF "[default: /tmp" "$out"; then
-    pass "$name"
-  else
-    fail_test "$name" "the /tmp default was not replaced"
-  fi
-fi
-if [[ -n $had_tmpdir ]]; then export TMPDIR=$saved_tmpdir; fi
 
 FAKE_FAIL_ARGS="help exec fork" expect_failure \
   "codex: a failed nested help call stops the script and names it" \

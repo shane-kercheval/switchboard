@@ -446,11 +446,12 @@ impl Reconstruction {
         }
         // Close every tool that never got a result. Mirrors the live path's
         // turn-end close-out, and is what stops a reopened project from showing
-        // a tool spinning forever: agy writes **no record at all** for a tool
-        // call it rejects, so on disk that call is simply never answered. The
-        // specific error is unrecoverable here — it existed only on the live
-        // control stream — so this states what disk can support and shares the
-        // live path's wording via one constant rather than a second copy.
+        // a tool spinning forever: a call still running when the turn is
+        // stopped gets no result on disk (harness-behavior.md §1.5), and agy
+        // 1.1.19 wrote none for a call it rejected. Any error reported for such
+        // a call existed only on the live control stream, so this states what
+        // disk can support and shares the live path's wording via one constant
+        // rather than a second copy.
         // The instant this turn closed. Bound once and reused for both the
         // orphaned tools below and the `Turn::Agent` stamp further down, so the
         // two are identical by construction rather than by two expressions that

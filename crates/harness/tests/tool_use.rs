@@ -349,7 +349,8 @@ async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
 /// A call to a tool that does not exist must complete as a tool error. `agy`
 /// 1.4.9 writes its result `status:"INVALID"` while the stream reports the
 /// step `state:"ERROR"`, and the transcript's verdict is the one shown, so
-/// this fails when `agy` writes a failure status the parser does not count.
+/// this fails when an unknown-tool call reads as succeeded: `agy` wrote it
+/// with neither a listed failure status nor an `error`.
 /// Pinned to Gemini 3.8 Flash, the model the `INVALID` records were captured
 /// on, because the model has to choose to call a tool it was not given.
 #[tokio::test]
@@ -415,9 +416,9 @@ async fn live_antigravity_unknown_tool_call_completes_as_tool_error() {
                 if !output.trim().is_empty() && output != MISSING_TOOL_RESULT_OUTPUT
         ),
         "expected the unknown tool call to complete as an error carrying agy's message; \
-         if it completed as a success, agy wrote its result with a status that \
-         `TranscriptRecord::tool_result_failure` (`antigravity/parser.rs`) does not \
-         count as a failure. Got: {completed:?}"
+         if it completed as a success, agy wrote its result with neither a failure \
+         status nor an `error` that `TranscriptRecord::tool_result_failure` \
+         (`antigravity/parser.rs`) counts. Got: {completed:?}"
     );
     assert!(
         events.iter().any(|event| matches!(

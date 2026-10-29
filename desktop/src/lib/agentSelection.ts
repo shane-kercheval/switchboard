@@ -51,8 +51,9 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
     { label: "GPT-6.1 Terra", value: "gpt-6.1-terra" },
     { label: "GPT-6 Luna", value: "gpt-6-luna" },
   ],
-  /// Exactly the models `agy models` lists (agy 1.4.2, 2026-10-19), read from
-  /// `antigravityModels.json`. **Effort-bearing models are listed by their base
+  /// Exactly the models `agy models` lists, read from `antigravityModels.json`,
+  /// whose comment records the `agy` version it was checked against.
+  /// **Effort-bearing models are listed by their base
   /// slug**, not the effort-folded variant `agy models` prints
   /// (`gemini-3.8-flash`, not `gemini-3.8-flash-high`): the folded form
   /// conflicts with `--effort`, and the two-control shape is what matches every

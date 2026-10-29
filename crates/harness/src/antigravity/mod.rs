@@ -28,8 +28,9 @@
 //!   only the stream's `state:"ERROR"` step reported it, and reopened history
 //!   cannot recover those (see the dangling-tool backstop in
 //!   [`session_file`]). agy 1.4.2 writes the failure to the transcript as a
-//!   `status:"ERROR"` result, which then settles the step; the stream's report
-//!   is used only for a call that still leaves no record.
+//!   `status:"ERROR"` result (1.4.9: `"INVALID"` for a call rejected before
+//!   running), which then settles the step; the stream's report is used only
+//!   for a call that still leaves no record.
 //! - **One-shot process = one turn.** `agy -p` runs exactly one turn and
 //!   exits. Process exit — not a stream/transcript record — remains the
 //!   authoritative turn terminator; the pipes are then read to their end, or
@@ -1247,9 +1248,13 @@ async fn run_producer(ctx: ProducerCtx) {
         );
     }
     if !closed.contradicted.is_empty() {
-        // Never observed: the transcript, which owns the displayed result,
-        // recorded these steps as successes while the stream called them
-        // failed. The transcript's verdict stands; this is the tripwire.
+        // A failed tool step is reported on both channels: the stream's
+        // `state:"ERROR"` and the transcript's result record. The transcript
+        // owns the displayed result, so when it reads as a success here the
+        // row shows a success and this warning is the only trace. It most
+        // likely means `agy` wrote the failure in a shape
+        // `TranscriptRecord::tool_result_failure` does not read; the other
+        // cause is the two channels numbering steps differently.
         tracing::warn!(
             %turn_id,
             agent_id = %agent_id,

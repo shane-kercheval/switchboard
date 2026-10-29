@@ -446,11 +446,12 @@ impl Reconstruction {
         }
         // Close every tool that never got a result. Mirrors the live path's
         // turn-end close-out, and is what stops a reopened project from showing
-        // a tool spinning forever: agy writes **no record at all** for a tool
-        // call it rejects, so on disk that call is simply never answered. The
-        // specific error is unrecoverable here — it existed only on the live
-        // control stream — so this states what disk can support and shares the
-        // live path's wording via one constant rather than a second copy.
+        // a tool spinning forever: a call still running when the turn is
+        // stopped gets no result on disk (harness-behavior.md §1.5), and agy
+        // 1.1.19 wrote none for a call it rejected. Any error reported for such
+        // a call existed only on the live control stream, so this states what
+        // disk can support and shares the live path's wording via one constant
+        // rather than a second copy.
         // The instant this turn closed. Bound once and reused for both the
         // orphaned tools below and the `Turn::Agent` stamp further down, so the
         // two are identical by construction rather than by two expressions that
@@ -921,6 +922,147 @@ mod tests {
         assert!(tools[1].1.contains("No such file or directory"));
         assert!(tools.iter().all(|(_, _, is_error)| *is_error), "{tools:?}");
         assert!(transcript.warnings.is_empty());
+    }
+
+    /// Captured @ agy 1.4.9 (2026-10-28, Gemini 3.8 Flash, the adapter's
+    /// dispatch flags, compact transcript; the planner's `thinking` is left
+    /// out): a call to a tool that does not exist, and `run_command` called
+    /// with no arguments. Both results are written `status:"INVALID"`, and
+    /// reopening must show each as failed with `agy`'s message.
+    #[test]
+    fn invalid_results_reopen_as_failed() {
+        let unknown_tool = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-28T22:28:47Z","content":"<USER_REQUEST>\nThis is a test of tool error handling. Call a tool named frobnicate_widget with arguments {\"x\": 1}, even though it is not in your tool list; emit the call anyway. Do not call any other tool. Then reply with the exact error text you received, quoted.\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-28T16:28:47-06:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.8 Flash (Medium). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:47Z","input_tokens":7877,"cache_read_tokens":0,"output_tokens":959,"tool_calls":[{"name":"frobnicate_widget","args":{"x":"1"}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"INVALID","error":"unknown tool: \"frobnicate_widget\" — check spelling","created_at":"2026-10-28T22:28:57Z","content":"Created At: 2026-10-28T16:28:57-06:00\nCompleted At: 2026-10-28T16:28:57-06:00\nError invalid tool call: unknown tool: \"frobnicate_widget\" — check spelling"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:57Z","input_tokens":8938,"cache_read_tokens":0,"output_tokens":203,"content":"\"Created At: 2026-10-28T16:28:57-06:00\nCompleted At: 2026-10-28T16:28:57-06:00\nEncountered error in tool validation: unknown tool: \"frobnicate_widget\" — check spelling\""}"#,
+            "\n",
+        );
+        let missing_arguments = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-28T22:29:27Z","content":"<USER_REQUEST>\nThis is a test of tool error handling. Call your run_command tool with an empty arguments object {} (deliberately omit CommandLine and every other argument). Do not call any other tool. Then reply with the exact error text you received, quoted.\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-28T16:29:27-06:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.8 Flash (Medium). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:29:27Z","input_tokens":7847,"cache_read_tokens":0,"output_tokens":169,"tool_calls":[{"name":"run_command"}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"INVALID","error":"invalid arguments:\n- missing properties 'CommandLine', 'toolSummary', 'WaitMsBeforeAsync'","created_at":"2026-10-28T22:29:31Z","content":"Created At: 2026-10-28T16:29:31-06:00\nCompleted At: 2026-10-28T16:29:31-06:00\nError invalid tool call: invalid arguments:\n- missing properties 'CommandLine', 'toolSummary', 'WaitMsBeforeAsync'"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:29:31Z","input_tokens":8117,"cache_read_tokens":0,"output_tokens":215,"content":"Here is the exact error text received:\n\n```\nCreated At: 2026-10-28T16:29:31-06:00\nCompleted At: 2026-10-28T16:29:31-06:00\nEncountered error in tool validation: invalid arguments:\n- missing properties 'CommandLine', 'toolSummary', 'WaitMsBeforeAsync'\n```"}"#,
+            "\n",
+        );
+        let reopened: Vec<Vec<(String, String, bool)>> = [unknown_tool, missing_arguments]
+            .into_iter()
+            .map(|content| {
+                let transcript = parse_antigravity_transcript_content(content, agent_id());
+                assert!(transcript.warnings.is_empty(), "{:?}", transcript.warnings);
+                agent_items(&transcript.turns[1])
+                    .iter()
+                    .filter_map(|item| match item {
+                        TurnItem::Tool {
+                            name,
+                            output: Some(output),
+                            is_error: Some(is_error),
+                            completed_at: Some(_),
+                            ..
+                        } => Some((name.clone(), output.clone(), *is_error)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+
+        assert_eq!(
+            reopened,
+            vec![
+                vec![(
+                    "frobnicate_widget".to_owned(),
+                    "unknown tool: \"frobnicate_widget\" — check spelling".to_owned(),
+                    true,
+                )],
+                vec![(
+                    "run_command".to_owned(),
+                    "invalid arguments:\n- missing properties 'CommandLine', 'toolSummary', 'WaitMsBeforeAsync'".to_owned(),
+                    true,
+                )],
+            ]
+        );
+    }
+
+    /// Synthetic: a failure whose status the parser does not list (`REJECTED`
+    /// is not among the binary's step statuses @ 1.4.9 or 1.4.10). Reopening
+    /// must show it as failed on its `error` alone, as the live view does.
+    #[test]
+    fn a_result_with_an_unlisted_status_and_an_error_reopens_as_failed() {
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-28T22:28:47Z","content":"<USER_REQUEST>\ncall frobnicate_widget\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:47Z","tool_calls":[{"name":"frobnicate_widget","args":{"x":"1"}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"REJECTED","error":"the tool call was rejected","created_at":"2026-10-28T22:28:57Z","content":"Created At: 2026-10-28T16:28:57-06:00\nCompleted At: 2026-10-28T16:28:57-06:00\nthe tool call was rejected"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:58Z","content":"ack"}"#,
+            "\n",
+        );
+        let transcript = parse_antigravity_transcript_content(content, agent_id());
+        let tools: Vec<(&str, &str, bool)> = agent_items(&transcript.turns[1])
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Tool {
+                    name,
+                    output: Some(output),
+                    is_error: Some(is_error),
+                    completed_at: Some(_),
+                    ..
+                } => Some((name.as_str(), output.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            tools,
+            vec![("frobnicate_widget", "the tool call was rejected", true)]
+        );
+        assert!(transcript.warnings.is_empty(), "{:?}", transcript.warnings);
+    }
+
+    /// Synthetic, a shape no transcript has shown: each listed failure status
+    /// with no reason (`error` missing, empty or blank). Reopening must show
+    /// it as failed on the status alone, as the live view does.
+    #[test]
+    fn a_listed_failure_status_without_an_error_reopens_as_failed() {
+        let user_input = r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-28T22:28:47Z","content":"<USER_REQUEST>\ncall frobnicate_widget\n</USER_REQUEST>"}"#;
+        let planner = r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:47Z","tool_calls":[{"name":"frobnicate_widget","args":{"x":"1"}}]}"#;
+        let answer = r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:58Z","content":"ack"}"#;
+        let mut verdicts = Vec::new();
+        for status in ["FAILED", "ERROR", "INVALID"] {
+            for error in [None, Some(""), Some("  ")] {
+                let error_field = match error {
+                    Some(text) => format!(r#","error":"{text}""#),
+                    None => String::new(),
+                };
+                let result = format!(
+                    r#"{{"step_index":2,"source":"MODEL","type":"GENERIC","status":"{status}"{error_field},"created_at":"2026-10-28T22:28:57Z","content":"Created At: 2026-10-28T16:28:57-06:00"}}"#
+                );
+                let content = [user_input, planner, result.as_str(), answer].join("\n") + "\n";
+                let transcript = parse_antigravity_transcript_content(&content, agent_id());
+                let is_error = agent_items(&transcript.turns[1])
+                    .iter()
+                    .find_map(|item| match item {
+                        TurnItem::Tool { is_error, .. } => Some(*is_error),
+                        _ => None,
+                    })
+                    .flatten();
+                verdicts.push((status, error, is_error));
+            }
+        }
+
+        assert!(
+            verdicts
+                .iter()
+                .all(|(_, _, is_error)| *is_error == Some(true)),
+            "{verdicts:?}"
+        );
     }
 
     /// Reopen applies the same command-only rule as the live parser: an MCP

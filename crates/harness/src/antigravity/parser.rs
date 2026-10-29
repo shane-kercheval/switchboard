@@ -111,14 +111,35 @@ impl TranscriptRecord {
     ///   a missing-file `view_file` or a missing-target `replace_file_content`.
     ///   1.4.3 writes the same shape when a renamed tool fails while running
     ///   (a missing-file `read_file`: `error:"file does not exist"`).
+    /// - 1.4.9 (first observed 2026-10-28; the release that introduced it is
+    ///   unverified, and the 1.4.8 changelog's "failed tool calls, including
+    ///   calls to a tool that doesn't exist and canceled or interrupted calls"
+    ///   fix is the likely origin): a call `agy` rejects before running it as
+    ///   an ordinary `MODEL` result with `status:"INVALID"` and the reason in
+    ///   `error`, e.g. a tool that does not exist (`unknown tool: "<name>" —
+    ///   check spelling`) or a `run_command` with no arguments (`invalid
+    ///   arguments:` and a list of the missing properties). The stream reports
+    ///   the same step `state:"ERROR"`.
     ///
-    /// `status:"FAILED"` predates these captures and is kept. A command that
-    /// ran and exited non-zero carries no structured signal in any version, so
-    /// it is read from the record's prose by [`header_reports_nonzero_exit`].
+    /// **A non-empty `error` is a failure whatever the status**, so a failure
+    /// status `agy` adds later still reads as failed when it gives a reason;
+    /// in the saved transcripts every `ERROR` and `INVALID` result carries an
+    /// `error` and no `DONE` or `RUNNING` result does. Not "every status but
+    /// `DONE`": a command `agy` moves to the background is written once as
+    /// `status:"RUNNING"` with no `error`, and that call has not failed.
+    /// `status:"FAILED"` predates these captures and is kept.
+    ///
+    /// A command that ran and exited non-zero is written `status:"DONE"` with
+    /// no `error` in every version observed, so it is read from the record's
+    /// prose by [`header_reports_nonzero_exit`].
     pub(crate) fn tool_result_failure(&self) -> ResultFailure {
         ResultFailure {
             structured: self.is_invalid_tool_call_error()
-                || matches!(self.status.as_deref(), Some("FAILED" | "ERROR")),
+                || matches!(self.status.as_deref(), Some("FAILED" | "ERROR" | "INVALID"))
+                || self
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| !error.trim().is_empty()),
             nonzero_exit_header: self
                 .content
                 .as_deref()
@@ -162,8 +183,11 @@ impl TranscriptRecord {
 /// `type:"GENERIC"`, so only the paired call says a result came from a
 /// command. If `agy` renamed it, failed commands would read as successes again
 /// (`live_antigravity_failing_command_completes_as_tool_error` fails on that).
-/// A command that ran in the background and whose exit is reported through a
-/// separate status tool is not covered; none has been observed.
+/// A command `agy` moves to the background is written once as
+/// `status:"RUNNING"` and never updated (observed @ 1.4.9 and 1.4.10); its
+/// completion arrives later as a `SYSTEM` message that is not paired with the
+/// call, so one that later exits non-zero keeps its success mark, live and on
+/// reopen.
 const COMMAND_TOOL: &str = "run_command";
 
 /// What a tool-result record says about failure, before it is paired with its
@@ -172,8 +196,9 @@ const COMMAND_TOOL: &str = "run_command";
 /// are kept apart until [`Self::is_error_for`] combines them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResultFailure {
-    /// A failure the record states whatever the tool: `status:"FAILED"` or
-    /// `"ERROR"`, or the 1.1.2 invalid-tool-call shape.
+    /// A failure the record states whatever the tool: `status:"FAILED"`,
+    /// `"ERROR"` or `"INVALID"`, a non-empty `error`, or the 1.1.2
+    /// invalid-tool-call shape.
     structured: bool,
     /// The header says a command exited non-zero. A failure only for a
     /// command call.
@@ -314,8 +339,9 @@ pub(crate) struct ClosedTools {
     /// Failures naming a step no pending tool expects and no transcript result
     /// settled, with their message.
     pub(crate) unattributed: Vec<(i64, String)>,
-    /// Failures on a step whose transcript result reported success. Never
-    /// observed; the transcript's result stands.
+    /// Failures on a step whose transcript result reported success. The
+    /// transcript's result stands; see
+    /// [`AntigravityParserState::close_pending_tools`] for what this means.
     pub(crate) contradicted: Vec<(i64, Option<String>)>,
 }
 
@@ -425,18 +451,21 @@ impl AntigravityParserState {
     /// tool left without a message closes with [`MISSING_TOOL_RESULT_OUTPUT`].
     ///
     /// **The transcript settles a step it has a result for.** Since agy 1.4.2
-    /// a rejected call is reported twice: as a `status:"ERROR"` transcript
-    /// result and as a stream `state:"ERROR"` step. The transcript record
-    /// completes the call as soon as it is tailed, whichever channel arrived
-    /// first, so by this drain the stream's report for that step has no call
-    /// left to close and is dropped here rather than logged as unattributed. The
-    /// transcript wins even if the two ever disagree, because it owns the
-    /// agents' side of the conversation (system-design §3) and is all a
-    /// reopened conversation can read: letting the stream override it would
-    /// make the live row and the reopened row differ. A stream failure on a
-    /// step the transcript recorded as a *success* is that disagreement, never
-    /// observed; it is returned in [`ClosedTools::contradicted`] so the
-    /// producer can log it.
+    /// a rejected call is reported twice: as a `status:"ERROR"` (1.4.9:
+    /// `"INVALID"`) transcript result and as a stream `state:"ERROR"` step.
+    /// The transcript record completes the call as soon as it is tailed,
+    /// whichever channel arrived first, so by this drain the stream's report
+    /// for that step has no call left to close and is dropped here rather than
+    /// logged as unattributed. The transcript wins even if the two ever
+    /// disagree, because it owns the agents' side of the conversation
+    /// (system-design §3) and is all a reopened conversation can read: letting
+    /// the stream override it would make the live row and the reopened row
+    /// differ. A stream failure on a
+    /// step the transcript recorded as a *success* is that disagreement, and
+    /// the row shows a success. It most likely means `agy` wrote the failure
+    /// in a shape [`TranscriptRecord::tool_result_failure`] does not read; the
+    /// other cause is the two channels numbering steps differently. It is
+    /// returned in [`ClosedTools::contradicted`] so the producer can log it.
     pub(crate) fn close_pending_tools(&mut self, turn_id: TurnId) -> ClosedTools {
         let mut events = Vec::new();
         let mut unattributed = Vec::new();
@@ -1338,6 +1367,163 @@ mod tests {
         );
     }
 
+    /// Captured @ agy 1.4.9 (2026-10-28, Gemini 3.8 Flash, the adapter's
+    /// dispatch flags, compact transcript; the planner's `thinking` is left
+    /// out): a call to a tool that does not exist. The result is written
+    /// `status:"INVALID"`, and the stream reports step 2 as `state:"ERROR"`
+    /// with the same message.
+    const UNKNOWN_TOOL_1_4_9: [&str; 2] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:47Z","input_tokens":7877,"cache_read_tokens":0,"output_tokens":959,"tool_calls":[{"name":"frobnicate_widget","args":{"x":"1"}}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"INVALID","error":"unknown tool: \"frobnicate_widget\" — check spelling","created_at":"2026-10-28T22:28:57Z","content":"Created At: 2026-10-28T16:28:57-06:00\nCompleted At: 2026-10-28T16:28:57-06:00\nError invalid tool call: unknown tool: \"frobnicate_widget\" — check spelling"}"#,
+    ];
+
+    /// Captured @ agy 1.4.9 (2026-10-28, Gemini 3.8 Flash, the adapter's
+    /// dispatch flags, compact transcript): `run_command` called with no
+    /// arguments. The planner record carries no `args` at all, and the result
+    /// is written `status:"INVALID"`.
+    const MISSING_ARGUMENTS_1_4_9: [&str; 2] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:29:27Z","input_tokens":7847,"cache_read_tokens":0,"output_tokens":169,"tool_calls":[{"name":"run_command"}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"INVALID","error":"invalid arguments:\n- missing properties 'CommandLine', 'toolSummary', 'WaitMsBeforeAsync'","created_at":"2026-10-28T22:29:31Z","content":"Created At: 2026-10-28T16:29:31-06:00\nCompleted At: 2026-10-28T16:29:31-06:00\nError invalid tool call: invalid arguments:\n- missing properties 'CommandLine', 'toolSummary', 'WaitMsBeforeAsync'"}"#,
+    ];
+
+    /// Synthetic, on the captured unknown-tool call: a failure whose status the
+    /// parser does not list (`REJECTED` is not among the binary's step
+    /// statuses @ 1.4.9 or 1.4.10). Its `error` alone must make it a failure.
+    const UNLISTED_STATUS_WITH_AN_ERROR: [&str; 2] = [
+        UNKNOWN_TOOL_1_4_9[0],
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"REJECTED","error":"the tool call was rejected","created_at":"2026-10-28T22:28:57Z","content":"Created At: 2026-10-28T16:28:57-06:00\nCompleted At: 2026-10-28T16:28:57-06:00\nthe tool call was rejected"}"#,
+    ];
+
+    /// Captured @ agy 1.4.9 (2026-10-28, Gemini 3.8 Flash, the adapter's
+    /// dispatch flags, compact transcript; only the task-log path is
+    /// neutralized): a command `agy` moved to the background. Its result is
+    /// written once, `status:"RUNNING"` with no `error`, and never updated.
+    const BACKGROUNDED_COMMAND_1_4_9: [&str; 2] = [
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T23:00:21Z","input_tokens":7874,"cache_read_tokens":0,"output_tokens":45,"tool_calls":[{"name":"run_command","args":{"CommandLine":"\"sleep 25; echo LATE_MARKER\"","WaitMsBeforeAsync":"500","toolSummary":"\"Late marker sleep command\""}}]}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"RUNNING","created_at":"2026-10-28T23:00:23Z","content":"Created At: 2026-10-28T17:00:23-06:00\nTool is running as a background task with task id: ee4a8cf1-b893-4085-8408-0978e1e88788/task-2\nTask Description: sleep 25; echo LATE_MARKER\nTask logs are available at: file:///tmp/agyprobe/brain/ee4a8cf1-b893-4085-8408-0978e1e88788/.system_generated/tasks/task-2.log\nYOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: A) either proceed to other relevant work (if any) or, B) simply update the user with a short message (that you have launched the command and will wait for it to finish) and end the turn.\n DO NOTHING ELSE."}"#,
+    ];
+
+    #[test]
+    fn a_result_with_an_unlisted_status_and_an_error_completes_as_failed() {
+        let completions = completions_of(
+            &UNLISTED_STATUS_WITH_AN_ERROR,
+            &mut AntigravityParserState::default(),
+        );
+
+        assert_eq!(
+            completions,
+            vec![(
+                "1:0:frobnicate_widget".to_owned(),
+                "the tool call was rejected".to_owned(),
+                true,
+            )],
+            "an error is failure evidence whatever the status"
+        );
+    }
+
+    /// Synthetic, a shape no transcript has shown: each listed failure status
+    /// with no reason (`error` missing, empty or blank). The status alone must
+    /// make it a failure, so a rule that read only `error` fails here.
+    #[test]
+    fn a_listed_failure_status_without_an_error_completes_as_failed() {
+        let mut verdicts = Vec::new();
+        for status in ["FAILED", "ERROR", "INVALID"] {
+            for error in [None, Some(""), Some("  ")] {
+                let error_field = match error {
+                    Some(text) => format!(r#","error":"{text}""#),
+                    None => String::new(),
+                };
+                let result = format!(
+                    r#"{{"step_index":2,"source":"MODEL","type":"GENERIC","status":"{status}"{error_field},"content":"Created At: 2026-10-28T16:28:57-06:00"}}"#
+                );
+                let completions = completions_of(
+                    &[UNKNOWN_TOOL_1_4_9[0], result.as_str()],
+                    &mut AntigravityParserState::default(),
+                );
+                let is_error = completions.first().map(|(_, _, is_error)| *is_error);
+                verdicts.push((status, error, is_error));
+            }
+        }
+
+        assert!(
+            verdicts
+                .iter()
+                .all(|(_, _, is_error)| *is_error == Some(true)),
+            "{verdicts:?}"
+        );
+    }
+
+    /// Counting every status but `DONE` as a failure would mark every
+    /// backgrounded command as failed.
+    #[test]
+    fn a_backgrounded_command_written_running_completes_as_succeeded() {
+        let completions = completions_of(
+            &BACKGROUNDED_COMMAND_1_4_9,
+            &mut AntigravityParserState::default(),
+        );
+
+        assert_eq!(completions.len(), 1, "{completions:?}");
+        let (id, output, is_error) = &completions[0];
+        assert_eq!(id, "1:0:run_command");
+        assert!(!*is_error, "status:RUNNING with no error is a success");
+        assert!(output.contains("running as a background task"), "{output}");
+    }
+
+    /// Each 1.4.9 `INVALID` capture with its tool-use id and the message `agy`
+    /// wrote, which the stream also carries as `tool_info.error.message`.
+    const INVALID_CALLS_1_4_9: [(&[&str; 2], &str, &str); 2] = [
+        (
+            &UNKNOWN_TOOL_1_4_9,
+            "1:0:frobnicate_widget",
+            "unknown tool: \"frobnicate_widget\" — check spelling",
+        ),
+        (
+            &MISSING_ARGUMENTS_1_4_9,
+            "1:0:run_command",
+            "invalid arguments:\n- missing properties 'CommandLine', 'toolSummary', 'WaitMsBeforeAsync'",
+        ),
+    ];
+
+    #[test]
+    fn a_1_4_9_invalid_call_completes_as_failed_with_agys_message() {
+        let completions: Vec<Vec<(String, String, bool)>> = INVALID_CALLS_1_4_9
+            .iter()
+            .map(|(records, _, _)| completions_of(*records, &mut AntigravityParserState::default()))
+            .collect();
+        let expected: Vec<Vec<(String, String, bool)>> = INVALID_CALLS_1_4_9
+            .iter()
+            .map(|(_, id, message)| vec![((*id).to_owned(), (*message).to_owned(), true)])
+            .collect();
+
+        assert_eq!(
+            completions, expected,
+            "a status:INVALID result is a failure shown with agy's error"
+        );
+    }
+
+    /// The stream and the transcript both report the step failed, so the
+    /// transcript's result settles it and nothing is left to warn about.
+    #[test]
+    fn a_1_4_9_invalid_call_agrees_with_the_streams_error_for_its_step() {
+        let closed: Vec<_> = INVALID_CALLS_1_4_9
+            .iter()
+            .map(|(records, _, message)| {
+                let mut state = AntigravityParserState::default();
+                state.record_stream_tool_failure(2, Some((*message).to_owned()));
+                let completions = completions_of(*records, &mut state);
+                assert_eq!(completions.len(), 1, "{completions:?}");
+                state.close_pending_tools(tid())
+            })
+            .collect();
+
+        assert!(
+            closed.iter().all(|closed| closed.events.is_empty()
+                && closed.unattributed.is_empty()
+                && closed.contradicted.is_empty()),
+            "{closed:?}"
+        );
+    }
+
     /// Each heading `agy` has put before a command's output ends the header,
     /// so an exit sentence the command printed is not read as its status.
     /// `Output snapshot:` is the background-command heading in the older output
@@ -1467,9 +1653,10 @@ mod tests {
         }
     }
 
-    /// Never observed: the stream calls a step failed that the transcript
-    /// recorded as a success. The transcript owns the displayed result, so it
-    /// stands, and the disagreement is kept for the producer to log.
+    /// The stream calls a step failed that the transcript recorded as a
+    /// success, most likely because `agy` wrote a failure in a shape the parser
+    /// does not read. The transcript owns the displayed result, so it stands,
+    /// and the disagreement is kept for the producer to log.
     #[test]
     fn a_stream_failure_on_a_step_the_transcript_called_a_success_is_kept_for_diagnostics() {
         let mut state = AntigravityParserState::default();

@@ -43,7 +43,7 @@ If a code-level look is needed, fetch the specific PRs (`gh pr view <n> --repo <
 
 1. Install the new version, run `make cli-surface HARNESS=<codex|claude|agy>`, and read `git diff docs/research/cli-surface/`. For `agy`, compare the snapshot's first line with `agy --version` and with the version this review is recording: the snapshot starts `agy -p`, which runs `agy`'s auto-updater, so `agy` can update itself mid-run. If the three differ, regenerate the snapshot and recheck any part of the review that depends on the version.
 2. For each added command, flag, app-server method or slash command, ask whether Switchboard would want it. Check it against the capability watchlist (`harness-behavior.md` §8), and probe anything that matches a row.
-3. If an addition is a capability we would want later but are not building now, add a watchlist row for it.
+3. If an addition is a capability we would want later but are not building now, add a watchlist row for it. An idea that is not a harness capability, such as a simplification a new field makes possible, goes in `docs/backlog.md`.
 4. Commit the regenerated file with the review, so the snapshot always matches the "Last reviewed" version.
 
 **`agy plugin`'s subcommand flags are not in the snapshot.** The script only descends into an `agy` command group whose help says `Run "agy <group> <subcommand> --help"`, because `plugin`'s subcommands treat `--help` as an ordinary argument: `agy plugin list --help` runs `list`, and `agy plugin import --help` tries to import a path named `--help` (verified on 1.3.3). New or removed plugin subcommands still show in the diff through the group's own list.

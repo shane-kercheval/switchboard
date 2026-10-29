@@ -198,6 +198,7 @@ Project-wide rules that apply across all milestones. Milestone-specific mechanic
 - `docs/implementation_plans/` — per-milestone plans and the v1 roadmap. Read the active milestone plan before changing scope; it's the ground truth for what to build.
 - `docs/harness-behavior.md` — **the single source of truth for harness behavior**: how each harness behaves in the scenarios we care about (failures, auth, quota, metadata), how our adapter/frontend handles it, and the gap register. Start here.
 - `docs/harness-update-review.md` — playbook for reviewing a harness CLI version bump for impact on Switchboard (what to read, the dependency surface to check, how to record findings).
+- `docs/backlog.md`: improvement ideas deferred on purpose, each with its evidence and why it waits. A harness capability Switchboard hasn't built goes in `harness-behavior.md` §8 instead, and a known harness bug in its gap register (§4).
 - `docs/research/` — harness ground-truth notes:
   - `same-session-parallel-invocation.md` — why we enforce session-id uniqueness at the app layer.
   - `archive/` — frozen, no-longer-maintained provenance, including the per-harness `*-cli-observed.md` probes (raw strings, exit codes, fixtures) that `harness-behavior.md` distills from. Cite for evidence; trust `harness-behavior.md` for current behavior. `docs/system-design.md` §9 is the design-level capability matrix; `harness-behavior.md` is its operational companion.

@@ -1515,6 +1515,8 @@ describe("Sidebar", () => {
     );
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [claude, codex] } });
     const cards = screen.getAllByTestId("sidebar-agent");
+    // A saved model the picker no longer lists is labelled by its raw id.
+    expect(within(cards[1]!).getByTestId("agent-model-chip")).toHaveTextContent("gpt-5.6-sol");
 
     await fireEvent.click(within(cards[0]!).getByTestId("agent-model-chip"));
     await fireEvent.click(within(cards[1]!).getByTestId("agent-model-chip"));

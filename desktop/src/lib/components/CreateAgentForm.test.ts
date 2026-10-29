@@ -228,7 +228,7 @@ describe("CreateAgentForm", () => {
       selection: {
         model: "gpt-6.1-sol",
         effort: "medium",
-        model_choices: ["gpt-6.1-sol", "gpt-5.6-terra"],
+        model_choices: ["gpt-6.1-sol", "gpt-6.1-terra"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
@@ -739,7 +739,7 @@ describe("CreateAgentForm", () => {
       selection: {
         model: "gpt-6.1-sol",
         effort: "medium",
-        model_choices: ["gpt-6.1-sol", "gpt-5.6-terra"],
+        model_choices: ["gpt-6.1-sol", "gpt-6.1-terra"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
@@ -848,7 +848,7 @@ describe("CreateAgentForm", () => {
       selection: {
         model: "gpt-6.1-sol",
         effort: "medium",
-        model_choices: ["gpt-6.1-sol", "gpt-5.6-terra"],
+        model_choices: ["gpt-6.1-sol", "gpt-6.1-terra"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);

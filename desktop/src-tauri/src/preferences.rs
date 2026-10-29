@@ -108,7 +108,7 @@ fn default_agent_defaults() -> BTreeMap<HarnessKind, AgentDefaults> {
         (
             HarnessKind::Codex,
             AgentDefaults {
-                model_choices: vec!["gpt-6.1-sol".to_owned(), "gpt-5.6-terra".to_owned()],
+                model_choices: vec!["gpt-6.1-sol".to_owned(), "gpt-6.1-terra".to_owned()],
                 effort_choices: vec!["medium".to_owned(), "high".to_owned()],
                 default_model: Some("gpt-6.1-sol".to_owned()),
                 default_effort: Some("medium".to_owned()),

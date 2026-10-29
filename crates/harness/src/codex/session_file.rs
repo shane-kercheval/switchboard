@@ -1031,11 +1031,12 @@ impl Enrichment {
     /// [`crate::transcript::merge_meta_with_loaders`] applies on reload, so a
     /// live `SessionMeta` and a reloaded one agree.
     ///
-    /// MCP servers have no rollout source at all (Codex records its loaded
-    /// servers nowhere — not the stream, not the rollout), so they are always
+    /// MCP servers have no rollout source at all (Codex records which servers
+    /// it loaded in neither the stream nor the rollout), so they are always
     /// the loader's, carrying the `"configured"` status that says so. `tools`
-    /// stays `None` for the same absence: claiming zero tools would be a
-    /// statement Codex never made.
+    /// stays `None` because this reader ignores the rollout's
+    /// `world_state.state.top_level_tools`, and `Some([])` would claim Codex
+    /// loaded zero tools.
     #[must_use]
     pub fn inventory(
         &self,
@@ -4153,8 +4154,8 @@ mod tests {
 
     #[test]
     fn codex_never_claims_a_tool_inventory() {
-        // Codex records its tools nowhere — not the stream, not the rollout.
-        // `None` says that; `Some([])` would claim it loaded zero tools.
+        // The reader ignores `world_state.state.top_level_tools`, so it reports
+        // no tools: `None`, because `Some([])` would claim Codex loaded zero.
         assert_eq!(world_state_fixture().inventory(None, None).tools, None);
     }
 

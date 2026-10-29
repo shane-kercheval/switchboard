@@ -181,8 +181,8 @@ describe("environmentView sections", () => {
   });
 
   it("omits a long list the harness never reported", () => {
-    // Codex reports no tool inventory anywhere, so its card must draw no
-    // Tools line — not "Tools · 0".
+    // The Codex reader ignores the tool list in `world_state.state.top_level_tools`
+    // and reports none, so a Codex card must draw no Tools line, not "Tools · 0".
     const v = view({ slash_commands: ["init"] });
     expect(v.lists.map((l) => l.key)).toEqual(["slash_commands"]);
   });

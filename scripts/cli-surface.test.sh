@@ -52,7 +52,14 @@ case "$*" in
     printf '\nOptions:\n  -h, --help  width=%s\n' "${COLUMNS:-unset}"
     ;;
   "help exec") printf 'Usage: codex exec\n\nCommands:\n  fork  Fork a session\n' ;;
-  "help exec fork") echo "Usage: codex exec fork <SESSION_ID>" ;;
+  # A flag whose default is TMPDIR, which Codex quotes when it contains
+  # whitespace (`codex migrate-nfs-db --staging-dir`).
+  "help exec fork")
+    printf 'Usage: codex exec fork <SESSION_ID>\n\n  --staging-dir <DIR>\n'
+    dir=${TMPDIR-}
+    case $dir in *[[:space:]]*) dir="\"$dir\"" ;; esac
+    printf '          [default: %s]\n' "$dir"
+    ;;
   "help plugin") echo "Usage: codex plugin" ;;
   "app-server generate-json-schema --out "*) schema "$4" ;;
   "app-server generate-json-schema --experimental --out "*) schema "$5" experimental ;;
@@ -195,6 +202,27 @@ if expect_success "$name" codex; then
   expected=$(printf 'thread/items/read\nthread/readState/update')
   if [[ $table == "$expected" ]]; then pass "$name"; else fail_test "$name" "got: $table"; fi
 fi
+
+# Run with TMPDIR set to $2 and expect its flag default printed as <TMPDIR>
+# with no trace of the path.
+expect_temp_dir_hidden() {
+  local name="$1" dir="$2"
+  mkdir -p "$dir"
+  if TMPDIR="$dir" expect_success "$name" codex; then
+    if has_line "          [default: <TMPDIR>]" && ! grep -qF "$dir" "$out"; then
+      pass "$name"
+    else
+      fail_test "$name" "the temp directory default was not replaced"
+    fi
+  fi
+}
+
+expect_temp_dir_hidden "codex: a temp-directory default with regex characters is printed as <TMPDIR>" \
+  "$tmp/T+[1].x/"
+expect_temp_dir_hidden "codex: a quoted temp-directory default (a path with a space) is printed as <TMPDIR>" \
+  "$tmp/with space/"
+expect_temp_dir_hidden "codex: a temp-directory default with a backslash is printed as <TMPDIR>" \
+  "$tmp/back\\slash/"
 
 FAKE_FAIL_ARGS="help exec fork" expect_failure \
   "codex: a failed nested help call stops the script and names it" \

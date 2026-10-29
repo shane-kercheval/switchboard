@@ -198,8 +198,8 @@ describe("AgentEnvironment", () => {
     render(AgentEnvironment, { props: { inventory: CODEX } });
     await expand();
 
-    // Codex records its tools nowhere, so there is no Tools line — not
-    // "Tools · 0".
+    // The Codex reader ignores `world_state.state.top_level_tools` and reports
+    // no tools, so there is no Tools line, not "Tools · 0".
     expect(screen.queryByTestId("agent-env-list-tools")).toBeNull();
     expect(screen.queryByTestId("agent-env-agents")).toBeNull();
     expect(screen.queryByTestId("agent-env-plugins")).toBeNull();

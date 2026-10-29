@@ -133,9 +133,9 @@ pub struct SettingPair {
 /// model, and both harnesses' fields are mapped onto it at their own parsers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SessionInventory {
-    /// Tool names. Claude's `init.tools`; no harness has an on-disk analog, and
-    /// Codex reports no tool inventory anywhere (neither stream nor rollout),
-    /// so it stays `None` there rather than claiming zero tools.
+    /// Tool names. Claude's `init.tools`. Codex's reader leaves it `None`
+    /// rather than claiming zero tools, because it ignores the rollout's
+    /// `world_state.state.top_level_tools`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

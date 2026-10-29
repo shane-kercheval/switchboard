@@ -133,7 +133,7 @@ describe("SettingsView", () => {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             codex: {
-              model_choices: ["gpt-6.1-sol", "gpt-5.6-terra", "gpt-6-astra"],
+              model_choices: ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra"],
               effort_choices: ["medium", "high"],
               default_model: "gpt-6.1-sol",
               default_effort: "medium",
@@ -145,16 +145,16 @@ describe("SettingsView", () => {
 
     expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("GPT-6.1 Sol");
     await fireEvent.change(screen.getByTestId("settings-selection-codex-model-current"), {
-      target: { value: "gpt-5.6-terra" },
+      target: { value: "gpt-6.1-terra" },
     });
     await waitFor(() =>
       expect(invokeMock).toHaveBeenLastCalledWith("set_preferences", {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             codex: {
-              model_choices: ["gpt-6.1-sol", "gpt-5.6-terra", "gpt-6-astra"],
+              model_choices: ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra"],
               effort_choices: ["medium", "high"],
-              default_model: "gpt-5.6-terra",
+              default_model: "gpt-6.1-terra",
               default_effort: "medium",
             },
           }),
@@ -162,8 +162,27 @@ describe("SettingsView", () => {
       }),
     );
     await waitFor(() =>
-      expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("GPT-5.6 Terra"),
+      expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("GPT-6.1 Terra"),
     );
+  });
+
+  it("keeps a saved model the picker no longer lists, labelled by its raw id", async () => {
+    // Saved model ids are never migrated, so a choice the catalog dropped must
+    // stay selected and readable rather than vanish from Settings.
+    preferences.agent_defaults.codex = {
+      model_choices: ["gpt-6.1-sol", "gpt-5.6-terra"],
+      effort_choices: ["medium", "high"],
+      default_model: "gpt-5.6-terra",
+      default_effort: "medium",
+    };
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+
+    const summary = await screen.findByTestId("agent-defaults-codex-summary");
+    expect(summary).toHaveTextContent("gpt-5.6-terra");
+    await fireEvent.click(summary);
+    const choice = screen.getByTestId("settings-selection-codex-model-choice-gpt-5.6-terra");
+    expect(choice).toHaveTextContent("gpt-5.6-terra");
+    expect(choice).toHaveAttribute("aria-pressed", "true");
   });
 
   // Leaving the Agents section hides it rather than unmounting it, so a card a
@@ -312,10 +331,10 @@ describe("SettingsView", () => {
     expect(card?.open).toBe(true);
 
     await fireEvent.change(screen.getByTestId("settings-selection-codex-model-current"), {
-      target: { value: "gpt-5.6-terra" },
+      target: { value: "gpt-6.1-terra" },
     });
     await waitFor(() =>
-      expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("GPT-5.6 Terra"),
+      expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("GPT-6.1 Terra"),
     );
     expect(screen.getByTestId("agent-defaults-codex-summary").closest("details")).toBe(card);
     expect(card?.open).toBe(true);

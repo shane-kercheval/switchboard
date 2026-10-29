@@ -81,7 +81,7 @@ test("Codex's six effort levels fit one row without clipping at the dialog width
 
 test("Codex's model pills fit one row without clipping at the dialog width", async () => {
   render(SegmentedFitHost, {
-    props: { width: DIALOG_INNER_WIDTH, options: MODEL_OPTIONS.codex, value: "gpt-5.6-terra" },
+    props: { width: DIALOG_INNER_WIDTH, options: MODEL_OPTIONS.codex, value: "gpt-6.1-terra" },
   });
   await expect.element(page.getByTestId("fit")).toBeInTheDocument();
   await expect

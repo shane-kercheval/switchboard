@@ -54,6 +54,35 @@ section() {
   printf '\n===== %s\n' "$1"
 }
 
+# Copy stdin to stdout with `TMPDIR` replaced by `<TMPDIR>` where help text
+# shows it as a flag's default (`codex migrate-nfs-db --staging-dir`), so the
+# snapshot is the same on every machine. Codex quotes it when it contains a
+# space. It reaches awk through ENVIRON, which keeps backslashes, and is
+# matched as a plain string. Not replaced: the default printed when `TMPDIR`
+# is unset or empty, which depends on the operating system; a default
+# wrapped onto a second line; and (untested) a path with whitespace plus a
+# backslash or double quote, which clap escapes inside the quotes.
+hide_temp_dir() {
+  if [[ -z ${TMPDIR:-} ]]; then
+    cat
+    return
+  fi
+  TEMP_DIR_TO_HIDE="$TMPDIR" awk '
+    function replace_all(text, from, to, out, i) {
+      out = ""
+      while ((i = index(text, from)) > 0) {
+        out = out substr(text, 1, i - 1) to
+        text = substr(text, i + length(from))
+      }
+      return out text
+    }
+    BEGIN { dir = ENVIRON["TEMP_DIR_TO_HIDE"] }
+    {
+      line = replace_all($0, "[default: \"" dir "\"", "[default: <TMPDIR>")
+      print replace_all(line, "[default: " dir, "[default: <TMPDIR>")
+    }'
+}
+
 print_version() {
   local version
   version=$(run_help "$@" --version) || fail "'$* --version' failed"
@@ -195,10 +224,12 @@ agy_surface() {
   print_table "agy slash commands (/help)" "$commands"
 }
 
+# A pipeline rather than `$(...)`, because bash turns off `set -e` inside a
+# command substitution; `pipefail` passes a failed capture's status on.
 case "$harness" in
-  codex) codex_surface ;;
-  claude) claude_surface ;;
-  agy) agy_surface ;;
+  codex) codex_surface | hide_temp_dir ;;
+  claude) claude_surface | hide_temp_dir ;;
+  agy) agy_surface | hide_temp_dir ;;
   *)
     echo "unknown harness: $harness (expected codex, claude or agy)" >&2
     exit 2

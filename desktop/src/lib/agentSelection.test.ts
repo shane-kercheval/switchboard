@@ -67,7 +67,7 @@ describe("agent selection catalogs", () => {
       default_effort: "medium",
     });
     expect(DEFAULT_AGENT_SELECTIONS.codex).toEqual({
-      model_choices: ["gpt-6.1-sol", "gpt-5.6-terra"],
+      model_choices: ["gpt-6.1-sol", "gpt-6.1-terra"],
       effort_choices: ["medium", "high"],
       default_model: "gpt-6.1-sol",
       default_effort: "medium",
@@ -91,11 +91,11 @@ describe("agent selection catalogs", () => {
     ]);
   });
 
-  it("offers the GPT-6 family plus GPT-5.6 Terra, which has no GPT-6 counterpart", () => {
+  it("offers the current GPT-6 family", () => {
     expect(MODEL_OPTIONS.codex).toEqual([
       { label: "GPT-6 Astra", value: "gpt-6-astra" },
       { label: "GPT-6.1 Sol", value: "gpt-6.1-sol" },
-      { label: "GPT-5.6 Terra", value: "gpt-5.6-terra" },
+      { label: "GPT-6.1 Terra", value: "gpt-6.1-terra" },
       { label: "GPT-6 Luna", value: "gpt-6-luna" },
     ]);
   });
@@ -281,7 +281,7 @@ describe("default agent naming", () => {
   });
 
   it("slugifies vendor model ids and falls back when no model is selected", () => {
-    expect(defaultAgentName("codex", "gpt-5.6-terra", "medium")).toBe("gpt-5-6-terra-medium");
+    expect(defaultAgentName("codex", "gpt-6.1-terra", "medium")).toBe("gpt-6-1-terra-medium");
     expect(defaultAgentName("antigravity", undefined, undefined)).toBe("antigravity");
   });
 

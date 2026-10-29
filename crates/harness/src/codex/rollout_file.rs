@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 const COMPRESSED_SUFFIX: &str = ".zst";
 
 /// Whether `name` is the rollout file of `session_id`, plain or compressed.
-/// Codex's temporary files, which add a `.tmp` suffix, are not.
+/// Codex's temporary copies are not: `rollout-compress-<random>.tmp` while
+/// compressing, `.rollout-materialize-<random>` while decompressing (read at
+/// `rust-v0.165.0`).
 pub(crate) fn is_rollout_of(name: &str, session_id: &str) -> bool {
     let plain = name.strip_suffix(COMPRESSED_SUFFIX).unwrap_or(name);
     plain.starts_with("rollout-") && plain.ends_with(&format!("-{session_id}.jsonl"))
@@ -177,6 +179,8 @@ mod tests {
         for name in [
             format!("rollout-2026-10-03T10-51-47-{ID}.jsonl.zst.compress.4242.0.tmp"),
             format!("rollout-2026-10-03T10-51-47-{ID}.jsonl.decompress.4242.0.tmp"),
+            "rollout-compress-Ab3dE9.tmp".to_owned(),
+            ".rollout-materialize-Qz81Lm".to_owned(),
             format!("rollout-2026-10-03T10-51-47-{ID}.jsonl.zst.zst"),
             format!("rollout-2026-10-03T10-51-47-{ID}.json"),
             format!("other-{ID}.jsonl.zst"),

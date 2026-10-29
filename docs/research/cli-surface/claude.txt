@@ -1,4 +1,4 @@
-version: 2.1.302 (Claude Code)
+version: 2.1.312 (Claude Code)
 
 ===== claude --help
 Usage: claude [options] [command] [prompt]
@@ -73,14 +73,14 @@ Options:
                                         Recommended only for sandboxes with no
                                         internet access.
   -d, --debug [filter]                  Enable debug mode with optional category
-                                        filtering (e.g., "api,hooks" or
-                                        "!1p,!file")
+                                        filtering (e.g., --debug=hooks,mcp or
+                                        --debug='!hooks,!mcp')
   --debug-file <path>                   Write debug logs to a specific file path
                                         (implicitly enables debug mode)
   --desktop                             Open in the Claude Desktop app instead
                                         of the terminal (with --continue or
                                         --resume <id> to pick the session)
-  --disable-slash-commands              Disable all skills
+  --disable-slash-commands              Disable all skills and commands
   --disallowedTools, --disallowed-tools <tools...>
       Comma or space-separated list of tool names to deny (e.g. "Bash(git *)
       Edit")
@@ -128,7 +128,8 @@ Options:
                                         (realtime streaming input) (choices:
                                         "text", "stream-json")
   --json-schema <schema>                JSON Schema for structured output
-                                        validation. Example:
+                                        validation (only works with --print).
+                                        Example:
                                         {"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
   --max-budget-usd <amount>             Maximum dollar amount to spend on API
                                         calls (only works with --print)
@@ -209,9 +210,9 @@ Options:
                                         permission handler approve writes to
                                         settings, git and tool-configuration
                                         files.
-  -r, --resume [value]                  Resume a conversation by session ID, or
-                                        open interactive picker with optional
-                                        search term
+  -r, --resume [value]                  Resume a conversation by session ID or
+                                        name, or open interactive picker with
+                                        optional search term
   --safe-mode                           Start with all customizations
                                         (CLAUDE.md, skills, installed plugins,
                                         hooks, MCP servers, custom commands and
@@ -235,9 +236,10 @@ Options:
   --system-prompt-snapshot <on|off>     Record the system prompt once per
                                         conversation and reuse it verbatim on
                                         every request and resume. on (the
-                                        default): the prompt is rendered on the
-                                        conversation's first request — a
-                                        --system-prompt or
+                                        default, except under --bare outside
+                                        cloud and background sessions): the
+                                        prompt is rendered on the conversation's
+                                        first request — a --system-prompt or
                                         --append-system-prompt included — sent,
                                         and recorded; every later request and
                                         resume sends the record as-is, even when
@@ -245,9 +247,8 @@ Options:
                                         until the conversation is compacted.
                                         off: never record; the prompt is
                                         rendered fresh every request (for
-                                        iterating on prompt text). No effect
-                                        where system-prompt recording is not yet
-                                        enabled. (choices: "on", "off")
+                                        iterating on prompt text). (choices:
+                                        "on", "off")
   --teleport [session]                  Resume a teleport session, optionally
                                         specify session ID
   --tmux                                Create a tmux session for the worktree
@@ -256,8 +257,8 @@ Options:
                                         --tmux=classic for traditional tmux.
   --tools <tools...>                    Specify the list of available tools from
                                         the built-in set. Use "" to disable all
-                                        tools, "default" to use all tools, or
-                                        specify tool names (e.g.
+                                        tools, "default" to use the default set,
+                                        or specify tool names (e.g.
                                         "Bash,Edit,Read").
   --verbose                             Override verbose mode setting from
                                         config
@@ -291,9 +292,10 @@ Commands:
                                         terminal output
   mcp                                   Configure and manage MCP servers
   plugin|plugins                        Manage Claude Code plugins
-  purge [options] [path]                Delete all Claude Code state for a
-                                        project (transcripts, tasks, file
-                                        history, config entry)
+  purge [options] [path]                Delete a project's Claude Code data
+                                        (transcripts, tasks, file history, and
+                                        its entry in ~/.claude.json) from this
+                                        computer only
   respawn [options] [id]                Restart a background session, or all of
                                         them with --all, so it runs the current
                                         Claude Code version
@@ -311,7 +313,8 @@ Commands:
                                         number / base branch) and print the
                                         findings
   update|upgrade                        Check for updates and install if
-                                        available
+                                        available; package-manager installs
+                                        update through the package manager
 
 ===== claude agents --help
 Usage: claude agents [options]
@@ -1139,17 +1142,26 @@ Validate a plugin or marketplace manifest, or the skills, agents, and commands
 in a directory
 
 Options:
-  -h, --help  Display help for command
-  --json      Output the validation report as JSON (same exit codes)
-  --strict    Treat warnings as errors (exit 1). Use in CI to fail on
-              unrecognized fields, missing metadata, and other issues that the
-              runtime tolerates.
+  -h, --help        Display help for command
+  --json            Output the validation report as JSON (same exit codes)
+  --profile <name>  Also exit 1 when the plugin directory (the catalog that
+                    plugins are submitted to) would refuse a submission of the
+                    plugin on a check this command runs, such as a missing
+                    README, or when such a check could not be made: plugin.json
+                    lists more than 16 files for MCP servers or for hooks (16 of
+                    each are checked), or an MCP or hooks file is one these
+                    checks cannot use, such as one that is not valid JSON. With
+                    --strict, also fail on its warnings. The directory runs more
+                    checks. (choices: "directory")
+  --strict          Treat warnings as errors (exit 1). Use in CI to fail on
+                    unrecognized fields, missing metadata, and other issues that
+                    the runtime tolerates.
 
 ===== claude purge --help
 Usage: claude purge [options] [path]
 
-Delete all Claude Code state for a project (transcripts, tasks, file history,
-config entry)
+Delete a project's Claude Code data (transcripts, tasks, file history, and its
+entry in ~/.claude.json) from this computer only
 
 Options:
   --all              Purge state for every project (mutually exclusive with
@@ -1185,7 +1197,7 @@ Usage: claude stop <id>
   Stop a background session. Its conversation is kept; resume it later with `claude attach <id>`.
 
 ===== claude ultrareview --help
-Usage: claude ultrareview [options] [target]
+Usage: claude ultrareview [target] [options]
 
 Run a cloud-hosted multi-agent code review of the current branch (or a PR number
 / base branch) and print the findings
@@ -1201,11 +1213,17 @@ Options:
                        targets only; one plain comment, not a review)
   --timeout <minutes>  Maximum minutes to wait for the review to finish
                        (default: 45)
+  --trust-workspace    Trust the current folder for this run only, without
+                       asking (for scripts and CI). Takes no value: put a PR
+                       number or base branch before it. Use it only on folders
+                       you trust: the folder's git configuration and Claude Code
+                       project settings can run programs
 
 ===== claude update --help
 Usage: claude update|upgrade [options]
 
-Check for updates and install if available
+Check for updates and install if available; package-manager installs update
+through the package manager
 
 Options:
   -h, --help  Display help for command

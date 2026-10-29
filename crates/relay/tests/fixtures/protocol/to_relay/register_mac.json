@@ -1,0 +1,13 @@
+{
+  "type": "register",
+  "relay_protocol": 1,
+  "device_id": "jdgks74jsp725pfms4unp6kpof",
+  "identity_public_key": "iEuIV/TqoWE8YVBNs01L6vNGUXoOMd483dTZtCAdnQs=",
+  "signature": "81glPuQblS3sRnrWWLrjUt2nzkgg4fe+UtZczcedG/IN1EL7oq5E4r+M23ro9AAEWLiA0uUuWex9f3vMp4UOBQ==",
+  "role": {
+    "type": "mac",
+    "paired_devices": [
+      "cms3qugcq4mrn2xcapyo7q6itb"
+    ]
+  }
+}

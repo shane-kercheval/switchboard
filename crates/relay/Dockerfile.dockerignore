@@ -1,0 +1,9 @@
+# The build context is the repository root; send only the Cargo workspace.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+crates/*/target/
+!desktop/src-tauri/Cargo.toml
+!desktop/src-tauri/build.rs
+!desktop/src-tauri/src/

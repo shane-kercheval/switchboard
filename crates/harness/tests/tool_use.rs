@@ -346,6 +346,91 @@ async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
     );
 }
 
+/// A call to a tool that does not exist must complete as a tool error. `agy`
+/// 1.4.9 writes its result `status:"INVALID"` while the stream reports the
+/// step `state:"ERROR"`, and the transcript's verdict is the one shown, so
+/// this fails when `agy` writes a failure status the parser does not count.
+/// Pinned to Gemini 3.8 Flash, the model the `INVALID` records were captured
+/// on, because the model has to choose to call a tool it was not given.
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+#[serial_test::serial(antigravity)]
+async fn live_antigravity_unknown_tool_call_completes_as_tool_error() {
+    let tmp = tempfile::Builder::new()
+        .prefix("agy-unknown-tool-test")
+        .tempdir()
+        .expect("tempdir");
+
+    let adapter = AntigravityAdapter::new();
+    let agent = AgentRecord {
+        model: Some("gemini-3.8-flash".to_owned()),
+        effort: Some("medium".to_owned()),
+        ..antigravity_agent()
+    };
+    let turn_id = Uuid::now_v7();
+    let prompt = r#"This is a test of tool error handling. Call a tool named frobnicate_widget with arguments {"x": 1}, even though it is not in your tool list; emit the call anyway. Do not call any other tool. After the call fails, reply with only the word ack."#;
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            prompt,
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real agy");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let started = events.iter().find(|event| {
+        matches!(event, AdapterEvent::ToolStarted { name, .. } if name == "frobnicate_widget")
+    });
+    let AdapterEvent::ToolStarted {
+        tool_use_id: started_id,
+        ..
+    } = started.unwrap_or_else(|| {
+        let calls: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ToolStarted { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        panic!(
+            "the model made no frobnicate_widget call, so this run tested nothing about \
+             the adapter; calls made: {calls:?}; events: {events:?}"
+        )
+    })
+    else {
+        unreachable!();
+    };
+    // The adapter's own line is what it shows for a call with no result at
+    // all, so any other non-empty output is agy's message.
+    let completed = events.iter().find(|event| {
+        matches!(event, AdapterEvent::ToolCompleted { tool_use_id, .. } if tool_use_id == started_id)
+    });
+    assert!(
+        matches!(
+            completed,
+            Some(AdapterEvent::ToolCompleted { output, is_error: true, .. })
+                if !output.trim().is_empty() && output != MISSING_TOOL_RESULT_OUTPUT
+        ),
+        "expected the unknown tool call to complete as an error carrying agy's message; \
+         if it completed as a success, agy wrote its result with a status that \
+         `TranscriptRecord::tool_result_failure` (`antigravity/parser.rs`) does not \
+         count as a failure. Got: {completed:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "expected the agent to recover and complete the turn; got: {events:?}"
+    );
+}
+
 /// A command that exits non-zero must complete as a tool error. `agy` records
 /// no exit code as a field — only in the result's prose (`The command exited
 /// with code 1.` @ 1.4.2, `Command exited with code 1.` @ 1.4.3) — and the

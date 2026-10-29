@@ -923,6 +923,71 @@ mod tests {
         assert!(transcript.warnings.is_empty());
     }
 
+    /// Captured @ agy 1.4.9 (2026-10-28, Gemini 3.8 Flash, the adapter's
+    /// dispatch flags, compact transcript; the planner's `thinking` is left
+    /// out): a call to a tool that does not exist, and `run_command` called
+    /// with no arguments. Both results are written `status:"INVALID"`, and
+    /// reopening must show each as failed with `agy`'s message.
+    #[test]
+    fn invalid_results_reopen_as_failed() {
+        let unknown_tool = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-28T22:28:47Z","content":"<USER_REQUEST>\nThis is a test of tool error handling. Call a tool named frobnicate_widget with arguments {\"x\": 1}, even though it is not in your tool list; emit the call anyway. Do not call any other tool. Then reply with the exact error text you received, quoted.\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-28T16:28:47-06:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.8 Flash (Medium). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:47Z","input_tokens":7877,"cache_read_tokens":0,"output_tokens":959,"tool_calls":[{"name":"frobnicate_widget","args":{"x":"1"}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"INVALID","error":"unknown tool: \"frobnicate_widget\" — check spelling","created_at":"2026-10-28T22:28:57Z","content":"Created At: 2026-10-28T16:28:57-06:00\nCompleted At: 2026-10-28T16:28:57-06:00\nError invalid tool call: unknown tool: \"frobnicate_widget\" — check spelling"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:28:57Z","input_tokens":8938,"cache_read_tokens":0,"output_tokens":203,"content":"\"Created At: 2026-10-28T16:28:57-06:00\nCompleted At: 2026-10-28T16:28:57-06:00\nEncountered error in tool validation: unknown tool: \"frobnicate_widget\" — check spelling\""}"#,
+            "\n",
+        );
+        let missing_arguments = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-28T22:29:27Z","content":"<USER_REQUEST>\nThis is a test of tool error handling. Call your run_command tool with an empty arguments object {} (deliberately omit CommandLine and every other argument). Do not call any other tool. Then reply with the exact error text you received, quoted.\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-28T16:29:27-06:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.8 Flash (Medium). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:29:27Z","input_tokens":7847,"cache_read_tokens":0,"output_tokens":169,"tool_calls":[{"name":"run_command"}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"INVALID","error":"invalid arguments:\n- missing properties 'CommandLine', 'toolSummary', 'WaitMsBeforeAsync'","created_at":"2026-10-28T22:29:31Z","content":"Created At: 2026-10-28T16:29:31-06:00\nCompleted At: 2026-10-28T16:29:31-06:00\nError invalid tool call: invalid arguments:\n- missing properties 'CommandLine', 'toolSummary', 'WaitMsBeforeAsync'"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-28T22:29:31Z","input_tokens":8117,"cache_read_tokens":0,"output_tokens":215,"content":"Here is the exact error text received:\n\n```\nCreated At: 2026-10-28T16:29:31-06:00\nCompleted At: 2026-10-28T16:29:31-06:00\nEncountered error in tool validation: invalid arguments:\n- missing properties 'CommandLine', 'toolSummary', 'WaitMsBeforeAsync'\n```"}"#,
+            "\n",
+        );
+        let reopened: Vec<Vec<(String, String, bool)>> = [unknown_tool, missing_arguments]
+            .into_iter()
+            .map(|content| {
+                let transcript = parse_antigravity_transcript_content(content, agent_id());
+                assert!(transcript.warnings.is_empty(), "{:?}", transcript.warnings);
+                agent_items(&transcript.turns[1])
+                    .iter()
+                    .filter_map(|item| match item {
+                        TurnItem::Tool {
+                            name,
+                            output: Some(output),
+                            is_error: Some(is_error),
+                            completed_at: Some(_),
+                            ..
+                        } => Some((name.clone(), output.clone(), *is_error)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+
+        assert_eq!(
+            reopened,
+            vec![
+                vec![(
+                    "frobnicate_widget".to_owned(),
+                    "unknown tool: \"frobnicate_widget\" — check spelling".to_owned(),
+                    true,
+                )],
+                vec![(
+                    "run_command".to_owned(),
+                    "invalid arguments:\n- missing properties 'CommandLine', 'toolSummary', 'WaitMsBeforeAsync'".to_owned(),
+                    true,
+                )],
+            ]
+        );
+    }
+
     /// Reopen applies the same command-only rule as the live parser: an MCP
     /// reply quoting the exit sentence stays a success, and a failed command
     /// whose result was written before its planner record still fails.

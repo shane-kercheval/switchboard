@@ -57,19 +57,26 @@ section() {
 # Copy stdin to stdout with this machine's temp directory replaced by
 # `<TMPDIR>` where help text shows it as a flag's default (`codex
 # migrate-nfs-db --staging-dir`), so the snapshot is the same on every
-# machine. The CLIs take it from `TMPDIR`, else `/tmp`, as Rust's
-# `std::env::temp_dir` does. A plain string match, so a path with regex
-# characters needs no escaping.
+# machine. The CLIs take it from `TMPDIR`, else `/tmp`, and quote it when it
+# contains a space. It reaches awk through ENVIRON, which keeps backslashes,
+# and is matched as a plain string. Not replaced: a default wrapped onto a
+# second line, and (untested) a path with whitespace plus a backslash or
+# double quote, which clap escapes inside the quotes.
 hide_temp_dir() {
-  awk -v from="[default: ${TMPDIR:-/tmp}" -v to="[default: <TMPDIR>" '{
-    rest = $0
-    out = ""
-    while ((i = index(rest, from)) > 0) {
-      out = out substr(rest, 1, i - 1) to
-      rest = substr(rest, i + length(from))
+  TEMP_DIR_TO_HIDE="${TMPDIR:-/tmp}" awk '
+    function replace_all(text, from, to, out, i) {
+      out = ""
+      while ((i = index(text, from)) > 0) {
+        out = out substr(text, 1, i - 1) to
+        text = substr(text, i + length(from))
+      }
+      return out text
     }
-    print out rest
-  }'
+    BEGIN { dir = ENVIRON["TEMP_DIR_TO_HIDE"] }
+    {
+      line = replace_all($0, "[default: \"" dir "\"", "[default: <TMPDIR>")
+      print replace_all(line, "[default: " dir, "[default: <TMPDIR>")
+    }'
 }
 
 print_version() {

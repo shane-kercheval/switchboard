@@ -878,7 +878,7 @@ fn assert_first_turn_session_meta(event: &AdapterEvent) {
     assert_eq!(harness_version, "0.130.0");
     assert!(
         inventory.tools.is_none(),
-        "Codex reports no tool inventory anywhere — absent, not empty"
+        "the reader reports no tools for Codex; absent, not empty"
     );
     let mcp_servers = inventory
         .mcp_servers

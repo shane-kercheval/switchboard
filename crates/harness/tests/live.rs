@@ -2483,7 +2483,7 @@ async fn live_codex_basic_turn_completes() {
             );
             assert!(
                 inventory.tools.is_none(),
-                "Codex reports no tool inventory anywhere — absent, not empty"
+                "the reader reports no tools for Codex; absent, not empty"
             );
         }
         _ => unreachable!(),

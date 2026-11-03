@@ -8,7 +8,7 @@
 //! token, travel in the relay's own frame, never in these bytes.
 
 use crate::CryptoError;
-use crate::fragment::MAX_RECORD_LEN;
+use crate::fragment::{MAX_FRAGMENT_COUNT, MAX_RECORD_LEN};
 use crate::noise::ECHO_LEN;
 use crate::session::SESSION_ID_LEN;
 
@@ -16,6 +16,10 @@ use crate::session::SESSION_ID_LEN;
 /// carries before its Noise message (a reply's echo), and the longest Noise
 /// message. Anything longer is refused before anything is allocated for it.
 pub const MAX_FRAME_LEN: usize = 1 + ECHO_LEN + MAX_RECORD_LEN;
+
+/// Most frames one message is sent as, one per fragment: the longest message
+/// the reassembler accepts, in fragments of the longest chunk.
+pub const MAX_MESSAGE_FRAMES: usize = MAX_FRAGMENT_COUNT;
 
 /// Declares `FrameKind` and the list of every kind from one table, so a new
 /// kind is encoded by `tagged` and decoded by `kind` without a second edit.

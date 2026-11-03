@@ -1,0 +1,6 @@
+{
+  "type": "error",
+  "code": "not_paired",
+  "message": "this device is not paired with that one",
+  "device_id": "jdgks74jsp725pfms4unp6kpof"
+}

@@ -2127,23 +2127,19 @@ pub fn rename_project_impl(
     })
 }
 
-/// Archive or unarchive a project — a user-global *view-state* flip stored in
+/// Archive or unarchive a project: a user-global *view-state* flip stored in
 /// `workspace.yaml`. Deliberately the lightest of the project ops: it takes only
-/// the `workspace` lock, touches **no** on-disk project state, **no**
-/// `registry_write`, **no** directory resolution, and **no** dispatcher — so it
+/// the workspace locks and touches **no** on-disk project state, **no**
+/// `registry_write`, **no** directory resolution, and **no** dispatcher, so it
 /// works whether the project's directory is loaded, available, or offline, and
 /// never interrupts a running agent. Validates the id against the **store
-/// index** so a bogus id can't accumulate in the set — the index lists every
-/// project regardless of its directory's state, which is exactly the set archive
-/// must work for, and it replaces the cached-snapshot check that could only see
-/// projects some earlier read had happened to cache.
-/// Returns `()`; the frontend flips the row locally and the next `list_projects`
-/// confirms it from the persisted set.
+/// index**, which lists every project whatever its directory's state, so a bogus
+/// id can't accumulate in the set. Returns whether the archived set changed.
 pub fn set_project_archived_impl(
     state: &AppState,
     project_id: ProjectId,
     archived: bool,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     if !state
         .store
         .list_projects()?
@@ -2156,7 +2152,7 @@ pub fn set_project_archived_impl(
     if changed {
         persist_workspace(state);
     }
-    Ok(())
+    Ok(changed)
 }
 
 pub fn list_message_pins_impl(
@@ -17542,6 +17538,24 @@ mod tests {
 
         set_project_archived_impl(&state, project.id, false).unwrap();
         assert!(!archived_of(&state));
+    }
+
+    #[tokio::test]
+    async fn set_project_archived_reports_whether_it_changed_the_set() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "alpha");
+
+        assert!(set_project_archived_impl(&state, project.id, true).unwrap());
+        assert!(
+            !set_project_archived_impl(&state, project.id, true).unwrap(),
+            "archiving an archived project changes nothing"
+        );
+        assert!(set_project_archived_impl(&state, project.id, false).unwrap());
+        assert!(
+            !set_project_archived_impl(&state, project.id, false).unwrap(),
+            "unarchiving an active project changes nothing"
+        );
     }
 
     #[tokio::test]

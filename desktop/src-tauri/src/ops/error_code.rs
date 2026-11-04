@@ -62,7 +62,8 @@ pub fn error_code(error: &AppError) -> &'static str {
         AppError::AgentBusy
         | AppError::RecipientsBusy { .. }
         | AppError::RemoveAgentBusy { .. }
-        | AppError::RemoveAgentWorkflowRunning { .. } => AGENT_BUSY,
+        | AppError::RemoveAgentWorkflowRunning { .. }
+        | AppError::ArchiveProjectBusy { .. } => AGENT_BUSY,
         AppError::SessionInUse => AGENT_BUSY_ELSEWHERE,
         // A fork's source mid-turn, including the Codex case where another
         // program holds the parent's session: the advice is the same, wait for

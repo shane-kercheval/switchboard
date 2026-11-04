@@ -328,6 +328,98 @@ async fn a_tool_error_is_a_result_with_a_code_and_a_message() {
     listener.stop().await;
 }
 
+#[tokio::test]
+async fn a_client_is_refused_archiving_a_busy_project_and_archives_and_unarchives_an_idle_one() {
+    let (env, project_id, agent_id) = unopened_project(TestEnv::new());
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("working", &gate));
+    let (listener, url) = serve(&env).await;
+    let client = connect(&url, TOKEN).await;
+
+    let receipt = ok(
+        &client,
+        "send",
+        json!({ "project_id": project_id, "recipients": [agent_id], "text": "work" }),
+    )
+    .await;
+    await_turn_running(&env.state, agent_id).await;
+    let (is_error, body) = call(
+        &client,
+        "archive_project",
+        json!({ "project_id": project_id }),
+    )
+    .await;
+    assert!(is_error, "a busy project is not archived: {body}");
+    assert_eq!(body["code"], "agent_busy");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("wait_agent") && m.contains("wait_workflow")),
+        "{body}"
+    );
+    let projects = ok(&client, "list_projects", json!({})).await;
+    assert_eq!(uuid(&projects[0]["id"]), project_id, "still listed");
+    assert_eq!(projects[0]["archived"], false);
+
+    gate.notify_one();
+    let mut reply = Value::Null;
+    for _ in 0..20 {
+        reply = ok(
+            &client,
+            "wait_send",
+            json!({ "project_id": project_id, "send_id": receipt["send_id"], "timeout_seconds": 5 }),
+        )
+        .await;
+        if reply["done"] == true {
+            break;
+        }
+    }
+    assert_eq!(reply["done"], true, "{reply}");
+    let waited = ok(
+        &client,
+        "wait_agent",
+        json!({ "project_id": project_id, "agent_id": agent_id, "timeout_seconds": 10 }),
+    )
+    .await;
+    assert_eq!(waited["status"], "idle", "{waited}");
+
+    let archived = ok(
+        &client,
+        "archive_project",
+        json!({ "project_id": project_id }),
+    )
+    .await;
+    assert_eq!(archived["archived"], true);
+    assert_eq!(archived["changed"], true);
+    assert_eq!(uuid(&archived["id"]), project_id);
+    assert_eq!(ok(&client, "list_projects", json!({})).await, json!([]));
+    let all = ok(
+        &client,
+        "list_projects",
+        json!({ "include_archived": true }),
+    )
+    .await;
+    assert_eq!(all[0]["archived"], true);
+
+    let restored = ok(
+        &client,
+        "unarchive_project",
+        json!({ "project_id": project_id }),
+    )
+    .await;
+    assert_eq!(restored["archived"], false);
+    assert_eq!(restored["changed"], true);
+    let projects = ok(&client, "list_projects", json!({})).await;
+    assert_eq!(
+        uuid(&projects[0]["id"]),
+        project_id,
+        "back in the default list"
+    );
+
+    client.cancel().await.unwrap();
+    listener.stop().await;
+}
+
 /// A raw POST of `body` to the server, as a browser or a misconfigured
 /// client would send it.
 async fn post(
@@ -1317,6 +1409,10 @@ async fn every_tool_answers_a_valid_call_through_the_server() {
     )
     .await;
     assert_eq!(renamed["name"], "renamed");
+    let archived = call("archive_project", json!({ "project_id": second["id"] })).await;
+    assert_eq!(archived["archived"], true);
+    let restored = call("unarchive_project", json!({ "project_id": second["id"] })).await;
+    assert_eq!(restored["archived"], false);
     let extra = call(
         "create_agent",
         json!({ "project_id": project_id, "name": "extra", "harness": "codex" }),
@@ -2713,6 +2809,8 @@ fn tool_like_words(text: &str) -> Vec<&str> {
         "get_",
         "set_",
         "stop_",
+        "archive_",
+        "unarchive_",
     ];
     // Field names and error codes that share a tool's prefix.
     const NOT_TOOLS: &[&str] = &[

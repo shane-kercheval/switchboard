@@ -27,8 +27,8 @@ use crate::workflow_commands::ProjectDispatchFactoryProvider;
 
 use super::budget::fit;
 use super::change::{
-    SelectionChange, SelectionChanges, create_agent, create_project, dismiss_workflow_run,
-    rename_agent, set_agent_model_and_effort,
+    SelectionChange, SelectionChanges, archive_project, create_agent, create_project,
+    dismiss_workflow_run, rename_agent, set_agent_model_and_effort, unarchive_project,
 };
 use super::desktop_sync::{Hearing, SyncAck, SyncFork};
 use super::error_code::{self, error_code};
@@ -288,6 +288,328 @@ async fn list_projects_leaves_out_archived_projects_unless_asked() {
         all.iter()
             .any(|p| p.listing.id == archived && p.listing.archived),
         "the archived one says so"
+    );
+}
+
+fn default_listing_ids(listed: &[ProjectStatusListing]) -> Vec<ProjectId> {
+    listed.iter().map(|p| p.listing.id).collect()
+}
+
+#[tokio::test]
+async fn archiving_takes_a_project_out_of_the_default_list_and_unarchiving_puts_it_back() {
+    let (env, project_id, _agents) = project_with_agents(&["a"]);
+    let cancel = CancellationToken::new();
+
+    let archived = archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap();
+    assert!(archived.changed);
+    assert_eq!(archived.listing.id, project_id);
+    assert!(archived.listing.archived);
+    let default = list_projects(&env.state, false, &cancel).await.unwrap();
+    assert!(default.is_empty(), "left out of the default list");
+    assert_eq!(
+        *lock(&env.sync.projects_changed),
+        1,
+        "the window is told to re-list"
+    );
+
+    let restored = unarchive_project(&env.state, project_id).unwrap();
+    assert!(restored.changed);
+    assert!(!restored.listing.archived);
+    let default = list_projects(&env.state, false, &cancel).await.unwrap();
+    assert_eq!(default_listing_ids(&default), vec![project_id]);
+    assert_eq!(*lock(&env.sync.projects_changed), 2);
+}
+
+/// A retry of either change returns success and says nothing changed, without
+/// telling the window to re-list.
+#[tokio::test]
+async fn archiving_twice_or_unarchiving_an_active_project_changes_nothing() {
+    let (env, project_id, _agents) = project_with_agents(&["a"]);
+    let cancel = CancellationToken::new();
+
+    let unchanged = unarchive_project(&env.state, project_id).unwrap();
+    assert!(!unchanged.changed);
+    assert!(!unchanged.listing.archived);
+    assert_eq!(*lock(&env.sync.projects_changed), 0);
+
+    archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap();
+    let again = archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap();
+    assert!(!again.changed);
+    assert!(again.listing.archived);
+    assert_eq!(*lock(&env.sync.projects_changed), 1);
+}
+
+#[tokio::test]
+async fn archiving_a_busy_project_is_refused_until_its_work_ends() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let cancel = CancellationToken::new();
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("working", &gate));
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agents[0]], "go"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+
+    let err = archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), error_code::AGENT_BUSY);
+    let message = err.to_string();
+    assert!(
+        message.contains("wait_agent")
+            && message.contains("wait_workflow")
+            && message.contains("ask the user"),
+        "{message}"
+    );
+    let default = list_projects(&env.state, false, &cancel).await.unwrap();
+    assert_eq!(
+        default_listing_ids(&default),
+        vec![project_id],
+        "still in the default list"
+    );
+    assert_eq!(*lock(&env.sync.projects_changed), 0);
+    assert_eq!(
+        env.state.ledger.send(receipt.send_id).unwrap().recipients[0].status,
+        SendStatus::Running,
+        "and its turn is untouched"
+    );
+
+    gate.notify_one();
+    wait_done(&env, project_id, receipt.send_id).await;
+    let waited = wait_agent(
+        &env.state,
+        project_id,
+        agents[0],
+        &WaitBudget::default_wait(),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(waited.status, AgentWaitStatus::Idle);
+    let archived = archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap();
+    assert!(archived.changed && archived.listing.archived);
+}
+
+/// After a reply ends, the harness can still be exiting: the agent accepts a
+/// send then, so `wait_agent` reports it idle and the archive its refusal
+/// pointed to succeeds.
+#[tokio::test]
+async fn an_archive_succeeds_once_wait_agent_reports_idle_while_the_harness_still_exits() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let drain = source_holding_its_session_after_a_reply(&env, project_id, agents[0]).await;
+    let cancel = CancellationToken::new();
+
+    let waited = wait_agent(
+        &env.state,
+        project_id,
+        agents[0],
+        &WaitBudget::default_wait(),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(waited.status, AgentWaitStatus::Idle);
+    let listed = list_projects(&env.state, false, &cancel).await.unwrap();
+    assert_eq!(listed[0].status, ProjectStatus::Idle);
+    let archived = archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap();
+    assert!(archived.changed && archived.listing.archived);
+    assert!(
+        env.state.dispatcher.has_pending_work(agents[0]).await,
+        "the harness had not finished exiting"
+    );
+
+    drain.notify_one();
+}
+
+/// An agent whose removal could not be confirmed refuses every send until
+/// restart but holds no work, so it leaves its project idle and archivable.
+#[tokio::test]
+async fn an_agent_left_blocked_by_an_unconfirmed_removal_leaves_its_project_archivable() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    env.state
+        .dispatcher
+        .remove_agent(agents[0], CancelSource::Shutdown, || (true, ()))
+        .await;
+    assert!(
+        !env.state.dispatcher.accepts_now(agents[0]).await,
+        "the agent refuses sends"
+    );
+    assert!(
+        lock(&env.state.agents_by_id).contains_key(&agents[0]),
+        "and is still registered"
+    );
+    let cancel = CancellationToken::new();
+
+    let listed = list_projects(&env.state, false, &cancel).await.unwrap();
+    assert_eq!(listed[0].status, ProjectStatus::Idle);
+    let archived = archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap();
+    assert!(archived.changed && archived.listing.archived);
+}
+
+#[tokio::test]
+async fn archiving_is_refused_while_a_workflow_runs_in_the_project() {
+    let (env, project_id, agents) = workflow_env().await;
+    let (_run_id, _send_id, gate) =
+        workflow_with_a_running_first_send(&env, project_id, &agents).await;
+
+    let err = archive_project(&env.state, project_id, &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), error_code::AGENT_BUSY);
+    assert!(
+        !lock(&env.state.workspace).is_archived(project_id),
+        "the project stays active"
+    );
+    gate.notify_one();
+}
+
+/// A run between two steps holds no agent's work, so only the run itself can
+/// refuse the archive.
+#[tokio::test]
+async fn archiving_is_refused_while_a_run_is_registered_even_with_every_agent_idle() {
+    let (env, project_id, _agents) = project_with_agents(&["a"]);
+    crate::commands::open_project_impl(&env.state, project_id).unwrap();
+    let run_id = Uuid::now_v7();
+    lock(&env.state.workflow_runs).insert(run_id, idle_run(project_id));
+    let cancel = CancellationToken::new();
+
+    let err = archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), error_code::AGENT_BUSY);
+    assert!(
+        !lock(&env.state.workspace).is_archived(project_id),
+        "the project stays active"
+    );
+    assert_eq!(
+        *lock(&env.sync.projects_changed),
+        0,
+        "a refused archive tells the window nothing"
+    );
+
+    lock(&env.state.workflow_runs).remove(&run_id);
+    let archived = archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap();
+    assert!(archived.changed && archived.listing.archived);
+}
+
+/// An archived project that has since become busy archives again without a
+/// refusal, so a caller retrying a successful archive never sees it as busy.
+#[tokio::test]
+async fn a_busy_project_that_is_already_archived_archives_again_without_change() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let cancel = CancellationToken::new();
+    archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap();
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("working", &gate));
+    send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agents[0]], "go"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+
+    let again = archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap();
+    assert!(!again.changed);
+    assert!(again.listing.archived);
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn unarchiving_a_busy_project_is_not_refused() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let cancel = CancellationToken::new();
+    archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap();
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("working", &gate));
+    send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, vec![agents[0]], "go"),
+    )
+    .await
+    .unwrap();
+    await_turn_running(&env.state, agents[0]).await;
+
+    let restored = unarchive_project(&env.state, project_id).unwrap();
+    assert!(restored.changed);
+    assert!(!restored.listing.archived);
+    let listed = list_projects(&env.state, false, &cancel).await.unwrap();
+    assert_eq!(listed[0].status, ProjectStatus::Busy, "the work carries on");
+    gate.notify_one();
+}
+
+#[tokio::test]
+async fn archiving_or_unarchiving_an_unknown_project_is_project_not_found() {
+    let (env, _project_id, _agents) = project_with_agents(&["a"]);
+    let stranger = Uuid::now_v7();
+    let err = archive_project(&env.state, stranger, &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), error_code::PROJECT_NOT_FOUND);
+    let err = unarchive_project(&env.state, stranger).unwrap_err();
+    assert_eq!(error_code(&err), error_code::PROJECT_NOT_FOUND);
+    assert_eq!(
+        *lock(&env.state.workspace),
+        crate::workspace::Workspace::default(),
+        "no unknown id joins the archived set"
+    );
+}
+
+/// An archived project's agents work as before, and the work does not bring
+/// the project back to the default list.
+#[tokio::test]
+async fn a_send_to_an_archived_projects_agent_runs_and_leaves_it_archived() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let cancel = CancellationToken::new();
+    archive_project(&env.state, project_id, &cancel)
+        .await
+        .unwrap();
+
+    let receipt = send_now(
+        env.handle(),
+        env.home(),
+        text_send(project_id, agents.clone(), "hi"),
+    )
+    .await
+    .unwrap();
+    let done = wait_done(&env, project_id, receipt.send_id).await;
+    assert_eq!(done.recipients[0].status, SendStatus::Completed);
+    assert_eq!(done.recipients[0].text.as_deref(), Some("ack: hi"));
+
+    let all = list_projects(&env.state, true, &cancel).await.unwrap();
+    assert!(all[0].listing.archived, "still archived");
+    assert!(
+        list_projects(&env.state, false, &cancel)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 

@@ -2013,6 +2013,7 @@ pub async fn cancel_runs_for_projects(state: &AppState, project_ids: &[ProjectId
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::test_support::idle_run;
     use switchboard_workflow::{TerminalStatus, WorkflowStepKind};
 
     /// Captures the most recent emitted (channel, payload) for assertions.
@@ -2048,22 +2049,6 @@ mod tests {
                 done: Arc::new(tokio::sync::Notify::new()),
             },
         );
-    }
-
-    fn idle_run(project_id: ProjectId) -> ActiveRun {
-        ActiveRun {
-            cancel: CancellationToken::new(),
-            project_id,
-            workflow: "w".to_owned(),
-            snapshot: RunSnapshot {
-                total_steps: 1,
-                current_step: 0,
-            },
-            steps: Vec::new(),
-            resolved: BTreeMap::new(),
-            through_agent_access: false,
-            done: Arc::new(tokio::sync::Notify::new()),
-        }
     }
 
     #[test]

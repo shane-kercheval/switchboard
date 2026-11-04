@@ -33,8 +33,9 @@ use super::with_cap;
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectStatus {
-    /// An agent of the project has running or queued work, or a workflow run
-    /// is registered for it.
+    /// A workflow run is registered for the project, or one of its agents has
+    /// work and would refuse a send now: a turn whose reply has not ended, or
+    /// a queued message.
     Busy,
     Idle,
 }
@@ -75,7 +76,11 @@ pub async fn list_projects(
     Ok(out)
 }
 
-async fn project_is_busy(
+/// Busy as [`list_projects`] reports it: a workflow run is registered for the
+/// project, or one of its agents has work and would refuse a send now. An
+/// agent whose reply has ended accepts a send while its harness exits, so it
+/// is idle here as it is to `wait_agent`.
+pub(super) async fn project_is_busy(
     state: &AppState,
     project_id: ProjectId,
     cancel: &CancellationToken,
@@ -92,16 +97,24 @@ async fn project_is_busy(
         .map(|a| a.id)
         .collect();
     for agent_id in agents {
-        let pending = tokio::select! {
+        let busy = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(AppError::Interrupted),
-            pending = state.dispatcher.has_pending_work(agent_id) => pending,
+            busy = agent_is_busy(state, agent_id) => busy,
         };
-        if pending {
+        if busy {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Pending work is asked first: an agent whose removal could not be confirmed
+/// refuses every send until restart but holds no work, and must not keep its
+/// project busy.
+async fn agent_is_busy(state: &AppState, agent_id: AgentId) -> bool {
+    state.dispatcher.has_pending_work(agent_id).await
+        && !state.dispatcher.accepts_now(agent_id).await
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

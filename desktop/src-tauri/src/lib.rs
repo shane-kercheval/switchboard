@@ -1060,7 +1060,9 @@ async fn set_project_archived(
     archived: bool,
 ) -> Result<(), String> {
     let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
-    set_project_archived_impl(state.inner(), id, archived).map_err(|e| e.to_string())
+    set_project_archived_impl(state.inner(), id, archived)
+        .map(|_changed| ())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

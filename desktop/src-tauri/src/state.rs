@@ -176,6 +176,12 @@ pub enum TestSeam {
     /// after the reading's journal read. Holds the reading there so a test can
     /// change what the journal holds before the answer is built.
     WorkQuestion,
+    /// Inside `persist_workspace`, after its snapshot and before its write,
+    /// **while it holds `workspace_save`**. Holds the first of two concurrent
+    /// saves open so a test can prove the second waits for it and writes the
+    /// newer set, rather than finishing first and being overwritten by the
+    /// older snapshot.
+    WorkspaceSave,
 }
 
 /// Two-way handshake for a [`TestSeam`].
@@ -198,10 +204,15 @@ pub struct MaintenanceBarrier {
 /// `Directory` handle by its canonical path.
 ///
 /// **Lock-order convention** (when more than one of these mutexes is held
-/// at the same time): `workspace` → `registry_write` → `git_registry` →
-/// `maintenance` → `project_generation` → `projects` → `active_project_id` →
-/// `needs_session_meta` → `project_locks` → `agents_by_id`. Always acquire in
-/// this order.
+/// at the same time): `workspace_save` → `workspace` → `registry_write` →
+/// `git_registry` → `maintenance` → `project_generation` → `projects` →
+/// `active_project_id` → `needs_session_meta` → `project_locks` →
+/// `agents_by_id`. Always acquire in this order.
+///
+/// `workspace_save` is taken only by `persist_workspace`, which takes
+/// `workspace` under it briefly for the snapshot. It is the one state lock held
+/// across a file write, so no caller may hold it, or `workspace`, when calling
+/// `persist_workspace`.
 ///
 /// `maintenance` and `project_generation` sit directly under `registry_write`
 /// because `begin_maintenance` takes all three in that order — the write lock
@@ -398,6 +409,12 @@ pub struct AppState {
     /// empty; production hydrates it from `workspace.yaml` via
     /// [`AppState::with_workspace`].
     pub workspace: Mutex<Workspace>,
+
+    /// Serializes saves of `workspace.yaml`, held from the snapshot of
+    /// `workspace` through the write: the window and agent-access tools archive
+    /// concurrently, and overlapping saves could otherwise leave the older set
+    /// on disk or share the temporary file.
+    pub workspace_save: Mutex<()>,
 
     /// Resolved path of `workspace.yaml`, or `None` when no global location was
     /// resolved (tests, or an exotic host with no home dir). `persist_workspace`
@@ -709,6 +726,7 @@ impl AppState {
             project_locks: Mutex::new(HashMap::new()),
             agents_by_id: Arc::new(Mutex::new(HashMap::new())),
             workspace: Mutex::new(Workspace::default()),
+            workspace_save: Mutex::new(()),
             workspace_path: None,
             git_registry: Mutex::new(GitRegistry::default()),
             git_registry_path: None,
@@ -910,10 +928,12 @@ pub(crate) fn persist_workspace(state: &AppState) {
     let Some(path) = state.workspace_path.as_ref() else {
         return;
     };
-    // Snapshot under the lock, then release it before touching disk — never
-    // hold a state mutex across filesystem I/O (single-writer app, so the next
-    // mutation's persist captures anything that lands after this clone).
+    // `workspace` is released before the write so readers never wait on disk;
+    // `workspace_save` is held through it so the last save to finish wrote the
+    // newest snapshot.
+    let _save = lock(&state.workspace_save);
     let snapshot = lock(&state.workspace).clone();
+    wait_between_workspace_snapshot_and_save(state);
     if let Err(e) = workspace::save(path, &snapshot) {
         tracing::warn!(
             path = %path.display(),
@@ -922,6 +942,19 @@ pub(crate) fn persist_workspace(state: &AppState) {
         );
     }
 }
+
+/// Hold a workspace save between its snapshot and its write when a test asks.
+/// See [`TestSeam::WorkspaceSave`].
+#[cfg(test)]
+fn wait_between_workspace_snapshot_and_save(state: &AppState) {
+    crate::commands::wait_at_blocking_seam(crate::commands::test_seam(
+        state,
+        TestSeam::WorkspaceSave,
+    ));
+}
+
+#[cfg(not(test))]
+fn wait_between_workspace_snapshot_and_save(_state: &AppState) {}
 
 /// Persist the Git-view tracked-repo registry to disk if a `git_registry_path`
 /// is configured. Best-effort, same as [`persist_workspace`]: a `None` path is a
@@ -998,6 +1031,8 @@ mod visible_project_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use switchboard_dispatcher::RecordingEmitter;
     use switchboard_harness::MockHarnessAdapter;
     use tempfile::tempdir;
@@ -1033,5 +1068,43 @@ mod tests {
 
         let loaded = workspace::load(&path).workspace;
         assert_eq!(&loaded, &*lock(&state.workspace));
+    }
+
+    fn archive_and_save(state: &Arc<AppState>, id: ProjectId) -> tokio::task::JoinHandle<()> {
+        let state = Arc::clone(state);
+        tokio::task::spawn_blocking(move || {
+            lock(&state.workspace).set_archived(id, true);
+            persist_workspace(&state);
+        })
+    }
+
+    #[tokio::test]
+    async fn a_save_that_starts_during_another_waits_and_writes_the_newer_set() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspace.yaml");
+        let state = Arc::new(mock_state().with_workspace(path.clone()));
+        let barrier = Arc::new(MaintenanceBarrier::default());
+        lock(&state.test_seams).insert(TestSeam::WorkspaceSave, Arc::clone(&barrier));
+        let (first_id, second_id) = (Uuid::new_v4(), Uuid::new_v4());
+
+        let first = archive_and_save(&state, first_id);
+        barrier.entered.notified().await;
+        lock(&state.test_seams).remove(&TestSeam::WorkspaceSave);
+        let second = archive_and_save(&state, second_id);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Released before asserting: a parked first save left behind by a
+        // failed assertion would hang the runtime's shutdown instead of failing.
+        let second_waited = !second.is_finished();
+        barrier.release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+        assert!(second_waited, "the second save waits for the first");
+
+        let saved = workspace::load(&path).workspace;
+        assert!(saved.is_archived(first_id), "the first archive is on disk");
+        assert!(
+            saved.is_archived(second_id),
+            "the first save's older snapshot did not overwrite the second"
+        );
     }
 }

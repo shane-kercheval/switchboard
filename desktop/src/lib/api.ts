@@ -162,7 +162,7 @@ export async function listenDesktopRosterChanged(
   );
 }
 
-/// Another client created or renamed a project.
+/// Another client created, renamed, archived, or unarchived a project.
 export async function listenProjectsChanged(handler: () => void): Promise<UnlistenFn> {
   return await listen("projects_changed", () => handler());
 }

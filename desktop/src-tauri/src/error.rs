@@ -792,6 +792,14 @@ pub enum AppError {
     )]
     RemoveAgentWorkflowRunning { name: String },
 
+    /// A caller other than the window asked to archive a project that is busy
+    /// as `list_projects` reports it, which would take that work out of the
+    /// user's project list.
+    #[error(
+        "project {name} is busy: an agent has a turn running or queued, or a workflow is running. Wait for it with wait_agent or wait_workflow, then archive the project, or ask the user"
+    )]
+    ArchiveProjectBusy { name: String },
+
     /// Writing the copied built-in prompt into the user's folder failed.
     #[error("failed to copy prompt to {path}: {source}")]
     PromptCopyIo {

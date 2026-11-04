@@ -2,7 +2,7 @@
 //! can park and release, an `AppState` over a store that survives a "restart",
 //! and a window-sync double.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,11 +17,12 @@ use switchboard_harness::{
 };
 use tempfile::TempDir;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::commands::{create_project_impl, set_agent_session_locator_impl};
 use crate::error::AppError;
-use crate::state::{AppState, lock};
+use crate::state::{ActiveRun, AppState, RunSnapshot, lock};
 
 use super::desktop_sync::{DesktopSync, Hearing, ReadyReport, SyncFork, WindowSync};
 
@@ -1017,6 +1018,24 @@ fn build_state_with(
             .with_workflows_dir(workflows_dir);
     }
     (Arc::new(state), emitter, sync)
+}
+
+/// A workflow run registered for `project_id` that has dispatched nothing, so
+/// none of the project's agents holds work for it.
+pub fn idle_run(project_id: ProjectId) -> ActiveRun {
+    ActiveRun {
+        cancel: CancellationToken::new(),
+        project_id,
+        workflow: "w".to_owned(),
+        snapshot: RunSnapshot {
+            total_steps: 1,
+            current_step: 0,
+        },
+        steps: Vec::new(),
+        resolved: BTreeMap::new(),
+        through_agent_access: false,
+        done: Arc::new(Notify::new()),
+    }
 }
 
 /// One completed Claude turn as the session file records it, stamped now so

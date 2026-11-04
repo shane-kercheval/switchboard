@@ -1,25 +1,28 @@
-//! The change tier: create, rename, model and effort, removing an agent, and
-//! dismissing a failed workflow run. Each opens the project in Rust first (a
-//! no-op when loaded), then notifies the window without waiting on it.
+//! The change tier: create, rename, archive, model and effort, removing an
+//! agent, and dismissing a failed workflow run. Each opens the project in Rust
+//! first (a no-op when loaded) where the change needs it, then notifies the
+//! window without waiting on it.
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
-    AgentId, AgentRecord, AgentSelection, HarnessKind, ProjectId, ProjectSummary,
+    AgentId, AgentRecord, AgentSelection, CoreError, HarnessKind, ProjectId, ProjectSummary,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::commands::{
-    ProjectListing, create_agent_in_project_impl, create_project_impl, open_project_impl,
-    remove_agent_impl, rename_agent_impl, rename_project_impl, update_agent_selection_impl,
+    ProjectListing, create_agent_in_project_impl, create_project_impl, list_projects_impl,
+    open_project_impl, remove_agent_impl, rename_agent_impl, rename_project_impl,
+    set_project_archived_impl, update_agent_selection_impl,
 };
 use crate::error::AppError;
 use crate::state::{AppState, lock};
 use crate::workflow_commands::{abandon_workflow_run_impl, classify_run_file, read_run_files};
 
 use super::handle::AppStateHandle;
-use super::read::agent_in_project;
+use super::read::{agent_in_project, project_is_busy};
 
 /// Create a project for `directory`. Seeds no agents: the desktop seeds one
 /// per installed harness, but an orchestrator adds the agents it wants.
@@ -45,6 +48,74 @@ pub fn rename_project(
     let listing = rename_project_impl(state, project_id, name)?;
     state.desktop_sync.projects_changed();
     Ok(listing)
+}
+
+/// A project after an archive or unarchive: its listing without the busy status
+/// `list_projects` adds.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ArchiveChange {
+    #[serde(flatten)]
+    pub listing: ProjectListing,
+    /// False when the project was already in the state asked for.
+    pub changed: bool,
+}
+
+/// Archive a project, refused while it is busy. An already-archived project
+/// answers before the busy check, so a retried archive never comes back busy.
+/// The check is an observation: work can start right after it, since an
+/// archived project's id keeps working everywhere.
+pub async fn archive_project(
+    state: &AppState,
+    project_id: ProjectId,
+    cancel: &CancellationToken,
+) -> Result<ArchiveChange, AppError> {
+    let listing = listed_project(state, project_id)?;
+    if listing.archived {
+        return Ok(ArchiveChange {
+            listing,
+            changed: false,
+        });
+    }
+    if project_is_busy(state, project_id, cancel).await? {
+        return Err(AppError::ArchiveProjectBusy { name: listing.name });
+    }
+    set_archived(state, listing, true)
+}
+
+/// Bring an archived project back to the window's active list. Never refused
+/// for work in the project.
+pub fn unarchive_project(
+    state: &AppState,
+    project_id: ProjectId,
+) -> Result<ArchiveChange, AppError> {
+    let listing = listed_project(state, project_id)?;
+    set_archived(state, listing, false)
+}
+
+/// The project's listing, or `ProjectNotFound`: the window's archive command
+/// answers an unknown id with `ProjectNotLoaded`, and these callers have no
+/// way to load a project.
+fn listed_project(state: &AppState, project_id: ProjectId) -> Result<ProjectListing, AppError> {
+    list_projects_impl(state)?
+        .into_iter()
+        .find(|listing| listing.id == project_id)
+        .ok_or_else(|| CoreError::ProjectNotFound(project_id).into())
+}
+
+/// `changed` is the write's own answer, so a project another caller moved
+/// between the read and the write reports no change and sends the window
+/// nothing.
+fn set_archived(
+    state: &AppState,
+    mut listing: ProjectListing,
+    archived: bool,
+) -> Result<ArchiveChange, AppError> {
+    let changed = set_project_archived_impl(state, listing.id, archived)?;
+    if changed {
+        state.desktop_sync.projects_changed();
+    }
+    listing.archived = archived;
+    Ok(ArchiveChange { listing, changed })
 }
 
 /// Create an agent in `project_id`. Starts from the user's per-harness

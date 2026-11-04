@@ -224,7 +224,7 @@ impl ToolGroup {
 enum ToolKind {
     /// Reads, waits: changes nothing.
     Read,
-    /// Creates or renames; nothing is lost.
+    /// Creates, renames, or archives; nothing is lost.
     Additive,
     /// Starts agents, removes one, or deletes a run's record.
     Acts,
@@ -359,6 +359,20 @@ tools! {
          user already has for this folder, whose agents and history a new one would not have.";
     RenameProject = "rename_project" (RenameProjectArgs) [Additive, SetUp]
         "Rename a project. Its id does not change.";
+    ArchiveProject = "archive_project" (ProjectArgs) [Additive, SetUp]
+        "Archive a project: it moves to the Archived view of the user's project list, and \
+         list_projects leaves it out unless include_archived is true. It stops and deletes \
+         nothing: its agents, conversation, and folder stay, and its id still works in every \
+         tool. Refused with agent_busy while the project is busy as list_projects reports it (an \
+         agent has a turn running or queued, or a workflow is running): wait with wait_agent or \
+         wait_workflow, or ask the user. Returns the project as list_projects lists it but \
+         without status, with changed: false when it was already archived. unarchive_project \
+         undoes it.";
+    UnarchiveProject = "unarchive_project" (ProjectArgs) [Additive, SetUp]
+        "Bring an archived project back to the Active view of the user's project list and to \
+         list_projects' default listing. Never refused for work running in the project. Returns \
+         the project as list_projects lists it but without status, with changed: false when it \
+         was not archived.";
     CreateAgent = "create_agent" (CreateAgentArgs) [Additive, SetUp]
         "Add an agent to a project. harness is claude_code, codex, or antigravity. The model and \
          effort start from the user's defaults for that harness; pass either to override it, in \
@@ -1441,6 +1455,14 @@ pub async fn call(tool: ToolName, args: JsonObject, cx: &CallContext) -> Result<
         ToolName::RenameProject => {
             let a: RenameProjectArgs = parse(args)?;
             Reply::plain(&change::rename_project(state, a.project_id, &a.name)?)
+        }
+        ToolName::ArchiveProject => {
+            let a: ProjectArgs = parse(args)?;
+            Reply::plain(&change::archive_project(state, a.project_id, &cx.cancel).await?)
+        }
+        ToolName::UnarchiveProject => {
+            let a: ProjectArgs = parse(args)?;
+            Reply::plain(&change::unarchive_project(state, a.project_id)?)
         }
         ToolName::CreateAgent => {
             let a: CreateAgentArgs = parse(args)?;

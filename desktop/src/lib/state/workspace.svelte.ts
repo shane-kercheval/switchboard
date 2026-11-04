@@ -1755,7 +1755,10 @@ export async function installDesktopSync(): Promise<() => void> {
   const unlisteners = await Promise.all([
     api.listenDesktopSyncProject(answerSyncRequest),
     api.listenDesktopRosterChanged(onRosterChanged),
-    api.listenProjectsChanged(() => void refreshProjectRegistry()),
+    // `loadWorkspace`, not `refreshProjectRegistry`: a change that arrives
+    // mid-read must schedule one more read, or the window applies a list
+    // from before it.
+    api.listenProjectsChanged(() => void loadWorkspace().catch(() => undefined)),
     api.listenDesktopRunsChanged(onRunsChanged),
   ]);
   // Requests emitted before the listener existed (the window's first seconds,

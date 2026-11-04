@@ -3582,6 +3582,9 @@ describe("desktop sync for another client's turn", () => {
     failRemove?: string;
     failConversation?: boolean;
     projects?: ProjectListing[];
+    /// Holds every `list_projects` read; each answers with the list as it was
+    /// when the read was issued.
+    projectReads?: Gate;
     pending?: { request_id: string; project_id: string }[];
   };
 
@@ -3627,8 +3630,11 @@ describe("desktop sync for another client's turn", () => {
             return [];
           case "workspace_status":
             return { persistable: true };
-          case "list_projects":
-            return backend.projects ?? [];
+          case "list_projects": {
+            const snapshot = backend.projects ?? [];
+            await backend.projectReads?.promise;
+            return snapshot;
+          }
           default:
             return undefined;
         }
@@ -4274,6 +4280,28 @@ describe("desktop sync for another client's turn", () => {
     await settle();
 
     expect(ws.projects.list.map((p) => p.id)).toEqual([PROJECT_3]);
+  });
+
+  it("reads the project list again when a change arrives while a re-read is in flight", async () => {
+    const ws = await loadWorkspaceState();
+    const reads = gate();
+    const active = project(PROJECT_3, "2026-05-16T00:00:00Z");
+    const backend = installBackend({ roster: [], projects: [active], projectReads: reads });
+    await ws.installDesktopSync();
+    const listReads = (): number =>
+      invokeMock.mock.calls.filter(([cmd]) => cmd === "list_projects").length;
+    const before = listReads();
+
+    fireTo("projects_changed", null);
+    await settle();
+    backend.projects = [{ ...active, archived: true }];
+    fireTo("projects_changed", null);
+    await settle();
+    reads.open();
+    await settle();
+
+    expect(listReads()).toBe(before + 2);
+    expect(ws.projects.list.map((p) => p.archived)).toEqual([true]);
   });
 
   it("re-reads a loaded project's runs when another client dismisses one", async () => {

@@ -244,13 +244,13 @@ test-live-antigravity:
 
 # Snapshot a harness CLI's command surface (every command and subcommand's
 # help, plus its slash commands or app-server methods) for a harness update
-# review to `git diff`. HARNESS is codex, claude or agy. See
+# review to `git diff`. HARNESS is codex, claude, agy or kimi. See
 # docs/harness-update-review.md for when to regenerate it.
 # CLI_SURFACE_DIR is overridable so scripts/cli-surface.test.sh can exercise
 # this target without touching the committed snapshots.
 CLI_SURFACE_DIR ?= docs/research/cli-surface
 cli-surface:
-	@test -n "$(HARNESS)" || { echo "usage: make cli-surface HARNESS=codex|claude|agy" >&2; exit 2; }
+	@test -n "$(HARNESS)" || { echo "usage: make cli-surface HARNESS=codex|claude|agy|kimi" >&2; exit 2; }
 	scripts/cli-surface.sh $(HARNESS) > $(CLI_SURFACE_DIR)/$(HARNESS).txt.tmp || { rm -f $(CLI_SURFACE_DIR)/$(HARNESS).txt.tmp; exit 1; }
 	mv $(CLI_SURFACE_DIR)/$(HARNESS).txt.tmp $(CLI_SURFACE_DIR)/$(HARNESS).txt
 

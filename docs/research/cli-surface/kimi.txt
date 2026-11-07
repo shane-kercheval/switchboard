@@ -1,0 +1,416 @@
+version: 2.5.2
+
+===== kimi --help
+Usage: kimi [options] [command]
+
+The Starting Point for Next-Gen Agents
+
+Options:
+  -V, --version                 output the version number
+  -S, --session [id]            Resume a session. With ID: resume that session. Without ID:
+                                interactively pick.
+  -c, --continue                Continue the previous session for the working directory. (default:
+                                false)
+  -y, --yolo                    Start in Ask When Needed mode: routine edits and commands run
+                                automatically; risky actions, questions, and plans still ask.
+                                (default: false)
+  --auto                        Start in Never Ask mode: everything runs and is decided
+                                automatically; only plans in Plan mode wait for your review.
+                                (default: false)
+  -m, --model <model>           LLM model alias to use for this invocation. Defaults to
+                                default_model in config.toml.
+  -p, --prompt <prompt>         Run one prompt non-interactively and print the response.
+  --output-format <format>      Output format for prompt mode. Defaults to text. (choices: "text",
+                                "stream-json")
+  --skills-dir <dir>            Load skills from this directory instead of auto-discovered user and
+                                project directories. Can be repeated. (default: [])
+  --agent <name>                Agent profile to start the new session with. Custom profiles are
+                                discovered from agent directories or loaded via --agent-file. Cannot
+                                be combined with --session/--continue.
+  --agent-file <path>           Load an agent definition from a Markdown file and select it for the
+                                new session. Cannot be combined with --session/--continue. (default:
+                                [])
+  --add-dir <dir>               Add an additional workspace directory for this session. Can be
+                                repeated. (default: [])
+  --plan                        Start in plan mode. (default: false)
+  -h, --help                    Show help.
+
+Commands:
+  export [options] [sessionId]  Export a session as a ZIP archive.
+  fork [options] [sessionId]    Fork a session into a new session.
+  provider                      Manage LLM providers non-interactively.
+  session                       Manage sessions non-interactively.
+  acp [options]                 Run kimi-code as an Agent Client Protocol (ACP) server over stdio.
+  web [options]                 Run the local Kimi server and open the web UI.
+  server                        Deprecated — use `kimi web` instead.
+  rc|remote [options]           Run the local Kimi server and open the web UI through Remote
+                                Control.
+  login [options]               Authenticate with Kimi Code CLI via the device-code flow.
+  doctor                        Validate Kimi Code configuration files.
+  vis [options] [sessionId]     Launch the session visualizer in your browser.
+  install-desktop               Print the Kimi Code desktop app page and open it in your browser.
+  app [path]                    Open a new chat in the Kimi Code desktop app for this directory.
+  migrate [options]             Migrate data from a legacy kimi-cli installation into kimi-code.
+  import-sessions               Import recent Claude Code and Codex sessions into Kimi Code.
+  upgrade|update [options]      Upgrade Kimi Code to the latest version.
+
+Documentation:        https://moonshotai.github.io/kimi-code/
+
+===== kimi export --help
+Usage: kimi export [options] [sessionId]
+
+Export a session as a ZIP archive.
+
+Arguments:
+  sessionId                Session id to export. Defaults to the most recent session.
+
+Options:
+  -o, --output <path>      Output ZIP path.
+  -y, --yes                Skip previous-session confirmation.
+  --no-include-global-log  Skip bundling the active global diagnostic log
+                           (~/.kimi-code/logs/kimi-code.log, not rotated .1 files). By default the
+                           global log is included.
+  -h, --help               Show help.
+
+===== kimi fork --help
+Usage: kimi fork [options] [sessionId]
+
+Fork a session into a new session.
+
+Arguments:
+  sessionId     Session id to fork. Defaults to the most recent session.
+
+Options:
+  --cwd <path>  Working directory used to find the most recent session to fork. Defaults to the
+                current directory.
+  -y, --yes     Skip previous-session confirmation.
+  -h, --help    Show help.
+
+===== kimi provider --help
+Usage: kimi provider [options] [command]
+
+Manage LLM providers non-interactively.
+
+Options:
+  -h, --help           Show help.
+
+Commands:
+  add [options] <url>  Import every provider listed in a custom registry (api.json).
+  remove <providerId>  Remove a provider and every model alias that referenced it.
+  list [options]       Show configured providers and their model counts.
+  catalog              Discover and import providers from the public models.dev catalog.
+  help [command]       display help for command
+
+===== kimi provider add --help
+Usage: kimi provider add [options] <url>
+
+Import every provider listed in a custom registry (api.json).
+
+Options:
+  --api-key <key>  Registry API key. Falls back to KIMI_REGISTRY_API_KEY; omit both for public
+                   registries.
+  -h, --help       Show help.
+
+===== kimi provider remove --help
+Usage: kimi provider remove [options] <providerId>
+
+Remove a provider and every model alias that referenced it.
+
+Options:
+  -h, --help  Show help.
+
+===== kimi provider list --help
+Usage: kimi provider list [options]
+
+Show configured providers and their model counts.
+
+Options:
+  --json      Emit the raw providers/models config as JSON. (default: false)
+  -h, --help  Show help.
+
+===== kimi provider catalog --help
+Usage: kimi provider catalog [options] [command]
+
+Discover and import providers from the public models.dev catalog.
+
+Options:
+  -h, --help                   Show help.
+
+Commands:
+  list [options] [providerId]  List providers in the catalog, or models when a providerId is given.
+  add [options] <providerId>   Import a known provider from the catalog by id.
+  help [command]               display help for command
+
+===== kimi provider catalog list --help
+Usage: kimi provider catalog list [options] [providerId]
+
+List providers in the catalog, or models when a providerId is given.
+
+Options:
+  --filter <substring>  Case-insensitive id/name substring filter.
+  --url <url>           Override catalog URL. Defaults to https://models.dev/api.json.
+  --json                Emit the matching catalog slice as JSON. (default: false)
+  -h, --help            Show help.
+
+===== kimi provider catalog add --help
+Usage: kimi provider catalog add [options] <providerId>
+
+Import a known provider from the catalog by id.
+
+Options:
+  --api-key <key>            API key for the provider. Falls back to KIMI_REGISTRY_API_KEY.
+  --default-model <modelId>  Mark the imported model as default_model after import.
+  --base-url <url>           Override the catalog endpoint. Required when the catalog declares none
+                             (or an env placeholder).
+  --url <url>                Override catalog URL. Defaults to https://models.dev/api.json.
+  -h, --help                 Show help.
+
+===== kimi session --help
+Usage: kimi session [options] [command]
+
+Manage sessions non-interactively.
+
+Options:
+  -h, --help      Show help.
+
+Commands:
+  list [options]  List sessions, most recently updated first.
+  help [command]  display help for command
+
+===== kimi session list --help
+Usage: kimi session list [options]
+
+List sessions, most recently updated first.
+
+Options:
+  --cwd <path>  List sessions of this working directory. Defaults to the current directory.
+  --all         List sessions across every workspace. (default: false)
+  --archived    Include archived sessions. (default: false)
+  --limit <n>   Print at most n sessions.
+  --json        Emit the session summaries as JSON. (default: false)
+  -h, --help    Show help.
+
+===== kimi acp --help
+Usage: kimi acp [options]
+
+Run kimi-code as an Agent Client Protocol (ACP) server over stdio.
+
+Options:
+  --login            Run the device-code login flow then exit (entry point for ACP terminal-auth).
+                     (default: false)
+  --region <region>  Login region used together with --login: "mainland-cn" (kimi.com) or "global"
+                     (kimi.ai).
+  -h, --help         Show help.
+
+===== kimi web --help
+Usage: kimi web [options] [command]
+
+Run the local Kimi server and open the web UI.
+
+Options:
+  --port <port>             Bind port (default 58627) (default: "58627")
+  --host [host]             Bind host. Omit to bind 127.0.0.1 (this machine only); pass --host to
+                            bind 0.0.0.0 (all interfaces), or --host <host> for a specific host. The
+                            bearer token is printed at startup.
+  --allowed-host <host...>  Extra Host header value to allow through the DNS-rebinding check. Repeat
+                            or comma-separate; a leading dot matches a domain suffix (e.g.
+                            .example.com).
+  --insecure-no-tls         Allow a non-loopback bind without a TLS-terminating reverse proxy.
+                            Defaults to true; only relevant for non-loopback binds. (default: true)
+  --allow-remote-shutdown   On a non-loopback bind, keep POST /api/v1/shutdown enabled (default:
+                            route is disabled → 404). (default: false)
+  --dangerous-bypass-auth   Disable bearer-token auth on every REST and WebSocket route, and
+                            advertise it via /api/v1/meta so the web UI connects without a token.
+                            Only use on a trusted network or behind your own authenticating proxy.
+                            (default: false)
+  --log-level <level>       Server log level: fatal|error|warn|info|debug|trace|silent. Omit to keep
+                            logs off.
+  --debug-endpoints         Mount /api/v1/debug/* routes for test introspection. OFF by default;
+                            production callers leave this unset. (default: false)
+  --web-title <title>       Set a custom browser tab title for this web UI instance (default:
+                            "<workspace dir> | Kimi Code").
+  --rc, --remote-control    Expose the web UI through Kimi Remote Control. (default: false)
+  --no-open                 Do not open the web UI in the default browser.
+  -h, --help                Show help.
+
+Commands:
+  rotate-token              Generate a new persistent server token; the previous token stops working
+                            immediately.
+
+===== kimi web rotate-token --help
+Usage: kimi web rotate-token [options]
+
+Generate a new persistent server token; the previous token stops working immediately.
+
+Options:
+  -h, --help  Show help.
+
+===== kimi server --help
+Usage: kimi server [options] [command]
+
+Deprecated — use `kimi web` instead.
+
+Options:
+  -h, --help  Show help.
+
+Commands:
+  kill        Deprecated — stop a server started by a version before 0.28.0 (recorded in the legacy
+              server lock). Servers started by `kimi web` run in the foreground — stop them with
+              Ctrl+C.
+
+===== kimi server kill --help
+Usage: kimi server kill [options]
+
+Deprecated — stop a server started by a version before 0.28.0 (recorded in the legacy server lock).
+Servers started by `kimi web` run in the foreground — stop them with Ctrl+C.
+
+Options:
+  -h, --help  Show help.
+
+===== kimi rc --help
+Usage: kimi rc|remote [options]
+
+Run the local Kimi server and open the web UI through Remote Control.
+
+Options:
+  --port <port>             Bind port (default 58627) (default: "58627")
+  --host [host]             Bind host. Omit to bind 127.0.0.1 (this machine only); pass --host to
+                            bind 0.0.0.0 (all interfaces), or --host <host> for a specific host. The
+                            bearer token is printed at startup.
+  --allowed-host <host...>  Extra Host header value to allow through the DNS-rebinding check. Repeat
+                            or comma-separate; a leading dot matches a domain suffix (e.g.
+                            .example.com).
+  --insecure-no-tls         Allow a non-loopback bind without a TLS-terminating reverse proxy.
+                            Defaults to true; only relevant for non-loopback binds. (default: true)
+  --allow-remote-shutdown   On a non-loopback bind, keep POST /api/v1/shutdown enabled (default:
+                            route is disabled → 404). (default: false)
+  --dangerous-bypass-auth   Disable bearer-token auth on every REST and WebSocket route, and
+                            advertise it via /api/v1/meta so the web UI connects without a token.
+                            Only use on a trusted network or behind your own authenticating proxy.
+                            (default: false)
+  --log-level <level>       Server log level: fatal|error|warn|info|debug|trace|silent. Omit to keep
+                            logs off.
+  --debug-endpoints         Mount /api/v1/debug/* routes for test introspection. OFF by default;
+                            production callers leave this unset. (default: false)
+  --web-title <title>       Set a custom browser tab title for this web UI instance (default:
+                            "<workspace dir> | Kimi Code").
+  --no-open                 Do not open the web UI in the default browser.
+  -h, --help                Show help.
+
+===== kimi login --help
+Usage: kimi login [options]
+
+Authenticate with Kimi Code CLI via the device-code flow.
+
+Options:
+  --region <region>  Login region: "mainland-cn" (kimi.com) or "global" (kimi.ai).
+  -h, --help         Show help.
+
+===== kimi doctor --help
+Usage: kimi doctor [options] [command]
+
+Validate Kimi Code configuration files.
+
+Options:
+  -h, --help     Show help.
+
+Commands:
+  config [path]  Validate config.toml.
+  tui [path]     Validate tui.toml.
+
+===== kimi doctor config --help
+Usage: kimi doctor config [options] [path]
+
+Validate config.toml.
+
+Arguments:
+  path        Validate this file as config.toml instead of the default path.
+
+Options:
+  -h, --help  Show help.
+
+===== kimi doctor tui --help
+Usage: kimi doctor tui [options] [path]
+
+Validate tui.toml.
+
+Arguments:
+  path        Validate this file as tui.toml instead of the default path.
+
+Options:
+  -h, --help  Show help.
+
+===== kimi vis --help
+Usage: kimi vis [options] [sessionId]
+
+Launch the session visualizer in your browser.
+
+Arguments:
+  sessionId        Open directly to this session.
+
+Options:
+  --port <number>  Port to bind. Default: auto-pick a free port.
+  --host <host>    Host to bind. Default: 127.0.0.1.
+  --no-open        Do not open the browser automatically.
+  -h, --help       Show help.
+
+===== kimi install-desktop --help
+Usage: kimi install-desktop [options]
+
+Print the Kimi Code desktop app page and open it in your browser.
+
+Options:
+  -h, --help  Show help.
+
+===== kimi app --help
+Usage: kimi app [options] [path]
+
+Open a new chat in the Kimi Code desktop app for this directory.
+
+Options:
+  -h, --help  Show help.
+
+===== kimi migrate --help
+Usage: kimi migrate [options]
+
+Migrate data from a legacy kimi-cli installation into kimi-code.
+
+Options:
+  --run          Run the migration non-interactively and print step-by-step logs. Migrates
+                 everything unless --config-only is also given. (default: false)
+  --config-only  With --run: migrate config, MCP servers, REPL history and skills, but skip chat
+                 sessions. (default: false)
+  -h, --help     Show help.
+
+===== kimi import-sessions --help
+Usage: kimi import-sessions [options]
+
+Import recent Claude Code and Codex sessions into Kimi Code.
+
+Options:
+  -h, --help  Show help.
+
+===== kimi upgrade --help
+Usage: kimi upgrade|update [options]
+
+Upgrade Kimi Code to the latest version.
+
+Options:
+  -y, --yes   Skip the confirmation prompt and install the update directly. (default: false)
+  -h, --help  Show help.
+
+===== kimi acp initialize (agentCapabilities, auth methods)
+auth/logout
+authMethod/login
+loadSession=true
+mcpCapabilities/http=true
+mcpCapabilities/sse=true
+promptCapabilities/audio=false
+promptCapabilities/embeddedContext=true
+promptCapabilities/image=true
+sessionCapabilities/additionalDirectories
+sessionCapabilities/close
+sessionCapabilities/delete
+sessionCapabilities/fork
+sessionCapabilities/list
+sessionCapabilities/resume

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Tests for scripts/cli-surface.sh and `make cli-surface`. Fake `codex`,
-# `claude` and `agy` executables shadow the real ones on PATH, so these run
+# `claude`, `agy` and `kimi` executables shadow the real ones on PATH, so these run
 # without any harness installed or logged in. Each fake's behavior is steered
 # by environment variables:
 #   FAKE_FAIL_ARGS    the exact argument string the fake should fail on
 #   FAKE_FAIL_STATUS  the exit code for that failure (default 1); the fake
 #                     prints a Go-flag-style error line before the usage text
 #   FAKE_EMPTY        make the fake's command table empty (no methods, no init
-#                     event, no /help command list)
+#                     event, no /help command list, no ACP capabilities)
 #
 # Run: make test-scripts
 set -euo pipefail
@@ -130,7 +130,37 @@ case "$*" in
   *) echo "fake agy: unexpected arguments: $*" >&2; exit 64 ;;
 esac
 FAKE
-chmod +x "$bin/codex" "$bin/claude" "$bin/agy"
+# Answers `--help` at every level and, as `kimi acp`, replies to one request
+# on stdin and then waits for stdin to close, as the real server does.
+cat >"$bin/kimi" <<'FAKE'
+#!/bin/sh
+[ "$*" = "${FAKE_FAIL_ARGS:-}" ] && { echo "boom" >&2; exit 1; }
+case "$*" in
+  "--version") echo "9.9.9" ;;
+  "--help")
+    printf 'Usage: kimi [options] [command]\n\nOptions:\n  -h, --help  width=%s\n\nCommands:\n' "${COLUMNS:-unset}"
+    printf '  session         Manage sessions\n  upgrade|update  Upgrade\n  help [command]  display help\n'
+    printf '\nDocumentation: https://example.invalid\n'
+    ;;
+  "session --help")
+    printf 'Usage: kimi session [options] [command]\n\nCommands:\n'
+    printf '  list [options]  List sessions\n  help [command]  display help for command\n'
+    ;;
+  "session list --help") echo "Usage: kimi session list [options]" ;;
+  "upgrade --help") echo "Usage: kimi upgrade|update [options]" ;;
+  "acp")
+    IFS= read -r _request
+    if [ -n "${FAKE_EMPTY:-}" ]; then
+      echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{}}}'
+    else
+      echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"fork":{}},"promptCapabilities":{"audio":false}},"authMethods":[{"id":"login"}]}}'
+    fi
+    cat >/dev/null
+    ;;
+  *) echo "fake kimi: unexpected arguments: $*" >&2; exit 64 ;;
+esac
+FAKE
+chmod +x "$bin/codex" "$bin/claude" "$bin/agy" "$bin/kimi"
 
 out="$tmp/out" err="$tmp/err"
 export FAKE_MARKER="$tmp/danger-wipe-ran"
@@ -294,6 +324,36 @@ FAKE_FAIL_ARGS="help update" FAKE_FAIL_STATUS=2 expect_failure \
 FAKE_EMPTY=1 expect_failure \
   "agy: a /help response without a command list is refused" \
   "agy slash commands (/help) came back empty" agy
+
+# --- Kimi ----------------------------------------------------------------
+
+name="kimi: walks nested subcommands, skips help, and lists the acp capabilities"
+if expect_success "$name" kimi; then
+  if has_line "version: 9.9.9" &&
+    has_line "===== kimi session list --help" &&
+    has_line "===== kimi upgrade --help" &&
+    ! grep -qF "===== kimi help --help" "$out" &&
+    has_line "loadSession=true" &&
+    has_line "promptCapabilities/audio=false" &&
+    has_line "sessionCapabilities/fork" &&
+    has_line "authMethod/login"; then
+    pass "$name"
+  else
+    fail_test "$name" "missing or unexpected sections"
+  fi
+fi
+
+FAKE_FAIL_ARGS="session list --help" expect_failure \
+  "kimi: a failed nested help call stops the script and names it" \
+  "help for 'kimi session list' failed" kimi
+
+FAKE_FAIL_ARGS="acp" expect_failure \
+  "kimi: an acp server that refuses to start stops the script" \
+  "'kimi acp' initialize failed" kimi
+
+FAKE_EMPTY=1 expect_failure \
+  "kimi: an initialize reply without capabilities is refused" \
+  "kimi acp initialize (agentCapabilities, auth methods) came back empty" kimi
 
 # --- make cli-surface --------------------------------------------------
 

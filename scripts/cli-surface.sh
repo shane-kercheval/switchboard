@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Print a harness CLI's command surface: every command and subcommand's help
 # text, plus the harness's other command tables (Codex's app-server methods,
-# Claude's and Antigravity's slash commands). `make cli-surface` writes the
+# Claude's and Antigravity's slash commands, Kimi's ACP capabilities).
+# `make cli-surface` writes the
 # output to docs/research/cli-surface/<harness>.txt, so a harness update
 # review can `git diff` the file to see every new command, flag and method.
 #
-# Usage: scripts/cli-surface.sh codex|claude|agy
+# Usage: scripts/cli-surface.sh codex|claude|agy|kimi
 #
 # Every call is free and changes nothing of Switchboard's: `--help`, a schema
-# dump, and slash commands that answer without a model call (`num_turns: 0`).
+# dump, slash commands that answer without a model call (`num_turns: 0`), and
+# Kimi's ACP `initialize` handshake, which needs no account.
 # One side effect belongs to agy: starting `agy -p` runs agy's own
 # auto-updater (at most every 15 minutes), as any agy session does, so agy may
 # update itself in the background while this runs.
@@ -18,7 +20,7 @@
 # scripts/cli-surface.test.sh covers those paths with fake CLIs.
 set -euo pipefail
 
-harness="${1:?usage: $0 codex|claude|agy}"
+harness="${1:?usage: $0 codex|claude|agy|kimi}"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -114,9 +116,16 @@ help_claude() {
   CLAUDE_CONFIG_DIR="$work/claude-config" COLUMNS=100 claude "$@" --help </dev/null 2>&1
 }
 
+# Kimi's option parser handles `--help` at every level before any command
+# runs. An unknown name followed by `--help` prints the parent's help and
+# exits 0 (kimi 2.5.2), so only names read from a help text are walked.
+help_kimi() {
+  run_help kimi "$@" --help
+}
+
 # Print one command's help and recurse into every subcommand it lists, up to
-# three levels below the top. $1 is the CLI (codex or claude), the rest the
-# command path.
+# three levels below the top. $1 is the CLI (codex, claude or kimi), the rest
+# the command path.
 walk() {
   local cli="$1" help sub
   shift
@@ -167,6 +176,60 @@ claude_surface() {
   commands=$(jq -r 'select(.type == "system" and .subtype == "init") | .slash_commands[]?' \
     <<<"$stream" | sort) || fail "could not read Claude's init event"
   print_table "claude slash commands accepted in print mode (bare)" "$commands"
+}
+
+# Send the Agent Client Protocol `initialize` request to `kimi acp` and print
+# its reply line. `kimi acp` exits when stdin reaches EOF, so stdin is a pipe
+# from a writer that sends the request and exits once the reply has landed
+# (or the capture gave up). A FIFO would not do: kimi 2.5.2 keeps running
+# after a FIFO's writers close, so the wait never ended. Its stdout also goes
+# through a pipe, because kimi flushes a regular-file stdout only at exit.
+# The wait stops early when the process dies, so a CLI that refuses to start
+# fails the capture at once.
+acp_request_writer() {
+  local waited=0
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"switchboard-cli-surface","version":"0"}}}'
+  while [[ ! -e "$work/acp-done" ]] && ((waited < 600)); do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+}
+
+acp_initialize() {
+  local reply pid waited=0
+  : >"$work/acp-out"
+  (cd "$work/cwd" && kimi acp 2>"$work/acp-err" < <(acp_request_writer) | head -n 1 >"$work/acp-out") &
+  pid=$!
+  while (($(wc -l <"$work/acp-out") < 1)) && kill -0 "$pid" 2>/dev/null && ((waited < 600)); do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  touch "$work/acp-done"
+  wait "$pid" 2>/dev/null || true
+  reply=$(head -n 1 "$work/acp-out")
+  [[ -n $reply ]] || return 1
+  echo "$reply"
+}
+
+kimi_surface() {
+  print_version kimi
+  walk kimi
+  # Kimi's slash commands exist only in its TUI, and `kimi -p` refuses to run
+  # without a configured model, so the table beyond `--help` is the ACP
+  # server's `initialize` reply: every capability flag with its value, every
+  # empty capability object by path, and the login methods by id.
+  local reply capabilities
+  reply=$(acp_initialize) ||
+    fail "'kimi acp' initialize failed: $(head -c 300 "$work/acp-err" 2>/dev/null)"
+  capabilities=$(jq -r '
+    .result.agentCapabilities as $caps
+    | [$caps | paths(type != "object" and type != "array") as $p
+        | "\($p | join("/"))=\($caps | getpath($p))"]
+    + [$caps | paths(type == "object" and length == 0) | join("/")]
+    + [.result.authMethods[]? | "authMethod/\(.id)"]
+    | .[]' <<<"$reply" | sort -u) ||
+    fail "could not read capabilities from the acp initialize reply"
+  print_table "kimi acp initialize (agentCapabilities, auth methods)" "$capabilities"
 }
 
 # Run an agy help command into $agy_help_text. Every agy help call must exit 0
@@ -230,8 +293,9 @@ case "$harness" in
   codex) codex_surface | hide_temp_dir ;;
   claude) claude_surface | hide_temp_dir ;;
   agy) agy_surface | hide_temp_dir ;;
+  kimi) kimi_surface | hide_temp_dir ;;
   *)
-    echo "unknown harness: $harness (expected codex, claude or agy)" >&2
+    echo "unknown harness: $harness (expected codex, claude, agy or kimi)" >&2
     exit 2
     ;;
 esac

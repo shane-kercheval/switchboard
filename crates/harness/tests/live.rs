@@ -585,11 +585,15 @@ async fn live_claude_rate_limit_carries_unified_windows() {
              read it, and without it the card falls back to a reset line with no percentage",
         );
 
-    for key in ["five_hour", "seven_day"] {
-        let window = unified
-            .get(key)
-            .and_then(serde_json::Value::as_object)
-            .unwrap_or_else(|| panic!("`unifiedWindows` must carry a `{key}` object"));
+    // `five_hour` is optional: the server sends it only to plans that have a 5-hour limit.
+    for (key, required) in [("seven_day", true), ("five_hour", false)] {
+        let Some(window) = unified.get(key) else {
+            assert!(!required, "`unifiedWindows` must carry a `{key}` object");
+            continue;
+        };
+        let window = window
+            .as_object()
+            .unwrap_or_else(|| panic!("`unifiedWindows.{key}` must be an object"));
         let utilization = window
             .get("utilization")
             .and_then(serde_json::Value::as_f64)

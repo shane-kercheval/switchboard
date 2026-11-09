@@ -1146,9 +1146,10 @@ async fn text_first_report_findings_live_capture_matches_the_session_file_read()
 
 /// An agent made on Fable 5.1 keeps its session when the `fable` alias moves to
 /// Fable 5.2, so its next turn resumes that session on 5.2. Recorded from that
-/// sequence: one turn on CLI 2.1.312 (`fable` resolved to 5.1; a redacted
-/// thinking block and a tool call), then one on 2.1.321 (`fable` resolved to
-/// 5.2). The file mixes both models, and each turn must reload on its own.
+/// sequence, then sanitized and trimmed of housekeeping records: one turn on
+/// CLI 2.1.312 (`fable` resolved to 5.1; a redacted thinking block and a tool
+/// call), then one on 2.1.321 (`fable` resolved to 5.2). The file mixes both
+/// models, and each turn must reload on its own.
 #[test]
 fn fable_5_1_session_resumed_on_fable_5_2_reloads_each_turn_on_its_model() {
     type AgentTurnView<'a> = (

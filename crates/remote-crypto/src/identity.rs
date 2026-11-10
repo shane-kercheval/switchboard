@@ -65,6 +65,15 @@ pub fn device_id(identity_public_key: &VerifyingKey) -> String {
     id
 }
 
+/// Whether `value` has the shape `device_id` produces. The relay parses ids
+/// with this, so the two cannot drift apart.
+pub fn is_device_id(value: &str) -> bool {
+    value.len() == DEVICE_ID_LEN
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+}
+
 /// Crate-private: no caller outside this crate handles a private key.
 /// Signing with an in-memory Ed25519 key cannot fail.
 pub(crate) fn sign(key: &SigningKey, purpose: SignaturePurpose, payload: &[u8]) -> Signature {
@@ -112,6 +121,24 @@ mod tests {
                     .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)),
                 "{id}"
             );
+            assert!(is_device_id(&id), "{id}");
+        }
+    }
+
+    #[test]
+    fn is_device_id_refuses_any_other_shape() {
+        let id = "abcdefghijklmnopqrstuvwxyz";
+        assert!(is_device_id(id));
+        for bad in [
+            "",
+            &id[..25],
+            &format!("{id}a"),
+            "Abcdefghijklmnopqrstuvwxyz",
+            "abcdefghijklmnopqrstuvwxy1",
+            "abcdefghijklmnopqrstuvwxy8",
+            "abcdefghijklmnopqrstuvwxy=",
+        ] {
+            assert!(!is_device_id(bad), "{bad:?}");
         }
     }
 

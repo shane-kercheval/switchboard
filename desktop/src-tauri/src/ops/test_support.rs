@@ -1084,7 +1084,8 @@ pub fn claude_session_jsonl(prompt: &str, text: &str, key: &str) -> String {
                 "stop_reason": "end_turn",
                 "usage": { "input_tokens": 10, "output_tokens": 5 },
             },
-            "timestamp": (now + chrono::Duration::milliseconds(1)).to_rfc3339(),
+            // The merge trusts a reply only if it is stamped before the next send starts.
+            "timestamp": Utc::now().to_rfc3339(),
         }),
     ]
     .iter()

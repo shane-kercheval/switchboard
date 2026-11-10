@@ -1,4 +1,4 @@
-version: 2.1.312 (Claude Code)
+version: 2.1.321 (Claude Code)
 
 ===== claude --help
 Usage: claude [options] [command] [prompt]
@@ -274,8 +274,7 @@ Commands:
                                         lists. Part of the session name works
                                         too
   auth                                  Manage authentication
-  auto-mode                             Inspect or reset auto mode classifier
-                                        configuration
+  auto-mode                             Inspect or reset auto mode configuration
   doctor                                Check the health of your Claude Code
                                         installation. Reads settings files in
                                         the current directory without a trust
@@ -415,7 +414,7 @@ Options:
 ===== claude auto-mode --help
 Usage: claude auto-mode [options] [command]
 
-Inspect or reset auto mode classifier configuration
+Inspect or reset auto mode configuration
 
 Options:
   -h, --help          Display help for command
@@ -695,58 +694,62 @@ Usage: claude plugin|plugins [options] [command]
 Manage Claude Code plugins
 
 Options:
-  -h, --help                           Display help for command
+  -h, --help                            Display help for command
 
 Commands:
-  configure [options] <plugin>         Show a plugin's options and which are
-                                       unset, or save values from stdin with
-                                       --values-stdin
-  details [options] <name>             Show a plugin's component inventory and
-                                       projected token cost
-  disable [options] [plugin]           Disable an enabled plugin
-  enable [options] <plugin>            Enable a disabled plugin
-  eval [options] [target]              Run eval cases (<eval dir>/**/case.yaml
-                                       or prompt.md + graders/*.md; the eval dir
-                                       is evals/ unless --eval-dir or the
-                                       manifest says otherwise) against a plugin
-                                       and report scored results. Target is a
-                                       path, a plugin name, or a
-                                       `plugin@marketplace` id — installed and
-                                       skills-dir plugins both resolve (and add
-                                       a no-plugin baseline arm). It loads the
-                                       plugin and runs its eval suite (prompts,
-                                       graders; scaffold scripts and real MCP
-                                       servers only when you opt in) on your
-                                       machine, as you: only evaluate plugins
-                                       you trust — the run's sandboxing limits
-                                       what a malicious plugin can reach but is
-                                       not a guarantee, and a bundled suite
-                                       passing is not a security vetting. The
-                                       first run in an untrusted plugin
-                                       directory asks you to confirm
-                                       (--trust-plugin answers for CI)
-  help [command]                       display help for command
-  init|new [options] <name>            Scaffold a new plugin at
-                                       ~/.claude/skills/<name>/ (auto-loads next
-                                       session as <name>@skills-dir)
-  install|i [options] <plugin>         Install a plugin from available
-                                       marketplaces (use plugin@marketplace for
-                                       specific marketplace)
-  list [options]                       List installed plugins
-  marketplace                          Manage Claude Code marketplaces
-  prune|autoremove [options]           Remove auto-installed dependencies that
-                                       are no longer needed
-  tag [options] [path]                 Create a {name}--v{version} git tag for a
-                                       plugin release, validating that
-                                       plugin.json and any enclosing marketplace
-                                       entry agree
-  test [dir]                           Run a mod's tests
-  uninstall|remove [options] <plugin>  Uninstall an installed plugin
-  update [options] <plugin>            Update a plugin to the latest version
-                                       (restart required to apply)
-  validate [options] <path>            Validate a plugin or marketplace
-                                       manifest, or the skills, agents, and
-                                       commands in a directory
+  configure [options] <plugin>          Show a plugin's options and which are
+                                        unset, or save values from stdin with
+                                        --values-stdin
+  details [options] <name>              Show a plugin's component inventory and
+                                        projected token cost
+  disable [options] [plugin]            Disable an enabled plugin
+  enable [options] <plugin>             Enable a disabled plugin
+  eval [options] [target]               Run eval cases (<eval dir>/**/case.yaml
+                                        or prompt.md + graders/*.md; the eval
+                                        dir is evals/ unless --eval-dir or the
+                                        manifest says otherwise) against a
+                                        plugin and report scored results. Target
+                                        is a path, a plugin name, or a
+                                        `plugin@marketplace` id — installed and
+                                        skills-dir plugins both resolve (and add
+                                        a no-plugin baseline arm). It loads the
+                                        plugin and runs its eval suite (prompts,
+                                        graders; scaffold scripts and real MCP
+                                        servers only when you opt in) on your
+                                        machine, as you: only evaluate plugins
+                                        you trust — the run's sandboxing limits
+                                        what a malicious plugin can reach but is
+                                        not a guarantee, and a bundled suite
+                                        passing is not a security vetting. The
+                                        first run in an untrusted plugin
+                                        directory asks you to confirm
+                                        (--trust-plugin answers for CI)
+  help [command]                        display help for command
+  init|new [options] <name>             Scaffold a new plugin at
+                                        ~/.claude/skills/<name>/ (auto-loads
+                                        next session as <name>@skills-dir)
+  install|i [options] <plugin>          Install a plugin from available
+                                        marketplaces (use plugin@marketplace for
+                                        specific marketplace)
+  list [options]                        List installed plugins
+  marketplace                           Manage Claude Code marketplaces
+  prune|autoremove [options]            Remove auto-installed dependencies that
+                                        are no longer needed
+  restore-set-aside [options] <plugin>  Give a plugin id back the options and
+                                        secrets set aside when a marketplace
+                                        your organization declares replaced
+                                        another source
+  tag [options] [path]                  Create a {name}--v{version} git tag for
+                                        a plugin release, validating that
+                                        plugin.json and any enclosing
+                                        marketplace entry agree
+  test [dir]                            Run a mod's tests
+  uninstall|remove [options] <plugin>   Uninstall an installed plugin
+  update [options] <plugin>             Update a plugin to the latest version
+                                        (restart required to apply)
+  validate [options] <path>             Validate a plugin or marketplace
+                                        manifest, or the skills, agents, and
+                                        commands in a directory
 
 ===== claude plugin configure --help
 Usage: claude plugin configure [options] <plugin>
@@ -1059,6 +1062,16 @@ Options:
   -s, --scope <scope>  Prune at scope: user, project, or local (default: "user")
   -y, --yes            Skip the confirmation prompt (required when stdin or
                        stdout is not a TTY)
+
+===== claude plugin restore-set-aside --help
+Usage: claude plugin restore-set-aside [options] <plugin>
+
+Give a plugin id back the options and secrets set aside when a marketplace your
+organization declares replaced another source
+
+Options:
+  --discard   Delete what is set aside instead of restoring it
+  -h, --help  Display help for command
 
 ===== claude plugin tag --help
 Usage: claude plugin tag [options] [path]

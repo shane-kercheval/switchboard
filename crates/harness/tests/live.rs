@@ -576,20 +576,33 @@ async fn live_claude_rate_limit_carries_unified_windows() {
     // that sent good windows first and degraded ones second would leave the
     // card on its no-percentage fallback while a first-match assertion still
     // passed.
-    let unified = payloads
-        .last()
-        .and_then(|info| info.get("unifiedWindows"))
+    assert_unified_windows(payloads[payloads.len() - 1]);
+}
+
+/// Asserts the shape the usage meters read from one `rate_limit_event` payload.
+/// `five_hour` is optional because the server omits it for plans with no 5-hour
+/// limit, but a payload whose `rateLimitType` names it must carry it.
+fn assert_unified_windows(info: &serde_json::Value) {
+    let unified = info
+        .get("unifiedWindows")
         .and_then(serde_json::Value::as_object)
         .expect(
             "rate_limit_event must carry a `unifiedWindows` object — the per-window usage meters \
              read it, and without it the card falls back to a reset line with no percentage",
         );
+    let names_five_hour = info
+        .get("rateLimitType")
+        .and_then(serde_json::Value::as_str)
+        == Some("five_hour");
 
-    for key in ["five_hour", "seven_day"] {
-        let window = unified
-            .get(key)
-            .and_then(serde_json::Value::as_object)
-            .unwrap_or_else(|| panic!("`unifiedWindows` must carry a `{key}` object"));
+    for (key, required) in [("seven_day", true), ("five_hour", names_five_hour)] {
+        let Some(window) = unified.get(key) else {
+            assert!(!required, "`unifiedWindows` must carry a `{key}` object");
+            continue;
+        };
+        let window = window
+            .as_object()
+            .unwrap_or_else(|| panic!("`unifiedWindows.{key}` must be an object"));
         let utilization = window
             .get("utilization")
             .and_then(serde_json::Value::as_f64)
@@ -609,6 +622,55 @@ async fn live_claude_rate_limit_carries_unified_windows() {
             "`{key}.resetsAt` must be a number (unix seconds) — the window is dropped without it"
         );
     }
+}
+
+#[test]
+fn unified_windows_check_accepts_a_payload_without_five_hour_that_does_not_name_it() {
+    assert_unified_windows(&json!({
+        "rateLimitType": "seven_day",
+        "unifiedWindows": { "seven_day": { "utilization": 0.15, "resetsAt": 1_794_754_800 } },
+    }));
+}
+
+#[test]
+fn unified_windows_check_accepts_five_hour_when_named_and_present() {
+    assert_unified_windows(&json!({
+        "rateLimitType": "five_hour",
+        "unifiedWindows": {
+            "five_hour": { "utilization": 0.4, "resetsAt": 1_794_200_000 },
+            "seven_day": { "utilization": 0.15, "resetsAt": 1_794_754_800 },
+        },
+    }));
+}
+
+#[test]
+#[should_panic(expected = "must carry a `five_hour` object")]
+fn unified_windows_check_requires_five_hour_when_rate_limit_type_names_it() {
+    assert_unified_windows(&json!({
+        "rateLimitType": "five_hour",
+        "unifiedWindows": { "seven_day": { "utilization": 0.15, "resetsAt": 1_794_754_800 } },
+    }));
+}
+
+#[test]
+#[should_panic(expected = "`five_hour.utilization` must be a 0-1 fraction")]
+fn unified_windows_check_validates_an_unnamed_five_hour_when_present() {
+    assert_unified_windows(&json!({
+        "rateLimitType": "seven_day",
+        "unifiedWindows": {
+            "five_hour": { "utilization": 40, "resetsAt": 1_794_200_000 },
+            "seven_day": { "utilization": 0.15, "resetsAt": 1_794_754_800 },
+        },
+    }));
+}
+
+#[test]
+#[should_panic(expected = "must carry a `seven_day` object")]
+fn unified_windows_check_requires_seven_day() {
+    assert_unified_windows(&json!({
+        "rateLimitType": "five_hour",
+        "unifiedWindows": { "five_hour": { "utilization": 0.4, "resetsAt": 1_794_200_000 } },
+    }));
 }
 
 #[tokio::test]

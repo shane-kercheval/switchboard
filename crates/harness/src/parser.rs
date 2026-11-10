@@ -472,9 +472,10 @@ impl ParserState {
 /// family word (`some-vendor-opus-proxy`).
 ///
 /// **Probed @ 2.1.241 with Switchboard's exact `-p` flags** (`claude-fable-5-1`
-/// added @ 2.1.257, `claude-opus-5-5` @ 2.1.280, `claude-sonnet-5-5` @ 2.1.284
-/// and `claude-haiku-5-5` @ 2.1.296, each when its alias moved to it) — the
-/// requested level is written back verbatim for exactly these seven:
+/// added @ 2.1.257, `claude-opus-5-5` @ 2.1.280, `claude-sonnet-5-5` @ 2.1.284,
+/// `claude-haiku-5-5` @ 2.1.296 and `claude-fable-5-2` @ 2.1.321, each when its
+/// alias moved to it) — the requested level is written back verbatim for
+/// exactly these eight:
 ///
 /// | id | `--effort` sent | recorded |
 /// |---|---|---|
@@ -483,7 +484,8 @@ impl ParserState {
 /// | `claude-sonnet-5` | `max` / `low` | `"max"` / `"low"` |
 /// | `claude-sonnet-5-5` | `low` / `max` | `"low"` / `"max"` (`max` recorded even with thinking disabled — no clamp) |
 /// | `claude-fable-5` | `low` | `"low"` (upper bound on disk unprobed; full-id pinning only) |
-/// | `claude-fable-5-1` | `low` / `max` | `"low"` / `"max"` (`max` is the live loop's standing check) |
+/// | `claude-fable-5-1` | `low` / `max` | `"low"` / `"max"` (full-id pinning only since 2.1.321) |
+/// | `claude-fable-5-2` | `low` / `max` | `"low"` / `"max"` (`max` is the live loop's standing check) |
 /// | `claude-haiku-5-5` | `low` / `max` | `"low"` / `"max"` (`max` recorded even with thinking disabled — no clamp) |
 /// | `claude-haiku-4-5-20251001` | `max` / `low` | *no key written* |
 ///
@@ -499,13 +501,14 @@ impl ParserState {
 /// live-vs-disk mismatch — which is the signal to probe the new id and add it.
 /// See the "Model catalog" step in `harness-update-review.md`.
 fn model_records_effort(model: &str) -> bool {
-    const EFFORT_RECORDING_MODELS: [&str; 7] = [
+    const EFFORT_RECORDING_MODELS: [&str; 8] = [
         "claude-opus-5",
         "claude-opus-5-5",
         "claude-sonnet-5",
         "claude-sonnet-5-5",
         "claude-fable-5",
         "claude-fable-5-1",
+        "claude-fable-5-2",
         "claude-haiku-5-5",
     ];
     EFFORT_RECORDING_MODELS.contains(&model)
@@ -1919,6 +1922,7 @@ mod tests {
             "claude-sonnet-5-5",
             "claude-fable-5",
             "claude-fable-5-1",
+            "claude-fable-5-2",
             "claude-haiku-5-5",
         ] {
             assert_eq!(
@@ -1958,6 +1962,7 @@ mod tests {
             "claude-opus-4-6",
             "claude-mythos-5",
             "claude-mythos-5-1",
+            "claude-mythos-5-2",
             "some-vendor-opus-proxy",
             "bedrock/anthropic.claude-opus-5",
             "some-vendor-model",

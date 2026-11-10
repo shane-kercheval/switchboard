@@ -4,8 +4,8 @@ use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, ClaudeCodeAdapter, ContentKind, DispatchError, DispatchOptions, FailureKind,
-    HarnessAdapter, TextCapture, ToolFacet, ToolKind, TurnOutcome, TurnUsage,
-    claude_session_file_path, latest_completed_agent_text, load_claude_transcript,
+    HarnessAdapter, TextCapture, ToolFacet, ToolKind, Turn, TurnItem, TurnOutcome, TurnStatus,
+    TurnUsage, claude_session_file_path, latest_completed_agent_text, load_claude_transcript,
 };
 use uuid::Uuid;
 
@@ -1142,4 +1142,94 @@ async fn text_first_report_findings_live_capture_matches_the_session_file_read()
         "{live}"
     );
     assert_eq!(live, disk);
+}
+
+/// An agent made on Fable 5.1 keeps its session when the `fable` alias moves to
+/// Fable 5.2, so its next turn resumes that session on 5.2. Recorded from that
+/// sequence, then sanitized and trimmed of housekeeping records: one turn on
+/// CLI 2.1.312 (`fable` resolved to 5.1; a redacted thinking block and a tool
+/// call), then one on 2.1.321 (`fable` resolved to 5.2). The file mixes both
+/// models, and each turn must reload on its own.
+#[test]
+fn fable_5_1_session_resumed_on_fable_5_2_reloads_each_turn_on_its_model() {
+    type AgentTurnView<'a> = (
+        Option<&'a str>,
+        Option<&'a str>,
+        &'a TurnStatus,
+        &'a [TurnItem],
+    );
+    let home = tempfile::TempDir::new().expect("home");
+    let cwd = tempfile::TempDir::new().expect("cwd");
+    let cwd = cwd.path().canonicalize().expect("canonical cwd");
+    let session_id = Uuid::now_v7();
+    let recording =
+        std::fs::read_to_string(format!("{FIXTURES}/fable-5-1-resumed-on-5-2.session.jsonl"))
+            .expect("read fixture");
+    write_session_file(home.path(), &cwd, session_id, &recording);
+
+    let loaded = load_claude_transcript(home.path(), &cwd, session_id, fake_agent().id)
+        .expect("load the recorded session");
+
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert_eq!(loaded.turns.len(), 4, "{:#?}", loaded.turns);
+    let agent_turns: Vec<AgentTurnView<'_>> = loaded
+        .turns
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::Agent {
+                model,
+                effort,
+                status,
+                items,
+                ..
+            } => Some((
+                model.as_deref(),
+                effort.as_deref(),
+                status,
+                items.as_slice(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let [
+        (model_51, effort_51, status_51, items_51),
+        (model_52, effort_52, status_52, items_52),
+    ] = agent_turns.as_slice()
+    else {
+        panic!("expected two agent turns, got {agent_turns:#?}");
+    };
+
+    assert_eq!(*model_51, Some("claude-fable-5-1"));
+    assert_eq!(*effort_51, Some("low"));
+    assert_eq!(**status_51, TurnStatus::Complete);
+    assert!(
+        items_51.iter().any(|item| matches!(
+            item,
+            TurnItem::Tool { name, output: Some(output), .. } if name == "Bash" && output == "checked"
+        )),
+        "{items_51:#?}"
+    );
+    assert!(
+        matches!(items_51.last(), Some(TurnItem::Text { kind: ContentKind::Text, text }) if text == "yes"),
+        "{items_51:#?}"
+    );
+    // The 5.1 thinking block is redacted to empty text, which reloads as no item.
+    assert!(
+        !items_51.iter().any(|item| matches!(
+            item,
+            TurnItem::Text {
+                kind: ContentKind::Thinking,
+                ..
+            }
+        )),
+        "{items_51:#?}"
+    );
+
+    assert_eq!(*model_52, Some("claude-fable-5-2"));
+    assert_eq!(*effort_52, Some("low"));
+    assert_eq!(**status_52, TurnStatus::Complete);
+    assert!(
+        matches!(items_52, [TurnItem::Text { kind: ContentKind::Text, text }] if text == "ack"),
+        "{items_52:#?}"
+    );
 }

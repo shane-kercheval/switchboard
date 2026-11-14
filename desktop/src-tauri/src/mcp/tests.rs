@@ -3,6 +3,7 @@
 //! HTTP where a test needs a request that client never sends (no progress
 //! token, a browser's `Origin`, a wrong `Host`).
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -2858,17 +2859,75 @@ async fn live_fork_through_the_server(harness: switchboard_core::HarnessKind) {
     );
 }
 
-/// Poll `wait_send` until the send's only recipient has been running for at
-/// least `seconds`, and return that result. Fails, showing the last result,
-/// if the turn ends first or never gets there.
-async fn live_running_for(
+/// A named pipe an agent's `cat` blocks on until the test releases it, so the
+/// test decides when the agent's turn can end. Dropping it frees a `cat` still
+/// waiting on the pipe, as after a cancelled turn or a failed assertion.
+struct PipeGate {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl PipeGate {
+    fn new() -> Self {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("gate");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed: {made}");
+        Self { path, _dir: dir }
+    }
+
+    fn prompt(&self) -> String {
+        format!(
+            "Run the shell command `cat {}` with your Bash tool. When it finishes, reply with \
+             only the word done.",
+            self.path.display()
+        )
+    }
+
+    /// Write one line to the pipe, which ends the agent's `cat`. The writer
+    /// blocks until a reader opens the pipe, so it is killed at the deadline
+    /// and the test fails instead of hanging.
+    async fn release(&self) {
+        let mut writer = tokio::process::Command::new("sh")
+            .args(["-c", "echo go > \"$1\"", "sh"])
+            .arg(&self.path)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let Ok(status) = tokio::time::timeout(Duration::from_mins(1), writer.wait()).await else {
+            writer.kill().await.unwrap();
+            panic!("the agent's cat did not open the pipe within a minute");
+        };
+        assert!(status.unwrap().success(), "the release write failed");
+    }
+}
+
+impl Drop for PipeGate {
+    fn drop(&mut self) {
+        // Opening a pipe for both reading and writing never blocks, and it
+        // gives a `cat` waiting for a writer its end of input.
+        let _ = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path);
+    }
+}
+
+/// Poll `wait_send` until the send's only recipient is running with a Bash
+/// call open and has run at least two seconds, and return that result. The two
+/// seconds catch a `started_at` stamped at the look instead of at the turn's
+/// start, which a span of zero would match. Fails, showing the last result, if
+/// the turn ends first or never gets there.
+async fn live_running_in_bash(
     client: &RunningService<RoleClient, Recorder>,
     project_id: ProjectId,
     send_id: &Value,
-    seconds: u64,
 ) -> Value {
     let mut reply = Value::Null;
-    for _ in 0..90 {
+    for _ in 0..120 {
         reply = ok(
             client,
             "wait_send",
@@ -2877,18 +2936,20 @@ async fn live_running_for(
         .await;
         assert_ne!(
             reply["done"], true,
-            "the turn ended before it ran {seconds} seconds: {reply}"
+            "the turn ended before its Bash call was seen: {reply}"
         );
         let recipient = &reply["recipients"][0];
-        if recipient["status"] == "running"
-            && recipient["running_seconds"]
-                .as_u64()
-                .is_some_and(|running| running >= seconds)
-        {
+        let in_bash = recipient["activity"]["open_tool_calls"]
+            .as_array()
+            .is_some_and(|calls| calls.iter().any(|call| call["name"] == "Bash"));
+        let ran = recipient["running_seconds"]
+            .as_u64()
+            .is_some_and(|seconds| seconds >= 2);
+        if recipient["status"] == "running" && in_bash && ran {
             return reply;
         }
     }
-    panic!("the turn never ran {seconds} seconds: {reply}");
+    panic!("the turn never ran two seconds with a Bash call open: {reply}");
 }
 
 /// Poll `wait_send` until the send is done, and return that result.
@@ -2912,11 +2973,52 @@ async fn live_done(
     panic!("the send never finished: {reply}");
 }
 
+/// Check every span the result's only recipient carries, and every span it
+/// leaves out, against the timestamps in the same result.
+fn assert_spans(result: &Value) {
+    let now = instant(&result["now"]);
+    let recipient = &result["recipients"][0];
+    let started = recipient.get("started_at").map(instant);
+    let ended = recipient.get("ended_at").map(instant);
+    let running = recipient["status"] == "running";
+    let expected = [
+        (
+            "running_seconds",
+            started
+                .filter(|_| running)
+                .map(|started| whole_seconds(started, now)),
+        ),
+        (
+            "duration_seconds",
+            started
+                .zip(ended)
+                .map(|(started, ended)| whole_seconds(started, ended)),
+        ),
+        (
+            "seconds_since_ended",
+            ended.map(|ended| whole_seconds(ended, now)),
+        ),
+    ];
+    for (field, span) in expected {
+        match span {
+            Some(seconds) => assert_eq!(
+                recipient.get(field),
+                Some(&json!(seconds)),
+                "{field}: {result}"
+            ),
+            None => assert!(
+                recipient.get(field).is_none(),
+                "{field} is left out: {result}"
+            ),
+        }
+    }
+}
+
 /// A real Claude agent's turn times through the server: a running turn, the
 /// same turn completed, a turn cancelled while it ran, and both ended turns
-/// again from the journal after a restart. The agent sleeps with its Bash
-/// tool, so its turn is still running when the test looks. Prints each
-/// result, for a person to read the real shape.
+/// again from the journal after a restart. The agent blocks on a pipe with its
+/// Bash tool, so each turn runs until the test releases or cancels it. Prints
+/// each result, for a person to read the real shape.
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
 #[allow(clippy::too_many_lines)] // One agent's turns, live and then from the journal.
@@ -2935,12 +3037,6 @@ async fn live_claude_mcp_wait_reports_turn_times() {
     )
     .unwrap()
     .id;
-    let sleep_then_reply = |seconds: u32| {
-        format!(
-            "Run the shell command `sleep {seconds}` with your Bash tool. When it finishes, \
-             reply with only the word done."
-        )
-    };
     let (listener, url) = serve(&env).await;
     let client = connect(&url, TOKEN).await;
     let send = async |text: String| -> Value {
@@ -2953,26 +3049,27 @@ async fn live_claude_mcp_wait_reports_turn_times() {
             .clone()
     };
 
-    let completed = send(sleep_then_reply(20)).await;
-    let running = live_running_for(&client, project_id, &completed, 3).await;
+    let released = PipeGate::new();
+    let completed = send(released.prompt()).await;
+    let running = live_running_in_bash(&client, project_id, &completed).await;
     println!("running: {running}");
+    assert_spans(&running);
     let started = instant(&running["recipients"][0]["started_at"]);
+    released.release().await;
     let done = live_done(&client, project_id, &completed).await;
     println!("completed: {done}");
     let recipient = &done["recipients"][0];
     assert_eq!(recipient["status"], "completed", "{done}");
     assert_eq!(instant(&recipient["started_at"]), started, "{done}");
-    assert!(instant(&recipient["ended_at"]) > started, "{done}");
     assert!(
-        recipient["duration_seconds"]
-            .as_u64()
-            .is_some_and(|duration| duration >= 3),
-        "{done}"
+        instant(&recipient["ended_at"]) >= instant(&running["now"]),
+        "the turn ended after the test saw it running: {done}"
     );
-    assert!(recipient.get("running_seconds").is_none(), "{done}");
+    assert_spans(&done);
 
-    let cancelled = send(sleep_then_reply(60)).await;
-    live_running_for(&client, project_id, &cancelled, 2).await;
+    let held = PipeGate::new();
+    let cancelled = send(held.prompt()).await;
+    live_running_in_bash(&client, project_id, &cancelled).await;
     ok(
         &client,
         "cancel_send",
@@ -2987,13 +3084,7 @@ async fn live_claude_mcp_wait_reports_turn_times() {
         instant(&recipient["started_at"]),
         instant(&recipient["ended_at"]),
     );
-    assert!(
-        recipient["duration_seconds"]
-            .as_u64()
-            .is_some_and(|duration| duration >= 2),
-        "{stopped}"
-    );
-    assert!(recipient["seconds_since_ended"].is_u64(), "{stopped}");
+    assert_spans(&stopped);
 
     client.cancel().await.unwrap();
     listener.stop().await;
@@ -3007,12 +3098,11 @@ async fn live_claude_mcp_wait_reports_turn_times() {
     let recipient = &journaled["recipients"][0];
     assert_eq!(recipient["status"], "completed", "{journaled}");
     assert_eq!(instant(&recipient["started_at"]), started, "{journaled}");
-    for absent in ["ended_at", "duration_seconds", "seconds_since_ended"] {
-        assert!(
-            recipient.get(absent).is_none(),
-            "the journal holds no end for a completed turn ({absent}): {journaled}"
-        );
-    }
+    assert!(
+        recipient.get("ended_at").is_none(),
+        "the journal holds no end for a completed turn: {journaled}"
+    );
+    assert_spans(&journaled);
 
     let journaled = live_done(&client, project_id, &cancelled).await;
     println!("cancelled, from the journal: {journaled}");
@@ -3027,6 +3117,7 @@ async fn live_claude_mcp_wait_reports_turn_times() {
         cancelled_times,
         "{journaled}"
     );
+    assert_spans(&journaled);
 
     client.cancel().await.unwrap();
     listener.stop().await;

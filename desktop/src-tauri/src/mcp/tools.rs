@@ -65,8 +65,8 @@ then list_agents, and use the ids they return (names are for display and can cha
 const INSTRUCTIONS_LOOP: &str = "\
 An agent is a persistent session of its harness, run in the project's folder with the user's \
 own configuration for that harness (the folder's CLAUDE.md or AGENTS.md included) and the \
-harness's full tools, but not these Switchboard tools: it reads and edits files, runs commands, \
-and uses git. A project's \
+harness's full tools: it reads and edits files, runs commands, and uses git. Switchboard turns \
+these Switchboard tools off for the Claude Code and Codex agents it starts. A project's \
 agents share its folder, so each sees the others' uncommitted changes. An agent receives your \
 message as if the user had typed it and cannot tell you from the user. Each send continues its \
 conversation: it keeps earlier sends and its own replies until its context is compacted, so a \

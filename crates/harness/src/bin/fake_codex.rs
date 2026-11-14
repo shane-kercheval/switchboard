@@ -65,6 +65,9 @@
 //!     reaches EOF when the parent exits, so the reader finishes normally,
 //!     while the child keeps the stderr pipe open. The promptless fork's tests
 //!     use it to check that a normal exit still sweeps the process group.
+//!   `// argv_to:<path>` — write every argument after the binary name to the
+//!     given path, one per line. Tests use it to check the flags the adapter
+//!     passed, such as the `-c` overrides that turn an MCP server off.
 //!   `// write_file:<path>` — create an empty file at the given path, and any
 //!     missing parent directories. The promptless fork test uses it to stand
 //!     in for the rollout Codex writes (`tests/codex_fork.rs`), so the code
@@ -165,6 +168,11 @@ fn main() {
             {
                 let _ = path;
             }
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("// argv_to:") {
+            std::fs::write(path.trim(), args[1..].join("\n")).ok();
             continue;
         }
 

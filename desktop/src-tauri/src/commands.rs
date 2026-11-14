@@ -2707,13 +2707,18 @@ async fn create_codex_fork(
         },
         other => other,
     })?;
+    let own_server_overrides = switchboard_harness::codex_own_server_overrides(
+        state.own_mcp_server(),
+        home_dir,
+        &project.directory,
+    );
     let created = switchboard_harness::fork_codex_session(
         codex_binary,
         home_dir,
         &project.directory,
         parent_thread_id,
         &source.selection(),
-        Some(state.own_mcp_server()),
+        &own_server_overrides,
         switchboard_harness::CODEX_FORK_TIMEOUT,
     )
     .await;

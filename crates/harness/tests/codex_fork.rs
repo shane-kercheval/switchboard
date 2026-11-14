@@ -100,7 +100,7 @@ impl Setup {
             &self.cwd,
             PARENT,
             &AgentSelection::default(),
-            None,
+            &[],
             timeout,
         )
         .await
@@ -134,6 +134,49 @@ async fn a_fork_returns_the_new_session_dated_by_the_folder_codex_wrote_it_in() 
             partition_date: NaiveDate::from_ymd_opt(2026, 10, 10).unwrap(),
         }
     );
+}
+
+#[tokio::test]
+async fn a_fork_passes_its_overrides_among_the_flags_before_fork() {
+    let setup = Setup::new();
+    let rollout = setup.rollout_path("2026-10-10", FORK);
+    let argv_path = setup.root.join("argv");
+    let shim = setup.shim(&format!(
+        "// read_stdin\n// argv_to:{}\n// write_file:{}\n{}\n",
+        argv_path.display(),
+        rollout.display(),
+        thread_started(FORK)
+    ));
+    let overrides = [
+        "-c".to_owned(),
+        r#"mcp_servers.switchboard.url="http://127.0.0.1:47821/mcp""#.to_owned(),
+        "-c".to_owned(),
+        "mcp_servers.switchboard.enabled=false".to_owned(),
+    ];
+
+    fork_codex_session(
+        &shim,
+        &setup.home,
+        &setup.cwd,
+        PARENT,
+        &AgentSelection::default(),
+        &overrides,
+        AMPLE,
+    )
+    .await
+    .expect("a fork");
+
+    let argv: Vec<String> = std::fs::read_to_string(&argv_path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let at = argv
+        .windows(overrides.len())
+        .position(|window| window == overrides)
+        .unwrap_or_else(|| panic!("overrides in {argv:?}"));
+    let fork_at = argv.iter().position(|arg| arg == "fork").unwrap();
+    assert!(at < fork_at, "{argv:?}");
 }
 
 #[tokio::test]
@@ -244,7 +287,7 @@ async fn a_missing_working_folder_is_not_reported_as_a_missing_binary() {
         &gone,
         PARENT,
         &AgentSelection::default(),
-        None,
+        &[],
         AMPLE,
     )
     .await

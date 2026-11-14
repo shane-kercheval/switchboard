@@ -2,105 +2,68 @@
 //! `-c` overrides that turn it off for one run (see [`crate::own_mcp`]).
 //!
 //! Codex has no per-run deny list, so each matching entry is switched off with
-//! `-c mcp_servers.<name>.enabled=false`. That override alone is unsafe:
-//! `-c` merges into the user's table, and for a name Codex didn't load (an
-//! untrusted folder's file, say) it leaves an entry with no transport, which
-//! fails the run with "invalid transport in `mcp_servers.<name>`". So each
-//! override also repeats the entry's own transport key with its own value
-//! (`url` or `command`), which is valid whether or not Codex loaded the entry.
-//! A different transport key is not safe either: `-c url=…` over a stdio entry
+//! `-c mcp_servers.<name>.enabled=false`. That override alone is unsafe: for a
+//! name with no entry it leaves one with no transport, which fails the run with
+//! "invalid transport in `mcp_servers.<name>`". So each override also repeats
+//! the entry's own transport key with its own value (`url` or `command`). A
+//! different transport key is not safe either: `-c url=…` over a stdio entry
 //! fails with "url is not supported for stdio". Probed @ codex-cli 0.165.0.
 //!
-//! The block must never stop an agent from starting, so where an override
-//! might not be valid this passes none for the entry and logs a warning:
-//! - a config file that can't be read or parsed (no overrides at all, since
-//!   the file could redefine any entry);
-//! - an entry with both `url` and `command` after merging the files, which
-//!   includes the same name with a different transport in two files;
-//! - an entry with neither, a non-string transport, or one that isn't a table;
-//! - an entry with `required = true`, untested with `enabled = false`;
-//! - a name outside `[A-Za-z0-9_-]`, which can't be written as a `-c` key path.
+//! Only the files Codex reads on every run are read, lowest precedence first:
+//! `/etc/codex/config.toml`, then `$CODEX_HOME/config.toml` (default
+//! `~/.codex/config.toml`). A later file can add keys to an entry but not
+//! remove them, and `-c` merges key by key, so the transport repeated here is
+//! one Codex's own entry already has, and an override can't fail a run that
+//! would otherwise start. Project `.codex/config.toml` files are not read:
+//! which of them Codex loads depends on folder trust and the project root, and
+//! repeating a transport from one Codex skipped could fail the run. An entry
+//! defined only in a project file stays on.
 //!
-//! Files read, lowest precedence first: `$CODEX_HOME/config.toml` (default
-//! `~/.codex/config.toml`), then `.codex/config.toml` in each folder from the
-//! git root (the first ancestor holding `.git`; with none, the filesystem root)
-//! down to the working folder. Codex reads project files only in trusted
-//! folders; reading them regardless adds at most a disabled entry Codex never
-//! had. `/etc/codex/config.toml` and managed config are not read.
+//! Where no override is safe, this passes none for the entry and logs a warning:
+//! - a file that can't be read or parsed (no overrides at all, since the file
+//!   could redefine any entry);
+//! - an entry with both `url` and `command` (Codex rejects it anyway), with
+//!   neither, with a non-string transport, or that isn't a table;
+//! - a name outside `[A-Za-z0-9_-]`, which can't be written as a `-c` key path.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::own_mcp::{OWN_MCP_SERVER_NAME, OwnMcpServer};
 
+/// The system config file, read below the user's on every Codex run.
+const SYSTEM_CONFIG_FILE: &str = "/etc/codex/config.toml";
+
 /// The `-c` arguments that turn Switchboard's own server off for a Codex run
-/// in `cwd`, or none when `own` is `None`.
-pub(crate) fn own_server_overrides(
-    own: Option<OwnMcpServer>,
-    home: &Path,
-    cwd: &Path,
-) -> Vec<String> {
-    let Some(own) = own else {
+/// in `cwd`, from the system file and `$CODEX_HOME/config.toml`.
+#[must_use]
+pub fn codex_own_server_overrides(own: OwnMcpServer, home_dir: &Path, cwd: &Path) -> Vec<String> {
+    let codex_home = codex_home(std::env::var_os("CODEX_HOME").as_deref(), home_dir, cwd);
+    overrides_from_files(
+        &[
+            PathBuf::from(SYSTEM_CONFIG_FILE),
+            codex_home.join("config.toml"),
+        ],
+        own,
+    )
+}
+
+/// Codex's home for a run in `cwd`: `CODEX_HOME` when set, resolved from `cwd`
+/// when relative, as the Codex child started there resolves it; else
+/// `<home>/.codex`.
+pub(crate) fn codex_home(env_value: Option<&OsStr>, home_dir: &Path, cwd: &Path) -> PathBuf {
+    match env_value.filter(|value| !value.is_empty()) {
+        Some(value) => cwd.join(value),
+        None => home_dir.join(".codex"),
+    }
+}
+
+/// The overrides for the matching entries in `files`, lowest precedence first.
+pub(crate) fn overrides_from_files(files: &[PathBuf], own: OwnMcpServer) -> Vec<String> {
+    let Some(merged) = merged_servers(files) else {
         return Vec::new();
     };
-    overrides_from_layers(&config_layers(&codex_home(home), cwd), own)
-}
-
-/// `$CODEX_HOME` when set, as the Codex child inherits it; else `<home>/.codex`.
-fn codex_home(home: &Path) -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .filter(|value| !value.is_empty())
-        .map_or_else(|| home.join(".codex"), PathBuf::from)
-}
-
-/// The config files Codex may read for a run in `cwd`, lowest precedence first.
-fn config_layers(codex_home: &Path, cwd: &Path) -> Vec<PathBuf> {
-    let user = codex_home.join("config.toml");
-    let mut project: Vec<PathBuf> = Vec::new();
-    for dir in cwd.ancestors() {
-        project.push(dir.join(".codex").join("config.toml"));
-        if dir.join(".git").exists() {
-            break;
-        }
-    }
-    project.reverse();
-    let mut layers = vec![user];
-    for path in project {
-        if !layers.iter().any(|seen| same_file(seen, &path)) {
-            layers.push(path);
-        }
-    }
-    layers
-}
-
-fn same_file(a: &Path, b: &Path) -> bool {
-    a == b
-        || matches!(
-            (a.canonicalize(), b.canonicalize()),
-            (Ok(a), Ok(b)) if a == b
-        )
-}
-
-fn overrides_from_layers(layers: &[PathBuf], own: OwnMcpServer) -> Vec<String> {
-    let mut merged: BTreeMap<String, toml::Value> = BTreeMap::new();
-    for path in layers {
-        let Some(servers) = read_servers(path) else {
-            tracing::warn!(
-                path = %path.display(),
-                "Codex config unreadable; not turning off Switchboard's own MCP server for this run"
-            );
-            return Vec::new();
-        };
-        for (name, entry) in servers {
-            match merged.get_mut(&name) {
-                Some(existing) => merge_into(existing, entry),
-                None => {
-                    merged.insert(name, entry);
-                }
-            }
-        }
-    }
-
     let mut args = Vec::new();
     for (name, entry) in &merged {
         if !is_own_entry(name, entry, own) {
@@ -124,6 +87,30 @@ fn overrides_from_layers(layers: &[PathBuf], own: OwnMcpServer) -> Vec<String> {
         }
     }
     args
+}
+
+/// The `[mcp_servers]` tables of `files` merged as Codex merges them, or
+/// `None` when one can't be read or parsed.
+fn merged_servers(files: &[PathBuf]) -> Option<BTreeMap<String, toml::Value>> {
+    let mut merged: BTreeMap<String, toml::Value> = BTreeMap::new();
+    for path in files {
+        let Some(servers) = read_servers(path) else {
+            tracing::warn!(
+                path = %path.display(),
+                "Codex config unreadable; not turning off Switchboard's own MCP server for this run"
+            );
+            return None;
+        };
+        for (name, entry) in servers {
+            match merged.get_mut(&name) {
+                Some(existing) => merge_into(existing, entry),
+                None => {
+                    merged.insert(name, entry);
+                }
+            }
+        }
+    }
+    Some(merged)
 }
 
 /// The `[mcp_servers]` table of one file: empty when the file is absent or has
@@ -194,13 +181,10 @@ fn transport_override<'a>(
     let Some(table) = entry.as_table() else {
         return Err("entry is not a table");
     };
-    if table.get("required").and_then(toml::Value::as_bool) == Some(true) {
-        return Err("entry is required = true");
-    }
     match (table.get("url"), table.get("command")) {
         (Some(toml::Value::String(url)), None) => Ok(("url", url)),
         (None, Some(toml::Value::String(command))) => Ok(("command", command)),
-        (Some(_), Some(_)) => Err("entry has both url and command, possibly from two files"),
+        (Some(_), Some(_)) => Err("entry has both url and command"),
         (None, None) => Err("entry has neither url nor command"),
         _ => Err("entry's transport is not a string"),
     }
@@ -226,8 +210,8 @@ mod tests {
         path.to_owned()
     }
 
-    fn overrides(layers: &[PathBuf]) -> Vec<String> {
-        overrides_from_layers(layers, OWN)
+    fn overrides(files: &[PathBuf]) -> Vec<String> {
+        overrides_from_files(files, OWN)
     }
 
     #[test]
@@ -348,48 +332,49 @@ command = '/Applications/My "Tools"/bridge'
     #[test]
     fn an_unparseable_file_turns_off_every_override() {
         let dir = TempDir::new().unwrap();
-        let user = write(
-            &dir.path().join("user.toml"),
+        let system = write(
+            &dir.path().join("system.toml"),
             "[mcp_servers.switchboard]\nurl = \"http://127.0.0.1:47821/mcp\"\n",
         );
-        let project = write(
-            &dir.path().join("project.toml"),
-            "[mcp_servers.switchboard\n",
-        );
+        let user = write(&dir.path().join("user.toml"), "[mcp_servers.switchboard\n");
 
-        assert!(overrides(&[user, project]).is_empty());
+        assert!(overrides(&[system, user]).is_empty());
     }
 
     #[test]
     fn a_non_table_mcp_servers_turns_off_every_override() {
         let dir = TempDir::new().unwrap();
+        let system = write(&dir.path().join("system.toml"), "mcp_servers = 3\n");
         let user = write(
             &dir.path().join("user.toml"),
             "[mcp_servers.switchboard]\nurl = \"http://127.0.0.1:47821/mcp\"\n",
         );
-        let project = write(&dir.path().join("project.toml"), "mcp_servers = 3\n");
 
-        assert!(overrides(&[user, project]).is_empty());
+        assert!(overrides(&[system, user]).is_empty());
     }
 
     #[test]
     fn an_unreadable_file_turns_off_every_override() {
         let dir = TempDir::new().unwrap();
+        // A directory where the file should be fails to read with an error
+        // other than NotFound under any user, root included, unlike a mode bit.
+        let system = dir.path().join("system.toml");
+        std::fs::create_dir(&system).unwrap();
         let user = write(
             &dir.path().join("user.toml"),
             "[mcp_servers.switchboard]\nurl = \"http://127.0.0.1:47821/mcp\"\n",
         );
-        // A directory where the file should be fails to read with an error
-        // other than NotFound under any user, root included, unlike a mode bit.
-        let project = dir.path().join("project.toml");
-        std::fs::create_dir(&project).unwrap();
 
-        assert!(overrides(&[user, project]).is_empty());
+        assert!(overrides(&[system, user]).is_empty());
     }
 
     #[test]
     fn different_transports_in_two_files_skip_that_entry_only() {
         let dir = TempDir::new().unwrap();
+        let system = write(
+            &dir.path().join("system.toml"),
+            "[mcp_servers.switchboard]\ncommand = \"npx\"\n",
+        );
         let user = write(
             &dir.path().join("user.toml"),
             r#"
@@ -400,13 +385,9 @@ url = "http://127.0.0.1:47821/mcp"
 url = "http://127.0.0.1:47821/mcp"
 "#,
         );
-        let project = write(
-            &dir.path().join("project.toml"),
-            "[mcp_servers.switchboard]\ncommand = \"npx\"\n",
-        );
 
         assert_eq!(
-            overrides(&[user, project]),
+            overrides(&[system, user]),
             vec![
                 "-c",
                 r#"mcp_servers.sb_http.url="http://127.0.0.1:47821/mcp""#,
@@ -417,36 +398,36 @@ url = "http://127.0.0.1:47821/mcp"
     }
 
     #[test]
-    fn same_transport_in_two_files_uses_the_higher_precedence_value() {
+    fn same_transport_in_two_files_uses_the_user_files_value() {
         let dir = TempDir::new().unwrap();
-        let user = write(
-            &dir.path().join("user.toml"),
+        let system = write(
+            &dir.path().join("system.toml"),
             "[mcp_servers.switchboard]\nurl = \"http://127.0.0.1:47821/mcp\"\n",
         );
-        let project = write(
-            &dir.path().join("project.toml"),
+        let user = write(
+            &dir.path().join("user.toml"),
             "[mcp_servers.switchboard]\nurl = \"http://localhost:47821/mcp\"\n",
         );
 
         assert_eq!(
-            overrides(&[user, project])[1],
+            overrides(&[system, user])[1],
             r#"mcp_servers.switchboard.url="http://localhost:47821/mcp""#
         );
     }
 
     #[test]
-    fn a_later_file_can_point_a_renamed_entry_away_from_this_instance() {
+    fn the_user_file_can_point_a_renamed_entry_away_from_this_instance() {
         let dir = TempDir::new().unwrap();
-        let user = write(
-            &dir.path().join("user.toml"),
+        let system = write(
+            &dir.path().join("system.toml"),
             "[mcp_servers.sb]\nurl = \"http://127.0.0.1:47821/mcp\"\n",
         );
-        let project = write(
-            &dir.path().join("project.toml"),
+        let user = write(
+            &dir.path().join("user.toml"),
             "[mcp_servers.sb]\nurl = \"http://127.0.0.1:9000/mcp\"\n",
         );
 
-        assert!(overrides(&[user, project]).is_empty());
+        assert!(overrides(&[system, user]).is_empty());
     }
 
     #[test]
@@ -457,7 +438,6 @@ url = "http://127.0.0.1:47821/mcp"
             "enabled = true",
             "url = 47821",
             "command = [\"npx\"]",
-            "url = \"http://127.0.0.1:47821/mcp\"\nrequired = true",
         ] {
             let user = write(
                 &dir.path().join("user.toml"),
@@ -504,81 +484,51 @@ url = "http://127.0.0.1:47821/mcp"
     }
 
     #[test]
-    fn layers_run_from_the_user_file_through_the_git_root_down_to_the_cwd() {
-        let root = TempDir::new().unwrap();
-        let repo = root.path().join("repo");
-        let cwd = repo.join("a").join("b");
-        std::fs::create_dir_all(&cwd).unwrap();
-        std::fs::create_dir(repo.join(".git")).unwrap();
-        let codex_home = root.path().join("codex-home");
-
-        assert_eq!(
-            config_layers(&codex_home, &cwd),
-            vec![
-                codex_home.join("config.toml"),
-                repo.join(".codex/config.toml"),
-                repo.join("a/.codex/config.toml"),
-                repo.join("a/b/.codex/config.toml"),
-            ]
-        );
-    }
-
-    #[test]
-    fn layers_without_a_git_root_reach_the_filesystem_root() {
-        let root = TempDir::new().unwrap();
-        let codex_home = root.path().join("codex-home");
-
-        let layers = config_layers(&codex_home, root.path());
-        assert_eq!(layers[0], codex_home.join("config.toml"));
-        assert_eq!(layers[1], Path::new("/.codex/config.toml"));
-        assert_eq!(
-            layers.last().unwrap(),
-            &root.path().join(".codex/config.toml")
-        );
-    }
-
-    #[test]
-    fn the_user_file_is_not_read_twice_when_the_cwd_is_under_home() {
-        let home = TempDir::new().unwrap();
-        let cwd = home.path().join("project");
-        std::fs::create_dir_all(&cwd).unwrap();
-        std::fs::create_dir(home.path().join(".git")).unwrap();
-        let codex_home = home.path().join(".codex");
-
-        assert_eq!(
-            config_layers(&codex_home, &cwd),
-            vec![
-                codex_home.join("config.toml"),
-                cwd.join(".codex/config.toml"),
-            ]
-        );
-    }
-
-    #[test]
-    fn project_files_are_found_through_the_layers() {
-        let root = TempDir::new().unwrap();
-        let repo = root.path().join("repo");
-        let cwd = repo.join("sub");
-        std::fs::create_dir_all(&cwd).unwrap();
-        std::fs::create_dir(repo.join(".git")).unwrap();
-        write(
-            &repo.join(".codex/config.toml"),
-            "[mcp_servers.switchboard]\nurl = \"http://127.0.0.1:47821/mcp\"\n",
-        );
-
-        let layers = config_layers(&root.path().join("codex-home"), &cwd);
-        assert_eq!(overrides(&layers).len(), 4);
-    }
-
-    #[test]
-    fn no_own_server_reads_nothing_and_passes_nothing() {
+    fn a_required_entry_is_turned_off_too() {
+        // Codex requires a server only while it is enabled, so `enabled=false`
+        // can't make a required entry fail the run.
         let dir = TempDir::new().unwrap();
-        write(
-            &dir.path().join(".codex/config.toml"),
-            "[mcp_servers.switchboard]\nurl = \"http://127.0.0.1:47821/mcp\"\n",
+        let user = write(
+            &dir.path().join("config.toml"),
+            "[mcp_servers.switchboard]\nurl = \"http://127.0.0.1:47821/mcp\"\nrequired = true\n",
         );
 
-        assert!(own_server_overrides(None, dir.path(), dir.path()).is_empty());
+        assert_eq!(
+            overrides(&[user]),
+            vec![
+                "-c",
+                r#"mcp_servers.switchboard.url="http://127.0.0.1:47821/mcp""#,
+                "-c",
+                "mcp_servers.switchboard.enabled=false",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_home_defaults_to_dot_codex_under_home() {
+        let home = Path::new("/Users/someone");
+        let cwd = Path::new("/work/project");
+
+        assert_eq!(codex_home(None, home, cwd), home.join(".codex"));
+        assert_eq!(
+            codex_home(Some(OsStr::new("")), home, cwd),
+            home.join(".codex")
+        );
+    }
+
+    #[test]
+    fn codex_home_resolves_a_relative_value_from_the_agents_folder() {
+        let home = Path::new("/Users/someone");
+        let cwd = Path::new("/work/project");
+
+        assert_eq!(
+            codex_home(Some(OsStr::new("codex-state")), home, cwd),
+            Path::new("/work/project/codex-state")
+        );
+        assert_eq!(
+            codex_home(Some(OsStr::new("/opt/codex")), home, cwd),
+            Path::new("/opt/codex")
+        );
     }
 
     /// A loopback listener on a free port that counts the connections it
@@ -620,6 +570,7 @@ url = "http://127.0.0.1:47821/mcp"
             tokio::process::Command::new("codex")
                 .args(&args)
                 .current_dir(cwd)
+                .env(TOKEN_VARIABLE, "switchboard-live-test-dummy")
                 .stdin(Stdio::null())
                 .kill_on_drop(true)
                 .output(),
@@ -633,13 +584,39 @@ url = "http://127.0.0.1:47821/mcp"
         (completed, format!("{}\n{stdout}\n{stderr}", output.status))
     }
 
-    /// The finder's overrides, laid over entries passed with `-c` in place of
-    /// the user's config file (so the test reads and writes nothing in
-    /// `~/.codex`), keep every matching server from starting: an HTTP entry
-    /// named `switchboard` at another port, a renamed one at this port by
+    /// The variable the setup copy's Codex entry reads its token from. The
+    /// test's Codex gets a dummy value, so no real token reaches a listener.
+    const TOKEN_VARIABLE: &str = "SWITCHBOARD_TOKEN";
+
+    /// The transport key of the developer's own `switchboard` entry, which a
+    /// `-c` entry of that name merges into, or `None` without one.
+    fn developers_switchboard_transport(cwd: &Path) -> Option<&'static str> {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let codex_home = codex_home(std::env::var_os("CODEX_HOME").as_deref(), &home, cwd);
+        let files = [
+            PathBuf::from(SYSTEM_CONFIG_FILE),
+            codex_home.join("config.toml"),
+        ];
+        let merged = merged_servers(&files).expect("your Codex config files parse");
+        let entry = merged.get(OWN_MCP_SERVER_NAME)?;
+        match (entry.get("url"), entry.get("command")) {
+            (Some(_), None) => Some("url"),
+            (None, Some(_)) => Some("command"),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                panic!("your `switchboard` entry has both url and command, which Codex rejects")
+            }
+        }
+    }
+
+    /// The overrides keep every matching server from starting: an entry named
+    /// `switchboard` at another address, a renamed one at this port by
     /// `localhost`, and a stdio bridge whose argument is this port's URL. The
-    /// overrides alone, as for an entry Codex never loaded (an untrusted
-    /// folder's file), still let the run start.
+    /// entries come in with `-c`, so the test writes nothing in `~/.codex`.
+    /// `-c` merges the named entry into the developer's own `switchboard`
+    /// entry, so it takes that entry's transport (a second one fails every
+    /// run) and carries the setup copy's keys. The overrides alone, as for an
+    /// entry Codex never loaded, still let the run start.
     #[tokio::test]
     #[ignore = "requires codex installed — run with: make test-live"]
     async fn live_codex_own_server_overrides_keep_matching_servers_from_starting() {
@@ -648,16 +625,39 @@ url = "http://127.0.0.1:47821/mcp"
         let dir = TempDir::new().unwrap();
         let cwd = dir.path().join("work");
         std::fs::create_dir(&cwd).unwrap();
-        let marker = dir.path().join("bridge-started");
-        let entries = [
-            format!(r#"mcp_servers.switchboard.url="http://127.0.0.1:{named_port}/mcp""#),
+        let named_marker = dir.path().join("named-started");
+        let bridge_marker = dir.path().join("bridge-started");
+        let named_is_stdio = developers_switchboard_transport(&cwd) == Some("command");
+        let mut entries = if named_is_stdio {
+            vec![
+                r#"mcp_servers.switchboard.command="sh""#.to_owned(),
+                format!(
+                    r#"mcp_servers.switchboard.args=["-c", "touch '{}'"]"#,
+                    named_marker.display()
+                ),
+            ]
+        } else {
+            vec![
+                format!(r#"mcp_servers.switchboard.url="http://127.0.0.1:{named_port}/mcp""#),
+                format!(r#"mcp_servers.switchboard.bearer_token_env_var="{TOKEN_VARIABLE}""#),
+            ]
+        };
+        entries.extend([
+            r#"mcp_servers.switchboard.default_tools_approval_mode="approve""#.to_owned(),
             format!(r#"mcp_servers.sb_localhost.url="http://localhost:{own_port}/mcp""#),
             r#"mcp_servers.sb_bridge.command="sh""#.to_owned(),
             format!(
                 r#"mcp_servers.sb_bridge.args=["-c", "touch '{}'", "http://127.0.0.1:{own_port}/mcp"]"#,
-                marker.display()
+                bridge_marker.display()
             ),
-        ];
+        ]);
+        let named_started = || {
+            if named_is_stdio {
+                named_marker.exists()
+            } else {
+                named_hits.load(Ordering::SeqCst) > 0
+            }
+        };
         let fixture = write(
             &dir.path().join("config.toml"),
             &format!("{}\n", entries.join("\n")),
@@ -666,35 +666,38 @@ url = "http://127.0.0.1:47821/mcp"
             .iter()
             .flat_map(|pair| ["-c".to_owned(), pair.clone()])
             .collect();
-        let overrides = overrides_from_layers(&[fixture], OwnMcpServer::new(own_port));
+        let overrides = overrides_from_files(&[fixture], OwnMcpServer::new(own_port));
         assert_eq!(overrides.len(), 12, "three entries matched: {overrides:?}");
 
         let (completed, log) = run_codex(&cwd, &injected).await;
         assert!(completed, "the control run completed: {log}");
         assert!(
-            named_hits.load(Ordering::SeqCst) > 0,
-            "control reached the named entry"
+            named_started(),
+            "control started the entry named switchboard"
         );
         assert!(
             own_hits.load(Ordering::SeqCst) > 0,
             "control reached localhost"
         );
-        assert!(marker.exists(), "control started the stdio bridge");
+        assert!(bridge_marker.exists(), "control started the stdio bridge");
 
         named_hits.store(0, Ordering::SeqCst);
         own_hits.store(0, Ordering::SeqCst);
-        std::fs::remove_file(&marker).unwrap();
+        std::fs::remove_file(&bridge_marker).unwrap();
+        if named_is_stdio {
+            std::fs::remove_file(&named_marker).unwrap();
+        }
         let (completed, log) = run_codex(&cwd, &[injected, overrides.clone()].concat()).await;
         assert!(completed, "the blocked run completed: {log}");
-        assert_eq!(named_hits.load(Ordering::SeqCst), 0, "by name");
+        assert!(!named_started(), "by name");
         assert_eq!(own_hits.load(Ordering::SeqCst), 0, "by address");
-        assert!(!marker.exists(), "by a stdio argument");
+        assert!(!bridge_marker.exists(), "by a stdio argument");
 
         let (completed, log) = run_codex(&cwd, &overrides).await;
         assert!(completed, "the overrides alone still start: {log}");
-        assert_eq!(named_hits.load(Ordering::SeqCst), 0);
+        assert!(!named_started());
         assert_eq!(own_hits.load(Ordering::SeqCst), 0);
-        assert!(!marker.exists());
+        assert!(!bridge_marker.exists());
 
         own_task.abort();
         named_task.abort();

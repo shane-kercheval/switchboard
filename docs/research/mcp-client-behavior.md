@@ -2,7 +2,7 @@
 
 **Captured:** 2026-10-10
 **Versions:** Claude Code 2.1.289 (CLI, interactive and `-p`); Codex CLI 0.161.0 (model GPT-6-Astra, medium effort); Claude Desktop 2.31226.1 (Chat, and Code in Local mode) through `mcp-remote` 0.14.3; probe server on `rmcp` 1.7.0.
-**Decision:** Every `wait_*` call defaults to 50 seconds, and a call that carries no progress token is capped there. A call with a progress token may ask for up to an hour, with progress every 60 seconds. Results stay under 25,000 serialized characters (superseded: the MCP plan's revision 10 sets 100,000 for every client). No client needs MCP tasks. Claude Desktop uses `mcp-remote`, and Codex is configured per folder, in a trusted orchestration folder (both superseded 2026-11-14: Desktop's Code tab uses the Claude Code entry and `mcp-remote` serves Chat; Codex is configured in `~/.codex/config.toml`; see "Later observations"). Details and the measurements behind each are in "Decisions this note settles".
+**Decision:** Every `wait_*` call defaults to 50 seconds, and a call that carries no progress token is capped there. A call with a progress token may ask for up to an hour, with progress every 60 seconds. Results stay under 25,000 serialized characters (superseded: the MCP plan's revision 10 sets 100,000 for every client). No client needs MCP tasks. Claude Desktop uses `mcp-remote`, and Codex is configured per folder, in a trusted orchestration folder (both superseded 2026-11-14: Desktop's Code tab uses the Claude Code entry, named `switchboard`, and `mcp-remote` serves Chat under the name `switchboard-chat`, since with two entries named `switchboard` the Code tab calls through the bridge; Codex is configured in `~/.codex/config.toml`; see "Later observations"). Details and the measurements behind each are in "Decisions this note settles".
 **Consumed by:** [implementation_plans/2026-10-09-mcp.md](../implementation_plans/2026-10-09-mcp.md) (M0; the numbers M1, M3, and M4 use)
 
 ## Question
@@ -174,8 +174,10 @@ Each with the measurement that settles it.
 - **MCP tasks: not needed.** No client declares support (E1).
 - **Claude Desktop path: `mcp-remote`,** with an absolute `npx` path and a `PATH` entry in
   the snippet, in Chat or Code → Local. No in-repo bridge. The README must say Code → Cloud
-  cannot use it. (Superseded 2026-11-14 for Code → Local, which now uses the Claude Code
-  entry at user scope; `mcp-remote` remains the path for Chat. See "Later observations".)
+  cannot use it. (Superseded 2026-11-14 for Code → Local, which should use the Claude Code
+  entry at user scope: when an `mcp-remote` entry of the same name sits beside it, the Code
+  tab calls through the bridge. `mcp-remote` remains the path for Chat. See "Later
+  observations".)
 - **Codex configuration shown in Settings:** a `[mcp_servers.switchboard]` block with `url`,
   `bearer_token_env_var` (or `http_headers`), and `default_tools_approval_mode = "approve"`,
   placed in `.codex/config.toml` of a trusted folder that is not any project's folder. Codex
@@ -241,8 +243,10 @@ Measurements made after the milestones, each with how it was made.
   where it cut) was measured on Codex 0.161.0 and has not been rechecked since.
 - **2026-11-14, long waits in Claude Desktop's Code tab, and keeping the server from the agents
   Switchboard starts.** Versions: Claude Code 2.1.321 (CLI), Codex 0.165.0, Antigravity 1.5.3,
-  Claude Desktop 5.11492.5, whose bundled Claude Code folder holds 2.1.325 (which version the
-  Code tab ran is not confirmed).
+  Claude Desktop 5.11492.5. The Code tab session that checked which entry it uses reported
+  Claude Code 2.1.325, from its transcript's `version` field and its executable's path. The
+  wait and result-size measurements ran in the same app the same day and are assumed to be
+  2.1.325 too.
   - **Code tab, measured by the user.** Through the `mcp-remote` entry, `wait_send` with
     `timeout_seconds` 600 returned `capped_to_seconds: 50`. Through a direct HTTP entry in
     `~/.claude.json` registered for every folder, one `wait_send` lasted about 107 seconds and
@@ -251,6 +255,25 @@ Measurements made after the milestones, each with how it was made.
     50-second waits) reached the session only when the wait returned. `claude -p` with
     `--disallowedTools "mcp__switchboard"` listed none of the 33 `mcp__switchboard__…` tools
     (normal permissions, Haiku).
+  - **Which entry the Code tab uses, measured by the user.** With the direct entry under another
+    name (`switchboard-direct`) beside the `mcp-remote` entry named `switchboard`, a session had
+    both sets of tools, and waits through the direct one were not capped. With both entries
+    named `switchboard`, `wait_send` with `timeout_seconds` 600 returned `capped_to_seconds: 50`.
+    That session listed one server named `switchboard`, of kind `user` with transport `http`,
+    connected, with 33 tools, but its own connection to Switchboard stayed idle while the bridge
+    process carried each call (measured from connection byte counts). So for long waits in the
+    Code tab, the desktop app's config must not hold an `mcp-remote` entry named `switchboard`.
+  - **Result size through the direct entry, measured by the user.** `read_conversation` with no
+    `max_chars` returned about 96,000 characters (an estimate, between 90,000 and 100,000) as the
+    ordinary tool result, and the app did not save it to a file. The 50,000-character limit in
+    the 2026-10-14 entry was measured through `mcp-remote` on Claude Code 2.1.295. The two runs
+    differ in both the entry and the version, so they don't show which one changed the outcome.
+    Either way, a Code tab session through the direct entry needs no `max_chars`.
+  - **Stop during a wait: not measured.** The planned check of what the Stop button does while a
+    wait runs was not made, and nothing here describes it. The wait hint's sentence about the
+    desktop app rests on the measurements above: the session stayed blocked on single calls of
+    about 107 and 406 seconds, and a typed message reached the session when a call returned
+    (seen with 50-second waits).
   - **Claude Code, with Switchboard's flags (`--dangerously-skip-permissions`).** Probe servers
     in a scratch folder's `.mcp.json`. `--disallowedTools mcp__switchboard` hides the tools, but
     the server still starts (`initialize`, `tools/list`) and the model quoted a word from its
@@ -263,12 +286,25 @@ Measurements made after the milestones, each with how it was made.
   - **Codex.** `-c mcp_servers.<name>.enabled=false` keeps a server from starting, on `exec`,
     `exec resume`, and `exec … fork`. For a name with no entry, the run fails before any turn:
     "invalid transport in `mcp_servers.<name>`", exit 1. `-c` merges into the existing table:
-    a `url` laid over a stdio entry fails with "url is not supported for stdio". Codex reads
-    `.codex/config.toml` from the working folder up to the git root.
+    a `url` laid over a stdio entry fails with "url is not supported for stdio". Codex reads a
+    project's `.codex/config.toml` files only in a trusted folder, from the project root (the
+    nearest folder with `.git`; a `.git` directory must hold `HEAD`) down to the working folder,
+    and only the working folder's file when there is no root. It also reads
+    `/etc/codex/config.toml` below the user's file. A server counts as required only while it is
+    enabled. Sources: the 0.165.0 source (`config/src/loader/mod.rs`,
+    `codex-mcp/src/connection_manager.rs`) and `codex mcp list --json` in a scratch
+    `CODEX_HOME`. `codex mcp list` checks each HTTP server's sign-in status before it answers,
+    which can mean OAuth discovery requests of up to 5 seconds per server
+    (`cli/src/mcp_cmd.rs`, `rmcp-client/src/auth_status.rs`).
   - **Antigravity.** No per-run way to keep a server out. `--settings
     '{"permissions":{"deny":["mcp(switchboard/*)"]}}'` refuses each call, but the server starts
     and its tools stay listed.
   - **What followed.** Settings registers Claude Code at user scope and Codex in
-    `~/.codex/config.toml`; `mcp-remote` stays for Desktop's Chat tab. The Claude Code and Codex
-    adapters turn off any server named `switchboard` or at the instance's address for each run
-    (`crates/harness/src/own_mcp.rs`, `crates/harness/src/codex/own_server.rs`).
+    `~/.codex/config.toml`. `mcp-remote` stays for Desktop's Chat tab, and its setup snippet
+    names the entry `switchboard-chat`, so it never shares a name with the Claude Code entry. The Claude
+    Code and Codex adapters turn off any server named `switchboard` or at the instance's address
+    for each run (`crates/harness/src/own_mcp.rs`, `crates/harness/src/codex/own_server.rs`).
+    For Codex they read only `/etc/codex/config.toml` and `$CODEX_HOME/config.toml`, which Codex
+    loads on every run, so an override never repeats a transport Codex skipped; an entry only in
+    a project's file stays on. Asking `codex mcp list` instead would add its sign-in checks
+    before every run.

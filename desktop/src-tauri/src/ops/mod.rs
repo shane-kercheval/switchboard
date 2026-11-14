@@ -71,8 +71,8 @@ pub const MIN_RESULT_CHARS: usize = 10_000;
 
 /// The result budget for one call: the caller's `max_chars` clamped to
 /// [`MIN_RESULT_CHARS`]..=[`RESULT_BUDGET_CHARS`], or the full budget. A
-/// caller lowers it to fit its client: Claude Desktop's Code tab, measured
-/// through `mcp-remote`, showed a result inline only under 50,000 characters.
+/// caller lowers it to fit its client: Codex keeps about 10,000 tokens of a
+/// result and cuts the middle.
 #[must_use]
 pub fn result_budget_chars(max_chars: Option<usize>) -> usize {
     max_chars.map_or(RESULT_BUDGET_CHARS, |n| {

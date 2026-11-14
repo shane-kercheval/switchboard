@@ -116,6 +116,23 @@ describe("AgentAccessSettings", () => {
     );
   });
 
+  it("names the Claude Desktop entry apart from the Claude Code one and tells earlier users to rename theirs", async () => {
+    // The Code tab reads both configs; with two entries named `switchboard`
+    // it calls through the `mcp-remote` one, whose waits stop at 50 seconds.
+    backend = listening();
+    render(AgentAccessSettings);
+    await openClientSetup();
+    expect(screen.getByTestId("agent-access-claude-desktop")).toHaveTextContent(
+      '"switchboard-chat": {',
+    );
+    expect(screen.getByTestId("agent-access-claude-desktop")).not.toHaveTextContent(
+      '"switchboard": {',
+    );
+    expect(screen.getByTestId("agent-access-claude-desktop-old-entry")).toHaveTextContent(
+      "still have an mcp-remote entry named switchboard, rename it or remove it",
+    );
+  });
+
   it("tells Codex users to keep the token in a private file and Claude Code users to remove before re-adding", async () => {
     backend = listening();
     render(AgentAccessSettings);

@@ -10,7 +10,7 @@ use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, CodexAdapter, DispatchError, DispatchOptions, FailureKind, HarnessAdapter,
-    ToolKind, TurnOutcome,
+    OwnMcpServer, ToolKind, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -1733,5 +1733,120 @@ async fn context_report_is_refused_as_an_unsupported_operation() {
             }
         ),
         "expected UnsupportedOperation, got {err:?}"
+    );
+}
+
+/// The setup copy's entry, at the port the own-server tests turn off.
+const SWITCHBOARD_ENTRY: &str = r#"
+[mcp_servers.switchboard]
+url = "http://127.0.0.1:47821/mcp"
+bearer_token_env_var = "SWITCHBOARD_TOKEN"
+"#;
+
+/// The `-c` pair that turns `SWITCHBOARD_ENTRY` off for one run.
+const OWN_SERVER_FLAGS: [&str; 4] = [
+    "-c",
+    r#"mcp_servers.switchboard.url="http://127.0.0.1:47821/mcp""#,
+    "-c",
+    "mcp_servers.switchboard.enabled=false",
+];
+
+/// One turn replaying `text-only`, with Switchboard's own server at port 47821
+/// and `config` as the staged home's `.codex/config.toml`. The project folder
+/// holds a `.codex/config.toml` naming another entry at that port, which the
+/// lookup must not read. Returns the events and the arguments `fake_codex` got.
+async fn turn_with_own_server(
+    agent: &AgentRecord,
+    config: &str,
+) -> (Vec<AdapterEvent>, Vec<String>) {
+    let root = tempfile::TempDir::new().unwrap();
+    let home = root.path().join("home");
+    let cwd = root.path().join("project");
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::create_dir_all(cwd.join(".codex")).unwrap();
+    std::fs::write(home.join(".codex/config.toml"), config).unwrap();
+    std::fs::write(
+        cwd.join(".codex/config.toml"),
+        "[mcp_servers.sb_project]\nurl = \"http://127.0.0.1:47821/mcp\"\n",
+    )
+    .unwrap();
+    let argv_path = root.path().join("argv");
+    let fixture_path = root.path().join("fixture.jsonl");
+    let recorded = std::fs::read_to_string(fixture("text-only")).unwrap();
+    std::fs::write(
+        &fixture_path,
+        format!("// argv_to:{}\n{recorded}", argv_path.display()),
+    )
+    .unwrap();
+    let options = DispatchOptions {
+        own_mcp_server: Some(OwnMcpServer::new(47821)),
+        ..DispatchOptions::default()
+    };
+
+    let events: Vec<AdapterEvent> = CodexAdapter::with_binary_and_home(FAKE_CODEX, &home)
+        .dispatch(
+            agent,
+            &cwd,
+            fixture_path.to_str().unwrap(),
+            Uuid::now_v7(),
+            options,
+        )
+        .await
+        .expect("dispatch should succeed")
+        .collect()
+        .await;
+    let argv = std::fs::read_to_string(&argv_path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (events, argv)
+}
+
+fn own_server_flags_at(argv: &[String]) -> Option<usize> {
+    argv.windows(OWN_SERVER_FLAGS.len())
+        .position(|window| window == OWN_SERVER_FLAGS)
+}
+
+fn separator_at(argv: &[String]) -> usize {
+    argv.iter()
+        .position(|arg| arg == "--")
+        .expect("a -- before the prompt")
+}
+
+#[tokio::test]
+async fn a_first_turn_passes_the_own_server_overrides_before_the_prompt() {
+    let (events, argv) = turn_with_own_server(&codex_agent(), SWITCHBOARD_ENTRY).await;
+
+    assert!(matches!(outcome_of(&events), TurnOutcome::Completed));
+    let at = own_server_flags_at(&argv).unwrap_or_else(|| panic!("flags in {argv:?}"));
+    assert!(at < separator_at(&argv), "{argv:?}");
+    assert!(
+        !argv.iter().any(|arg| arg.contains("sb_project")),
+        "a project's config file is not read: {argv:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_turn_passes_the_own_server_overrides_before_the_prompt() {
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+    let agent = codex_agent_resuming("00000000-0000-7000-8000-000000000001", date);
+
+    let (events, argv) = turn_with_own_server(&agent, SWITCHBOARD_ENTRY).await;
+
+    assert!(matches!(outcome_of(&events), TurnOutcome::Completed));
+    assert_eq!(&argv[..2], ["exec", "resume"], "{argv:?}");
+    let at = own_server_flags_at(&argv).unwrap_or_else(|| panic!("flags in {argv:?}"));
+    assert!(at < separator_at(&argv), "{argv:?}");
+}
+
+#[tokio::test]
+async fn a_turn_whose_config_lookup_fails_still_runs_without_overrides() {
+    let (events, argv) = turn_with_own_server(&codex_agent(), "[mcp_servers.switchboard\n").await;
+
+    assert!(matches!(outcome_of(&events), TurnOutcome::Completed));
+    assert!(
+        !argv.iter().any(|arg| arg.starts_with("mcp_servers.")),
+        "{argv:?}"
     );
 }

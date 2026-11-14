@@ -505,8 +505,10 @@ struct BuildArgsInput<'a> {
 /// A stdio bridge to the server (`mcp-remote`) under another name is not caught.
 /// `--disallowedTools` is not a substitute: it hides the tools but the server
 /// still connects and its instructions still reach the model. Verified @ 2.1.321
-/// on a turn, a resume, a fork, compaction, and `/context`, with entries from a
-/// folder's `.mcp.json` and from `~/.claude.json`.
+/// on a turn, a resume, a fork, and `/context`, with entries from a folder's
+/// `.mcp.json` and from `~/.claude.json`. Compaction passes the same arguments
+/// as a turn, which `maintenance_argv_matches_send_argv_except_the_positional`
+/// tests.
 fn own_server_settings(own: OwnMcpServer) -> String {
     let mut denied = vec![serde_json::json!({ "serverName": OWN_MCP_SERVER_NAME })];
     denied.extend(
@@ -628,6 +630,8 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
         args.push("--add-dir".to_owned());
         args.push(grant.to_string_lossy().into_owned());
     }
+    // Claude Code takes one `--settings`: merge any other setting into this
+    // object, since a second flag would replace the deny list.
     if let Some(own) = own_mcp_server {
         args.push("--settings".to_owned());
         args.push(own_server_settings(own));
@@ -1882,7 +1886,11 @@ mod tests {
         ] {
             let args = build_args(&input(agent, project.path(), home.path()));
             assert!(args.contains(&arm.to_owned()), "{arm}: {args:?}");
-            assert!(args.contains(&"--settings".to_owned()), "{arm}: {args:?}");
+            assert_eq!(
+                args.iter().filter(|arg| *arg == "--settings").count(),
+                1,
+                "{arm}: {args:?}"
+            );
         }
     }
 

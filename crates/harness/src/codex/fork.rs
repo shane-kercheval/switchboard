@@ -39,7 +39,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::CodexLocator;
 use super::session_file::{AttachLookupError, find_codex_session_file_for_attach};
-use crate::own_mcp::OwnMcpServer;
 
 /// Production bound for creating a fork.
 ///
@@ -133,8 +132,9 @@ fn exit_description(code: Option<i32>) -> String {
 /// `selection` is passed as the same `-m` / `-c model_reasoning_effort=` flags a
 /// dispatch sends, so the fork's recorded settings match the agent the caller
 /// registers. `home_dir` is where the new rollout is looked up
-/// (`<home_dir>/.codex/sessions`). `own_mcp_server` is turned off as on a
-/// dispatch (see [`crate::own_mcp`]).
+/// (`<home_dir>/.codex/sessions`). `own_server_overrides` are the `-c` flags
+/// from [`super::codex_own_server_overrides`], placed with the other flags as
+/// on a dispatch.
 ///
 /// **The partition date comes from where Codex wrote the file**, not from
 /// today's date. A creation that crossed midnight would otherwise look in the
@@ -165,13 +165,12 @@ pub async fn fork_codex_session(
     cwd: &Path,
     parent_thread_id: &str,
     selection: &AgentSelection,
-    own_mcp_server: Option<OwnMcpServer>,
+    own_server_overrides: &[String],
     timeout: Duration,
 ) -> Result<CodexLocator, CodexForkError> {
-    let overrides = super::own_server::own_server_overrides(own_mcp_server, home_dir, cwd);
     let binary = binary.to_owned();
     let cwd = cwd.to_owned();
-    let args = fork_args(parent_thread_id, selection, &overrides);
+    let args = fork_args(parent_thread_id, selection, own_server_overrides);
     let cancel = CancellationToken::new();
     let task = tokio::spawn({
         let cancel = cancel.clone();

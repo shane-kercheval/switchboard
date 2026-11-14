@@ -15,7 +15,11 @@
     setAgentAccessEnabled,
     setAgentAccessPort,
   } from "$lib/api";
-  import { CODEX_TOKEN_VARIABLE, agentAccessSnippets } from "$lib/agentAccessSnippets";
+  import {
+    CLAUDE_DESKTOP_ENTRY_NAME,
+    CODEX_TOKEN_VARIABLE,
+    agentAccessSnippets,
+  } from "$lib/agentAccessSnippets";
   import type { AgentAccessStatus } from "$lib/types";
 
   let status = $state<AgentAccessStatus | null>(null);
@@ -208,8 +212,10 @@
           <span class="font-mono">~/.claude.json</span>. The agents Switchboard starts don't get
           these tools: Switchboard turns off any server named
           <span class="font-mono">switchboard</span> or at its address for each of them, so keep the
-          name. Don't use <span class="font-mono">--scope project</span>, which writes the token
-          into a file you might commit.
+          name. An agent's card lists the MCP servers in its configuration, so it can still show
+          <span class="font-mono">switchboard</span> there. Don't use
+          <span class="font-mono">--scope project</span>, which writes the token into a file you
+          might commit.
         </p>
         <p data-testid="agent-access-claude-code-readd">
           After regenerating the token or changing the port, run
@@ -235,9 +241,10 @@
         <p>
           Put this in <span class="font-mono">~/.codex/config.toml</span>, so Codex has Switchboard
           in every folder. The Codex agents Switchboard starts don't get these tools: Switchboard
-          turns off any server named <span class="font-mono">switchboard</span> or at its address for
-          each of them, so keep the name. Then set the token in the shell you start Codex from with this
-          line:
+          turns off any server named <span class="font-mono">switchboard</span> or at its address
+          for each of them, so keep the name. An agent's card lists the MCP servers in its
+          configuration, so it can still show <span class="font-mono">switchboard</span> there. Then set
+          the token in the shell you start Codex from with this line:
         </p>
         <div class="flex items-center gap-2">
           <pre
@@ -283,10 +290,16 @@
           <span class="font-mono">which npx</span> in a terminal, and use that path for
           <span class="font-mono">command</span> and its folder for
           <span class="font-mono">PATH</span>. Claude Desktop doesn't read your shell profile, so it
-          needs both spelled out. This is for Chat. For the Code tab, run the Claude Code command
-          instead: the Code tab reads Claude Code's configuration, and a wait there can run up to an
-          hour, where this connection stops each wait at 50 seconds. Code in the cloud can't reach
+          needs both spelled out. This entry is for the Chat tab, where each wait stops at 50
+          seconds. Under the name <span class="font-mono">{CLAUDE_DESKTOP_ENTRY_NAME}</span>, a Code
+          tab session that also has the Claude Code entry lists both sets of tools, and long waits
+          go through the <span class="font-mono">switchboard</span> ones. Code in the cloud can't reach
           your Mac.
+        </p>
+        <p data-testid="agent-access-claude-desktop-old-entry">
+          If you set this up before and still have an <span class="font-mono">mcp-remote</span>
+          entry named <span class="font-mono">switchboard</span>, rename it or remove it: the Code
+          tab otherwise calls through it, and each wait stops at 50 seconds.
         </p>
       </Disclosure>
     </div>

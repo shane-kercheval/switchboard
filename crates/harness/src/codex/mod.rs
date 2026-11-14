@@ -34,6 +34,7 @@ pub(crate) mod facets;
 pub mod fork;
 pub(crate) mod inherited_history;
 mod own_server;
+pub use own_server::codex_own_server_overrides;
 pub mod parser;
 pub(crate) mod rollout_file;
 pub mod session_file;
@@ -168,6 +169,27 @@ impl CodexAdapter {
         self.compaction_startup_bound = bound;
         self
     }
+
+    /// The `-c` arguments that turn Switchboard's own MCP server off for a run
+    /// in `cwd`. A staged home stands in for the whole machine, so tests read
+    /// only its `.codex/config.toml`, never the system file or `CODEX_HOME`.
+    fn own_server_overrides(
+        &self,
+        own: Option<crate::OwnMcpServer>,
+        home_dir: &Path,
+        cwd: &Path,
+    ) -> Vec<String> {
+        let Some(own) = own else {
+            return Vec::new();
+        };
+        if self.home_dir_override.is_some() {
+            return own_server::overrides_from_files(
+                &[home_dir.join(".codex").join("config.toml")],
+                own,
+            );
+        }
+        codex_own_server_overrides(own, home_dir, cwd)
+    }
 }
 
 impl Default for CodexAdapter {
@@ -204,7 +226,7 @@ impl HarnessAdapter for CodexAdapter {
         // first-dispatch case; the adapter captures it from the stream below.
         let prior = codex_locator(agent);
         let home_dir = resolve_home_dir(self.home_dir_override.as_deref());
-        let overrides = own_server::own_server_overrides(options.own_mcp_server, &home_dir, cwd);
+        let overrides = self.own_server_overrides(options.own_mcp_server, &home_dir, cwd);
         let args = build_args(
             agent,
             prompt,
@@ -303,7 +325,7 @@ impl HarnessAdapter for CodexAdapter {
         // everything up to the three replies.
         let startup_deadline = tokio::time::Instant::now() + self.compaction_startup_bound;
         let binary = crate::subprocess::resolve_binary(&self.codex_binary_path)?;
-        let overrides = own_server::own_server_overrides(options.own_mcp_server, &home_dir, cwd);
+        let overrides = self.own_server_overrides(options.own_mcp_server, &home_dir, cwd);
         let server = app_server::AppServer::spawn(&binary, Some(cwd), &overrides)
             .map_err(|e| crate::subprocess::map_spawn_error(e, cwd))?;
         let requests = compaction::requests(&compaction::CompactionTarget {

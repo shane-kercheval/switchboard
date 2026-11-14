@@ -1273,7 +1273,8 @@ fn parse<P: DeserializeOwned>(args: JsonObject) -> Result<P, AppError> {
 /// The result budget for a client that sends no progress token. Claude
 /// Desktop through `mcp-remote` is the one measured client without one, and
 /// its Code tab, measured that way, showed a result inline only under 50,000
-/// characters and saved a larger one to a file.
+/// characters and saved a larger one to a file. Through a direct entry the
+/// Code tab sends one and showed a 96,000-character result inline.
 const NO_PROGRESS_RESULT_CHARS: usize = 45_000;
 
 /// What one tool call runs with.

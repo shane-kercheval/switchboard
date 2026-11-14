@@ -16,7 +16,7 @@ use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::codex::parser::CODEX_AUTH_MESSAGE;
 use switchboard_harness::{
     AdapterEvent, CodexAdapter, DispatchError, DispatchOptions, FailureKind, HarnessAdapter,
-    TurnOutcome,
+    OwnMcpServer, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -298,6 +298,53 @@ async fn the_recorded_compaction_completes_with_the_compacted_size_after_livenes
     assert!(
         events.len() > 1,
         "the running compaction must show activity before it ends"
+    );
+}
+
+#[tokio::test]
+async fn the_compaction_server_gets_the_own_server_overrides() {
+    let argv_dir = tempfile::TempDir::new().unwrap();
+    let argv_path = argv_dir.path().join("argv");
+    let recorded = std::fs::read_to_string(RECORDED).unwrap();
+    let staged = Staged::new(&format!("// argv_to:{}\n{recorded}", argv_path.display()));
+    std::fs::write(
+        staged.home.join(".codex/config.toml"),
+        "[mcp_servers.switchboard]\nurl = \"http://127.0.0.1:47821/mcp\"\n",
+    )
+    .unwrap();
+    let options = DispatchOptions {
+        own_mcp_server: Some(OwnMcpServer::new(47821)),
+        ..DispatchOptions::default()
+    };
+
+    let Ok(stream) = staged
+        .adapter()
+        .compact(&agent(), &staged.cwd, Uuid::now_v7(), options)
+        .await
+    else {
+        panic!("compact should start");
+    };
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    assert!(
+        matches!(terminal(&events), TurnOutcome::Completed),
+        "events: {events:?}"
+    );
+    let argv: Vec<String> = std::fs::read_to_string(&argv_path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        &argv[..5],
+        [
+            "app-server",
+            "-c",
+            r#"mcp_servers.switchboard.url="http://127.0.0.1:47821/mcp""#,
+            "-c",
+            "mcp_servers.switchboard.enabled=false",
+        ],
+        "{argv:?}"
     );
 }
 

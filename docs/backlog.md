@@ -107,3 +107,24 @@ Since Claude Code 2.1.277, the cost and token totals on a resumed turn's `result
 - G39 in `docs/harness-behavior.md` §4: the cumulative totals, the subtraction, and its edge cases (a cancelled turn, a fork's first turn, a `/context` report, a session continued on an older CLI).
 - [PR #148, the Claude Code 2.1.312 review](https://github.com/shane-kercheval/switchboard/pull/148), section "Not probed", where the review declined to adopt the field.
 - `UsageSeed` in `crates/harness/src/parser.rs`, `read_usage_seed` in `crates/harness/src/claude_code/session_file.rs`, and `read_usage_seed_for` in `crates/harness/src/claude_code/mod.rs`.
+
+## An agent's card lists Switchboard's own MCP server, which Switchboard turns off
+
+**What a user would get.** An agent's Environment card marks Switchboard's own MCP server (agent access) as off for that agent, rather than listing it among the servers the agent has. Today a user who checks the card after reading in Settings that the agents Switchboard starts don't get the server sees it listed and can conclude the block failed.
+
+**What we know.**
+
+- The setup copy registers the server for every folder: Claude Code with `--scope user`, Codex in `~/.codex/config.toml`. Each Claude Code and Codex run then gets the server turned off (`docs/harness-behavior.md` §3.13).
+- The card's MCP list comes from the harness's config files. Codex: `crates/harness/src/codex/config.rs` reads `~/.codex/config.toml` and the folder's `.codex/config.toml`, called from `codex/mod.rs` when the session's details are emitted. Claude Code: when a project opens, `crates/harness/src/claude_code/session_file.rs` calls `claude_code/config.rs`, which reads the user, local, and project scopes. Read from source on 2026-11-14.
+- After a live Claude turn, the list comes from Claude Code's startup event instead, and that event leaves a denied server out (observed 2026-11-14 at 2.1.321 with entries at local scope). So a Claude card lists `switchboard` after a project reopens and drops it after the agent's next turn. A Codex card always lists it.
+- A server read from a config file is shown by name only, with no status label or dot (`AgentEnvironment.test.ts`, "draws no status dot for config-file servers").
+- The Settings copy and the README say that an agent's card lists the MCP servers in its configuration, so it can still show `switchboard` there.
+
+**Why it waits.** The mismatch misleads but changes nothing an agent can do, and a correct label needs the block's own matching to reach the display code, including the transcript-load path, which doesn't have the agent access port today.
+
+**A candidate approach.** This is recorded, not decided. A label must come from the same code that builds the block, so the card never says "off" for an entry the run left on. Two examples: a Codex entry the lookup skips, such as one in a file it can't parse, and a Claude Code `mcp-remote` bridge under another name, which `deniedMcpServers` doesn't match. For Codex that means calling the lookup in `crates/harness/src/codex/own_server.rs`. For Claude Code it means the name and URL patterns in `own_server_settings` (`crates/harness/src/claude_code/mod.rs`), never the bridge's arguments. The card would also need a neutral tone and a label for the new status (`desktop/src/lib/agentEnvironment.ts`).
+
+**Where the detail is.**
+
+- `docs/harness-behavior.md` §3.13, for what each harness turns off and what it misses.
+- `desktop/src/lib/agentEnvironment.ts`, for the card's rule of showing what is configured rather than hiding it.

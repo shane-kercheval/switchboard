@@ -4,11 +4,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId, Store};
 use switchboard_dispatcher::{Dispatcher, EventEmitter};
-use switchboard_harness::HarnessAdapter;
+use switchboard_harness::{HarnessAdapter, OwnMcpServer};
 use switchboard_prompts::PromptService;
 use switchboard_workflow::WorkflowStepInfo;
 use tokio_util::sync::CancellationToken;
@@ -554,6 +555,11 @@ pub struct AppState {
     /// (browser-tools toggle), rather than freezing the value at enqueue.
     pub preferences: Arc<Mutex<Preferences>>,
 
+    /// The port of this instance's MCP server (see [`crate::mcp`]), kept current
+    /// by `AgentAccess` and read per dispatch so every agent run turns that
+    /// server off. Holds the configured port whether or not the server listens.
+    pub own_mcp_port: Arc<AtomicU16>,
+
     /// Resolved path of `config.yaml`, or `None` when no global location was
     /// resolved (tests, exotic host). `set_preferences` errors-as-noop persist
     /// while this is `None`, so tests never touch user-global state.
@@ -730,6 +736,7 @@ impl AppState {
             harness_usage: Mutex::new(HarnessUsage::default()),
             harness_usage_path: None,
             preferences: Arc::new(Mutex::new(Preferences::default())),
+            own_mcp_port: Arc::new(AtomicU16::new(crate::mcp::config::DEFAULT_PORT)),
             preferences_path: None,
             prompts: PromptService::disabled(),
             forwards: Mutex::new(HashMap::new()),
@@ -807,6 +814,11 @@ impl AppState {
         );
         state.lock_tmp = Some(locks);
         state
+    }
+
+    /// This instance's MCP server, for a harness call made outside a dispatch.
+    pub fn own_mcp_server(&self) -> OwnMcpServer {
+        OwnMcpServer::new(self.own_mcp_port.load(Ordering::Relaxed))
     }
 
     /// Builder step that injects the production notifier. Production calls this

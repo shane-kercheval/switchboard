@@ -2713,6 +2713,7 @@ async fn create_codex_fork(
         &project.directory,
         parent_thread_id,
         &source.selection(),
+        Some(state.own_mcp_server()),
         switchboard_harness::CODEX_FORK_TIMEOUT,
     )
     .await;
@@ -3997,6 +3998,7 @@ pub async fn dispatch_message_impl(
             project_generation: Arc::clone(&state.project_generation),
             generation_at_capture: generation,
             preferences: Arc::clone(&state.preferences),
+            own_mcp_port: Arc::clone(&state.own_mcp_port),
         },
     ));
     // Last point before the hand-off: refuse if the project moved under us while
@@ -4120,6 +4122,7 @@ pub async fn compact_agent_with_impl(
             project_generation: Arc::clone(&state.project_generation),
             generation_at_capture: generation,
             preferences: Arc::clone(&state.preferences),
+            own_mcp_port: Arc::clone(&state.own_mcp_port),
         },
     ));
     // Same last-moment check as a send: refuse if the project moved under us
@@ -4190,6 +4193,7 @@ pub async fn context_report_agent_impl(
             project_generation: Arc::clone(&state.project_generation),
             generation_at_capture: generation,
             preferences: Arc::clone(&state.preferences),
+            own_mcp_port: Arc::clone(&state.own_mcp_port),
         },
     ));
     // Same last-moment check as a send: refuse if the project moved under us
@@ -9652,6 +9656,7 @@ mod tests {
                 project_generation: Arc::clone(&state.project_generation),
                 generation_at_capture: generation,
                 preferences: Arc::clone(&state.preferences),
+                own_mcp_port: Arc::clone(&state.own_mcp_port),
             },
         )
     }
@@ -14196,6 +14201,103 @@ mod tests {
         )
         .await;
         assert_eq!(lock(&seen).as_slice(), [false, true, false]);
+    }
+
+    #[tokio::test]
+    async fn every_turn_names_the_own_mcp_server_at_the_current_port() {
+        // Read at dispatch time, like the browser-tools preference: a port
+        // changed in Settings must reach the very next turn.
+        struct OwnServerRecordingAdapter {
+            seen: Arc<Mutex<Vec<Option<switchboard_harness::OwnMcpServer>>>>,
+        }
+
+        #[async_trait]
+        impl HarnessAdapter for OwnServerRecordingAdapter {
+            fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
+                Ok(())
+            }
+            fn version(&self) -> Option<String> {
+                None
+            }
+            async fn dispatch(
+                &self,
+                _agent: &AgentRecord,
+                _cwd: &Path,
+                _prompt: &str,
+                turn_id: switchboard_harness::TurnId,
+                options: switchboard_harness::DispatchOptions,
+            ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError>
+            {
+                lock(&self.seen).push(options.own_mcp_server);
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
+                    turn_id,
+                    outcome: switchboard_harness::TurnOutcome::Completed,
+                    ended_at: chrono::Utc::now(),
+                    usage: None,
+                    context_window_source: None,
+                    stable_message_id: None,
+                    first_message_id: None,
+                    spend: None,
+                    model: None,
+                    effort: None,
+                });
+                Ok(Box::pin(
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+                ))
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(OwnServerRecordingAdapter {
+            seen: Arc::clone(&seen),
+        });
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let proj = create_project_in_only_dir(&state, "alpha");
+        set_active_project_impl(&state, proj.id).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "a",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+
+        send_msg(&state, agent.id, "one").await.unwrap();
+        within(
+            &emitter,
+            "turn 1 idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        state
+            .own_mcp_port
+            .store(40_001, std::sync::atomic::Ordering::Relaxed);
+        send_msg(&state, agent.id, "two").await.unwrap();
+        within(
+            &emitter,
+            "turn 2 idle",
+            emitter.wait_for_type("agent_idle", 2),
+        )
+        .await;
+
+        assert_eq!(
+            lock(&seen).as_slice(),
+            [
+                Some(switchboard_harness::OwnMcpServer::new(
+                    crate::mcp::config::DEFAULT_PORT
+                )),
+                Some(switchboard_harness::OwnMcpServer::new(40_001)),
+            ]
+        );
     }
 
     #[tokio::test]

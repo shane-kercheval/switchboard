@@ -3,7 +3,7 @@
 /// client (`docs/research/mcp-client-behavior.md`).
 
 /// The environment variable the Codex configuration reads the token from, so
-/// the token stays out of the folder's config file.
+/// the token stays out of `~/.codex/config.toml`.
 export const CODEX_TOKEN_VARIABLE = "SWITCHBOARD_TOKEN";
 
 /// The `mcp-remote` release Claude Desktop was measured with. Pinned so an
@@ -18,9 +18,10 @@ export type AgentAccessSnippets = {
 };
 
 export function agentAccessSnippets(url: string, token: string): AgentAccessSnippets {
-  // Default (local) scope: the token goes into the user's private
-  // `~/.claude.json`, never into a project's committed `.mcp.json`.
-  const claudeCode = `claude mcp add --transport http switchboard ${url} --header "Authorization: Bearer ${token}"`;
+  // User scope: one entry for every folder, with the token in the user's
+  // private `~/.claude.json`, never in a project's committed `.mcp.json`.
+  // Agents Switchboard starts don't get it: dispatch turns the entry off.
+  const claudeCode = `claude mcp add --scope user --transport http switchboard ${url} --header "Authorization: Bearer ${token}"`;
   const codexConfig = [
     "[mcp_servers.switchboard]",
     `url = "${url}"`,

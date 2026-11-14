@@ -2832,6 +2832,7 @@ async fn live_codex_compressed_rollout_loads_forks_and_resumes() {
         tmp.path(),
         &thread_id,
         &agent.selection(),
+        None,
         CODEX_FORK_TIMEOUT,
     )
     .await
@@ -2913,6 +2914,7 @@ async fn live_codex_fork_without_a_prompt_creates_an_idle_session_that_inherits_
         tmp.path(),
         &parent_thread_id,
         &agent.selection(),
+        None,
         CODEX_FORK_TIMEOUT,
     )
     .await
@@ -3036,6 +3038,7 @@ async fn live_codex_fork_loads_the_parents_history_up_to_the_fork_point() {
         tmp.path(),
         &parent_thread_id,
         &parent.selection(),
+        None,
         CODEX_FORK_TIMEOUT,
     )
     .await
@@ -4865,6 +4868,7 @@ async fn live_codex_compact_of_a_fork_keeps_its_inherited_context() {
         tmp.path(),
         &parent_thread_id,
         &parent.selection(),
+        None,
         CODEX_FORK_TIMEOUT,
     )
     .await

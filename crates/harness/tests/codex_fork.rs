@@ -100,6 +100,7 @@ impl Setup {
             &self.cwd,
             PARENT,
             &AgentSelection::default(),
+            None,
             timeout,
         )
         .await
@@ -243,6 +244,7 @@ async fn a_missing_working_folder_is_not_reported_as_a_missing_binary() {
         &gone,
         PARENT,
         &AgentSelection::default(),
+        None,
         AMPLE,
     )
     .await

@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::CodexLocator;
 use super::session_file::{AttachLookupError, find_codex_session_file_for_attach};
+use crate::own_mcp::OwnMcpServer;
 
 /// Production bound for creating a fork.
 ///
@@ -132,7 +133,8 @@ fn exit_description(code: Option<i32>) -> String {
 /// `selection` is passed as the same `-m` / `-c model_reasoning_effort=` flags a
 /// dispatch sends, so the fork's recorded settings match the agent the caller
 /// registers. `home_dir` is where the new rollout is looked up
-/// (`<home_dir>/.codex/sessions`).
+/// (`<home_dir>/.codex/sessions`). `own_mcp_server` is turned off as on a
+/// dispatch (see [`crate::own_mcp`]).
 ///
 /// **The partition date comes from where Codex wrote the file**, not from
 /// today's date. A creation that crossed midnight would otherwise look in the
@@ -163,11 +165,13 @@ pub async fn fork_codex_session(
     cwd: &Path,
     parent_thread_id: &str,
     selection: &AgentSelection,
+    own_mcp_server: Option<OwnMcpServer>,
     timeout: Duration,
 ) -> Result<CodexLocator, CodexForkError> {
+    let overrides = super::own_server::own_server_overrides(own_mcp_server, home_dir, cwd);
     let binary = binary.to_owned();
     let cwd = cwd.to_owned();
-    let args = fork_args(parent_thread_id, selection);
+    let args = fork_args(parent_thread_id, selection, &overrides);
     let cancel = CancellationToken::new();
     let task = tokio::spawn({
         let cancel = cancel.clone();
@@ -206,8 +210,12 @@ pub async fn fork_codex_session(
 ///
 /// `-C .` with the child's working directory set to the project folder, as a
 /// first-turn dispatch does: `.` resolves against the child's cwd, so the path
-/// is not encoded twice.
-fn fork_args(parent_thread_id: &str, selection: &AgentSelection) -> Vec<String> {
+/// is not encoded twice. `overrides` are `-c` pairs, among the flags.
+fn fork_args(
+    parent_thread_id: &str,
+    selection: &AgentSelection,
+    overrides: &[String],
+) -> Vec<String> {
     let mut args = vec![
         "exec".to_owned(),
         "--json".to_owned(),
@@ -221,6 +229,7 @@ fn fork_args(parent_thread_id: &str, selection: &AgentSelection) -> Vec<String> 
         selection.model.as_deref(),
         selection.effort.as_deref(),
     );
+    args.extend_from_slice(overrides);
     args.push("fork".to_owned());
     args.push(parent_thread_id.to_owned());
     args
@@ -443,7 +452,7 @@ mod tests {
             ..AgentSelection::default()
         };
         assert_eq!(
-            fork_args("parent-id", &selection),
+            fork_args("parent-id", &selection, &[]),
             [
                 "exec",
                 "--json",
@@ -462,8 +471,26 @@ mod tests {
     }
 
     #[test]
+    fn args_put_overrides_before_fork() {
+        let overrides = [
+            "-c".to_owned(),
+            "mcp_servers.switchboard.enabled=false".to_owned(),
+        ];
+        let args = fork_args("parent-id", &AgentSelection::default(), &overrides);
+        assert_eq!(
+            args[args.len() - 4..],
+            [
+                "-c",
+                "mcp_servers.switchboard.enabled=false",
+                "fork",
+                "parent-id"
+            ]
+        );
+    }
+
+    #[test]
     fn args_omit_selection_flags_that_are_unset() {
-        let args = fork_args("parent-id", &AgentSelection::default());
+        let args = fork_args("parent-id", &AgentSelection::default(), &[]);
         assert!(!args.iter().any(|arg| arg == "-m" || arg == "-c"));
         assert_eq!(args[args.len() - 2..], ["fork", "parent-id"]);
     }

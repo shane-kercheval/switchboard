@@ -19,6 +19,7 @@ pub mod facets;
 pub mod forward;
 pub mod meta_sidecar;
 pub mod mock;
+pub mod own_mcp;
 mod parser;
 pub mod resume;
 pub mod subprocess;
@@ -58,6 +59,7 @@ pub use forward::{
     is_forwardable_text, latest_completed_agent_text, turn_answer_text,
 };
 pub use mock::{MockHarnessAdapter, MockScenario};
+pub use own_mcp::{OWN_MCP_SERVER_NAME, OwnMcpServer};
 pub use resume::interactive_resume_command;
 pub use transcript::{
     CompactedContext, InheritedHistoryGap, LoadTranscriptError, LoadedTranscript, ParseWarning,

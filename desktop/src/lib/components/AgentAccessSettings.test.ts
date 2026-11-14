@@ -103,7 +103,7 @@ describe("AgentAccessSettings", () => {
     expect(screen.getByTestId("agent-access-claude-desktop")).toBeVisible();
 
     expect(screen.getByTestId("agent-access-claude-code")).toHaveTextContent(
-      `claude mcp add --transport http switchboard http://127.0.0.1:47822/mcp --header "Authorization: Bearer ${TOKEN}"`,
+      `claude mcp add --scope user --transport http switchboard http://127.0.0.1:47822/mcp --header "Authorization: Bearer ${TOKEN}"`,
     );
     expect(screen.getByTestId("agent-access-codex")).toHaveTextContent(
       'url = "http://127.0.0.1:47822/mcp"',
@@ -123,9 +123,9 @@ describe("AgentAccessSettings", () => {
     expect(screen.getByTestId("agent-access-codex-token-file")).toHaveTextContent(
       "chmod 600 ~/.switchboard-token",
     );
-    expect(screen.getByTestId("agent-access-claude-code-readd")).toHaveTextContent(
-      "claude mcp remove switchboard --scope local",
-    );
+    const readd = screen.getByTestId("agent-access-claude-code-readd");
+    expect(readd).toHaveTextContent("claude mcp remove switchboard --scope user");
+    expect(readd).toHaveTextContent("claude mcp remove switchboard --scope local");
   });
 
   it("copies the token itself, not the masked text", async () => {

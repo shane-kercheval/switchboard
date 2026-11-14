@@ -83,7 +83,7 @@ running a multi-step exchange across agents by hand (review rounds, a fan-out an
 
 Results are JSON: {\"result\": …, \"truncated\": […], \"items_omitted\": n}, under 100,000 \
 characters, or 45,000 for any result that can be cut when your client sends no progress token \
-(Claude Desktop). Each cut is listed in truncated with the call that reads the rest \
+(Claude Desktop through mcp-remote). Each cut is listed in truncated with the call that reads the rest \
 (read_with), when there is one. max_chars sets the limit for one call, and the call a cut \
 lists keeps it: Codex keeps about 10,000 tokens of a result and cuts the middle, so pass 25000 \
 there. An error is \
@@ -129,12 +129,12 @@ const MAX_RESULT_SIZE_META: &str = "anthropic/maxResultSizeChars";
 
 /// Hints shared by every blocking tool.
 const WAIT_HINTS: &str = "\
-Timeouts: timeout_seconds defaults to 50. If your client sends a progress token with the call, \
-you may ask for up to 3600 and get a progress notification every 60 seconds; without one, waits \
-are capped at 50, and the reply says so (capped_to_seconds). In the Claude Code CLI, ask for a \
-long timeout (e.g. 600): the call moves to the background and its result arrives on its own \
-when it settles. Claude Desktop, its Code tab included, sends no token: use the default and call \
-again. In Codex, stay under 300 seconds unless the user raised tool_timeout_sec.";
+Timeouts: timeout_seconds defaults to 50. If your client sends a progress token, you may ask for \
+up to 3600 and get a progress notification every 60 seconds; without one, waits are capped at 50 \
+(the reply says capped_to_seconds). In Claude Code, ask for a long timeout (e.g. 600): in a \
+terminal a call past two minutes moves to the background and its result arrives on its own; in \
+the desktop app the session waits, and a message the user types reaches you when the call \
+returns. In Codex, stay under 300 seconds unless the user raised tool_timeout_sec.";
 
 /// What a finished wait's `usage` is, shared by every wait's description.
 const USAGE_NOTE: &str = "\
@@ -1271,8 +1271,9 @@ fn parse<P: DeserializeOwned>(args: JsonObject) -> Result<P, AppError> {
 // --- calling ---------------------------------------------------------------------
 
 /// The result budget for a client that sends no progress token. Claude
-/// Desktop is the one measured client without one, and its Code tab shows a
-/// result inline only under 50,000 characters, saving a larger one to a file.
+/// Desktop through `mcp-remote` is the one measured client without one, and
+/// its Code tab, measured that way, showed a result inline only under 50,000
+/// characters and saved a larger one to a file.
 const NO_PROGRESS_RESULT_CHARS: usize = 45_000;
 
 /// What one tool call runs with.
@@ -1308,8 +1309,8 @@ impl CallContext {
 
     /// The result budget for this call: the caller's `max_chars`, or the
     /// full budget, or [`NO_PROGRESS_RESULT_CHARS`] for a client that sends no
-    /// progress token, so Claude Desktop gets results it shows inline without
-    /// the model having to know which client it runs in.
+    /// progress token, so Claude Desktop through `mcp-remote` gets results it
+    /// shows inline without the model having to know which client it runs in.
     fn result_chars(&self, max_chars: Option<usize>) -> usize {
         result_budget_chars(
             max_chars.or((!self.can_keep_alive).then_some(NO_PROGRESS_RESULT_CHARS)),

@@ -2,13 +2,13 @@
 //! honours it.
 //!
 //! The numbers are the client measurements in
-//! `docs/research/mcp-client-behavior.md`: Claude Desktop sends no progress
-//! token and cancels any call at 60 seconds, so a wait that cannot be kept
-//! alive is capped at 50; Claude Code aborts a call silent for 300 seconds and
-//! `rmcp`'s own session keep-alive ends a session silent for 300 seconds, so a
-//! wait that can be kept alive fires its progress hook every 60; Claude Code
-//! backgrounds a long call and delivers its result into the session, so long
-//! waits are the intended use there. The limits key on whether the caller can
+//! `docs/research/mcp-client-behavior.md`: Claude Desktop through `mcp-remote`
+//! sends no progress token and cancels any call at 60 seconds, so a wait that
+//! cannot be kept alive is capped at 50; Claude Code aborts a call silent for
+//! 300 seconds and `rmcp`'s own session keep-alive ends a session silent for
+//! 300 seconds, so a wait that can be kept alive fires its progress hook every
+//! 60; Claude Code in a terminal backgrounds a long call and delivers its
+//! result into the session, so long waits are the intended use there. The limits key on whether the caller can
 //! be kept alive (the tool layer sets it when the client sent a progress
 //! token), never on the client's name.
 //!
@@ -46,8 +46,8 @@ pub const PROGRESS_INTERVAL: Duration = Duration::from_mins(1);
 /// idle agent's output — needs an allowance, or the wait would return the
 /// state it saw last rather than the state as of now. It is one fixed point
 /// (the deadline plus five seconds) shared by every finishing step, never five
-/// seconds per step, so a 50-second call ends by 55 seconds: inside Claude
-/// Desktop's 60-second cancel.
+/// seconds per step, so a 50-second call ends by 55 seconds: inside the
+/// 60-second cancel of Claude Desktop through `mcp-remote`.
 pub const FINAL_OBSERVATION_GRACE: Duration = Duration::from_secs(5);
 
 pub type ProgressHook = Arc<dyn Fn() + Send + Sync>;

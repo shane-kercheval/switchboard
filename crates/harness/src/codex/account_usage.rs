@@ -379,7 +379,7 @@ async fn read_on_task(
     // binary apart from a working directory that no longer exists, and this
     // spawn sets no working directory. `resolve_binary` trusts an absolute path
     // without probing it, so this is the branch that catches one.
-    let mut server = AppServer::spawn(&resolved, None).map_err(|e| {
+    let mut server = AppServer::spawn(&resolved, None, &[]).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             AccountUsageError::BinaryNotFound
         } else {

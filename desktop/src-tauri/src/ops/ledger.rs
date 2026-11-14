@@ -174,6 +174,8 @@ pub struct RecipientSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_id: Option<MessageId>,
     pub status: SendStatus,
+    #[serde(flatten)]
+    pub times: TurnTimes,
     /// The reply text once `Completed`; `None` before and for every other
     /// terminal.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,6 +216,7 @@ impl RecipientSnapshot {
             agent_id,
             message_id: None,
             status,
+            times: TurnTimes::default(),
             text: None,
             error: None,
             code: None,
@@ -223,6 +226,57 @@ impl RecipientSnapshot {
             context: None,
         }
     }
+
+    /// Fill the recipient's spans against `now`, the moment its reply reports.
+    pub fn stamp(&mut self, now: DateTime<Utc>) {
+        self.times.stamp(self.status == SendStatus::Running, now);
+    }
+}
+
+/// When a recipient's turn started and ended, and the spans from those times
+/// to the reply's `now`. The ledger and the journal supply the two times;
+/// [`TurnTimes::stamp`] fills the spans once per reply, so every span in one
+/// reply counts to the same moment.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct TurnTimes {
+    /// The dispatcher's start of the turn, the instant both `turn_start` and
+    /// the journal's record of the send carry. Absent while the message waits
+    /// in line, and for one that ended before its turn started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// While the turn runs: whole seconds from `started_at` to `now`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running_seconds: Option<u64>,
+    /// When the turn ended, or the message did without starting one. Absent
+    /// for a completed turn read back from the journal, which records no end
+    /// for one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seconds_since_ended: Option<u64>,
+}
+
+impl TurnTimes {
+    pub fn stamp(&mut self, running: bool, now: DateTime<Utc>) {
+        self.running_seconds = self
+            .started_at
+            .filter(|_| running)
+            .map(|started| whole_seconds(started, now));
+        self.duration_seconds = self
+            .started_at
+            .zip(self.ended_at)
+            .map(|(started, ended)| whole_seconds(started, ended));
+        self.seconds_since_ended = self.ended_at.map(|ended| whole_seconds(ended, now));
+    }
+}
+
+/// Whole seconds from `from` to `to`, rounded down; zero when `to` is the
+/// earlier, as after the system clock was set back.
+#[must_use]
+pub fn whole_seconds(from: DateTime<Utc>, to: DateTime<Utc>) -> u64 {
+    u64::try_from((to - from).num_seconds()).unwrap_or(0)
 }
 
 /// How much of a running turn's text a send's snapshot carries.
@@ -416,6 +470,10 @@ pub struct RunSnapshot {
     /// Every send the run's send steps made so far, in step order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sends: Vec<RunSend>,
+    /// When the ledger saw the run's final progress event, which the run
+    /// emits in-process as it ends; absent while it runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 /// One send a workflow step made: follow it with `wait_send`, and read any
@@ -502,6 +560,12 @@ struct RecipientEntry {
     /// event stream.
     dispatch: SendStatus,
     status: SendStatus,
+    /// From the recipient's own `turn_start`.
+    started_at: Option<DateTime<Utc>>,
+    /// From its `turn_end`, the `message_failed` or `message_cancelled` of a
+    /// message that ended before its turn started, or the moment a cancel
+    /// stopped it before the send offered it to its agent.
+    ended_at: Option<DateTime<Utc>>,
     text: Option<String>,
     error: Option<String>,
     code: Option<&'static str>,
@@ -521,6 +585,11 @@ impl RecipientEntry {
             context: None,
             message_id: self.message_id,
             status: self.status,
+            times: TurnTimes {
+                started_at: self.started_at,
+                ended_at: self.ended_at,
+                ..TurnTimes::default()
+            },
             text: self.text.clone(),
             error: self.error.clone(),
             code: self.code,
@@ -538,6 +607,7 @@ impl RecipientEntry {
             context: None,
             message_id: self.message_id,
             status: self.dispatch,
+            times: TurnTimes::default(),
             text: None,
             error: self.error.clone(),
             code: self.code,
@@ -1095,6 +1165,7 @@ impl SendLedger {
         {
             recipient.dispatch = SendStatus::Cancelled;
             recipient.status = SendStatus::Cancelled;
+            recipient.ended_at = Some(Utc::now());
         }
         drop(inner);
         self.bump();
@@ -1124,6 +1195,7 @@ impl SendLedger {
                 if recipient.dispatch == SendStatus::NotDispatched {
                     recipient.dispatch = SendStatus::Cancelled;
                     recipient.status = SendStatus::Cancelled;
+                    recipient.ended_at = Some(Utc::now());
                 }
             }
         }
@@ -1374,19 +1446,24 @@ impl SendLedger {
                 turn_id,
                 message_id,
                 send_id,
+                started_at,
                 ..
-            }) => self.on_turn_start(agent_id, message_id, send_id, turn_id),
+            }) => self.on_turn_start(agent_id, message_id, send_id, turn_id, started_at),
             Ok(NormalizedEvent::TurnEnd {
-                turn_id, outcome, ..
-            }) => self.on_turn_end(turn_id, &outcome),
+                turn_id,
+                outcome,
+                ended_at,
+                ..
+            }) => self.on_turn_end(turn_id, &outcome, ended_at),
             Ok(NormalizedEvent::MessageFailed {
                 message_id,
                 error,
                 kind,
+                at,
                 ..
-            }) => self.on_message_failed(message_id, error, kind),
-            Ok(NormalizedEvent::MessageCancelled { message_id, .. }) => {
-                self.on_message_cancelled(message_id);
+            }) => self.on_message_failed(message_id, error, kind, at),
+            Ok(NormalizedEvent::MessageCancelled { message_id, at, .. }) => {
+                self.on_message_cancelled(message_id, at);
             }
             Ok(_) => {}
             Err(e) => {
@@ -1408,6 +1485,7 @@ impl SendLedger {
         message_id: MessageId,
         turn_send: SendId,
         turn_id: TurnId,
+        started_at: DateTime<Utc>,
     ) {
         let mut inner = lock(&self.inner);
         if let Some(state) = inner.activity.get_mut(&agent_id) {
@@ -1432,6 +1510,7 @@ impl SendLedger {
         if let Some(recipient) = recipient_mut(&mut inner, send_id, index) {
             recipient.turn_id = Some(turn_id);
             recipient.status = SendStatus::Running;
+            recipient.started_at = Some(started_at);
         }
     }
 
@@ -1502,7 +1581,7 @@ impl SendLedger {
         }
     }
 
-    fn on_turn_end(&self, turn_id: TurnId, outcome: &TurnOutcome) {
+    fn on_turn_end(&self, turn_id: TurnId, outcome: &TurnOutcome, ended_at: DateTime<Utc>) {
         let mut inner = lock(&self.inner);
         let Some((send_id, index)) = inner.by_turn.get(&turn_id).copied() else {
             return;
@@ -1510,6 +1589,7 @@ impl SendLedger {
         let Some(recipient) = recipient_mut(&mut inner, send_id, index) else {
             return;
         };
+        recipient.ended_at = Some(ended_at);
         match outcome {
             TurnOutcome::Completed => {
                 recipient.status = SendStatus::Completed;
@@ -1537,6 +1617,7 @@ impl SendLedger {
         message_id: MessageId,
         error: String,
         kind: Option<MessageFailureKind>,
+        at: DateTime<Utc>,
     ) {
         let mut inner = lock(&self.inner);
         let Some((send_id, index)) = inner.by_message.get(&message_id).copied() else {
@@ -1546,6 +1627,7 @@ impl SendLedger {
             return;
         };
         recipient.status = SendStatus::Failed;
+        recipient.ended_at = Some(at);
         recipient.error = Some(error);
         recipient.code = match kind {
             Some(MessageFailureKind::SessionInUse) => Some(error_code::AGENT_BUSY_ELSEWHERE),
@@ -1553,7 +1635,7 @@ impl SendLedger {
         };
     }
 
-    fn on_message_cancelled(&self, message_id: MessageId) {
+    fn on_message_cancelled(&self, message_id: MessageId, at: DateTime<Utc>) {
         let mut inner = lock(&self.inner);
         let Some((send_id, index)) = inner.by_message.get(&message_id).copied() else {
             return;
@@ -1562,6 +1644,7 @@ impl SendLedger {
             return;
         };
         recipient.status = SendStatus::Cancelled;
+        recipient.ended_at = Some(at);
     }
 
     fn observe_run(&self, project_id: ProjectId, payload: &serde_json::Value) {
@@ -1594,15 +1677,16 @@ impl SendLedger {
             label: progress.label,
             recipients: progress.recipients,
             sends: Vec::new(),
+            ended_at: None,
         };
         let now = Utc::now();
         let mut inner = lock(&self.inner);
         let mut snapshot = snapshot;
-        snapshot.sends = inner
-            .runs
-            .get(&run_id)
-            .map(|entry| entry.snapshot.sends.clone())
-            .unwrap_or_default();
+        let previous = inner.runs.get(&run_id).map(|entry| &entry.snapshot);
+        snapshot.sends = previous.map(|run| run.sends.clone()).unwrap_or_default();
+        // A repeated final event keeps the first one's time.
+        snapshot.ended_at = (status != RunState::Running)
+            .then(|| previous.and_then(|run| run.ended_at).unwrap_or(now));
         if let Some(send_id) = progress.send_id {
             let send = RunSend {
                 step: snapshot.step,
@@ -1751,6 +1835,8 @@ fn recipient_entry(agent_id: AgentId) -> RecipientEntry {
         admitted_at: None,
         dispatch: SendStatus::NotDispatched,
         status: SendStatus::NotDispatched,
+        started_at: None,
+        ended_at: None,
         text: None,
         error: None,
         code: None,
@@ -2886,6 +2972,335 @@ mod tests {
         assert_eq!(
             ledger.send(compaction).unwrap().recipients[0].status,
             SendStatus::Running
+        );
+    }
+
+    fn instant(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text).unwrap().to_utc()
+    }
+
+    /// The turn times the ledger holds for a send's only recipient.
+    fn times_of(ledger: &SendLedger, send_id: SendId) -> TurnTimes {
+        ledger.send(send_id).unwrap().recipients[0].times
+    }
+
+    #[test]
+    fn a_recipient_carries_its_turns_start_and_end_as_the_events_stamp_them() {
+        let outcomes = [
+            (json!({ "status": "completed" }), SendStatus::Completed),
+            (
+                json!({ "status": "failed", "kind": "harness_error", "message": "boom" }),
+                SendStatus::Failed,
+            ),
+            (
+                json!({ "status": "cancelled", "source": "user" }),
+                SendStatus::Cancelled,
+            ),
+        ];
+        for (outcome, status) in outcomes {
+            let ledger = SendLedger::new();
+            let (_, send_id, agent_id, message_id) = registered(&ledger);
+            assert_eq!(
+                times_of(&ledger, send_id),
+                TurnTimes::default(),
+                "nothing while the message waits in line"
+            );
+            let turn_id = Uuid::now_v7();
+            ledger.observe(
+                &channel(agent_id),
+                &turn_start(message_id, turn_id, send_id),
+            );
+            assert_eq!(
+                times_of(&ledger, send_id),
+                TurnTimes {
+                    started_at: Some(instant("2026-06-17T00:00:00Z")),
+                    ..TurnTimes::default()
+                },
+                "running: its start only"
+            );
+            ledger.observe(&channel(agent_id), &turn_end(turn_id, &outcome));
+            let recipient = &ledger.send(send_id).unwrap().recipients[0];
+            assert_eq!(recipient.status, status);
+            assert_eq!(
+                recipient.times,
+                TurnTimes {
+                    started_at: Some(instant("2026-06-17T00:00:00Z")),
+                    ended_at: Some(instant("2026-06-17T00:00:01Z")),
+                    ..TurnTimes::default()
+                },
+                "{status:?}: the start and the end the events carry"
+            );
+            assert_eq!(
+                ledger.receipt(send_id).unwrap().recipients[0].times,
+                TurnTimes::default(),
+                "a receipt reports dispatch, before any turn"
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_that_ends_before_its_turn_starts_has_an_end_and_no_start() {
+        let ledger = SendLedger::new();
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        ledger.observe(
+            &channel(agent_id),
+            &json!({
+                "type": "message_cancelled",
+                "message_id": message_id,
+                "send_id": send_id,
+                "agent_id": agent_id,
+                "at": "2026-06-17T00:00:05Z",
+            }),
+        );
+        assert_eq!(
+            times_of(&ledger, send_id),
+            TurnTimes {
+                ended_at: Some(instant("2026-06-17T00:00:05Z")),
+                ..TurnTimes::default()
+            }
+        );
+
+        let (_, send_id, agent_id, message_id) = registered(&ledger);
+        ledger.observe(
+            &channel(agent_id),
+            &json!({
+                "type": "message_failed",
+                "message_id": message_id,
+                "send_id": null,
+                "agent_id": agent_id,
+                "error": "held elsewhere",
+                "kind": "session_in_use",
+                "at": "2026-06-17T00:00:06Z",
+            }),
+        );
+        assert_eq!(
+            times_of(&ledger, send_id),
+            TurnTimes {
+                ended_at: Some(instant("2026-06-17T00:00:06Z")),
+                ..TurnTimes::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_recipient_the_send_never_handed_to_its_agent_has_no_times() {
+        let ledger = SendLedger::new();
+        let project_id = Uuid::now_v7();
+        let (refused, unreached) = (Uuid::now_v7(), Uuid::now_v7());
+        let Claim::Fresh { send_id } = ledger.claim(project_id, None, "h") else {
+            panic!("fresh");
+        };
+        ledger.register_send(
+            send_id,
+            project_id,
+            &[refused, unreached],
+            CancellationToken::new(),
+        );
+        ledger.mark_rejected(send_id, refused, error_code::AGENT_BUSY, "busy");
+        ledger.settle(send_id);
+        let snapshot = ledger.send(send_id).unwrap();
+        assert_eq!(
+            snapshot
+                .recipients
+                .iter()
+                .map(|r| (r.status, r.times))
+                .collect::<Vec<_>>(),
+            vec![
+                (SendStatus::Rejected, TurnTimes::default()),
+                (SendStatus::NotDispatched, TurnTimes::default()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_recipient_cancelled_before_it_was_offered_ends_at_the_cancel() {
+        let ledger = SendLedger::new();
+        let project_id = Uuid::now_v7();
+        let (named, rest) = (Uuid::now_v7(), Uuid::now_v7());
+        let Claim::Fresh { send_id } = ledger.claim(project_id, None, "h") else {
+            panic!("fresh");
+        };
+        ledger.register_send(
+            send_id,
+            project_id,
+            &[named, rest],
+            CancellationToken::new(),
+        );
+        let before = Utc::now();
+        ledger.cancel_recipient_undispatched(send_id, named);
+        ledger.cancel_undispatched(send_id);
+        let after = Utc::now();
+        let ended: Vec<DateTime<Utc>> = ledger
+            .send(send_id)
+            .unwrap()
+            .recipients
+            .iter()
+            .map(|recipient| {
+                assert_eq!(recipient.status, SendStatus::Cancelled);
+                let ended = recipient.times.ended_at.expect("ended at the cancel");
+                assert!(before <= ended && ended <= after, "{:?}", recipient.times);
+                assert_eq!(
+                    recipient.times,
+                    TurnTimes {
+                        ended_at: Some(ended),
+                        ..TurnTimes::default()
+                    },
+                    "it never started"
+                );
+                ended
+            })
+            .collect();
+
+        ledger.cancel_recipient_undispatched(send_id, named);
+        ledger.cancel_undispatched(send_id);
+        let again: Vec<Option<DateTime<Utc>>> = ledger
+            .send(send_id)
+            .unwrap()
+            .recipients
+            .iter()
+            .map(|recipient| recipient.times.ended_at)
+            .collect();
+        assert_eq!(
+            again,
+            ended.into_iter().map(Some).collect::<Vec<_>>(),
+            "a repeated cancel keeps the first time"
+        );
+    }
+
+    #[test]
+    fn a_compaction_carries_its_turns_start_and_end() {
+        let ledger = SendLedger::new();
+        let project_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let CompactionClaim::Fresh { send_id } =
+            compaction_claim(&ledger, project_id, agent_id, None)
+        else {
+            panic!("fresh");
+        };
+        let message_id = ledger.mark_accepted(send_id, agent_id).unwrap();
+        ledger.settle(send_id);
+        let turn_id = Uuid::now_v7();
+        ledger.observe(
+            &channel(agent_id),
+            &turn_start(message_id, turn_id, send_id),
+        );
+        ledger.observe(
+            &channel(agent_id),
+            &turn_end(turn_id, &json!({ "status": "completed" })),
+        );
+        assert_eq!(
+            times_of(&ledger, send_id),
+            TurnTimes {
+                started_at: Some(instant("2026-06-17T00:00:00Z")),
+                ended_at: Some(instant("2026-06-17T00:00:01Z")),
+                ..TurnTimes::default()
+            }
+        );
+    }
+
+    #[test]
+    fn spans_count_whole_seconds_to_the_replys_now() {
+        let started = instant("2026-06-17T00:00:00Z");
+        let ended = instant("2026-06-17T00:00:05.700Z");
+        let mut running = TurnTimes {
+            started_at: Some(started),
+            ..TurnTimes::default()
+        };
+        running.stamp(true, instant("2026-06-17T00:01:30.900Z"));
+        assert_eq!(
+            running,
+            TurnTimes {
+                started_at: Some(started),
+                running_seconds: Some(90),
+                ..TurnTimes::default()
+            },
+            "rounded down"
+        );
+
+        let mut started_only = TurnTimes {
+            started_at: Some(started),
+            ..TurnTimes::default()
+        };
+        started_only.stamp(false, instant("2026-06-17T00:01:30Z"));
+        assert_eq!(
+            started_only.running_seconds, None,
+            "a turn not running, such as one whose end is unknown, has no running span"
+        );
+
+        let mut ended_turn = TurnTimes {
+            started_at: Some(started),
+            ended_at: Some(ended),
+            ..TurnTimes::default()
+        };
+        ended_turn.stamp(false, instant("2026-06-17T00:10:00Z"));
+        assert_eq!(
+            ended_turn,
+            TurnTimes {
+                started_at: Some(started),
+                running_seconds: None,
+                ended_at: Some(ended),
+                duration_seconds: Some(5),
+                seconds_since_ended: Some(594),
+            }
+        );
+
+        let mut never_started = TurnTimes {
+            ended_at: Some(ended),
+            ..TurnTimes::default()
+        };
+        never_started.stamp(false, instant("2026-06-17T00:00:10Z"));
+        assert_eq!(
+            (
+                never_started.duration_seconds,
+                never_started.seconds_since_ended
+            ),
+            (None, Some(4)),
+            "no duration without a start"
+        );
+
+        let mut clock_set_back = TurnTimes {
+            started_at: Some(started),
+            ended_at: Some(ended),
+            ..TurnTimes::default()
+        };
+        clock_set_back.stamp(false, instant("2026-06-16T23:00:00Z"));
+        assert_eq!(
+            clock_set_back.seconds_since_ended,
+            Some(0),
+            "never negative"
+        );
+
+        let mut waiting = TurnTimes::default();
+        waiting.stamp(true, instant("2026-06-17T00:00:10Z"));
+        assert_eq!(waiting, TurnTimes::default(), "nothing to count from");
+    }
+
+    #[test]
+    fn a_finished_run_records_when_its_final_event_arrived() {
+        let ledger = SendLedger::new();
+        let project_id = Uuid::now_v7();
+        let run_id = Uuid::now_v7();
+        let progress = |status: &str| {
+            json!({
+                "run_id": run_id, "workflow": "pair", "step": 0, "total": 1,
+                "status": status, "reason": null,
+            })
+        };
+        ledger.observe(&format!("workflow:{project_id}"), &progress("running"));
+        assert_eq!(ledger.run(run_id).unwrap().ended_at, None);
+        let before = Utc::now();
+        ledger.observe(&format!("workflow:{project_id}"), &progress("complete"));
+        let after = Utc::now();
+        let ended_at = ledger.run(run_id).unwrap().ended_at.unwrap();
+        assert!(
+            before <= ended_at && ended_at <= after,
+            "stamped as the final event arrived"
+        );
+        ledger.observe(&format!("workflow:{project_id}"), &progress("complete"));
+        assert_eq!(
+            ledger.run(run_id).unwrap().ended_at,
+            Some(ended_at),
+            "a repeated final event keeps the first one's time"
         );
     }
 }

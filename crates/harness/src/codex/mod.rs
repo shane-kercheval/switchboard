@@ -33,6 +33,8 @@ pub mod config;
 pub(crate) mod facets;
 pub mod fork;
 pub(crate) mod inherited_history;
+mod own_server;
+pub use own_server::{CodexConfigSources, codex_own_server_overrides};
 pub mod parser;
 pub(crate) mod rollout_file;
 pub mod session_file;
@@ -111,6 +113,8 @@ pub struct CodexAdapter {
     /// production this is `None` and the adapter resolves `$HOME` at
     /// dispatch time (the same pattern as `ClaudeCodeAdapter::home`).
     home_dir_override: Option<PathBuf>,
+    /// Where the own-server lookup finds Codex's config files.
+    config_sources: CodexConfigSources,
     /// Lazily-resolved `codex --version`, cached for the lifetime of the
     /// adapter. Empty string caches a failed/absent probe (version is
     /// display-only). Mirrors the Antigravity pattern.
@@ -129,6 +133,7 @@ impl CodexAdapter {
         Self {
             codex_binary_path: PathBuf::from("codex"),
             home_dir_override: None,
+            config_sources: CodexConfigSources::from_env(),
             cached_version: OnceLock::new(),
             compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
@@ -139,6 +144,7 @@ impl CodexAdapter {
         Self {
             codex_binary_path: path.into(),
             home_dir_override: None,
+            config_sources: CodexConfigSources::from_env(),
             cached_version: OnceLock::new(),
             compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
@@ -147,14 +153,22 @@ impl CodexAdapter {
     /// Override both the binary path and the home directory — used by
     /// fixture-driven adapter tests that stage a `TempDir` as `home_dir`
     /// so they can write into `<home>/.codex/sessions/...` without touching
-    /// the developer's real `~/.codex/`.
+    /// the developer's real `~/.codex/`. The staged home stands in for the
+    /// machine's config too: the own-server lookup reads
+    /// `<home>/etc/codex/config.toml` as the system file and ignores
+    /// `CODEX_HOME`.
     pub fn with_binary_and_home(
         binary_path: impl Into<PathBuf>,
         home_dir: impl Into<PathBuf>,
     ) -> Self {
+        let home_dir = home_dir.into();
         Self {
             codex_binary_path: binary_path.into(),
-            home_dir_override: Some(home_dir.into()),
+            config_sources: CodexConfigSources {
+                system_file: home_dir.join("etc/codex/config.toml"),
+                codex_home: None,
+            },
+            home_dir_override: Some(home_dir),
             cached_version: OnceLock::new(),
             compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
@@ -166,6 +180,18 @@ impl CodexAdapter {
     pub fn with_compaction_startup_bound(mut self, bound: Duration) -> Self {
         self.compaction_startup_bound = bound;
         self
+    }
+
+    /// The `-c` arguments that turn Switchboard's own MCP server off for a run
+    /// in `cwd`.
+    fn own_server_overrides(
+        &self,
+        own: Option<crate::OwnMcpServer>,
+        home_dir: &Path,
+        cwd: &Path,
+    ) -> Vec<String> {
+        own.map(|own| codex_own_server_overrides(own, &self.config_sources, home_dir, cwd))
+            .unwrap_or_default()
     }
 }
 
@@ -202,7 +228,14 @@ impl HarnessAdapter for CodexAdapter {
         // and passed in as dispatch input — like Claude. `None` is the
         // first-dispatch case; the adapter captures it from the stream below.
         let prior = codex_locator(agent);
-        let args = build_args(agent, prompt, prior.as_ref().map(|l| l.thread_id.as_str()));
+        let home_dir = resolve_home_dir(self.home_dir_override.as_deref());
+        let overrides = self.own_server_overrides(options.own_mcp_server, &home_dir, cwd);
+        let args = build_args(
+            agent,
+            prompt,
+            prior.as_ref().map(|l| l.thread_id.as_str()),
+            &overrides,
+        );
 
         let mut command = tokio::process::Command::new(&binary);
         command
@@ -234,7 +267,6 @@ impl HarnessAdapter for CodexAdapter {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let agent_id = agent.id;
-        let home_dir = resolve_home_dir(self.home_dir_override.as_deref());
 
         // SessionMeta-emission gate: normally first-dispatch-of-an-agent
         // (no prior locator). The attach flow writes the locator onto the
@@ -296,7 +328,8 @@ impl HarnessAdapter for CodexAdapter {
         // everything up to the three replies.
         let startup_deadline = tokio::time::Instant::now() + self.compaction_startup_bound;
         let binary = crate::subprocess::resolve_binary(&self.codex_binary_path)?;
-        let server = app_server::AppServer::spawn(&binary, Some(cwd))
+        let overrides = self.own_server_overrides(options.own_mcp_server, &home_dir, cwd);
+        let server = app_server::AppServer::spawn(&binary, Some(cwd), &overrides)
             .map_err(|e| crate::subprocess::map_spawn_error(e, cwd))?;
         let requests = compaction::requests(&compaction::CompactionTarget {
             thread_id: &locator.thread_id,
@@ -339,8 +372,14 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 /// `docs/research/archive/codex-cli-observed.md` for the `-C`-on-resume rejection
 /// finding. Positionals (session id, prompt) follow a `--` end-of-options
 /// separator so a prompt beginning with `-` is not misparsed as a flag (verified
-/// against codex-cli 0.136.0).
-fn build_args(agent: &AgentRecord, prompt: &str, resume_thread_id: Option<&str>) -> Vec<String> {
+/// against codex-cli 0.136.0). `overrides` are `-c` pairs, placed with the
+/// other flags before the separator.
+fn build_args(
+    agent: &AgentRecord,
+    prompt: &str,
+    resume_thread_id: Option<&str>,
+    overrides: &[String],
+) -> Vec<String> {
     if let Some(thread_id) = resume_thread_id {
         // Resume subcommand — NO `-C` (rejected by codex 0.130.0). cwd is
         // pinned via `Command::current_dir(cwd)` instead.
@@ -352,6 +391,7 @@ fn build_args(agent: &AgentRecord, prompt: &str, resume_thread_id: Option<&str>)
             "--dangerously-bypass-approvals-and-sandbox".to_owned(),
         ];
         push_selection_flags(&mut args, agent.model.as_deref(), agent.effort.as_deref());
+        args.extend_from_slice(overrides);
         // End-of-options separator so the positionals (session id and,
         // critically, the prompt) are never parsed as flags. Without it a
         // prompt beginning with `-` (e.g. a markdown bullet) makes clap
@@ -376,6 +416,7 @@ fn build_args(agent: &AgentRecord, prompt: &str, resume_thread_id: Option<&str>)
             ".".to_owned(),
         ];
         push_selection_flags(&mut args, agent.model.as_deref(), agent.effort.as_deref());
+        args.extend_from_slice(overrides);
         // End-of-options separator (see the resume branch) — guards the
         // prompt positional against a leading `-`.
         args.push("--".to_owned());
@@ -1212,7 +1253,7 @@ mod tests {
 
     #[test]
     fn build_args_first_turn_omits_resume_and_session_id_and_includes_dash_c() {
-        let args = build_args(&codex_test_agent(), "hello", None);
+        let args = build_args(&codex_test_agent(), "hello", None, &[]);
         assert!(args.contains(&"exec".to_owned()));
         assert!(
             !args.contains(&"resume".to_owned()),
@@ -1249,7 +1290,12 @@ mod tests {
     fn build_args_resume_includes_session_id_and_omits_dash_c() {
         // Verified against codex-cli 0.130.0: `codex exec resume` rejects -C.
         // This test pins the behaviour against regression.
-        let args = build_args(&codex_test_agent(), "hello again", Some(RESUME_THREAD_ID));
+        let args = build_args(
+            &codex_test_agent(),
+            "hello again",
+            Some(RESUME_THREAD_ID),
+            &[],
+        );
         // resume subcommand
         let exec_idx = args
             .iter()
@@ -1293,7 +1339,7 @@ mod tests {
         // branches, sitting after the `--` separator rather than being parsed
         // as a flag.
         for prompt in ["- the left border is cut off", "--help"] {
-            let first = build_args(&codex_test_agent(), prompt, None);
+            let first = build_args(&codex_test_agent(), prompt, None, &[]);
             assert_eq!(first.last(), Some(&prompt.to_owned()));
             assert_eq!(
                 first[first.len() - 2],
@@ -1301,7 +1347,7 @@ mod tests {
                 "prompt is preceded by the `--` separator (first turn); got {first:?}"
             );
 
-            let resume = build_args(&codex_test_agent(), prompt, Some(RESUME_THREAD_ID));
+            let resume = build_args(&codex_test_agent(), prompt, Some(RESUME_THREAD_ID), &[]);
             assert_eq!(resume.last(), Some(&prompt.to_owned()));
             assert_eq!(resume[resume.len() - 2], RESUME_THREAD_ID);
             assert_eq!(
@@ -1318,7 +1364,7 @@ mod tests {
         agent.model = Some("gpt-5.5".to_owned());
         agent.effort = Some("high".to_owned());
 
-        let args = build_args(&agent, "hello", None);
+        let args = build_args(&agent, "hello", None, &[]);
 
         let model_pos = args
             .windows(2)
@@ -1337,7 +1383,7 @@ mod tests {
 
     #[test]
     fn build_args_omits_model_and_effort_when_unset() {
-        let args = build_args(&codex_test_agent(), "hello", None);
+        let args = build_args(&codex_test_agent(), "hello", None, &[]);
         assert!(!args.iter().any(|a| a == "-m"));
         assert!(
             !args
@@ -1352,7 +1398,7 @@ mod tests {
         agent.model = Some("gpt-5.5".to_owned());
         agent.effort = Some("medium".to_owned());
 
-        let args = build_args(&agent, "hello again", Some(RESUME_THREAD_ID));
+        let args = build_args(&agent, "hello again", Some(RESUME_THREAD_ID), &[]);
 
         let sep = args.iter().position(|a| a == "--").unwrap();
         let model_pos = args
@@ -1365,6 +1411,24 @@ mod tests {
             .unwrap();
         assert!(model_pos < sep, "resume: -m before `--`; got {args:?}");
         assert!(effort_pos < sep, "resume: -c before `--`; got {args:?}");
+    }
+
+    #[test]
+    fn build_args_puts_overrides_before_the_separator_on_both_paths() {
+        let overrides = vec![
+            "-c".to_owned(),
+            "mcp_servers.switchboard.enabled=false".to_owned(),
+        ];
+
+        for resume in [None, Some(RESUME_THREAD_ID)] {
+            let args = build_args(&codex_test_agent(), "hello", resume, &overrides);
+            let sep = args.iter().position(|a| a == "--").unwrap();
+            let at = args
+                .windows(2)
+                .position(|w| w == overrides.as_slice())
+                .unwrap_or_else(|| panic!("overrides missing: {args:?}"));
+            assert!(at < sep, "overrides before `--`; got {args:?}");
+        }
     }
 
     #[test]

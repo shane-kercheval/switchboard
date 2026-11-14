@@ -15,7 +15,11 @@
     setAgentAccessEnabled,
     setAgentAccessPort,
   } from "$lib/api";
-  import { CODEX_TOKEN_VARIABLE, agentAccessSnippets } from "$lib/agentAccessSnippets";
+  import {
+    CLAUDE_DESKTOP_ENTRY_NAME,
+    CODEX_TOKEN_VARIABLE,
+    agentAccessSnippets,
+  } from "$lib/agentAccessSnippets";
   import type { AgentAccessStatus } from "$lib/types";
 
   let status = $state<AgentAccessStatus | null>(null);
@@ -203,16 +207,22 @@
           class="bg-raised text-fg overflow-x-auto rounded-md px-3 py-2 font-mono text-[11px] leading-relaxed break-all whitespace-pre-wrap"
           data-testid="agent-access-claude-code">{shownSnippets?.claudeCode}</pre>
         <p>
-          Run this in the folder you'll orchestrate from, and choose a folder that isn't any
-          project's folder. Claude Code's MCP configuration applies per folder, and the agents
-          Switchboard launches run Claude Code in their project's folder, so registering it there
-          would give them these tools too. For the same reason, don't add
-          <span class="font-mono">--scope user</span>.
+          Run this once, in any folder. It registers Switchboard for every folder, in a terminal and
+          in the Claude desktop app's Code tab, and saves the token in your private
+          <span class="font-mono">~/.claude.json</span>. The agents Switchboard starts don't get
+          these tools: Switchboard turns off any server named
+          <span class="font-mono">switchboard</span> or at its address for each of them, so keep the
+          name. An agent's card lists the MCP servers in its configuration, so it can still show
+          <span class="font-mono">switchboard</span> there. Don't use
+          <span class="font-mono">--scope project</span>, which writes the token into a file you
+          might commit.
         </p>
         <p data-testid="agent-access-claude-code-readd">
           After regenerating the token or changing the port, run
-          <span class="font-mono">claude mcp remove switchboard --scope local</span> in that folder first:
-          adding a name that already exists fails.
+          <span class="font-mono">claude mcp remove switchboard --scope user</span> first: adding a
+          name that already exists fails. If you added Switchboard in one folder before, also run
+          <span class="font-mono">claude mcp remove switchboard --scope local</span> in that folder, because
+          that entry takes precedence there.
         </p>
       </Disclosure>
 
@@ -229,10 +239,12 @@
           class="bg-raised text-fg overflow-x-auto rounded-md px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre"
           data-testid="agent-access-codex">{shownSnippets?.codexConfig}</pre>
         <p>
-          Put this in <span class="font-mono">.codex/config.toml</span> inside a folder Codex trusts
-          that isn't any project's folder, not in
-          <span class="font-mono">~/.codex/config.toml</span>, which every Codex agent Switchboard
-          launches reads. Then set the token in the shell you start Codex from with this line:
+          Put this in <span class="font-mono">~/.codex/config.toml</span>, so Codex has Switchboard
+          in every folder. The Codex agents Switchboard starts don't get these tools: Switchboard
+          turns off any server named <span class="font-mono">switchboard</span> or at its address
+          for each of them, so keep the name. An agent's card lists the MCP servers in its
+          configuration, so it can still show <span class="font-mono">switchboard</span> there. Then set
+          the token in the shell you start Codex from with this line:
         </p>
         <div class="flex items-center gap-2">
           <pre
@@ -278,8 +290,16 @@
           <span class="font-mono">which npx</span> in a terminal, and use that path for
           <span class="font-mono">command</span> and its folder for
           <span class="font-mono">PATH</span>. Claude Desktop doesn't read your shell profile, so it
-          needs both spelled out. It works in Chat and in Code with the Local environment; Code in
-          the cloud can't reach your Mac.
+          needs both spelled out. This entry is for the Chat tab, where each wait stops at 50
+          seconds. Under the name <span class="font-mono">{CLAUDE_DESKTOP_ENTRY_NAME}</span>, a Code
+          tab session that also has the Claude Code entry lists both sets of tools, and long waits
+          go through the <span class="font-mono">switchboard</span> ones. Code in the cloud can't reach
+          your Mac.
+        </p>
+        <p data-testid="agent-access-claude-desktop-old-entry">
+          If you set this up before and still have an <span class="font-mono">mcp-remote</span>
+          entry named <span class="font-mono">switchboard</span>, rename it or remove it: the Code
+          tab otherwise calls through it, and each wait stops at 50 seconds.
         </p>
       </Disclosure>
     </div>

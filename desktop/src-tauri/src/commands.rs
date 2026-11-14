@@ -2707,12 +2707,19 @@ async fn create_codex_fork(
         },
         other => other,
     })?;
+    let own_server_overrides = switchboard_harness::codex_own_server_overrides(
+        state.own_mcp_server(),
+        &state.codex_config_sources,
+        home_dir,
+        &project.directory,
+    );
     let created = switchboard_harness::fork_codex_session(
         codex_binary,
         home_dir,
         &project.directory,
         parent_thread_id,
         &source.selection(),
+        &own_server_overrides,
         switchboard_harness::CODEX_FORK_TIMEOUT,
     )
     .await;
@@ -3997,6 +4004,7 @@ pub async fn dispatch_message_impl(
             project_generation: Arc::clone(&state.project_generation),
             generation_at_capture: generation,
             preferences: Arc::clone(&state.preferences),
+            own_mcp_port: Arc::clone(&state.own_mcp_port),
         },
     ));
     // Last point before the hand-off: refuse if the project moved under us while
@@ -4120,6 +4128,7 @@ pub async fn compact_agent_with_impl(
             project_generation: Arc::clone(&state.project_generation),
             generation_at_capture: generation,
             preferences: Arc::clone(&state.preferences),
+            own_mcp_port: Arc::clone(&state.own_mcp_port),
         },
     ));
     // Same last-moment check as a send: refuse if the project moved under us
@@ -4190,6 +4199,7 @@ pub async fn context_report_agent_impl(
             project_generation: Arc::clone(&state.project_generation),
             generation_at_capture: generation,
             preferences: Arc::clone(&state.preferences),
+            own_mcp_port: Arc::clone(&state.own_mcp_port),
         },
     ));
     // Same last-moment check as a send: refuse if the project moved under us
@@ -9074,6 +9084,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_fork_turns_off_the_own_mcp_server_from_both_config_files() {
+        let (_tmp, home, mut state, _project_id) = codex_fork_state();
+        let config = TempDir::new().unwrap();
+        let system_file = config.path().join("system.toml");
+        let codex_home = config.path().join("codex-home");
+        std::fs::create_dir(&codex_home).unwrap();
+        std::fs::write(
+            &system_file,
+            "[mcp_servers.switchboard]\nurl = \"http://127.0.0.1:47821/mcp\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "[mcp_servers.sb_bridge]\ncommand = \"npx\"\nargs = [\"mcp-remote\", \"http://127.0.0.1:47821/mcp\"]\n",
+        )
+        .unwrap();
+        state.codex_config_sources = switchboard_harness::CodexConfigSources {
+            system_file,
+            codex_home: Some(codex_home.into_os_string()),
+        };
+        state
+            .own_mcp_port
+            .store(47821, std::sync::atomic::Ordering::Relaxed);
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let argv_path = config.path().join("argv");
+        let shim = codex_fork_shim(
+            home.path(),
+            home.path(),
+            &format!("printf '%s\\n' \"$@\" > '{}'", argv_path.display()),
+        );
+
+        fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
+            .await
+            .expect("forking an idle Codex agent with a session should succeed");
+
+        let argv: Vec<String> = std::fs::read_to_string(&argv_path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let fork_at = argv
+            .iter()
+            .position(|arg| arg == "fork")
+            .unwrap_or_else(|| panic!("a fork subcommand in {argv:?}"));
+        for flag in [
+            r#"mcp_servers.sb_bridge.command="npx""#,
+            "mcp_servers.sb_bridge.enabled=false",
+            r#"mcp_servers.switchboard.url="http://127.0.0.1:47821/mcp""#,
+            "mcp_servers.switchboard.enabled=false",
+        ] {
+            let at = argv
+                .iter()
+                .position(|arg| arg == flag)
+                .unwrap_or_else(|| panic!("{flag} in {argv:?}"));
+            assert_eq!(argv[at - 1], "-c", "{argv:?}");
+            assert!(at < fork_at, "{flag} before fork: {argv:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn codex_fork_creation_failure_registers_nothing() {
         let (_tmp, home, state, project_id) = codex_fork_state();
         let source_id = seed_codex_source(&state, home.path(), "cx");
@@ -9652,6 +9722,7 @@ mod tests {
                 project_generation: Arc::clone(&state.project_generation),
                 generation_at_capture: generation,
                 preferences: Arc::clone(&state.preferences),
+                own_mcp_port: Arc::clone(&state.own_mcp_port),
             },
         )
     }
@@ -14196,6 +14267,103 @@ mod tests {
         )
         .await;
         assert_eq!(lock(&seen).as_slice(), [false, true, false]);
+    }
+
+    #[tokio::test]
+    async fn every_turn_names_the_own_mcp_server_at_the_current_port() {
+        // Read at dispatch time, like the browser-tools preference: a port
+        // changed in Settings must reach the very next turn.
+        struct OwnServerRecordingAdapter {
+            seen: Arc<Mutex<Vec<Option<switchboard_harness::OwnMcpServer>>>>,
+        }
+
+        #[async_trait]
+        impl HarnessAdapter for OwnServerRecordingAdapter {
+            fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
+                Ok(())
+            }
+            fn version(&self) -> Option<String> {
+                None
+            }
+            async fn dispatch(
+                &self,
+                _agent: &AgentRecord,
+                _cwd: &Path,
+                _prompt: &str,
+                turn_id: switchboard_harness::TurnId,
+                options: switchboard_harness::DispatchOptions,
+            ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError>
+            {
+                lock(&self.seen).push(options.own_mcp_server);
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
+                    turn_id,
+                    outcome: switchboard_harness::TurnOutcome::Completed,
+                    ended_at: chrono::Utc::now(),
+                    usage: None,
+                    context_window_source: None,
+                    stable_message_id: None,
+                    first_message_id: None,
+                    spend: None,
+                    model: None,
+                    effort: None,
+                });
+                Ok(Box::pin(
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+                ))
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(OwnServerRecordingAdapter {
+            seen: Arc::clone(&seen),
+        });
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let proj = create_project_in_only_dir(&state, "alpha");
+        set_active_project_impl(&state, proj.id).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "a",
+            HarnessKind::ClaudeCode,
+            AgentSelection::default(),
+        )
+        .unwrap();
+
+        send_msg(&state, agent.id, "one").await.unwrap();
+        within(
+            &emitter,
+            "turn 1 idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        state
+            .own_mcp_port
+            .store(40_001, std::sync::atomic::Ordering::Relaxed);
+        send_msg(&state, agent.id, "two").await.unwrap();
+        within(
+            &emitter,
+            "turn 2 idle",
+            emitter.wait_for_type("agent_idle", 2),
+        )
+        .await;
+
+        assert_eq!(
+            lock(&seen).as_slice(),
+            [
+                Some(switchboard_harness::OwnMcpServer::new(
+                    crate::mcp::config::DEFAULT_PORT
+                )),
+                Some(switchboard_harness::OwnMcpServer::new(40_001)),
+            ]
+        );
     }
 
     #[tokio::test]

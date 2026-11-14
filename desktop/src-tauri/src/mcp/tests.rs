@@ -15,6 +15,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::{ClientHandler, ServiceExt};
 use serde_json::{Value, json};
 use switchboard_core::{AgentId, ProjectId, SendId};
+use switchboard_harness::HarnessAdapter as _;
 use switchboard_prompts::{InMemorySecretStore, SecretStore};
 use tokio::sync::Notify;
 
@@ -1029,6 +1030,29 @@ async fn regenerating_the_token_refuses_the_old_one_and_ends_open_sessions() {
     access.shut_down().await;
 }
 
+#[tokio::test]
+async fn the_port_agents_are_kept_off_follows_the_saved_setting_and_each_change() {
+    let env = TestEnv::new();
+    let dir = tempfile::TempDir::new().unwrap();
+    let saved = free_port();
+    let (access, _secrets) = access(&env, &dir);
+    access.set_port(saved).await.unwrap();
+    env.state
+        .own_mcp_port
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+
+    let (_relaunched, _secrets) = self::access(&env, &dir);
+    assert_eq!(
+        env.state.own_mcp_server().port,
+        saved,
+        "a launch reads the saved port, whether or not access is on"
+    );
+
+    let moved = free_port();
+    access.set_port(moved).await.unwrap();
+    assert_eq!(env.state.own_mcp_server().port, moved);
+}
+
 #[test]
 fn port_zero_is_refused() {
     let env = TestEnv::new();
@@ -1881,7 +1905,7 @@ async fn max_chars_keeps_a_conversation_under_the_size_asked_for() {
         .await;
     assert!(
         serialized_len(&no_token) <= 45_000,
-        "a client that sends no progress token (Claude Desktop) gets results it shows inline"
+        "a client that sends no progress token (Claude Desktop through mcp-remote) gets results it shows inline"
     );
     assert!(no_token["items_omitted"].as_u64().unwrap() > 0);
 
@@ -2602,8 +2626,8 @@ async fn live_claude_mcp_send_and_wait() {
 async fn live_codex_mcp_send_and_wait() {
     let (env, _project_id, _agent_id) = unopened_project(TestEnv::new());
     let (listener, url) = serve(&env).await;
-    // The documented setup: a `.codex/config.toml` in a folder Codex trusts
-    // (a git repository, trusted explicitly) that is not a project's folder.
+    // A trusted folder's `.codex/config.toml` stands in for the documented
+    // entry in `~/.codex/config.toml`, so the test leaves the user's file alone.
     let folder = tempfile::TempDir::new().unwrap();
     let root = folder.path().canonicalize().unwrap();
     let git = std::process::Command::new("git")
@@ -3145,6 +3169,220 @@ async fn live_claude_mcp_compact() {
 #[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_mcp_compact() {
     live_compact_through_the_server(switchboard_core::HarnessKind::Codex).await;
+}
+
+/// Switchboard's MCP server on a free port, recording the `Host` header of
+/// every request that reaches it, before the bearer check.
+struct RecordingServer {
+    port: u16,
+    hosts: Arc<Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+    _shutdown: server::Shutdown,
+}
+
+impl RecordingServer {
+    async fn start(env: &TestEnv) -> Self {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = server::Shutdown::new();
+        let hosts = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&hosts);
+        let router = server::router(
+            port,
+            TOKEN.to_owned(),
+            env.handle(),
+            env.home(),
+            &shutdown,
+            None,
+        )
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let host = request
+                    .headers()
+                    .get(axum::http::header::HOST)
+                    .and_then(|host| host.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                seen.lock().unwrap().push(host);
+                next.run(request)
+            },
+        ));
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Self {
+            port,
+            hosts,
+            task,
+            _shutdown: shutdown,
+        }
+    }
+
+    fn hosts(&self) -> Vec<String> {
+        self.hosts.lock().unwrap().clone()
+    }
+}
+
+impl Drop for RecordingServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Register four Switchboard servers in `folder`'s `.mcp.json` and enable
+/// them: `switchboard` at `elsewhere` (reachable only by name), two other
+/// names at `own` in each host form (reachable only by address), and a stdio
+/// entry named `switchboard-chat`, the Claude Desktop entry's name, that
+/// creates `chat_marker` when it starts.
+fn register_own_servers(
+    folder: &std::path::Path,
+    own: u16,
+    elsewhere: u16,
+    chat_marker: &std::path::Path,
+) {
+    let entry = |url: String| json!({ "type": "http", "url": url, "headers": { "Authorization": format!("Bearer {TOKEN}") } });
+    std::fs::write(
+        folder.join(".mcp.json"),
+        json!({ "mcpServers": {
+            "switchboard": entry(format!("http://127.0.0.1:{elsewhere}/mcp")),
+            "sb_ip": entry(format!("http://127.0.0.1:{own}/mcp")),
+            "sb_localhost": entry(format!("http://localhost:{own}/mcp")),
+            "switchboard-chat": {
+                "type": "stdio",
+                "command": "sh",
+                "args": ["-c", format!("touch '{}'", chat_marker.display())],
+            },
+        } })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir(folder.join(".claude")).unwrap();
+    std::fs::write(
+        folder.join(".claude/settings.json"),
+        json!({ "enableAllProjectMcpServers": true }).to_string(),
+    )
+    .unwrap();
+}
+
+/// A Claude agent on Haiku, created through the command layer.
+fn haiku_agent(env: &TestEnv, project_id: ProjectId, name: &str) -> switchboard_core::AgentRecord {
+    crate::commands::create_agent_in_project_impl(
+        &env.state,
+        project_id,
+        name,
+        switchboard_core::HarnessKind::ClaudeCode,
+        switchboard_core::AgentSelection {
+            model: Some("haiku".to_owned()),
+            ..switchboard_core::AgentSelection::default()
+        },
+    )
+    .unwrap()
+}
+
+/// One turn dispatched straight to the Claude adapter with default options,
+/// so nothing is turned off; returns how it ended.
+async fn dispatch_without_the_block(
+    agent: &switchboard_core::AgentRecord,
+    folder: &std::path::Path,
+) -> Option<switchboard_harness::TurnOutcome> {
+    let mut stream = switchboard_harness::ClaudeCodeAdapter::new()
+        .dispatch(
+            agent,
+            folder,
+            "Reply with only the word ack.",
+            uuid::Uuid::now_v7(),
+            switchboard_harness::DispatchOptions::default(),
+        )
+        .await
+        .unwrap();
+    let mut outcome = None;
+    while let Some(event) = futures::StreamExt::next(&mut stream).await {
+        if let switchboard_harness::AdapterEvent::TurnEnd { outcome: end, .. } = event {
+            outcome = Some(end);
+        }
+    }
+    outcome
+}
+
+/// An agent Switchboard starts never connects to Switchboard's own server,
+/// registered in the project folder by either name or at this instance's
+/// address in either host form; the same folder dispatched without the block
+/// starts all four entries.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_agents_switchboard_starts_never_reach_its_own_server() {
+    let mut env = TestEnv::live();
+    let own = RecordingServer::start(&env).await;
+    let elsewhere = RecordingServer::start(&env).await;
+    env.state
+        .own_mcp_port
+        .store(own.port, std::sync::atomic::Ordering::Relaxed);
+    let project_id = env.project("p");
+    let folder = crate::state::lock(&env.state.projects)
+        .get(&project_id)
+        .unwrap()
+        .directory
+        .clone();
+    let markers = tempfile::TempDir::new().unwrap();
+    let chat_marker = markers.path().join("switchboard-chat-started");
+    register_own_servers(&folder, own.port, elsewhere.port, &chat_marker);
+    let worker = haiku_agent(&env, project_id, "worker").id;
+    let control = haiku_agent(&env, project_id, "control");
+
+    let (router, _shutdown) = in_process(&env);
+    let session = open_session(&router).await;
+    let (is_error, receipt) = call_in_process(
+        &router,
+        &session,
+        2,
+        "send",
+        &json!({ "project_id": project_id, "recipients": [worker], "text": "Reply with only the word ack." }),
+    )
+    .await;
+    assert!(!is_error, "{receipt}");
+    let (is_error, waited) = call_in_process(
+        &router,
+        &session,
+        3,
+        "wait_send",
+        &json!({ "project_id": project_id, "send_id": receipt["result"]["send_id"], "timeout_seconds": 180 }),
+    )
+    .await;
+    assert!(!is_error, "{waited}");
+    assert_eq!(waited["result"]["done"], true, "{waited}");
+    assert_eq!(
+        waited["result"]["recipients"][0]["status"], "completed",
+        "{waited}"
+    );
+    assert_eq!(own.hosts(), Vec::<String>::new(), "by address");
+    assert_eq!(elsewhere.hosts(), Vec::<String>::new(), "by name");
+    assert!(!chat_marker.exists(), "by the Claude Desktop entry's name");
+
+    let outcome = dispatch_without_the_block(&control, &folder).await;
+    assert!(
+        matches!(outcome, Some(switchboard_harness::TurnOutcome::Completed)),
+        "{outcome:?}"
+    );
+    let hosts = own.hosts();
+    for host in [
+        format!("127.0.0.1:{}", own.port),
+        format!("localhost:{}", own.port),
+    ] {
+        assert!(
+            hosts.contains(&host),
+            "without the block, {host} is reached: {hosts:?}"
+        );
+    }
+    assert!(
+        !elsewhere.hosts().is_empty(),
+        "without the block, the entry named switchboard is reached"
+    );
+    assert!(
+        chat_marker.exists(),
+        "without the block, the entry named switchboard-chat starts"
+    );
 }
 
 /// The words in `text` shaped like a tool name: a tool's verb prefix, less

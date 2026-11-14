@@ -2,6 +2,13 @@
 //! Code, Codex, Claude Desktop) can run the operations the user runs from the
 //! keyboard. The tools are thin wrappers over [`crate::ops`].
 //!
+//! **Not for the agents Switchboard starts.** The Claude Code and Codex
+//! adapters turn off any configured server named `switchboard` or at this
+//! port for every run (`switchboard_harness::own_mcp`), so a user who
+//! registers the server for their own sessions doesn't hand it to every agent.
+//! That guards against accidents only: an agent with a shell can still reach
+//! the port.
+//!
 //! **Off by default, and local only.** Nothing listens until the user turns
 //! agent access on in Settings, and the listener binds `127.0.0.1`. Turning
 //! it off stops the listener at once, even with clients connected; agent
@@ -28,6 +35,7 @@ mod tests;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use serde::Serialize;
 use switchboard_prompts::SecretStore;
@@ -85,6 +93,10 @@ impl AgentAccess {
         home: PathBuf,
     ) -> Self {
         let config = config_path.as_deref().map(config::load).unwrap_or_default();
+        handle
+            .app_state()
+            .own_mcp_port
+            .store(config.port, Ordering::Relaxed);
         Self {
             config_path,
             secrets,
@@ -158,6 +170,10 @@ impl AgentAccess {
             ..inner.config
         })?;
         inner.config.port = port;
+        self.handle
+            .app_state()
+            .own_mcp_port
+            .store(port, Ordering::Relaxed);
         tracing::info!(port, "agent access port changed");
         Self::stop(&mut inner).await;
         if inner.config.enabled {

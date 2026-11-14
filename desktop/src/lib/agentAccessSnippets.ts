@@ -3,8 +3,15 @@
 /// client (`docs/research/mcp-client-behavior.md`).
 
 /// The environment variable the Codex configuration reads the token from, so
-/// the token stays out of the folder's config file.
+/// the token stays out of `~/.codex/config.toml`.
 export const CODEX_TOKEN_VARIABLE = "SWITCHBOARD_TOKEN";
+
+/// The name of the Claude Desktop entry. Not `switchboard`: the Code tab reads
+/// Claude Desktop's config too, and with two entries of one name it calls
+/// through this one, whose waits stop at 50 seconds. Claude Code agents that
+/// Switchboard starts deny this name, so it must equal `CLAUDE_DESKTOP_ENTRY_NAME`
+/// in `crates/harness/src/own_mcp.rs`.
+export const CLAUDE_DESKTOP_ENTRY_NAME = "switchboard-chat";
 
 /// The `mcp-remote` release Claude Desktop was measured with. Pinned so an
 /// update to the bridge cannot change behavior under the user.
@@ -18,9 +25,10 @@ export type AgentAccessSnippets = {
 };
 
 export function agentAccessSnippets(url: string, token: string): AgentAccessSnippets {
-  // Default (local) scope: the token goes into the user's private
-  // `~/.claude.json`, never into a project's committed `.mcp.json`.
-  const claudeCode = `claude mcp add --transport http switchboard ${url} --header "Authorization: Bearer ${token}"`;
+  // User scope: one entry for every folder, with the token in the user's
+  // private `~/.claude.json`, never in a project's committed `.mcp.json`.
+  // Agents Switchboard starts don't get it: dispatch turns the entry off.
+  const claudeCode = `claude mcp add --scope user --transport http switchboard ${url} --header "Authorization: Bearer ${token}"`;
   const codexConfig = [
     "[mcp_servers.switchboard]",
     `url = "${url}"`,
@@ -32,7 +40,7 @@ export function agentAccessSnippets(url: string, token: string): AgentAccessSnip
   const claudeDesktop = JSON.stringify(
     {
       mcpServers: {
-        switchboard: {
+        [CLAUDE_DESKTOP_ENTRY_NAME]: {
           command: "/absolute/path/to/npx",
           // The header goes through `env` because Claude Desktop does not
           // escape the space in "Bearer <token>" inside `args`.

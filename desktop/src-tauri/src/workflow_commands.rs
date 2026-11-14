@@ -125,6 +125,7 @@ impl ProjectDispatchFactoryProvider {
                     project_generation: Arc::clone(&state.project_generation),
                     generation_at_capture: generation,
                     preferences: Arc::clone(&state.preferences),
+                    own_mcp_port: Arc::clone(&state.own_mcp_port),
                 },
             );
             factories.insert(

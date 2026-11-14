@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId, SessionLocator};
@@ -24,7 +25,7 @@ use switchboard_dispatcher::{
     MetadataCache, PreflightRefusal, SelectionSnapshot, SessionLocatorSink, TurnPermit,
 };
 use switchboard_harness::MessageFailureKind;
-use switchboard_harness::{DispatchOptions, HarnessAdapter};
+use switchboard_harness::{DispatchOptions, HarnessAdapter, OwnMcpServer};
 
 use crate::emitter::SessionMetaObservingEmitter;
 use crate::journal::ProjectJournal;
@@ -81,6 +82,9 @@ pub struct ProjectDispatchContextFactory {
     /// User-global preferences, read live at `build()` so the browser-tools
     /// toggle takes effect on an agent's next turn.
     preferences: Arc<Mutex<Preferences>>,
+    /// This instance's MCP server port, read live at `build()` like
+    /// `preferences`, so a port change applies to an agent's next turn.
+    own_mcp_port: Arc<AtomicU16>,
 }
 
 /// The app-wide handles every dispatch context needs, grouped so the factory's
@@ -112,6 +116,8 @@ pub struct DispatchDeps {
     pub generation_at_capture: u64,
     /// Read live per dispatch (browser-tools toggle), never frozen at enqueue.
     pub preferences: Arc<Mutex<Preferences>>,
+    /// Read live per dispatch: the MCP server port every agent run turns off.
+    pub own_mcp_port: Arc<AtomicU16>,
 }
 
 /// The refusal a preflight error becomes on the wire: the error's own text, and
@@ -143,6 +149,7 @@ impl ProjectDispatchContextFactory {
             project_generation,
             generation_at_capture,
             preferences,
+            own_mcp_port,
         } = deps;
         Self {
             project,
@@ -159,6 +166,7 @@ impl ProjectDispatchContextFactory {
             project_generation,
             generation_at_capture,
             preferences,
+            own_mcp_port,
         }
     }
 
@@ -346,6 +354,7 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
         let options = DispatchOptions {
             is_first_dispatch_after_attach,
             chrome_integration,
+            own_mcp_server: Some(OwnMcpServer::new(self.own_mcp_port.load(Ordering::Relaxed))),
             // The dispatcher overwrites `cancel_token` with the turn's token.
             ..Default::default()
         };

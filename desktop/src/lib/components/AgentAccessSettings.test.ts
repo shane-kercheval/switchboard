@@ -103,7 +103,7 @@ describe("AgentAccessSettings", () => {
     expect(screen.getByTestId("agent-access-claude-desktop")).toBeVisible();
 
     expect(screen.getByTestId("agent-access-claude-code")).toHaveTextContent(
-      `claude mcp add --transport http switchboard http://127.0.0.1:47822/mcp --header "Authorization: Bearer ${TOKEN}"`,
+      `claude mcp add --scope user --transport http switchboard http://127.0.0.1:47822/mcp --header "Authorization: Bearer ${TOKEN}"`,
     );
     expect(screen.getByTestId("agent-access-codex")).toHaveTextContent(
       'url = "http://127.0.0.1:47822/mcp"',
@@ -116,6 +116,23 @@ describe("AgentAccessSettings", () => {
     );
   });
 
+  it("names the Claude Desktop entry apart from the Claude Code one and tells earlier users to rename theirs", async () => {
+    // The Code tab reads both configs; with two entries named `switchboard`
+    // it calls through the `mcp-remote` one, whose waits stop at 50 seconds.
+    backend = listening();
+    render(AgentAccessSettings);
+    await openClientSetup();
+    expect(screen.getByTestId("agent-access-claude-desktop")).toHaveTextContent(
+      '"switchboard-chat": {',
+    );
+    expect(screen.getByTestId("agent-access-claude-desktop")).not.toHaveTextContent(
+      '"switchboard": {',
+    );
+    expect(screen.getByTestId("agent-access-claude-desktop-old-entry")).toHaveTextContent(
+      "still have an mcp-remote entry named switchboard, rename it or remove it",
+    );
+  });
+
   it("tells Codex users to keep the token in a private file and Claude Code users to remove before re-adding", async () => {
     backend = listening();
     render(AgentAccessSettings);
@@ -123,9 +140,9 @@ describe("AgentAccessSettings", () => {
     expect(screen.getByTestId("agent-access-codex-token-file")).toHaveTextContent(
       "chmod 600 ~/.switchboard-token",
     );
-    expect(screen.getByTestId("agent-access-claude-code-readd")).toHaveTextContent(
-      "claude mcp remove switchboard --scope local",
-    );
+    const readd = screen.getByTestId("agent-access-claude-code-readd");
+    expect(readd).toHaveTextContent("claude mcp remove switchboard --scope user");
+    expect(readd).toHaveTextContent("claude mcp remove switchboard --scope local");
   });
 
   it("copies the token itself, not the masked text", async () => {

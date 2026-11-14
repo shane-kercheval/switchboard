@@ -163,6 +163,13 @@ pub struct DispatchOptions {
     /// `Default` (a fresh, never-fired token) is just a harmless placeholder
     /// for direct callers.
     pub cancel_token: CancellationToken,
+
+    /// Switchboard's own MCP server, which this run must not connect to (see
+    /// [`crate::own_mcp`]). The Claude Code and Codex adapters turn off any
+    /// configured server with its name or address; Antigravity has no per-run
+    /// way to do so and ignores it. `None` turns nothing off; the app always
+    /// sets it.
+    pub own_mcp_server: Option<crate::OwnMcpServer>,
 }
 
 /// Implemented by each harness (`ClaudeCode`, Codex, ...). Returns a stream of

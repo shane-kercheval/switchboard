@@ -118,16 +118,23 @@ impl AppServer {
     /// `cwd` is the process's working directory, or `None` to inherit the
     /// app's. The quota read belongs to no project and passes `None`; a
     /// compaction runs in the agent's working directory, as its turns do.
+    /// `overrides` are `-c` pairs for `app-server`, which takes them as `exec`
+    /// does.
     ///
     /// # Errors
     ///
     /// The spawn's own error. Callers map it, because what a `NotFound` means
     /// depends on whether they set a working directory
     /// (`subprocess::map_spawn_error`).
-    pub(crate) fn spawn(binary: &Path, cwd: Option<&Path>) -> std::io::Result<Self> {
+    pub(crate) fn spawn(
+        binary: &Path,
+        cwd: Option<&Path>,
+        overrides: &[String],
+    ) -> std::io::Result<Self> {
         let mut command = tokio::process::Command::new(binary);
         command
             .arg("app-server")
+            .args(overrides)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

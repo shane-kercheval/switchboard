@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome};
+use crate::own_mcp::{CLAUDE_DESKTOP_ENTRY_NAME, OWN_MCP_SERVER_NAME, OwnMcpServer};
 use crate::parser::{self, ParseOutcome, ParserState, StreamMode, UsageSeed};
 
 /// Adapter for Claude Code (`claude -p`). Spawns a `claude` subprocess,
@@ -193,6 +194,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             chrome: options.chrome_integration,
             home: home.as_deref(),
             grants: &self.working_directory_grants,
+            own_mcp_server: options.own_mcp_server,
         });
 
         spawn_stream(
@@ -255,6 +257,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             chrome: options.chrome_integration,
             home: home.as_deref(),
             grants: &self.working_directory_grants,
+            own_mcp_server: options.own_mcp_server,
         });
         spawn_stream(
             &binary,
@@ -313,6 +316,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             chrome: options.chrome_integration,
             home: home.as_deref(),
             grants: &self.working_directory_grants,
+            own_mcp_server: options.own_mcp_server,
         });
         spawn_stream(
             &binary,
@@ -488,6 +492,35 @@ struct BuildArgsInput<'a> {
     home: Option<&'a Path>,
     /// Emitted as `--add-dir` entries (see [`root_grant`]).
     grants: &'a [PathBuf],
+    /// Turned off for this run through `--settings` (see [`own_server_settings`]).
+    own_mcp_server: Option<OwnMcpServer>,
+}
+
+/// The `--settings` JSON that keeps a run off Switchboard's own MCP server.
+///
+/// `deniedMcpServers` merges across every settings source, the flag included,
+/// and a denied server is never started, so the run gets neither its tools nor
+/// its instructions. Each entry takes one matcher: the names catch the entries
+/// the setup copy produces, the Claude Desktop one included, and the URL
+/// patterns catch an HTTP entry renamed by the user. A stdio bridge to the
+/// server (`mcp-remote`) under another name is not caught.
+/// `--disallowedTools` is not a substitute: it hides the tools but the server
+/// still connects and its instructions still reach the model. Verified @ 2.1.321
+/// on a turn, a resume, a fork, and `/context`, with entries from a folder's
+/// `.mcp.json` and from `~/.claude.json`. Compaction passes the same arguments
+/// as a turn, which `maintenance_argv_matches_send_argv_except_the_positional`
+/// tests.
+fn own_server_settings(own: OwnMcpServer) -> String {
+    let mut denied = vec![
+        serde_json::json!({ "serverName": OWN_MCP_SERVER_NAME }),
+        serde_json::json!({ "serverName": CLAUDE_DESKTOP_ENTRY_NAME }),
+    ];
+    denied.extend(
+        own.url_patterns()
+            .into_iter()
+            .map(|pattern| serde_json::json!({ "serverUrl": pattern })),
+    );
+    serde_json::json!({ "deniedMcpServers": denied }).to_string()
 }
 
 fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
@@ -498,6 +531,7 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
         chrome,
         home,
         grants,
+        own_mcp_server,
     } = *input;
     let mut args = vec![
         "-p".to_owned(),
@@ -599,6 +633,12 @@ fn build_args(input: &BuildArgsInput<'_>) -> Vec<String> {
     for grant in grants {
         args.push("--add-dir".to_owned());
         args.push(grant.to_string_lossy().into_owned());
+    }
+    // Claude Code takes one `--settings`: merge any other setting into this
+    // object, since a second flag would replace the deny list.
+    if let Some(own) = own_mcp_server {
+        args.push("--settings".to_owned());
+        args.push(own_server_settings(own));
     }
     // `claude -p` takes the prompt as a positional. Pass it last, after a `--`
     // end-of-options separator, so a prompt beginning with `-` (e.g. a markdown
@@ -1058,6 +1098,7 @@ mod tests {
             chrome: false,
             home: Some(home),
             grants: root_grant(),
+            own_mcp_server: Some(OwnMcpServer::new(47821)),
         }
     }
 
@@ -1798,6 +1839,78 @@ mod tests {
             chrome < sep,
             "--chrome after the separator lands as a positional alongside the prompt: {args:?}"
         );
+    }
+
+    #[test]
+    fn build_args_denies_the_own_mcp_server_by_both_names_and_both_host_forms() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::now_v7());
+
+        let args = build_args(&BuildArgsInput {
+            own_mcp_server: Some(OwnMcpServer::new(47822)),
+            ..input(&agent, project.path(), home.path())
+        });
+
+        let settings = flag_at(&args, "--settings");
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        assert!(
+            settings < sep,
+            "--settings after the separator lands as a positional alongside the prompt: {args:?}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&args[settings + 1]).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({ "deniedMcpServers": [
+                { "serverName": "switchboard" },
+                { "serverName": "switchboard-chat" },
+                { "serverUrl": "http://127.0.0.1:47822/*" },
+                { "serverUrl": "http://localhost:47822/*" },
+            ]})
+        );
+    }
+
+    #[test]
+    fn build_args_denies_the_own_mcp_server_on_first_turn_resume_and_fork() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let fresh = agent_with_session(Uuid::now_v7());
+        let resumed = agent_with_session(Uuid::now_v7());
+        if let Some(SessionLocator::Uuid(id)) = resumed.session_locator {
+            materialize_session(home.path(), project.path(), id);
+        }
+        let fork = AgentRecord {
+            forked_from_session: Some(Uuid::now_v7()),
+            ..agent_with_session(Uuid::now_v7())
+        };
+
+        for (agent, arm) in [
+            (&fresh, "--session-id"),
+            (&resumed, "--resume"),
+            (&fork, "--fork-session"),
+        ] {
+            let args = build_args(&input(agent, project.path(), home.path()));
+            assert!(args.contains(&arm.to_owned()), "{arm}: {args:?}");
+            assert_eq!(
+                args.iter().filter(|arg| *arg == "--settings").count(),
+                1,
+                "{arm}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_args_passes_no_settings_without_an_own_server() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::now_v7());
+
+        let args = build_args(&BuildArgsInput {
+            own_mcp_server: None,
+            ..input(&agent, project.path(), home.path())
+        });
+
+        assert!(!args.contains(&"--settings".to_owned()), "{args:?}");
     }
 
     #[test]

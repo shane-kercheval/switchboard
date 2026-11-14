@@ -19,6 +19,7 @@ pub mod facets;
 pub mod forward;
 pub mod meta_sidecar;
 pub mod mock;
+pub mod own_mcp;
 mod parser;
 pub mod resume;
 pub mod subprocess;
@@ -41,7 +42,7 @@ pub use codex::fork::{CODEX_FORK_TIMEOUT, CodexForkError, fork_codex_session};
 pub use codex::session_file::{
     AttachLookupError, find_codex_session_file_for_attach, load_codex_transcript,
 };
-pub use codex::{CodexAdapter, CodexLocator};
+pub use codex::{CodexAdapter, CodexConfigSources, CodexLocator, codex_own_server_overrides};
 pub use context_report::{ContextCategory, ContextItem, ContextReport};
 pub use events::{
     AdapterEvent, AnnouncedSendKind, CancelSource, ContentKind, ContextWindowSource, FailureKind,
@@ -58,6 +59,7 @@ pub use forward::{
     is_forwardable_text, latest_completed_agent_text, turn_answer_text,
 };
 pub use mock::{MockHarnessAdapter, MockScenario};
+pub use own_mcp::{OWN_MCP_SERVER_NAME, OwnMcpServer};
 pub use resume::interactive_resume_command;
 pub use transcript::{
     CompactedContext, InheritedHistoryGap, LoadTranscriptError, LoadedTranscript, ParseWarning,

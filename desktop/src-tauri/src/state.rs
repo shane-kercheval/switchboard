@@ -4,11 +4,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId, SendId, Store};
 use switchboard_dispatcher::{Dispatcher, EventEmitter};
-use switchboard_harness::HarnessAdapter;
+use switchboard_harness::{CodexConfigSources, HarnessAdapter, OwnMcpServer};
 use switchboard_prompts::PromptService;
 use switchboard_workflow::WorkflowStepInfo;
 use tokio_util::sync::CancellationToken;
@@ -554,6 +555,11 @@ pub struct AppState {
     /// (browser-tools toggle), rather than freezing the value at enqueue.
     pub preferences: Arc<Mutex<Preferences>>,
 
+    /// The port of this instance's MCP server (see [`crate::mcp`]), kept current
+    /// by `AgentAccess` and read per dispatch so every agent run turns that
+    /// server off. Holds the configured port whether or not the server listens.
+    pub own_mcp_port: Arc<AtomicU16>,
+
     /// Resolved path of `config.yaml`, or `None` when no global location was
     /// resolved (tests, exotic host). `set_preferences` errors-as-noop persist
     /// while this is `None`, so tests never touch user-global state.
@@ -639,6 +645,10 @@ pub struct AppState {
     /// login-shell PATH as every harness call is. A path so a test can point
     /// it at a stand-in; production keeps the default.
     pub codex_binary: PathBuf,
+    /// Where a fork's own-server lookup finds Codex's config files. Test
+    /// states point it into their own temp directory, so no test reads the
+    /// developer's `/etc/codex/config.toml` or `CODEX_HOME`.
+    pub codex_config_sources: CodexConfigSources,
     /// The *kind* of the last account-usage failure, so a persistent one is
     /// logged on change rather than on repeat.
     ///
@@ -678,6 +688,17 @@ fn production_codex_read(
         )
         .await
     })
+}
+
+/// A test state's Codex config sources: a system file that doesn't exist, and
+/// no `CODEX_HOME`, so a fork reads only `<home>/.codex/config.toml` under the
+/// home the test passes.
+#[cfg(test)]
+fn test_codex_config_sources(locks: &tempfile::TempDir) -> CodexConfigSources {
+    CodexConfigSources {
+        system_file: locks.path().join("etc-codex-config.toml"),
+        codex_home: None,
+    }
 }
 
 impl AppState {
@@ -730,6 +751,7 @@ impl AppState {
             harness_usage: Mutex::new(HarnessUsage::default()),
             harness_usage_path: None,
             preferences: Arc::new(Mutex::new(Preferences::default())),
+            own_mcp_port: Arc::new(AtomicU16::new(crate::mcp::config::DEFAULT_PORT)),
             preferences_path: None,
             prompts: PromptService::disabled(),
             forwards: Mutex::new(HashMap::new()),
@@ -746,6 +768,7 @@ impl AppState {
             // through this seam; production overrides it in `run`.
             spawns_real_harnesses: false,
             codex_binary: PathBuf::from("codex"),
+            codex_config_sources: CodexConfigSources::from_env(),
             last_account_usage_failure: Mutex::new(None),
             context,
             codex_usage_reader: Arc::new(CodexUsageReader::new(Arc::new(production_codex_read))),
@@ -779,6 +802,7 @@ impl AppState {
             store,
             locks.path().to_path_buf(),
         );
+        state.codex_config_sources = test_codex_config_sources(&locks);
         state.store_tmp = Some(root);
         state.lock_tmp = Some(locks);
         state
@@ -805,8 +829,14 @@ impl AppState {
             store,
             locks.path().to_path_buf(),
         );
+        state.codex_config_sources = test_codex_config_sources(&locks);
         state.lock_tmp = Some(locks);
         state
+    }
+
+    /// This instance's MCP server, for a harness call made outside a dispatch.
+    pub fn own_mcp_server(&self) -> OwnMcpServer {
+        OwnMcpServer::new(self.own_mcp_port.load(Ordering::Relaxed))
     }
 
     /// Builder step that injects the production notifier. Production calls this

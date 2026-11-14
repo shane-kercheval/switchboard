@@ -562,8 +562,9 @@ struct RecipientEntry {
     status: SendStatus,
     /// From the recipient's own `turn_start`.
     started_at: Option<DateTime<Utc>>,
-    /// From its `turn_end`, or the `message_failed` or `message_cancelled`
-    /// of a message that ended before its turn started.
+    /// From its `turn_end`, the `message_failed` or `message_cancelled` of a
+    /// message that ended before its turn started, or the moment a cancel
+    /// stopped it before the send offered it to its agent.
     ended_at: Option<DateTime<Utc>>,
     text: Option<String>,
     error: Option<String>,
@@ -1164,6 +1165,7 @@ impl SendLedger {
         {
             recipient.dispatch = SendStatus::Cancelled;
             recipient.status = SendStatus::Cancelled;
+            recipient.ended_at = Some(Utc::now());
         }
         drop(inner);
         self.bump();
@@ -1193,6 +1195,7 @@ impl SendLedger {
                 if recipient.dispatch == SendStatus::NotDispatched {
                     recipient.dispatch = SendStatus::Cancelled;
                     recipient.status = SendStatus::Cancelled;
+                    recipient.ended_at = Some(Utc::now());
                 }
             }
         }
@@ -3106,6 +3109,61 @@ mod tests {
                 (SendStatus::Rejected, TurnTimes::default()),
                 (SendStatus::NotDispatched, TurnTimes::default()),
             ]
+        );
+    }
+
+    #[test]
+    fn a_recipient_cancelled_before_it_was_offered_ends_at_the_cancel() {
+        let ledger = SendLedger::new();
+        let project_id = Uuid::now_v7();
+        let (named, rest) = (Uuid::now_v7(), Uuid::now_v7());
+        let Claim::Fresh { send_id } = ledger.claim(project_id, None, "h") else {
+            panic!("fresh");
+        };
+        ledger.register_send(
+            send_id,
+            project_id,
+            &[named, rest],
+            CancellationToken::new(),
+        );
+        let before = Utc::now();
+        ledger.cancel_recipient_undispatched(send_id, named);
+        ledger.cancel_undispatched(send_id);
+        let after = Utc::now();
+        let ended: Vec<DateTime<Utc>> = ledger
+            .send(send_id)
+            .unwrap()
+            .recipients
+            .iter()
+            .map(|recipient| {
+                assert_eq!(recipient.status, SendStatus::Cancelled);
+                let ended = recipient.times.ended_at.expect("ended at the cancel");
+                assert!(before <= ended && ended <= after, "{:?}", recipient.times);
+                assert_eq!(
+                    recipient.times,
+                    TurnTimes {
+                        ended_at: Some(ended),
+                        ..TurnTimes::default()
+                    },
+                    "it never started"
+                );
+                ended
+            })
+            .collect();
+
+        ledger.cancel_recipient_undispatched(send_id, named);
+        ledger.cancel_undispatched(send_id);
+        let again: Vec<Option<DateTime<Utc>>> = ledger
+            .send(send_id)
+            .unwrap()
+            .recipients
+            .iter()
+            .map(|recipient| recipient.times.ended_at)
+            .collect();
+        assert_eq!(
+            again,
+            ended.into_iter().map(Some).collect::<Vec<_>>(),
+            "a repeated cancel keeps the first time"
         );
     }
 

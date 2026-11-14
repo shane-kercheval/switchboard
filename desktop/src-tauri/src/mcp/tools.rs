@@ -141,12 +141,12 @@ again. In Codex, stay under 300 seconds unless the user raised tool_timeout_sec.
 const TIMES_NOTE: &str = "\
 Times: now, at the top level, is when the result was made. A recipient whose turn started \
 carries started_at; while running, running_seconds (the whole turn so far); once ended, \
-ended_at, duration_seconds, and seconds_since_ended (to now). Spans are whole seconds. Left out \
-where Switchboard does not know them: a completed recipient with source journal (a message \
-typed in the window always is) and a started one carry started_at only, since the journal \
-records no end for a completed turn; one cancelled while waiting in line, or that failed before \
-its turn started, has ended_at but no started_at or duration_seconds; accepted, rejected, and \
-not_dispatched carry none.";
+ended_at, duration_seconds, and seconds_since_ended (to now). Spans are whole seconds, rounded \
+down. Left out where Switchboard does not know them: a recipient with status completed or \
+started and source journal carries started_at only, since the journal records no end for a \
+completed turn (a message typed in the window always has source journal); with source live, \
+one cancelled or failed before its turn started has ended_at but no started_at or \
+duration_seconds; accepted, rejected, and not_dispatched carry none.";
 
 /// What a finished wait's `usage` is, shared by every wait's description.
 const USAGE_NOTE: &str = "\

@@ -2928,6 +2928,21 @@ async fn cancelling_a_forward_while_it_waits_on_a_source_dispatches_nothing() {
         .unwrap()
         .unwrap();
     assert_eq!(receipt.recipients[0].status, SendStatus::Cancelled);
+    let reply = look_now(&env, project_id, send_id).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Cancelled);
+    let ended = reply.recipients[0]
+        .times
+        .ended_at
+        .expect("the recipient ended when the send was cancelled");
+    assert_eq!(
+        reply.recipients[0].times,
+        TurnTimes {
+            ended_at: Some(ended),
+            seconds_since_ended: Some(whole_seconds(ended, reply.now.unwrap())),
+            ..TurnTimes::default()
+        },
+        "a recipient cancelled before it was offered never started"
+    );
     gate.notify_waiters();
     wait_agent(
         &env.state,
@@ -11758,6 +11773,8 @@ async fn wait_send_reports_when_each_recipients_turn_started_and_ended() {
     await_open_turn(&env, running_agent, running).await;
     await_open_turn(&env, cancelled_agent, cancelled).await;
     let in_line = send_alone(&env, project_id, running_agent, OnBusyPolicy::Queue).await;
+    env.adapter.push_for(running_agent, Script::reply("later"));
+    let later = send_alone(&env, project_id, running_agent, OnBusyPolicy::Queue).await;
 
     let completed_live = ended_times(&wait_done(&env, project_id, completed).await);
     let reply = wait_done(&env, project_id, failed).await;
@@ -11830,6 +11847,13 @@ async fn wait_send_reports_when_each_recipients_turn_started_and_ended() {
 
     gate.notify_waiters();
     let running_live = wait_done(&env, project_id, running).await.recipients[0].times;
+    let reply = wait_done(&env, project_id, later).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Completed);
+    assert!(
+        ended_times(&reply).started_at >= running_live.ended_at,
+        "a queued message's turn starts when it leaves the line, after the turn ahead of it: \
+         {reply:?}, {running_live:?}"
+    );
     let env = env.restart();
 
     for (send_id, live) in [(completed, completed_live), (running, running_live)] {
@@ -11970,6 +11994,136 @@ async fn the_journal_fallback_reports_the_times_the_journal_holds() {
     assert!(
         reply.now.is_some(),
         "even an unknown send's reply says when"
+    );
+}
+
+/// One send to two agents, read back from the journal: each agent gets the
+/// times of its own turn, a completed turn its start only and a failed one its
+/// own start and end.
+#[tokio::test]
+async fn the_journal_gives_each_recipient_of_a_send_its_own_times() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("proj");
+    let completes = env.agent(project_id, "completes");
+    let fails = env.agent(project_id, "fails");
+    // The send predates the seeded turn, which is stamped now, so the turn
+    // falls inside its send's dispatch window as a real turn would.
+    let first_start = Utc::now() - chrono::Duration::minutes(2);
+    let second_start = first_start + chrono::Duration::seconds(30);
+    let end = second_start + chrono::Duration::seconds(12);
+    let send_id = Uuid::now_v7();
+    let (completed_turn, failed_turn) = (Uuid::now_v7(), Uuid::now_v7());
+    let journal = env.journal_path(project_id);
+    for record in [
+        JournalRecord::Send {
+            send_id,
+            turn_id: completed_turn,
+            agent_id: completes,
+            prompt: "hi".to_owned(),
+            attachments: Vec::new(),
+            at: first_start,
+        },
+        JournalRecord::Send {
+            send_id,
+            turn_id: failed_turn,
+            agent_id: fails,
+            prompt: "hi".to_owned(),
+            attachments: Vec::new(),
+            at: second_start,
+        },
+        JournalRecord::TurnLink {
+            send_id,
+            turn_id: completed_turn,
+            agent_id: completes,
+            hydration_key: "m1".to_owned(),
+            at: first_start,
+        },
+        JournalRecord::Outcome {
+            send_id,
+            turn_id: failed_turn,
+            agent_id: fails,
+            outcome: serde_json::to_value(TurnOutcome::Failed {
+                kind: switchboard_harness::FailureKind::HarnessError,
+                message: "boom".to_owned(),
+            })
+            .unwrap(),
+            started_at: second_start,
+            ended_at: end,
+        },
+    ] {
+        switchboard_core::journal::append_record(&journal, &record).unwrap();
+    }
+    env.seed_claude_turn(project_id, completes, "DONE", "m1");
+    let env = env.restart();
+
+    let reply = wait_done(&env, project_id, send_id).await;
+    assert_eq!(reply.source, WaitSource::Journal);
+    let of = |agent_id: AgentId| {
+        reply
+            .recipients
+            .iter()
+            .find(|r| r.agent_id == agent_id)
+            .unwrap()
+    };
+    assert_eq!(of(completes).status, SendStatus::Completed);
+    assert_eq!(
+        of(completes).times,
+        TurnTimes {
+            started_at: Some(first_start),
+            ..TurnTimes::default()
+        }
+    );
+    assert_eq!(of(fails).status, SendStatus::Failed);
+    assert_eq!(
+        of(fails).times,
+        TurnTimes {
+            started_at: Some(second_start),
+            ended_at: Some(end),
+            duration_seconds: Some(12),
+            seconds_since_ended: Some(whole_seconds(end, reply.now.unwrap())),
+            ..TurnTimes::default()
+        }
+    );
+}
+
+/// A harness that fails to launch never opens a turn, so live its recipient
+/// has an end and no start. The dispatcher journals the send before it
+/// launches, so from the journal the same recipient reads as a turn that
+/// started and failed, lasting as long as the launch attempt took.
+#[tokio::test]
+async fn a_harness_that_fails_to_launch_has_a_start_only_from_the_journal() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let mut script = Script::reply("");
+    script.fail_dispatch = true;
+    env.adapter.push_for(agents[0], script);
+    let send_id = send_alone(&env, project_id, agents[0], OnBusyPolicy::Refuse).await;
+
+    let reply = wait_done(&env, project_id, send_id).await;
+    assert_eq!(reply.source, WaitSource::Live);
+    assert_eq!(reply.recipients[0].status, SendStatus::Failed);
+    let ended = reply.recipients[0]
+        .times
+        .ended_at
+        .expect("the message ended when the launch failed");
+    assert_eq!(
+        reply.recipients[0].times,
+        TurnTimes {
+            ended_at: Some(ended),
+            seconds_since_ended: Some(whole_seconds(ended, reply.now.unwrap())),
+            ..TurnTimes::default()
+        },
+        "live, a turn that never opened has no start"
+    );
+
+    let env = env.restart();
+    let reply = wait_done(&env, project_id, send_id).await;
+    assert_eq!(reply.source, WaitSource::Journal);
+    assert_eq!(reply.recipients[0].status, SendStatus::Failed);
+    let times = ended_times(&reply);
+    assert_eq!(
+        times.started_at,
+        Some(journaled_start(&env, project_id, send_id)),
+        "the journal's record of the send gives the start"
     );
 }
 

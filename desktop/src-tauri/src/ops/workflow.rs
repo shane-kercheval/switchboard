@@ -251,6 +251,15 @@ pub struct StepAgent {
     pub recent_text: Option<String>,
 }
 
+impl StepAgent {
+    /// Fill the agent's spans against `now`, as [`RecipientSnapshot::stamp`]
+    /// does for a `wait_send` recipient.
+    fn stamp(&mut self, now: DateTime<Utc>) {
+        self.times
+            .stamp(self.status == Some(SendStatus::Running), now);
+    }
+}
+
 impl From<ResolvedRecipient> for StepAgent {
     fn from(agent: ResolvedRecipient) -> Self {
         Self {
@@ -339,8 +348,7 @@ pub async fn wait_workflow(
     let now = Utc::now();
     reply.seconds_since_ended = reply.ended_at.map(|ended| whole_seconds(ended, now));
     for step_agent in &mut reply.recipients {
-        let running = step_agent.status == Some(SendStatus::Running);
-        step_agent.times.stamp(running, now);
+        step_agent.stamp(now);
     }
     reply.now = Some(now);
     Ok(reply)

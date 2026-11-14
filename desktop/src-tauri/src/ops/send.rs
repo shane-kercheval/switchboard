@@ -47,10 +47,11 @@
 //! and, if that ends first, reports `request_in_progress` with the send id,
 //! leaving the key claimed.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use switchboard_core::{
@@ -75,7 +76,9 @@ use super::attach;
 use super::budget::{BudgetSpec, CutSite};
 use super::error_code::error_code;
 use super::handle::AppStateHandle;
-use super::ledger::{Claim, ClaimResult, RecipientSnapshot, SendReceipt, SendSnapshot, SendStatus};
+use super::ledger::{
+    Claim, ClaimResult, RecipientSnapshot, SendReceipt, SendSnapshot, SendStatus, TurnTimes,
+};
 use super::read::{
     LatestReply, agent_in_project, correlate_turns, project_readonly, read_journal,
     read_latest_reply,
@@ -1294,6 +1297,10 @@ pub enum WaitSource {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WaitSendReply {
     pub send_id: SendId,
+    /// When the reply was made: every recipient's spans count to this moment.
+    /// Absent inside `wait_any_send`'s sends, which share the one at its top.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub now: Option<DateTime<Utc>>,
     /// The wait was shortened to this many seconds: the client sent no
     /// progress token to keep a longer one alive (or asked for over an hour).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1328,7 +1335,19 @@ pub async fn wait_send(
     if reply.done {
         reply.usage = Some(stored_usage(state));
     }
+    let now = Utc::now();
+    reply.stamp(now);
+    reply.now = Some(now);
     Ok(reply)
+}
+
+impl WaitSendReply {
+    /// Fill every recipient's spans against `now`.
+    pub(super) fn stamp(&mut self, now: DateTime<Utc>) {
+        for recipient in &mut self.recipients {
+            recipient.stamp(now);
+        }
+    }
 }
 
 /// Block until every recipient of the send is terminal or the budget ends,
@@ -1575,6 +1594,9 @@ impl JournaledRecipients {
 /// Several sends waited on together, as [`wait_any_send`] reports them.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WaitAnySendReply {
+    /// When the reply was made: every recipient's spans, in every send,
+    /// count to this moment.
+    pub now: DateTime<Utc>,
     /// The wait was shortened to this many seconds: the client sent no
     /// progress token to keep a longer one alive (or asked for over an hour).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1632,7 +1654,7 @@ pub async fn wait_any_send(
         || Ok(ids.iter().map(|_| Watched::Unobserved).collect()),
     )
     .await?;
-    let sends = futures::future::join_all(ids.iter().zip(observed).map(
+    let mut sends = futures::future::join_all(ids.iter().zip(observed).map(
         |(&send_id, watched)| async move {
             let mut reply =
                 watched_reply(state, project_id, send_id, watched, budget, home_dir).await?;
@@ -1644,7 +1666,12 @@ pub async fn wait_any_send(
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
     let any_done = sends.iter().any(|send| send.done);
+    let now = Utc::now();
+    for send in &mut sends {
+        send.stamp(now);
+    }
     Ok(WaitAnySendReply {
+        now,
         capped_to_seconds: budget.capped_to_seconds(),
         usage: any_done.then(|| stored_usage(state)),
         any_done,
@@ -1710,6 +1737,7 @@ pub(super) async fn current_send(
             handed_out: snapshot.settled,
             reply: WaitSendReply {
                 send_id,
+                now: None,
                 capped_to_seconds: None,
                 usage: None,
                 done: snapshot.is_done(),
@@ -1754,6 +1782,7 @@ fn live_reply(send_id: SendId, snapshot: SendSnapshot) -> WaitSendReply {
         .collect();
     WaitSendReply {
         send_id,
+        now: None,
         capped_to_seconds: None,
         usage: None,
         done,
@@ -1788,6 +1817,7 @@ async fn unheld_reply(
 fn unfinished_reply(send_id: SendId) -> WaitSendReply {
     WaitSendReply {
         send_id,
+        now: None,
         capped_to_seconds: None,
         usage: None,
         done: false,
@@ -1883,6 +1913,7 @@ async fn journal_fallback(
     if order.is_empty() {
         return Ok(WaitSendReply {
             send_id,
+            now: None,
             capped_to_seconds: None,
             usage: None,
             done: true,
@@ -1922,8 +1953,10 @@ async fn journal_fallback(
             };
         }
     }
+    add_journaled_times(&mut recipients, records, send_id);
     Ok(WaitSendReply {
         send_id,
+        now: None,
         capped_to_seconds: None,
         usage: None,
         // Nothing more can arrive for a recipient whose turn is over; the
@@ -1932,6 +1965,53 @@ async fn journal_fallback(
         source: WaitSource::Journal,
         recipients,
     })
+}
+
+/// Each recipient's start of its turn for `send_id`, and the end of one that
+/// failed or was cancelled, as the journal holds them: a `Send` record carries
+/// the dispatcher's start, and an `Outcome` record both times. The journal
+/// records no end for a completed turn.
+fn add_journaled_times(
+    recipients: &mut [RecipientSnapshot],
+    records: &[switchboard_core::JournalRecord],
+    send_id: SendId,
+) {
+    let mut times: HashMap<AgentId, TurnTimes> = HashMap::new();
+    for record in records {
+        match record {
+            switchboard_core::JournalRecord::Send {
+                send_id: s,
+                agent_id,
+                at,
+                ..
+            } if *s == send_id => {
+                times
+                    .entry(*agent_id)
+                    .or_default()
+                    .started_at
+                    .get_or_insert(*at);
+            }
+            switchboard_core::JournalRecord::Outcome {
+                send_id: s,
+                agent_id,
+                started_at,
+                ended_at,
+                ..
+            } if *s == send_id => {
+                let entry = times.entry(*agent_id).or_default();
+                entry.started_at.get_or_insert(*started_at);
+                entry.ended_at = Some(*ended_at);
+            }
+            _ => {}
+        }
+    }
+    for recipient in recipients {
+        let journaled = times.get(&recipient.agent_id).copied().unwrap_or_default();
+        recipient.times.started_at = journaled.started_at;
+        if matches!(recipient.status, SendStatus::Failed | SendStatus::Cancelled) {
+            recipient.times.ended_at = journaled.ended_at;
+        }
+    }
 }
 
 /// One recipient of [`journal_fallback`]: its journaled outcome, or else its

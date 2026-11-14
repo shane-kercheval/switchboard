@@ -3,9 +3,11 @@
 //! HTTP where a test needs a request that client never sends (no progress
 //! token, a browser's `Origin`, a wrong `Host`).
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use rmcp::model::{CallToolRequestParams, ProgressNotificationParam};
 use rmcp::service::{NotificationContext, RoleClient, RunningService};
 use rmcp::transport::StreamableHttpClientTransport;
@@ -17,7 +19,7 @@ use switchboard_harness::HarnessAdapter as _;
 use switchboard_prompts::{InMemorySecretStore, SecretStore};
 use tokio::sync::Notify;
 
-use crate::ops::ledger::SendStatus;
+use crate::ops::ledger::{SendStatus, whole_seconds};
 use crate::ops::send::{Body, OnBusyPolicy, SendRequest};
 use crate::ops::test_support::{Script, TestEnv, await_turn_running};
 use crate::ops::wait::WaitBudget;
@@ -189,6 +191,98 @@ async fn a_client_lists_projects_creates_an_agent_sends_and_waits() {
     assert_eq!(reply["recipients"][0]["status"], "completed");
     assert_eq!(reply["recipients"][0]["text"], "ack: hello");
 
+    client.cancel().await.unwrap();
+    listener.stop().await;
+}
+
+/// A timestamp field of a tool result.
+fn instant(value: &Value) -> DateTime<Utc> {
+    value
+        .as_str()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| panic!("not a timestamp: {value}"))
+}
+
+/// The turn times reach the client as fields of each recipient, with `now`
+/// once at the top of the result: a completed recipient's start, end, and
+/// spans, a running one's start and span, and in `wait_any_send` one `now`
+/// over every send.
+#[tokio::test]
+async fn wait_results_carry_each_recipients_turn_times_and_one_now() {
+    let (env, project_id, agent_id) = unopened_project(TestEnv::new());
+    let (listener, url) = serve(&env).await;
+    let client = connect(&url, TOKEN).await;
+
+    let completed = send_in_process(&env, project_id, agent_id).await;
+    let done = ok(
+        &client,
+        "wait_send",
+        json!({ "project_id": project_id, "send_id": completed, "timeout_seconds": 30 }),
+    )
+    .await;
+    assert_eq!(done["recipients"][0]["status"], "completed", "{done}");
+    let recipient = &done["recipients"][0];
+    let now = instant(&done["now"]);
+    let started = instant(&recipient["started_at"]);
+    let ended = instant(&recipient["ended_at"]);
+    assert!(started <= ended && ended <= now, "{done}");
+    assert_eq!(
+        recipient["duration_seconds"],
+        whole_seconds(started, ended),
+        "{done}"
+    );
+    assert_eq!(
+        recipient["seconds_since_ended"],
+        whole_seconds(ended, now),
+        "{done}"
+    );
+    assert!(recipient.get("running_seconds").is_none(), "{done}");
+
+    let gate = Arc::new(Notify::new());
+    env.adapter.push(Script::parked("working", &gate));
+    let running = send_in_process(&env, project_id, agent_id).await;
+    await_turn_running(&env.state, agent_id).await;
+    let mut reply = Value::Null;
+    for _ in 0..50 {
+        reply = ok(
+            &client,
+            "wait_send",
+            json!({ "project_id": project_id, "send_id": running, "timeout_seconds": 1 }),
+        )
+        .await;
+        if reply["recipients"][0]["status"] == "running" {
+            break;
+        }
+    }
+    assert_eq!(reply["recipients"][0]["status"], "running", "{reply}");
+    let recipient = &reply["recipients"][0];
+    let started = instant(&recipient["started_at"]);
+    assert_eq!(
+        recipient["running_seconds"],
+        whole_seconds(started, instant(&reply["now"])),
+        "{reply}"
+    );
+    for absent in ["ended_at", "duration_seconds", "seconds_since_ended"] {
+        assert!(recipient.get(absent).is_none(), "{absent}: {reply}");
+    }
+
+    let any = ok(
+        &client,
+        "wait_any_send",
+        json!({ "project_id": project_id, "send_ids": [completed, running], "timeout_seconds": 1 }),
+    )
+    .await;
+    instant(&any["now"]);
+    assert!(
+        any["sends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|send| send.get("now").is_none()),
+        "the sends share the one now at the top: {any}"
+    );
+
+    gate.notify_waiters();
     client.cancel().await.unwrap();
     listener.stop().await;
 }
@@ -2787,6 +2881,270 @@ async fn live_fork_through_the_server(harness: switchboard_core::HarnessKind) {
         source_turns,
         "the source is unchanged"
     );
+}
+
+/// A named pipe an agent's `cat` blocks on until the test releases it, so the
+/// test decides when the agent's turn can end. Dropping it frees a `cat` still
+/// waiting on the pipe, as after a cancelled turn or a failed assertion.
+struct PipeGate {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl PipeGate {
+    fn new() -> Self {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("gate");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed: {made}");
+        Self { path, _dir: dir }
+    }
+
+    fn prompt(&self) -> String {
+        format!(
+            "Run the shell command `cat {}` with your Bash tool. When it finishes, reply with \
+             only the word done.",
+            self.path.display()
+        )
+    }
+
+    /// Write one line to the pipe, which ends the agent's `cat`. The writer
+    /// blocks until a reader opens the pipe, so it is killed at the deadline
+    /// and the test fails instead of hanging.
+    async fn release(&self) {
+        let mut writer = tokio::process::Command::new("sh")
+            .args(["-c", "echo go > \"$1\"", "sh"])
+            .arg(&self.path)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let Ok(status) = tokio::time::timeout(Duration::from_mins(1), writer.wait()).await else {
+            writer.kill().await.unwrap();
+            panic!("the agent's cat did not open the pipe within a minute");
+        };
+        assert!(status.unwrap().success(), "the release write failed");
+    }
+}
+
+impl Drop for PipeGate {
+    fn drop(&mut self) {
+        // Opening a pipe for both reading and writing never blocks, and it
+        // gives a `cat` waiting for a writer its end of input.
+        let _ = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path);
+    }
+}
+
+/// Poll `wait_send` until the send's only recipient is running with a Bash
+/// call open and has run at least two seconds, and return that result. The two
+/// seconds catch a `started_at` stamped at the look instead of at the turn's
+/// start, which a span of zero would match. Fails, showing the last result, if
+/// the turn ends first or never gets there.
+async fn live_running_in_bash(
+    client: &RunningService<RoleClient, Recorder>,
+    project_id: ProjectId,
+    send_id: &Value,
+) -> Value {
+    let mut reply = Value::Null;
+    for _ in 0..120 {
+        reply = ok(
+            client,
+            "wait_send",
+            json!({ "project_id": project_id, "send_id": send_id, "timeout_seconds": 1 }),
+        )
+        .await;
+        assert_ne!(
+            reply["done"], true,
+            "the turn ended before its Bash call was seen: {reply}"
+        );
+        let recipient = &reply["recipients"][0];
+        let in_bash = recipient["activity"]["open_tool_calls"]
+            .as_array()
+            .is_some_and(|calls| calls.iter().any(|call| call["name"] == "Bash"));
+        let ran = recipient["running_seconds"]
+            .as_u64()
+            .is_some_and(|seconds| seconds >= 2);
+        if recipient["status"] == "running" && in_bash && ran {
+            return reply;
+        }
+    }
+    panic!("the turn never ran two seconds with a Bash call open: {reply}");
+}
+
+/// Poll `wait_send` until the send is done, and return that result.
+async fn live_done(
+    client: &RunningService<RoleClient, Recorder>,
+    project_id: ProjectId,
+    send_id: &Value,
+) -> Value {
+    let mut reply = Value::Null;
+    for _ in 0..20 {
+        reply = ok(
+            client,
+            "wait_send",
+            json!({ "project_id": project_id, "send_id": send_id, "timeout_seconds": 30 }),
+        )
+        .await;
+        if reply["done"] == true {
+            return reply;
+        }
+    }
+    panic!("the send never finished: {reply}");
+}
+
+/// Check every span the result's only recipient carries, and every span it
+/// leaves out, against the timestamps in the same result.
+fn assert_spans(result: &Value) {
+    let now = instant(&result["now"]);
+    let recipient = &result["recipients"][0];
+    let started = recipient.get("started_at").map(instant);
+    let ended = recipient.get("ended_at").map(instant);
+    let running = recipient["status"] == "running";
+    let expected = [
+        (
+            "running_seconds",
+            started
+                .filter(|_| running)
+                .map(|started| whole_seconds(started, now)),
+        ),
+        (
+            "duration_seconds",
+            started
+                .zip(ended)
+                .map(|(started, ended)| whole_seconds(started, ended)),
+        ),
+        (
+            "seconds_since_ended",
+            ended.map(|ended| whole_seconds(ended, now)),
+        ),
+    ];
+    for (field, span) in expected {
+        match span {
+            Some(seconds) => assert_eq!(
+                recipient.get(field),
+                Some(&json!(seconds)),
+                "{field}: {result}"
+            ),
+            None => assert!(
+                recipient.get(field).is_none(),
+                "{field} is left out: {result}"
+            ),
+        }
+    }
+}
+
+/// A real Claude agent's turn times through the server: a running turn, the
+/// same turn completed, a turn cancelled while it ran, and both ended turns
+/// again from the journal after a restart. The agent blocks on a pipe with its
+/// Bash tool, so each turn runs until the test releases or cancels it. Prints
+/// each result, for a person to read the real shape.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+#[allow(clippy::too_many_lines)] // One agent's turns, live and then from the journal.
+async fn live_claude_mcp_wait_reports_turn_times() {
+    let mut env = TestEnv::live();
+    let project_id = env.project("p");
+    let agent_id = crate::commands::create_agent_in_project_impl(
+        &env.state,
+        project_id,
+        "worker",
+        switchboard_core::HarnessKind::ClaudeCode,
+        switchboard_core::AgentSelection {
+            model: Some("haiku".to_owned()),
+            ..switchboard_core::AgentSelection::default()
+        },
+    )
+    .unwrap()
+    .id;
+    let (listener, url) = serve(&env).await;
+    let client = connect(&url, TOKEN).await;
+    let send = async |text: String| -> Value {
+        ok(
+            &client,
+            "send",
+            json!({ "project_id": project_id, "recipients": [agent_id], "text": text }),
+        )
+        .await["send_id"]
+            .clone()
+    };
+
+    let released = PipeGate::new();
+    let completed = send(released.prompt()).await;
+    let running = live_running_in_bash(&client, project_id, &completed).await;
+    println!("running: {running}");
+    assert_spans(&running);
+    let started = instant(&running["recipients"][0]["started_at"]);
+    released.release().await;
+    let done = live_done(&client, project_id, &completed).await;
+    println!("completed: {done}");
+    let recipient = &done["recipients"][0];
+    assert_eq!(recipient["status"], "completed", "{done}");
+    assert_eq!(instant(&recipient["started_at"]), started, "{done}");
+    assert!(
+        instant(&recipient["ended_at"]) >= instant(&running["now"]),
+        "the turn ended after the test saw it running: {done}"
+    );
+    assert_spans(&done);
+
+    let held = PipeGate::new();
+    let cancelled = send(held.prompt()).await;
+    live_running_in_bash(&client, project_id, &cancelled).await;
+    ok(
+        &client,
+        "cancel_send",
+        json!({ "project_id": project_id, "send_id": cancelled }),
+    )
+    .await;
+    let stopped = live_done(&client, project_id, &cancelled).await;
+    println!("cancelled: {stopped}");
+    let recipient = &stopped["recipients"][0];
+    assert_eq!(recipient["status"], "cancelled", "{stopped}");
+    let cancelled_times = (
+        instant(&recipient["started_at"]),
+        instant(&recipient["ended_at"]),
+    );
+    assert_spans(&stopped);
+
+    client.cancel().await.unwrap();
+    listener.stop().await;
+    let env = env.restart();
+    let (listener, url) = serve(&env).await;
+    let client = connect(&url, TOKEN).await;
+
+    let journaled = live_done(&client, project_id, &completed).await;
+    println!("completed, from the journal: {journaled}");
+    assert_eq!(journaled["source"], "journal", "{journaled}");
+    let recipient = &journaled["recipients"][0];
+    assert_eq!(recipient["status"], "completed", "{journaled}");
+    assert_eq!(instant(&recipient["started_at"]), started, "{journaled}");
+    assert!(
+        recipient.get("ended_at").is_none(),
+        "the journal holds no end for a completed turn: {journaled}"
+    );
+    assert_spans(&journaled);
+
+    let journaled = live_done(&client, project_id, &cancelled).await;
+    println!("cancelled, from the journal: {journaled}");
+    assert_eq!(journaled["source"], "journal", "{journaled}");
+    let recipient = &journaled["recipients"][0];
+    assert_eq!(recipient["status"], "cancelled", "{journaled}");
+    assert_eq!(
+        (
+            instant(&recipient["started_at"]),
+            instant(&recipient["ended_at"])
+        ),
+        cancelled_times,
+        "{journaled}"
+    );
+    assert_spans(&journaled);
+
+    client.cancel().await.unwrap();
+    listener.stop().await;
 }
 
 #[tokio::test]

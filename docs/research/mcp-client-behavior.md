@@ -302,10 +302,17 @@ Measurements made after the milestones, each with how it was made.
     and its tools stay listed.
   - **What followed.** Settings registers Claude Code at user scope and Codex in
     `~/.codex/config.toml`. `mcp-remote` stays for Desktop's Chat tab, and its setup snippet
-    names the entry `switchboard-chat`, so it never shares a name with the Claude Code entry. The Claude
-    Code and Codex adapters turn off any server named `switchboard` or at the instance's address
-    for each run (`crates/harness/src/own_mcp.rs`, `crates/harness/src/codex/own_server.rs`).
-    For Codex they read only `/etc/codex/config.toml` and `$CODEX_HOME/config.toml`, which Codex
-    loads on every run, so an override never repeats a transport Codex skipped; an entry only in
-    a project's file stays on. Asking `codex mcp list` instead would add its sign-in checks
-    before every run.
+    names the entry `switchboard-chat`, so it never shares a name with the Claude Code entry.
+    The Claude Code and Codex adapters turn off any server named `switchboard` or at the
+    instance's address for each run (`crates/harness/src/own_mcp.rs`,
+    `crates/harness/src/codex/own_server.rs`). The Claude Code adapter also turns off a server
+    named `switchboard-chat`, which `claude mcp add-from-claude-desktop` would copy in under
+    that name. For Codex they read only `/etc/codex/config.toml` and `$CODEX_HOME/config.toml`,
+    which Codex loads on every run, so an override never repeats a transport Codex skipped; an
+    entry only in a project's file stays on. Asking `codex mcp list` instead would add its
+    sign-in checks before every run.
+  - **After the change was installed, measured by the user.** With the direct entry at user
+    scope under the name `switchboard` and no `mcp-remote` entry in the desktop app's config, a
+    Code tab session's `wait_send` with `timeout_seconds` 600 on a 96-second turn returned in
+    one call, with no `capped_to_seconds` and `seconds_since_ended` 0. The setup with a
+    `switchboard-chat` entry beside the direct entry was not measured.

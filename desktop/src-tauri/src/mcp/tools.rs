@@ -136,6 +136,18 @@ long timeout (e.g. 600): the call moves to the background and its result arrives
 when it settles. Claude Desktop, its Code tab included, sends no token: use the default and call \
 again. In Codex, stay under 300 seconds unless the user raised tool_timeout_sec.";
 
+/// The turn times a send's recipients carry, as `wait_send` describes them;
+/// the other tools that report recipients refer to it.
+const TIMES_NOTE: &str = "\
+Times: now, at the top level, is when the result was made. A recipient whose turn started \
+carries started_at; while running, running_seconds (the whole turn so far); once ended, \
+ended_at, duration_seconds, and seconds_since_ended (to now). Spans are whole seconds. Left out \
+where Switchboard does not know them: a completed recipient with source journal (a message \
+typed in the window always is) and a started one carry started_at only, since the journal \
+records no end for a completed turn; one cancelled while waiting in line, or that failed before \
+its turn started, has ended_at but no started_at or duration_seconds; accepted, rejected, and \
+not_dispatched carry none.";
+
 /// What a finished wait's `usage` is, shared by every wait's description.
 const USAGE_NOTE: &str = "\
 carries usage: each harness account's limits as get_usage reports them, without each window's \
@@ -280,7 +292,14 @@ tools! {
          agent turn's answer text with its send_id and status (complete, running, failed, \
          cancelled), failures with their reason, and a compacted marker where an agent's context \
          was compacted (it may have lost earlier instructions there). Tool calls and thinking are \
-         left out; the answer says what the agent did. last_n_items keeps only the newest items. \
+         left out; the answer says what the agent did. Each item's at: for a user_message, when \
+         its first recipient's turn started (a message that waited in line, when it left the \
+         line), or for a prompt imported from an older session, its session file's time; for an \
+         agent_turn, when the turn began as the agent's session file records it, which can be \
+         after its message's at (a turn compacted part-way continues as another agent_turn with \
+         its own at); for an outcome, when that turn started, not when it failed or was \
+         cancelled; for compacted, when the session file recorded the compaction. last_n_items \
+         keeps only the newest items. \
          When the whole would pass the budget (100,000 characters, 45,000 without a progress \
          token, or max_chars), older items are left out whole (items_omitted says how many); a single answer too long on its own is cut, and \
          truncated names the read_reply call that reads on.";
@@ -337,7 +356,8 @@ tools! {
     ReadWorkflowRun = "read_workflow_run" (ReadWorkflowRunArgs) [Read, Look]
         "Every reply a workflow run produced, in step order, without waiting: its status and \
          done, then each send with its step, label, send_id, done, and source, and each \
-         recipient as wait_send reports it, with its agent's name and, once that recipient \
+         recipient as wait_send reports it, with its agent's name, its times as wait_send \
+         describes them (counted to now, at the top level), and, once that recipient \
          completed, its reply text. A reviewer's first round comes back under its own step, \
          which the agent's latest answer no longer holds. On a running run it gives the \
          replies so far and the others' statuses (a running one with activity and \
@@ -537,8 +557,8 @@ tools! {
              Switchboard's record of it, or after a restart), or unknown: this project has no record of the send, so \
              check project_id and send_id; a message still waiting in line when the app restarted \
              was never sent and reads this way too. Long replies share the result evenly, each cut \
-             one listed in truncated with the read_reply call that reads on. When done, \
-             the result also {USAGE_NOTE}\n{WAIT_HINTS}"
+             one listed in truncated with the read_reply call that reads on. {TIMES_NOTE} \
+             When done, the result also {USAGE_NOTE}\n{WAIT_HINTS}"
         );
     WaitAnySend = "wait_any_send" (WaitAnySendArgs) [Read, Wait]
         format!(
@@ -546,8 +566,10 @@ tools! {
              any one is done, or when timeout_seconds passes, with every send's current state \
              either way. sends lists each send once, in the order given, shaped as wait_send \
              returns it: a done one carries its replies, the others their recipients' statuses, \
-             activity, and recent_text. any_done says whether one finished. Call again with the \
-             sends still running; a send already done returns at once. Long replies share the \
+             activity, and recent_text, each recipient with the times wait_send describes. \
+             now is once at the top level, and every send's spans count to it. any_done says \
+             whether one finished. Call again with the sends still running; a send already done \
+             returns at once. Long replies share the \
              result evenly, each cut one listed in truncated with the read_reply call \
              that reads on. When any_done, the result also, once at its top level, \
              {USAGE_NOTE}\n{WAIT_HINTS}"
@@ -569,7 +591,7 @@ tools! {
              0, its label, and its agents as {{agent_id, name}}) and sends. While the run is \
              unfinished, each of the step's agents also carries the send_id of the run's \
              newest send that reached it and, while Switchboard holds that send, its status, \
-             activity, and recent_text as wait_send reports them. On a wait step that is the \
+             times, activity, and recent_text as wait_send reports them. On a wait step that is the \
              send step's turn, usually the one the step waits on. sends lists every send the run's \
              send steps made so far, each with its step, label, send_id, and recipients \
              (dispatched false for one a failed step never reached). Follow any of those sends \
@@ -579,7 +601,10 @@ tools! {
              says how many of the earliest were left out, and read_workflow_run still lists \
              them. sends_unavailable is true once Switchboard no longer holds the \
              run's record (after a restart, or once it pruned the run): its sends are no longer \
-             known. When done, the result also {USAGE_NOTE}\n{WAIT_HINTS}"
+             known. now, at the top level, is when the result was made. Once the run has \
+             finished, ended_at says when it ended and seconds_since_ended how long before now; \
+             both are absent for an interrupted run, which stopped without recording its end. \
+             When done, the result also {USAGE_NOTE}\n{WAIT_HINTS}"
         );
 }
 

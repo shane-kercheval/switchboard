@@ -4,9 +4,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use switchboard_core::{ProjectId, SendId};
-use switchboard_workflow::InputValue;
+use switchboard_workflow::{InputValue, RunRecord};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -22,7 +23,8 @@ use crate::workflow_commands::{
 
 use super::budget::BudgetSpec;
 use super::ledger::{
-    AgentActivity, RecipientSnapshot, RunSend, RunState, SendSnapshot, SendStatus,
+    AgentActivity, RecipientSnapshot, RunSend, RunState, SendSnapshot, SendStatus, TurnTimes,
+    whole_seconds,
 };
 use super::read::project_readonly;
 use super::send::{WaitSource, current_send, held_send, wait_any_send_budget};
@@ -163,6 +165,17 @@ pub enum WorkflowRunStatus {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WaitWorkflowReply {
     pub run_id: Uuid,
+    /// When the reply was made: `seconds_since_ended` and every step agent's
+    /// spans count to this moment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub now: Option<DateTime<Utc>>,
+    /// When a finished run ended: the ledger's record of its final progress
+    /// event, or a failed run's file's terminal record. Absent while it runs
+    /// and for an interrupted run, which stopped without a terminal record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seconds_since_ended: Option<u64>,
     /// The wait was shortened to this many seconds: the client sent no
     /// progress token to keep a longer one alive (or asked for over an hour).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,6 +238,9 @@ pub struct StepAgent {
     /// pruned: polls read no journal or session file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<SendStatus>,
+    /// As on a `wait_send` recipient, for that send.
+    #[serde(flatten)]
+    pub times: TurnTimes,
     /// As on an unfinished `wait_send` recipient: present while this agent's
     /// own turn runs, absent while it waits in line or once it finished.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,6 +257,7 @@ impl From<ResolvedRecipient> for StepAgent {
             agent,
             send_id: None,
             status: None,
+            times: TurnTimes::default(),
             activity: None,
             recent_text: None,
         }
@@ -283,6 +300,7 @@ fn add_step_progress(state: &AppState, project_id: ProjectId, reply: &mut WaitWo
             continue;
         };
         step_agent.status = Some(recipient.status);
+        step_agent.times = recipient.times;
         step_agent.activity.clone_from(&recipient.activity);
         step_agent.recent_text.clone_from(&recipient.recent_text);
     }
@@ -318,6 +336,13 @@ pub async fn wait_workflow(
     if reply.done {
         reply.usage = Some(super::usage::stored_usage(state));
     }
+    let now = Utc::now();
+    reply.seconds_since_ended = reply.ended_at.map(|ended| whole_seconds(ended, now));
+    for step_agent in &mut reply.recipients {
+        let running = step_agent.status == Some(SendStatus::Running);
+        step_agent.times.stamp(running, now);
+    }
+    reply.now = Some(now);
     Ok(reply)
 }
 
@@ -355,6 +380,9 @@ fn observe_run(state: &AppState, project_id: ProjectId, run_id: Uuid) -> Option<
     match state.ledger.run(run_id) {
         Some(run) if run.project_id == project_id => Some(WaitWorkflowReply {
             run_id,
+            now: None,
+            ended_at: run.ended_at,
+            seconds_since_ended: None,
             capped_to_seconds: None,
             usage: None,
             status: match run.status {
@@ -395,8 +423,16 @@ fn run_from_files(
         "interrupted" => WorkflowRunStatus::Interrupted,
         _ => WorkflowRunStatus::Failed,
     };
+    let ended_at = if status == WorkflowRunStatus::Failed {
+        terminal_at(state, project_id, run_id)?
+    } else {
+        None
+    };
     Ok(WaitWorkflowReply {
         run_id,
+        now: None,
+        ended_at,
+        seconds_since_ended: None,
         capped_to_seconds: None,
         usage: None,
         status,
@@ -410,6 +446,23 @@ fn run_from_files(
         sends_unavailable: true,
         reason: info.reason,
     })
+}
+
+/// When the run's file says the run ended: its terminal record's time, or
+/// `None` when the file holds no terminal record or cannot be read.
+fn terminal_at(
+    state: &AppState,
+    project_id: ProjectId,
+    run_id: Uuid,
+) -> Result<Option<DateTime<Utc>>, AppError> {
+    let path = project_readonly(state, project_id)?.run_path(run_id);
+    let Ok(records) = switchboard_core::read_jsonl::<RunRecord>(&path) else {
+        return Ok(None);
+    };
+    Ok(records.iter().rev().find_map(|record| match record {
+        RunRecord::Terminal { at, .. } => Some(*at),
+        _ => None,
+    }))
 }
 
 fn live_run(state: &AppState, project_id: ProjectId, run_id: Uuid) -> Option<WaitWorkflowReply> {
@@ -432,6 +485,9 @@ fn live_run(state: &AppState, project_id: ProjectId, run_id: Uuid) -> Option<Wai
         .collect();
     Some(WaitWorkflowReply {
         run_id,
+        now: None,
+        ended_at: None,
+        seconds_since_ended: None,
         capped_to_seconds: None,
         usage: None,
         status: WorkflowRunStatus::Running,
@@ -462,6 +518,8 @@ fn live_run(state: &AppState, project_id: ProjectId, run_id: Uuid) -> Option<Wai
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WorkflowRunReplies {
     pub run_id: Uuid,
+    /// When the reply was made: every recipient's spans count to this moment.
+    pub now: DateTime<Utc>,
     pub workflow: String,
     pub status: WorkflowRunStatus,
     pub done: bool,
@@ -584,8 +642,15 @@ pub async fn read_workflow_run(
             recipients,
         });
     }
+    let now = Utc::now();
+    for send in &mut sends {
+        for recipient in &mut send.recipients {
+            recipient.reply.stamp(now);
+        }
+    }
     Ok(WorkflowRunReplies {
         run_id,
+        now,
         workflow: run.workflow,
         status: run.status,
         done: run.done,
@@ -688,6 +753,9 @@ mod tests {
         let (reached, failed) = (Uuid::now_v7(), Uuid::now_v7());
         let mut reply = WaitWorkflowReply {
             run_id: Uuid::now_v7(),
+            now: None,
+            ended_at: None,
+            seconds_since_ended: None,
             capped_to_seconds: None,
             usage: None,
             status: WorkflowRunStatus::Running,

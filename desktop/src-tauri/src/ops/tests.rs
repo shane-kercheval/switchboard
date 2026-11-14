@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use switchboard_core::{AgentId, JournalRecord, ProjectId, SessionLocator};
 use switchboard_harness::{CancelSource, TurnOutcome};
 use switchboard_workflow::{InputValue, RunRecord, TerminalStatus};
@@ -32,7 +32,7 @@ use super::change::{
 };
 use super::desktop_sync::{Hearing, SyncAck, SyncFork};
 use super::error_code::{self, error_code};
-use super::ledger::{ForkClaim, SendStatus};
+use super::ledger::{ForkClaim, SendStatus, TurnTimes, whole_seconds};
 use super::read::conversation_budget;
 use super::read::{
     DigestItem, DigestTurnStatus, LatestReplyStatus, OutputSource, ProjectStatus,
@@ -2684,6 +2684,9 @@ fn a_workflow_wait_with_more_sends_than_fit_keeps_the_newest() {
     };
     let reply = crate::ops::workflow::WaitWorkflowReply {
         run_id: Uuid::now_v7(),
+        now: None,
+        ended_at: None,
+        seconds_since_ended: None,
         capped_to_seconds: None,
         usage: None,
         status: WorkflowRunStatus::Completed,
@@ -7736,6 +7739,7 @@ async fn cancelling_one_agents_reply_to_a_workflow_send_ends_the_run() {
 /// activity), the other still writing (running, with its activity and text so
 /// far). A finished run carries none of it.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One run, read while it waits and once it finished.
 async fn wait_workflow_shows_what_each_agent_of_the_current_step_is_doing() {
     let (env, project_id, agents) = workflow_env().await;
     let gate = Arc::new(Notify::new());
@@ -7801,12 +7805,53 @@ async fn wait_workflow_shows_what_each_agent_of_the_current_step_is_doing() {
     assert_eq!(shape["agent_id"], agents[2].to_string(), "{shape}");
     assert_eq!(shape["name"], "r2", "{shape}");
     assert_eq!(shape["status"], "running", "{shape}");
+    let now = waiting.now.expect("a reply says when it was made");
+    assert_eq!(
+        (waiting.ended_at, waiting.seconds_since_ended),
+        (None, None),
+        "a running run has not ended"
+    );
+    let started = slow
+        .times
+        .started_at
+        .expect("the slow reviewer's turn started");
+    assert_eq!(
+        slow.times,
+        TurnTimes {
+            started_at: Some(started),
+            running_seconds: Some(whole_seconds(started, now)),
+            ..TurnTimes::default()
+        }
+    );
+    assert_eq!(
+        shape["running_seconds"],
+        whole_seconds(started, now),
+        "{shape}"
+    );
 
     let quick = of(agents[1]);
     assert_eq!(quick.send_id, Some(review));
     assert_eq!(quick.status, Some(SendStatus::Completed));
     assert_eq!(quick.activity, None, "a finished reply has no activity");
     assert_eq!(quick.recent_text, None);
+    let started = quick
+        .times
+        .started_at
+        .expect("the quick reviewer's turn started");
+    let ended = quick
+        .times
+        .ended_at
+        .expect("the quick reviewer's turn ended");
+    assert_eq!(
+        quick.times,
+        TurnTimes {
+            started_at: Some(started),
+            ended_at: Some(ended),
+            duration_seconds: Some(whole_seconds(started, ended)),
+            seconds_since_ended: Some(whole_seconds(ended, now)),
+            ..TurnTimes::default()
+        }
+    );
 
     gate.notify_waiters();
     let ended = wait_workflow(
@@ -7818,9 +7863,20 @@ async fn wait_workflow_shows_what_each_agent_of_the_current_step_is_doing() {
     .await
     .unwrap();
     assert_eq!(ended.status, WorkflowRunStatus::Completed);
+    let end = ended.ended_at.expect("a finished run says when it ended");
+    let ended_now = ended.now.unwrap();
+    assert!(
+        now <= end && end <= ended_now,
+        "the run ended after the slow reviewer was let go: {end}"
+    );
+    assert_eq!(
+        ended.seconds_since_ended,
+        Some(whole_seconds(end, ended_now))
+    );
     assert!(
         ended.recipients.iter().all(|a| a.send_id.is_none()
             && a.status.is_none()
+            && a.times == TurnTimes::default()
             && a.activity.is_none()
             && a.recent_text.is_none()),
         "a finished run carries no step progress: {:?}",
@@ -10920,6 +10976,17 @@ async fn read_workflow_run_returns_each_rounds_replies_under_its_own_step() {
             .iter()
             .all(|s| s.done && s.source == WaitSource::Live)
     );
+    for recipient in run.sends.iter().flat_map(|s| &s.recipients) {
+        let times = recipient.reply.times;
+        let started = times.started_at.expect("each reply's turn started");
+        let ended = times.ended_at.expect("each reply's turn ended");
+        assert_eq!(times.duration_seconds, Some(whole_seconds(started, ended)));
+        assert_eq!(
+            times.seconds_since_ended,
+            Some(whole_seconds(ended, run.now)),
+            "every reply counts to the one now"
+        );
+    }
 }
 
 #[tokio::test]
@@ -10970,6 +11037,17 @@ async fn read_workflow_run_on_a_running_run_reports_its_recipient_running_from_t
     );
     assert!(!run.sends[0].done);
     assert_eq!(run.sends[0].recipients[0].reply.text, None);
+    let times = run.sends[0].recipients[0].reply.times;
+    let started = times.started_at.expect("the coder's turn started");
+    assert_eq!(
+        times,
+        TurnTimes {
+            started_at: Some(started),
+            running_seconds: Some(whole_seconds(started, run.now)),
+            ..TurnTimes::default()
+        },
+        "a running reply's span counts to the reply's now"
+    );
 
     gate.notify_waiters();
     wait_workflow(
@@ -11581,4 +11659,408 @@ async fn the_first_finished_waits_carry_a_stale_codex_reading_without_reading_th
         0,
         "with nothing fresh, no wait read the Codex account"
     );
+}
+
+// --- turn times ------------------------------------------------------------------
+
+/// The send as `wait_send` reports it right now, without waiting.
+async fn look_now(
+    env: &TestEnv,
+    project_id: ProjectId,
+    send_id: Uuid,
+) -> super::send::WaitSendReply {
+    wait_send(
+        &env.state,
+        project_id,
+        send_id,
+        &WaitBudget::new(Some(0), false),
+        &env.home(),
+    )
+    .await
+    .unwrap()
+}
+
+/// Send "go" to one agent and return the send's id.
+async fn send_alone(
+    env: &TestEnv,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    on_busy: OnBusyPolicy,
+) -> Uuid {
+    let mut request = text_send(project_id, vec![agent_id], "go");
+    request.on_busy = on_busy;
+    send_now(env.handle(), env.home(), request)
+        .await
+        .unwrap()
+        .send_id
+}
+
+/// The only recipient's times, checked as those of a turn that ran and ended:
+/// every span is in whole seconds and counts to the reply's `now`.
+fn ended_times(reply: &super::send::WaitSendReply) -> TurnTimes {
+    let now = reply.now.expect("a reply says when it was made");
+    let times = reply.recipients[0].times;
+    let started = times.started_at.expect("the turn started");
+    let ended = times.ended_at.expect("the turn ended");
+    assert!(started <= ended && ended <= now, "{times:?}, now {now}");
+    assert_eq!(times.running_seconds, None, "{times:?}");
+    assert_eq!(
+        times.duration_seconds,
+        Some(whole_seconds(started, ended)),
+        "{times:?}"
+    );
+    assert_eq!(
+        times.seconds_since_ended,
+        Some(whole_seconds(ended, now)),
+        "{times:?}"
+    );
+    times
+}
+
+/// The start the journal's record of `send_id` carries.
+fn journaled_start(env: &TestEnv, project_id: ProjectId, send_id: Uuid) -> DateTime<Utc> {
+    switchboard_core::read_jsonl::<JournalRecord>(&env.journal_path(project_id))
+        .unwrap()
+        .into_iter()
+        .find_map(|record| match record {
+            JournalRecord::Send {
+                send_id: journaled,
+                at,
+                ..
+            } if journaled == send_id => Some(at),
+            _ => None,
+        })
+        .expect("the send is journaled at turn start")
+}
+
+/// Each status a held send's recipient reaches carries the times the
+/// dispatcher stamped on its turn, with every span counted to the reply's
+/// `now`. After a restart the journal gives back the same start, and the end
+/// of a failed or cancelled turn, but no end for a completed one.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Every status, live and then from the journal, in one run.
+async fn wait_send_reports_when_each_recipients_turn_started_and_ended() {
+    let (env, project_id, agents) =
+        project_with_agents(&["completes", "fails", "runs", "is-cancelled"]);
+    let (done_agent, failed_agent, running_agent, cancelled_agent) =
+        (agents[0], agents[1], agents[2], agents[3]);
+    let gate = Arc::new(Notify::new());
+    env.adapter.push_for(done_agent, Script::reply("done"));
+    env.adapter.push_for(failed_agent, Script::failing("nope"));
+    env.adapter
+        .push_for(running_agent, Script::parked("working", &gate));
+    env.adapter
+        .push_for(cancelled_agent, Script::parked("long", &gate));
+    let completed = send_alone(&env, project_id, done_agent, OnBusyPolicy::Refuse).await;
+    let failed = send_alone(&env, project_id, failed_agent, OnBusyPolicy::Refuse).await;
+    let running = send_alone(&env, project_id, running_agent, OnBusyPolicy::Refuse).await;
+    let cancelled = send_alone(&env, project_id, cancelled_agent, OnBusyPolicy::Refuse).await;
+    await_open_turn(&env, running_agent, running).await;
+    await_open_turn(&env, cancelled_agent, cancelled).await;
+    let in_line = send_alone(&env, project_id, running_agent, OnBusyPolicy::Queue).await;
+
+    let completed_live = ended_times(&wait_done(&env, project_id, completed).await);
+    let reply = wait_done(&env, project_id, failed).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Failed);
+    let failed_live = ended_times(&reply);
+
+    let reply = look_now(&env, project_id, running).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Running);
+    let times = reply.recipients[0].times;
+    let started = times.started_at.expect("a running turn started");
+    assert_eq!(
+        times,
+        TurnTimes {
+            started_at: Some(started),
+            running_seconds: Some(whole_seconds(started, reply.now.unwrap())),
+            ..TurnTimes::default()
+        },
+        "a running turn has no end yet"
+    );
+
+    let reply = look_now(&env, project_id, in_line).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Accepted);
+    assert_eq!(
+        reply.recipients[0].times,
+        TurnTimes::default(),
+        "a message waiting in line has no times"
+    );
+    cancel_send(&env.state, project_id, in_line, Some(running_agent)).unwrap();
+    let reply = wait_done(&env, project_id, in_line).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Cancelled);
+    let times = reply.recipients[0].times;
+    let ended = times
+        .ended_at
+        .expect("the message ended when it was cancelled");
+    assert_eq!(
+        times,
+        TurnTimes {
+            ended_at: Some(ended),
+            seconds_since_ended: Some(whole_seconds(ended, reply.now.unwrap())),
+            ..TurnTimes::default()
+        },
+        "a message cancelled in line ended without a turn, so it has no start"
+    );
+
+    cancel_send(&env.state, project_id, cancelled, None).unwrap();
+    let reply = wait_done(&env, project_id, cancelled).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Cancelled);
+    let cancelled_live = ended_times(&reply);
+
+    let any = wait_any_send(
+        &env.state,
+        project_id,
+        vec![completed, failed],
+        &WaitBudget::new(Some(0), false),
+        &env.home(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        any.sends.iter().all(|send| send.now.is_none()),
+        "the sends share the one now at the top"
+    );
+    for send in &any.sends {
+        let ended = send.recipients[0].times.ended_at.unwrap();
+        assert_eq!(
+            send.recipients[0].times.seconds_since_ended,
+            Some(whole_seconds(ended, any.now))
+        );
+    }
+
+    gate.notify_waiters();
+    let running_live = wait_done(&env, project_id, running).await.recipients[0].times;
+    let env = env.restart();
+
+    for (send_id, live) in [(completed, completed_live), (running, running_live)] {
+        let reply = wait_done(&env, project_id, send_id).await;
+        assert_eq!(reply.source, WaitSource::Journal);
+        assert_eq!(reply.recipients[0].status, SendStatus::Completed);
+        assert_eq!(
+            reply.recipients[0].times,
+            TurnTimes {
+                started_at: live.started_at,
+                ..TurnTimes::default()
+            },
+            "the journal records the start of a completed turn and not its end"
+        );
+    }
+    for (send_id, live) in [(failed, failed_live), (cancelled, cancelled_live)] {
+        let reply = wait_done(&env, project_id, send_id).await;
+        assert_eq!(reply.source, WaitSource::Journal);
+        let times = ended_times(&reply);
+        assert_eq!(
+            (times.started_at, times.ended_at, times.duration_seconds),
+            (live.started_at, live.ended_at, live.duration_seconds),
+            "the journal's outcome record carries the turn's own times"
+        );
+    }
+}
+
+/// A send the ledger does not hold is answered from the journal, which
+/// records each turn's start, and the end of one that failed or was
+/// cancelled, but no end for a completed one.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One journal holding every status.
+async fn the_journal_fallback_reports_the_times_the_journal_holds() {
+    let mut env = TestEnv::new();
+    let project_id = env.project("proj");
+    let done_agent = env.agent(project_id, "completes");
+    let failed_agent = env.agent(project_id, "fails");
+    let cancelled_agent = env.agent(project_id, "is-cancelled");
+    let started_agent = env.agent(project_id, "starts");
+    // The sends predate the seeded turn, which is stamped now, so it falls
+    // inside its send's dispatch window as a real turn would.
+    let start = Utc::now() - chrono::Duration::minutes(1);
+    let end = start + chrono::Duration::milliseconds(7_400);
+    let journal = env.journal_path(project_id);
+    let write = |record: JournalRecord| {
+        switchboard_core::journal::append_record(&journal, &record).unwrap();
+    };
+    let journal_send = |agent_id: AgentId| {
+        let (send_id, turn_id) = (Uuid::now_v7(), Uuid::now_v7());
+        write(JournalRecord::Send {
+            send_id,
+            turn_id,
+            agent_id,
+            prompt: "hi".to_owned(),
+            attachments: Vec::new(),
+            at: start,
+        });
+        (send_id, turn_id)
+    };
+    let (completed, completed_turn) = journal_send(done_agent);
+    let (failed, failed_turn) = journal_send(failed_agent);
+    let (cancelled, cancelled_turn) = journal_send(cancelled_agent);
+    let (started, _) = journal_send(started_agent);
+    write(JournalRecord::TurnLink {
+        send_id: completed,
+        turn_id: completed_turn,
+        agent_id: done_agent,
+        hydration_key: "m1".to_owned(),
+        at: start,
+    });
+    for (send_id, turn_id, agent_id, outcome) in [
+        (
+            failed,
+            failed_turn,
+            failed_agent,
+            TurnOutcome::Failed {
+                kind: switchboard_harness::FailureKind::HarnessError,
+                message: "boom".to_owned(),
+            },
+        ),
+        (
+            cancelled,
+            cancelled_turn,
+            cancelled_agent,
+            TurnOutcome::Cancelled {
+                source: CancelSource::User,
+            },
+        ),
+    ] {
+        write(JournalRecord::Outcome {
+            send_id,
+            turn_id,
+            agent_id,
+            outcome: serde_json::to_value(outcome).unwrap(),
+            started_at: start,
+            ended_at: end,
+        });
+    }
+    env.seed_claude_turn(project_id, done_agent, "DONE", "m1");
+    let env = env.restart();
+
+    let start_only = TurnTimes {
+        started_at: Some(start),
+        ..TurnTimes::default()
+    };
+    let reply = wait_done(&env, project_id, completed).await;
+    assert_eq!(reply.source, WaitSource::Journal);
+    assert_eq!(reply.recipients[0].status, SendStatus::Completed);
+    assert_eq!(reply.recipients[0].times, start_only);
+
+    for (send_id, status) in [
+        (failed, SendStatus::Failed),
+        (cancelled, SendStatus::Cancelled),
+    ] {
+        let reply = wait_done(&env, project_id, send_id).await;
+        assert_eq!(reply.recipients[0].status, status);
+        let now = reply.now.unwrap();
+        assert_eq!(
+            reply.recipients[0].times,
+            TurnTimes {
+                started_at: Some(start),
+                ended_at: Some(end),
+                duration_seconds: Some(7),
+                seconds_since_ended: Some(whole_seconds(end, now)),
+                ..TurnTimes::default()
+            },
+            "7.4 seconds count as 7"
+        );
+    }
+
+    let reply = wait_done(&env, project_id, started).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Started);
+    assert_eq!(reply.recipients[0].times, start_only);
+
+    let reply = wait_done(&env, project_id, Uuid::now_v7()).await;
+    assert_eq!(reply.source, WaitSource::Unknown);
+    assert!(reply.recipients.is_empty());
+    assert!(
+        reply.now.is_some(),
+        "even an unknown send's reply says when"
+    );
+}
+
+/// A message typed in the window is never in the ledger, so its times come
+/// from the journal: the start and the running span while its turn runs, and
+/// the start alone once it completed.
+#[tokio::test]
+async fn a_message_typed_in_the_window_reports_its_start_from_the_journal() {
+    let (env, project_id, agents) = project_with_agents(&["a"]);
+    let gate = Arc::new(Notify::new());
+    let send_id = send_from_the_window_and_hold(&env, project_id, agents[0], "hi", &gate).await;
+    let start = journaled_start(&env, project_id, send_id);
+
+    let reply = look_now(&env, project_id, send_id).await;
+    assert_eq!(reply.source, WaitSource::Journal);
+    assert_eq!(reply.recipients[0].status, SendStatus::Running);
+    assert_eq!(
+        reply.recipients[0].times,
+        TurnTimes {
+            started_at: Some(start),
+            running_seconds: Some(whole_seconds(start, reply.now.unwrap())),
+            ..TurnTimes::default()
+        }
+    );
+
+    gate.notify_waiters();
+    let reply = wait_done(&env, project_id, send_id).await;
+    assert_eq!(reply.recipients[0].status, SendStatus::Completed);
+    assert_eq!(
+        reply.recipients[0].times,
+        TurnTimes {
+            started_at: Some(start),
+            ..TurnTimes::default()
+        }
+    );
+}
+
+/// A run the ledger does not hold is read from its file: a failed run's
+/// terminal record says when it ended, and an interrupted run, which stopped
+/// without writing one, has no end.
+#[tokio::test]
+async fn a_run_read_from_its_file_ended_when_its_terminal_record_says() {
+    let (env, project_id, _agents) = project_with_agents(&["a"]);
+    let project = super::read::project_readonly(&env.state, project_id).unwrap();
+    std::fs::create_dir_all(project.runs_dir()).unwrap();
+    let start = Utc::now() - chrono::Duration::minutes(5);
+    let end = start + chrono::Duration::seconds(90);
+    let (failed, interrupted) = (Uuid::now_v7(), Uuid::now_v7());
+    let started = RunRecord::Started {
+        workflow: "pair".to_owned(),
+        total_steps: 1,
+        steps: Vec::new(),
+        at: start,
+    };
+    for record in [
+        started.clone(),
+        RunRecord::Terminal {
+            status: TerminalStatus::Failed,
+            failed_step: Some(0),
+            reason: Some("boom".to_owned()),
+            at: end,
+        },
+    ] {
+        switchboard_core::append_jsonl(&project.run_path(failed), &record).unwrap();
+    }
+    switchboard_core::append_jsonl(&project.run_path(interrupted), &started).unwrap();
+
+    let reply = wait_workflow(
+        &env.state,
+        project_id,
+        failed,
+        &WaitBudget::new(Some(0), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply.status, WorkflowRunStatus::Failed);
+    assert_eq!(reply.ended_at, Some(end));
+    assert_eq!(
+        reply.seconds_since_ended,
+        Some(whole_seconds(end, reply.now.unwrap()))
+    );
+
+    let reply = wait_workflow(
+        &env.state,
+        project_id,
+        interrupted,
+        &WaitBudget::new(Some(0), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply.status, WorkflowRunStatus::Interrupted);
+    assert_eq!((reply.ended_at, reply.seconds_since_ended), (None, None));
+    assert!(reply.now.is_some());
 }

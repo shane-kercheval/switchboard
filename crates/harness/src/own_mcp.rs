@@ -12,6 +12,12 @@
 /// The server name the setup instructions tell users to register.
 pub const OWN_MCP_SERVER_NAME: &str = "switchboard";
 
+/// The name of the Claude Desktop entry in the setup instructions, an
+/// `mcp-remote` bridge. `claude mcp add-from-claude-desktop` copies it into
+/// Claude Code's config under this name. Must equal `CLAUDE_DESKTOP_ENTRY_NAME`
+/// in `desktop/src/lib/agentAccessSnippets.ts`.
+pub const CLAUDE_DESKTOP_ENTRY_NAME: &str = "switchboard-chat";
+
 /// The loopback host names Switchboard's server accepts in a `Host` header, so
 /// the two forms a config entry can use to reach it.
 pub const OWN_MCP_SERVER_HOSTS: [&str; 2] = ["127.0.0.1", "localhost"];

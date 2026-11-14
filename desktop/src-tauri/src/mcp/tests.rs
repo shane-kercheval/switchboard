@@ -2873,10 +2873,17 @@ impl Drop for RecordingServer {
     }
 }
 
-/// Register three Switchboard servers in `folder`'s `.mcp.json` and enable
-/// them: `switchboard` at `elsewhere` (reachable only by name), and two other
-/// names at `own` in each host form (reachable only by address).
-fn register_own_servers(folder: &std::path::Path, own: u16, elsewhere: u16) {
+/// Register four Switchboard servers in `folder`'s `.mcp.json` and enable
+/// them: `switchboard` at `elsewhere` (reachable only by name), two other
+/// names at `own` in each host form (reachable only by address), and a stdio
+/// entry named `switchboard-chat`, the Claude Desktop entry's name, that
+/// creates `chat_marker` when it starts.
+fn register_own_servers(
+    folder: &std::path::Path,
+    own: u16,
+    elsewhere: u16,
+    chat_marker: &std::path::Path,
+) {
     let entry = |url: String| json!({ "type": "http", "url": url, "headers": { "Authorization": format!("Bearer {TOKEN}") } });
     std::fs::write(
         folder.join(".mcp.json"),
@@ -2884,6 +2891,11 @@ fn register_own_servers(folder: &std::path::Path, own: u16, elsewhere: u16) {
             "switchboard": entry(format!("http://127.0.0.1:{elsewhere}/mcp")),
             "sb_ip": entry(format!("http://127.0.0.1:{own}/mcp")),
             "sb_localhost": entry(format!("http://localhost:{own}/mcp")),
+            "switchboard-chat": {
+                "type": "stdio",
+                "command": "sh",
+                "args": ["-c", format!("touch '{}'", chat_marker.display())],
+            },
         } })
         .to_string(),
     )
@@ -2937,9 +2949,9 @@ async fn dispatch_without_the_block(
 }
 
 /// An agent Switchboard starts never connects to Switchboard's own server,
-/// registered in the project folder by name or at this instance's address in
-/// either host form; the same folder dispatched without the block connects to
-/// all three entries.
+/// registered in the project folder by either name or at this instance's
+/// address in either host form; the same folder dispatched without the block
+/// starts all four entries.
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_agents_switchboard_starts_never_reach_its_own_server() {
@@ -2955,7 +2967,9 @@ async fn live_claude_agents_switchboard_starts_never_reach_its_own_server() {
         .unwrap()
         .directory
         .clone();
-    register_own_servers(&folder, own.port, elsewhere.port);
+    let markers = tempfile::TempDir::new().unwrap();
+    let chat_marker = markers.path().join("switchboard-chat-started");
+    register_own_servers(&folder, own.port, elsewhere.port, &chat_marker);
     let worker = haiku_agent(&env, project_id, "worker").id;
     let control = haiku_agent(&env, project_id, "control");
 
@@ -2986,6 +3000,7 @@ async fn live_claude_agents_switchboard_starts_never_reach_its_own_server() {
     );
     assert_eq!(own.hosts(), Vec::<String>::new(), "by address");
     assert_eq!(elsewhere.hosts(), Vec::<String>::new(), "by name");
+    assert!(!chat_marker.exists(), "by the Claude Desktop entry's name");
 
     let outcome = dispatch_without_the_block(&control, &folder).await;
     assert!(
@@ -3005,6 +3020,10 @@ async fn live_claude_agents_switchboard_starts_never_reach_its_own_server() {
     assert!(
         !elsewhere.hosts().is_empty(),
         "without the block, the entry named switchboard is reached"
+    );
+    assert!(
+        chat_marker.exists(),
+        "without the block, the entry named switchboard-chat starts"
     );
 }
 

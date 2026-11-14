@@ -8,7 +8,9 @@ export const CODEX_TOKEN_VARIABLE = "SWITCHBOARD_TOKEN";
 
 /// The name of the Claude Desktop entry. Not `switchboard`: the Code tab reads
 /// Claude Desktop's config too, and with two entries of one name it calls
-/// through this one, whose waits stop at 50 seconds.
+/// through this one, whose waits stop at 50 seconds. Claude Code agents that
+/// Switchboard starts deny this name, so it must equal `CLAUDE_DESKTOP_ENTRY_NAME`
+/// in `crates/harness/src/own_mcp.rs`.
 export const CLAUDE_DESKTOP_ENTRY_NAME = "switchboard-chat";
 
 /// The `mcp-remote` release Claude Desktop was measured with. Pinned so an

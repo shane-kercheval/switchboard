@@ -2709,6 +2709,7 @@ async fn create_codex_fork(
     })?;
     let own_server_overrides = switchboard_harness::codex_own_server_overrides(
         state.own_mcp_server(),
+        &state.codex_config_sources,
         home_dir,
         &project.directory,
     );
@@ -9080,6 +9081,66 @@ mod tests {
             "an eager fork has nothing to materialize, so it carries no provenance"
         );
         assert!(lock(&state.agents_by_id).contains_key(&fork.id));
+    }
+
+    #[tokio::test]
+    async fn codex_fork_turns_off_the_own_mcp_server_from_both_config_files() {
+        let (_tmp, home, mut state, _project_id) = codex_fork_state();
+        let config = TempDir::new().unwrap();
+        let system_file = config.path().join("system.toml");
+        let codex_home = config.path().join("codex-home");
+        std::fs::create_dir(&codex_home).unwrap();
+        std::fs::write(
+            &system_file,
+            "[mcp_servers.switchboard]\nurl = \"http://127.0.0.1:47821/mcp\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "[mcp_servers.sb_bridge]\ncommand = \"npx\"\nargs = [\"mcp-remote\", \"http://127.0.0.1:47821/mcp\"]\n",
+        )
+        .unwrap();
+        state.codex_config_sources = switchboard_harness::CodexConfigSources {
+            system_file,
+            codex_home: Some(codex_home.into_os_string()),
+        };
+        state
+            .own_mcp_port
+            .store(47821, std::sync::atomic::Ordering::Relaxed);
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let argv_path = config.path().join("argv");
+        let shim = codex_fork_shim(
+            home.path(),
+            home.path(),
+            &format!("printf '%s\\n' \"$@\" > '{}'", argv_path.display()),
+        );
+
+        fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
+            .await
+            .expect("forking an idle Codex agent with a session should succeed");
+
+        let argv: Vec<String> = std::fs::read_to_string(&argv_path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let fork_at = argv
+            .iter()
+            .position(|arg| arg == "fork")
+            .unwrap_or_else(|| panic!("a fork subcommand in {argv:?}"));
+        for flag in [
+            r#"mcp_servers.sb_bridge.command="npx""#,
+            "mcp_servers.sb_bridge.enabled=false",
+            r#"mcp_servers.switchboard.url="http://127.0.0.1:47821/mcp""#,
+            "mcp_servers.switchboard.enabled=false",
+        ] {
+            let at = argv
+                .iter()
+                .position(|arg| arg == flag)
+                .unwrap_or_else(|| panic!("{flag} in {argv:?}"));
+            assert_eq!(argv[at - 1], "-c", "{argv:?}");
+            assert!(at < fork_at, "{flag} before fork: {argv:?}");
+        }
     }
 
     #[tokio::test]

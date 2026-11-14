@@ -290,12 +290,13 @@ Measurements made after the milestones, each with how it was made.
     project's `.codex/config.toml` files only in a trusted folder, from the project root (the
     nearest folder with `.git`; a `.git` directory must hold `HEAD`) down to the working folder,
     and only the working folder's file when there is no root. It also reads
-    `/etc/codex/config.toml` below the user's file. A server counts as required only while it is
-    enabled. Sources: the 0.165.0 source (`config/src/loader/mod.rs`,
+    `/etc/codex/config.toml` below the user's file. It applies an admin's managed config
+    (`/etc/codex/managed_config.toml`, or a macOS device-management profile) after `-c`. A server
+    counts as required only while it is enabled. Sources: the 0.165.0 source (`config/src/loader/mod.rs`,
     `codex-mcp/src/connection_manager.rs`) and `codex mcp list --json` in a scratch
-    `CODEX_HOME`. `codex mcp list` checks each HTTP server's sign-in status before it answers,
-    which can mean OAuth discovery requests of up to 5 seconds per server
-    (`cli/src/mcp_cmd.rs`, `rmcp-client/src/auth_status.rs`).
+    `CODEX_HOME`. `codex mcp list` checks every HTTP server's sign-in status at once before it
+    answers, which can mean waiting up to 5 seconds for OAuth discovery before each run
+    (`cli/src/mcp_cmd.rs`, `rmcp-client/src/auth_status.rs`, `codex-mcp/src/mcp/auth.rs`).
   - **Antigravity.** No per-run way to keep a server out. `--settings
     '{"permissions":{"deny":["mcp(switchboard/*)"]}}'` refuses each call, but the server starts
     and its tools stay listed.

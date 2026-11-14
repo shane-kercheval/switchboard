@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome};
-use crate::own_mcp::{OWN_MCP_SERVER_NAME, OwnMcpServer};
+use crate::own_mcp::{CLAUDE_DESKTOP_ENTRY_NAME, OWN_MCP_SERVER_NAME, OwnMcpServer};
 use crate::parser::{self, ParseOutcome, ParserState, StreamMode, UsageSeed};
 
 /// Adapter for Claude Code (`claude -p`). Spawns a `claude` subprocess,
@@ -500,9 +500,10 @@ struct BuildArgsInput<'a> {
 ///
 /// `deniedMcpServers` merges across every settings source, the flag included,
 /// and a denied server is never started, so the run gets neither its tools nor
-/// its instructions. Each entry takes one matcher: the name catches the entry
-/// the setup copy produces, and the URL patterns catch one renamed by the user.
-/// A stdio bridge to the server (`mcp-remote`) under another name is not caught.
+/// its instructions. Each entry takes one matcher: the names catch the entries
+/// the setup copy produces, the Claude Desktop one included, and the URL
+/// patterns catch an HTTP entry renamed by the user. A stdio bridge to the
+/// server (`mcp-remote`) under another name is not caught.
 /// `--disallowedTools` is not a substitute: it hides the tools but the server
 /// still connects and its instructions still reach the model. Verified @ 2.1.321
 /// on a turn, a resume, a fork, and `/context`, with entries from a folder's
@@ -510,7 +511,10 @@ struct BuildArgsInput<'a> {
 /// as a turn, which `maintenance_argv_matches_send_argv_except_the_positional`
 /// tests.
 fn own_server_settings(own: OwnMcpServer) -> String {
-    let mut denied = vec![serde_json::json!({ "serverName": OWN_MCP_SERVER_NAME })];
+    let mut denied = vec![
+        serde_json::json!({ "serverName": OWN_MCP_SERVER_NAME }),
+        serde_json::json!({ "serverName": CLAUDE_DESKTOP_ENTRY_NAME }),
+    ];
     denied.extend(
         own.url_patterns()
             .into_iter()
@@ -1838,7 +1842,7 @@ mod tests {
     }
 
     #[test]
-    fn build_args_denies_the_own_mcp_server_by_name_and_both_host_forms() {
+    fn build_args_denies_the_own_mcp_server_by_both_names_and_both_host_forms() {
         let home = tempfile::TempDir::new().unwrap();
         let project = tempfile::TempDir::new().unwrap();
         let agent = agent_with_session(Uuid::now_v7());
@@ -1859,6 +1863,7 @@ mod tests {
             parsed,
             serde_json::json!({ "deniedMcpServers": [
                 { "serverName": "switchboard" },
+                { "serverName": "switchboard-chat" },
                 { "serverUrl": "http://127.0.0.1:47822/*" },
                 { "serverUrl": "http://localhost:47822/*" },
             ]})

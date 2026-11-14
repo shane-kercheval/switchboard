@@ -11,13 +11,22 @@
 //!
 //! Only the files Codex reads on every run are read, lowest precedence first:
 //! `/etc/codex/config.toml`, then `$CODEX_HOME/config.toml` (default
-//! `~/.codex/config.toml`). A later file can add keys to an entry but not
-//! remove them, and `-c` merges key by key, so the transport repeated here is
-//! one Codex's own entry already has, and an override can't fail a run that
-//! would otherwise start. Project `.codex/config.toml` files are not read:
-//! which of them Codex loads depends on folder trust and the project root, and
-//! repeating a transport from one Codex skipped could fail the run. An entry
-//! defined only in a project file stays on.
+//! `~/.codex/config.toml`). The layers Codex applies between those files and
+//! `-c` can add keys to an entry but not remove them, and `-c` merges key by
+//! key, so the transport repeated here is one Codex's own entry already has.
+//! Project `.codex/config.toml` files are not read: which of them Codex loads
+//! depends on folder trust and the project root, and repeating a transport
+//! from one Codex skipped could fail the run. An entry defined only in a
+//! project file stays on.
+//!
+//! An override can still fail a run that would otherwise start. Codex applies
+//! an admin's managed config (`/etc/codex/managed_config.toml`, or a macOS
+//! device-management profile) after `-c`. When it forces the entry's
+//! `enabled = true`, some layer sets `required = true`, a project's
+//! `.codex/config.toml` points the entry at a working address, and the two
+//! files read here point it at one that doesn't answer, the repeated transport
+//! replaces the project's address and the required server fails to start. Read in the 0.165.0 loader
+//! source, not probed.
 //!
 //! Where no override is safe, this passes none for the entry and logs a warning:
 //! - a file that can't be read or parsed (no overrides at all, since the file
@@ -27,7 +36,7 @@
 //! - a name outside `[A-Za-z0-9_-]`, which can't be written as a `-c` key path.
 
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::own_mcp::{OWN_MCP_SERVER_NAME, OwnMcpServer};
@@ -35,24 +44,50 @@ use crate::own_mcp::{OWN_MCP_SERVER_NAME, OwnMcpServer};
 /// The system config file, read below the user's on every Codex run.
 const SYSTEM_CONFIG_FILE: &str = "/etc/codex/config.toml";
 
+/// Where the two config files the lookup reads are: the system file, and the
+/// `CODEX_HOME` value the Codex child runs with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexConfigSources {
+    pub system_file: PathBuf,
+    pub codex_home: Option<OsString>,
+}
+
+impl CodexConfigSources {
+    /// The system file Codex reads on macOS and Linux, and this process's
+    /// `CODEX_HOME`, which every Codex child inherits.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            system_file: PathBuf::from(SYSTEM_CONFIG_FILE),
+            codex_home: std::env::var_os("CODEX_HOME"),
+        }
+    }
+
+    /// The two files for a run in `cwd`, lowest precedence first.
+    fn files(&self, home_dir: &Path, cwd: &Path) -> [PathBuf; 2] {
+        [
+            self.system_file.clone(),
+            codex_home(self.codex_home.as_deref(), home_dir, cwd).join("config.toml"),
+        ]
+    }
+}
+
 /// The `-c` arguments that turn Switchboard's own server off for a Codex run
 /// in `cwd`, from the system file and `$CODEX_HOME/config.toml`.
 #[must_use]
-pub fn codex_own_server_overrides(own: OwnMcpServer, home_dir: &Path, cwd: &Path) -> Vec<String> {
-    let codex_home = codex_home(std::env::var_os("CODEX_HOME").as_deref(), home_dir, cwd);
-    overrides_from_files(
-        &[
-            PathBuf::from(SYSTEM_CONFIG_FILE),
-            codex_home.join("config.toml"),
-        ],
-        own,
-    )
+pub fn codex_own_server_overrides(
+    own: OwnMcpServer,
+    sources: &CodexConfigSources,
+    home_dir: &Path,
+    cwd: &Path,
+) -> Vec<String> {
+    overrides_from_files(&sources.files(home_dir, cwd), own)
 }
 
 /// Codex's home for a run in `cwd`: `CODEX_HOME` when set, resolved from `cwd`
 /// when relative, as the Codex child started there resolves it; else
 /// `<home>/.codex`.
-pub(crate) fn codex_home(env_value: Option<&OsStr>, home_dir: &Path, cwd: &Path) -> PathBuf {
+fn codex_home(env_value: Option<&OsStr>, home_dir: &Path, cwd: &Path) -> PathBuf {
     match env_value.filter(|value| !value.is_empty()) {
         Some(value) => cwd.join(value),
         None => home_dir.join(".codex"),
@@ -60,7 +95,7 @@ pub(crate) fn codex_home(env_value: Option<&OsStr>, home_dir: &Path, cwd: &Path)
 }
 
 /// The overrides for the matching entries in `files`, lowest precedence first.
-pub(crate) fn overrides_from_files(files: &[PathBuf], own: OwnMcpServer) -> Vec<String> {
+fn overrides_from_files(files: &[PathBuf], own: OwnMcpServer) -> Vec<String> {
     let Some(merged) = merged_servers(files) else {
         return Vec::new();
     };
@@ -592,11 +627,7 @@ url = "http://127.0.0.1:47821/mcp"
     /// `-c` entry of that name merges into, or `None` without one.
     fn developers_switchboard_transport(cwd: &Path) -> Option<&'static str> {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-        let codex_home = codex_home(std::env::var_os("CODEX_HOME").as_deref(), &home, cwd);
-        let files = [
-            PathBuf::from(SYSTEM_CONFIG_FILE),
-            codex_home.join("config.toml"),
-        ];
+        let files = CodexConfigSources::from_env().files(&home, cwd);
         let merged = merged_servers(&files).expect("your Codex config files parse");
         let entry = merged.get(OWN_MCP_SERVER_NAME)?;
         match (entry.get("url"), entry.get("command")) {
@@ -615,8 +646,11 @@ url = "http://127.0.0.1:47821/mcp"
     /// entries come in with `-c`, so the test writes nothing in `~/.codex`.
     /// `-c` merges the named entry into the developer's own `switchboard`
     /// entry, so it takes that entry's transport (a second one fails every
-    /// run) and carries the setup copy's keys. The overrides alone, as for an
-    /// entry Codex never loaded, still let the run start.
+    /// run), sets `enabled` and `required` so the developer's values can't
+    /// break the control run, and carries the setup copy's keys. The last run
+    /// passes the overrides alone, so the renamed entries are missing from what
+    /// Codex loaded, as they would be if Switchboard read a file Codex didn't:
+    /// the repeated transport still lets the run start.
     #[tokio::test]
     #[ignore = "requires codex installed — run with: make test-live"]
     async fn live_codex_own_server_overrides_keep_matching_servers_from_starting() {
@@ -644,6 +678,8 @@ url = "http://127.0.0.1:47821/mcp"
         };
         entries.extend([
             r#"mcp_servers.switchboard.default_tools_approval_mode="approve""#.to_owned(),
+            "mcp_servers.switchboard.enabled=true".to_owned(),
+            "mcp_servers.switchboard.required=false".to_owned(),
             format!(r#"mcp_servers.sb_localhost.url="http://localhost:{own_port}/mcp""#),
             r#"mcp_servers.sb_bridge.command="sh""#.to_owned(),
             format!(

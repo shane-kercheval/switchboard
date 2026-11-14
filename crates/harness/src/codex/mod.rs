@@ -34,7 +34,7 @@ pub(crate) mod facets;
 pub mod fork;
 pub(crate) mod inherited_history;
 mod own_server;
-pub use own_server::codex_own_server_overrides;
+pub use own_server::{CodexConfigSources, codex_own_server_overrides};
 pub mod parser;
 pub(crate) mod rollout_file;
 pub mod session_file;
@@ -113,6 +113,8 @@ pub struct CodexAdapter {
     /// production this is `None` and the adapter resolves `$HOME` at
     /// dispatch time (the same pattern as `ClaudeCodeAdapter::home`).
     home_dir_override: Option<PathBuf>,
+    /// Where the own-server lookup finds Codex's config files.
+    config_sources: CodexConfigSources,
     /// Lazily-resolved `codex --version`, cached for the lifetime of the
     /// adapter. Empty string caches a failed/absent probe (version is
     /// display-only). Mirrors the Antigravity pattern.
@@ -131,6 +133,7 @@ impl CodexAdapter {
         Self {
             codex_binary_path: PathBuf::from("codex"),
             home_dir_override: None,
+            config_sources: CodexConfigSources::from_env(),
             cached_version: OnceLock::new(),
             compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
@@ -141,6 +144,7 @@ impl CodexAdapter {
         Self {
             codex_binary_path: path.into(),
             home_dir_override: None,
+            config_sources: CodexConfigSources::from_env(),
             cached_version: OnceLock::new(),
             compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
@@ -149,14 +153,22 @@ impl CodexAdapter {
     /// Override both the binary path and the home directory — used by
     /// fixture-driven adapter tests that stage a `TempDir` as `home_dir`
     /// so they can write into `<home>/.codex/sessions/...` without touching
-    /// the developer's real `~/.codex/`.
+    /// the developer's real `~/.codex/`. The staged home stands in for the
+    /// machine's config too: the own-server lookup reads
+    /// `<home>/etc/codex/config.toml` as the system file and ignores
+    /// `CODEX_HOME`.
     pub fn with_binary_and_home(
         binary_path: impl Into<PathBuf>,
         home_dir: impl Into<PathBuf>,
     ) -> Self {
+        let home_dir = home_dir.into();
         Self {
             codex_binary_path: binary_path.into(),
-            home_dir_override: Some(home_dir.into()),
+            config_sources: CodexConfigSources {
+                system_file: home_dir.join("etc/codex/config.toml"),
+                codex_home: None,
+            },
+            home_dir_override: Some(home_dir),
             cached_version: OnceLock::new(),
             compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
@@ -171,24 +183,15 @@ impl CodexAdapter {
     }
 
     /// The `-c` arguments that turn Switchboard's own MCP server off for a run
-    /// in `cwd`. A staged home stands in for the whole machine, so tests read
-    /// only its `.codex/config.toml`, never the system file or `CODEX_HOME`.
+    /// in `cwd`.
     fn own_server_overrides(
         &self,
         own: Option<crate::OwnMcpServer>,
         home_dir: &Path,
         cwd: &Path,
     ) -> Vec<String> {
-        let Some(own) = own else {
-            return Vec::new();
-        };
-        if self.home_dir_override.is_some() {
-            return own_server::overrides_from_files(
-                &[home_dir.join(".codex").join("config.toml")],
-                own,
-            );
-        }
-        codex_own_server_overrides(own, home_dir, cwd)
+        own.map(|own| codex_own_server_overrides(own, &self.config_sources, home_dir, cwd))
+            .unwrap_or_default()
     }
 }
 

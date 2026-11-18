@@ -1283,8 +1283,8 @@ pub fn parse_cli_version(line: &str) -> Option<String> {
 
 /// Best-effort version string for a harness CLI: the first line of
 /// `<binary> --version`, trimmed. Returns `None` when the binary can't be
-/// resolved/invoked or reports nothing — the value is display-only, never
-/// load-bearing, so any failure collapses to "unknown" rather than an error.
+/// resolved/invoked or reports nothing. Any failure collapses to "unknown"
+/// rather than an error; the Codex `--trust` gate treats unknown as current.
 pub fn fetch_version(binary: &Path) -> Option<String> {
     let resolved = resolve_binary(binary).ok()?;
     let mut command = std::process::Command::new(&resolved);

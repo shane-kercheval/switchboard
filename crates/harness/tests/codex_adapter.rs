@@ -1814,6 +1814,106 @@ fn separator_at(argv: &[String]) -> usize {
         .expect("a -- before the prompt")
 }
 
+#[cfg(unix)]
+/// A stand-in for `codex` in `dir` that answers `--version` with
+/// `version_line`, or fails it when `None`, and hands every other call to
+/// `fake_codex`.
+fn codex_reporting(dir: &Path, version_line: Option<&str>) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let answer = version_line.map_or_else(
+        || "exit 1".to_owned(),
+        |line| format!("echo '{line}'; exit 0"),
+    );
+    let shim = dir.join("codex");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then {answer}; fi\nexec '{FAKE_CODEX}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    shim
+}
+
+#[cfg(unix)]
+/// The arguments `fake_codex` gets for one turn in a new folder, from a Codex
+/// whose `--version` reports `version_line`, with `config(folder)` as the
+/// staged home's `.codex/config.toml`.
+async fn argv_of_a_turn(
+    version_line: Option<&str>,
+    config: impl FnOnce(&Path) -> String,
+) -> Vec<String> {
+    let root = tempfile::TempDir::new().unwrap();
+    let home = root.path().join("home");
+    let cwd = root.path().join("project");
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(home.join(".codex/config.toml"), config(&cwd)).unwrap();
+    let codex = codex_reporting(root.path(), version_line);
+    let argv_path = root.path().join("argv");
+    let fixture_path = root.path().join("fixture.jsonl");
+    let recorded = std::fs::read_to_string(fixture("text-only")).unwrap();
+    std::fs::write(
+        &fixture_path,
+        format!("// argv_to:{}\n{recorded}", argv_path.display()),
+    )
+    .unwrap();
+
+    let events: Vec<AdapterEvent> = CodexAdapter::with_binary_and_home(codex, &home)
+        .dispatch(
+            &codex_agent(),
+            &cwd,
+            fixture_path.to_str().unwrap(),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed")
+        .collect()
+        .await;
+    assert!(matches!(outcome_of(&events), TurnOutcome::Completed));
+    std::fs::read_to_string(&argv_path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_turn_passes_trust_unless_the_user_marked_the_folder_untrusted() {
+    let current = Some("codex-cli 0.170.0");
+    let argv = argv_of_a_turn(current, |_| String::new()).await;
+    assert!(argv.iter().any(|arg| arg == "--trust"), "{argv:?}");
+
+    let argv = argv_of_a_turn(current, |folder| {
+        format!(
+            "[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
+            folder.display()
+        )
+    })
+    .await;
+    assert!(!argv.iter().any(|arg| arg == "--trust"), "{argv:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_turn_passes_trust_only_to_codex_0_169_0_or_newer_or_an_unreadable_version() {
+    for (version_line, trust) in [
+        (Some("codex-cli 0.168.0"), false),
+        (Some("codex-cli 0.169.0"), true),
+        (None, true),
+    ] {
+        let argv = argv_of_a_turn(version_line, |_| String::new()).await;
+        assert_eq!(
+            argv.iter().any(|arg| arg == "--trust"),
+            trust,
+            "{version_line:?}: {argv:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_first_turn_passes_the_own_server_overrides_before_the_prompt() {
     let (events, argv) = turn_with_own_server(&codex_agent(), SWITCHBOARD_ENTRY).await;

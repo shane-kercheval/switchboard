@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use switchboard_core::AgentSelection;
-use switchboard_harness::{CodexForkError, CodexLocator, fork_codex_session};
+use switchboard_harness::{CodexForkError, CodexLocator, CodexRunFlags, fork_codex_session};
 
 #[cfg(unix)]
 mod common;
@@ -23,6 +23,15 @@ const FAKE_CODEX: &str = env!("CARGO_BIN_EXE_fake_codex");
 
 const PARENT: &str = "01a12d13-1b40-7232-8895-631605068ea7";
 const FORK: &str = "01a12d13-2870-7f61-93dc-f2b7256018a6";
+
+/// Run flags with `--trust` and `own_server_overrides`, as a fork in a folder
+/// with no saved trust decision gets them.
+fn trusting(own_server_overrides: Vec<String>) -> CodexRunFlags {
+    CodexRunFlags {
+        own_server_overrides,
+        trust: true,
+    }
+}
 
 /// Bounds a fork that is expected to finish: it only has to outlast a local
 /// replay.
@@ -100,7 +109,7 @@ impl Setup {
             &self.cwd,
             PARENT,
             &AgentSelection::default(),
-            &[],
+            &trusting(Vec::new()),
             timeout,
         )
         .await
@@ -160,7 +169,7 @@ async fn a_fork_passes_its_overrides_among_the_flags_before_fork() {
         &setup.cwd,
         PARENT,
         &AgentSelection::default(),
-        &overrides,
+        &trusting(overrides.to_vec()),
         AMPLE,
     )
     .await
@@ -287,7 +296,7 @@ async fn a_missing_working_folder_is_not_reported_as_a_missing_binary() {
         &gone,
         PARENT,
         &AgentSelection::default(),
-        &[],
+        &trusting(Vec::new()),
         AMPLE,
     )
     .await

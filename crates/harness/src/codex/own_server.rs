@@ -65,17 +65,20 @@ impl CodexConfigSources {
 
     /// The two files for a run in `cwd`, lowest precedence first.
     fn files(&self, home_dir: &Path, cwd: &Path) -> [PathBuf; 2] {
-        [
-            self.system_file.clone(),
-            codex_home(self.codex_home.as_deref(), home_dir, cwd).join("config.toml"),
-        ]
+        [self.system_file.clone(), self.user_file(home_dir, cwd)]
+    }
+
+    /// `$CODEX_HOME/config.toml` for a run in `cwd`: the user's own config,
+    /// where Codex saves project trust.
+    pub(crate) fn user_file(&self, home_dir: &Path, cwd: &Path) -> PathBuf {
+        codex_home(self.codex_home.as_deref(), home_dir, cwd).join("config.toml")
     }
 }
 
 /// The `-c` arguments that turn Switchboard's own server off for a Codex run
 /// in `cwd`, from the system file and `$CODEX_HOME/config.toml`.
 #[must_use]
-pub fn codex_own_server_overrides(
+pub(crate) fn codex_own_server_overrides(
     own: OwnMcpServer,
     sources: &CodexConfigSources,
     home_dir: &Path,
@@ -598,8 +601,13 @@ url = "http://127.0.0.1:47821/mcp"
             forked_from_session: None,
             created_at: chrono::Utc::now(),
         };
-        let args =
-            super::super::build_args(&agent, "Reply with only the word ack.", None, overrides);
+        let args = super::super::build_args(
+            &agent,
+            "Reply with only the word ack.",
+            None,
+            overrides,
+            true,
+        );
         let output = tokio::time::timeout(
             Duration::from_mins(3),
             tokio::process::Command::new("codex")

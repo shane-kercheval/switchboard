@@ -34,11 +34,14 @@ pub(crate) mod facets;
 pub mod fork;
 pub(crate) mod inherited_history;
 mod own_server;
-pub use own_server::{CodexConfigSources, codex_own_server_overrides};
+pub use own_server::CodexConfigSources;
+mod run_flags;
+pub use run_flags::CodexRunFlags;
 pub mod parser;
 pub(crate) mod rollout_file;
 pub mod session_file;
 pub mod skills;
+mod trust;
 pub(crate) mod world_state;
 
 use std::collections::VecDeque;
@@ -116,9 +119,10 @@ pub struct CodexAdapter {
     /// Where the own-server lookup finds Codex's config files.
     config_sources: CodexConfigSources,
     /// Lazily-resolved `codex --version`, cached for the lifetime of the
-    /// adapter. Empty string caches a failed/absent probe (version is
-    /// display-only). Mirrors the Antigravity pattern.
-    cached_version: OnceLock<String>,
+    /// adapter; an empty string caches a failed probe. Shared so the first
+    /// read can run on a blocking thread. It decides whether a run passes
+    /// `--trust`, so a Codex update takes effect on that after a restart.
+    cached_version: Arc<OnceLock<String>>,
     /// How long a compaction's server has to answer its three requests.
     /// [`compaction::COMPACTION_STARTUP_TIMEOUT`] in production; tests shorten
     /// it to exercise the timeout without a thirty-second test.
@@ -134,7 +138,7 @@ impl CodexAdapter {
             codex_binary_path: PathBuf::from("codex"),
             home_dir_override: None,
             config_sources: CodexConfigSources::from_env(),
-            cached_version: OnceLock::new(),
+            cached_version: Arc::default(),
             compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
     }
@@ -145,7 +149,7 @@ impl CodexAdapter {
             codex_binary_path: path.into(),
             home_dir_override: None,
             config_sources: CodexConfigSources::from_env(),
-            cached_version: OnceLock::new(),
+            cached_version: Arc::default(),
             compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
     }
@@ -169,7 +173,7 @@ impl CodexAdapter {
                 codex_home: None,
             },
             home_dir_override: Some(home_dir),
-            cached_version: OnceLock::new(),
+            cached_version: Arc::default(),
             compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
     }
@@ -182,17 +186,27 @@ impl CodexAdapter {
         self
     }
 
-    /// The `-c` arguments that turn Switchboard's own MCP server off for a run
-    /// in `cwd`.
-    fn own_server_overrides(
-        &self,
-        own: Option<crate::OwnMcpServer>,
-        home_dir: &Path,
-        cwd: &Path,
-    ) -> Vec<String> {
-        own.map(|own| codex_own_server_overrides(own, &self.config_sources, home_dir, cwd))
-            .unwrap_or_default()
+    /// [`HarnessAdapter::version`] for an async caller. The first read runs
+    /// `codex --version` and waits up to its timeout, so it runs on a blocking
+    /// thread.
+    async fn version_off_async_thread(&self) -> Option<String> {
+        let raw = if let Some(raw) = self.cached_version.get() {
+            raw.clone()
+        } else {
+            let cell = Arc::clone(&self.cached_version);
+            let binary = self.codex_binary_path.clone();
+            tokio::task::spawn_blocking(move || read_version(&cell, &binary))
+                .await
+                .unwrap_or_default()
+        };
+        crate::subprocess::parse_cli_version(&raw)
     }
+}
+
+/// The first line of `codex --version`, read once into `cell`.
+fn read_version(cell: &OnceLock<String>, binary: &Path) -> String {
+    cell.get_or_init(|| crate::subprocess::fetch_version(binary).unwrap_or_default())
+        .clone()
 }
 
 impl Default for CodexAdapter {
@@ -208,10 +222,10 @@ impl HarnessAdapter for CodexAdapter {
     }
 
     fn version(&self) -> Option<String> {
-        let raw = self.cached_version.get_or_init(|| {
-            crate::subprocess::fetch_version(&self.codex_binary_path).unwrap_or_default()
-        });
-        crate::subprocess::parse_cli_version(raw)
+        crate::subprocess::parse_cli_version(&read_version(
+            &self.cached_version,
+            &self.codex_binary_path,
+        ))
     }
 
     async fn dispatch(
@@ -229,12 +243,20 @@ impl HarnessAdapter for CodexAdapter {
         // first-dispatch case; the adapter captures it from the stream below.
         let prior = codex_locator(agent);
         let home_dir = resolve_home_dir(self.home_dir_override.as_deref());
-        let overrides = self.own_server_overrides(options.own_mcp_server, &home_dir, cwd);
+        let version = self.version_off_async_thread().await;
+        let flags = CodexRunFlags::for_run(
+            &self.config_sources,
+            &home_dir,
+            cwd,
+            options.own_mcp_server,
+            version.as_deref(),
+        );
         let args = build_args(
             agent,
             prompt,
             prior.as_ref().map(|l| l.thread_id.as_str()),
-            &overrides,
+            &flags.own_server_overrides,
+            flags.trust,
         );
 
         let mut command = tokio::process::Command::new(&binary);
@@ -328,7 +350,12 @@ impl HarnessAdapter for CodexAdapter {
         // everything up to the three replies.
         let startup_deadline = tokio::time::Instant::now() + self.compaction_startup_bound;
         let binary = crate::subprocess::resolve_binary(&self.codex_binary_path)?;
-        let overrides = self.own_server_overrides(options.own_mcp_server, &home_dir, cwd);
+        let overrides = run_flags::own_server_overrides(
+            &self.config_sources,
+            &home_dir,
+            cwd,
+            options.own_mcp_server,
+        );
         let server = app_server::AppServer::spawn(&binary, Some(cwd), &overrides)
             .map_err(|e| crate::subprocess::map_spawn_error(e, cwd))?;
         let requests = compaction::requests(&compaction::CompactionTarget {
@@ -374,11 +401,14 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 /// separator so a prompt beginning with `-` is not misparsed as a flag (verified
 /// against codex-cli 0.136.0). `overrides` are `-c` pairs, placed with the
 /// other flags before the separator.
+///
+/// `trust` adds `--trust`, from [`CodexRunFlags::for_run`].
 fn build_args(
     agent: &AgentRecord,
     prompt: &str,
     resume_thread_id: Option<&str>,
     overrides: &[String],
+    trust: bool,
 ) -> Vec<String> {
     if let Some(thread_id) = resume_thread_id {
         // Resume subcommand — NO `-C` (rejected by codex 0.130.0). cwd is
@@ -390,6 +420,7 @@ fn build_args(
             "--skip-git-repo-check".to_owned(),
             "--dangerously-bypass-approvals-and-sandbox".to_owned(),
         ];
+        push_trust_flag(&mut args, trust);
         push_selection_flags(&mut args, agent.model.as_deref(), agent.effort.as_deref());
         args.extend_from_slice(overrides);
         // End-of-options separator so the positionals (session id and,
@@ -406,6 +437,9 @@ fn build_args(
             "--json".to_owned(),
             "--skip-git-repo-check".to_owned(),
             "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+        ];
+        push_trust_flag(&mut args, trust);
+        args.extend([
             "-C".to_owned(),
             // The Command's `current_dir(cwd)` already pins the child's
             // process working directory; passing `-C cwd` is redundant but
@@ -414,7 +448,7 @@ fn build_args(
             // set by Command::current_dir — "." is interpreted relative to
             // the child's pwd, which IS cwd. Avoids encoding the path twice.
             ".".to_owned(),
-        ];
+        ]);
         push_selection_flags(&mut args, agent.model.as_deref(), agent.effort.as_deref());
         args.extend_from_slice(overrides);
         // End-of-options separator (see the resume branch) — guards the
@@ -422,6 +456,16 @@ fn build_args(
         args.push("--".to_owned());
         args.push(prompt.to_owned());
         args
+    }
+}
+
+/// Append `--trust` when `trust` is set. It saves trust for the folder in the
+/// user's Codex config when the folder has no saved decision, so the folder's
+/// `.codex/config.toml` loads; since 0.169.0 Codex skips that file in a folder
+/// that isn't trusted. Valid on `exec`, `exec resume` and `exec fork`.
+fn push_trust_flag(args: &mut Vec<String>, trust: bool) {
+    if trust {
+        args.push("--trust".to_owned());
     }
 }
 
@@ -1253,7 +1297,7 @@ mod tests {
 
     #[test]
     fn build_args_first_turn_omits_resume_and_session_id_and_includes_dash_c() {
-        let args = build_args(&codex_test_agent(), "hello", None, &[]);
+        let args = build_args(&codex_test_agent(), "hello", None, &[], true);
         assert!(args.contains(&"exec".to_owned()));
         assert!(
             !args.contains(&"resume".to_owned()),
@@ -1262,6 +1306,7 @@ mod tests {
         assert!(args.contains(&"--json".to_owned()));
         assert!(args.contains(&"--skip-git-repo-check".to_owned()));
         assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_owned()));
+        assert!(args.contains(&"--trust".to_owned()));
         assert!(
             args.iter().any(|a| a == "-C"),
             "first turn includes -C (accepted by `codex exec`)"
@@ -1295,6 +1340,7 @@ mod tests {
             "hello again",
             Some(RESUME_THREAD_ID),
             &[],
+            true,
         );
         // resume subcommand
         let exec_idx = args
@@ -1330,6 +1376,271 @@ mod tests {
         assert!(args.contains(&"--json".to_owned()));
         assert!(args.contains(&"--skip-git-repo-check".to_owned()));
         assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_owned()));
+        assert!(args.contains(&"--trust".to_owned()));
+    }
+
+    /// Runs the real `codex` with `args` in `cwd`, with `home` as its
+    /// `CODEX_HOME` and no API key in its environment, and returns its exit
+    /// status, stdout and stderr as one log.
+    async fn run_codex_in_home(home: &Path, cwd: &Path, args: &[String]) -> (String, String) {
+        let output = tokio::time::timeout(
+            Duration::from_mins(3),
+            tokio::process::Command::new("codex")
+                .args(args)
+                .current_dir(cwd)
+                .env("CODEX_HOME", home)
+                .env_remove("OPENAI_API_KEY")
+                .env_remove("CODEX_API_KEY")
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("codex finished within three minutes")
+        .expect("codex started");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let log = format!(
+            "{}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (stdout, log)
+    }
+
+    /// A new git repository, canonicalized as Codex keys trust entries.
+    fn live_git_folder() -> (tempfile::TempDir, PathBuf) {
+        let folder = tempfile::TempDir::new().unwrap();
+        let root = folder.path().canonicalize().unwrap();
+        let git = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(git.success());
+        (folder, root)
+    }
+
+    fn live_luna_agent() -> AgentRecord {
+        let mut agent = codex_test_agent();
+        agent.model = Some("gpt-6-luna".to_owned());
+        agent.effort = Some("low".to_owned());
+        agent
+    }
+
+    /// The `--trust` decision for a run in `cwd` with `home` as `CODEX_HOME`,
+    /// gated on the installed Codex's own `--version`.
+    fn live_trust_decision(home: &Path, cwd: &Path) -> bool {
+        let sources = CodexConfigSources {
+            system_file: home.join("absent-system-config.toml"),
+            codex_home: Some(home.as_os_str().to_owned()),
+        };
+        let version = CodexAdapter::new().version();
+        CodexRunFlags::for_run(
+            &sources,
+            Path::new("/nonexistent-home"),
+            cwd,
+            None,
+            version.as_deref(),
+        )
+        .trust
+    }
+
+    fn untrusted_entry_for(folder: &Path) -> String {
+        format!(
+            "[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
+            folder.display()
+        )
+    }
+
+    // These run against an empty CODEX_HOME: Codex decides and saves trust and
+    // starts MCP servers before it signs in, so none needs credentials or
+    // quota, and none writes the developer's own config. A turn that starts
+    // fails at sign-in.
+
+    #[tokio::test]
+    #[ignore = "requires codex installed — run with: make test-live"]
+    async fn live_codex_first_turn_trusts_the_folder_and_starts_its_project_mcp_server() {
+        let home = tempfile::TempDir::new().unwrap();
+        let (_folder, root) = live_git_folder();
+        let marker = home.path().join("project-server-started");
+        std::fs::create_dir(root.join(".codex")).unwrap();
+        std::fs::write(
+            root.join(".codex/config.toml"),
+            format!(
+                "[mcp_servers.project]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch '{}'; sleep 5\"]\nstartup_timeout_sec = 2\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let trust = live_trust_decision(home.path(), &root);
+        assert!(trust, "a folder with no saved decision gets --trust");
+        let args = build_args(
+            &live_luna_agent(),
+            "Reply with only the word ack.",
+            None,
+            &[],
+            trust,
+        );
+
+        let (_stdout, log) = run_codex_in_home(home.path(), &root, &args).await;
+
+        assert!(
+            marker.exists(),
+            "the project's MCP server did not start: {log}"
+        );
+        let saved = std::fs::read_to_string(home.path().join("config.toml")).unwrap_or_default();
+        let config: toml::Table = toml::from_str(&saved).unwrap();
+        let root_key = root.to_str().unwrap();
+        let trust_level = config
+            .get("projects")
+            .and_then(|projects| projects.get(root_key))
+            .and_then(|project| project.get("trust_level"))
+            .and_then(toml::Value::as_str);
+        assert_eq!(
+            trust_level,
+            Some("trusted"),
+            "no trust entry for {root_key}:\n{saved}\n{log}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires codex installed — run with: make test-live"]
+    async fn live_codex_turn_in_a_folder_marked_untrusted_starts_and_keeps_the_entry() {
+        let home = tempfile::TempDir::new().unwrap();
+        let (_folder, root) = live_git_folder();
+        let config = untrusted_entry_for(&root);
+        std::fs::write(home.path().join("config.toml"), &config).unwrap();
+        let agent = live_luna_agent();
+        let prompt = "Reply with only the word ack.";
+
+        // The control: with the flag, Codex refuses the run before any turn.
+        let (_stdout, refused) = run_codex_in_home(
+            home.path(),
+            &root,
+            &build_args(&agent, prompt, None, &[], true),
+        )
+        .await;
+        assert!(
+            refused.contains("is marked as untrusted"),
+            "Codex no longer refuses --trust in an untrusted folder: {refused}"
+        );
+
+        let trust = live_trust_decision(home.path(), &root);
+        assert!(!trust, "a folder marked untrusted gets no --trust");
+        let (stdout, log) = run_codex_in_home(
+            home.path(),
+            &root,
+            &build_args(&agent, prompt, None, &[], trust),
+        )
+        .await;
+
+        assert!(!log.contains("is marked as untrusted"), "{log}");
+        assert!(
+            stdout.contains("\"turn.started\""),
+            "the turn did not start: {log}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            config,
+            "the untrusted entry changed"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires codex installed — run with: make test-live"]
+    async fn live_codex_accepts_trust_for_a_repository_inside_a_folder_marked_untrusted() {
+        let home = tempfile::TempDir::new().unwrap();
+        let folder = tempfile::TempDir::new().unwrap();
+        let parent = folder.path().canonicalize().unwrap();
+        let repo = parent.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        trust::test_git::git(&repo, &["init", "-q"]);
+        std::fs::write(
+            home.path().join("config.toml"),
+            untrusted_entry_for(&parent),
+        )
+        .unwrap();
+        assert!(
+            live_trust_decision(home.path(), &repo),
+            "an entry above the repository leaves --trust on"
+        );
+
+        let (stdout, log) = run_codex_in_home(
+            home.path(),
+            &repo,
+            &build_args(
+                &live_luna_agent(),
+                "Reply with only the word ack.",
+                None,
+                &[],
+                true,
+            ),
+        )
+        .await;
+
+        assert!(
+            !log.contains("is marked as untrusted"),
+            "Codex now refuses --trust below a folder marked untrusted: {log}"
+        );
+        assert!(
+            stdout.contains("\"turn.started\""),
+            "the turn did not start: {log}"
+        );
+        let saved = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let config: toml::Table = toml::from_str(&saved).unwrap();
+        let repo_key = repo.to_str().unwrap();
+        let trust_level = config
+            .get("projects")
+            .and_then(|projects| projects.get(repo_key))
+            .and_then(|project| project.get("trust_level"))
+            .and_then(toml::Value::as_str);
+        assert_eq!(
+            trust_level,
+            Some("trusted"),
+            "no trust entry for {repo_key}:\n{saved}\n{log}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires codex installed — run with: make test-live"]
+    async fn live_codex_refuses_trust_in_a_worktree_whose_main_checkout_is_marked_untrusted() {
+        let home = tempfile::TempDir::new().unwrap();
+        let folder = tempfile::TempDir::new().unwrap();
+        let base = folder.path().canonicalize().unwrap();
+        let main = base.join("main");
+        let worktree = base.join("wt");
+        trust::test_git::repo_with_worktree(&main, &worktree);
+        std::fs::write(home.path().join("config.toml"), untrusted_entry_for(&main)).unwrap();
+
+        let (_stdout, refused) = run_codex_in_home(
+            home.path(),
+            &worktree,
+            &build_args(
+                &live_luna_agent(),
+                "Reply with only the word ack.",
+                None,
+                &[],
+                true,
+            ),
+        )
+        .await;
+
+        assert!(
+            refused.contains("is marked as untrusted"),
+            "Codex no longer refuses --trust where the main checkout is untrusted: {refused}"
+        );
+        assert!(
+            !live_trust_decision(home.path(), &worktree),
+            "a worktree whose main checkout is untrusted gets no --trust"
+        );
+    }
+
+    #[test]
+    fn build_args_omits_trust_when_told_to_on_a_first_turn_and_a_resume() {
+        for resume in [None, Some(RESUME_THREAD_ID)] {
+            let args = build_args(&codex_test_agent(), "hello", resume, &[], false);
+            assert!(!args.contains(&"--trust".to_owned()), "{args:?}");
+        }
     }
 
     #[test]
@@ -1339,7 +1650,7 @@ mod tests {
         // branches, sitting after the `--` separator rather than being parsed
         // as a flag.
         for prompt in ["- the left border is cut off", "--help"] {
-            let first = build_args(&codex_test_agent(), prompt, None, &[]);
+            let first = build_args(&codex_test_agent(), prompt, None, &[], true);
             assert_eq!(first.last(), Some(&prompt.to_owned()));
             assert_eq!(
                 first[first.len() - 2],
@@ -1347,7 +1658,13 @@ mod tests {
                 "prompt is preceded by the `--` separator (first turn); got {first:?}"
             );
 
-            let resume = build_args(&codex_test_agent(), prompt, Some(RESUME_THREAD_ID), &[]);
+            let resume = build_args(
+                &codex_test_agent(),
+                prompt,
+                Some(RESUME_THREAD_ID),
+                &[],
+                true,
+            );
             assert_eq!(resume.last(), Some(&prompt.to_owned()));
             assert_eq!(resume[resume.len() - 2], RESUME_THREAD_ID);
             assert_eq!(
@@ -1364,7 +1681,7 @@ mod tests {
         agent.model = Some("gpt-5.5".to_owned());
         agent.effort = Some("high".to_owned());
 
-        let args = build_args(&agent, "hello", None, &[]);
+        let args = build_args(&agent, "hello", None, &[], true);
 
         let model_pos = args
             .windows(2)
@@ -1383,7 +1700,7 @@ mod tests {
 
     #[test]
     fn build_args_omits_model_and_effort_when_unset() {
-        let args = build_args(&codex_test_agent(), "hello", None, &[]);
+        let args = build_args(&codex_test_agent(), "hello", None, &[], true);
         assert!(!args.iter().any(|a| a == "-m"));
         assert!(
             !args
@@ -1398,7 +1715,7 @@ mod tests {
         agent.model = Some("gpt-5.5".to_owned());
         agent.effort = Some("medium".to_owned());
 
-        let args = build_args(&agent, "hello again", Some(RESUME_THREAD_ID), &[]);
+        let args = build_args(&agent, "hello again", Some(RESUME_THREAD_ID), &[], true);
 
         let sep = args.iter().position(|a| a == "--").unwrap();
         let model_pos = args
@@ -1421,7 +1738,7 @@ mod tests {
         ];
 
         for resume in [None, Some(RESUME_THREAD_ID)] {
-            let args = build_args(&codex_test_agent(), "hello", resume, &overrides);
+            let args = build_args(&codex_test_agent(), "hello", resume, &overrides, true);
             let sep = args.iter().position(|a| a == "--").unwrap();
             let at = args
                 .windows(2)

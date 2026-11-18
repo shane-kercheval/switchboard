@@ -6,11 +6,11 @@
 //!
 //! Format: `[mcp_servers.<name>]` table entries. The names — not the table
 //! contents — are what Switchboard's `SessionMeta.mcp_servers` surfaces;
-//! the registry is display-only. Switchboard does **not** enforce Codex's
-//! trust-list gate (which Codex itself uses to decide whether to load
-//! project-scope config): the small fidelity gap of showing project-scoped
-//! servers Codex wouldn't load for untrusted directories self-corrects on
-//! first interactive Codex use in that directory.
+//! the registry is display-only. The project file is read without checking
+//! trust, though Codex loads it only in a trusted folder. Switchboard's first
+//! Codex turn in a folder passes `--trust`, so from then on the agent loads it
+//! too, except in a folder the user marked untrusted or when the user's Codex
+//! config can't be written (`trust.rs`).
 //!
 //! **Partial-parse policy** (skip-with-warning for harness-owned files):
 //! - File not found → empty list, no warning (a missing config file is the

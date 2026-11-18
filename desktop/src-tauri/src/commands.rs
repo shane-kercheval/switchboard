@@ -2689,6 +2689,13 @@ async fn create_codex_fork(
             name: source.name.clone(),
         });
     };
+    // Read before the parent's lock is taken: the first read runs
+    // `codex --version` and waits for it.
+    let adapter = Arc::clone(&state.codex_adapter);
+    let codex_version = tokio::task::spawn_blocking(move || adapter.version())
+        .await
+        .ok()
+        .flatten();
     let key = crate::session_lock::session_lock_key(source.harness, parent, &project.directory)?;
     let lock_root = state.lock_root.clone();
     // Off the async worker: acquisition opens a file and, when contended,
@@ -2707,11 +2714,12 @@ async fn create_codex_fork(
         },
         other => other,
     })?;
-    let own_server_overrides = switchboard_harness::codex_own_server_overrides(
-        state.own_mcp_server(),
+    let flags = switchboard_harness::CodexRunFlags::for_run(
         &state.codex_config_sources,
         home_dir,
         &project.directory,
+        Some(state.own_mcp_server()),
+        codex_version.as_deref(),
     );
     let created = switchboard_harness::fork_codex_session(
         codex_binary,
@@ -2719,7 +2727,7 @@ async fn create_codex_fork(
         &project.directory,
         parent_thread_id,
         &source.selection(),
-        &own_server_overrides,
+        &flags,
         switchboard_harness::CODEX_FORK_TIMEOUT,
     )
     .await;
@@ -9140,6 +9148,75 @@ mod tests {
                 .unwrap_or_else(|| panic!("{flag} in {argv:?}"));
             assert_eq!(argv[at - 1], "-c", "{argv:?}");
             assert!(at < fork_at, "{flag} before fork: {argv:?}");
+        }
+    }
+
+    /// The arguments a Codex fork passes to `codex`, from a Codex whose
+    /// `--version` reports `version_line` (or fails when `None`), with
+    /// `config(project folder)` as the user's `~/.codex/config.toml`.
+    async fn codex_fork_argv(
+        version_line: Option<&str>,
+        config: impl FnOnce(&Path) -> String,
+    ) -> Vec<String> {
+        let (tmp, home, mut state, _project_id) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        std::fs::write(home.path().join(".codex/config.toml"), config(tmp.path())).unwrap();
+        let argv_path = home.path().join("argv");
+        let answer = version_line.map_or_else(
+            || "exit 1".to_owned(),
+            |line| format!("echo '{line}'; exit 0"),
+        );
+        let shim = codex_fork_shim(
+            home.path(),
+            home.path(),
+            &format!(
+                "if [ \"$1\" = --version ]; then {answer}; fi\nprintf '%s\\n' \"$@\" > '{}'",
+                argv_path.display()
+            ),
+        );
+        state.codex_adapter = Arc::new(switchboard_harness::CodexAdapter::with_binary_path(
+            shim.clone(),
+        ));
+
+        fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
+            .await
+            .expect("forking an idle Codex agent with a session should succeed");
+        std::fs::read_to_string(&argv_path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn codex_fork_passes_trust_unless_the_user_marked_the_folder_untrusted() {
+        let current = Some("codex-cli 0.170.0");
+        let argv = codex_fork_argv(current, |_| String::new()).await;
+        assert!(argv.iter().any(|arg| arg == "--trust"), "{argv:?}");
+
+        let argv = codex_fork_argv(current, |folder| {
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
+                folder.display()
+            )
+        })
+        .await;
+        assert!(!argv.iter().any(|arg| arg == "--trust"), "{argv:?}");
+    }
+
+    #[tokio::test]
+    async fn codex_fork_passes_trust_only_to_codex_0_169_0_or_newer_or_an_unreadable_version() {
+        for (version_line, trust) in [
+            (Some("codex-cli 0.168.0"), false),
+            (Some("codex-cli 0.169.0"), true),
+            (None, true),
+        ] {
+            let argv = codex_fork_argv(version_line, |_| String::new()).await;
+            assert_eq!(
+                argv.iter().any(|arg| arg == "--trust"),
+                trust,
+                "{version_line:?}: {argv:?}"
+            );
         }
     }
 

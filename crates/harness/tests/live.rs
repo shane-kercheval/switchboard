@@ -13,10 +13,10 @@ use serde_json::json;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, CODEX_FORK_TIMEOUT, ClaudeCodeAdapter, CodexAdapter,
-    ContentKind, ContextWindowSource, DispatchOptions, EditChange, FailureKind, HarnessAdapter,
-    RateLimitSource, ToolFacet, Turn, TurnItem, TurnOutcome, TurnUsage, UserPromptSource,
-    claude_session_file_path, find_codex_session_file_for_attach, fork_codex_session,
-    load_antigravity_transcript, load_claude_transcript, load_codex_transcript,
+    CodexRunFlags, ContentKind, ContextWindowSource, DispatchOptions, EditChange, FailureKind,
+    HarnessAdapter, RateLimitSource, ToolFacet, Turn, TurnItem, TurnOutcome, TurnUsage,
+    UserPromptSource, claude_session_file_path, find_codex_session_file_for_attach,
+    fork_codex_session, load_antigravity_transcript, load_claude_transcript, load_codex_transcript,
 };
 use uuid::Uuid;
 
@@ -2159,6 +2159,11 @@ async fn live_claude_slash_leading_prompt_reaches_model() {
 }
 
 // --- Codex live tests ---
+//
+// The adapter passes `--trust`, so a Codex live test that runs in a git repo or
+// a folder with `.codex/`, using the developer's real `CODEX_HOME`, writes a
+// permanent trust entry into their `config.toml`. Use an isolated `CODEX_HOME`
+// where the test allows. A plain temporary folder gets no entry.
 
 fn live_codex_agent() -> AgentRecord {
     AgentRecord {
@@ -2832,7 +2837,10 @@ async fn live_codex_compressed_rollout_loads_forks_and_resumes() {
         tmp.path(),
         &thread_id,
         &agent.selection(),
-        &[],
+        &CodexRunFlags {
+            own_server_overrides: Vec::new(),
+            trust: true,
+        },
         CODEX_FORK_TIMEOUT,
     )
     .await
@@ -2914,7 +2922,10 @@ async fn live_codex_fork_without_a_prompt_creates_an_idle_session_that_inherits_
         tmp.path(),
         &parent_thread_id,
         &agent.selection(),
-        &[],
+        &CodexRunFlags {
+            own_server_overrides: Vec::new(),
+            trust: true,
+        },
         CODEX_FORK_TIMEOUT,
     )
     .await
@@ -3038,7 +3049,10 @@ async fn live_codex_fork_loads_the_parents_history_up_to_the_fork_point() {
         tmp.path(),
         &parent_thread_id,
         &parent.selection(),
-        &[],
+        &CodexRunFlags {
+            own_server_overrides: Vec::new(),
+            trust: true,
+        },
         CODEX_FORK_TIMEOUT,
     )
     .await
@@ -4872,7 +4886,10 @@ async fn live_codex_compact_of_a_fork_keeps_its_inherited_context() {
         tmp.path(),
         &parent_thread_id,
         &parent.selection(),
-        &[],
+        &CodexRunFlags {
+            own_server_overrides: Vec::new(),
+            trust: true,
+        },
         CODEX_FORK_TIMEOUT,
     )
     .await

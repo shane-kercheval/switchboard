@@ -2689,13 +2689,20 @@ async fn create_codex_fork(
             name: source.name.clone(),
         });
     };
-    // Read before the parent's lock is taken: the first read runs
+    // Found once, so the version decides `--trust` for the program that runs.
+    // A `codex` that can't be found is reported by the launch, after the lock.
+    let binary = switchboard_harness::subprocess::resolve_binary(codex_binary).ok();
+    // Read before the parent's lock is taken: the first read of a program runs
     // `codex --version` and waits for it.
-    let adapter = Arc::clone(&state.codex_adapter);
-    let codex_version = tokio::task::spawn_blocking(move || adapter.version())
-        .await
-        .ok()
-        .flatten();
+    let codex_version = match binary.clone() {
+        Some(binary) => {
+            tokio::task::spawn_blocking(move || switchboard_harness::codex_version(&binary))
+                .await
+                .ok()
+                .flatten()
+        }
+        None => None,
+    };
     let key = crate::session_lock::session_lock_key(source.harness, parent, &project.directory)?;
     let lock_root = state.lock_root.clone();
     // Off the async worker: acquisition opens a file and, when contended,
@@ -2722,7 +2729,7 @@ async fn create_codex_fork(
         codex_version.as_deref(),
     );
     let created = switchboard_harness::fork_codex_session(
-        codex_binary,
+        binary.as_deref().unwrap_or(codex_binary),
         home_dir,
         &project.directory,
         parent_thread_id,
@@ -9018,12 +9025,23 @@ mod tests {
 
     /// A stand-in for `codex exec fork`, written as a shell script because the
     /// harness crate's `fake_codex` binary isn't built for this crate's tests.
-    /// It runs `before` (shell), then does what a promptless fork does: writes
-    /// the new rollout under `home` and prints `thread.started` with its id.
+    /// It answers `--version` as Codex 0.170.0 does. Any other call runs
+    /// `before` (shell), then does what a promptless fork does: writes the new
+    /// rollout under `home` and prints `thread.started` with its id.
     fn codex_fork_shim(dir: &Path, home: &Path, before: &str) -> PathBuf {
+        codex_fork_shim_answering(dir, home, "echo 'codex-cli 0.170.0'", before)
+    }
+
+    /// [`codex_fork_shim`] that runs `version_answer` (shell) for `--version`.
+    fn codex_fork_shim_answering(
+        dir: &Path,
+        home: &Path,
+        version_answer: &str,
+        before: &str,
+    ) -> PathBuf {
         let folder = home.join(".codex/sessions/2026/10/11");
         let script = format!(
-            "#!/bin/sh\n{before}\nmkdir -p '{folder}'\n: > '{folder}/rollout-2026-10-11T00-00-01-{CODEX_NEW_FORK_THREAD}.jsonl'\necho '{{\"type\":\"thread.started\",\"thread_id\":\"{CODEX_NEW_FORK_THREAD}\"}}'\n",
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then {version_answer}; exit; fi\n{before}\nmkdir -p '{folder}'\n: > '{folder}/rollout-2026-10-11T00-00-01-{CODEX_NEW_FORK_THREAD}.jsonl'\necho '{{\"type\":\"thread.started\",\"thread_id\":\"{CODEX_NEW_FORK_THREAD}\"}}'\n",
             folder = folder.display(),
         );
         let shim = dir.join("codex");
@@ -9153,31 +9171,24 @@ mod tests {
 
     /// The arguments a Codex fork passes to `codex`, from a Codex whose
     /// `--version` reports `version_line` (or fails when `None`), with
-    /// `config(project folder)` as the user's `~/.codex/config.toml`.
+    /// `config(project folder)` as the user's `~/.codex/config.toml`. The
+    /// app's Codex adapter is the mock, which reports no version.
     async fn codex_fork_argv(
         version_line: Option<&str>,
         config: impl FnOnce(&Path) -> String,
     ) -> Vec<String> {
-        let (tmp, home, mut state, _project_id) = codex_fork_state();
+        let (tmp, home, state, _project_id) = codex_fork_state();
         let source_id = seed_codex_source(&state, home.path(), "cx");
         std::fs::write(home.path().join(".codex/config.toml"), config(tmp.path())).unwrap();
         let argv_path = home.path().join("argv");
-        let answer = version_line.map_or_else(
-            || "exit 1".to_owned(),
-            |line| format!("echo '{line}'; exit 0"),
-        );
-        let shim = codex_fork_shim(
+        let answer =
+            version_line.map_or_else(|| "exit 1".to_owned(), |line| format!("echo '{line}'"));
+        let shim = codex_fork_shim_answering(
             home.path(),
             home.path(),
-            &format!(
-                "if [ \"$1\" = --version ]; then {answer}; fi\nprintf '%s\\n' \"$@\" > '{}'",
-                argv_path.display()
-            ),
+            &answer,
+            &format!("printf '%s\\n' \"$@\" > '{}'", argv_path.display()),
         );
-        state.codex_adapter = Arc::new(switchboard_harness::CodexAdapter::with_binary_path(
-            shim.clone(),
-        ));
-
         fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
             .await
             .expect("forking an idle Codex agent with a session should succeed");
@@ -9201,6 +9212,14 @@ mod tests {
             )
         })
         .await;
+        assert!(!argv.iter().any(|arg| arg == "--trust"), "{argv:?}");
+    }
+
+    #[tokio::test]
+    async fn codex_fork_reads_the_version_of_the_codex_it_launches() {
+        // The app's adapter reports no version, which would pass the flag; the
+        // Codex the fork launches predates it.
+        let argv = codex_fork_argv(Some("codex-cli 0.168.0"), |_| String::new()).await;
         assert!(!argv.iter().any(|arg| arg == "--trust"), "{argv:?}");
     }
 

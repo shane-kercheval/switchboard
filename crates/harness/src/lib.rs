@@ -42,7 +42,7 @@ pub use codex::fork::{CODEX_FORK_TIMEOUT, CodexForkError, fork_codex_session};
 pub use codex::session_file::{
     AttachLookupError, find_codex_session_file_for_attach, load_codex_transcript,
 };
-pub use codex::{CodexAdapter, CodexConfigSources, CodexLocator, CodexRunFlags};
+pub use codex::{CodexAdapter, CodexConfigSources, CodexLocator, CodexRunFlags, codex_version};
 pub use context_report::{ContextCategory, ContextItem, ContextReport};
 pub use events::{
     AdapterEvent, AnnouncedSendKind, CancelSource, ContentKind, ContextWindowSource, FailureKind,

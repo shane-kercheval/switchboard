@@ -47,7 +47,7 @@ pub(crate) mod world_state;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -118,11 +118,6 @@ pub struct CodexAdapter {
     home_dir_override: Option<PathBuf>,
     /// Where the own-server lookup finds Codex's config files.
     config_sources: CodexConfigSources,
-    /// `codex --version` for each program path `codex` has resolved to, read
-    /// on first use; `None` caches a failed read. Shared so a read can run on
-    /// a blocking thread. It decides whether a run passes `--trust`, so a
-    /// Codex replaced at the same path takes effect on that after a restart.
-    versions: Arc<Mutex<HashMap<PathBuf, Option<String>>>>,
     /// How long a compaction's server has to answer its three requests.
     /// [`compaction::COMPACTION_STARTUP_TIMEOUT`] in production; tests shorten
     /// it to exercise the timeout without a thirty-second test.
@@ -138,7 +133,6 @@ impl CodexAdapter {
             codex_binary_path: PathBuf::from("codex"),
             home_dir_override: None,
             config_sources: CodexConfigSources::from_env(),
-            versions: Arc::default(),
             compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
     }
@@ -149,7 +143,6 @@ impl CodexAdapter {
             codex_binary_path: path.into(),
             home_dir_override: None,
             config_sources: CodexConfigSources::from_env(),
-            versions: Arc::default(),
             compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
     }
@@ -173,7 +166,6 @@ impl CodexAdapter {
                 codex_home: None,
             },
             home_dir_override: Some(home_dir),
-            versions: Arc::default(),
             compaction_startup_bound: compaction::COMPACTION_STARTUP_TIMEOUT,
         }
     }
@@ -185,33 +177,50 @@ impl CodexAdapter {
         self.compaction_startup_bound = bound;
         self
     }
-
-    /// The version of the program at `binary`, for an async caller. The first
-    /// read of a path runs `codex --version` and waits up to its timeout, so
-    /// it runs on a blocking thread.
-    async fn version_off_async_thread(&self, binary: &Path) -> Option<String> {
-        let versions = Arc::clone(&self.versions);
-        let binary = binary.to_owned();
-        tokio::task::spawn_blocking(move || version_at(&versions, &binary))
-            .await
-            .ok()
-            .flatten()
-    }
 }
 
-/// The version of the program at `binary`, a path from
-/// [`crate::subprocess::resolve_binary`], read once per path. The lock is held
-/// through the read, so concurrent first reads of a path run it once.
-fn version_at(versions: &Mutex<HashMap<PathBuf, Option<String>>>, binary: &Path) -> Option<String> {
-    let mut versions = versions.lock().unwrap_or_else(PoisonError::into_inner);
-    versions
-        .entry(binary.to_owned())
-        .or_insert_with(|| {
-            crate::subprocess::fetch_version(binary)
-                .as_deref()
-                .and_then(crate::subprocess::parse_cli_version)
-        })
-        .clone()
+/// `codex --version` for each program path `codex` has resolved to in this
+/// process. Each path's slot is filled once; `None` records a failed read.
+type VersionSlots = Mutex<HashMap<PathBuf, Arc<OnceLock<Option<String>>>>>;
+
+static VERSIONS: LazyLock<VersionSlots> = LazyLock::new(VersionSlots::default);
+
+/// The version of the Codex at `binary`, a path from
+/// [`crate::subprocess::resolve_binary`], read once per path for the life of
+/// the process. The first read runs `codex --version` and waits up to its
+/// timeout, so an async caller runs this on a blocking thread. It decides
+/// whether a run passes `--trust`, so a Codex replaced at the same path takes
+/// effect on that after a restart.
+#[must_use]
+pub fn codex_version(binary: &Path) -> Option<String> {
+    version_at(&VERSIONS, binary)
+}
+
+/// [`codex_version`] for an async caller.
+async fn version_off_async_thread(binary: &Path) -> Option<String> {
+    let binary = binary.to_owned();
+    tokio::task::spawn_blocking(move || codex_version(&binary))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`codex_version`] against `slots`. The map's lock is released before the
+/// read, so a slow read of one path doesn't hold up a lookup of another.
+fn version_at(slots: &VersionSlots, binary: &Path) -> Option<String> {
+    let slot = Arc::clone(
+        slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(binary.to_owned())
+            .or_default(),
+    );
+    slot.get_or_init(|| {
+        crate::subprocess::fetch_version(binary)
+            .as_deref()
+            .and_then(crate::subprocess::parse_cli_version)
+    })
+    .clone()
 }
 
 impl Default for CodexAdapter {
@@ -228,7 +237,7 @@ impl HarnessAdapter for CodexAdapter {
 
     fn version(&self) -> Option<String> {
         let binary = crate::subprocess::resolve_binary(&self.codex_binary_path).ok()?;
-        version_at(&self.versions, &binary)
+        codex_version(&binary)
     }
 
     async fn dispatch(
@@ -246,7 +255,7 @@ impl HarnessAdapter for CodexAdapter {
         // first-dispatch case; the adapter captures it from the stream below.
         let prior = codex_locator(agent);
         let home_dir = resolve_home_dir(self.home_dir_override.as_deref());
-        let version = self.version_off_async_thread(&binary).await;
+        let version = version_off_async_thread(&binary).await;
         let flags = CodexRunFlags::for_run(
             &self.config_sources,
             &home_dir,
@@ -1658,12 +1667,50 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let older = codex_printing(dir.path(), "older", "codex-cli 0.168.0");
         let newer = codex_printing(dir.path(), "newer", "codex-cli 0.170.0");
-        let versions = Mutex::default();
+        let versions = VersionSlots::default();
         assert_eq!(version_at(&versions, &older).as_deref(), Some("0.168.0"));
         assert_eq!(version_at(&versions, &newer).as_deref(), Some("0.170.0"));
         // A program replaced at the same path keeps its first answer until restart.
         codex_printing(dir.path(), "older", "codex-cli 0.171.0");
         assert_eq!(version_at(&versions, &older).as_deref(), Some("0.168.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_version_read_does_not_hold_up_another_paths_cached_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let started = dir.path().join("started");
+        let release = dir.path().join("release");
+        // Prints its version only once the test creates `release`.
+        let slow = dir.path().join("slow");
+        std::fs::write(
+            &slow,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\necho 'codex-cli 0.168.0'\n",
+                started.display(),
+                release.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cached = codex_printing(dir.path(), "cached", "codex-cli 0.170.0");
+        let versions = Arc::new(VersionSlots::default());
+        assert_eq!(version_at(&versions, &cached).as_deref(), Some("0.170.0"));
+
+        let reading = std::thread::spawn({
+            let versions = Arc::clone(&versions);
+            move || version_at(&versions, &slow)
+        });
+        while !started.exists() && !reading.is_finished() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started.exists(), "the slow read never started");
+        assert_eq!(version_at(&versions, &cached).as_deref(), Some("0.170.0"));
+        assert!(!reading.is_finished(), "the slow read waits for `release`");
+        std::fs::write(&release, "").unwrap();
+        // A read that held the map's lock would have blocked the lookup above
+        // until `codex --version` timed out, and returned no version.
+        assert_eq!(reading.join().unwrap().as_deref(), Some("0.168.0"));
     }
 
     #[test]

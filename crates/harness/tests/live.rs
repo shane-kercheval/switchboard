@@ -2630,7 +2630,7 @@ async fn live_codex_astra_dispatches_and_hydrates() {
     let agent_id = Uuid::now_v7();
     let mut agent = live_codex_agent();
     agent.id = agent_id;
-    agent.model = Some("gpt-6-astra".to_owned());
+    agent.model = Some("gpt-6.2-astra".to_owned());
     agent.effort = Some("low".to_owned());
 
     let events: Vec<AdapterEvent> = adapter
@@ -2647,7 +2647,7 @@ async fn live_codex_astra_dispatches_and_hydrates() {
         .await;
 
     let (model, effort) = turn_end_model_effort(&events).expect("Astra TurnEnd");
-    assert_eq!(model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(model.as_deref(), Some("gpt-6.2-astra"));
     assert_eq!(effort.as_deref(), Some("low"));
     assert!(
         events.iter().any(|event| matches!(
@@ -2673,7 +2673,7 @@ async fn live_codex_astra_dispatches_and_hydrates() {
         .collect();
     assert_eq!(
         hydrated_model_effort,
-        vec![(Some("gpt-6-astra".to_owned()), Some("low".to_owned()))]
+        vec![(Some("gpt-6.2-astra".to_owned()), Some("low".to_owned()))]
     );
 }
 
@@ -5240,7 +5240,7 @@ async fn live_codex_apply_patch_emits_edit_facet() {
     std::fs::write(cwd.path().join("alpha.txt"), "foo\n").unwrap();
     let adapter = CodexAdapter::new();
     let mut agent = live_codex_agent();
-    agent.model = Some("gpt-6.1-sol".to_owned());
+    agent.model = Some("gpt-6.2-sol".to_owned());
     agent.effort = Some("medium".to_owned());
 
     let events: Vec<AdapterEvent> = adapter

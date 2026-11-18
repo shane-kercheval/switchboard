@@ -835,9 +835,9 @@ describe("App", () => {
         name: "codex",
         harness: "codex",
         selection: {
-          model: "gpt-6.1-sol",
+          model: "gpt-6.2-sol",
           effort: "medium",
-          model_choices: ["gpt-6.1-sol", "gpt-6.1-terra"],
+          model_choices: ["gpt-6.2-sol", "gpt-6.1-terra"],
           effort_choices: ["medium", "high"],
         },
       },

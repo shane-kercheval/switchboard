@@ -127,15 +127,17 @@ describe("SettingsView", () => {
   it("persists independent quick choices and explicit defaults atomically", async () => {
     render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
     await fireEvent.click(await screen.findByTestId("agent-defaults-codex-summary"));
-    await fireEvent.click(screen.getByTestId("settings-selection-codex-model-choice-gpt-6-astra"));
+    await fireEvent.click(
+      screen.getByTestId("settings-selection-codex-model-choice-gpt-6.2-astra"),
+    );
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             codex: {
-              model_choices: ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra"],
+              model_choices: ["gpt-6.2-sol", "gpt-6.1-terra", "gpt-6.2-astra"],
               effort_choices: ["medium", "high"],
-              default_model: "gpt-6.1-sol",
+              default_model: "gpt-6.2-sol",
               default_effort: "medium",
             },
           }),
@@ -143,7 +145,7 @@ describe("SettingsView", () => {
       }),
     );
 
-    expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("GPT-6.1 Sol");
+    expect(screen.getByTestId("agent-defaults-codex-summary")).toHaveTextContent("GPT-6.2 Sol");
     await fireEvent.change(screen.getByTestId("settings-selection-codex-model-current"), {
       target: { value: "gpt-6.1-terra" },
     });
@@ -152,7 +154,7 @@ describe("SettingsView", () => {
         preferences: expect.objectContaining({
           agent_defaults: expect.objectContaining({
             codex: {
-              model_choices: ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra"],
+              model_choices: ["gpt-6.2-sol", "gpt-6.1-terra", "gpt-6.2-astra"],
               effort_choices: ["medium", "high"],
               default_model: "gpt-6.1-terra",
               default_effort: "medium",
@@ -170,18 +172,18 @@ describe("SettingsView", () => {
     // Saved model ids are never migrated, so a choice the catalog dropped must
     // stay selected and readable rather than vanish from Settings.
     preferences.agent_defaults.codex = {
-      model_choices: ["gpt-6.1-sol", "gpt-5.6-terra"],
+      model_choices: ["gpt-6.1-sol", "gpt-6.1-terra"],
       effort_choices: ["medium", "high"],
-      default_model: "gpt-5.6-terra",
+      default_model: "gpt-6.1-sol",
       default_effort: "medium",
     };
     render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
 
     const summary = await screen.findByTestId("agent-defaults-codex-summary");
-    expect(summary).toHaveTextContent("gpt-5.6-terra");
+    expect(summary).toHaveTextContent("gpt-6.1-sol");
     await fireEvent.click(summary);
-    const choice = screen.getByTestId("settings-selection-codex-model-choice-gpt-5.6-terra");
-    expect(choice).toHaveTextContent("gpt-5.6-terra");
+    const choice = screen.getByTestId("settings-selection-codex-model-choice-gpt-6.1-sol");
+    expect(choice).toHaveTextContent("gpt-6.1-sol");
     expect(choice).toHaveAttribute("aria-pressed", "true");
   });
 
@@ -306,7 +308,7 @@ describe("SettingsView", () => {
     );
     expect(labels).toEqual([
       "Claude Default model: Opus · Default effort: Medium",
-      "Codex Default model: GPT-6.1 Sol · Default effort: Medium",
+      "Codex Default model: GPT-6.2 Sol · Default effort: Medium",
       "Antigravity Default model: Gemini 3.8 Flash · Default effort: Medium",
     ]);
   });

@@ -1493,8 +1493,11 @@ mod tests {
 
     // These run against an empty CODEX_HOME with no credential variables: Codex
     // decides and saves trust and starts MCP servers before it calls the model,
-    // so none needs credentials or quota, and none writes the developer's own
-    // config. A turn that starts is refused by OpenAI's API with 401.
+    // and none writes the developer's own config. With the default OpenAI
+    // provider, a turn that starts is refused by OpenAI's API with 401 and uses
+    // no quota. Codex still reads /etc/codex/config.toml, so a provider chosen
+    // there that takes its key from its own `env_key` variable could reach a
+    // model.
 
     #[tokio::test]
     #[ignore = "requires codex installed — run with: make test-live"]

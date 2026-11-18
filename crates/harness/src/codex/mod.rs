@@ -180,43 +180,50 @@ impl CodexAdapter {
 }
 
 /// `codex --version` for each program path `codex` has resolved to in this
-/// process. Each path's slot is filled once; `None` records a failed read.
-type VersionSlots = Mutex<HashMap<PathBuf, Arc<OnceLock<Option<String>>>>>;
+/// process and each folder it was read in (`None`: this process's folder).
+/// Each slot is filled once; `None` records a failed read.
+type VersionSlots = Mutex<HashMap<(PathBuf, Option<PathBuf>), Arc<OnceLock<Option<String>>>>>;
 
 static VERSIONS: LazyLock<VersionSlots> = LazyLock::new(VersionSlots::default);
 
 /// The version of the Codex at `binary`, a path from
-/// [`crate::subprocess::resolve_binary`], read once per path for the life of
-/// the process. The first read runs `codex --version` and waits up to its
-/// timeout, so an async caller runs this on a blocking thread. It decides
-/// whether a run passes `--trust`, so a Codex replaced at the same path takes
-/// effect on that after a restart.
+/// [`crate::subprocess::resolve_binary`], as a run in `cwd` sees it: a version
+/// manager's shim, such as mise's, can launch a different Codex in each
+/// folder. Read once per path and folder for the life of the process, so a
+/// Codex replaced at the same path takes effect on `--trust` after a restart.
+/// The first read runs `codex --version` and waits up to its timeout, so an
+/// async caller runs this on a blocking thread.
 #[must_use]
-pub fn codex_version(binary: &Path) -> Option<String> {
-    version_at(&VERSIONS, binary)
+pub fn codex_version(binary: &Path, cwd: &Path) -> Option<String> {
+    version_at(&VERSIONS, binary, Some(cwd))
 }
 
 /// [`codex_version`] for an async caller.
-async fn version_off_async_thread(binary: &Path) -> Option<String> {
+async fn version_off_async_thread(binary: &Path, cwd: &Path) -> Option<String> {
     let binary = binary.to_owned();
-    tokio::task::spawn_blocking(move || codex_version(&binary))
+    let cwd = cwd.to_owned();
+    tokio::task::spawn_blocking(move || codex_version(&binary, &cwd))
         .await
         .ok()
         .flatten()
 }
 
 /// [`codex_version`] against `slots`. The map's lock is released before the
-/// read, so a slow read of one path doesn't hold up a lookup of another.
-fn version_at(slots: &VersionSlots, binary: &Path) -> Option<String> {
+/// read, so a slow read of one slot doesn't hold up a lookup of another. A
+/// folder that doesn't exist is not cached, so restoring it gets a fresh read.
+fn version_at(slots: &VersionSlots, binary: &Path, cwd: Option<&Path>) -> Option<String> {
+    if cwd.is_some_and(|dir| !dir.is_dir()) {
+        return None;
+    }
     let slot = Arc::clone(
         slots
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .entry(binary.to_owned())
+            .entry((binary.to_owned(), cwd.map(Path::to_owned)))
             .or_default(),
     );
     slot.get_or_init(|| {
-        crate::subprocess::fetch_version(binary)
+        crate::subprocess::fetch_version_in(binary, cwd)
             .as_deref()
             .and_then(crate::subprocess::parse_cli_version)
     })
@@ -235,9 +242,11 @@ impl HarnessAdapter for CodexAdapter {
         crate::subprocess::probe_binary(&self.codex_binary_path)
     }
 
+    /// Read in Switchboard's own folder; a run reads its own with
+    /// [`codex_version`].
     fn version(&self) -> Option<String> {
         let binary = crate::subprocess::resolve_binary(&self.codex_binary_path).ok()?;
-        codex_version(&binary)
+        version_at(&VERSIONS, &binary, None)
     }
 
     async fn dispatch(
@@ -255,7 +264,7 @@ impl HarnessAdapter for CodexAdapter {
         // first-dispatch case; the adapter captures it from the stream below.
         let prior = codex_locator(agent);
         let home_dir = resolve_home_dir(self.home_dir_override.as_deref());
-        let version = version_off_async_thread(&binary).await;
+        let version = version_off_async_thread(&binary, cwd).await;
         let flags = CodexRunFlags::for_run(
             &self.config_sources,
             &home_dir,
@@ -1443,13 +1452,15 @@ mod tests {
     }
 
     /// The `--trust` decision for a run in `cwd` with `home` as `CODEX_HOME`,
-    /// gated on the installed Codex's own `--version`.
+    /// gated on the installed Codex's own `--version` as read in `cwd`.
     fn live_trust_decision(home: &Path, cwd: &Path) -> bool {
         let sources = CodexConfigSources {
             system_file: home.join("absent-system-config.toml"),
             codex_home: Some(home.as_os_str().to_owned()),
         };
-        let version = CodexAdapter::new().version();
+        let version = crate::subprocess::resolve_binary(Path::new("codex"))
+            .ok()
+            .and_then(|binary| codex_version(&binary, cwd));
         CodexRunFlags::for_run(
             &sources,
             Path::new("/nonexistent-home"),
@@ -1668,11 +1679,20 @@ mod tests {
         let older = codex_printing(dir.path(), "older", "codex-cli 0.168.0");
         let newer = codex_printing(dir.path(), "newer", "codex-cli 0.170.0");
         let versions = VersionSlots::default();
-        assert_eq!(version_at(&versions, &older).as_deref(), Some("0.168.0"));
-        assert_eq!(version_at(&versions, &newer).as_deref(), Some("0.170.0"));
+        assert_eq!(
+            version_at(&versions, &older, None).as_deref(),
+            Some("0.168.0")
+        );
+        assert_eq!(
+            version_at(&versions, &newer, None).as_deref(),
+            Some("0.170.0")
+        );
         // A program replaced at the same path keeps its first answer until restart.
         codex_printing(dir.path(), "older", "codex-cli 0.171.0");
-        assert_eq!(version_at(&versions, &older).as_deref(), Some("0.168.0"));
+        assert_eq!(
+            version_at(&versions, &older, None).as_deref(),
+            Some("0.168.0")
+        );
     }
 
     #[cfg(unix)]
@@ -1695,22 +1715,82 @@ mod tests {
         std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cached = codex_printing(dir.path(), "cached", "codex-cli 0.170.0");
         let versions = Arc::new(VersionSlots::default());
-        assert_eq!(version_at(&versions, &cached).as_deref(), Some("0.170.0"));
+        assert_eq!(
+            version_at(&versions, &cached, None).as_deref(),
+            Some("0.170.0")
+        );
 
         let reading = std::thread::spawn({
             let versions = Arc::clone(&versions);
-            move || version_at(&versions, &slow)
+            move || version_at(&versions, &slow, None)
         });
         while !started.exists() && !reading.is_finished() {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(started.exists(), "the slow read never started");
-        assert_eq!(version_at(&versions, &cached).as_deref(), Some("0.170.0"));
+        assert_eq!(
+            version_at(&versions, &cached, None).as_deref(),
+            Some("0.170.0")
+        );
         assert!(!reading.is_finished(), "the slow read waits for `release`");
         std::fs::write(&release, "").unwrap();
         // A read that held the map's lock would have blocked the lookup above
         // until `codex --version` timed out, and returned no version.
         assert_eq!(reading.join().unwrap().as_deref(), Some("0.168.0"));
+    }
+
+    /// A stand-in `codex` at `dir/codex` that reports 0.168.0 in a folder
+    /// holding `.codex-0.168` and 0.170.0 elsewhere, as a version manager's
+    /// shim does.
+    #[cfg(unix)]
+    fn codex_pinned_per_folder(dir: &Path) -> PathBuf {
+        let path = dir.join("codex");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nif [ -e .codex-0.168 ]; then echo 'codex-cli 0.168.0'; else echo 'codex-cli 0.170.0'; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn each_folder_gets_the_version_codex_reports_there() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let codex = codex_pinned_per_folder(dir.path());
+        let pinned = tempfile::TempDir::new().unwrap();
+        std::fs::write(pinned.path().join(".codex-0.168"), "").unwrap();
+        let unpinned = tempfile::TempDir::new().unwrap();
+        let versions = VersionSlots::default();
+        assert_eq!(
+            version_at(&versions, &codex, None).as_deref(),
+            Some("0.170.0")
+        );
+        assert_eq!(
+            version_at(&versions, &codex, Some(pinned.path())).as_deref(),
+            Some("0.168.0")
+        );
+        assert_eq!(
+            version_at(&versions, &codex, Some(unpinned.path())).as_deref(),
+            Some("0.170.0")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_folder_is_read_again_once_it_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let codex = codex_pinned_per_folder(dir.path());
+        let folder = dir.path().join("project");
+        let versions = VersionSlots::default();
+        assert_eq!(version_at(&versions, &codex, Some(&folder)), None);
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join(".codex-0.168"), "").unwrap();
+        assert_eq!(
+            version_at(&versions, &codex, Some(&folder)).as_deref(),
+            Some("0.168.0")
+        );
     }
 
     #[test]

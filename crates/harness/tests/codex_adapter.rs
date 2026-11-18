@@ -1815,15 +1815,20 @@ fn separator_at(argv: &[String]) -> usize {
 }
 
 #[cfg(unix)]
-/// A stand-in for `codex` in `dir` that answers `--version` with
-/// `version_line`, or fails it when `None`, and hands every other call to
-/// `fake_codex`.
-fn codex_reporting(dir: &Path, version_line: Option<&str>) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-    let answer = version_line.map_or_else(
+/// The `--version` answer of a stand-in that reports `version_line`, or fails
+/// when `None`.
+fn version_answer(version_line: Option<&str>) -> String {
+    version_line.map_or_else(
         || "exit 1".to_owned(),
         |line| format!("echo '{line}'; exit 0"),
-    );
+    )
+}
+
+#[cfg(unix)]
+/// A stand-in for `codex` in `dir` that runs the shell commands `answer` for
+/// `--version` and hands every other call to `fake_codex`.
+fn codex_answering(dir: &Path, answer: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
     let shim = dir.join("codex");
     std::fs::write(
         &shim,
@@ -1844,13 +1849,24 @@ async fn argv_of_a_turn(
     version_line: Option<&str>,
     config: impl FnOnce(&Path) -> String,
 ) -> Vec<String> {
+    argv_of_a_turn_answering(&version_answer(version_line), config, |_, _| {}).await
+}
+
+#[cfg(unix)]
+/// As [`argv_of_a_turn`], with `answer` as the stand-in's `--version` commands
+/// and `before(adapter, folder)` run before the turn.
+async fn argv_of_a_turn_answering(
+    answer: &str,
+    config: impl FnOnce(&Path) -> String,
+    before: impl FnOnce(&CodexAdapter, &Path),
+) -> Vec<String> {
     let root = tempfile::TempDir::new().unwrap();
     let home = root.path().join("home");
     let cwd = root.path().join("project");
     std::fs::create_dir_all(home.join(".codex")).unwrap();
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::write(home.join(".codex/config.toml"), config(&cwd)).unwrap();
-    let codex = codex_reporting(root.path(), version_line);
+    let codex = codex_answering(root.path(), answer);
     let argv_path = root.path().join("argv");
     let fixture_path = root.path().join("fixture.jsonl");
     let recorded = std::fs::read_to_string(fixture("text-only")).unwrap();
@@ -1860,7 +1876,9 @@ async fn argv_of_a_turn(
     )
     .unwrap();
 
-    let events: Vec<AdapterEvent> = CodexAdapter::with_binary_and_home(codex, &home)
+    let adapter = CodexAdapter::with_binary_and_home(codex, &home);
+    before(&adapter, &cwd);
+    let events: Vec<AdapterEvent> = adapter
         .dispatch(
             &codex_agent(),
             &cwd,
@@ -1912,6 +1930,24 @@ async fn a_turn_passes_trust_only_to_codex_0_169_0_or_newer_or_an_unreadable_ver
             "{version_line:?}: {argv:?}"
         );
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_turn_reads_the_codex_version_in_its_own_folder() {
+    // A version manager's shim can launch an older Codex in the project folder
+    // than the one Switchboard's own folder gets.
+    let answer = "if [ -e .codex-0.168 ]; then echo 'codex-cli 0.168.0'; else echo 'codex-cli 0.170.0'; fi; exit 0";
+    let argv = argv_of_a_turn_answering(
+        answer,
+        |_| String::new(),
+        |adapter, folder| {
+            std::fs::write(folder.join(".codex-0.168"), "").unwrap();
+            assert_eq!(adapter.version().as_deref(), Some("0.170.0"));
+        },
+    )
+    .await;
+    assert!(!argv.iter().any(|arg| arg == "--trust"), "{argv:?}");
 }
 
 #[tokio::test]

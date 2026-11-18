@@ -1286,8 +1286,17 @@ pub fn parse_cli_version(line: &str) -> Option<String> {
 /// resolved/invoked or reports nothing. Any failure collapses to "unknown"
 /// rather than an error; the Codex `--trust` gate treats unknown as current.
 pub fn fetch_version(binary: &Path) -> Option<String> {
+    fetch_version_in(binary, None)
+}
+
+/// [`fetch_version`] run in `cwd`, or in this process's folder when `None`. A
+/// version manager's shim answers for the version pinned in its working folder.
+pub fn fetch_version_in(binary: &Path, cwd: Option<&Path>) -> Option<String> {
     let resolved = resolve_binary(binary).ok()?;
     let mut command = std::process::Command::new(&resolved);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
     // Same PATH augmentation as a dispatched turn: a `--version` that shells
     // out (or is an env-shebang script) must resolve its interpreter/tools the
     // way a real turn would, so the displayed version matches what runs.

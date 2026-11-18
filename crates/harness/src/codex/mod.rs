@@ -1403,25 +1403,35 @@ mod tests {
         assert!(args.contains(&"--trust".to_owned()));
     }
 
+    /// Every environment variable Codex 0.170.0 signs in with (`codex-rs/login`:
+    /// the API key and access token readers, and workload identity).
+    const CODEX_CREDENTIAL_VARS: [&str; 6] = [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "OPENAI_FEDERATION_RULE_ID",
+        "OPENAI_IDENTITY_TOKEN_FILE",
+        "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+    ];
+
     /// Runs the real `codex` with `args` in `cwd`, with `home` as its
-    /// `CODEX_HOME` and no API key in its environment, and returns its exit
+    /// `CODEX_HOME` and no credential in its environment, and returns its exit
     /// status, stdout and stderr as one log.
     async fn run_codex_in_home(home: &Path, cwd: &Path, args: &[String]) -> (String, String) {
-        let output = tokio::time::timeout(
-            Duration::from_mins(3),
-            tokio::process::Command::new("codex")
-                .args(args)
-                .current_dir(cwd)
-                .env("CODEX_HOME", home)
-                .env_remove("OPENAI_API_KEY")
-                .env_remove("CODEX_API_KEY")
-                .stdin(Stdio::null())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .expect("codex finished within three minutes")
-        .expect("codex started");
+        let mut command = tokio::process::Command::new("codex");
+        command
+            .args(args)
+            .current_dir(cwd)
+            .env("CODEX_HOME", home)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        for name in CODEX_CREDENTIAL_VARS {
+            command.env_remove(name);
+        }
+        let output = tokio::time::timeout(Duration::from_mins(3), command.output())
+            .await
+            .expect("codex finished within three minutes")
+            .expect("codex started");
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let log = format!(
             "{}\n{stdout}\n{}",
@@ -1478,10 +1488,10 @@ mod tests {
         )
     }
 
-    // These run against an empty CODEX_HOME: Codex decides and saves trust and
-    // starts MCP servers before it signs in, so none needs credentials or
-    // quota, and none writes the developer's own config. A turn that starts
-    // fails at sign-in.
+    // These run against an empty CODEX_HOME with no credential variables: Codex
+    // decides and saves trust and starts MCP servers before it calls the model,
+    // so none needs credentials or quota, and none writes the developer's own
+    // config. A turn that starts is refused by OpenAI's API with 401.
 
     #[tokio::test]
     #[ignore = "requires codex installed — run with: make test-live"]

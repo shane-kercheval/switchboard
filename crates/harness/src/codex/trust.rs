@@ -7,14 +7,15 @@
 //! project config. Probed @ codex-cli 0.170.0.
 //! - The user marked the folder untrusted ("<path> is marked as untrusted").
 //!   Codex reads the entries for the folder, its project root (the nearest
-//!   folder holding a `project_root_markers` entry, `.git` by default), a
-//!   linked worktree's main checkout, and folders holding `.codex/` between the
-//!   first two. This check reads every folder from the run's folder up to the
-//!   project root, and the main checkout. An `untrusted` entry on any of them
-//!   leaves the flag off, whatever order Codex reads them in: when another
-//!   entry trusts the folder, its project config loads without the flag. An
-//!   entry on a folder between the two that holds no `.codex/` leaves the flag
-//!   off where Codex would have run.
+//!   folder holding a `project_root_markers` entry, `.git` by default), its git
+//!   repository root (the nearest folder holding `.git` whatever the markers
+//!   say, or a linked worktree's main checkout), and folders holding `.codex/`
+//!   between the first two. This check reads every folder from the run's folder
+//!   up to the project root, and the repository root. An `untrusted` entry on
+//!   any of them leaves the flag off, whatever order Codex reads them in: when
+//!   another entry trusts the folder, its project config loads without the
+//!   flag. An entry on a folder between the run's folder and the project root
+//!   that holds no `.codex/` leaves the flag off where Codex would have run.
 //! - Codex can't write the config ("failed to persist config"). Codex follows a
 //!   symlinked config link by link, creates missing folders, and writes a
 //!   temporary file beside the end of the chain, so the OS is asked whether
@@ -63,8 +64,8 @@ pub(crate) fn should_pass_codex_trust(
 }
 
 /// The key of an `untrusted` entry in `file` that names `cwd`, a folder above
-/// it up to its project root, or the main checkout of the linked worktree
-/// holding it. A file that is missing or can't be read or parsed has none.
+/// it up to its project root, or its git repository root. A file that is
+/// missing or can't be read or parsed has none.
 fn untrusted_entry(file: &Path, cwd: &Path) -> Option<String> {
     let text = std::fs::read_to_string(file).ok()?;
     let config: toml::Table = toml::from_str(&text).ok()?;
@@ -86,8 +87,8 @@ fn untrusted_entry(file: &Path, cwd: &Path) -> Option<String> {
     if let Some(canonical) = &canonical {
         folders.extend(up_to_project_root(canonical, &markers));
     }
-    if let Some(main) = main_checkout(canonical.as_deref().unwrap_or(cwd)) {
-        folders.push(main);
+    if let Some(root) = repo_root(canonical.as_deref().unwrap_or(cwd)) {
+        folders.push(root);
     }
     untrusted
         .into_iter()
@@ -138,13 +139,21 @@ fn holds_marker(folder: &Path, markers: &[String]) -> bool {
     })
 }
 
-/// The main checkout of the linked worktree holding `dir`. A worktree's `.git`
-/// is a file whose `gitdir:` names `<main>/.git/worktrees/<name>`.
-fn main_checkout(dir: &Path) -> Option<PathBuf> {
-    let root = dir
-        .ancestors()
-        .find(|folder| folder.join(".git").exists())?;
+/// The git repository root Codex reads an entry for, whatever
+/// `project_root_markers` says: the nearest folder above `dir` holding `.git`,
+/// skipping a `.git` folder with no `HEAD`, or for a linked worktree its main
+/// checkout. A worktree's `.git` is a file whose `gitdir:` names
+/// `<main>/.git/worktrees/<name>`.
+fn repo_root(dir: &Path) -> Option<PathBuf> {
+    let root = dir.ancestors().find(|folder| {
+        let dot_git = folder.join(".git");
+        std::fs::metadata(&dot_git)
+            .is_ok_and(|metadata| !metadata.is_dir() || dot_git.join("HEAD").exists())
+    })?;
     let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return Some(root.to_path_buf());
+    }
     let metadata = std::fs::symlink_metadata(&dot_git).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_GIT_FILE_BYTES {
         return None;
@@ -355,6 +364,20 @@ mod tests {
         let (home, _work, folder) = setup();
         std::fs::create_dir(folder.join(".hg")).unwrap();
         let cwd = folder.join("a");
+        std::fs::create_dir(&cwd).unwrap();
+        write_config(
+            home.path(),
+            &format!("project_root_markers = [\".hg\"]\n{}", untrusted(&folder)),
+        );
+        assert!(!decide(home.path(), &cwd));
+    }
+
+    #[test]
+    fn omits_trust_when_custom_markers_leave_out_an_untrusted_git_root() {
+        // Codex reads the git root's entry whatever the markers say.
+        let (home, _work, folder) = setup();
+        git(&folder, &["init", "-q"]);
+        let cwd = folder.join("sub");
         std::fs::create_dir(&cwd).unwrap();
         write_config(
             home.path(),

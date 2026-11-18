@@ -4725,7 +4725,11 @@ async fn live_codex_compact_succeeds_and_the_conversation_continues() {
     };
     assert_eq!(compaction["model"], "gpt-6-luna");
     assert_eq!(compaction["effort"], "medium");
-    assert_eq!(compaction["sandbox_policy"], reply["sandbox_policy"]);
+    // Checked against the expected value rather than between the two turns, so
+    // the test fails if Codex stops recording `sandbox_policy` at all.
+    for turn in [reply, compaction] {
+        assert_eq!(turn["sandbox_policy"]["type"], "danger-full-access");
+    }
     assert_eq!(compaction["approval_policy"], reply["approval_policy"]);
 
     let transcript = load_codex_transcript(

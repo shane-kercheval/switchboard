@@ -209,12 +209,12 @@ async fn version_off_async_thread(binary: &Path, cwd: &Path) -> Option<String> {
 }
 
 /// [`codex_version`] against `slots`. The map's lock is released before the
-/// read, so a slow read of one slot doesn't hold up a lookup of another. A
-/// folder that doesn't exist is not cached, so restoring it gets a fresh read.
+/// read, so a slow read of one slot doesn't hold up a lookup of another. Only a
+/// `codex --version` that ran is cached, as unreadable when it reported no
+/// version. One that couldn't start, because the folder or the program is
+/// missing, is read again on the next turn, which costs one failed spawn before
+/// a turn that fails anyway.
 fn version_at(slots: &VersionSlots, binary: &Path, cwd: Option<&Path>) -> Option<String> {
-    if cwd.is_some_and(|dir| !dir.is_dir()) {
-        return None;
-    }
     let slot = Arc::clone(
         slots
             .lock()
@@ -222,9 +222,12 @@ fn version_at(slots: &VersionSlots, binary: &Path, cwd: Option<&Path>) -> Option
             .entry((binary.to_owned(), cwd.map(Path::to_owned)))
             .or_default(),
     );
+    if let Some(version) = slot.get() {
+        return version.clone();
+    }
+    let line = crate::subprocess::fetch_version_in(binary, cwd).ok()?;
     slot.get_or_init(|| {
-        crate::subprocess::fetch_version_in(binary, cwd)
-            .as_deref()
+        line.as_deref()
             .and_then(crate::subprocess::parse_cli_version)
     })
     .clone()
@@ -1801,6 +1804,17 @@ mod tests {
             version_at(&versions, &codex, Some(&folder)).as_deref(),
             Some("0.168.0")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_ran_without_a_version_stays_unreadable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let codex = codex_printing(dir.path(), "codex", "no version here");
+        let versions = VersionSlots::default();
+        assert_eq!(version_at(&versions, &codex, Some(dir.path())), None);
+        codex_printing(dir.path(), "codex", "codex-cli 0.170.0");
+        assert_eq!(version_at(&versions, &codex, Some(dir.path())), None);
     }
 
     #[test]

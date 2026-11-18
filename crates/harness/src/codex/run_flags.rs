@@ -12,6 +12,10 @@ use crate::OwnMcpServer;
 /// their own.
 const FIRST_VERSION_WITH_TRUST: [u64; 3] = [0, 169, 0];
 
+/// The version a Codex built from source reports: its workspace version,
+/// which a release build replaces.
+const SOURCE_BUILD_VERSION: [u64; 3] = [0, 0, 0];
+
 /// What a Codex `exec` run in one folder adds to its command line.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodexRunFlags {
@@ -53,14 +57,19 @@ pub(crate) fn own_server_overrides(
 }
 
 /// Whether a Codex reporting `version` accepts `--trust`. A version that is
-/// missing or can't be read counts as current: a refused run says why, where
-/// a missing flag would skip the project's config without a word. A
-/// pre-release counts as the release it precedes.
+/// missing or can't be read counts as current, and so does 0.0.0, which a
+/// Codex built from source reports: a refused run says why, where a missing
+/// flag would skip the project's config without a word. A pre-release counts
+/// as older than its release, as semver orders them: 0.169.0-alpha.1 and
+/// alpha.2 lack the flag.
 fn accepts_trust(version: Option<&str>) -> bool {
-    let Some(numbers) = version.and_then(release_numbers) else {
+    let Some((numbers, pre_release)) = version
+        .and_then(parse_version)
+        .filter(|(numbers, _)| *numbers != SOURCE_BUILD_VERSION)
+    else {
         return true;
     };
-    if numbers < FIRST_VERSION_WITH_TRUST {
+    if numbers < FIRST_VERSION_WITH_TRUST || (numbers == FIRST_VERSION_WITH_TRUST && pre_release) {
         tracing::debug!(
             version = version.unwrap_or_default(),
             "this Codex predates --trust; running Codex without it"
@@ -70,12 +79,13 @@ fn accepts_trust(version: Option<&str>) -> bool {
     true
 }
 
-/// `major.minor.patch` from a version such as `0.170.0` or `0.169.0-alpha.2`.
-/// A missing patch reads as 0.
-fn release_numbers(version: &str) -> Option<[u64; 3]> {
-    let release = version
-        .split(|c: char| !c.is_ascii_digit() && c != '.')
-        .next()?;
+/// `major.minor.patch` from a version such as `0.170.0` or `0.169.0-alpha.2`,
+/// and whether it is a pre-release. A missing patch reads as 0.
+fn parse_version(version: &str) -> Option<([u64; 3], bool)> {
+    let end = version
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(version.len());
+    let (release, rest) = version.split_at(end);
     let mut parts = release.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -83,7 +93,7 @@ fn release_numbers(version: &str) -> Option<[u64; 3]> {
         Some(patch) => patch.parse().ok()?,
         None => 0,
     };
-    Some([major, minor, patch])
+    Some(([major, minor, patch], rest.starts_with('-')))
 }
 
 #[cfg(test)]
@@ -108,8 +118,18 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_release_counts_as_its_release() {
-        assert!(accepts_trust(Some("0.169.0-alpha.2")));
-        assert!(!accepts_trust(Some("0.168.0-alpha.9")));
+    fn a_source_build_counts_as_current() {
+        // Codex built from source reports its workspace version, 0.0.0.
+        assert!(accepts_trust(Some("0.0.0")));
+    }
+
+    #[test]
+    fn a_pre_release_counts_as_older_than_its_release() {
+        for version in ["0.170.0-alpha.1", "0.169.1-alpha.1", "0.169.0+build.5"] {
+            assert!(accepts_trust(Some(version)), "{version}");
+        }
+        for version in ["0.169.0-alpha.2", "0.169.0-alpha.3", "0.168.0-alpha.9"] {
+            assert!(!accepts_trust(Some(version)), "{version}");
+        }
     }
 }

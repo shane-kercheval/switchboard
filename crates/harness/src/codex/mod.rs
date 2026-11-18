@@ -181,8 +181,16 @@ impl CodexAdapter {
 
 /// `codex --version` for each program path `codex` has resolved to in this
 /// process and each folder it was read in (`None`: this process's folder).
-/// Each slot is filled once; `None` records a failed read.
-type VersionSlots = Mutex<HashMap<(PathBuf, Option<PathBuf>), Arc<OnceLock<Option<String>>>>>;
+type VersionSlots = Mutex<HashMap<(PathBuf, Option<PathBuf>), Arc<VersionSlot>>>;
+
+/// One program path and folder's version. `version` is filled once; `None`
+/// records a read that reported no version. `reading` is held for the whole
+/// read, so concurrent lookups of the slot share one `codex --version`.
+#[derive(Default)]
+struct VersionSlot {
+    reading: Mutex<()>,
+    version: OnceLock<Option<String>>,
+}
 
 static VERSIONS: LazyLock<VersionSlots> = LazyLock::new(VersionSlots::default);
 
@@ -209,11 +217,12 @@ async fn version_off_async_thread(binary: &Path, cwd: &Path) -> Option<String> {
 }
 
 /// [`codex_version`] against `slots`. The map's lock is released before the
-/// read, so a slow read of one slot doesn't hold up a lookup of another. Only a
-/// `codex --version` that ran is cached, as unreadable when it reported no
-/// version. One that couldn't start, because the folder or the program is
-/// missing, is read again on the next turn, which costs one failed spawn before
-/// a turn that fails anyway.
+/// read, so a slow read of one slot doesn't hold up a lookup of another, and a
+/// lookup of a slot being read waits for that read. Only a `codex --version`
+/// that ran is cached, as unreadable when it reported no version. One that
+/// couldn't start, because the folder or the program is missing, leaves the slot
+/// empty, so the next lookup reads again: one failed spawn per turn, before a
+/// turn that fails anyway.
 fn version_at(slots: &VersionSlots, binary: &Path, cwd: Option<&Path>) -> Option<String> {
     let slot = Arc::clone(
         slots
@@ -222,15 +231,20 @@ fn version_at(slots: &VersionSlots, binary: &Path, cwd: Option<&Path>) -> Option
             .entry((binary.to_owned(), cwd.map(Path::to_owned)))
             .or_default(),
     );
-    if let Some(version) = slot.get() {
+    if let Some(version) = slot.version.get() {
+        return version.clone();
+    }
+    let _reading = slot.reading.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(version) = slot.version.get() {
         return version.clone();
     }
     let line = crate::subprocess::fetch_version_in(binary, cwd).ok()?;
-    slot.get_or_init(|| {
-        line.as_deref()
-            .and_then(crate::subprocess::parse_cli_version)
-    })
-    .clone()
+    slot.version
+        .get_or_init(|| {
+            line.as_deref()
+                .and_then(crate::subprocess::parse_cli_version)
+        })
+        .clone()
 }
 
 impl Default for CodexAdapter {
@@ -1807,6 +1821,54 @@ mod tests {
             version_at(&versions, &codex, Some(&folder)).as_deref(),
             Some("0.168.0")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_lookups_of_one_slot_run_one_version_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let runs_log = dir.path().join("runs");
+        let release = dir.path().join("release");
+        // Records each run, then prints its version only once the test creates
+        // `release`, so the two lookups overlap.
+        let codex = dir.path().join("codex");
+        std::fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\necho run >> '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\necho 'codex-cli 0.170.0'\n",
+                runs_log.display(),
+                release.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runs = || std::fs::read_to_string(&runs_log).map_or(0, |log| log.lines().count());
+        let versions = Arc::new(VersionSlots::default());
+        let lookup = || {
+            std::thread::spawn({
+                let versions = Arc::clone(&versions);
+                let codex = codex.clone();
+                let folder = dir.path().to_owned();
+                move || version_at(&versions, &codex, Some(&folder))
+            })
+        };
+
+        let first = lookup();
+        while runs() == 0 && !first.is_finished() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let second = lookup();
+        // A lookup that runs its own read starts it well within this wait; one
+        // that shares the first read never does.
+        let waited = std::time::Instant::now();
+        while runs() < 2 && waited.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(&release, "").unwrap();
+
+        assert_eq!(first.join().unwrap().as_deref(), Some("0.170.0"));
+        assert_eq!(second.join().unwrap().as_deref(), Some("0.170.0"));
+        assert_eq!(runs(), 1, "each lookup ran its own `codex --version`");
     }
 
     #[cfg(unix)]

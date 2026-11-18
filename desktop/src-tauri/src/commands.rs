@@ -2690,19 +2690,17 @@ async fn create_codex_fork(
         });
     };
     // Found once, so the version decides `--trust` for the program that runs.
-    // A `codex` that can't be found is reported by the launch, after the lock.
-    let binary = switchboard_harness::subprocess::resolve_binary(codex_binary).ok();
+    let binary = switchboard_harness::subprocess::resolve_binary(codex_binary)
+        .map_err(|_| switchboard_harness::CodexForkError::BinaryNotFound)?;
     // Read before the parent's lock is taken: the first read of a program runs
     // `codex --version` and waits for it.
-    let codex_version = match binary.clone() {
-        Some(binary) => {
-            tokio::task::spawn_blocking(move || switchboard_harness::codex_version(&binary))
-                .await
-                .ok()
-                .flatten()
-        }
-        None => None,
-    };
+    let codex_version = tokio::task::spawn_blocking({
+        let binary = binary.clone();
+        move || switchboard_harness::codex_version(&binary)
+    })
+    .await
+    .ok()
+    .flatten();
     let key = crate::session_lock::session_lock_key(source.harness, parent, &project.directory)?;
     let lock_root = state.lock_root.clone();
     // Off the async worker: acquisition opens a file and, when contended,
@@ -2729,7 +2727,7 @@ async fn create_codex_fork(
         codex_version.as_deref(),
     );
     let created = switchboard_harness::fork_codex_session(
-        binary.as_deref().unwrap_or(codex_binary),
+        &binary,
         home_dir,
         &project.directory,
         parent_thread_id,
@@ -9330,6 +9328,43 @@ mod tests {
         assert!(
             matches!(&err, AppError::ForkSourceBusy { name } if name == "cx"),
             "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_fork_with_no_codex_on_the_path_fails_as_not_installed() {
+        // The parent's lock is held elsewhere, so a fork that looked for Codex
+        // only after taking the lock would report the parent as busy instead.
+        let (_tmp, home, state, project_id) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let _contender = crate::session_lock::acquire_session_locks(
+            &state.lock_root,
+            &BTreeSet::from([codex_parent_key(&state, project_id)]),
+        )
+        .unwrap();
+        let before = lock(&state.agents_by_id).len();
+
+        let err = fork_agent_with(
+            &state,
+            source_id,
+            home.path(),
+            Path::new("switchboard-test-codex-not-on-any-path"),
+            path_settled(),
+        )
+        .await
+        .expect_err("a fork with no Codex to run must fail");
+
+        assert!(
+            matches!(
+                err,
+                AppError::CodexFork(switchboard_harness::CodexForkError::BinaryNotFound)
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            lock(&state.agents_by_id).len(),
+            before,
+            "a failed fork must not leave an agent behind"
         );
     }
 

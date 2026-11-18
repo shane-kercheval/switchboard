@@ -7000,12 +7000,13 @@ fn codex_fork_date() -> chrono::NaiveDate {
     chrono::NaiveDate::from_ymd_opt(2026, 10, 11).unwrap()
 }
 
-/// A stand-in for `codex exec fork`, as the app's fork tests use: it writes
-/// the fork's rollout under `home` and prints `thread.started` with its id.
+/// A stand-in for `codex exec fork`, as the app's fork tests use: it answers
+/// `--version` as Codex 0.170.0 does, and otherwise writes the fork's rollout
+/// under `home` and prints `thread.started` with its id.
 fn codex_fork_shim(home: &std::path::Path) -> PathBuf {
     let folder = home.join(".codex/sessions/2026/10/11");
     let script = format!(
-        "#!/bin/sh\nmkdir -p '{folder}'\n: > '{folder}/rollout-2026-10-11T00-00-01-{CODEX_FORK_CHILD}.jsonl'\necho '{{\"type\":\"thread.started\",\"thread_id\":\"{CODEX_FORK_CHILD}\"}}'\n",
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.170.0'; exit; fi\nmkdir -p '{folder}'\n: > '{folder}/rollout-2026-10-11T00-00-01-{CODEX_FORK_CHILD}.jsonl'\necho '{{\"type\":\"thread.started\",\"thread_id\":\"{CODEX_FORK_CHILD}\"}}'\n",
         folder = folder.display(),
     );
     let shim = home.join("codex");

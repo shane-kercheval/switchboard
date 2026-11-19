@@ -128,3 +128,26 @@ Since Claude Code 2.1.277, the cost and token totals on a resumed turn's `result
 
 - `docs/harness-behavior.md` §3.13, for what each harness turns off and what it misses.
 - `desktop/src/lib/agentEnvironment.ts`, for the card's rule of showing what is configured rather than hiding it.
+
+## Agents created or changed over MCP skip the window's effort rules
+
+**What a user would get.** An Antigravity agent created or changed over MCP gets an effort level its model accepts, as one set up in the window does, instead of failing every turn on a level `agy` rejects.
+
+**What we know.**
+
+- `create_agent` in `desktop/src-tauri/src/ops/change.rs` gives a new agent the caller's effort or else the Settings default, whatever the model. `set_agent_model_and_effort` keeps the agent's effort when the caller changes only the model. Read from source on 2026-11-19.
+- The window applies two rules that MCP skips, both in `desktop/src/lib/agentSelection.ts`: `selectionForNewAgent` clears the effort for a model that takes none, and `resolveModelChange` clears it or picks a quick choice the new model accepts.
+- Three pairs MCP can create today:
+  - An orchestrator model with the default `medium`. Probed @ 1.5.12: `agy -p ... --model gemini-pro-orchestrator-neon --effort medium` exits 1 within 4 seconds with `--effort is not supported for model "gemini-pro-orchestrator-neon"`. The sidebar hides the effort control for a model that takes no effort, so the user can't see the setting that fails.
+  - GPT-OSS 120B with a default of `high`. `agy` accepts only `medium` for it (`harness-behavior.md` §3.4).
+  - Gemini 4 Argon with a default of `xhigh`. `agy models` lists Argon at `low`, `medium` and `high` only. Not probed.
+- To recover today, call `set_agent_model_and_effort` with `effort: null`, or switch the agent to another model in the window. The window offers the curated models plus the agent's quick choices, and the orchestrators are not curated. If the orchestrator is among the agent's quick choices, switching back to it clears the effort (`resolveModelChange`); if not, the window can't put the agent back on it. `create_agent` copies the quick choices from the Settings defaults.
+
+**Why it waits.** Reaching any of these needs an MCP caller to pass a model the pickers leave out, or a Settings default the model lacks, and no agent is known to be in this state. A fix touches only the app's ops layer: `create_agent` and `set_agent_model_and_effort` would load `antigravityModels.json`, which in Rust only a test module reads today, and apply the window's two rules. `switchboard-core` stays unchanged.
+
+**A candidate approach.** This is recorded, not decided. Apply `selectionForNewAgent` and `resolveModelChange` in the ops layer, from the same `antigravityModels.json`. Separately, the agent's selection editor could offer to clear an effort its model doesn't take, which would also repair agents already in this state.
+
+**Where the detail is.**
+
+- `desktop/src-tauri/src/ops/change.rs` and `desktop/src/lib/agentSelection.ts`.
+- `docs/harness-behavior.md` §3.4, for the per-model levels and the catalog decision.

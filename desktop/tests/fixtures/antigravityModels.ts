@@ -1,7 +1,8 @@
 /**
  * Stand-in Antigravity models for tests that need a kind of model rather than
  * a particular one: two that take low, medium and high, one that takes only
- * medium, and one that takes no effort at all. Google adds and retires
+ * medium, and one that takes no effort at all, plus one left out of the
+ * pickers that takes low, medium and high. Google adds and retires
  * Antigravity models without a CLI release, and tests that used real models as
  * examples had to be rewritten each time. Real ids belong only in tests about
  * the built-in defaults.
@@ -24,9 +25,20 @@ export const STAND_IN_ANTIGRAVITY_MODELS = [
   { value: "no-effort-model", label: "No Effort Model", efforts: null },
 ];
 
-type ModelTableModule = { default: { models: readonly unknown[] } };
+export const STAND_IN_LEFT_OUT_ANTIGRAVITY_MODELS = [
+  {
+    value: "left-out-model",
+    label: "Left Out Model",
+    efforts: ["low", "medium", "high"],
+    reason: "A stand-in for a model the pickers leave out.",
+  },
+];
 
-/** The real model table with the stand-ins appended after its own models. */
+type ModelTableModule = {
+  default: { models: readonly unknown[]; left_out: readonly unknown[] };
+};
+
+/** The real model table with the stand-ins appended after each list's own models. */
 export async function withStandIns(importOriginal: <T>() => Promise<T>): Promise<ModelTableModule> {
   const actual = await importOriginal<ModelTableModule>();
   return {
@@ -34,6 +46,7 @@ export async function withStandIns(importOriginal: <T>() => Promise<T>): Promise
     default: {
       ...actual.default,
       models: [...actual.default.models, ...STAND_IN_ANTIGRAVITY_MODELS],
+      left_out: [...actual.default.left_out, ...STAND_IN_LEFT_OUT_ANTIGRAVITY_MODELS],
     },
   };
 }

@@ -15,8 +15,7 @@ import SegmentedFitHost from "./SegmentedFitHost.svelte";
 //
 // `max-w` is a ceiling, not a width: the card is `w-[calc(100vw-2rem)]`, so a
 // window under ~564px shrinks it further and labels begin to truncate. That is
-// an accepted limit, not a covered case — measured crossover for the widest set
-// (Antigravity's five models) is between 500px and 472px of inner width.
+// an accepted limit, not a covered case.
 const DIALOG_INNER_WIDTH = 580;
 
 test("multi-select quick choices divide the full track into equal segments", async () => {
@@ -90,12 +89,12 @@ test("Codex's model pills fit one row without clipping at the dialog width", asy
   await assertSingleRowNoClip("fit");
 });
 
-test("Antigravity's five model pills fit one row without clipping at the dialog width", async () => {
+test("Antigravity's model pills fit one row without clipping at the dialog width", async () => {
   render(SegmentedFitHost, {
     props: {
       width: DIALOG_INNER_WIDTH,
       options: MODEL_OPTIONS.antigravity,
-      value: "gemini-4-argon",
+      value: "gemini-4-neon",
     },
   });
   await expect.element(page.getByTestId("fit")).toBeInTheDocument();

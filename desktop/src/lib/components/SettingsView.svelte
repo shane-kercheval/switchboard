@@ -39,7 +39,7 @@
     notificationAvailability,
   } from "$lib/api";
   import type { AgentSelection, HarnessKind, NotificationAvailability } from "$lib/types";
-  import { EFFORT_OPTIONS, MODEL_OPTIONS, selectionIsValid } from "$lib/agentSelection";
+  import { EFFORT_OPTIONS, modelLabel, selectionIsValid } from "$lib/agentSelection";
   import { HARNESS_LABEL, ALL_HARNESSES } from "$lib/harnessDisplay";
   import { workflowAuthoringPrompt } from "$lib/workflowAuthoring";
   import { promptAuthoringPrompt } from "$lib/promptAuthoring";
@@ -229,7 +229,7 @@
   function defaultModelLabel(harness: HarnessKind): string {
     const model = preferences.agent_defaults[harness].default_model;
     if (model === null) return "Not set";
-    return MODEL_OPTIONS[harness].find((option) => option.value === model)?.label ?? model;
+    return modelLabel(harness, model);
   }
 
   function defaultEffortLabel(harness: HarnessKind): string {

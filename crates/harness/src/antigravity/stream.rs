@@ -78,6 +78,9 @@ pub(crate) struct StreamResult {
     pub succeeded: bool,
     /// `result.error`, when non-empty.
     pub error: Option<String>,
+    /// `result.finished_reason` is `print_timeout`: `--print-timeout` ended the
+    /// turn, and `agy` killed any background commands still running.
+    pub print_timeout: bool,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +124,8 @@ struct RawResult {
     status: String,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    finished_reason: Option<String>,
 }
 
 /// Parse one stdout line.
@@ -163,6 +168,7 @@ pub(crate) fn parse_line(line: &str) -> Option<StreamEvent> {
             Some(StreamEvent::Result(StreamResult {
                 succeeded: result.status == "SUCCESS",
                 error,
+                print_timeout: result.finished_reason.as_deref() == Some("print_timeout"),
             }))
         }
         _ => Some(StreamEvent::Ignored),
@@ -252,7 +258,8 @@ mod tests {
             parse_line(ok),
             Some(StreamEvent::Result(StreamResult {
                 succeeded: true,
-                error: None
+                error: None,
+                print_timeout: false,
             }))
         );
 
@@ -261,7 +268,8 @@ mod tests {
             parse_line(bad),
             Some(StreamEvent::Result(StreamResult {
                 succeeded: false,
-                error: Some("timeout waiting for response".to_owned())
+                error: Some("timeout waiting for response".to_owned()),
+                print_timeout: false,
             }))
         );
     }
@@ -275,7 +283,28 @@ mod tests {
             parse_line(line),
             Some(StreamEvent::Result(StreamResult {
                 succeeded: false,
-                error: None
+                error: None,
+                print_timeout: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn a_print_timeout_result_says_so() {
+        // Captured from agy 1.5.12 run with `--print-timeout 15s` while a
+        // background `sleep 40` ran (exit 3); the conversation id is scrubbed.
+        let line = r#"{"event":"result","result":{"conversation_id":"00000000-0000-0000-0000-000000000000","status":"ERROR","response":"ack\n","error":"print timeout after 15s while the agent was waiting on 1 background task(s); the response may be incomplete; terminated 00000000-0000-0000-0000-000000000000/task-2 (sleep 40, running 12s)","duration_seconds":5.153743,"num_turns":1,"usage":{"input_tokens":12931,"output_tokens":247,"thinking_tokens":189,"cache_read_tokens":8427,"total_tokens":13178},"finished_reason":"print_timeout"}}"#;
+        assert_eq!(
+            parse_line(line),
+            Some(StreamEvent::Result(StreamResult {
+                succeeded: false,
+                error: Some(
+                    "print timeout after 15s while the agent was waiting on 1 background \
+                     task(s); the response may be incomplete; terminated \
+                     00000000-0000-0000-0000-000000000000/task-2 (sleep 40, running 12s)"
+                        .to_owned()
+                ),
+                print_timeout: true,
             }))
         );
     }

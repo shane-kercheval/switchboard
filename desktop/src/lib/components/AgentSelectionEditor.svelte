@@ -5,6 +5,7 @@
     MODEL_OPTIONS,
     activatableEffortValues,
     effortSupportFor,
+    modelLabel,
     resolveModelChange,
     selectionIsValid,
     type SelectionOption,
@@ -47,10 +48,12 @@
 
   const roleLabel = $derived(context === "current" ? "Current" : "Default");
   const modelOptions = $derived(
-    optionsWithPersisted(MODEL_OPTIONS[harness], selection.model_choices),
+    optionsWithPersisted(MODEL_OPTIONS[harness], selection.model_choices, (value) =>
+      modelLabel(harness, value),
+    ),
   );
   const effortOptions = $derived(
-    optionsWithPersisted(EFFORT_OPTIONS[harness], selection.effort_choices),
+    optionsWithPersisted(EFFORT_OPTIONS[harness], selection.effort_choices, (value) => value),
   );
   const modelSupported = $derived(SUPPORTS_MODEL_SELECTION[harness]);
   const effortSupported = $derived(SUPPORTS_EFFORT_SELECTION[harness]);
@@ -82,10 +85,13 @@
   function optionsWithPersisted(
     curated: SelectionOption[],
     persisted: readonly string[],
+    labelFor: (value: string) => string,
   ): SelectionOption[] {
     const options = [...curated];
     for (const value of persisted) {
-      if (!options.some((option) => option.value === value)) options.push({ label: value, value });
+      if (!options.some((option) => option.value === value)) {
+        options.push({ label: labelFor(value), value });
+      }
     }
     return options;
   }

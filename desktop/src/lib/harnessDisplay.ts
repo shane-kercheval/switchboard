@@ -73,9 +73,9 @@ export const HARNESS_LOGIN_HINT: Record<HarnessKind, string> = {
 /// the exhaustive `Record<HarnessKind, …>` makes a missing harness a
 /// type error, the same discipline the Rust match enforces.
 /// **Uniform capability maps are extension points, not dead weight.** Several
-/// per-harness maps here (and `MODEL_PRESENTATION` in `agentSelection.ts`,
-/// `AUTO_SEED_ON_NEW_PROJECT` below) currently hold the same value for every
-/// harness, so the code reading them can only take one branch. They stay written
+/// per-harness maps here (and `AUTO_SEED_ON_NEW_PROJECT` below) currently hold
+/// the same value for every harness, so the code reading them can only take one
+/// branch. They stay written
 /// out per harness: the map is what forces the next harness's capability to be a
 /// deliberate decision instead of an inherited default, and the exhaustive
 /// `Record<HarnessKind, …>` makes omitting one a type error. Collapsing any of

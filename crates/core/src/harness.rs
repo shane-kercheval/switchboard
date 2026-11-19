@@ -53,8 +53,8 @@ impl HarnessKind {
     /// **Antigravity's levels are per-model.** Unlike Claude, which accepts
     /// any level for any model and silently degrades, `agy` validates
     /// client-side before dispatch: a model without an axis *rejects* one, and
-    /// the valid set differs by model (GPT-OSS 120B takes only medium; the
-    /// Gemini and Claude models take low, medium and high). The window's
+    /// the valid set differs by model (Gemini 4 Neon and Hydrogen take low
+    /// through xhigh; GPT-OSS 120B takes only medium). The window's
     /// pickers always store a level for a model that has them
     /// (`effortIsRequired`); core does not enforce it, so an agent whose effort
     /// was cleared through MCP dispatches a bare model, for which `agy` has

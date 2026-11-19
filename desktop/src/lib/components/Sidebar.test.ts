@@ -1409,6 +1409,30 @@ describe("Sidebar", () => {
     });
   });
 
+  it("names an agent's left-out Antigravity model and disables levels it lacks", async () => {
+    const state = await loadState();
+    const agent: AgentRecord = {
+      ...ANTIGRAVITY_AGENT,
+      model: "left-out-model",
+      effort: "medium",
+      model_choices: ["left-out-model"],
+      effort_choices: ["medium", "high", "xhigh"],
+    };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
+
+    expect(screen.getByTestId("agent-model-chip")).toHaveTextContent("Left Out Model");
+    await fireEvent.click(screen.getByTestId("agent-effort-chip"));
+    expect(await screen.findByTestId("agent-effort-option-xhigh")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(screen.getByTestId("agent-effort-option-high")).not.toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+
   // `gemini-3.7-flash` is deliberately NOT updated: it is a real model the
   // table no longer lists, as an agent created before its removal still
   // carries, so this pins that the sidebar keeps working for such an agent.

@@ -845,9 +845,9 @@ describe("App", () => {
         name: "antigravity",
         harness: "antigravity",
         selection: {
-          model: "gemini-3.8-flash",
+          model: "gemini-4-neon",
           effort: "medium",
-          model_choices: ["gemini-3.8-flash", "gemini-4-argon"],
+          model_choices: ["gemini-4-neon", "gemini-4-hydrogen"],
           effort_choices: ["medium", "high"],
         },
       },

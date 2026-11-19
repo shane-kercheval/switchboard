@@ -351,8 +351,8 @@ async fn live_antigravity_invalid_file_read_completes_as_tool_error() {
 /// step `state:"ERROR"`, and the transcript's verdict is the one shown, so
 /// this fails when an unknown-tool call reads as succeeded: `agy` wrote it
 /// with neither a listed failure status nor an `error`.
-/// Pinned to Gemini 3.8 Flash, the model the `INVALID` records were captured
-/// on, because the model has to choose to call a tool it was not given.
+/// Pinned to Gemini 4 Hydrogen, which makes the call when asked, because the
+/// model has to choose to call a tool it was not given.
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 #[serial_test::serial(antigravity)]
@@ -364,7 +364,7 @@ async fn live_antigravity_unknown_tool_call_completes_as_tool_error() {
 
     let adapter = AntigravityAdapter::new();
     let agent = AgentRecord {
-        model: Some("gemini-3.8-flash".to_owned()),
+        model: Some("gemini-4-hydrogen".to_owned()),
         effort: Some("medium".to_owned()),
         ..antigravity_agent()
     };
